@@ -78,6 +78,48 @@ The façade is a concrete type with a `cfg`-selected body, not a trait. One impl
 trait's reason to exist, and a trait here would add a dispatch seam whose only caller is the one
 this ADR is wiring.
 
+_Amended 2026-09-21._ Building the façade surfaced the question this decision actually turns on,
+and it is not the signature. `AdapterRouter::route` maps a gate output column to an adapter by
+position: the selected column index is used directly as `available[idx]`, in both weight policies
+(`mixture.rs:474` under `Uniform`, `mixture.rs:509` under `Softmax`), and the `AdapterId` string is
+a label copied into the returned tuple, never matched against anything the gate holds. The gate is a bare fann `Network` — weights, input width, output width — and the
+artifact carries no adapter identity, so nothing in the system can tell whether the caller's slice
+is ordered the way the gate was trained.
+
+That makes the correspondence between gate columns and adapters an unwritten contract owned
+entirely by the caller, with no instrument that can check it. A gate trained with one adapter at
+column 3 routes to whatever happens to sit at index 3 in the list the caller passes: valid weights,
+no error, wrong adapter. It is latent rather than live only because there are no production callers
+— the three that exist (tune's `prompt_router` example, `router_loop_closure`, the in-module tests)
+each pass a fixed literal pool in the same scope, where position and name cannot disagree. Wiring
+the serving path is the act that creates the first caller whose adapter set changes underneath it,
+since an operator can load or unload an adapter between two requests.
+
+**So the gate artifact gains the list of adapter names it was trained on, and the façade matches by
+name and refuses when the resident set does not match.** This is chosen over pinning an ordering
+convention in the caller for one reason that outweighs the rest: it is the only shape in which a
+wrong pairing is detectable at all. An ordering convention is unverifiable by construction — there
+is no assertion to write, because neither side holds both halves of the key. Refusing on mismatch
+is also decision 1's shape reused: the missing configuration becomes a runtime answer a caller can
+read, rather than a silent default. And it is the failure mode this ADR family already refuses
+twice, in decision 1 and in ADR-095 decision 6 — a behaviour change arriving a long way from its
+cause, here an adapter load quietly re-pointing every column of a gate nobody touched.
+
+The cost is contained: the refit path already writes the artifact, so it gains a field, and the
+residency registry already stores each adapter's name beside its `u32` id, so the façade's lookup
+has somewhere to resolve against. Note that the two id types do not meet today — the router speaks
+`AdapterId = String` (`mixture.rs:46`) while the serving contract speaks `LoraSelection.id: u32` —
+and naming the trained set is what gives that translation a defined direction instead of an
+implied one.
+
+On the façade's error type, which this decision left open and which needs no new invention: it
+returns the existing `ApiError`. The pattern is already in the serving path — `lora_unsupported_backend`
+and the `#[cfg(not(...))]` helper `adapter_unsupported_build` build an `ApiError` for a compiled-out
+feature, and `lora_list` beside them is this decision's exact shape, two `cfg` blocks inside one
+gate-free function. A new error enum would add a type whose only job is to be converted at the same
+boundary. `RouterError` renders into the message through `Display`, on the same argument decision 3
+used for its variant remap: a move should not change the text a user sees.
+
 **3. `router_update.rs` moves from `lattice-tune` to `lattice-fann`, behind `online-router`.** Its
 only tune-specific dependency is tune's error type; everything substantive it imports is already
 `lattice_fann::{Network, training::{RlooConfig, RlooTrainer}}` (`router_update.rs:12-15`), and
