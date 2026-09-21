@@ -187,23 +187,36 @@ above is written against the second of those, and it is sound today for one reas
 binary has no `--router-state`, so it cannot route and cannot serve a gate at all. That is the
 whole of the protection, and it is a property of a missing flag rather than of the key.
 
-So the embedder type is a member of the representation in its own right, beside the model id, the
-pooling strategy, the prompt-selection rule and the loader format, and it names which of the two
-types produced the vector: `BertModel` or `serve::embeddings::EmbeddingModel`. It is not folded
-into the model id, because the same directory is a legal argument to both and the id would read
-identical across them. It is not folded into the pooling value either, because the two types do not
-share a pooling vocabulary — `Mean` and `CLS` on one side, `MeanVisualTokens` and `LastToken` on
-the other — and a key whose members come from different vocabularies depending on an unrecorded
-member is a key that cannot be compared at all.
+_Superseded within a day of being written, and the correction is the more interesting half._ The
+first version of this paragraph made the embedder type a member of the representation in its own
+right, beside the model id, the pooling strategy, the prompt-selection rule and the loader format.
+That member is withdrawn. `loader_format` already answers the question it was added to answer: it
+is documented as how the bytes were READ, and the two embedders differ in exactly that respect —
+the one reads an f16 decoder, the other reads a BERT encoder — so a server on the second records a
+different loader format by construction. Two members that cannot disagree in any case either of
+them can reach are one member with two names, and the failure mode of that shape is a later reader
+updating one and not the other, leaving a key that reads complete and compares on the stale half.
+A representation member also cannot be removed later without invalidating every artifact written
+under it, so the redundancy would have been permanent.
 
-The refusal arm follows from the member: an artifact recorded under one embedder type is refused by
-a server running the other, naming both, at startup rather than per request. That arm is a merge
-condition on the router-artifact PR and not a later hardening, because it is the only arm that
-distinguishes this key from the one that passes on a vector the gate was never trained on. The day
-`lattice_serve` gains `--router-state` it therefore records its own type and its own pooling
-vocabulary rather than inheriting the constant this decision writes, and the inheriting version is
-the failure with no symptom: both sides agree on a string that describes only one of them, and
-every check above passes.
+What was actually missing was never a member. It is that `loader_format` has one value today for a
+reason that is not about the key at all: the binary holding the other loader has no
+`--router-state`, so it cannot route and cannot serve a gate. That is a property of a missing flag,
+and it will stop being true.
+
+So the arm is built on the field that already exists, and it has three parts, because two of them
+are about the arm not being vacuous rather than about the check:
+
+1. **Each binary names its OWN loader constant, and a test asserts the two constants differ.**
+   Without this the cross-binary arm is vacuous by construction: an arm comparing a value against
+   itself passes for every input and proves nothing, while reading exactly like a guard.
+2. **The startup refusal names both values**, the artifact's and the binary's, so an operator can
+   act on it without reading source.
+3. **A test constructs an artifact recorded under the other binary's loader and asserts the refusal
+   fires at startup, naming both.** The fixture has to come from the other binary's constant rather
+   than from a literal, or it stops tracking the thing it is pinning the moment that constant moves.
+
+All three are merge conditions on the router-artifact PR rather than later hardening.
 
 Recording it moves the artifact format from 3 to 4, and the field is inside the content hash: a
 representation member outside the hash is a member two artifacts can disagree on while claiming to
