@@ -187,11 +187,23 @@ above is written against the second of those, and it is sound today for one reas
 binary has no `--router-state`, so it cannot route and cannot serve a gate at all. That is the
 whole of the protection, and it is a property of a missing flag rather than of the key.
 
-So the condition attaches here rather than being rediscovered: the day `lattice_serve` gains
-`--router-state`, it records its OWN `loader_format` and its own pooling vocabulary, and it does
-not inherit the constant this decision writes. Inheriting it is the failure with no symptom, since
-both sides would then agree on a string that describes only one of them, and every check above
-would pass on a vector the gate was never trained on.
+So the embedder type is a member of the representation in its own right, beside the model id, the
+pooling strategy, the prompt-selection rule and the loader format, and it names which of the two
+types produced the vector: `BertModel` or `serve::embeddings::EmbeddingModel`. It is not folded
+into the model id, because the same directory is a legal argument to both and the id would read
+identical across them. It is not folded into the pooling value either, because the two types do not
+share a pooling vocabulary — `Mean` and `CLS` on one side, `MeanVisualTokens` and `LastToken` on
+the other — and a key whose members come from different vocabularies depending on an unrecorded
+member is a key that cannot be compared at all.
+
+The refusal arm follows from the member: an artifact recorded under one embedder type is refused by
+a server running the other, naming both, at startup rather than per request. That arm is a merge
+condition on the router-artifact PR and not a later hardening, because it is the only arm that
+distinguishes this key from the one that passes on a vector the gate was never trained on. The day
+`lattice_serve` gains `--router-state` it therefore records its own type and its own pooling
+vocabulary rather than inheriting the constant this decision writes, and the inheriting version is
+the failure with no symptom: both sides agree on a string that describes only one of them, and
+every check above passes.
 
 Recording it moves the artifact format from 3 to 4, and the field is inside the content hash: a
 representation member outside the hash is a member two artifacts can disagree on while claiming to
