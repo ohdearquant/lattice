@@ -1700,20 +1700,34 @@ pub async fn lora_load(
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    lattice_inference::serve::require_json_content_type(&headers)?;
-    let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
-        .await
-        .map_err(|err| {
-            eprintln!("invalid request body: {err}");
-            ApiError::BadRequest {
-                message: "invalid JSON request body".to_string(),
-                code: "invalid_request_body",
-            }
-        })?;
-    let (path, name) = lattice_inference::serve::lora::parse_lora_load(&bytes)?;
+    // ORDERING RULE (ADR-095 decision 4). A refusal that is a property of the
+    // BUILD answers before anything is read, because it is true of every
+    // request: there is no request this build could have accepted, so reading
+    // one only decides which wrong answer to give. A refusal that is a
+    // property of the RUNTIME answers AFTER content-type, body cap and parse,
+    // so a malformed request gets the malformed-request answer whatever the
+    // runtime state happens to be.
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        let _ = (&state, headers, body);
+        Err(adapter_unsupported_build())
+    }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
+        lattice_inference::serve::require_json_content_type(&headers)?;
+        let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
+            .await
+            .map_err(|err| {
+                eprintln!("invalid request body: {err}");
+                ApiError::BadRequest {
+                    message: "invalid JSON request body".to_string(),
+                    code: "invalid_request_body",
+                }
+            })?;
+        let (path, name) = lattice_inference::serve::lora::parse_lora_load(&bytes)?;
+
+        // Runtime, so it follows the parse.
         let client = adapter_client(&state)?;
         let prepared = lattice_inference::serve::lora::prepare_adapter_load(&path, &name)?;
         let receiver = client.submit_adapter_command(prepared.command)?;
@@ -1737,11 +1751,6 @@ pub async fn lora_load(
             )),
         }
     }
-    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    {
-        let _ = (&state, path, name);
-        Err(adapter_unsupported_build())
-    }
 }
 
 /// Remove one resident identifier, refusing unknown ids.
@@ -1750,9 +1759,20 @@ pub async fn lora_unload(
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    // Backend refusal keeps its own diagnosis even for a bodyless CPU request.
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    let client = adapter_client(&state)?;
+    // ORDERING RULE (ADR-095 decision 4). A refusal that is a property of the
+    // BUILD answers before anything is read, because it is true of every
+    // request: there is no request this build could have accepted, so reading
+    // one only decides which wrong answer to give. A refusal that is a
+    // property of the RUNTIME answers AFTER content-type, body cap and parse,
+    // so a malformed request gets the malformed-request answer whatever the
+    // runtime state happens to be.
+    // The comment this replaced said the backend refusal "keeps its own
+    // diagnosis even for a bodyless CPU request". That argument carries for
+    // the COMPILED-OUT arm, which is why it still answers first. It does not
+    // carry for `adapter_client`, which is a worker lookup: a malformed
+    // request is malformed whether or not a worker happens to be running, and
+    // resolving the worker first made a malformed unload answer differently
+    // from a malformed load on this same binary.
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
         let _ = (&state, headers, body);
@@ -1769,6 +1789,8 @@ pub async fn lora_unload(
             })?;
         let id = lattice_inference::serve::lora::parse_lora_unload(&bytes)?;
 
+        // Runtime, so it follows the parse.
+        let client = adapter_client(&state)?;
         let receiver = client.submit_adapter_command(
             lattice_inference::serve::metal_worker::AdapterCommand::Unload { id },
         )?;
@@ -3749,6 +3771,15 @@ mod tests {
                 .expect("request fixture must build")
         }
 
+        fn post_lora_unload(body: &str) -> axum::http::Request<Body> {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/lora/unload")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request fixture must build")
+        }
+
         /// The route has to be registered on the router, not merely written: a
         /// handler nobody routed to is a 404 that reads exactly like an unsupported
         /// build. Both arms assert a non-404 status.
@@ -3792,13 +3823,7 @@ mod tests {
         #[tokio::test]
         async fn lora_unload_on_a_cpu_backend_refuses_by_name() {
             let response = router(tiny_state(64))
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method("POST")
-                        .uri("/v1/lora/unload")
-                        .body(Body::empty())
-                        .expect("request fixture must build"),
-                )
+                .oneshot(post_lora_unload(r#"{"id":0}"#))
                 .await
                 .expect("router must return a response");
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -3808,6 +3833,11 @@ mod tests {
             );
         }
 
+        /// Gated to the supported build on purpose. On a build with no Metal
+        /// compiled in, the refusal is true of every request, so it answers before
+        /// anything is read and no request ever reaches the content-type check --
+        /// which is the arm `the_build_refusal_precedes_the_request_contract` pins.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[tokio::test]
         async fn lora_load_without_json_content_type_is_415() {
             let response = router(tiny_state(64))
@@ -3825,7 +3855,10 @@ mod tests {
 
         /// Request-contract failures are answered before the backend question, so
         /// this arm distinguishes itself from `lora_unsupported_backend` on the same
-        /// CPU state: a malformed body is the caller's error whatever the backend is.
+        /// CPU state: a malformed body is the caller's error whatever the *runtime*
+        /// state is. It says nothing about a build that cannot serve the route at
+        /// all, hence the gate.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[tokio::test]
         async fn lora_load_rejects_an_unknown_field_before_asking_the_backend() {
             let response = router(tiny_state(64))
@@ -3838,6 +3871,47 @@ mod tests {
             assert_eq!(
                 json_body(response).await["error"]["code"],
                 "invalid_request"
+            );
+        }
+
+        /// Unload's half of the same rule. `adapter_client` used to answer first
+        /// here, so a malformed unload body got the backend's answer while the
+        /// identical mistake on load got the caller's. Same order, both routes.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[tokio::test]
+        async fn lora_unload_rejects_an_unknown_field_before_asking_the_backend() {
+            let response = router(tiny_state(64))
+                .oneshot(post_lora_unload(r#"{"id":0,"path":"/tmp/a"}"#))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["code"],
+                "invalid_request"
+            );
+        }
+
+        /// The inverse of the two gated arms above. A refusal that is a property
+        /// of the build is true of every request, so it answers before the request
+        /// is read: this body is malformed twice over -- no JSON content type and an
+        /// unknown field -- and still gets the build's answer, not the caller's.
+        #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+        #[tokio::test]
+        async fn the_build_refusal_precedes_the_request_contract() {
+            let response = router(tiny_state(64))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/lora/load")
+                        .body(Body::from(r#"{"path":"/tmp/a.safetensors","scale":2.0}"#))
+                        .expect("request fixture must build"),
+                )
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["code"],
+                "lora_unsupported_backend"
             );
         }
 
