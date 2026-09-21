@@ -221,6 +221,22 @@ impl ServingRouter {
         //
         // Equality rather than "at least": the list IS the labelling, so an
         // unnamed column is a column nothing can route to or verify.
+        // RECORDED against MEASURED, named separately from the output-width
+        // check below because the faults differ. This one says the artifact
+        // describes itself wrongly; the server's embedding model is not
+        // implicated and re-configuring it would not help.
+        let recorded = artifact.representation.input_width;
+        let measured = gate.num_inputs() as u64;
+        if recorded != measured {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "router artifact records an input width of {recorded} but its gate takes \
+                     {measured}; the artifact disagrees with the network it ships with"
+                ),
+                code: "router_artifact_input_width_mismatch",
+            });
+        }
+
         let declared = artifact.adapter_names.len();
         let outputs = gate.num_outputs();
         if declared != outputs {
@@ -334,10 +350,19 @@ mod tests {
         }
     }
 
+    fn representation(input_width: u64) -> crate::router_state::TrainedRepresentation {
+        crate::router_state::TrainedRepresentation {
+            embedding_model: "gme-qwen35".into(),
+            pooling: "mean_visual".into(),
+            input_width,
+        }
+    }
+
     fn artifact(names: &[&str]) -> RouterArtifact {
         RouterArtifact {
             version: 1,
             adapter_names: names.iter().map(|n| (*n).to_string()).collect(),
+            representation: representation(4),
             gate_bytes: vec![0],
         }
     }
@@ -453,6 +478,51 @@ mod tests {
         assert!((got[0].scale - 0.75).abs() < f32::EPSILON);
     }
 
+    /// Recorded input width against the width the gate actually takes. A
+    /// separate refusal from the output-width one because the fault differs:
+    /// this says the artifact describes itself wrongly, and re-configuring the
+    /// server's embedding model would not help.
+    #[cfg(feature = "mixture")]
+    #[test]
+    fn an_artifact_that_misrecords_its_own_input_width_refuses() {
+        use lattice_fann::{Activation, NetworkBuilder};
+
+        let gate_bytes = NetworkBuilder::new()
+            .input(4)
+            .output(1, Activation::Linear)
+            .build()
+            .expect("gate must build")
+            .to_bytes();
+
+        // Control first: the truthful record constructs.
+        assert!(
+            ServingRouter::new(RouterArtifact {
+                version: 1,
+                adapter_names: vec!["technical".into()],
+                representation: representation(4),
+                gate_bytes: gate_bytes.clone(),
+            })
+            .is_ok(),
+            "a truthful artifact must construct, or the refusal proves nothing"
+        );
+
+        match ServingRouter::new(RouterArtifact {
+            version: 1,
+            adapter_names: vec!["technical".into()],
+            representation: representation(1024),
+            gate_bytes,
+        }) {
+            Err(err) => {
+                let m = err.message();
+                assert!(
+                    m.contains("1024") && m.contains('4'),
+                    "the refusal must name recorded AND measured, got {m}"
+                );
+            }
+            Ok(_) => panic!("a misrecorded input width must refuse"),
+        }
+    }
+
     /// A gate whose output width disagrees with the name list is refused at
     /// construction. Without this the disagreement is invisible: every other
     /// check in this module compares the list against RESIDENCY, never against
@@ -478,6 +548,7 @@ mod tests {
         let ok = RouterArtifact {
             version: 1,
             adapter_names: vec!["technical".into(), "legal".into()],
+            representation: representation(4),
             gate_bytes: gate(2),
         };
         assert!(
@@ -489,6 +560,7 @@ mod tests {
             let artifact = RouterArtifact {
                 version: 1,
                 adapter_names: (0..names).map(|i| format!("a{i}")).collect(),
+                representation: representation(4),
                 gate_bytes: gate(outputs),
             };
             match ServingRouter::new(artifact) {

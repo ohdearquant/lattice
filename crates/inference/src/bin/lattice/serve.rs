@@ -2521,6 +2521,11 @@ mod tests {
             artifact: RouterArtifact {
                 version: 7,
                 adapter_names: vec!["technical".into()],
+                representation: lattice_inference::router_state::TrainedRepresentation {
+                    embedding_model: "gme-qwen35".into(),
+                    pooling: "mean_visual".into(),
+                    input_width: 4,
+                },
                 gate_bytes: vec![1, 2, 3],
             },
             pinned: true,

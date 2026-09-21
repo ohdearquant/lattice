@@ -44,7 +44,7 @@ use crate::bounded_read::{BoundedReadError, read_bytes_bounded};
 /// On-disk format revision for the manifest. Bumped only for a change that an
 /// older reader would misread; a reader refuses a revision it does not know
 /// rather than parsing a prefix of it.
-pub const ROUTER_ARTIFACT_FORMAT: u32 = 1;
+pub const ROUTER_ARTIFACT_FORMAT: u32 = 2;
 
 /// Size cap for the manifest read. The manifest is a small JSON object whose
 /// only unbounded field is the adapter-name list.
@@ -193,8 +193,46 @@ pub struct RouterArtifact {
     /// serving path matches against this by name; the order here is how the
     /// artifact records which column was which, never how a caller must sort.
     pub adapter_names: Vec<String>,
+    /// The representation the gate consumes. Inside the content hash, like
+    /// the names: editing it is a new version, never a mutation of this one.
+    pub representation: TrainedRepresentation,
     /// The serialized gate, opaque to this module.
     pub gate_bytes: Vec<u8>,
+}
+
+/// The representation a gate was trained on (ADR-094 decision 1, amended).
+///
+/// Recorded because "the gate was trained on that representation, so this
+/// reuses it as trained" was an unwritten contract with no instrument -- the
+/// same shape the adapter names were added to close. A mismatch here has no
+/// symptom: the gate routes confidently on vectors it never saw, and the only
+/// effect is worse selection, which is indistinguishable from a gate that did
+/// not learn much.
+///
+/// `pooling` is what makes this necessary rather than tidy. The two
+/// strategies produce DIFFERENT vectors of the SAME length, because the
+/// dimension is the checkpoint's hidden size either way, so `input_width`
+/// cannot stand in for it.
+///
+/// A refusal on mismatch, never a warrant of sameness on agreement: two
+/// checkpoints can share a name, and fine-tuning changes the representation
+/// without changing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrainedRepresentation {
+    /// Identity of the embedding model whose output the gate consumes.
+    pub embedding_model: String,
+    /// Pooling strategy, spelled as `/v1/embeddings` spells it: `mean_visual`
+    /// or `last_token`.
+    pub pooling: String,
+    /// The gate's input width as RECORDED at write time.
+    ///
+    /// Already implied by the gate payload, and stored anyway so a startup
+    /// refusal can name recorded against measured the way the hash check
+    /// names recorded against computed. A disagreement between this and the
+    /// loaded network is an artifact describing itself wrongly, which is a
+    /// different fault from a server configured with the wrong embedding
+    /// model, and the two have different remedies.
+    pub input_width: u64,
 }
 
 /// The JSON written beside the payload. Separate from [`RouterArtifact`] so
@@ -205,6 +243,7 @@ struct Manifest {
     format: u32,
     version: u64,
     adapter_names: Vec<String>,
+    representation: TrainedRepresentation,
     gate_len: u64,
     content_sha256: String,
 }
@@ -224,6 +263,18 @@ impl RouterArtifact {
             hasher.update((name.len() as u64).to_le_bytes());
             hasher.update(name.as_bytes());
         }
+        // The representation rides inside the hash for the reason the names
+        // do: a field stored beside the artifact rather than within it can be
+        // edited without producing a new version, which would make a pinned
+        // version mean two different things at two different times.
+        for field in [
+            self.representation.embedding_model.as_str(),
+            self.representation.pooling.as_str(),
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        hasher.update(self.representation.input_width.to_le_bytes());
         hasher.update((self.gate_bytes.len() as u64).to_le_bytes());
         hasher.update(&self.gate_bytes);
         hex_lower(&hasher.finalize())
@@ -286,6 +337,7 @@ pub fn write_artifact(
         format: ROUTER_ARTIFACT_FORMAT,
         version: artifact.version,
         adapter_names: artifact.adapter_names.clone(),
+        representation: artifact.representation.clone(),
         gate_len: artifact.gate_bytes.len() as u64,
         content_sha256: artifact.content_hash(),
     };
@@ -488,6 +540,7 @@ pub fn read_artifact(dir: &Path, version: u64) -> Result<RouterArtifact, RouterA
     let artifact = RouterArtifact {
         version: manifest.version,
         adapter_names: manifest.adapter_names,
+        representation: manifest.representation,
         gate_bytes,
     };
 
@@ -508,10 +561,19 @@ pub fn read_artifact(dir: &Path, version: u64) -> Result<RouterArtifact, RouterA
 mod tests {
     use super::*;
 
+    fn representation() -> TrainedRepresentation {
+        TrainedRepresentation {
+            embedding_model: "gme-qwen35".into(),
+            pooling: "mean_visual".into(),
+            input_width: 8,
+        }
+    }
+
     fn artifact() -> RouterArtifact {
         RouterArtifact {
             version: 7,
             adapter_names: vec!["legal".into(), "medical".into(), "code".into()],
+            representation: representation(),
             gate_bytes: vec![1, 2, 3, 4, 5],
         }
     }
@@ -593,11 +655,13 @@ mod tests {
         let a = RouterArtifact {
             version: 1,
             adapter_names: vec!["ab".into(), "c".into()],
+            representation: representation(),
             gate_bytes: vec![9],
         };
         let b = RouterArtifact {
             version: 1,
             adapter_names: vec!["a".into(), "bc".into()],
+            representation: representation(),
             gate_bytes: vec![9],
         };
         assert_ne!(a.content_hash(), b.content_hash());
@@ -621,6 +685,7 @@ mod tests {
         let next = RouterArtifact {
             version: 8,
             adapter_names: vec!["legal".into(), "medical".into(), "code".into()],
+            representation: representation(),
             gate_bytes: vec![6, 7, 8],
         };
         write_artifact(&dir, &next).expect("write v8");
@@ -678,6 +743,7 @@ mod tests {
                 &RouterArtifact {
                     version: v,
                     adapter_names: vec![format!("a{v}")],
+                    representation: representation(),
                     gate_bytes: vec![v as u8],
                 },
             )
@@ -827,6 +893,7 @@ mod tests {
             &RouterArtifact {
                 version: 9,
                 adapter_names: vec!["legal".into()],
+                representation: representation(),
                 gate_bytes: vec![4, 2],
             },
         )
@@ -886,6 +953,7 @@ mod tests {
             &RouterArtifact {
                 version: 9,
                 adapter_names: vec!["legal".into()],
+                representation: representation(),
                 gate_bytes: vec![4, 2],
             },
         )
@@ -898,6 +966,34 @@ mod tests {
             other => panic!("expected Loaded, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_representation_is_inside_the_content_hash() {
+        // Leo's ruling, and the reason is the pin. A field stored BESIDE the
+        // artifact could be edited without producing a new version, so a
+        // pinned version would mean two different things at two different
+        // times. Each field is varied alone, because a hash that covered only
+        // one of them would still pass a test that changed all three.
+        let base = artifact();
+        for mutate in [
+            (|r: &mut TrainedRepresentation| r.pooling = "last_token".into())
+                as fn(&mut TrainedRepresentation),
+            |r: &mut TrainedRepresentation| r.embedding_model = "other-model".into(),
+            |r: &mut TrainedRepresentation| r.input_width += 1,
+        ] {
+            let mut other = base.clone();
+            mutate(&mut other.representation);
+            assert_ne!(
+                base.content_hash(),
+                other.content_hash(),
+                "a representation field changed without changing the hash"
+            );
+        }
+
+        // The must-match control: an untouched copy hashes identically, so the
+        // inequalities above are about the edits and not about instability.
+        assert_eq!(base.content_hash(), base.clone().content_hash());
     }
 
     #[test]
