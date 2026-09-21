@@ -117,6 +117,16 @@ pub enum FannError {
     #[error("Invalid builder configuration: {0}")]
     InvalidBuilder(String),
 
+    /// Input or configuration failed validation.
+    ///
+    /// Distinct from `InvalidBuilder`, which names a network builder's own
+    /// configuration. This one carries validation of caller-supplied values and
+    /// input slices — the wording matches what these messages read as before the
+    /// router-refit module moved into this crate, so the text a user sees is
+    /// unchanged by the move.
+    #[error("Validation error: {0}")]
+    Validation(String),
+
     /// Training error
     #[error("Training error: {0}")]
     TrainingError(String),

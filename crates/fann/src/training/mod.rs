@@ -11,6 +11,8 @@ pub mod ewc;
 mod gradient;
 #[cfg(feature = "online-router")]
 pub mod rloo;
+#[cfg(feature = "online-router")]
+pub mod router_update;
 
 pub use backprop::BackpropTrainer;
 #[cfg(feature = "online-router")]

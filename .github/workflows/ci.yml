@@ -332,13 +332,34 @@ jobs:
           grep -q 'test lora::train_core::gdn_lora_tests::served_selection_is_exactly_the_modules_metal_can_load ... ok' "$log"
           grep -q 'test lora::train_core::gdn_lora_tests::all_selection_moves_the_fused_kernel_factors ... ok' "$log"
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
-      # The `mixture` feature gates the experimental online router-refit module
-      # (crates/tune/src/lora/router_update.rs) behind lattice-fann/online-router.
-      # It is off by default, so the required `ci` job never compiles or RUNS its
-      # fail-closed validation tests (empty-feedback, wrong context-dim, replay
-      # buffer bounds). Build AND run them here so the feature cannot rot silently.
-      - name: tune — mixture (online router-refit, build + run tests)
-        run: cargo test -p lattice-tune --features mixture --lib
+      # The online router-refit module now lives in lattice-fann
+      # (crates/fann/src/training/router_update.rs, ADR-094 decision 3); the step
+      # below named `fann — online-router` is what compiles and runs its 23
+      # validation tests. What lattice-tune's `mixture` feature still owns is the
+      # RE-EXPORT that keeps `lattice_tune::lora::router_update::*` resolving, and
+      # that re-export is the whole acceptance test for the move.
+      #
+      # The previous version of this step was `cargo test -p lattice-tune
+      # --features mixture --lib`, and after the move that command gates NOTHING:
+      # `feature = "mixture"` appears at exactly one site in lattice-tune, the
+      # re-export, which `--lib` compiles but whose two real callers it never
+      # touches. It would have kept passing while covering none of what its own
+      # name claims — the same shape as the holes the three comments below this
+      # one describe, arriving by a move rather than by a new feature.
+      #
+      # Both callers carry `required-features = ["mixture", "inference-hook",
+      # "serde"]`, so a default-feature `cargo test --workspace` (scripts/ci.sh)
+      # excludes them and no job compiled either one before this step. Naming the
+      # targets explicitly is deliberate: an absent or renamed `--test`/`--example`
+      # target makes cargo ERROR, where a name filter that matches nothing exits 0.
+      # This step fails closed; a filter-shaped one would not.
+      - name: tune — mixture re-export + both router callers (ADR-094 D3 acceptance)
+        run: |
+          cargo test -p lattice-tune --features mixture --lib
+          cargo test -p lattice-tune --features mixture,inference-hook,serde \
+            --test router_loop_closure
+          cargo build -p lattice-tune --features mixture,inference-hook,serde \
+            --example prompt_router
       # simulated-teacher gates the deterministic fixed-label test/example path
       # (label_single_simulated, label_batch_simulated). Off by default, so the
       # required `ci` job never compiles or runs it. Build AND run here so the
@@ -361,6 +382,8 @@ jobs:
       # by no job and run by none, while every surface that would report it was
       # green. A green `--workspace` run is a statement about the default feature
       # set, never about the code.
+      # Since ADR-094 decision 3 this step also owns the router-refit module's own
+      # tests, which moved here from lattice-tune with the module.
       - name: fann — online-router (build + run tests)
         run: cargo test -p lattice-fann --features online-router --lib
       # lattice-inference's OWN `mixture` feature is a different feature from the
@@ -371,7 +394,8 @@ jobs:
       # feature to go dark will hide the same way: the tune step's NAME contains
       # the word `mixture`, so a reader checking whether the feature is exercised
       # finds a step that builds and runs tests and stops there. Its comment is
-      # accurate about covering crates/tune/src/lora/router_update.rs; the name is
+      # accurate about covering the router-refit module (since ADR-094 D3 at
+      # crates/fann/src/training/router_update.rs); the name is
       # what generalises. And tune's `mixture` forwards with
       # `lattice-inference?/mixture`, where the `?` enables the dependency's
       # feature only if the OPTIONAL lattice-inference dep is already on -- which
