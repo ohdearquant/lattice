@@ -125,6 +125,44 @@ sample for a different gate.
 Retention regularisation is not in the initial objective. The existing wrapper validates its
 regularisation strength and does not apply it; retention is measured at admission instead.
 
+A refit is a round of those events, and two of the round's properties are not properties of any
+sample in it.
+
+**The baseline is the mean of the other rewards in the round.** A single judgement carries no
+baseline: one completion rated helpful says the mixture was good, not that it was better than
+whatever else the gate would have served, and a gradient taken against no baseline moves on the
+reward's sign alone. A leave-one-out mean is independent of each sample's own action, so the
+estimator stays unbiased. It does not control for how hard each context was, and a round whose
+rewards vary more across contexts than across actions gets little variance reduction out of it.
+That is a limit of the round, recorded here rather than tuned away.
+
+**Every gradient in a round is taken at the gate that produced the actions.** Applying each sample
+as the round proceeds would evaluate every gradient after the first at a gate that did not produce
+its action, while the epoch rule above still counted those samples on-policy. The code's meaning of
+on-policy and the feedback store's have to be the same one.
+
+**A round whose rewards are all equal is a no-op, byte for byte**, and that includes a round of
+one. Such a round carries no comparison. The load-balance and z-loss terms do not fill the gap, and
+deliberately: they exist to shape a policy update, not to constitute one, and a gate that drifted
+toward balance because a refit was attempted would change served behaviour with no feedback behind
+it. Traffic history still records every sample, because those completions were served either way.
+
+**The refit runs in the server, behind a feature that is off.** `router-learning` implies the
+mixture gate and the trainer, and it is the only thing that pulls a trainer into the serving crate.
+A default build is measured trainer-free rather than declared so: a check reads symbols out of the
+artifact each build actually produced, over three feature sets, with the feature-on build as the
+same-pass positive control, because an absence reported by a probe that has never been shown to
+find a presence is not a finding. The refit is its own bounded task and never runs on the request
+path; its candidate reaches the live gate only through the entropy guard and the promotion rule in
+decision 5. Enabling it on a serving host happens only inside a registered qualification run.
+
+The alternative shapes were a learner in the training crate, which needs a dependency edge from the
+serving crate that does not exist, and an exported feedback stream with an admission endpoint,
+which is new public API. The second is not refused: the round's objective is plain data over
+recorded actions with no knowledge of storage or transport, so a learner that ever has to run off
+the serving host costs an export surface and its own decision record, not a rewrite of the
+objective.
+
 ### 4. The serving-side weight policy is a decision with an evidence gate, not a flag
 
 Uniform `1/k` stays the default. Replacing it requires naming the policy, its temperature, and the
