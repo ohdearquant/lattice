@@ -70,9 +70,21 @@ pub const MAX_CUMULATIVE_STOP_BYTES: usize = 2 * MAX_STOP_STRING_BYTES;
 #[derive(Debug, Deserialize)]
 #[non_exhaustive]
 pub struct ChatRequest {
-    /// Ordered resident adapters to apply; omitted or empty selects the base model.
+    /// Ordered resident adapters to apply, in three distinguishable states
+    /// (ADR-094, amended 2026-09-21). `None` when the field is omitted: route,
+    /// when routing is enabled, and the base model when it is not, which is what
+    /// omitting it does today. `Some(vec![])` when the client sends an explicit
+    /// `[]`: the base model, pinned, never routed. `Some(list)`: that list,
+    /// never routed.
+    ///
+    /// `Option` rather than a bare `Vec` for the same reason `model` below is
+    /// `Option<String>` — under `#[serde(default)]` an absent `Vec` and an
+    /// explicit `[]` deserialize to the identical value, and these three are
+    /// resolved differently, so the distinction must survive deserialization.
+    /// Classify it with [`super::lora::requested_adapters`] rather than matching
+    /// on the shape here.
     #[serde(default)]
-    pub lora: Vec<super::lora::LoraSelection>,
+    pub lora: Option<Vec<super::lora::LoraSelection>>,
     /// Requested model identifier. `None` when the field is omitted; `Some("")`
     /// when the client sends an explicit empty string — these are validated
     /// differently, so the distinction must survive deserialization.
@@ -1646,6 +1658,71 @@ mod tests {
                 "malformed reasoning_budget should have been rejected on both profiles"
             );
         }
+    }
+
+    /// ADR-094 amendment: the `lora` field carries THREE states and they must
+    /// stay pairwise distinguishable after deserialization.
+    ///
+    /// The arms are the point, not the classification helper. Under the previous
+    /// `#[serde(default)] pub lora: Vec<LoraSelection>`, an absent field and an
+    /// explicit `[]` produced the identical value, so "route for me" could not be
+    /// spelled at all. This test fails if that collapse returns — which is what a
+    /// later `#[serde(default)]` on a non-`Option` type, or a `default` attribute
+    /// added to the `Option`, would silently reintroduce.
+    #[test]
+    fn the_lora_field_keeps_absent_empty_and_explicit_pairwise_distinct() {
+        use super::super::lora::{LoraSelection, RequestedAdapters, requested_adapters};
+
+        let body = |lora: &str| {
+            format!(r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}]{lora}}}"#)
+        };
+        let parse = |lora: &str| {
+            serde_json::from_str::<ChatRequest>(&body(lora))
+                .expect("body should deserialize")
+                .lora
+        };
+
+        let absent = parse("");
+        let empty = parse(r#","lora":[]"#);
+        let explicit = parse(r#","lora":[{"id":3,"scale":0.5}]"#);
+
+        // The raw field first. Asserting only the classification would let a
+        // regression that collapses absent and empty pass if the classifier were
+        // changed to compensate, and these are two separate claims.
+        assert_eq!(absent, None, "an omitted field must stay None");
+        assert_eq!(empty, Some(vec![]), "an explicit [] must stay Some(empty)");
+        assert_ne!(absent, empty, "absent and [] must not deserialize alike");
+        assert_eq!(
+            explicit,
+            Some(vec![LoraSelection { id: 3, scale: 0.5 }]),
+            "an explicit list must survive intact"
+        );
+
+        // Then the three states the rest of the serving path branches on.
+        assert_eq!(requested_adapters(absent), RequestedAdapters::Unspecified);
+        assert_eq!(requested_adapters(empty), RequestedAdapters::PinnedBase);
+        assert_eq!(
+            requested_adapters(explicit),
+            RequestedAdapters::Explicit(vec![LoraSelection { id: 3, scale: 0.5 }])
+        );
+    }
+
+    /// `Unspecified` and `PinnedBase` both apply nothing today, and that is what
+    /// makes the field change behaviour preserving while no router exists. They
+    /// are still not interchangeable: routing replaces the `Unspecified` arm and
+    /// must leave `PinnedBase` alone, so the emptiness of the two selections must
+    /// never become the thing the serving path tests.
+    #[test]
+    fn unspecified_and_pinned_base_apply_nothing_today_but_only_one_is_routable() {
+        use super::super::lora::RequestedAdapters;
+
+        assert!(RequestedAdapters::Unspecified.selection().is_empty());
+        assert!(RequestedAdapters::PinnedBase.selection().is_empty());
+        assert!(RequestedAdapters::Unspecified.is_routable());
+        assert!(
+            !RequestedAdapters::PinnedBase.is_routable(),
+            "a client pinning the base model with [] must never be routed"
+        );
     }
 
     #[test]
