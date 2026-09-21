@@ -90,6 +90,31 @@ pub enum AdapterControlResult {
     Unloaded(u32),
 }
 
+/// Every `/v1/lora*` route, as data: path and methods, one copy (ADR-095
+/// decision 4).
+///
+/// Data rather than a shared constructor. The two binaries do not share a
+/// state type -- one carries a CPU-or-Metal backend, the other is
+/// Metal-worker-only with a metrics registry -- so a shared constructor would
+/// be generic over the state and take every handler as a parameter, replacing
+/// each `.route()` line with a handler argument. That relocates the
+/// duplication into a longer call while the handlers and the state, which are
+/// what actually drift, stay exactly where they are. A list has no state type
+/// to be generic over.
+///
+/// This list establishes only that a route is REGISTERED. Whether the two
+/// binaries' handlers behave the same is a separate question that no
+/// route-table mechanism can answer, and it is audited in the ADR rather than
+/// asserted here: the failure that motivated this decision was two binaries
+/// that both rejected a non-finite adapter scale, one at the HTTP boundary and
+/// one later inside `apply()`. Same route, same shared module, different
+/// reachable behaviour, both tables correct.
+pub const LORA_ROUTES: &[(&str, &[&str])] = &[
+    ("/v1/lora", &["GET"]),
+    ("/v1/lora/load", &["POST"]),
+    ("/v1/lora/unload", &["POST"]),
+];
+
 /// One contribution to an ordered request mixture.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

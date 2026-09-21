@@ -4215,6 +4215,67 @@ mod imp {
         // model load.
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        /// ADR-095 decision 4: every entry in the shared route list is registered
+        /// in THIS binary. A route added to the list and forgotten here reds this
+        /// test.
+        ///
+        /// The assertion is only that the response is not 404. A 405 or a 4xx from
+        /// validation both count as registered -- the test asks whether the route
+        /// exists and nothing else, because anything more would need the state the
+        /// two binaries do not share. Asserting a specific status would make this
+        /// a behaviour test that passes or fails for reasons unrelated to
+        /// registration.
+        #[tokio::test]
+        async fn every_shared_lora_route_is_registered_in_this_binary() {
+            use lattice_inference::serve::lora::LORA_ROUTES;
+            use tower::ServiceExt;
+
+            assert!(
+                !LORA_ROUTES.is_empty(),
+                "the route list is empty, so this test would pass while checking nothing"
+            );
+
+            for (path, methods) in LORA_ROUTES {
+                for method in *methods {
+                    let request = axum::http::Request::builder()
+                        .method(*method)
+                        .uri(*path)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from("{}"))
+                        .expect("fixture request must build");
+                    let response = router(test_app_state())
+                        .oneshot(request)
+                        .await
+                        .expect("router must produce a response, not a transport error");
+                    assert_ne!(
+                        response.status(),
+                        axum::http::StatusCode::NOT_FOUND,
+                        "{method} {path} is in LORA_ROUTES but not registered in this binary"
+                    );
+                }
+            }
+
+            // The must-not-match control: the same machinery reports 404 for a
+            // path nobody registered. Without it, a router that answered
+            // everything -- a catch-all fallback, say -- would pass the loop above
+            // while proving nothing about any individual route.
+            let request = axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/lora/definitely-not-a-route")
+                .body(axum::body::Body::empty())
+                .expect("control request must build");
+            let response = router(test_app_state())
+                .oneshot(request)
+                .await
+                .expect("router must produce a response");
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "an unregistered path did not 404, so the loop above cannot distinguish \
+                 a registered route from a router that answers everything"
+            );
+        }
+
         fn test_app_state() -> AppState {
             let (jobs, _rx) = test_client_and_jobs();
             AppState {
