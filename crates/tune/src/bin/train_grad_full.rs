@@ -25,6 +25,10 @@ Options:
   --max-valid   <N>      Held-out valid.jsonl samples for eval, 0=off (default: 16)
   --log-every   <N>      Print NLL every N steps (default: 5)
   --save        <PATH>   Save trained adapter as a PEFT safetensors file (requires --features safetensors)
+  --load        <PATH>   Start from a saved adapter instead of a fresh init (requires --features safetensors).
+                         With --steps 0 this is the eval-only path: it scores an existing
+                         adapter against --data-dir, which is the only way to measure an
+                         adapter on data it was not trained on.
   --gdn-modules <SET>    GDN projections to train: served|all (default: served).
                          `served` is the set the Metal forward can load. `all`
                          adds in_proj_a and in_proj_b, which the fused GDN
@@ -112,6 +116,7 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(4e-3),
         save_path: argv.arg("--save"),
+        load_path: argv.arg("--load"),
         a_init_amp: None,
         gdn_modules,
     })
@@ -157,6 +162,7 @@ mod tests {
         assert_eq!(cfg.probe, 6);
         assert_eq!(cfg.fd_eps, 4e-3);
         assert_eq!(cfg.save_path, None);
+        assert_eq!(cfg.load_path, None);
         assert_eq!(cfg.a_init_amp, None);
         assert_eq!(cfg.model_dir, train_common::default_model_dir());
     }
@@ -195,6 +201,8 @@ mod tests {
             "1e-3",
             "--save",
             "/tmp/out.safetensors",
+            "--load",
+            "/tmp/in.safetensors",
         ]);
         let cfg = parse_config(&ArgView::new(&values)).unwrap();
         assert_eq!(cfg.model_dir, PathBuf::from("/tmp/m"));
@@ -213,6 +221,7 @@ mod tests {
         assert_eq!(cfg.probe, 2);
         assert_eq!(cfg.fd_eps, 1e-3);
         assert_eq!(cfg.save_path, Some("/tmp/out.safetensors".to_string()));
+        assert_eq!(cfg.load_path, Some("/tmp/in.safetensors".to_string()));
     }
 
     #[test]

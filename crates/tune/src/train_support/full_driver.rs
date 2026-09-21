@@ -169,6 +169,178 @@ fn initial_training_loras(
     (loras, rng)
 }
 
+/// Overwrite freshly initialized training slots with a saved adapter's weights.
+///
+/// Strict in BOTH directions, and that is the whole point of the shape. Every
+/// (slot layer, module) pair this run's geometry expects must be present, and every
+/// key the adapter carries must be consumed by one of those expectations. A module
+/// the save block below writes but no arm here reads would otherwise be dropped in
+/// silence, and a dropped layer is indistinguishable from a badly trained adapter
+/// once the numbers are in a table: the score is simply worse, with nothing naming
+/// the reason. The unconsumed-key check is what turns that into a refusal.
+///
+/// The fused-kernel projections are required exactly when this run trains them,
+/// mirroring the save side's condition. Loading an `--gdn-modules all` adapter into
+/// a `served` run is therefore refused rather than silently truncated.
+#[cfg(feature = "safetensors")]
+#[allow(clippy::too_many_arguments)]
+fn overwrite_from_adapter(
+    adapter: &crate::lora::LoraAdapter,
+    loras: &mut [LoraParams],
+    slot_layers: &[usize],
+    gdn_loras: &mut [GdnLoraParams],
+    gdn_slot_layers: &[usize],
+    dims: &Dims,
+    gdn_dims: &GdnDims,
+    rank: usize,
+    gdn_modules: GdnModuleSelection,
+) -> Result<usize, String> {
+    fn take(
+        adapter: &crate::lora::LoraAdapter,
+        layer: usize,
+        module: &str,
+        d_in: usize,
+        d_out: usize,
+        rank: usize,
+        a: &mut Vec<f32>,
+        b: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        let saved = adapter
+            .layers()
+            .get(&(layer, module.to_string()))
+            .ok_or_else(|| format!("adapter carries no {module} at layer {layer}"))?;
+        if saved.rank != rank || saved.d_in != d_in || saved.d_out != d_out {
+            return Err(format!(
+                "{module} at layer {layer}: adapter is rank {} ({} -> {}), this run is rank {rank} ({d_in} -> {d_out})",
+                saved.rank, saved.d_in, saved.d_out
+            ));
+        }
+        if saved.a.len() != rank * d_in || saved.b.len() != d_out * rank {
+            return Err(format!(
+                "{module} at layer {layer}: array lengths {} / {} disagree with the declared shape {rank}x{d_in} / {d_out}x{rank}",
+                saved.a.len(),
+                saved.b.len()
+            ));
+        }
+        a.clear();
+        a.extend_from_slice(&saved.a);
+        b.clear();
+        b.extend_from_slice(&saved.b);
+        Ok(())
+    }
+
+    if loras.len() != slot_layers.len() || gdn_loras.len() != gdn_slot_layers.len() {
+        return Err("slot count disagrees with the layer map".to_string());
+    }
+
+    let mut consumed = 0usize;
+    for (slot, &li) in slot_layers.iter().enumerate() {
+        let p = &mut loras[slot];
+        take(
+            adapter,
+            li,
+            "q_proj",
+            dims.hidden,
+            2 * dims.q_dim,
+            rank,
+            &mut p.a_q,
+            &mut p.b_q,
+        )?;
+        take(
+            adapter,
+            li,
+            "v_proj",
+            dims.hidden,
+            dims.kv_dim,
+            rank,
+            &mut p.a_v,
+            &mut p.b_v,
+        )?;
+        consumed += 2;
+    }
+    for (slot, &li) in gdn_slot_layers.iter().enumerate() {
+        let g = &mut gdn_loras[slot];
+        take(
+            adapter,
+            li,
+            "in_proj_qkv",
+            dims.hidden,
+            gdn_dims.qkv_dim,
+            rank,
+            &mut g.a_qkv,
+            &mut g.b_qkv,
+        )?;
+        take(
+            adapter,
+            li,
+            "in_proj_z",
+            dims.hidden,
+            gdn_dims.output_dim,
+            rank,
+            &mut g.a_z,
+            &mut g.b_z,
+        )?;
+        take(
+            adapter,
+            li,
+            "out_proj",
+            gdn_dims.output_dim,
+            dims.hidden,
+            rank,
+            &mut g.a_out,
+            &mut g.b_out,
+        )?;
+        consumed += 3;
+        if gdn_modules.trains_fused_kernel_projections() {
+            take(
+                adapter,
+                li,
+                "in_proj_b",
+                dims.hidden,
+                gdn_dims.value_heads,
+                rank,
+                &mut g.a_b,
+                &mut g.b_b,
+            )?;
+            take(
+                adapter,
+                li,
+                "in_proj_a",
+                dims.hidden,
+                gdn_dims.value_heads,
+                rank,
+                &mut g.a_a,
+                &mut g.b_a,
+            )?;
+            consumed += 2;
+        }
+    }
+
+    if consumed != adapter.layers().len() {
+        let mut extra: Vec<String> = adapter
+            .layers()
+            .keys()
+            .filter(|(li, m)| {
+                let gqa = slot_layers.contains(li) && matches!(m.as_str(), "q_proj" | "v_proj");
+                let gdn = gdn_slot_layers.contains(li)
+                    && (matches!(m.as_str(), "in_proj_qkv" | "in_proj_z" | "out_proj")
+                        || (gdn_modules.trains_fused_kernel_projections()
+                            && matches!(m.as_str(), "in_proj_b" | "in_proj_a")));
+                !(gqa || gdn)
+            })
+            .map(|(li, m)| format!("{m}@{li}"))
+            .collect();
+        extra.sort();
+        return Err(format!(
+            "adapter carries {} layer/module entries, this run consumes {consumed}; unread: {}",
+            adapter.layers().len(),
+            extra.join(", ")
+        ));
+    }
+
+    Ok(consumed)
+}
+
 /// Fully resolved options for the shared multi-layer training driver.
 #[derive(Debug)]
 pub struct FullDriverConfig {
@@ -192,6 +364,12 @@ pub struct FullDriverConfig {
     pub probe: usize,
     pub fd_eps: f32,
     pub save_path: Option<String>,
+    /// Start from a saved adapter instead of a fresh initialization.
+    ///
+    /// Required for any evaluation of one adapter against data it was not
+    /// trained on: without it this binary can only ever score the task it just
+    /// trained, so a cross-task comparison is not expressible.
+    pub load_path: Option<String>,
     /// Fixed A-factor amplitude for compatibility callers; `None` uses the
     /// full trainer's `1 / sqrt(hidden)` initialization.
     pub a_init_amp: Option<f32>,
@@ -506,6 +684,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         probe,
         fd_eps,
         save_path,
+        load_path,
         a_init_amp,
         gdn_modules,
     } = config;
@@ -1034,6 +1213,31 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     let mut gdn_loras: Vec<GdnLoraParams> =
         zero_b_gdn_loras(num_gdn_slots, rank, dims.hidden, &gdn_dims, rng, init_amp);
 
+    if let Some(ref path) = load_path {
+        #[cfg(feature = "safetensors")]
+        {
+            let adapter = crate::lora::load_peft_safetensors(std::path::Path::new(path))
+                .map_err(|e| format!("load adapter: {e}"))?;
+            let consumed = overwrite_from_adapter(
+                &adapter,
+                &mut loras,
+                &slot_layers,
+                &mut gdn_loras,
+                &gdn_slot_layers,
+                &dims,
+                &gdn_dims,
+                rank,
+                gdn_modules,
+            )?;
+            println!("  loaded adapter: {consumed} layer/module entries from {path}");
+        }
+        #[cfg(not(feature = "safetensors"))]
+        {
+            let _ = path;
+            return Err("--load requires the safetensors feature (--features safetensors)".into());
+        }
+    }
+
     let mut adam = AdamState::new();
 
     let eval_valid = |loras: &[LoraParams],
@@ -1311,6 +1515,380 @@ epilogue re-scoring {epilogue_score_secs:.1}s"
     })
 }
 
+/// MEASURED MUTATION COVERAGE, six live arms and one void one. Predicted before
+/// running, reconciled after.
+///
+///   delete the unconsumed-key accounting         -> 2 red (ignored-module, fused pair)
+///   never load v_proj                            -> 2 red (values, missing-entry)
+///   drop the rank/width check                    -> 1 red (missing-entry)
+///   hand take() (b_v, a_v) instead of (a_v, b_v)  -> 1 red (values)
+///   require the fused projections always         -> 3 red
+///   flip one ULP of every loaded A value         -> 3 red (values, fused, round trip)
+///   round every loaded A value to a 1/1024 grid  -> 0 red, VOID
+///
+/// Two arms came back wider than predicted and one came back empty, and the empty
+/// one is the one to keep in mind. The 1/1024 rounding changed nothing because the
+/// fixture's ramp is built on 1/128, so every value was already on the coarser
+/// grid: a lossy-copy arm the fixture cannot express certifies nothing, and it
+/// reads as a passing suite. The one-ULP flip is its replacement precisely because
+/// no fixture value can survive it.
+///
+/// The wider-than-predicted arms have a shared cause: the ignored-module fixture is
+/// built from the SERVED save set, so an unconditional fused take refuses it before
+/// the accounting it was written to exercise ever runs. A fixture drawn from one
+/// selection cannot isolate a defect in the other selection's arm.
+#[cfg(all(test, feature = "safetensors"))]
+mod adapter_load_tests {
+    use super::*;
+    use crate::lora::{LoraAdapter, LoraConfig, LoraLayer};
+    use std::collections::HashMap;
+
+    const RANK: usize = 2;
+
+    fn dims() -> Dims {
+        Dims {
+            hidden: 4,
+            vocab: 32,
+            num_q_heads: 3,
+            num_kv_heads: 1,
+            head_dim: 2,
+            rope_dim: 2,
+            inter: 8,
+            q_dim: 3,
+            kv_dim: 2,
+            eps: 1e-6,
+        }
+    }
+
+    fn gdn_dims() -> GdnDims {
+        GdnDims {
+            num_kh: 1,
+            value_heads: 2,
+            key_dim: 2,
+            value_dim: 2,
+            qkv_dim: 5,
+            output_dim: 3,
+            kernel_size: 2,
+            scale: 1.0,
+        }
+    }
+
+    /// Distinct, position-dependent values: a loader that swapped two arrays, or
+    /// wrote A where B belongs, is caught by the VALUES rather than by the lengths.
+    fn ramp(tag: f32, n: usize) -> Vec<f32> {
+        (0..n).map(|i| tag + i as f32 / 128.0).collect()
+    }
+
+    fn layer(tag: f32, d_in: usize, d_out: usize) -> LoraLayer {
+        LoraLayer {
+            a: ramp(tag, RANK * d_in),
+            b: ramp(tag + 0.5, d_out * RANK),
+            d_in,
+            d_out,
+            rank: RANK,
+        }
+    }
+
+    /// Exactly the set the save block writes for this selection, built from the same
+    /// geometry `run` would pass.
+    fn saved(selection: GdnModuleSelection) -> HashMap<(usize, String), LoraLayer> {
+        let (d, g) = (dims(), gdn_dims());
+        let mut m = HashMap::new();
+        m.insert(
+            (23, "q_proj".to_string()),
+            layer(1.0, d.hidden, 2 * d.q_dim),
+        );
+        m.insert((23, "v_proj".to_string()), layer(2.0, d.hidden, d.kv_dim));
+        m.insert(
+            (20, "in_proj_qkv".to_string()),
+            layer(3.0, d.hidden, g.qkv_dim),
+        );
+        m.insert(
+            (20, "in_proj_z".to_string()),
+            layer(4.0, d.hidden, g.output_dim),
+        );
+        m.insert(
+            (20, "out_proj".to_string()),
+            layer(5.0, g.output_dim, d.hidden),
+        );
+        if selection.trains_fused_kernel_projections() {
+            m.insert(
+                (20, "in_proj_b".to_string()),
+                layer(6.0, d.hidden, g.value_heads),
+            );
+            m.insert(
+                (20, "in_proj_a".to_string()),
+                layer(7.0, d.hidden, g.value_heads),
+            );
+        }
+        m
+    }
+
+    fn adapter(layers: HashMap<(usize, String), LoraLayer>) -> LoraAdapter {
+        let config = LoraConfig {
+            rank: RANK,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            dtype: "f32".into(),
+        };
+        LoraAdapter::new(config, layers).expect("fixture adapter")
+    }
+
+    fn fresh() -> (Vec<LoraParams>, Vec<GdnLoraParams>) {
+        let (d, g) = (dims(), gdn_dims());
+        let (loras, rng) = initial_training_loras(7, 1, &d, RANK, 0.25);
+        let gdn = zero_b_gdn_loras(1, RANK, d.hidden, &g, rng, 0.25);
+        (loras, gdn)
+    }
+
+    fn overwrite(
+        adapter: &LoraAdapter,
+        selection: GdnModuleSelection,
+    ) -> Result<(usize, Vec<LoraParams>, Vec<GdnLoraParams>), String> {
+        let (d, g) = (dims(), gdn_dims());
+        let (mut loras, mut gdn) = fresh();
+        let consumed = overwrite_from_adapter(
+            adapter,
+            &mut loras,
+            &[23],
+            &mut gdn,
+            &[20],
+            &d,
+            &g,
+            RANK,
+            selection,
+        )?;
+        Ok((consumed, loras, gdn))
+    }
+
+    /// Neither weight struct implements `Debug`, and deriving it so that `unwrap`
+    /// compiles would dump every array on a failure. These two unwrap by hand.
+    fn expect_ok(
+        r: Result<(usize, Vec<LoraParams>, Vec<GdnLoraParams>), String>,
+    ) -> (usize, Vec<LoraParams>, Vec<GdnLoraParams>) {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("expected the load to succeed, got: {e}"),
+        }
+    }
+
+    fn expect_err(r: Result<(usize, Vec<LoraParams>, Vec<GdnLoraParams>), String>) -> String {
+        match r {
+            Ok((consumed, _, _)) => {
+                panic!("expected a refusal, but the load consumed {consumed} entries")
+            }
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn every_served_array_lands_with_the_saved_values() {
+        let selection = GdnModuleSelection::Served;
+        let (before_gqa, before_gdn) = fresh();
+        let (consumed, loras, gdn) = expect_ok(overwrite(&adapter(saved(selection)), selection));
+        assert_eq!(consumed, 5, "2 GQA + 3 served GDN arrays");
+        let (d, g) = (dims(), gdn_dims());
+
+        assert_eq!(loras[0].a_q, ramp(1.0, RANK * d.hidden));
+        assert_eq!(loras[0].b_q, ramp(1.5, 2 * d.q_dim * RANK));
+        assert_eq!(loras[0].a_v, ramp(2.0, RANK * d.hidden));
+        assert_eq!(loras[0].b_v, ramp(2.5, d.kv_dim * RANK));
+        assert_eq!(gdn[0].a_qkv, ramp(3.0, RANK * d.hidden));
+        assert_eq!(gdn[0].b_qkv, ramp(3.5, g.qkv_dim * RANK));
+        assert_eq!(gdn[0].a_z, ramp(4.0, RANK * d.hidden));
+        assert_eq!(gdn[0].b_z, ramp(4.5, g.output_dim * RANK));
+        assert_eq!(gdn[0].a_out, ramp(5.0, RANK * g.output_dim));
+        assert_eq!(gdn[0].b_out, ramp(5.5, d.hidden * RANK));
+
+        // The control that makes the ten assertions above mean something: the fresh
+        // state they replaced was not already equal to the saved values.
+        assert_ne!(before_gqa[0].a_q, loras[0].a_q);
+        assert_ne!(before_gdn[0].a_qkv, gdn[0].a_qkv);
+        // Untrained under `served`, and untouched: left at their fresh values rather
+        // than zeroed, which is what the step loop and the save block both assume.
+        assert_eq!(gdn[0].a_b, before_gdn[0].a_b);
+        assert_eq!(gdn[0].a_a, before_gdn[0].a_a);
+    }
+
+    #[test]
+    fn the_fused_projections_are_required_exactly_when_this_run_trains_them() {
+        let all = GdnModuleSelection::All;
+        let (consumed, _, gdn) = expect_ok(overwrite(&adapter(saved(all)), all));
+        assert_eq!(consumed, 7);
+        let (d, g) = (dims(), gdn_dims());
+        assert_eq!(gdn[0].a_b, ramp(6.0, RANK * d.hidden));
+        assert_eq!(gdn[0].b_a, ramp(7.5, g.value_heads * RANK));
+
+        // An `all` adapter into a `served` run: the two fused entries are real
+        // trained weights this run would never read. Dropping them silently is the
+        // exact failure the consumed-key accounting exists to refuse.
+        let err = expect_err(overwrite(&adapter(saved(all)), GdnModuleSelection::Served));
+        assert!(err.contains("unread: in_proj_a@20, in_proj_b@20"), "{err}");
+
+        // And the other direction: a `served` adapter cannot satisfy an `all` run.
+        let err = expect_err(overwrite(&adapter(saved(GdnModuleSelection::Served)), all));
+        assert!(err.contains("carries no in_proj_b at layer 20"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_entry_or_a_mismatched_shape_refuses_rather_than_partially_loading() {
+        let selection = GdnModuleSelection::Served;
+
+        let mut missing = saved(selection);
+        missing.remove(&(23, "v_proj".to_string()));
+        let err = expect_err(overwrite(&adapter(missing), selection));
+        assert!(err.contains("carries no v_proj at layer 23"), "{err}");
+
+        let (d, g) = (dims(), gdn_dims());
+        let mut wrong_rank = saved(selection);
+        wrong_rank.insert(
+            (23, "q_proj".to_string()),
+            LoraLayer {
+                // rank 1, so this is rank * d_in with rank == 1.
+                a: vec![0.0; d.hidden],
+                b: vec![0.0; 2 * d.q_dim],
+                d_in: d.hidden,
+                d_out: 2 * d.q_dim,
+                rank: 1,
+            },
+        );
+        let err = expect_err(overwrite(&adapter(wrong_rank), selection));
+        assert!(err.contains("this run is rank 2"), "{err}");
+
+        // Same rank, wrong width: a rank check alone would pass this.
+        let mut wrong_width = saved(selection);
+        wrong_width.insert(
+            (20, "in_proj_z".to_string()),
+            layer(4.0, d.hidden, g.output_dim + 1),
+        );
+        let err = expect_err(overwrite(&adapter(wrong_width), selection));
+        assert!(err.contains("in_proj_z at layer 20"), "{err}");
+
+        // Right module, wrong LAYER: the adapter was trained at a different
+        // --first-layer, so every array is present and none of them belongs here.
+        let mut wrong_layer = saved(selection);
+        let moved = wrong_layer.remove(&(23, "q_proj".to_string())).unwrap();
+        wrong_layer.insert((22, "q_proj".to_string()), moved);
+        let err = expect_err(overwrite(&adapter(wrong_layer), selection));
+        assert!(err.contains("carries no q_proj at layer 23"), "{err}");
+    }
+
+    /// The score-level acceptance this lane ran (train, save, load, score the same
+    /// data with `--steps 0`) reproduced the post-training NLL to every printed
+    /// digit, but the log prints four decimals and cannot resolve the 2.9e-6
+    /// tolerance it was measured against. This arm closes that gap from the other
+    /// side and with a stronger claim: through the REAL serializer and the REAL
+    /// loader, every array comes back bit-identical, so the forward cannot differ
+    /// at any tolerance. Together the two cover the whole chain, because this test
+    /// does not exercise the save block's own (slot, module) mapping and the
+    /// measured run does.
+    #[test]
+    fn a_real_file_round_trip_returns_every_array_bit_identical() {
+        let selection = GdnModuleSelection::Served;
+        let layers = saved(selection);
+        let dir = std::env::temp_dir().join(format!("lattice-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("roundtrip.safetensors");
+
+        adapter(layers.clone())
+            .save_safetensors(&path, None)
+            .expect("save");
+        let reloaded = crate::lora::load_peft_safetensors(&path).expect("load");
+
+        let (d, g) = (dims(), gdn_dims());
+        let (mut loras, mut gdn) = fresh();
+        let consumed = overwrite_from_adapter(
+            &reloaded,
+            &mut loras,
+            &[23],
+            &mut gdn,
+            &[20],
+            &d,
+            &g,
+            RANK,
+            selection,
+        )
+        .expect("overwrite from the reloaded file");
+        assert_eq!(consumed, 5);
+
+        // Bit-identical, not approximately equal: f32 written and read back with no
+        // dtype conversion has no rounding step to excuse a difference.
+        for (module, got, want) in [
+            (
+                "q_proj.a",
+                &loras[0].a_q,
+                &layers[&(23, "q_proj".to_string())].a,
+            ),
+            (
+                "q_proj.b",
+                &loras[0].b_q,
+                &layers[&(23, "q_proj".to_string())].b,
+            ),
+            (
+                "v_proj.a",
+                &loras[0].a_v,
+                &layers[&(23, "v_proj".to_string())].a,
+            ),
+            (
+                "v_proj.b",
+                &loras[0].b_v,
+                &layers[&(23, "v_proj".to_string())].b,
+            ),
+            (
+                "in_proj_qkv.a",
+                &gdn[0].a_qkv,
+                &layers[&(20, "in_proj_qkv".to_string())].a,
+            ),
+            (
+                "in_proj_qkv.b",
+                &gdn[0].b_qkv,
+                &layers[&(20, "in_proj_qkv".to_string())].b,
+            ),
+            (
+                "in_proj_z.a",
+                &gdn[0].a_z,
+                &layers[&(20, "in_proj_z".to_string())].a,
+            ),
+            (
+                "in_proj_z.b",
+                &gdn[0].b_z,
+                &layers[&(20, "in_proj_z".to_string())].b,
+            ),
+            (
+                "out_proj.a",
+                &gdn[0].a_out,
+                &layers[&(20, "out_proj".to_string())].a,
+            ),
+            (
+                "out_proj.b",
+                &gdn[0].b_out,
+                &layers[&(20, "out_proj".to_string())].b,
+            ),
+        ] {
+            let g: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            let w: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(g, w, "{module} did not survive the file round trip");
+        }
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn a_module_the_save_block_writes_and_this_loader_ignores_is_refused() {
+        // Stand-in for the real drift: someone adds a module to the save block and
+        // not here. Without the accounting the run would start from a half-loaded
+        // adapter and the number would be blamed on the data.
+        let selection = GdnModuleSelection::Served;
+        let (d, _) = (dims(), gdn_dims());
+        let mut extra = saved(selection);
+        extra.insert((23, "o_proj".to_string()), layer(9.0, d.hidden, d.hidden));
+        let err = expect_err(overwrite(&adapter(extra), selection));
+        assert!(err.contains("6 layer/module entries"), "{err}");
+        assert!(err.contains("unread: o_proj@23"), "{err}");
+    }
+}
+
 #[cfg(test)]
 mod run_bounds_tests {
     use super::*;
@@ -1334,6 +1912,7 @@ mod run_bounds_tests {
             probe: 0,
             fd_eps: 1e-3,
             save_path: None,
+            load_path: None,
             a_init_amp: None,
             gdn_modules: GdnModuleSelection::default(),
         }
