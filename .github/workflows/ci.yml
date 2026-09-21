@@ -420,8 +420,20 @@ jobs:
             cat "$log"
             exit "$status"
           fi
-          grep -Eq '^test .*route_[a-z0-9_]+ \.\.\. ok$' "$log"
-          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          # Self-naming for the reason recorded on the step below: a bare
+          # `grep -Eq` that fails prints nothing, and a `run:` block carries no
+          # `set -e` of its own -- the runner supplies it. Under any shell without
+          # it the failure is invisible and the block's status comes from its last
+          # line, so the assertion silently stops being one.
+          grep -Eq '^test .*route_[a-z0-9_]+ \.\.\. ok$' "$log" || {
+            echo "GUARD FAILED: no passing test matching the route_* shape in this run."
+            echo "The mixture filter selected something, but none of it was a router test."
+            exit 1
+          }
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || {
+            echo "GUARD FAILED: no passing test-result line with a non-zero count."
+            exit 1
+          }
       # The step above filters on `mixture::`, which is a SUBSTRING filter and so
       # never selects `serve::routing::`. The two artifact-vs-gate refusal tests
       # there are `#[cfg(feature = "mixture")]`, so they are compiled out of the
