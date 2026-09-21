@@ -90,6 +90,58 @@ pub enum AdapterControlResult {
     Unloaded(u32),
 }
 
+/// Assemble the `GET /v1/lora` body: the residency snapshot with `router`
+/// added beside it.
+///
+/// A separate function because the shape is the thing that breaks and a
+/// handler's shape can only be checked by launching a server. It already broke
+/// once: adding the router key as `json!({"adapters": index, "router": ...})`
+/// reads like adding a field and is not. `AdapterIndex` serializes to
+/// `{"adapters": [...], "applied": [...]}`, so wrapping it turned the
+/// top-level `adapters` from an array into an object and moved `applied` a
+/// level down -- a breaking change to two existing fields, written while
+/// intending a purely additive one, and invisible without a test that holds
+/// the whole body.
+///
+/// It lives in the shared module rather than in either binary because the two
+/// binaries answer the SAME route: a body assembled in one of them is a body
+/// the other can drift from, and it did -- `lattice_serve` was still returning
+/// the bare residency snapshot after `lattice` gained the `router` key, so one
+/// server reported which gate was serving and the other did not. A route-table
+/// mechanism cannot see that: both registered the route correctly.
+///
+/// `router` is therefore merged in beside the snapshot's own keys rather than
+/// containing them.
+pub fn lora_list_body(
+    index: &AdapterIndex,
+    router: Option<&crate::router_state::ResolvedRouter>,
+) -> serde_json::Value {
+    // ADR-095 decision 3: the response says which gate is serving, because
+    // "routing is enabled" and "routing ran with the gate I pinned" are
+    // different claims.
+    //
+    // `pinned` is reported rather than left for the reader to infer, because
+    // the version alone cannot carry it. A server reporting version 7 reports
+    // the same number whether --router-pin selected it or whether 7 is simply
+    // the highest version written so far, and the two only diverge at the next
+    // refit and restart -- which is when nobody is looking, and is the entire
+    // scenario a pin exists for.
+    let router = match router {
+        None => serde_json::json!({"enabled": false}),
+        Some(resolved) => serde_json::json!({
+            "enabled": true,
+            "version": resolved.artifact.version_label(),
+            "pinned": resolved.pinned,
+            "adapter_names": resolved.artifact.adapter_names,
+        }),
+    };
+    let mut body = serde_json::to_value(index).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(map) = body.as_object_mut() {
+        map.insert("router".into(), router);
+    }
+    body
+}
+
 /// Every `/v1/lora*` route, as data: path and methods, one copy (ADR-095
 /// decision 4).
 ///

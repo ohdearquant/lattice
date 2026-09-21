@@ -3346,7 +3346,20 @@ mod imp {
     /// file of their choosing. The startup warning covers it; an allow-root is the
     /// obvious next control and is deliberately not invented here.
     async fn lora_list(State(s): State<AppState>) -> Json<Value> {
-        Json(serde_json::json!(s.jobs.adapter_index()))
+        // Assembled by the shared helper so this binary and `lattice serve`
+        // cannot answer the same route with different shapes. They already
+        // did: this returned the bare residency snapshot while the other had
+        // gained the `router` key, and nothing caught it -- the route was
+        // registered correctly in both, which is all a route-table mechanism
+        // can see (ADR-095 decision 4, item 4).
+        //
+        // `None` because this binary has no `--router-state` yet, so it
+        // reports `{"enabled": false}`: the same shape, honestly filled. The
+        // flags are the next step, not a silent omission.
+        Json(lattice_inference::serve::lora::lora_list_body(
+            &s.jobs.adapter_index(),
+            None,
+        ))
     }
 
     /// Repeated exact `(name, path)` identities share one resident id and lifetime:
@@ -4276,6 +4289,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         fn test_app_state() -> AppState {
             let (jobs, _rx) = test_client_and_jobs();
             AppState {

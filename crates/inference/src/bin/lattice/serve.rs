@@ -1662,52 +1662,6 @@ fn adapter_unsupported_build() -> ApiError {
     )
 }
 
-/// Assemble the `GET /v1/lora` body: the residency snapshot with `router`
-/// added beside it.
-///
-/// A separate function because the shape is the thing that breaks and a
-/// handler's shape can only be checked by launching a server. It already broke
-/// once: adding the router key as `json!({"adapters": index, "router": ...})`
-/// reads like adding a field and is not. `AdapterIndex` serializes to
-/// `{"adapters": [...], "applied": [...]}`, so wrapping it turned the
-/// top-level `adapters` from an array into an object and moved `applied` a
-/// level down -- a breaking change to two existing fields, written while
-/// intending a purely additive one, and invisible without a test that holds
-/// the whole body.
-///
-/// `router` is therefore merged in beside the snapshot's own keys rather than
-/// containing them.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-fn lora_list_body(
-    index: &lattice_inference::serve::lora::AdapterIndex,
-    router: Option<&lattice_inference::router_state::ResolvedRouter>,
-) -> serde_json::Value {
-    // ADR-095 decision 3: the response says which gate is serving, because
-    // "routing is enabled" and "routing ran with the gate I pinned" are
-    // different claims.
-    //
-    // `pinned` is reported rather than left for the reader to infer, because
-    // the version alone cannot carry it. A server reporting version 7 reports
-    // the same number whether --router-pin selected it or whether 7 is simply
-    // the highest version written so far, and the two only diverge at the next
-    // refit and restart -- which is when nobody is looking, and is the entire
-    // scenario a pin exists for.
-    let router = match router {
-        None => serde_json::json!({"enabled": false}),
-        Some(resolved) => serde_json::json!({
-            "enabled": true,
-            "version": resolved.artifact.version_label(),
-            "pinned": resolved.pinned,
-            "adapter_names": resolved.artifact.adapter_names,
-        }),
-    };
-    let mut body = serde_json::to_value(index).unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(map) = body.as_object_mut() {
-        map.insert("router".into(), router);
-    }
-    body
-}
-
 /// List confirmed resident adapters and the currently applied mixture.
 pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiError> {
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -1723,7 +1677,7 @@ pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiErr
         // or whether 7 is simply the highest version written so far, and the
         // two only diverge at the next refit and restart -- which is when
         // nobody is looking and is the entire scenario a pin exists for.
-        Ok(Json(lora_list_body(
+        Ok(Json(lattice_inference::serve::lora::lora_list_body(
             &adapter_client(&state)?.adapter_index(),
             state.router_state.as_deref(),
         ))
@@ -2547,7 +2501,7 @@ mod tests {
             ],
         };
 
-        let body = lora_list_body(&index, None);
+        let body = lattice_inference::serve::lora::lora_list_body(&index, None);
         assert!(
             body["adapters"].is_array(),
             "top-level adapters must stay an array, got {}",
@@ -2571,7 +2525,7 @@ mod tests {
             },
             pinned: true,
         };
-        let body = lora_list_body(&index, Some(&resolved));
+        let body = lattice_inference::serve::lora::lora_list_body(&index, Some(&resolved));
         assert!(
             body["adapters"].is_array(),
             "residency shape must not depend on the router"
@@ -2593,7 +2547,7 @@ mod tests {
             ..resolved
         };
         assert_eq!(
-            lora_list_body(&index, Some(&unpinned))["router"]["pinned"],
+            lattice_inference::serve::lora::lora_list_body(&index, Some(&unpinned))["router"]["pinned"],
             false,
             "an unpinned gate must not report itself pinned"
         );
