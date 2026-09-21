@@ -122,6 +122,15 @@ rather than implementation latitude:
   opposite sides, and refusing only one direction leaves the other silent. Differences of order
   between the two lists are resolved by name, never by position — position is the thing this
   amendment exists to stop trusting.
+- **A duplicate name on either side is refused** (_added 2026-09-21, found while implementing_).
+  Not a fifth case of the same shape: it is not reachable by set difference, because two sides can
+  agree _as sets_ and still be unresolvable. Residency permits it — `(name, path)` identity reuses
+  a resident id only on an exact match, so one name at a second path is a second resident adapter
+  — and the gate's own trained list can repeat a name just as easily. Resolving that ambiguity in
+  either direction is precisely the silent wrong-adapter selection this amendment exists to stop,
+  so it refuses, with the same side-by-side lists. Its arm: two residents sharing a name must
+  refuse even when the artifact's list matches as a set, which is what makes it a different test
+  from the two below rather than a restatement of them.
 - **The arm that carries it**: two adapter pools differing only in order must route identically,
   and a pool missing one of the artifact's names must refuse. The first fails against any
   implementation that kept a positional path; the second fails against one that treats an absent

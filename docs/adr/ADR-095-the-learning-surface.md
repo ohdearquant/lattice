@@ -124,6 +124,43 @@ The aim — every route in both binaries or in neither — is kept, with a mecha
    same shared module, different reachable behaviour, and no route-table mechanism would have
    caught it, because both tables registered the route correctly.
 
+The table, as of 2026-09-21. Positions are given as ordinals rather than line numbers, because a
+line number in prose is never re-derived by the people who move the code and so can only decay. Read
+`lattice serve` as `bin/lattice/serve.rs` and `lattice_serve` as `bin/lattice_serve.rs`.
+
+| Route                  | Check                          | `lattice serve`                                                | `lattice_serve`                                                                 |
+| ---------------------- | ------------------------------ | -------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `GET /v1/lora`         | backend resolution             | `adapter_client` in the handler; a build without Metal refuses | none — this binary's state is Metal-worker-only, so there is nothing to resolve |
+| `GET /v1/lora`         | response body                  | shared `serve::lora::lora_list_body`                           | shared `serve::lora::lora_list_body`                                            |
+| `POST /v1/lora/load`   | Content-Type is JSON (415)     | 1st                                                            | 1st                                                                             |
+| `POST /v1/lora/load`   | body size cap (413)            | 2nd                                                            | 2nd                                                                             |
+| `POST /v1/lora/load`   | JSON parse and required fields | 3rd, `parse_lora_load`                                         | 3rd, `parse_lora_load`                                                          |
+| `POST /v1/lora/load`   | backend resolution             | 4th, `adapter_client`                                          | n/a                                                                             |
+| `POST /v1/lora/load`   | adapter path and name          | 5th, `prepare_adapter_load`                                    | 4th, `prepare_adapter_load`                                                     |
+| `POST /v1/lora/load`   | telemetry on every outcome     | not emitted                                                    | `emit_serve_event`, including on each refusal                                   |
+| `POST /v1/lora/unload` | backend resolution             | **1st — before Content-Type, the cap and the parse**           | n/a                                                                             |
+| `POST /v1/lora/unload` | Content-Type is JSON (415)     | 2nd                                                            | 1st                                                                             |
+| `POST /v1/lora/unload` | body size cap (413)            | 3rd                                                            | 2nd                                                                             |
+| `POST /v1/lora/unload` | JSON parse and required fields | 4th, `parse_lora_unload`                                       | 3rd, `parse_lora_unload`                                                        |
+| `POST /v1/lora/unload` | telemetry on every outcome     | not emitted                                                    | `emit_serve_event`, including on each refusal                                   |
+
+Two rows are divergences rather than descriptions, and writing the table is what surfaced them.
+
+The `GET /v1/lora` body row was one. `lattice_serve` returned the bare residency snapshot after
+`lattice serve` gained the `router` key, so one server reported which gate was serving and the other
+did not. Both registered the route; the presence test and the parity lint both passed. Fixed by
+moving the body into the shared module, which is the general form: a body assembled inside one
+binary is a body the other can drift from.
+
+The unload row is open. On `lattice serve`, `lora_unload` resolves the adapter backend before
+Content-Type, the cap and the parse, while `lora_load` on the same binary resolves it after — so a
+malformed unload and a malformed load answer with different statuses on one server. It is
+deliberate and commented for the build that has no Metal at all ("backend refusal keeps its own
+diagnosis even for a bodyless CPU request"), and that argument does not obviously carry to the Metal
+build, where the check is a worker lookup rather than a statement about the binary. Recorded here
+rather than changed, because it is a decision about which answer a caller should get and not a
+parity cleanup.
+
 No state-unification lane follows from this. It would be large and nothing here depends on it.
 
 The retroactive half is unchanged in scope: the three existing `/v1/lora*` routes are covered on
