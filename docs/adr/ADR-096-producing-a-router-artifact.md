@@ -1,6 +1,6 @@
 # ADR-096: Producing a router artifact — schema lineage, bootstrap, the learned action, and admission
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-21)
 **Date**: 2026-09-21
 **Crate**: lattice-inference, lattice-fann
 
@@ -160,6 +160,32 @@ commit, and activation.
   uses cannot express that distinction.
 - Activation follows the durable commit. An operation is not reported active before the in-memory
   gate has actually changed, and a crash between the two recovers the committed head.
+
+**Two selection rules, one per format revision, and neither amends ADR-095.** ADR-095 decided that
+startup serves the highest version counter present, resolved from the artifact filenames, and that
+`--router-pin <version>` serves a named one instead. That rule stays exactly as written **for format
+4**, because a format-4 directory has no head record and never acquires one: nothing writes it, so a
+reader looking for one would find an absence it could not distinguish from a truncated write.
+
+- **Format 4.** Unpinned startup scans the counters and serves the highest, and the reader compares
+  the manifest's own counter against the filename-derived one. `--router-pin <version>` resolves by
+  that same counter.
+- **The new revision.** Unpinned startup reads the committed head record and serves what it names; a
+  higher-numbered artifact present in the directory but not named by the head is a staged or rejected
+  candidate and is never served. `--router-pin` resolves against the artifact's full version
+  identity, and a pin **disables automatic promotion**, so a head advance while a pin is in force
+  changes the served gate for nobody until the pin is lifted.
+- **A directory holding both.** If a head record is present it governs unpinned selection, including
+  when the artifact it names is older than a format-4 file sitting beside it: the head is a statement
+  that a specific artifact was admitted, and a counter is not. A format-4 version in such a directory
+  remains reachable **by pin**, under the format-4 rule above, which is what keeps a rollback target
+  available across the revision boundary.
+
+Stated this way the change is additive: no accepted decision is reinterpreted, and the rule that
+applies is a property of the artifact being read rather than of the server reading it. The
+alternative — amending ADR-095 so that every directory is expected to carry a head — was rejected
+because it would make every existing state directory non-conforming the moment this ADR is accepted,
+with no migration and no writer to produce what it would then require.
 
 The bootstrap of decision 2 does not pass through the learned-candidate quality rule: it is checked
 for structure and provenance and reported untrained. That exemption is written here so that it cannot
