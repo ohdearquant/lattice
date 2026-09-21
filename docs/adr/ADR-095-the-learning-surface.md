@@ -111,11 +111,17 @@ The aim — every route in both binaries or in neither — is kept, with a mecha
    A 405 or a 4xx from validation both count as registered — the test asks whether the route
    exists, and nothing else, because anything more would need the state the two binaries do not
    share. A route added to the list and forgotten in one binary reds that binary's test.
-3. **A lint for the other direction.** A route registered in a binary and never added to the list
-   is invisible to (2), so the set of `/v1/lora` path literals in each binary's source must equal
-   the other's and equal the list. It runs with a must-match control, the way the existing
-   source-marker lint does, in the same CI step — a lint whose discovery can silently empty
-   reports success while checking nothing.
+3. **A lint for the other direction.** A route registered in a binary and never added to the
+   list is invisible to (2), so the set of `/v1/lora` **registrations** in each binary's source
+   must equal the other's and equal the list. Registrations, not path literals: the subject is
+   `.route("/v1/lora…", …)`, and a `/v1/lora` string that is not one — a doc comment, a request
+   fixture, a log line — is deliberately outside it. A lint over literals answers a different
+   question and answers it wrongly in both directions, going red on a test fixture and staying
+   clean on a binary that mentions a path it never registers. It runs with a must-match control,
+   the way the existing source-marker lint does, in the same CI step — a lint whose discovery can
+   silently empty reports success while checking nothing. The two directions stay separate
+   mechanisms on purpose: listed-but-not-registered is (2)'s arm, reached by driving a route that
+   answers 404, and registered-but-not-listed is this one's.
 4. **Validation parity is an audit, not code.** (1)–(3) establish that a route is registered, which
    is not the same as its behaviour being the same. The ADR carries a table per `/v1/lora*` route
    naming where each binary's handler performs each check, re-read whenever a handler changes. That
@@ -128,20 +134,35 @@ The table, as of 2026-09-21. Positions are given as ordinals rather than line nu
 line number in prose is never re-derived by the people who move the code and so can only decay. Read
 `lattice serve` as `bin/lattice/serve.rs` and `lattice_serve` as `bin/lattice_serve.rs`.
 
+The ordinals are not a transcript of what the handlers happen to do. They are consequences of one
+rule, so that a reader who did not write the handlers can still say whether a row is right:
+
+> A refusal that is a property of the **build** answers before the request is read, because it is
+> true of every request. A refusal that is a property of the **runtime** answers after
+> Content-Type, the body cap and the parse, so a malformed request gets the malformed-request
+> answer whatever the runtime state happens to be. The same order on every route, on both
+> binaries.
+
+A row that does not follow from that is either a defect or an amendment to the rule, and saying
+which is the point of writing the rule above the table. A table of ordinals alone cannot be wrong,
+only outdated; a table with a predicate can be checked by someone who reads only the table.
+
 | Route                  | Check                          | `lattice serve`                                                | `lattice_serve`                                                                 |
 | ---------------------- | ------------------------------ | -------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `GET /v1/lora`         | backend resolution             | `adapter_client` in the handler; a build without Metal refuses | none — this binary's state is Metal-worker-only, so there is nothing to resolve |
 | `GET /v1/lora`         | response body                  | shared `serve::lora::lora_list_body`                           | shared `serve::lora::lora_list_body`                                            |
+| `POST /v1/lora/load`   | build refusal (no Metal built) | 0th — before anything is read                                  | n/a — this binary is Metal-only                                                 |
 | `POST /v1/lora/load`   | Content-Type is JSON (415)     | 1st                                                            | 1st                                                                             |
 | `POST /v1/lora/load`   | body size cap (413)            | 2nd                                                            | 2nd                                                                             |
 | `POST /v1/lora/load`   | JSON parse and required fields | 3rd, `parse_lora_load`                                         | 3rd, `parse_lora_load`                                                          |
 | `POST /v1/lora/load`   | backend resolution             | 4th, `adapter_client`                                          | n/a                                                                             |
 | `POST /v1/lora/load`   | adapter path and name          | 5th, `prepare_adapter_load`                                    | 4th, `prepare_adapter_load`                                                     |
 | `POST /v1/lora/load`   | telemetry on every outcome     | not emitted                                                    | `emit_serve_event`, including on each refusal                                   |
-| `POST /v1/lora/unload` | backend resolution             | **1st — before Content-Type, the cap and the parse**           | n/a                                                                             |
-| `POST /v1/lora/unload` | Content-Type is JSON (415)     | 2nd                                                            | 1st                                                                             |
-| `POST /v1/lora/unload` | body size cap (413)            | 3rd                                                            | 2nd                                                                             |
-| `POST /v1/lora/unload` | JSON parse and required fields | 4th, `parse_lora_unload`                                       | 3rd, `parse_lora_unload`                                                        |
+| `POST /v1/lora/unload` | build refusal (no Metal built) | 0th — before anything is read                                  | n/a — this binary is Metal-only                                                 |
+| `POST /v1/lora/unload` | Content-Type is JSON (415)     | 1st                                                            | 1st                                                                             |
+| `POST /v1/lora/unload` | body size cap (413)            | 2nd                                                            | 2nd                                                                             |
+| `POST /v1/lora/unload` | JSON parse and required fields | 3rd, `parse_lora_unload`                                       | 3rd, `parse_lora_unload`                                                        |
+| `POST /v1/lora/unload` | backend resolution             | 4th, `adapter_client`                                          | n/a                                                                             |
 | `POST /v1/lora/unload` | telemetry on every outcome     | not emitted                                                    | `emit_serve_event`, including on each refusal                                   |
 
 Two rows are divergences rather than descriptions, and writing the table is what surfaced them.
@@ -152,14 +173,23 @@ did not. Both registered the route; the presence test and the parity lint both p
 moving the body into the shared module, which is the general form: a body assembled inside one
 binary is a body the other can drift from.
 
-The unload row is open. On `lattice serve`, `lora_unload` resolves the adapter backend before
-Content-Type, the cap and the parse, while `lora_load` on the same binary resolves it after — so a
-malformed unload and a malformed load answer with different statuses on one server. It is
-deliberate and commented for the build that has no Metal at all ("backend refusal keeps its own
-diagnosis even for a bodyless CPU request"), and that argument does not obviously carry to the Metal
-build, where the check is a worker lookup rather than a statement about the binary. Recorded here
-rather than changed, because it is a decision about which answer a caller should get and not a
-parity cleanup.
+The unload row was the other, and the rule above is what closed it. On `lattice serve`,
+`lora_unload` used to resolve the adapter backend before Content-Type, the cap and the parse, while
+`lora_load` on the same binary resolved it after, so one malformed request and an identical
+malformed request answered with different statuses depending on which route received them. The
+defence written in the code carried only for the build with no Metal compiled in — there the
+refusal really is true of every request, bodyless or not — and it was applied to the Metal build,
+where the same call is a worker lookup and says nothing about the binary. Splitting the two cases
+is what produced the rule, and the rule then put the backend lookup after the parse on both routes.
+
+The arms are worth naming, because a rule about ordering is invisible to any test that sends a
+well-formed request. On the compiled-out build, a body that is malformed twice over — no JSON
+content type and an unknown field — still receives the build's answer; parsing before that refusal
+reds it. On the Metal build, an unknown field on either route receives the caller's answer on a
+state whose backend cannot serve adapters at all; hoisting the backend lookup above the parse reds
+it, and reds nothing else. Two of the pre-existing arms asserted the old order and were gated to
+the build that can still express them, rather than deleted: a request-contract claim is a claim
+about a build that serves the route.
 
 No state-unification lane follows from this. It would be large and nothing here depends on it.
 

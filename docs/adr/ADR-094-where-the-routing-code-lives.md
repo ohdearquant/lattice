@@ -105,6 +105,22 @@ checkpoints can share a name, and fine-tuning changes the representation without
 it is a refusal on mismatch and not a warrant of sameness on agreement — which is worth stating
 rather than leaving for a later reader to discover.
 
+**The shape both amendments share, stated once because the next one will have it too.** Making X
+authoritative over Y does not remove an unverifiable pairing, it relocates it: X now has to
+describe something, and the pairing between X and the thing it describes is new, unchecked, and
+easy to miss precisely because the attention is on the X-to-Y relation that was just hardened.
+Decision 2's amendment made the artifact's name list authoritative over the caller's adapter order,
+and the first round of checks written for it compared that list against residency and nothing else
+— an artifact naming three adapters around a five-column gate passed every one of them, while
+`route` takes `available.len().min(scores.len())` columns and so drops the trailing ones in
+silence, with valid weights and no error. The amendment above is the same step one level further
+out: the artifact becomes authoritative over the representation, and only the half with a length is
+checkable. Both are closed here, by comparing the name list's length against the gate's output
+width and the recorded input width against the measured one. What is worth carrying forward is not
+either fix but the question that finds them: after making an artifact, list or registry
+authoritative for a correspondence, ask what that authority itself claims to describe, and what
+compares the two.
+
 **2. The `mixture` gate moves off the call site.** The rule is that a `cfg` never lands on the
 serving call. Either the router module stops being feature-gated, or the serving path acquires a
 gate-free façade whose non-`mixture` build is a compiled-in refusal rather than an absent symbol.
