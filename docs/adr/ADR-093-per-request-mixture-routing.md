@@ -92,6 +92,35 @@ above puts at roughly one token per token at full-adapter shapes — a 2x decode
 rejected here as out of scope rather than as impossible; decisions 1 through 3 are what a
 per-request router needs, and nothing in them forecloses revisiting this behind its own evidence.
 
+_Amended 2026-09-21, while wiring the serving path._ Decision 1 says the selection is decided once
+per request at prefill. Wiring it raised three questions it does not answer, and all three are
+caller-visible, so they are decided here rather than left to the code.
+
+**A request that names its own adapters keeps them.** The router runs only when `lora` is absent.
+A caller who named adapters asked for those, and a learned guess overruling a stated intent would
+make the request field advisory without saying so anywhere.
+
+**Every trained column is routed, and the gate decides the weight over them.** Not a top-k. A `k`
+would need a number nothing here has evidence for, and truncating the gate's own distribution is
+the opposite of letting it choose — the distribution is the thing being learned. This is also why
+no flag is added: a default of 1 would make a mixture router a single-adapter router for everyone
+who did not read the flag list.
+
+**A trained set that is not resident refuses the request, naming both lists.** The gate's columns
+are labelled by the artifact's adapter names, so a resident set that does not match cannot be
+routed at all, and there are only two ways to answer it. Refusing is loud and has a real cost: a
+server started with `--router-state` and no adapters loaded refuses every chat request until they
+are. Serving the base model instead is quiet and costs more, and it is the failure this ADR family
+refuses at every other level — the operator configured routing, `GET /v1/lora` reports routing
+enabled, and the only place the truth appears is in the answers, where it looks like a gate that
+did not learn much. The cost of the loud answer is paid once, at the moment the operator can act;
+the cost of the quiet one is paid by whoever later tries to explain the output.
+
+A conversation with no user turn is deliberately not that case: it serves the base model, because
+there is no text to route on under the recorded rule rather than a routable request being skipped.
+Inventing a substitute — the system prompt, the rendered history — would route on text the gate
+never saw and would look like it worked.
+
 ## Alternatives considered
 
 - **A coefficient-only fast path over the existing rebuild.** Skip the blend when only the weights

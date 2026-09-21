@@ -96,8 +96,9 @@ symptom is worse adapter selection, which is indistinguishable from a gate that 
 learn much.
 
 This is decision 2's amendment one level out, and it takes decision 2's answer: **the artifact
-records the representation it was trained on — the embedding model's identity and the pooling
-strategy — and the façade refuses when the server's differs.** The same reasoning applies for the
+records the representation it was trained on — the embedding model's identity, the pooling
+strategy, and which text of the request was embedded — and the façade refuses when the server's
+differs.** The same reasoning applies for the
 same reason: an unwritten convention about how two sides encode a vector is unverifiable by
 construction, so the only shape in which a mismatch is detectable at all is one where the artifact
 carries its half of the key. A model identity is weaker evidence than the adapter names (two
@@ -120,6 +121,20 @@ width and the recorded input width against the measured one. What is worth carry
 either fix but the question that finds them: after making an artifact, list or registry
 authoritative for a correspondence, ask what that authority itself claims to describe, and what
 compares the two.
+
+Asked a third time, while wiring the serving path, it found a third member. The representation as
+first written said how a text becomes a vector — which model, which pooling — and nothing about
+WHICH text. A gate trained on the last user message and served the whole rendered conversation
+agrees on the model, agrees on the pooling, and produces a vector of exactly the right width from
+different content. It is the pooling argument again with the last checkable property removed, and
+it is not a fourth incident: it is the same question returning an answer because it was asked.
+
+So the representation carries the prompt-selection rule too, and the serving path names that rule
+as a value rather than following it by convention, so the recorded name and the served rule can be
+compared at all. There is one rule today, which is precisely when this is cheap: the check cannot
+fail against an artifact this build wrote, only against one written by a build that had a second
+rule — and that is the case with no symptom. Adding it later would invalidate every artifact
+already written, which is the other reason the cost is lowest now.
 
 **2. The `mixture` gate moves off the call site.** The rule is that a `cfg` never lands on the
 serving call. Either the router module stops being feature-gated, or the serving path acquires a
