@@ -107,10 +107,28 @@ cause, here an adapter load quietly re-pointing every column of a gate nobody to
 
 The cost is contained: the refit path already writes the artifact, so it gains a field, and the
 residency registry already stores each adapter's name beside its `u32` id, so the façade's lookup
-has somewhere to resolve against. Note that the two id types do not meet today — the router speaks
-`AdapterId = String` (`mixture.rs:46`) while the serving contract speaks `LoraSelection.id: u32` —
-and naming the trained set is what gives that translation a defined direction instead of an
-implied one.
+has somewhere to resolve against. Four things follow from that and are part of the decision
+rather than implementation latitude:
+
+- **The name list lives inside the versioned artifact, and inside its content hash.** Editing the
+  list is therefore a new version, not a mutation of the current one, which is what makes a gate
+  pinnable at all (ADR-095 decision 3). A name list stored beside the artifact would reintroduce
+  the same unverifiable pairing one level up.
+- **The refusal prints the artifact's list and the resident list side by side.** An operator's
+  next question after "refused" is always "which adapter moved", and a refusal that does not
+  answer it sends them to read two sources by hand.
+- **Mismatch is refused in both directions**: a resident adapter absent from the artifact's list,
+  and an artifact name absent from residency. They are the same unverifiable pairing seen from
+  opposite sides, and refusing only one direction leaves the other silent. Differences of order
+  between the two lists are resolved by name, never by position — position is the thing this
+  amendment exists to stop trusting.
+- **The arm that carries it**: two adapter pools differing only in order must route identically,
+  and a pool missing one of the artifact's names must refuse. The first fails against any
+  implementation that kept a positional path; the second fails against one that treats an absent
+  name as a zero column. Note that the two id types do not meet today — the router speaks
+  `AdapterId = String` (`mixture.rs:46`) while the serving contract speaks `LoraSelection.id: u32` —
+  and naming the trained set is what gives that translation a defined direction instead of an
+  implied one.
 
 On the façade's error type, which this decision left open and which needs no new invention: it
 returns the existing `ApiError`. The pattern is already in the serving path — `lora_unsupported_backend`
