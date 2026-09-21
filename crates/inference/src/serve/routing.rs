@@ -329,6 +329,158 @@ impl ServingRouter {
     }
 }
 
+/// Resolve the pooling the gate was trained under.
+///
+/// Parsed once, at startup, rather than per request: an unrecognised value is
+/// a property of the artifact, so it is true of every request and there is no
+/// reason for a caller to be the one who learns about it.
+fn trained_pooling(pooling: &str) -> Result<crate::forward::cpu_f16::PoolingStrategy, ApiError> {
+    match pooling {
+        "mean_visual" => Ok(crate::forward::cpu_f16::PoolingStrategy::MeanVisualTokens),
+        "last_token" => Ok(crate::forward::cpu_f16::PoolingStrategy::LastToken),
+        other => Err(ApiError::BadRequest {
+            message: format!(
+                "router artifact records pooling {other:?}, which this build does not know how to                  reproduce; the gate would be served a representation it was not trained on"
+            ),
+            code: "router_artifact_unknown_pooling",
+        }),
+    }
+}
+
+/// Check a gate artifact against the embedding model this server actually
+/// loaded, and return the pooling the routing path must use.
+///
+/// This is the pairing [`ServingRouter::new`] cannot see. That constructor
+/// checks the artifact against the gate it ships with, which says the artifact
+/// describes itself correctly and nothing about whether this server can
+/// reproduce the representation it names.
+///
+/// The identity compared is the served model id -- the name `/v1/models`
+/// publishes and `--model-id` sets -- not the `--model` path, which is
+/// machine-local and would refuse a correct artifact for having been trained
+/// on a box that stored the checkpoint elsewhere.
+///
+/// A name is weak evidence, and the refusal is deliberately one-directional
+/// because of it: two checkpoints can share a name, and fine-tuning changes
+/// the representation without changing the name. So a mismatch refuses, and a
+/// match is not a warrant of sameness. The width comparison below is the half
+/// that is actually checkable, and its passing is exactly what makes the
+/// unchecked half look settled.
+pub fn check_representation(
+    artifact: &RouterArtifact,
+    served_model_id: &str,
+    dimensions: usize,
+) -> Result<crate::forward::cpu_f16::PoolingStrategy, ApiError> {
+    let trained_on = &artifact.representation.embedding_model;
+    if trained_on != served_model_id {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "router gate was trained on embedding model {trained_on:?} but this server serves                  {served_model_id:?}; the gate would route on a representation it never saw"
+            ),
+            code: "router_representation_model_mismatch",
+        });
+    }
+
+    let recorded = artifact.representation.input_width;
+    let measured = dimensions as u64;
+    if recorded != measured {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "router gate takes a {recorded}-dimension context vector but this server's                  embedding model produces {measured} dimensions"
+            ),
+            code: "router_representation_width_mismatch",
+        });
+    }
+
+    trained_pooling(&artifact.representation.pooling)
+}
+
+/// The serving state's router: one gate, the pooling it was trained under, and
+/// what `GET /v1/lora` reports about it.
+///
+/// One artifact, borrowed by the reporter rather than copied for it. A second
+/// copy would be a second thing a refit has to keep in step, with nothing able
+/// to notice when it does not.
+pub struct ServedRouter {
+    router: std::sync::Mutex<ServingRouter>,
+    pooling: crate::forward::cpu_f16::PoolingStrategy,
+    pinned: bool,
+}
+
+impl ServedRouter {
+    /// Build the serving router, checking it against this server's embedding
+    /// model before anything is served.
+    ///
+    /// Both checks run here rather than at the first request for ADR-095
+    /// decision 6's reason: "routing is configured" and "routing can run"
+    /// become the same question, answered while the operator is still watching
+    /// the process start.
+    pub fn new(
+        resolved: crate::router_state::ResolvedRouter,
+        served_model_id: &str,
+        dimensions: usize,
+    ) -> Result<Self, ApiError> {
+        // Ordered from the most general refusal to the most specific, which
+        // is the same rule the `/v1/lora` handlers follow. A build with no
+        // gate implementation cannot route any artifact, so it answers first;
+        // an artifact that disagrees with the gate it ships with is wrong on
+        // every server, so it answers next; only then does this server's own
+        // embedding model enter it. Reversed, an operator on a build without
+        // `mixture` is told to go fix a representation that was never the
+        // problem.
+        let router = ServingRouter::new(resolved.artifact)?;
+        let pooling = check_representation(router.artifact(), served_model_id, dimensions)?;
+        Ok(Self {
+            router: std::sync::Mutex::new(router),
+            pooling,
+            pinned: resolved.pinned,
+        })
+    }
+
+    /// The pooling the routing path must embed with.
+    pub fn pooling(&self) -> crate::forward::cpu_f16::PoolingStrategy {
+        self.pooling
+    }
+
+    /// Read the serving artifact for a report.
+    ///
+    /// A poisoned lock is recovered rather than propagated. The alternative is
+    /// that one panic inside routing makes `GET /v1/lora` permanently
+    /// unanswerable, which withholds the state an operator needs precisely
+    /// when something has gone wrong. The artifact is immutable for the life
+    /// of the process, so a reader cannot observe a half-written one.
+    pub fn with_report<R>(&self, f: impl FnOnce(crate::router_state::RouterReport<'_>) -> R) -> R {
+        let guard = self
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(crate::router_state::RouterReport {
+            artifact: guard.artifact(),
+            pinned: self.pinned,
+        })
+    }
+
+    /// Route one request.
+    ///
+    /// Unlike the report path, a poisoned lock refuses here. A panic inside
+    /// the gate's forward pass leaves the router's own scratch state
+    /// unaccounted for, and routing on it would produce a selection nobody can
+    /// argue is correct -- which is the silent wrong-adapter outcome this
+    /// module exists to prevent.
+    pub fn route(
+        &self,
+        resident: &AdapterIndex,
+        context_vector: &[f32],
+        k: usize,
+    ) -> Result<Vec<LoraSelection>, ApiError> {
+        let mut guard = self.router.lock().map_err(|_| ApiError::Internal {
+            message: "the adapter router panicked on an earlier request and is no longer serving"
+                .to_string(),
+        })?;
+        guard.route(resident, context_vector, k)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +517,95 @@ mod tests {
             representation: representation(4),
             gate_bytes: vec![0],
         }
+    }
+
+    #[cfg(not(feature = "mixture"))]
+    fn resolved(
+        rep: crate::router_state::TrainedRepresentation,
+    ) -> crate::router_state::ResolvedRouter {
+        let mut art = artifact(&["technical"]);
+        art.representation = rep;
+        crate::router_state::ResolvedRouter {
+            artifact: art,
+            pinned: false,
+        }
+    }
+
+    /// The pairing `ServingRouter::new` cannot see. It checks the artifact
+    /// against its own gate, which says the artifact is self-consistent and
+    /// nothing about whether this server can produce the vector it wants.
+    #[test]
+    fn a_gate_trained_on_another_embedding_model_refuses() {
+        let err = check_representation(&artifact(&["technical"]), "some-other-model", 4)
+            .expect_err("a different embedding model must refuse");
+        let msg = err.message();
+        assert!(
+            msg.contains("gme-qwen35") && msg.contains("some-other-model"),
+            "both identities must be named: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_gate_whose_width_differs_from_this_servers_embedder_refuses() {
+        let err = check_representation(&artifact(&["technical"]), "gme-qwen35", 1536)
+            .expect_err("a width the embedder cannot produce must refuse");
+        let msg = err.message();
+        assert!(
+            msg.contains('4') && msg.contains("1536"),
+            "both widths must be named: {msg}"
+        );
+    }
+
+    /// The half that is NOT checkable by width, which is why it is carried in
+    /// the artifact at all: `MeanVisualTokens` and `LastToken` produce
+    /// different vectors of the same length, so an unrecognised value here
+    /// cannot be caught later by any comparison of dimensions.
+    #[test]
+    fn an_unrecognised_pooling_refuses_rather_than_defaulting() {
+        let mut art = artifact(&["technical"]);
+        art.representation.pooling = "cls".into();
+        let err = check_representation(&art, "gme-qwen35", 4)
+            .expect_err("an unknown pooling must refuse");
+        assert!(
+            err.message().contains("cls"),
+            "the unrecognised value must be quoted: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn a_matching_representation_returns_the_pooling_the_gate_was_trained_under() {
+        let pooling = check_representation(&artifact(&["technical"]), "gme-qwen35", 4)
+            .expect("a matching representation must resolve");
+        assert_eq!(
+            pooling,
+            crate::forward::cpu_f16::PoolingStrategy::MeanVisualTokens,
+            "the routing path must embed the way the gate was trained, not the way a request asks"
+        );
+    }
+
+    /// The ordering `ServedRouter::new` owes an operator, on the build where
+    /// the two answers differ. A representation error here would send them to
+    /// re-train a gate on a server that cannot run any gate.
+    #[cfg(not(feature = "mixture"))]
+    #[test]
+    fn a_build_without_a_gate_says_so_before_it_says_anything_about_the_artifact() {
+        let mut rep = representation(4);
+        rep.embedding_model = "some-other-model".into();
+        // `match` rather than `expect_err`: a test's convenience is not a
+        // reason to derive `Debug` on a type that holds a gate.
+        let msg = match ServedRouter::new(resolved(rep), "gme-qwen35", 4) {
+            Ok(_) => panic!("a build with no gate implementation must refuse"),
+            Err(err) => err.message().to_string(),
+        };
+        assert!(
+            msg.contains("mixture"),
+            "the build is the answer, not the representation: {msg}"
+        );
+        assert!(
+            !msg.contains("some-other-model"),
+            "the artifact must not be blamed for a build problem: {msg}"
+        );
     }
 
     /// The first arm ADR-094 decision 2 names. It fails against any

@@ -427,7 +427,7 @@ pub struct AppState {
     /// `--router-state` passed to such a build is refused at startup rather
     /// than loaded into a field nothing on that build could ever apply.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    pub router_state: Option<Arc<lattice_inference::router_state::ResolvedRouter>>,
+    pub router_state: Option<Arc<lattice_inference::serve::routing::ServedRouter>>,
 }
 
 // -----------------------------------------------------------------------
@@ -1677,11 +1677,14 @@ pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiErr
         // or whether 7 is simply the highest version written so far, and the
         // two only diverge at the next refit and restart -- which is when
         // nobody is looking and is the entire scenario a pin exists for.
-        Ok(Json(lattice_inference::serve::lora::lora_list_body(
-            &adapter_client(&state)?.adapter_index(),
-            state.router_state.as_deref(),
-        ))
-        .into_response())
+        let index = adapter_client(&state)?.adapter_index();
+        let body = match state.router_state.as_deref() {
+            None => lattice_inference::serve::lora::lora_list_body(&index, None),
+            Some(served) => served.with_report(|report| {
+                lattice_inference::serve::lora::lora_list_body(&index, Some(report))
+            }),
+        };
+        Ok(Json(body).into_response())
     }
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
@@ -2552,7 +2555,7 @@ mod tests {
             },
             pinned: true,
         };
-        let body = lattice_inference::serve::lora::lora_list_body(&index, Some(&resolved));
+        let body = lattice_inference::serve::lora::lora_list_body(&index, Some(resolved.report()));
         assert!(
             body["adapters"].is_array(),
             "residency shape must not depend on the router"
@@ -2574,7 +2577,8 @@ mod tests {
             ..resolved
         };
         assert_eq!(
-            lattice_inference::serve::lora::lora_list_body(&index, Some(&unpinned))["router"]["pinned"],
+            lattice_inference::serve::lora::lora_list_body(&index, Some(unpinned.report()))["router"]
+                ["pinned"],
             false,
             "an unpinned gate must not report itself pinned"
         );

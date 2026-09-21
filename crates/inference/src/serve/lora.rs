@@ -114,7 +114,7 @@ pub enum AdapterControlResult {
 /// containing them.
 pub fn lora_list_body(
     index: &AdapterIndex,
-    router: Option<&crate::router_state::ResolvedRouter>,
+    router: Option<crate::router_state::RouterReport<'_>>,
 ) -> serde_json::Value {
     // ADR-095 decision 3: the response says which gate is serving, because
     // "routing is enabled" and "routing ran with the gate I pinned" are
@@ -128,11 +128,11 @@ pub fn lora_list_body(
     // scenario a pin exists for.
     let router = match router {
         None => serde_json::json!({"enabled": false}),
-        Some(resolved) => serde_json::json!({
+        Some(report) => serde_json::json!({
             "enabled": true,
-            "version": resolved.artifact.version_label(),
-            "pinned": resolved.pinned,
-            "adapter_names": resolved.artifact.adapter_names,
+            "version": report.artifact.version_label(),
+            "pinned": report.pinned,
+            "adapter_names": report.artifact.adapter_names,
         }),
     };
     let mut body = serde_json::to_value(index).unwrap_or_else(|_| serde_json::json!({}));

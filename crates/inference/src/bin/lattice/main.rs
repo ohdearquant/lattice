@@ -358,13 +358,45 @@ async fn main() {
                 match resolve_startup(router_state.as_deref().map(Path::new), router_pin) {
                     Ok(StartupDisposition::NoRouter) => None,
                     Ok(StartupDisposition::Loaded(resolved)) => {
-                        eprintln!(
-                            "Router gate loaded: version {} over {} adapter(s){}",
-                            resolved.artifact.version_label(),
-                            resolved.artifact.adapter_names.len(),
-                            if resolved.pinned { " (pinned)" } else { "" }
-                        );
-                        Some(Arc::new(*resolved))
+                        // Routing needs a context vector, and the only thing
+                        // on this server that produces one is the embedding
+                        // model. It is loaded best-effort above -- a
+                        // checkpoint that is not vision-language-shaped
+                        // disables embeddings and continues -- so a configured
+                        // router on such a checkpoint has no input and must
+                        // stop here rather than start and refuse every routed
+                        // request. The same fail-closed argument the
+                        // disposition itself is built on.
+                        let Some(embedder) = embedding_model.as_ref() else {
+                            eprintln!(
+                                "Error: --router-state needs the embedding model, which did not                                  load for this checkpoint; routing has no context vector without                                  it."
+                            );
+                            std::process::exit(1);
+                        };
+                        let version = resolved.artifact.version_label();
+                        let names = resolved.artifact.adapter_names.len();
+                        let pinned = resolved.pinned;
+                        // Checked against THIS server's embedding model, not
+                        // only against the gate the artifact ships with: the
+                        // two are different pairings and the constructor can
+                        // only see one of them.
+                        match lattice_inference::serve::routing::ServedRouter::new(
+                            *resolved,
+                            &served_model_id,
+                            embedder.dimensions(),
+                        ) {
+                            Ok(served) => {
+                                eprintln!(
+                                    "Router gate loaded: version {version} over {names}                                      adapter(s){}",
+                                    if pinned { " (pinned)" } else { "" }
+                                );
+                                Some(Arc::new(served))
+                            }
+                            Err(err) => {
+                                eprintln!("Error: {}", err.message());
+                                std::process::exit(1);
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("Error: {e}");

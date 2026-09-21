@@ -438,6 +438,32 @@ pub struct ResolvedRouter {
     pub pinned: bool,
 }
 
+/// What `GET /v1/lora` reports about the serving gate, borrowed.
+///
+/// A borrowed view rather than a `ResolvedRouter` so that the reporting path
+/// and the routing path can read one artifact. The serving state owns exactly
+/// one copy of the gate; handing the reporter its own `ResolvedRouter` would
+/// mean two, and two copies of a value that a later refit will replace is a
+/// pairing nothing checks — the reported version and the routing version can
+/// then disagree with no instrument able to say so.
+#[derive(Debug, Clone, Copy)]
+pub struct RouterReport<'a> {
+    /// The artifact currently serving.
+    pub artifact: &'a RouterArtifact,
+    /// True when `--router-pin` selected this version.
+    pub pinned: bool,
+}
+
+impl ResolvedRouter {
+    /// Borrow this resolution as a report.
+    pub fn report(&self) -> RouterReport<'_> {
+        RouterReport {
+            artifact: &self.artifact,
+            pinned: self.pinned,
+        }
+    }
+}
+
 /// Decide what a startup does about routing.
 ///
 /// `Ok(NoRouter)` only when no directory was configured. A configured
