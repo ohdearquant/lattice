@@ -266,6 +266,67 @@ The bootstrap of decision 2 does not pass through the learned-candidate quality 
 for structure and provenance and reported untrained. That exemption is written here so that it cannot
 be widened by an implementation that finds an ordinary refit inconvenient.
 
+### 6. The gate's output is per-adapter weights, and the contract it must satisfy already exists
+
+Decision 3 says the learned action is the whole mixture rather than an adapter index. That settles
+what the gate _decides_. It does not say what the gate _emits_, and the gap between those two is
+where this chain currently ends: the serving path selects adapters by name and has no code that
+turns a gate's output into a number.
+
+This is worth stating precisely, because the missing piece is smaller than it looks and the
+surrounding half is older than this chain. The application half shipped in #443, and its contract
+is already weight-shaped:
+
+```rust
+pub fn blend_lora_layer_data(
+    inputs: &[(&[LoraLayerData], f32)],
+) -> Result<Vec<LoraLayerData>, InferenceError>
+```
+
+It takes `(adapter, weight)` pairs and blends them into a single rank-Σr adapter — `A_blend` the
+vertical concatenation of the A matrices, `B_blend` the horizontal concatenation of the
+weight-scaled B matrices. That construction is mathematically exact rather than an approximation,
+and it needs no Metal kernel change, because adapter rank is a runtime `set_bytes` parameter and
+the kernels are rank-agnostic.
+
+So the contract this decision fixes is the one between the gate and that function.
+
+**Shape.** One `f32` per adapter, positionally aligned to the artifact's ordered adapter schema of
+decision 1. The schema is what makes the vector interpretable; a weight vector without its lineage
+is a list of numbers with no referent, which is the failure decision 1 exists to prevent.
+
+**Normalisation, and where it happens.** Weights are normalised to sum to 1 before they reach the
+blend, and the serving-side floor of ADR-091 is applied _before_ that normalisation, not after.
+The order matters and is not a detail: the floor clamps coordinates and the renormalisation that
+follows is what keeps the applied mixture a convex combination. Applying the floor afterwards would
+leave a vector that no longer sums to 1 and would silently rescale the blended adapter.
+
+**Where they enter.** The normalised vector is zipped with the resident adapters named by the
+artifact's schema and handed to `blend_lora_layer_data` as its `(adapter, weight)` pairs. Nothing
+else in serving is permitted to scale a weight afterwards; a second scaling site is how two
+correct-looking factors multiply into a wrong one.
+
+**What a non-Metal build returns.** The real blend is `cfg(all(target_os = "macos", feature =
+"metal-gpu"))`. Every other build links a stub that returns `Err` by design, so a caller fails
+loudly rather than silently serving an unblended adapter. A gate on such a build must refuse at
+startup with that reason named, in the same general-before-specific order the other routing
+refusals already follow: a build that cannot blend cannot route, whatever its artifact says.
+
+**Known bound, stated here rather than discovered later.** Weighted mixture is a Metal-only
+capability today, and Metal serving requires a Q4 checkpoint while the embedder that produces the
+gate's context vector rejects Q4 checkpoints unconditionally. Those two requirements are satisfied
+by disjoint checkpoint classes, so the full path is not reachable on a single directory until the
+embedder is loaded from a second one. This decision does not fix that; it records that the output
+contract above is specified against a path whose other end is still blocked, so that a reader does
+not mistake a specified contract for a reachable one.
+
+**Falsifier.** The claim this decision makes is that a gate's output can reach the blend. It is
+false until one test drives a gate output through the serving path into a weighted blend and
+asserts the blended adapter differs from the one produced by uniform weights over the same
+adapters. The uniform-weight arm is the control and is load-bearing: a blend that ignored its
+weights entirely would satisfy every other assertion in that test. Until that test exists, decision
+6 is a specification and nothing in the tree has been shown to meet it.
+
 ## What exists at this ADR's merge base, and what this chain builds
 
 This ADR cites `router_state::write_artifact`, `ServingRouter::new` and a format-4 artifact. None of
@@ -281,6 +342,12 @@ is the specification the later PRs are built to satisfy: the router-state module
 format and its version lineage, and the serving façade arrive in the router-artifact and producer
 PRs of this same chain. Until they do, every API name in this document is a name this chain is
 obliged to create, not one a reader can open.
+
+Decision 6 is the exception and is deliberately the other way round. `blend_lora_layer_data`
+shipped in #443 and a reader can open it today; the contract in that decision is written
+against an existing function rather than a promised one. That is why the gap it names is a
+connection rather than a component, and it is called out here because the blanket statement
+above would otherwise read as covering it.
 
 The practical consequence is for whoever reviews the producer PR. The compatibility and rollback
 decisions here are testable only against that PR's own tree, so the reviewer of this ADR is asked
