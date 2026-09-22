@@ -268,6 +268,12 @@ be widened by an implementation that finds an ordinary refit inconvenient.
 
 ### 6. The gate's output is per-adapter weights, and the contract it must satisfy already exists
 
+This decision serves a product instruction given on 2026-09-16: load LoRA adapters at
+runtime, hold several at once, and then build mixture of LoRA with dynamic weight learning.
+It is quoted here so the decision can be checked against what was asked rather than against
+a later paraphrase of it. The first two parts are reachable today; this decision is about
+the third.
+
 Decision 3 says the learned action is the whole mixture rather than an adapter index. That settles
 what the gate _decides_. It does not say what the gate _emits_, and the gap between those two is
 where this chain currently ends: the serving path selects adapters by name and has no code that
@@ -295,11 +301,33 @@ So the contract this decision fixes is the one between the gate and that functio
 decision 1. The schema is what makes the vector interpretable; a weight vector without its lineage
 is a list of numbers with no referent, which is the failure decision 1 exists to prevent.
 
-**Normalisation, and where it happens.** Weights are normalised to sum to 1 before they reach the
-blend, and the serving-side floor of ADR-091 is applied _before_ that normalisation, not after.
-The order matters and is not a detail: the floor clamps coordinates and the renormalisation that
-follows is what keeps the applied mixture a convex combination. Applying the floor afterwards would
-leave a vector that no longer sums to 1 and would silently rescale the blended adapter.
+**Normalisation and the floor, stated in ADR-091's own terms.** An earlier draft of this decision
+said the ADR-091 floor is a clamp applied before normalisation. That is wrong in both direction and
+mechanism, and the correction is recorded rather than quietly swapped because the wrong version is
+the intuitive one. ADR-091 decision 2 is explicit: the floor applies **after** normalisation, and it
+**drops rather than damps** — an adapter whose normalised weight is below `epsilon` is removed from
+the mixture and the survivors are renormalised, because an adapter carried at 0.001 pays its full
+rank in the decode of every token and changes nothing.
+
+So the learned path is: gate scores at temperature `tau`, normalised to 1 over the selected set,
+drop every coordinate below `epsilon`, renormalise the survivors. The post-drop invariant is that
+every adapter still in the mixture carries weight `>= epsilon`, and one pass suffices: renormalising
+survivors only scales them up, so it cannot create a new sub-`epsilon` coordinate.
+
+A clamp would have a weaker invariant, which is worth recording as the reason not to drift back to
+it: clamping a distribution at `c` and renormalising guarantees only `>= c/(1 + n*c)`, not `>= c`.
+At `n = 8` and `c = 0.2` the smallest surviving weight is `0.083`. A floor that does not hold its own
+value is not a floor, which is part of why ADR-091 drops instead.
+
+The caller path differs in exactly one respect (ADR-091 decision 4): caller-supplied weights keep
+their magnitudes and are floored **without** renormalisation, since scaling survivors up to recover
+dropped mass would move the caller's chosen strength by an amount depending on what was dropped.
+
+**Consequence for the shape above, which the first draft glossed.** The gate emits a full-width
+vector aligned to the ordered adapter schema, and the blend receives only the survivors. Those are
+different widths whenever a drop occurs, so alignment is a property of the emitted vector and never
+of the argument handed to `blend_lora_layer_data`. Reading the two as one vector is how a dropped
+adapter's weight would be applied to its neighbour.
 
 **Where they enter.** The normalised vector is zipped with the resident adapters named by the
 artifact's schema and handed to `blend_lora_layer_data` as its `(adapter, weight)` pairs. Nothing
