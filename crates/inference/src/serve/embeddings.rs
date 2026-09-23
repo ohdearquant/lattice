@@ -650,6 +650,104 @@ pub fn embed_items(
     ))
 }
 
+/// Maximum aggregate scaffold token count across every item in a single
+/// pooled `/v1/embeddings` request (the `lattice` binary's vision-language
+/// route), independent of each item's own `check_item_fits_window` cap.
+/// Without this, [`MAX_EMBEDDING_INPUT_COUNT`] alone does not bound
+/// [`embed_items`]'s aggregate work: a request at that item-count cap, with
+/// every item near the checkpoint's own hard per-item ceiling
+/// (`max_position_embeddings.min(8192)`, see [`EmbeddingModel::max_context`]),
+/// would still run thousands of individual pooled-decoder forward passes
+/// back to back inside one unbounded `spawn_blocking` job, with no
+/// concurrency cap on top either (issue #1397).
+///
+/// Chosen as a bound on the worst case the route's own admission cap can
+/// ever admit at once, rather than derived from a measured per-token memory
+/// footprint the way the sibling `lattice_serve` route's
+/// `MAX_EMBEDDINGS_TOTAL_TOKENS` is for `BertModel`'s packed-matmul buffers:
+/// 4 concurrent jobs (`lattice`'s own `EMBEDDING_MAX_CONCURRENT_JOBS`) times
+/// 8,192 (the hard per-item scaffold-token ceiling every item is already
+/// capped to) bounds the case where the admission cap is entirely full of
+/// maximal-length items. Numerically the same total as
+/// `MAX_EMBEDDINGS_TOTAL_TOKENS`, by coincidence of both being 4 x 8,192 --
+/// the two constants bound different compute shapes (packed batched-matmul
+/// buffer size there, pooled per-item attention cost here) and are not
+/// meant to stay equal if either changes.
+pub const MAX_EMBEDDING_TOTAL_TOKENS: usize = 4 * 8_192;
+
+/// Rejects a pooled `/v1/embeddings` request whose aggregate scaffold token
+/// count (summed across every `input` item, after each item's own
+/// `check_item_fits_window` admission) exceeds
+/// [`MAX_EMBEDDING_TOTAL_TOKENS`] -- the pooled-route sibling of
+/// [`check_embeddings_total_tokens`]. Computes the same per-item counts
+/// [`embed_items`] does (tokenizing text, preprocessing images for their
+/// scaffold length); `embed_items` recomputes these counts itself when it
+/// actually runs, the same tokenize-twice trade `BertModel::encode_batch`
+/// already makes for the sibling route.
+///
+/// The `lattice` binary's caller (`embeddings()` in `serve.rs`) deliberately
+/// does NOT run this before its admission semaphore the way the sibling
+/// route runs `check_embeddings_total_tokens` before ITS admission check:
+/// this function's image branch calls [`EmbeddingModel::image_scaffold_token_count`],
+/// which fully decodes and resizes the image, so running it pre-admission
+/// would (a) let a request the admission cap should have refused still pay
+/// for that decode, defeating the cap's purpose of bounding aggregate work,
+/// and (b) put CPU-heavy work back on the async executor instead of inside
+/// `spawn_blocking`. The caller therefore acquires its admission permit
+/// FIRST and calls this function from inside the admitted `spawn_blocking`
+/// job, before [`embed_items`]. The resulting caller-visible priority is
+/// **busy (503) before budget (400)** -- the reverse of the sibling route's
+/// own within-request order (which checks budget with no admission cap to
+/// order it against in the first place) -- and this is NOT sibling-order
+/// parity for that reason; it is a different, deliberate tradeoff for a
+/// route whose per-item counting is expensive enough to need admission
+/// first.
+///
+/// Runs each item's window check in `input` order, mirroring
+/// [`embed_items`]'s own order, so a single oversized item is reported as
+/// `context_length_exceeded` naming that item rather than the coarser
+/// aggregate `batch_token_budget_exceeded`.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] (`context_length_exceeded`), via
+/// `check_item_fits_window`, for the first item whose scaffold token count
+/// exceeds the loaded model's context window. Otherwise returns
+/// [`ApiError::BadRequest`] (`batch_token_budget_exceeded`) naming the
+/// request's total token count and the limit; propagates
+/// [`map_embedding_error`]'s mapped error if an image item's scaffold token
+/// count cannot be computed.
+pub fn check_pooled_embedding_total_tokens(
+    embedder: &EmbeddingModel,
+    items: &[NormalizedEmbeddingItem],
+) -> Result<(), ApiError> {
+    let max_context = embedder.max_context();
+    let mut total_tokens = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        let (admission_count, real_count) = match item {
+            NormalizedEmbeddingItem::Text(text) => embedder.tokenize_lengths(text),
+            NormalizedEmbeddingItem::Image(bytes) => {
+                let count = embedder
+                    .image_scaffold_token_count(bytes, "")
+                    .map_err(map_embedding_error)?;
+                (count, count)
+            }
+        };
+        check_item_fits_window(index, admission_count, max_context)?;
+        total_tokens += real_count;
+    }
+    if total_tokens > MAX_EMBEDDING_TOTAL_TOKENS {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "input has {total_tokens} total scaffold tokens across all items; maximum is \
+                 {MAX_EMBEDDING_TOTAL_TOKENS}"
+            ),
+            code: "batch_token_budget_exceeded",
+        });
+    }
+    Ok(())
+}
+
 /// Tiny end-to-end fixture: same shape as `pooled_embed`'s own unit tests
 /// (one full-attention layer, 8-dim hidden, 8x8 synthetic PNG) so the whole
 /// decode + pooling path is exercised without a real checkpoint. Duplicated
@@ -1657,6 +1755,79 @@ mod tests {
         assert_eq!(data[0].index, 0);
         assert_eq!(data[1].index, 1);
         assert_eq!(data[2].index, 2);
+    }
+
+    #[test]
+    fn check_pooled_embedding_total_tokens_accepts_within_budget() {
+        let model = tiny_embedding_model();
+        let items =
+            normalize_embedding_items(vec![EmbeddingInputItem::Text("a".to_string())]).unwrap();
+        check_pooled_embedding_total_tokens(&model, &items).unwrap();
+    }
+
+    #[test]
+    fn check_pooled_embedding_total_tokens_rejects_over_budget() {
+        let model = tiny_embedding_model();
+        // Every item individually fits `model.max_context()` (512, see
+        // `tiny_embedding_model`'s config); the aggregate across all of them
+        // does not. Repeated single-character words tokenize to one token
+        // each for this vocab's no-merge tokenizer (see
+        // `tiny_embedding_model`'s doc comment), so 80 items of 480 "a"
+        // characters is 38,400 aggregate tokens against a 32,768 budget.
+        let item_len = 480;
+        assert!(item_len <= model.max_context());
+        let item_count = 80;
+        assert!(
+            item_count * item_len > MAX_EMBEDDING_TOTAL_TOKENS,
+            "fixture must actually exceed the budget it tests"
+        );
+        let items = normalize_embedding_items(
+            std::iter::repeat_with(|| EmbeddingInputItem::Text("a".repeat(item_len)))
+                .take(item_count)
+                .collect(),
+        )
+        .unwrap();
+        let err = check_pooled_embedding_total_tokens(&model, &items).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "batch_token_budget_exceeded");
+                assert!(
+                    message.contains(&MAX_EMBEDDING_TOTAL_TOKENS.to_string()),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_pooled_embedding_total_tokens_reports_the_oversized_item_first() {
+        // A single item whose OWN scaffold token count already exceeds
+        // `max_context` must be reported as `context_length_exceeded`
+        // (naming that item), not the coarser aggregate
+        // `batch_token_budget_exceeded` -- mirroring `embed_items`'s own
+        // per-item-first check order.
+        let base = tiny_embedding_model();
+        let mut config = base.config.clone();
+        config.max_position_embeddings = 4;
+        let model = EmbeddingModel::new(
+            base.weights.clone(),
+            config,
+            base.vision_weights.clone(),
+            base.tokenizer.clone(),
+        );
+        assert_eq!(model.max_context(), 4);
+
+        let items =
+            normalize_embedding_items(vec![EmbeddingInputItem::Text("a".repeat(10))]).unwrap();
+        let err = check_pooled_embedding_total_tokens(&model, &items).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "context_length_exceeded");
+                assert!(message.contains("input item 0"), "message: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 
     #[test]
