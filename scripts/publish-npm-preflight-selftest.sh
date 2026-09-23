@@ -188,25 +188,50 @@ mkdir -p "$MSB"
 MATRIX_NPM_CACHE="$MSB/npm-cache"
 mkdir -p "$MATRIX_NPM_CACHE"
 
-# Build a fixture NATIVE_DIR ($1) whose optionalDependencies match the
-# platform/version pairs given as "$2..." (each "platform:version"). Copies
-# the real assert-platform-packlist.mjs and assert-packlist.mjs alongside it
-# so the packlist guard steps exercise the actual production checks, not a
-# stand-in.
+# Real napi-rs Rust-triple <-> platform-suffix pairing, mirroring
+# npm/lattice-embed-native/package.json's own napi.targets/optionalDependencies
+# keys. Only entries fixtures in this file actually use need to be present.
+triple_for_platform() {  # $1=platform suffix (e.g. darwin-arm64)
+  case "$1" in
+    darwin-arm64) echo "aarch64-apple-darwin" ;;
+    darwin-x64) echo "x86_64-apple-darwin" ;;
+    linux-x64-gnu) echo "x86_64-unknown-linux-gnu" ;;
+    linux-x64-musl) echo "x86_64-unknown-linux-musl" ;;
+    linux-arm64-gnu) echo "aarch64-unknown-linux-gnu" ;;
+    linux-arm64-musl) echo "aarch64-unknown-linux-musl" ;;
+    win32-x64-msvc) echo "x86_64-pc-windows-msvc" ;;
+    *)
+      echo "FATAL: triple_for_platform: no known triple for '$1' -- add one" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# Build a fixture NATIVE_DIR ($1) whose optionalDependencies AND napi.targets
+# match the platform/version pairs given as "$2..." (each "platform:version")
+# -- the two fields agree by construction, so this fixture is the must-PASS
+# shape for platform_matrix_completeness_guard's fallback (no
+# assert-prebuild-matrix.mjs present) path; arms that want to test a
+# DISAGREEMENT between the two fields build their own package.json instead of
+# calling this helper. Copies the real assert-platform-packlist.mjs and
+# assert-packlist.mjs alongside it so the packlist guard steps exercise the
+# actual production checks, not a stand-in.
 build_native_fixture() {
   native="$1"; shift
   mkdir -p "$native/scripts"
   cp "$REAL_PACKLIST_ASSERT" "$native/scripts/assert-platform-packlist.mjs"
   cp "$REAL_MAIN_PACKLIST_ASSERT" "$native/scripts/assert-packlist.mjs"
   deps=""
+  targets=""
   sep=""
   for pv in "$@"; do
     p="${pv%%:*}"; v="${pv#*:}"
     deps="${deps}${sep}\"@khive-ai/lattice-embed-$p\": \"$v\""
+    targets="${targets}${sep}\"$(triple_for_platform "$p")\""
     sep=", "
   done
   cat > "$native/package.json" <<EOF
-{"name": "@khive-ai/lattice-embed", "version": "1.2.3", "optionalDependencies": {$deps}}
+{"name": "@khive-ai/lattice-embed", "version": "1.2.3", "napi": {"targets": [$targets]}, "optionalDependencies": {$deps}}
 EOF
 }
 
@@ -247,6 +272,152 @@ else
   echo "  FAIL:   -> missing empty-matrix diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
 fi
 
+echo
+echo "=== publish-npm.sh platform matrix completeness guard self-test (fallback path) ==="
+# platform_matrix_completeness_guard is split out of platform_matrix_guard's
+# body specifically so these arms can call it directly, without also needing
+# the full per-platform npm/<platform>/ tree run_matrix_case's fixtures build
+# -- this guard runs BEFORE that loop and reads only $NATIVE_DIR and
+# $EXPECTED_PLATFORMS (the latter is what platform_matrix_guard itself
+# computes right before calling it, so callers set it directly here, the same
+# way run_pkgjson_case sets NATIVE_DIR for check_platform_pkgjson above).
+run_completeness_case() {  # $1=NATIVE_DIR $2=EXPECTED_PLATFORMS (space-separated)
+  RUNNER="$MSB/completeness-runner.sh"
+  {
+    echo 'PUBLISH_NPM_SH_LIB_ONLY=1'
+    printf '. %q\n' "$SRC"
+    printf 'NATIVE_DIR=%q\n' "$1"
+    printf 'EXPECTED_PLATFORMS=%q\n' "$2"
+    printf 'platform_matrix_completeness_guard\n'
+    printf 'echo COMPLETENESS_GUARD_PASSED\n'
+  } > "$RUNNER"
+  OUT="$(/bin/sh -c "set -e; . '$RUNNER'" 2>&1)"
+  return $?
+}
+
+# (h2) fallback path (no assert-prebuild-matrix.mjs present under
+#      $NATIVE_DIR/scripts/): napi.targets declares seven platforms,
+#      optionalDependencies lists only one -- the exact shape of the reported
+#      defect (a truncated optionalDependencies that the old code accepted
+#      because its "expectation" was derived from optionalDependencies
+#      itself). Must fail closed.
+NATIVE="$MSB/h2-incomplete-fallback"
+mkdir -p "$NATIVE"
+cat > "$NATIVE/package.json" <<'EOF'
+{"name": "@khive-ai/lattice-embed", "version": "1.2.3",
+ "napi": {"targets": ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "x86_64-pc-windows-msvc"]},
+ "optionalDependencies": {"@khive-ai/lattice-embed-darwin-arm64": "1.2.3"}}
+EOF
+run_completeness_case "$NATIVE" "darwin-arm64"; rc=$?
+check "(h2) fallback: napi.targets/optionalDependencies count mismatch fails closed" 1 $rc
+if printf '%s' "$OUT" | grep -qF "declares 7 napi.targets but"; then
+  echo "  PASS:   -> count-mismatch diagnostic printed"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> missing count-mismatch diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+# (h3) fallback-path must-PASS control: napi.targets and optionalDependencies
+#      name the same COUNT of platforms (build_native_fixture keeps them in
+#      lockstep by construction) -- without this, (h2) alone cannot tell "the
+#      guard correctly rejects a mismatch" apart from "the guard always
+#      rejects regardless of input".
+NATIVE="$MSB/h3-complete-fallback"; build_native_fixture "$NATIVE" "darwin-arm64:1.2.3" "linux-x64-gnu:1.2.3"
+run_completeness_case "$NATIVE" "darwin-arm64 linux-x64-gnu"; rc=$?
+check "(h3) fallback: matching napi.targets/optionalDependencies count passes" 0 $rc
+if printf '%s' "$OUT" | grep -qF "COMPLETENESS_GUARD_PASSED"; then
+  echo "  PASS:   -> guard reached the end of platform_matrix_completeness_guard"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> did not reach end of function (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+# (h4) fallback path: napi.targets absent entirely -- must fail closed rather
+#      than silently trusting an optionalDependencies list nothing verifies.
+NATIVE="$MSB/h4-no-napi-field"
+mkdir -p "$NATIVE"
+cat > "$NATIVE/package.json" <<'EOF'
+{"name": "@khive-ai/lattice-embed", "version": "1.2.3",
+ "optionalDependencies": {"@khive-ai/lattice-embed-darwin-arm64": "1.2.3"}}
+EOF
+run_completeness_case "$NATIVE" "darwin-arm64"; rc=$?
+check "(h4) fallback: missing napi.targets fails closed" 1 $rc
+if printf '%s' "$OUT" | grep -qF "has no napi.targets array"; then
+  echo "  PASS:   -> missing-napi-targets diagnostic printed"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> missing diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+echo
+echo "=== publish-npm.sh platform matrix completeness guard self-test (real assert-prebuild-matrix.mjs path) ==="
+# These arms exercise the STRONGER branch: when $NATIVE_DIR/scripts/
+# assert-prebuild-matrix.mjs is present, platform_matrix_completeness_guard
+# runs it directly rather than falling back to the count-only comparison
+# above. Using the REAL assertion script and the REAL workflow file (not a
+# stand-in) against a REAL, complete copy of the actual repo metadata is also
+# this run's evidence for whether napi.targets, optionalDependencies, and the
+# CI build workflow agree today -- see (h6).
+REAL_PREBUILD_MATRIX_ASSERT="$REPO/npm/lattice-embed-native/scripts/assert-prebuild-matrix.mjs"
+REAL_PREBUILD_WORKFLOW="$REPO/.github/workflows/npm-prebuild.yml"
+REAL_NATIVE_PKGJSON="$REPO/npm/lattice-embed-native/package.json"
+for f in "$REAL_PREBUILD_MATRIX_ASSERT" "$REAL_PREBUILD_WORKFLOW" "$REAL_NATIVE_PKGJSON"; do
+  if [ ! -f "$f" ]; then
+    echo "FATAL: $f not found -- has it moved?" >&2
+    exit 1
+  fi
+done
+
+# Build a fixture tree with the REAL assert-prebuild-matrix.mjs and the REAL
+# npm-prebuild.yml workflow at the same relative depth
+# assert-prebuild-matrix.mjs resolves them at (three directories up from
+# itself: scripts/ -> lattice-embed-native/ -> npm/ -> root), so the
+# assertion's own workflow-path resolution runs for real against $1's own
+# package.json, rather than a stand-in for it.
+build_prebuild_matrix_fixture_root() {  # $1=fixture root
+  root="$1"
+  native="$root/npm/lattice-embed-native"
+  mkdir -p "$native/scripts" "$root/.github/workflows"
+  cp "$REAL_PREBUILD_MATRIX_ASSERT" "$native/scripts/assert-prebuild-matrix.mjs"
+  cp "$REAL_PREBUILD_WORKFLOW" "$root/.github/workflows/npm-prebuild.yml"
+}
+
+# (h5) the real assert-prebuild-matrix.mjs, run against the issue's own
+#      reproduction shape: napi.targets carries the full real target list
+#      (untouched), optionalDependencies is truncated to one platform. Must
+#      fail closed.
+build_prebuild_matrix_fixture_root "$MSB/h5-real-incomplete"
+NATIVE="$MSB/h5-real-incomplete/npm/lattice-embed-native"
+node -e '
+  const fs = require("fs")
+  const pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+  const only = "@khive-ai/lattice-embed-darwin-arm64"
+  pkg.optionalDependencies = { [only]: pkg.optionalDependencies[only] }
+  fs.writeFileSync(process.argv[2], JSON.stringify(pkg, null, 2))
+' "$REAL_NATIVE_PKGJSON" "$NATIVE/package.json"
+run_completeness_case "$NATIVE" "darwin-arm64"; rc=$?
+check "(h5) real assert-prebuild-matrix.mjs: truncated optionalDependencies fails closed" 1 $rc
+if printf '%s' "$OUT" | grep -qF "assert-prebuild-matrix.mjs failed"; then
+  echo "  PASS:   -> real-assertion-failed diagnostic printed"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> missing diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+# (h6) must-PASS control: the same real assertion script and real workflow,
+#      run against the REAL, unmodified npm/lattice-embed-native/package.json
+#      -- without this, (h5) alone cannot tell "the guard correctly rejects a
+#      truncated matrix" apart from "the guard always rejects regardless of
+#      input". A pass here is also this run's evidence that napi.targets,
+#      optionalDependencies, and the CI build workflow agree as of this run.
+build_prebuild_matrix_fixture_root "$MSB/h6-real-complete"
+NATIVE="$MSB/h6-real-complete/npm/lattice-embed-native"
+cp "$REAL_NATIVE_PKGJSON" "$NATIVE/package.json"
+run_completeness_case "$NATIVE" "darwin-arm64"; rc=$?
+check "(h6) real assert-prebuild-matrix.mjs: current repo metadata agrees and passes" 0 $rc
+if printf '%s' "$OUT" | grep -qF "COMPLETENESS_GUARD_PASSED"; then
+  echo "  PASS:   -> guard reached the end of platform_matrix_completeness_guard"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> did not reach end of function (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+echo
 # (i) platform .node present but misnamed -- must fail closed (Defect B,
 #     exact-path guard rather than a *.node glob). "files" lists the
 #     wrong-name file too (not the name "main" declares), so the packlist
