@@ -61,6 +61,121 @@ fn main() {
     }
 }
 
+/// Canonical model identity used to key `prod_anchor_band`, derived the same
+/// way the scope-guard check in `run()` already recognizes "the 0.8B
+/// checkpoint": a substring match on `LATTICE_MODEL_DIR`. This harness has
+/// only ever loaded, and its production-anchor bands have only ever been
+/// calibrated against, that one checkpoint (see the module doc's "Scope
+/// guard: 0.8B path ONLY" and `LATTICE_MODEL_DIR`'s own default above).
+/// `None` covers every model directory that substring match does not
+/// recognize, including a differently-sized or differently-quantized
+/// checkpoint reached by overriding `LATTICE_MODEL_DIR`.
+#[cfg(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "bench-internals"
+))]
+fn model_identity(model_dir_str: &str) -> Option<&'static str> {
+    if model_dir_str.contains("0.8b") || model_dir_str.contains("0_8b") {
+        Some("qwen3.5-0.8b")
+    } else {
+        None
+    }
+}
+
+/// Production-total anchor bands, versioned to a measured baseline and keyed
+/// on `(model, length)`.
+///
+/// Baseline: re-measured at d96c26fccce846db9174e1c1ad15ebb0f2bf6856 on the
+/// qwen3.5-0.8b checkpoint, from four ABBA arms (base1/head1/head2/base2) on
+/// an idle machine, unmodified production dispatch, warmup>=2 repeats>=5:
+/// 1.227x @1024, 1.154x @4096. Bands are baseline -20%/+20%, floored at 1.0
+/// (a ratio below 1.0 would mean chunking made the production path slower,
+/// which is a different alarm than "this anchor is stale"). Full derivation
+/// and the underlying per-arm data: issue #1654.
+///
+/// The previous baseline recorded here (2.415x @1024, 2.072x @4096, 1.476x
+/// @16384) is removed rather than kept under a guessed identity: those
+/// ratios run roughly double this checkpoint's measured behavior and no
+/// model they were actually calibrated against could be established (see
+/// #1654) — carrying them forward keyed to a name would repeat the defect
+/// this `(model, length)` key exists to close.
+///
+/// 16384 has no re-measured baseline under this method and is left with no
+/// calibrated band for any model until one exists; it takes the `None` arm
+/// below unconditionally.
+///
+/// Anchors go stale as unrelated optimizations land: when this flag fires on
+/// an otherwise-clean idle run, re-measure the baseline at current HEAD and
+/// update these constants (with the new SHA) rather than widening the band.
+/// A `(model, length)` pair with no calibrated band returns `None`, and the
+/// caller skips the tight check instead of comparing against a band
+/// calibrated for a different checkpoint or a different length.
+#[cfg(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "bench-internals"
+))]
+fn prod_anchor_band(model: Option<&str>, length: usize) -> Option<(f64, f64)> {
+    match (model, length) {
+        (Some("qwen3.5-0.8b"), 1024) => Some((1.00, 1.47)),
+        (Some("qwen3.5-0.8b"), 4096) => Some((1.00, 1.38)),
+        _ => None,
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "bench-internals"
+))]
+mod prod_anchor_band_tests {
+    use super::{model_identity, prod_anchor_band};
+
+    #[test]
+    fn calibrated_pair_returns_its_band() {
+        assert_eq!(
+            prod_anchor_band(Some("qwen3.5-0.8b"), 1024),
+            Some((1.00, 1.47))
+        );
+        assert_eq!(
+            prod_anchor_band(Some("qwen3.5-0.8b"), 4096),
+            Some((1.00, 1.38))
+        );
+    }
+
+    /// 16384 has no re-measured baseline (issue #1654): it must stay
+    /// uncalibrated for the calibrated model too, not just for an unknown
+    /// one, and it must never fall back to the old length-only constant.
+    #[test]
+    fn calibrated_model_at_16384_is_skipped() {
+        assert_eq!(prod_anchor_band(Some("qwen3.5-0.8b"), 16384), None);
+    }
+
+    /// Length 1024 has a calibrated band, but only for qwen3.5-0.8b. An
+    /// unidentified (or differently identified) model must not reuse it —
+    /// this is the defect #1654 reports: a length-only key would return
+    /// `Some((1.00, 1.47))` here regardless of which model produced the
+    /// ratio.
+    #[test]
+    fn uncalibrated_model_at_a_calibrated_length_is_skipped() {
+        assert_eq!(prod_anchor_band(None, 1024), None);
+    }
+
+    #[test]
+    fn unknown_length_is_skipped_even_for_the_calibrated_model() {
+        assert_eq!(prod_anchor_band(Some("qwen3.5-0.8b"), 2048), None);
+    }
+
+    #[test]
+    fn model_identity_recognizes_only_the_calibrated_checkpoint() {
+        assert_eq!(model_identity("models/qwen3.5-0.8b"), Some("qwen3.5-0.8b"));
+        assert_eq!(model_identity("models/qwen3.5-0_8b"), Some("qwen3.5-0.8b"));
+        assert_eq!(model_identity("models/qwen3.5-27b"), None);
+    }
+}
+
 #[cfg(all(
     target_os = "macos",
     feature = "metal-gpu",
@@ -131,8 +246,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- SCOPE GUARD: 0.8B path only (name check is advisory; the hard check is
-    // the config-shape assert after Metal init below). ---
-    if !model_dir_str.contains("0.8b") && !model_dir_str.contains("0_8b") {
+    // the config-shape assert after Metal init below). Uses the same identity
+    // check the production-anchor band lookup below keys its calibration on. ---
+    if model_identity(&model_dir_str).is_none() {
         eprintln!(
             "[bench] WARNING: LATTICE_MODEL_DIR={model_dir_str} does not look like the 0.8B \
              checkpoint. This harness only measures configs supporting the chunked GDN \
@@ -295,23 +411,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             max: xs[n - 1],
             iqr_pct_of_median,
             suspect: iqr_pct_of_median > 15.0,
-        }
-    }
-
-    /// Production-total anchor bands, versioned to a measured baseline.
-    ///
-    /// Baseline: 2026-07-08 idle-machine run at f8c302f9e (serial_prod_total /
-    /// chunked_prod_total, unmodified production dispatch, warmup>=2 repeats>=5):
-    /// 2.415x @1024, 2.072x @4096, 1.476x @16384. Bands are baseline -20%/+20%.
-    /// Anchors go stale as unrelated optimizations land: when this flag fires on an
-    /// otherwise-clean idle run, re-measure the baseline at current HEAD and update
-    /// these constants (with the new SHA) rather than widening the band.
-    fn prod_anchor_band(length: usize) -> Option<(f64, f64)> {
-        match length {
-            1024 => Some((1.93, 2.90)),
-            4096 => Some((1.66, 2.49)),
-            16384 => Some((1.18, 1.77)),
-            _ => None,
         }
     }
 
@@ -714,15 +813,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             f64::NAN
         };
-        let band = prod_anchor_band(length);
+        let model = model_identity(&model_dir_str);
+        let band = prod_anchor_band(model, length);
         let prod_anchor_flag = match band {
             Some((lo, hi)) => !(lo..=hi).contains(&prod_ratio) || prod_ratio.is_nan(),
             None => false,
         };
         if band.is_none() {
             println!(
-                "# len={length}: no production-anchor band calibrated for this length \
-                 (bands: 1024/4096/16384); tight anchor skipped"
+                "# len={length}: no production-anchor band calibrated for model={} at this \
+                 length (bands: qwen3.5-0.8b @ 1024/4096); tight anchor skipped",
+                model.unwrap_or("unrecognized"),
             );
         }
 
@@ -775,12 +876,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if prod_anchor_flag {
             let (lo, hi) = band.expect("prod_anchor_flag only set when band is Some");
+            // `band` is only `Some` when `model_identity` matched, so this unwrap is safe.
+            let model_name = model.unwrap_or("?");
             length_flags.push(format!(
                 "FLAG[production_total_anchor]: serial_prod_total/chunked_prod_total=\
                  {prod_ratio:.3}x at len={length} is outside the expected {lo:.2}-{hi:.2}x band \
-                 (baseline 2026-07-08 @ f8c302f9e) — measured under the unmodified production \
-                 dispatch path (single command buffer per chunk, same regime the baseline was \
-                 measured under). Do NOT trust this length's speedup claim."
+                 (baseline @ d96c26fccce846db9174e1c1ad15ebb0f2bf6856 on {model_name}, four ABBA \
+                 arms, ±20%/floor-1.0 rule — see issue #1654) — measured under the unmodified \
+                 production dispatch path (single command buffer per chunk, same regime the \
+                 baseline was measured under). Do NOT trust this length's speedup claim."
             ));
         }
         if length_flags.is_empty() {
