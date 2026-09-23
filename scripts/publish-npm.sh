@@ -125,6 +125,80 @@ platform_binaries_present() {
     return 0
 }
 
+# Guard: reject a $NATIVE_DIR/package.json whose optionalDependencies is
+# COMPLETE relative to itself but INCOMPLETE relative to the actual supported
+# platform set. platform_matrix_guard's EXPECTED_PLATFORMS (read by this
+# function as a global, same convention as the rest of this file) is derived
+# from optionalDependencies, so every check downstream of it -- including the
+# empty-set check right above its call site -- validates the release against
+# whatever optionalDependencies currently says, even if that list has been
+# truncated. Drop entries from optionalDependencies and the "expectation"
+# shrinks to match; nothing in that check family can ever notice.
+#
+# napi.targets is a second, independently-authored field in the same
+# package.json: napi-rs's own build tooling ("npm run artifacts" / "npm run
+# create-npm-dirs", invoked by main() below and by CI) reads it to decide
+# which platforms to compile for and which npm/<platform>/ directories to
+# assemble. An edit that only touches optionalDependencies -- the exact shape
+# of the defect this guard exists for -- leaves napi.targets untouched, so
+# comparing the two catches it.
+#
+# The exact-set-by-name version of this comparison already exists:
+# $NATIVE_DIR/scripts/assert-prebuild-matrix.mjs (run via "npm run
+# test:prebuild") cross-checks napi.targets, optionalDependencies, and the CI
+# build workflow against one canonical target list. It is wired into
+# npm-prebuild.yml's package/publish jobs, but not into this script, so a
+# bare `make publish-npm` / `make publish-npm-dry` (Makefile:52-53, which
+# call this script directly and never touch that workflow) skip it entirely.
+# Run it directly when it is present, so every entry point that reaches this
+# guard gets the same exact check CI already runs. Fall back to a count-only
+# comparison against napi.targets only when that assertion script is absent
+# (e.g. napi-rs's dev tooling was not checked out) -- weaker (it cannot tell
+# two platform sets of equal size apart), but it still catches the truncation
+# shape this guard exists for, rather than trusting optionalDependencies
+# outright whenever the stronger check cannot run. Re-deriving napi-rs's own
+# Rust-triple-to-platform-name mapping a second time in this fallback would
+# duplicate knowledge assert-prebuild-matrix.mjs already owns; count is the
+# comparison available without it.
+platform_matrix_completeness_guard() {
+    prebuild_matrix_assertion="$NATIVE_DIR/scripts/assert-prebuild-matrix.mjs"
+    if [ -f "$prebuild_matrix_assertion" ]; then
+        if ! node "$prebuild_matrix_assertion" >/dev/null; then
+            echo "ERROR: $prebuild_matrix_assertion failed -- napi.targets," >&2
+            echo "       optionalDependencies, and/or the CI build workflow do not all name" >&2
+            echo "       the same platform set. Re-run 'node $prebuild_matrix_assertion' to" >&2
+            echo "       see which check failed and reconcile the metadata before publishing." >&2
+            exit 1
+        fi
+        return 0
+    fi
+
+    napi_target_count=$(node -p "
+        (function () {
+            var napi = require('$NATIVE_DIR/package.json').napi;
+            return napi && Array.isArray(napi.targets) ? napi.targets.length : -1;
+        })()
+    ")
+    if [ "$napi_target_count" = "-1" ]; then
+        echo "ERROR: $NATIVE_DIR/package.json has no napi.targets array -- cannot verify" >&2
+        echo "       optionalDependencies against it. A real release always declares both." >&2
+        exit 1
+    fi
+
+    expected_count=0
+    for _matrix_completeness_p in $EXPECTED_PLATFORMS; do
+        expected_count=$((expected_count + 1))
+    done
+
+    if [ "$napi_target_count" != "$expected_count" ]; then
+        echo "ERROR: $NATIVE_DIR/package.json declares $napi_target_count napi.targets but" >&2
+        echo "       optionalDependencies lists $expected_count platform(s): $EXPECTED_PLATFORMS." >&2
+        echo "       These must name the same platform set. Reconcile the two lists before" >&2
+        echo "       publishing." >&2
+        exit 1
+    fi
+}
+
 # Guard: require every platform advertised in the main package's
 # optionalDependencies to carry its native binary -- not any nonempty subset,
 # and not a zero-length set either (an empty optionalDependencies object is
@@ -171,6 +245,8 @@ platform_matrix_guard() {
         echo "       platform binaries to ship." >&2
         exit 1
     fi
+
+    platform_matrix_completeness_guard
 
     NATIVE_VERSION=$(node -p "require('$NATIVE_DIR/package.json').version")
 
