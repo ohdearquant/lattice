@@ -410,7 +410,9 @@ fn fold_weight_file_into_hasher(
     // function's existing error path, same as any other unreadable shard.
     let path = crate::weights::contained_shard_path(dir, file_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-    let mut file = std::io::BufReader::new(std::fs::File::open(&path)?);
+    let opened = crate::weights::mmap_trust::open_regular_file_no_hang(&path)
+        .map_err(std::io::Error::other)?;
+    let mut file = std::io::BufReader::new(opened);
     let len = file.get_ref().metadata()?.len();
 
     hasher.update(file_name.as_bytes());
@@ -2791,6 +2793,59 @@ mod tests {
         let rev2 = derive_base_model_rev(&tmp);
         assert!(rev1.is_some());
         assert_eq!(rev1, rev2, "deriving twice on the same dir must be stable");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // #1380: `derive_base_model_rev` folds weight-shard bytes into the
+    // revision fingerprint via `fold_weight_file_into_hasher`, which used to
+    // call plain `File::open` before any file-type check ran. A FIFO
+    // planted at the weight-shard path -- reachable the moment a checkpoint
+    // directory is pointed at by config, before any tensor is even loaded --
+    // blocked this call indefinitely, defeating the doc comment's own
+    // "degrades gracefully to the config-only derivation" promise for a read
+    // failure. Proves the fix the same way as the other loader entry
+    // points: the call must return (any return) inside a deadline; asserts
+    // separately that it took the documented graceful-degradation path
+    // (`Some` config-only rev, not a panic or a hang).
+    #[test]
+    fn derive_base_model_rev_rejects_a_fifo_without_blocking() {
+        // The single-file `model.safetensors` path is deliberately NOT used
+        // here: `resolve_weight_fingerprint_files` gates that branch on
+        // `.is_file()`, which is already `false` for a FIFO, so a FIFO named
+        // `model.safetensors` never reaches `fold_weight_file_into_hasher`
+        // at all -- that branch was never part of this defect. The sharded
+        // `weight_map` branch has no such filter (it forwards manifest
+        // strings unchecked, by the same threat model as
+        // `open_manifest_entry_once`), so a FIFO named by the index is what
+        // actually exercises the guard this test is for.
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_fifo");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let index_json = r#"{"weight_map": {"a.weight": "shard0.safetensors"}}"#;
+        std::fs::write(tmp.join("model.safetensors.index.json"), index_json).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(tmp.join("shard0.safetensors"))
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must succeed to set up this test");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_dir = tmp.clone();
+        std::thread::spawn(move || {
+            let result = derive_base_model_rev(&probe_dir);
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "derive_base_model_rev did not return within 5s -- it blocked on the planted \
+             FIFO, meaning the open-time regular-file guard regressed",
+        );
+        assert!(
+            result.is_some(),
+            "a FIFO weight file must degrade gracefully to the config-only revision, \
+             not return None"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
