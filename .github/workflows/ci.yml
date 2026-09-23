@@ -433,8 +433,75 @@ jobs:
             cat "$log"
             exit "$status"
           fi
-          grep -Eq '^test .*route_[a-z0-9_]+ \.\.\. ok$' "$log"
-          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          # Self-naming for the reason recorded on the step below: a bare
+          # `grep -Eq` that fails prints nothing, and a `run:` block carries no
+          # `set -e` of its own -- the runner supplies it. Under any shell without
+          # it the failure is invisible and the block's status comes from its last
+          # line, so the assertion silently stops being one.
+          grep -Eq '^test .*route_[a-z0-9_]+ \.\.\. ok$' "$log" || {
+            echo "GUARD FAILED: no passing test matching the route_* shape in this run."
+            echo "The mixture filter selected something, but none of it was a router test."
+            exit 1
+          }
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || {
+            echo "GUARD FAILED: no passing test-result line with a non-zero count."
+            exit 1
+          }
+      # The step above filters on `mixture::`, which is a SUBSTRING filter and so
+      # never selects `serve::routing::`. The two artifact-vs-gate refusal tests
+      # there are `#[cfg(feature = "mixture")]`, so they are compiled out of the
+      # default-feature `cargo test --workspace` in scripts/ci.sh as well.
+      # Measured at this commit with `--lib -- --list`, positive control on every
+      # arm: the mixture step lists 38 tests and contains neither name; the default
+      # workspace run lists 18 `serve::routing` tests and contains neither; under
+      # `--features mixture --lib serve::routing` both are present. They existed
+      # and no job ran them.
+      #
+      # What they guard is ADR-094's amendment, so they are not incidental: one
+      # refuses an artifact that misrecords its own input width, the other refuses a
+      # gate wider than its name list -- the case where `route` silently uses only
+      # the first `available.len()` columns, so the adapters its trailing columns
+      # were trained for can never be selected. A wrong-adapter answer with valid
+      # weights and no error is exactly what the amendment exists to prevent.
+      #
+      # Unlike the sibling step above, this one names those two tests EXACTLY rather
+      # than matching a shape. The reason the sibling avoids an exact list is that it
+      # would become a sibling of every test anyone adds; here the step exists FOR
+      # these two refusals, so a rename or a re-gate that drops them is the failure
+      # this step must catch, not noise. A cargo filter matching nothing exits 0, so
+      # without the name assertions a rotted filter would report these refusals as
+      # guarded in precisely the case where nothing ran.
+      - name: inference — mixture serve::routing (artifact-vs-gate refusals)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-mixture-routing-tests.log"
+          if cargo test -p lattice-inference --features mixture --lib serve::routing:: \
+            >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          # Each assertion names itself on failure rather than relying on the step
+          # shell's `-e`. A bare `grep -Eq` that fails says nothing, and when these
+          # were first written that silence read as a pass under a shell without
+          # `-e` -- a guard whose own failure is invisible is the thing it exists to
+          # prevent.
+          assert_ran() {
+            grep -Eq "^test serve::routing::tests::$1 \.\.\. ok\$" "$log" || {
+              echo "GUARD FAILED: serve::routing::tests::$1 did not run and pass."
+              echo "It is one of the two ADR-094 artifact-vs-gate refusals this step exists for;"
+              echo "a rename or a re-gate does not make it optional."
+              exit 1
+            }
+          }
+          assert_ran an_artifact_that_misrecords_its_own_input_width_refuses
+          assert_ran an_artifact_whose_gate_is_wider_than_its_name_list_refuses
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || {
+            echo "GUARD FAILED: no passing test-result line with a non-zero count."
+            exit 1
+          }
       - name: inference — mixture clippy
         run: cargo clippy -p lattice-inference --all-targets --features mixture -- -D warnings
       - name: inference — f16 + train-backward

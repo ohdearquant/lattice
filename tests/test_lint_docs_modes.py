@@ -15,6 +15,7 @@ _CHECKS = [
     "check-capability-matrix.sh:--selftest", "check-capability-matrix.sh:",
     "lint-absolute-paths.sh:--selftest", "lint-absolute-paths.sh:",
     "lint-source-markers.sh:--selftest", "lint-source-markers.sh:",
+    "lint-lora-routes.sh:--selftest", "lint-lora-routes.sh:",
 ]
 
 
@@ -43,7 +44,7 @@ class LintDocsModeTests(unittest.TestCase):
         self.script.write_bytes(_SCRIPT.read_bytes())
         self.script.chmod(0o755)
         for name in ("check-capability-matrix.sh", "lint-absolute-paths.sh",
-                     "lint-source-markers.sh"):
+                     "lint-source-markers.sh", "lint-lora-routes.sh"):
             check = scripts / name
             check.write_text(
                 f'#!/bin/sh\nprintf "{name}:%s\\n" "${{1:-}}" >>"$CHECK_LOG"\n'

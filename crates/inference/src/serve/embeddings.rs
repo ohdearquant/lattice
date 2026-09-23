@@ -87,9 +87,33 @@ fn capped_tokenizer(tokenizer: BpeTokenizer, max_context: usize) -> BpeTokenizer
     }
 }
 
+/// How a loader reads a checkpoint, recorded in a router artifact's
+/// representation so a gate cannot be served by a loader it was not trained
+/// through. Two names exist because this workspace ships two serving binaries
+/// whose embedders really do read the bytes differently: one shared constant
+/// would make every cross-binary comparison pass by construction, which is
+/// the one way this check can be wrong without ever failing.
+///
+/// `EmbeddingModel::from_directory` in this module -- a Qwen3.5 f16 decoder.
+/// The `lattice` binary reads this one; it is the only binary that checks a
+/// router gate.
+pub const QWEN35_F16_DECODER_LOADER: &str = "qwen35-f16-decoder";
+
+/// `BertModel::from_directory`, which is what `lattice_serve` embeds through.
+/// That binary has no routing path today, so nothing compares against this
+/// value at startup. It is declared anyway for two reasons: it gives the
+/// comparison in `check_representation` a second value that is REAL rather
+/// than invented, and it means a later wiring of routing into that binary
+/// names its own loader instead of silently inheriting this module's.
+pub const BERT_ENCODER_LOADER: &str = "bert-encoder";
+
 /// A loaded Qwen3.5 vision-language checkpoint used to serve pooled text and
 /// image embeddings. See the module doc comment for why this loader lives
 /// here instead of reusing `lattice-embed::vision::VisionEmbeddingModel`.
+///
+/// The two constants above used to sit between this comment and the struct,
+/// which silently reattached these three lines to a string constant and left
+/// the struct undocumented.
 pub struct EmbeddingModel {
     weights: F16ModelWeights,
     config: Qwen35Config,
