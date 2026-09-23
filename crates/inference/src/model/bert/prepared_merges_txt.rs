@@ -1,12 +1,19 @@
 //! Dormant prepared-BERT BPE `merges.txt` lexical census.
 //!
 //! This module mirrors the legacy text-level acceptance and occurrence-rank
-//! rules without constructing an effective merge table. The lexical census is
-//! allocation-free; a separate transient capability can fallibly retain only
-//! borrowed operand spans under explicit scratch and two-pass-work limits. The
-//! module performs no filesystem access and has no live caller. Unique-pair
-//! proof, first-wins effective ranks, vocabulary membership, and tokenizer
-//! construction remain deliberately out of scope.
+//! rules without constructing an effective merge table, with one deliberate
+//! divergence: the legacy loader (`tokenizer::bpe::parse_merges_txt`) takes
+//! the first two whitespace-separated tokens of a line and silently drops any
+//! remainder, so `"a b c"` becomes the pair `("a", "b")` with `c` discarded.
+//! This module refuses that line instead, naming it in the error, because a
+//! prepared-checkpoint validator's job is to reject a malformed input the
+//! legacy path would have silently misread rather than reproduce the
+//! misreading. The lexical census is allocation-free; a separate transient
+//! capability can fallibly retain only borrowed operand spans under explicit
+//! scratch and two-pass-work limits. The module performs no filesystem access
+//! and has no live caller. Unique-pair proof, first-wins effective ranks,
+//! vocabulary membership, and tokenizer construction remain deliberately out
+//! of scope.
 
 use std::mem::size_of;
 use std::num::NonZeroU64;
@@ -24,6 +31,7 @@ pub(super) enum PreparedBertBpeMergesTxtLimitAxis {
 pub(super) enum PreparedBertBpeMergesTxtExpression {
     BaseParseWorkBytes,
     MergeEntryCount,
+    MergeLineNumber,
     RetainedPairSpanBytes,
     TotalParseWorkBytes,
 }
@@ -47,6 +55,12 @@ pub(super) enum PreparedBertBpeMergesTxtError {
     ArithmeticOverflow(PreparedBertBpeMergesTxtExpression),
     InvalidUtf8 {
         valid_up_to: usize,
+    },
+    /// A line carries more than two whitespace-separated tokens. The legacy
+    /// loader takes the first two and silently drops the rest; this module
+    /// refuses the line instead, naming its 1-based line number.
+    MalformedMergeLine {
+        line: u64,
     },
     AllocationFailed {
         arena: PreparedBertBpeMergesTxtAllocationArena,
@@ -334,9 +348,15 @@ fn retain_prepared_bert_bpe_merges_txt_pairs_with_reserve<'a>(
         std::str::from_utf8(bytes).map_err(|error| PreparedBertBpeMergesTxtError::InvalidUtf8 {
             valid_up_to: error.valid_up_to(),
         })?;
-    for line in text.lines() {
-        let Some((left, right)) = legacy_merge_pair(line) else {
-            continue;
+    for (index, line) in text.lines().enumerate() {
+        let (left, right) = match legacy_merge_pair(line) {
+            LegacyMergeLine::Skip => continue,
+            LegacyMergeLine::Malformed => {
+                return Err(PreparedBertBpeMergesTxtError::MalformedMergeLine {
+                    line: legacy_merge_line_number(index)?,
+                });
+            }
+            LegacyMergeLine::Pair(left, right) => (left, right),
         };
         let actual = u64::try_from(pairs.len())
             .ok()
@@ -426,10 +446,16 @@ fn census_prepared_bert_bpe_merges_txt_after_preflight(
         })?;
 
     let mut merge_entry_count = 0_u64;
-    for line in text.lines() {
-        let Some((_left, _right)) = legacy_merge_pair(line) else {
-            continue;
-        };
+    for (index, line) in text.lines().enumerate() {
+        match legacy_merge_pair(line) {
+            LegacyMergeLine::Skip => continue,
+            LegacyMergeLine::Malformed => {
+                return Err(PreparedBertBpeMergesTxtError::MalformedMergeLine {
+                    line: legacy_merge_line_number(index)?,
+                });
+            }
+            LegacyMergeLine::Pair(_left, _right) => {}
+        }
         // Duplicate pairs deliberately remain separate occurrences. The live
         // constructor assigns their raw ranks before applying first-wins map
         // semantics, which belongs to a later retained-table slice.
@@ -453,13 +479,42 @@ fn census_prepared_bert_bpe_merges_txt_after_preflight(
     })
 }
 
-fn legacy_merge_pair(line: &str) -> Option<(&str, &str)> {
+enum LegacyMergeLine<'a> {
+    /// Blank or `#`-comment line, or a line with fewer than two operands. The
+    /// legacy loader forms no pair from it either, so nothing is discarded.
+    Skip,
+    Pair(&'a str, &'a str),
+    /// More than two whitespace-separated tokens: the legacy loader would
+    /// silently drop everything past the second one.
+    Malformed,
+}
+
+fn legacy_merge_pair(line: &str) -> LegacyMergeLine<'_> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
-        return None;
+        return LegacyMergeLine::Skip;
     }
     let mut operands = line.split_whitespace();
-    Some((operands.next()?, operands.next()?))
+    let (Some(left), Some(right)) = (operands.next(), operands.next()) else {
+        return LegacyMergeLine::Skip;
+    };
+    if operands.next().is_some() {
+        return LegacyMergeLine::Malformed;
+    }
+    LegacyMergeLine::Pair(left, right)
+}
+
+/// 1-based line number for a `str::lines()` index, for the error a caller
+/// sees; the merges-text byte count is already bounded well under `u64::MAX`
+/// by `preflight_merges_txt`, so this only fails on a platform where `usize`
+/// itself cannot fit in `u64`.
+fn legacy_merge_line_number(index: usize) -> Result<u64, PreparedBertBpeMergesTxtError> {
+    u64::try_from(index)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or(PreparedBertBpeMergesTxtError::ArithmeticOverflow(
+            PreparedBertBpeMergesTxtExpression::MergeLineNumber,
+        ))
 }
 
 fn checked_base_parse_work(merges_txt_bytes: u64) -> Result<u64, PreparedBertBpeMergesTxtError> {
@@ -502,7 +557,7 @@ mod tests {
     fn census_matches_legacy_unicode_line_and_rank_semantics() {
         let source = concat!(
             "\u{2003}#version: 0.2\r\n",
-            "a\u{00a0}b ignored\n",
+            "a\u{00a0}b\n",
             "single\n",
             "a b\n",
             "c\u{2028}d\n",
@@ -531,6 +586,52 @@ mod tests {
         .unwrap();
         assert_eq!(zero_width_facts.merge_entry_count(), 0);
         assert_eq!(zero_width_facts.max_merge_rank(), None);
+    }
+
+    #[test]
+    fn a_line_with_a_third_token_is_refused_not_truncated() {
+        // Regression for the truncation defect: `"a b c"` must be REJECTED
+        // and name its 1-based line number, never silently narrowed to the
+        // pair ("a", "b") with "c" dropped.
+        let source = b"a b\nc d e\n";
+        let bytes = u64::try_from(source.len()).unwrap();
+        assert_eq!(
+            census_prepared_bert_bpe_merges_txt(source, &limits(bytes, 10, bytes * 8)),
+            Err(PreparedBertBpeMergesTxtError::MalformedMergeLine { line: 2 })
+        );
+        assert_eq!(
+            retain_prepared_bert_bpe_merges_txt_pairs(
+                source,
+                &retained_limits(bytes, 10, 1024, bytes * 16),
+            ),
+            Err(PreparedBertBpeMergesTxtError::MalformedMergeLine { line: 2 })
+        );
+
+        // A three-token line is malformed regardless of which whitespace
+        // class separates the tokens (the NBSP case that motivated the
+        // fixture change above), and the line number counts blank/comment
+        // lines too.
+        let unicode_source = "# header\na\u{00a0}b c\n";
+        let unicode_bytes = u64::try_from(unicode_source.len()).unwrap();
+        assert_eq!(
+            census_prepared_bert_bpe_merges_txt(
+                unicode_source.as_bytes(),
+                &limits(unicode_bytes, 10, unicode_bytes * 8),
+            ),
+            Err(PreparedBertBpeMergesTxtError::MalformedMergeLine { line: 2 })
+        );
+
+        // A single incomplete token is not "malformed" in this sense: there
+        // is no extra data to discard, so the line is skipped exactly as the
+        // legacy loader skips it.
+        let incomplete = b"single\na b\n";
+        let incomplete_bytes = u64::try_from(incomplete.len()).unwrap();
+        let facts = census_prepared_bert_bpe_merges_txt(
+            incomplete,
+            &limits(incomplete_bytes, 10, incomplete_bytes * 8),
+        )
+        .unwrap();
+        assert_eq!(facts.merge_entry_count(), 1);
     }
 
     #[test]
@@ -629,7 +730,7 @@ mod tests {
     fn retained_pairs_preserve_exact_operands_occurrence_ranks_and_source_borrows() {
         let source = concat!(
             "\u{2003}# header\r\n",
-            "a\u{00a0}b ignored\n",
+            "a\u{00a0}b\n",
             "single\n",
             "a b\n",
             "c\u{2028}d\n",
