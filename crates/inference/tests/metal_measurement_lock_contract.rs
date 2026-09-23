@@ -57,6 +57,68 @@ const ADDITIONAL_GUARDED_ENTRYPOINTS: &[(&str, CallSelector)] = &[
         CallSelector::Path(&["MetalForwardPass", "new"]),
     ),
 ];
+/// Methods that drive Metal GPU work directly on an already-constructed
+/// `MetalQwen35State`, with no raw selector (`RAW_GPU_SELECTORS`) and no
+/// constructor call (`CONSTRUCTION_SELECTORS`) anywhere at the call site
+/// itself. A target reaching the GPU only through one of these is invisible
+/// to both of those lexical scans (#1527); every name below was confirmed,
+/// file by file, to be used only on a Metal state receiver and only inside
+/// the same function as its guard, so a bare method-name match cannot pick
+/// up an unrelated type's same-named method by accident.
+const STATE_WORK_SELECTORS: &[CallSelector] = &[
+    CallSelector::Method("forward_step"),
+    CallSelector::Method("forward_prefill"),
+    CallSelector::Method("forward_step_with_hidden"),
+    CallSelector::Method("forward_prefill_with_hidden"),
+    CallSelector::Method("forward_prefill_all_logits"),
+];
+/// `examples/` and `src/bin/` targets whose module closure calls a
+/// `STATE_WORK_SELECTORS` method directly, restricted to targets not already
+/// owned by `RAW_HARNESS_ENTRYPOINTS` or `ADDITIONAL_GUARDED_ENTRYPOINTS`.
+/// Closes the same admission gap #1524 closed for `benches/`
+/// (`validate_bench_harness_inventory`) on the `examples/`+`src/bin/` side:
+/// `state_driven_metal_measurement_targets_use_live_lock_bindings` asserts
+/// this list against the lexical scan, so a target added or removed from
+/// either side without updating the other fails the test — "found, but never
+/// examined" cannot happen silently. This list is deliberately narrower than
+/// the full `TARGETS_WITH_RECOGNIZED_METAL_MARKERS` classification: several
+/// targets in that broader set drive the GPU only through a higher-level
+/// wrapper (`generate`, `chat_completion`, `compute_perplexity`, the
+/// `QwenModel` `encode*` family) or through a library helper reached across
+/// a module boundary, and are out of scope for this lexical, single-file
+/// call-site check (named as a residual gap, not silently swept in).
+const TARGETS_WITH_STATE_DRIVEN_WORK: &[&str] = &[
+    "examples/bench_gdn_decode.rs",
+    "examples/bench_gdn_prefill_ab.rs",
+    "examples/bench_gdn_state.rs",
+    "examples/bench_metal_forward_allocation.rs",
+    "examples/bench_pruning.rs",
+    "examples/bench_q4_prefill.rs",
+    "examples/bench_q8_prefill.rs",
+    "examples/bench_quality.rs",
+    "examples/decode_profile.rs",
+    "examples/profile_metal.rs",
+    "examples/rss_autorelease_probe.rs",
+    "src/bin/bench_logit_dump.rs",
+];
+/// A same-file helper-mediated exception within `TARGETS_WITH_STATE_DRIVEN_WORK`,
+/// the `STATE_WORK_SELECTORS` analogue of `ADDITIONAL_GUARDED_ENTRYPOINTS`
+/// (whose own inventory test already names "helper-mediated" as a reviewed
+/// category, `cargo_target_lexical_metal_marker_inventory_is_explicit`).
+/// `examples/bench_gdn_prefill_ab.rs::run_interleaved` holds the shared lock
+/// for its whole body and calls `run_one` (a private helper, single caller,
+/// confirmed by grep) synchronously several times before releasing it; the
+/// low-level `forward_prefill` call sits in `run_one`'s own body, one lexical
+/// scope removed from the guard, so a direct `STATE_WORK_SELECTORS` scan
+/// cannot see it as enclosed even though every real invocation is. The same
+/// file's unrelated `run` function calls `forward_prefill` directly under its
+/// own guard and keeps going through the ordinary path below; only the
+/// `run_one`-mediated call sites are rerouted to validate the entrypoint
+/// (`run_one(...)`) instead of the low-level method inside it.
+const STATE_WORK_HELPER_ENTRYPOINTS: &[(&str, CallSelector)] = &[(
+    "examples/bench_gdn_prefill_ab.rs",
+    CallSelector::Path(&["run_one"]),
+)];
 
 struct BenchHarnessCall {
     selector: CallSelector,
@@ -3099,6 +3161,140 @@ fn alternate_and_helper_mediated_entrypoints_hold_the_shared_lock() {
             )
             .unwrap_or_else(|reason| panic!("{reason}"));
     }
+}
+
+/// Closes the `examples/`+`src/bin/` half of #1527 the same way #1524 closed
+/// `benches/`: a target is admitted into scrutiny by what it actually calls
+/// (`STATE_WORK_SELECTORS`), not by whether it happens to also use a raw
+/// selector, so `state.forward_prefill` / `state.forward_step` can no longer
+/// be silently skipped just because no raw Metal API call appears at the
+/// same call site. The population is the explicit `TARGETS_WITH_STATE_DRIVEN_WORK`
+/// list, asserted equal to the lexical scan below.
+#[test]
+fn state_driven_metal_measurement_targets_use_live_lock_bindings() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let already_owned = RAW_HARNESS_ENTRYPOINTS
+        .iter()
+        .chain(ADDITIONAL_GUARDED_ENTRYPOINTS)
+        .map(|(path, _)| (*path).to_string())
+        .collect::<BTreeSet<_>>();
+    let expected = TARGETS_WITH_STATE_DRIVEN_WORK
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        expected.is_disjoint(&already_owned),
+        "TARGETS_WITH_STATE_DRIVEN_WORK duplicates a target RAW_HARNESS_ENTRYPOINTS or \
+         ADDITIONAL_GUARDED_ENTRYPOINTS already owns"
+    );
+    assert_eq!(
+        expected.len(),
+        TARGETS_WITH_STATE_DRIVEN_WORK.len(),
+        "TARGETS_WITH_STATE_DRIVEN_WORK must not repeat a path"
+    );
+
+    let mut actual = BTreeSet::new();
+    let mut violations = Vec::new();
+    for path in cargo_target_roots(manifest_dir, &["example", "bin"])
+        .unwrap_or_else(|reason| panic!("{reason}"))
+    {
+        let relative = path
+            .strip_prefix(manifest_dir)
+            .expect("source under manifest directory")
+            .to_string_lossy()
+            .into_owned();
+        if already_owned.contains(&relative) {
+            continue;
+        }
+        let sources = parsed_module_closure(manifest_dir, &path, false)
+            .unwrap_or_else(|reason| panic!("{reason}"));
+
+        let mut has_state_work = false;
+        for source in &sources {
+            for selector in STATE_WORK_SELECTORS {
+                has_state_work |= source
+                    .parsed
+                    .has_selector(*selector)
+                    .unwrap_or_else(|reason| panic!("{reason}"));
+            }
+        }
+        if !has_state_work {
+            continue;
+        }
+        actual.insert(relative.clone());
+
+        let helper_names = STATE_WORK_HELPER_ENTRYPOINTS
+            .iter()
+            .filter(|(path, _)| *path == relative)
+            .map(|(_, selector)| *selector)
+            .collect::<Vec<_>>();
+
+        for source in &sources {
+            let all_sites = STATE_WORK_SELECTORS
+                .iter()
+                .flat_map(|selector| {
+                    source
+                        .parsed
+                        .call_sites(0..source.parsed.tokens.len(), *selector, true)
+                        .unwrap_or_else(|reason| panic!("{reason}"))
+                })
+                .collect::<Vec<_>>();
+
+            let mut direct_sites = Vec::new();
+            let mut mediating_helpers = BTreeSet::new();
+            for site in all_sites {
+                let owner = source.parsed.enclosing_function_path(site);
+                match helper_names
+                    .iter()
+                    .find(|selector| selector.final_name() == owner)
+                {
+                    Some(_) => {
+                        mediating_helpers.insert(owner);
+                    }
+                    None => direct_sites.push(site),
+                }
+            }
+
+            if !direct_sites.is_empty()
+                && let Err(reason) = source.parsed.validate_work_sites(
+                    &direct_sites,
+                    SHARED_LOCK_SELECTOR,
+                    GuardRequirement::Lexical,
+                )
+            {
+                violations.push(format!("{relative} ({}): {reason}", source.relative));
+            }
+            for helper_name in mediating_helpers {
+                let selector = *helper_names
+                    .iter()
+                    .find(|selector| selector.final_name() == helper_name)
+                    .expect("helper name resolved from helper_names");
+                if let Err(reason) = source.parsed.validate_selector(
+                    0..source.parsed.tokens.len(),
+                    selector,
+                    SHARED_LOCK_SELECTOR,
+                    GuardRequirement::Lexical,
+                ) {
+                    violations.push(format!(
+                        "{relative} ({}): helper `{helper_name}` mediating STATE_WORK_SELECTORS \
+                         work: {reason}",
+                        source.relative
+                    ));
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        actual, expected,
+        "state-driven Metal measurement inventory changed; classify every added or removed \
+         example/bin target explicitly in TARGETS_WITH_STATE_DRIVEN_WORK (#1527)"
+    );
+    assert!(
+        violations.is_empty(),
+        "state-driven Metal measurement targets without a live shared-lock binding:\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]
