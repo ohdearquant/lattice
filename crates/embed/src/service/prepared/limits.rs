@@ -821,7 +821,7 @@ pub(super) struct PreparationCharge {
 
 impl PreparationCharge {
     fn worst_case(ceilings: &PreparationCeilings) -> LimitResult<Self> {
-        let max_report_bytes = u64::try_from(super::MAX_ATTESTATION_REPORT_BYTES)
+        let max_report_bytes = u64::try_from(super::MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES)
             .map_err(|_| overflow(ChargeExpression::AttestationReportBytes))?;
         let retained_bytes = [
             ceilings.inventory.max_snapshot_bytes.get(),
@@ -1798,12 +1798,12 @@ mod tests {
         let retained_without_report = 16 + 32 + 64 + 1 + 128 + 256 + 512;
         assert_eq!(
             charge.retained_bytes() - retained_without_report,
-            u64::try_from(super::super::MAX_ATTESTATION_REPORT_BYTES).unwrap()
+            u64::try_from(super::super::MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES).unwrap()
         );
         let work_without_second_report = ATTESTATION_CHUNK_BYTES + 1 + 2 + 4 + 8;
         assert_eq!(
             charge.work_bytes() - work_without_second_report,
-            u64::try_from(super::super::MAX_ATTESTATION_REPORT_BYTES).unwrap()
+            u64::try_from(super::super::MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES).unwrap()
         );
     }
 
