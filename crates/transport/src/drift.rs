@@ -201,6 +201,13 @@ pub struct DriftReport<Id> {
     pub transport_cost: f32,
     /// Regularized cost.
     pub regularized_cost: f32,
+    /// Whether the underlying Sinkhorn solve reached its convergence threshold.
+    ///
+    /// `false` means every other numeric field in this report was computed from
+    /// the best iterate found within `max_iterations`, not from a converged
+    /// solution — this is the value to check before trusting the report under
+    /// the default (non-strict) `error_on_non_convergence` configuration.
+    pub converged: bool,
     /// Debiased Sinkhorn divergence (if computed).
     pub sinkhorn_divergence: Option<f32>,
     /// Sparse transport plan.
@@ -274,6 +281,12 @@ where
         return Err(SinkhornError::EmptyProblem);
     }
 
+    // Resolved before the (potentially expensive) solve: a slice naming more than
+    // one embedding model has no single distance to report, and computing one
+    // anyway would silently answer a question the caller never asked.
+    let source_model = resolve_model_label(source, "source")?;
+    let target_model = resolve_model_label(target, "target")?;
+
     let source_points: Vec<&[f32]> = source.iter().map(|record| record.embedding).collect();
     let target_points: Vec<&[f32]> = target.iter().map(|record| record.embedding).collect();
     let source_weights = match config.weighting {
@@ -308,6 +321,8 @@ where
             config,
             SquaredEuclidean,
             true,
+            source_model,
+            target_model,
         ),
         (DriftMetricKind::Cosine, DriftSolverMode::Balanced) => detect_balanced(
             source,
@@ -319,6 +334,8 @@ where
             config,
             CosineDistance::default(),
             false,
+            source_model,
+            target_model,
         ),
         (
             DriftMetricKind::SquaredEuclidean,
@@ -338,6 +355,8 @@ where
             true,
             tau_source,
             tau_target,
+            source_model,
+            target_model,
         ),
         (
             DriftMetricKind::Cosine,
@@ -357,6 +376,8 @@ where
             false,
             tau_source,
             tau_target,
+            source_model,
+            target_model,
         ),
     }
 }
@@ -372,6 +393,8 @@ fn detect_balanced<Id, M>(
     config: &DriftConfig,
     metric: M,
     squared_metric: bool,
+    source_model: Option<&str>,
+    target_model: Option<&str>,
 ) -> Result<DriftReport<Id>, SinkhornError>
 where
     Id: Clone,
@@ -400,12 +423,12 @@ where
     };
     build_report(
         source,
-        target,
         source_points,
         target_points,
         config,
         metric,
         squared_metric,
+        result.converged,
         result.transport_cost,
         result.regularized_cost,
         divergence.as_ref(),
@@ -413,6 +436,8 @@ where
         &result.log_v,
         result.epsilon,
         result.transport_cost,
+        source_model,
+        target_model,
     )
 }
 
@@ -429,6 +454,8 @@ fn detect_unbalanced<Id, M>(
     squared_metric: bool,
     tau_source: f32,
     tau_target: f32,
+    source_model: Option<&str>,
+    target_model: Option<&str>,
 ) -> Result<DriftReport<Id>, SinkhornError>
 where
     Id: Clone,
@@ -452,14 +479,23 @@ where
         &mut workspace,
         None,
     )?;
+    // `UnbalancedConfig` has no strictness flag of its own, so the caller's request
+    // is enforced here; otherwise the unbalanced path would quietly return a report
+    // for a solve the caller asked to be refused.
+    if !result.converged && config.sinkhorn.error_on_non_convergence {
+        return Err(SinkhornError::NonConvergence {
+            iterations: result.iterations,
+            last_error: result.last_error,
+        });
+    }
     build_report(
         source,
-        target,
         source_points,
         target_points,
         config,
         metric,
         squared_metric,
+        result.converged,
         result.transport_cost,
         result.regularized_cost,
         None,
@@ -467,18 +503,20 @@ where
         &result.log_v,
         result.epsilon,
         result.transport_cost,
+        source_model,
+        target_model,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_report<Id, M>(
     source: &[EmbeddingRecord<'_, Id>],
-    target: &[EmbeddingRecord<'_, Id>],
     source_points: &[&[f32]],
     target_points: &[&[f32]],
     config: &DriftConfig,
     metric: M,
     squared_metric: bool,
+    converged: bool,
     transport_cost: f32,
     regularized_cost: f32,
     divergence: Option<&SinkhornDivergence>,
@@ -486,12 +524,17 @@ fn build_report<Id, M>(
     log_v: &[f32],
     epsilon: f32,
     distance_cost: f32,
+    source_model: Option<&str>,
+    target_model: Option<&str>,
 ) -> Result<DriftReport<Id>, SinkhornError>
 where
     Id: Clone,
     M: PointMetric,
 {
     let cost_xy = PairwiseCostMatrix::new(source_points, target_points, metric);
+    // `converged` here is a scratch value for `extract_sparse_plan`, which never reads
+    // it (plan extraction only uses `log_u`/`log_v`/`epsilon`) — it is NOT the report's
+    // own `converged` field, which is threaded through as this function's own parameter.
     let pseudo_result = super::sinkhorn::SinkhornResult {
         epsilon,
         iterations: 0,
@@ -536,6 +579,7 @@ where
         wasserstein_distance,
         transport_cost,
         regularized_cost,
+        converged,
         sinkhorn_divergence: divergence.map(|value| value.value),
         transport_plan,
         per_entry,
@@ -546,15 +590,42 @@ where
             std_displacement,
             outlier_count,
         },
-        source_model: source
-            .first()
-            .and_then(|record| record.model)
-            .map(ToOwned::to_owned),
-        target_model: target
-            .first()
-            .and_then(|record| record.model)
-            .map(ToOwned::to_owned),
+        source_model: source_model.map(ToOwned::to_owned),
+        target_model: target_model.map(ToOwned::to_owned),
     })
+}
+
+/// Resolve the single embedding model a slice of records represents.
+///
+/// Records with no `model` set (`None`) carry no opinion and are ignored. Records
+/// that disagree on `model` cannot be reduced to one label without silently
+/// deciding which one is "right" — equal embedding dimensionality does not imply
+/// comparable coordinates (a shared rotation preserves within-model cosine
+/// relationships while changing cross-space transport costs), so a mixed slice
+/// is refused rather than labelled with an arbitrary record's value.
+fn resolve_model_label<'a, Id>(
+    records: &[EmbeddingRecord<'a, Id>],
+    axis: &'static str,
+) -> Result<Option<&'a str>, SinkhornError> {
+    let mut distinct: Vec<&str> = Vec::new();
+    for record in records {
+        if let Some(model) = record.model
+            && !distinct.contains(&model)
+        {
+            distinct.push(model);
+        }
+    }
+    match distinct.len() {
+        0 => Ok(None),
+        1 => Ok(Some(distinct[0])),
+        _ => {
+            distinct.sort_unstable();
+            Err(SinkhornError::MixedModelInput {
+                axis,
+                models: distinct.into_iter().map(ToOwned::to_owned).collect(),
+            })
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

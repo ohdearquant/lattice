@@ -201,6 +201,17 @@ pub enum SinkhornError {
     },
     /// Solve was cancelled by the progress observer.
     Cancelled,
+    /// Input records for one axis name more than one embedding model.
+    ///
+    /// The high-level drift API (see [`crate::drift`]) treats each side of a
+    /// comparison as representing a single embedding model; a slice mixing
+    /// models has no single distance to report.
+    MixedModelInput {
+        /// Which axis: `"source"` or `"target"`.
+        axis: &'static str,
+        /// The distinct model identifiers found, sorted.
+        models: Vec<String>,
+    },
 }
 
 impl fmt::Display for SinkhornError {
@@ -246,6 +257,10 @@ impl fmt::Display for SinkhornError {
                 write!(f, "invalid epsilon schedule {field}: {value}")
             }
             Self::Cancelled => write!(f, "Sinkhorn solve cancelled by progress observer"),
+            Self::MixedModelInput { axis, models } => write!(
+                f,
+                "{axis} records name more than one embedding model: {models:?}"
+            ),
         }
     }
 }
