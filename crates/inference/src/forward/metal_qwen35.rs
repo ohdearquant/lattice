@@ -7253,14 +7253,14 @@ mod inner {
             self.check_forward_step_capacity(position)?;
             self.check_live_cursor("try_forward_step", position)?;
             self.cross_turn_prefix_cache.clear();
-            Ok(self
-                .forward_step_inner(
-                    token_id,
-                    position,
-                    false,
-                    crate::forward::signpost::Scope::NotDecode,
-                )
-                .logits)
+            let output = self.forward_step_inner(
+                token_id,
+                position,
+                false,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            self.session.position = self.session.kv_cache.seq_len;
+            Ok(output.logits)
         }
 
         /// **Unstable**: fallible single-token forward with explicit hidden readback.
@@ -19342,6 +19342,39 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_eq!(state.session.kv_cache.seq_len, 2);
             assert_eq!(state.session.position, 2);
             assert!(hidden_b.iter().any(|&value| value != 0.0));
+        }
+
+        #[test]
+        fn try_forward_step_keeps_session_position_in_sync_with_kv_cache_cursor() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            assert_eq!(state.session.position, 0);
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+
+            // Drive several raw steps and assert the documented decode cursor
+            // (`session.position`) agrees with the live cache cursor
+            // (`kv_cache.seq_len`) after every one of them, matching the
+            // contract `forward_step_with_hidden` already keeps.
+            for (position, token_id) in (0usize..3).zip([1u32, 2, 3]) {
+                state
+                    .try_forward_step(token_id, position)
+                    .expect("position matching the live cache cursor succeeds");
+                assert_eq!(
+                    state.session.kv_cache.seq_len,
+                    position + 1,
+                    "kv_cache.seq_len must advance by one token per step"
+                );
+                assert_eq!(
+                    state.session.position, state.session.kv_cache.seq_len,
+                    "session.position must track the live cache cursor after try_forward_step"
+                );
+            }
         }
 
         #[test]
