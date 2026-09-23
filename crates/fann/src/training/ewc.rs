@@ -134,13 +134,48 @@ impl DiagonalFisher {
     ///
     /// Leaves `delta` unchanged when the estimate has no importance signal
     /// (`F_ref` below the guard threshold) or when the Fisher holds no values.
+    ///
+    /// **Non-finite Fisher fails closed, never propagates NaN/inf.**
+    /// `observe_gradient` does not itself reject a non-finite gradient, so a
+    /// caller can hand this method a Fisher containing NaN or +-inf (reachable
+    /// from an unvalidated caller-supplied gradient upstream). The exact rule:
+    /// `F_ref` is accumulated in `f64` (see below); if that `F_ref` is itself
+    /// non-finite (a NaN entry poisons the sum into NaN, an infinite entry
+    /// poisons it into +-inf), **every** coordinate of `delta` is set to `0.0`
+    /// — the reference magnitude cannot be trusted, so the whole update is
+    /// blocked rather than divided by, or allowed to propagate, a non-finite
+    /// value. If `F_ref` is finite but one coordinate's own scale factor still
+    /// comes out non-finite, **only that coordinate** is set to `0.0`. Both
+    /// cases mirror the effect (not the exact per-coordinate boundary) of the
+    /// max-normalised formula this replaced, which zeroed a coordinate
+    /// whenever its own scale computation went non-finite.
+    ///
+    /// `F_ref` is accumulated in `f64` rather than `f32` so that many
+    /// large-but-finite Fisher values cannot silently overflow the sum to
+    /// `+inf` — which would otherwise disable damping entirely (`v / inf ==
+    /// 0` for every finite `v`) without ever going through the non-finite
+    /// path above.
     /// See [`docs/training.md`](../../docs/training.md#fisher-weighted-delta-shrinkage) for the derivation and trade-offs.
     pub fn project_delta(&self, delta: &mut [f32]) {
         let n = self.values.len();
         if n == 0 {
             return;
         }
-        let f_ref = self.values.iter().sum::<f32>() / n as f32;
+
+        // f64 accumulation: see the "large-but-finite" note in the doc comment.
+        let sum: f64 = self.values.iter().map(|&v| f64::from(v)).sum();
+        let f_ref = sum / n as f64;
+
+        if !f_ref.is_finite() {
+            // A NaN entry poisons the sum into NaN; an infinite entry poisons
+            // it into +-inf. F_ref cannot be trusted as a reference magnitude
+            // either way — block the whole update instead of dividing by (or
+            // propagating) a non-finite value. Checked before the degenerate
+            // "no signal" comparison below because `NaN < 1e-8` is false, so a
+            // NaN F_ref would otherwise fall through to per-coordinate damping.
+            delta.fill(0.0);
+            return;
+        }
 
         // No importance signal has been observed yet — treat as identity.
         if f_ref < 1e-8 {
@@ -150,7 +185,15 @@ impl DiagonalFisher {
         // Fisher-weighted shrinkage: never reaches zero for finite F_i — see
         // docs/training.md and the doc comment above.
         for (d, &v) in delta.iter_mut().zip(self.values.iter()) {
-            *d /= 1.0 + PROJECT_DELTA_ALPHA * (v / f_ref);
+            let factor = 1.0 + f64::from(PROJECT_DELTA_ALPHA) * (f64::from(v) / f_ref);
+            // `factor` can still be non-finite for a single coordinate even
+            // when F_ref is finite (e.g. this entry's own value is +-inf but
+            // canceled out of the f64 sum) — block just that coordinate.
+            *d = if factor.is_finite() {
+                (f64::from(*d) / factor) as f32
+            } else {
+                0.0
+            };
         }
     }
 }
@@ -337,6 +380,99 @@ mod tests {
             assert!(
                 (a - b).abs() < 1e-4,
                 "project_delta must be scale-invariant in Fisher: {a} vs {b}"
+            );
+        }
+    }
+
+    /// A NaN Fisher entry must not propagate NaN into `delta`. `observe_gradient`
+    /// does not validate finiteness, so a caller-supplied non-finite gradient can
+    /// reach `project_delta` directly; the whole update must be blocked (every
+    /// coordinate zeroed) rather than turned into NaN by a poisoned `F_ref`.
+    ///
+    /// Mutation that defeats this: computing `F_ref` without the
+    /// `!f_ref.is_finite()` guard (review finding on commit 5554751b).
+    #[test]
+    fn ewc_nan_fisher_entry_zeroes_delta_without_propagating_nan() {
+        let fisher = DiagonalFisher {
+            values: vec![1.0_f32, f32::NAN, 2.0, 0.5],
+            anchor: vec![0.0; 4],
+            decay: 0.9,
+        };
+        let mut delta = vec![1.0_f32, 1.0, 1.0, 1.0];
+        fisher.project_delta(&mut delta);
+
+        for &d in &delta {
+            assert!(
+                !d.is_nan(),
+                "NaN must not reach the caller's delta: {delta:?}"
+            );
+            assert_eq!(
+                d, 0.0,
+                "a NaN Fisher entry must block the whole update: {delta:?}"
+            );
+        }
+    }
+
+    /// An infinite Fisher entry must not propagate NaN/inf into `delta` either
+    /// (an infinite entry poisons `F_ref` into `+inf`, and `inf / inf` is NaN).
+    ///
+    /// Mutation that defeats this: computing `F_ref` without the
+    /// `!f_ref.is_finite()` guard (review finding on commit 5554751b).
+    #[test]
+    fn ewc_infinite_fisher_entry_zeroes_delta_without_propagating_nan_or_inf() {
+        let fisher = DiagonalFisher {
+            values: vec![1.0_f32, f32::INFINITY, 2.0, 0.5],
+            anchor: vec![0.0; 4],
+            decay: 0.9,
+        };
+        let mut delta = vec![1.0_f32, 1.0, 1.0, 1.0];
+        fisher.project_delta(&mut delta);
+
+        for &d in &delta {
+            assert!(
+                d.is_finite(),
+                "NaN/inf must not reach the caller's delta: {delta:?}"
+            );
+            assert_eq!(
+                d, 0.0,
+                "an infinite Fisher entry must block the whole update: {delta:?}"
+            );
+        }
+    }
+
+    /// Many large-but-finite Fisher values must not silently disable damping via
+    /// an f32 sum overflowing to `+inf`. Four entries of `1e38` sum to `4e38`,
+    /// which overflows `f32::MAX` (~3.4e38) under naive sequential f32
+    /// summation but is well within `f64` range — `F_ref` must land at `1e38`
+    /// (finite) and damp normally, not at `+inf` (which would make `v / F_ref
+    /// == 0` for every finite `v`, i.e. no damping at all).
+    ///
+    /// Mutation that defeats this: summing `self.values` in `f32` instead of
+    /// `f64` (review finding on commit 5554751b).
+    #[test]
+    fn ewc_large_finite_fisher_sum_does_not_overflow_f32_and_still_damps() {
+        let fisher = DiagonalFisher {
+            values: vec![1e38_f32; 4],
+            anchor: vec![0.0; 4],
+            decay: 0.9,
+        };
+        let original = vec![2.0_f32, -2.0, 2.0, -2.0];
+        let mut delta = original.clone();
+        fisher.project_delta(&mut delta);
+
+        // F_ref = mean(1e38, 1e38, 1e38, 1e38) = 1e38 -> every coordinate's
+        // F_i / F_ref == 1 -> scale = 1 / (1 + alpha) = 0.5 for alpha = 1.0.
+        let expected_scale = 1.0 / (1.0 + PROJECT_DELTA_ALPHA);
+        for (d, orig) in delta.iter().zip(original.iter()) {
+            assert!(
+                d.is_finite(),
+                "an f32-overflowed sum must not reach the caller as NaN/inf: {delta:?}"
+            );
+            assert!(
+                (d - orig * expected_scale).abs() < 1e-2,
+                "expected {} (= {orig} * {expected_scale}), got {d} — did the sum overflow f32 \
+                 and disable damping (scale 1.0 instead of {expected_scale})?",
+                orig * expected_scale
             );
         }
     }
