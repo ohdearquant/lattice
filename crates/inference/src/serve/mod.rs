@@ -597,8 +597,12 @@ pub enum CaseBody {
     Fixed(&'static str),
     /// A `messages` array whose `content` field alone exceeds
     /// `REQUEST_BODY_LIMIT_BYTES`, forcing both binaries' body-limit
-    /// enforcement (`DefaultBodyLimit` on `lattice.rs`, manual
-    /// `to_bytes(.., LIMIT)` on `lattice_serve.rs`) to trip.
+    /// enforcement to trip. Both binaries' `chat_completions` take the raw
+    /// request `Body` rather than an axum extractor, so on both the trip
+    /// comes from the handler's own `to_bytes(.., LIMIT)` call, not from
+    /// `lattice.rs` router's `DefaultBodyLimit` layer -- that layer only
+    /// bounds extractors built on `Bytes` (`Json`, `Form`, ...), which
+    /// `axum::body::Body`'s own `FromRequest` impl never goes through.
     Oversized,
 }
 
@@ -1370,9 +1374,12 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         // `REQUEST_BODY_LIMIT_BYTES`, so restoring `lattice_serve.rs`'s old
         // 400/`invalid_request` oversized-body mapping (instead of the
         // current 413/`request_body_too_large`) also left the parity test
-        // green. Both binaries enforce the same 1 MiB cap today (`lattice.rs`
-        // via `DefaultBodyLimit`, `lattice_serve.rs` via a manual
-        // `to_bytes(.., LIMIT)` check) and must report it identically.
+        // green. Both binaries enforce the same 1 MiB cap today via a
+        // manual `to_bytes(.., LIMIT)` check in each `chat_completions`
+        // handler (both take the raw request `Body`, which `lattice.rs`
+        // router's `DefaultBodyLimit` layer does not bound -- see
+        // `CaseBody::Oversized`'s doc comment) and must report it
+        // identically.
         method: "POST",
         path: "/v1/chat/completions",
         body: CaseBody::Oversized,

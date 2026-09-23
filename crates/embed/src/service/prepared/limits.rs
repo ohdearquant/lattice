@@ -769,6 +769,14 @@ impl TensorCensus {
             .declared_tensor_bytes
             .checked_add(tensor_bytes)
             .ok_or_else(|| overflow(ChargeExpression::TensorBytes))?;
+        // Every declared tensor byte has to live somewhere inside the
+        // prepared snapshot, so the running total is bounded by the same
+        // aggregate ceiling that already bounds each individual weight
+        // file's on-disk size (`validate_relations`'s
+        // `WeightFileBytes <= SnapshotBytes` relation) — reusing it here
+        // means many individually-legal tensors can no longer sum to an
+        // unbounded payload without a fresh, hand-picked constant.
+        ceilings.validate(LimitAxis::SnapshotBytes, declared_tensor_bytes)?;
 
         self.tensor_count = tensor_count;
         self.total_name_bytes = total_name_bytes;
@@ -887,7 +895,18 @@ pub(super) fn test_tensor_inventory_ceilings(
             nz64(9),
             nz64(9),
             nz64(9),
-            nz64(9),
+            // `TensorCensus::push` bounds the running declared-payload total
+            // against this axis (see `push`'s `SnapshotBytes` check). This
+            // helper is shared by tests that deliberately push tensors sized
+            // off `max_elements`/`max_dimension` up to `u64::MAX`/
+            // `usize::MAX` to exercise arithmetic overflow, so a fixed
+            // placeholder here (matching the `9` the sibling file-size axes
+            // use) would trip this axis before that overflow ever occurs.
+            // Pinning it to the same platform ceiling `PreparationCeilings`
+            // itself enforces elsewhere makes the check a no-op for every
+            // caller that doesn't care about it, while a test that wants to
+            // probe it directly still builds its own `PreparationCeilings`.
+            nz64(u64::try_from(usize::MAX).unwrap_or(u64::MAX)),
             nz64(1),
             nz(1),
         ),
@@ -1066,7 +1085,12 @@ mod tests {
                 nz64(16),
                 nz64(16),
                 nz64(32),
-                nz64(32),
+                // See the matching comment in `test_tensor_inventory_ceilings`:
+                // `TensorCensus::push` bounds the running declared-payload
+                // total against this axis, and this helper's tensor tests
+                // push several tensors whose summed bytes can exceed the
+                // placeholder `32` the sibling file-size axes use.
+                nz64(1_000_000),
                 nz64(16),
                 nz(8),
             ),
@@ -1710,6 +1734,69 @@ mod tests {
         }
         assert_eq!(census.total_elements(), 18);
         assert_eq!(census.declared_tensor_bytes(), 48);
+    }
+
+    /// Ceilings identical to `census_ceilings`'s shape but with an explicit,
+    /// tight `max_snapshot_bytes` — the axis under test — so the boundary is
+    /// exercised in isolation from every other axis. `max_weight_file_bytes`
+    /// is pinned to the same value (a single-shard snapshot) and
+    /// `max_header_bytes` stays low enough to satisfy the framed-header
+    /// relation against it.
+    fn ceilings_with_snapshot_bytes(max_snapshot_bytes: u64) -> PreparationCeilings {
+        build((
+            InventoryCeilings::new(
+                nz(8),
+                nz(8),
+                nz64(16),
+                nz64(16),
+                nz64(16),
+                nz64(max_snapshot_bytes),
+                nz64(max_snapshot_bytes),
+                nz64(64),
+                nz(8),
+            ),
+            TensorCeilings::new(nz64(8), nz(8), nz(64), nz(8), nz(64), nz64(64), nz64(64)),
+            BertCeilings::all(nz(8)),
+            ParseCeilings::all(nz64(8)),
+            ResourceCeilings::all(nz64(64)),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn tensor_census_bounds_the_declared_payload_total_by_snapshot_bytes() {
+        // Two individually-legal 12-byte tensors (dims [2, 3], F16) sum to
+        // 24 declared bytes. Every other axis (name, rank, dimension,
+        // element, tensor count) is satisfied by each tensor on its own, so
+        // only a ceiling on the RUNNING TOTAL can catch this — which is
+        // exactly issue #1470's gap: `declared_tensor_bytes` accumulated
+        // with no ceiling of its own.
+        let fact = TensorFact {
+            name_bytes: 1,
+            metadata_bytes: 0,
+            dimensions: &[2, 3],
+            dtype: TensorDtype::F16,
+        };
+
+        let exact = ceilings_with_snapshot_bytes(24);
+        let mut census = TensorCensus::new();
+        census.push(fact, &exact).unwrap();
+        census.push(fact, &exact).unwrap();
+        assert_eq!(census.declared_tensor_bytes(), 24);
+
+        let tight = ceilings_with_snapshot_bytes(23);
+        let mut census = TensorCensus::new();
+        census.push(fact, &tight).unwrap();
+        assert_push_error_without_mutation(
+            census,
+            fact,
+            &tight,
+            PreparationLimitError::Exceeded {
+                axis: LimitAxis::SnapshotBytes,
+                actual: 24,
+                limit: 23,
+            },
+        );
     }
 
     #[test]
