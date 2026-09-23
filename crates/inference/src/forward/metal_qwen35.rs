@@ -18676,6 +18676,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
