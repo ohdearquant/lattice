@@ -489,14 +489,28 @@ pub fn parse_pooling(value: Option<&str>) -> Result<PoolingStrategy, ApiError> {
         }),
     }
 }
+/// RFC 2397 shape: `data:[<mediatype>][;base64],<data>`. The header before
+/// the first comma never contains whitespace, which is what separates a data
+/// URI from prose that happens to open with the word "data:" (a log line, a
+/// label), so only the former is refused as a text item.
+fn is_data_uri(text: &str) -> bool {
+    text.strip_prefix("data:")
+        .and_then(|rest| rest.split_once(','))
+        .is_some_and(|(header, _)| !header.chars().any(char::is_whitespace))
+}
 
 /// Validates and decodes every `input` item, in order.
 ///
 /// # Errors
 ///
 /// Returns [`ApiError::BadRequest`] (`invalid_input`) if `items` is empty or
-/// exceeds [`MAX_EMBEDDING_INPUT_COUNT`]; propagates [`decode_inline_image`]'s
-/// error for a malformed or rejected image item.
+/// exceeds [`MAX_EMBEDDING_INPUT_COUNT`]; [`ApiError::BadRequest`]
+/// (`data_uri_as_text_item`) for a plain-string item that is shaped like a
+/// data URI (see [`is_data_uri`]) -- a data URI is only ever meaningful as an
+/// `image_url` object (see [`EmbeddingInputItem`]'s own doc comment), so one
+/// arriving as a text item is a caller passing the wrong shape, not text to
+/// embed; propagates [`decode_inline_image`]'s error for a malformed or
+/// rejected image item.
 pub fn normalize_embedding_items(
     items: Vec<EmbeddingInputItem>,
 ) -> Result<Vec<NormalizedEmbeddingItem>, ApiError> {
@@ -518,6 +532,13 @@ pub fn normalize_embedding_items(
     items
         .into_iter()
         .map(|item| match item {
+            EmbeddingInputItem::Text(text) if is_data_uri(&text) => Err(ApiError::BadRequest {
+                message: "input item is a plain string beginning with \"data:\"; to embed \
+                              an image, pass {\"type\": \"image_url\", \"image_url\": \
+                              {\"url\": \"...\"}}"
+                    .to_string(),
+                code: "data_uri_as_text_item",
+            }),
             EmbeddingInputItem::Text(text) => Ok(NormalizedEmbeddingItem::Text(text)),
             EmbeddingInputItem::Image { url } => {
                 decode_inline_image(&url).map(NormalizedEmbeddingItem::Image)
@@ -1752,6 +1773,76 @@ mod tests {
         }])
         .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    /// Issue: a bare `"data:..."` string arriving as a plain-text `input`
+    /// item was silently tokenized as text instead of being rejected. A
+    /// well-formed image data URI passed as text must be caught exactly
+    /// like a malformed one below -- the defect is the *shape* (text vs.
+    /// `image_url` object), not the payload's validity.
+    #[test]
+    fn normalize_embedding_items_rejects_well_formed_data_uri_as_text() {
+        let err = normalize_embedding_items(vec![EmbeddingInputItem::Text(tiny_png_data_uri(0))])
+            .unwrap_err();
+        match err {
+            ApiError::BadRequest { code, message } => {
+                assert_eq!(code, "data_uri_as_text_item");
+                assert!(message.contains("data:"), "message: {message}");
+                assert!(message.contains("image_url"), "message: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// Same shape defect, malformed payload -- must be caught before any
+    /// attempt to parse it as an image, so the error names the shape
+    /// problem rather than a base64/format problem.
+    #[test]
+    fn normalize_embedding_items_rejects_malformed_data_uri_as_text() {
+        let err = normalize_embedding_items(vec![EmbeddingInputItem::Text(
+            "data:image/png;base64,@@not-base64@@".to_string(),
+        )])
+        .unwrap_err();
+        assert_eq!(err.code(), "data_uri_as_text_item");
+    }
+
+    /// The minimal data URI `data:,` (empty text/plain payload) is still a
+    /// data URI by shape, so it is refused as a text item like any other.
+    #[test]
+    fn normalize_embedding_items_rejects_empty_data_uri_as_text() {
+        let err = normalize_embedding_items(vec![EmbeddingInputItem::Text("data:,".to_string())])
+            .unwrap_err();
+        assert_eq!(err.code(), "data_uri_as_text_item");
+    }
+
+    /// Prose that opens with "data:" is not a data URI: whitespace before the
+    /// first comma, or no comma at all, keeps it an ordinary text item.
+    #[test]
+    fn normalize_embedding_items_accepts_prose_beginning_with_data_colon() {
+        for prose in [
+            "data: results show 3 rows, all valid",
+            "data:",
+            "data: none",
+        ] {
+            let items =
+                normalize_embedding_items(vec![EmbeddingInputItem::Text(prose.to_string())])
+                    .unwrap();
+            assert!(matches!(&items[0], NormalizedEmbeddingItem::Text(s) if s == prose));
+        }
+    }
+
+    /// Negative control: ordinary text is never affected by the new guard,
+    /// including text that merely mentions "data:" mid-string rather than
+    /// beginning with it.
+    #[test]
+    fn normalize_embedding_items_accepts_plain_text_mentioning_data_colon() {
+        let items = normalize_embedding_items(vec![EmbeddingInputItem::Text(
+            "see data: below for details".to_string(),
+        )])
+        .unwrap();
+        assert!(
+            matches!(&items[0], NormalizedEmbeddingItem::Text(s) if s == "see data: below for details")
+        );
     }
 
     #[test]
