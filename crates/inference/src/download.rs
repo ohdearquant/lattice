@@ -399,24 +399,33 @@ mod tests {
     /// Serializes tests in this module that mutate `LATTICE_OFFLINE` in the real
     /// process environment. `set_var`/`remove_var` are `unsafe` because they can race
     /// with a read on another thread; this is the same per-variable lock convention
-    /// `metal_qwen35.rs`'s `with_self_spec_env` uses for `LATTICE_SELF_SPEC`.
+    /// `metal_qwen35.rs`'s `with_self_spec_env` uses for `LATTICE_SELF_SPEC`. Restores
+    /// the prior value (including "was unset") on the way out, even if `f` panics.
     fn with_lattice_offline_env<R>(value: &str, f: impl FnOnce() -> R) -> R {
         use std::sync::Mutex;
         static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: only this serialized closure mutates LATTICE_OFFLINE; the lock
-        // forbids concurrent test threads from reading or writing it.
+        let prior = std::env::var("LATTICE_OFFLINE").ok();
+        // SAFETY: serialized by `ENV_LOCK` above — this lock only guards writers of
+        // LATTICE_OFFLINE against each other; it does not stop other tests from
+        // reading the environment concurrently.
         unsafe {
             std::env::set_var("LATTICE_OFFLINE", value);
         }
-        let r = f();
-        // SAFETY: same justification as above.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: see above.
         unsafe {
-            std::env::remove_var("LATTICE_OFFLINE");
+            match &prior {
+                Some(v) => std::env::set_var("LATTICE_OFFLINE", v),
+                None => std::env::remove_var("LATTICE_OFFLINE"),
+            }
         }
-        r
+        match result {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// `ensure_model_files` reads `LATTICE_OFFLINE` through `env_switch_enabled`, by

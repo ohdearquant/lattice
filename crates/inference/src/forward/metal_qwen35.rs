@@ -17725,23 +17725,33 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// real process environment. `set_var`/`remove_var` are `unsafe` because they
         /// can race with a read on another thread; this is the same per-variable lock
         /// convention `with_self_spec_env` (below) uses for `LATTICE_SELF_SPEC`.
+        /// Restores the prior value (including "was unset") on the way out, even if
+        /// `f` panics.
         fn with_compact_topk_env<R>(value: &str, f: impl FnOnce() -> R) -> R {
             use std::sync::Mutex;
             static ENV_LOCK: Mutex<()> = Mutex::new(());
             let _guard = ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // SAFETY: only this serialized closure mutates LATTICE_COMPACT_TOPK; the
-            // lock forbids concurrent test threads from reading or writing it.
+            let prior = std::env::var("LATTICE_COMPACT_TOPK").ok();
+            // SAFETY: serialized by `ENV_LOCK` above — this lock only guards writers
+            // of LATTICE_COMPACT_TOPK against each other; it does not stop other
+            // tests from reading the environment concurrently.
             unsafe {
                 std::env::set_var("LATTICE_COMPACT_TOPK", value);
             }
-            let r = f();
-            // SAFETY: same justification as above.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            // SAFETY: see above.
             unsafe {
-                std::env::remove_var("LATTICE_COMPACT_TOPK");
+                match &prior {
+                    Some(v) => std::env::set_var("LATTICE_COMPACT_TOPK", v),
+                    None => std::env::remove_var("LATTICE_COMPACT_TOPK"),
+                }
             }
-            r
+            match result {
+                Ok(r) => r,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
         }
 
         /// `SamplingRouteEnvironment::current()` reads `LATTICE_COMPACT_TOPK` through
