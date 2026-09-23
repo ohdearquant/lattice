@@ -134,6 +134,11 @@ enum Command {
         tokenizer_dir: Option<String>,
     },
     /// Score layer importance on a calibration corpus and PPL-gate a pruning plan.
+    ///
+    /// The score is a last-token variant: one hidden-state cosine per calibration
+    /// prompt, not the per-token-averaged metric that
+    /// `lattice_inference::pruning::BlockInfluenceAccumulator` implements. The
+    /// output artifact's `method` field names the estimator actually used.
     PruneScore {
         #[command(flatten)]
         args: prune_score::Args,

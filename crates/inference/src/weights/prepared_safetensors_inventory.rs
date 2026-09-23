@@ -79,7 +79,7 @@ pub(crate) enum HeaderSyntaxFault {
     ExpectedColon,
     ExpectedCommaOrEnd,
     TrailingComma,
-    TrailingNonSpace,
+    TrailingNonWhitespace,
     InvalidStringEscape,
     InvalidUnicodeEscape,
     InvalidUnsignedInteger,
@@ -847,11 +847,17 @@ fn walk_header<C: InventoryCollector>(
         }
     }
 
-    while scanner.peek() == Some(b' ') {
-        scanner.bump();
-    }
+    // The reference reader parses this buffer as JSON (the `safetensors`
+    // crate calls `serde_json::from_str`), whose own end-of-input check
+    // (`Deserializer::end`) skips exactly the space/tab/CR/LF class after the
+    // final `}` before requiring EOF — the same class `skip_ws` already uses
+    // for every interior gap in this grammar. Scanning only space here was an
+    // inconsistency with the rest of this parser, not a narrower contract:
+    // a tab or newline after a valid header was rejected here while the
+    // reference, and this parser's own interior grammar, both accept it.
+    scanner.skip_ws();
     if scanner.peek().is_some() {
-        return Err(scanner.error(HeaderSyntaxFault::TrailingNonSpace));
+        return Err(scanner.error(HeaderSyntaxFault::TrailingNonWhitespace));
     }
 
     finish_census(header.len(), limits, &mut census)?;
@@ -1848,14 +1854,22 @@ mod tests {
             4,
             HeaderSyntaxFault::TrailingComma,
         );
+        // JSON whitespace (RFC 8259) is space, tab, CR, and LF — exactly the
+        // set `serde_json` (what the reference `safetensors` crate parses
+        // the header with) skips before requiring EOF, and exactly the set
+        // `skip_ws` already accepts everywhere else in this header. Each is
+        // valid trailing padding; only a genuinely non-whitespace byte after
+        // the closing brace is malformed.
+        for trailing in [b" ".as_slice(), b"\t", b"\n", b"\r", b" \t\r\n"] {
+            let mut padded = one.to_vec();
+            padded.extend_from_slice(trailing);
+            assert!(parse(&padded, 4).is_ok(), "trailing {trailing:?}");
+        }
         assert_malformed(
-            b"{\"a\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}\n",
+            b"{\"a\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}x",
             4,
-            HeaderSyntaxFault::TrailingNonSpace,
+            HeaderSyntaxFault::TrailingNonWhitespace,
         );
-        let mut padded = one.to_vec();
-        padded.extend_from_slice(b"   ");
-        assert!(parse(&padded, 4).is_ok());
         for empty in [
             br#"{}"#.as_slice(),
             br#"{"__metadata__":{"format":"pt"}}"#.as_slice(),
