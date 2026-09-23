@@ -643,7 +643,18 @@ selection is retried on the next request, never mistaken for a cache hit.
     { "id": 0, "name": "technical", "path": "/path/to/adapter.safetensors", "rank": 8, "layers": 24 }
   ],
   "applied": [{ "id": 0, "scale": 1.0 }],
-  "router": { "enabled": true, "version": "7:1f9fbd2587812a3e", "pinned": false, "adapter_names": ["technical"] }
+  "router": {
+    "enabled": true,
+    "version": "7:1f9fbd2587812a3e",
+    "pinned": false,
+    "embedder": "qwen3.5-0.8b",
+    "adapter_names": ["technical"],
+    "routable": true,
+    "missing": [],
+    "unexpected": [],
+    "duplicate_trained": null,
+    "duplicate_resident": null
+  }
 }
 ```
 
@@ -659,6 +670,29 @@ whenever the gate or the adapter-name list does. `pinned` says whether
 highest one present. The two are worth distinguishing because the version
 number alone cannot: a pinned server and an unpinned one report the same number
 until the next refit lands, and by then the unpinned one has already moved.
+
+`embedder` is the embedding model this process loaded: the
+`--embedding-model` directory's basename, or `--embedding-model-id` when given.
+Startup refuses a gate trained on a different embedder, so this is the identity
+the gate was checked against.
+
+`adapter_names` lists the adapters the gate was trained on, in the gate's
+column order. The remaining fields compare that list with the adapters resident
+right now:
+
+- `missing`: trained names that are not resident.
+- `unexpected`: resident names the gate was not trained on.
+- `duplicate_trained`: a name the gate's trained list holds twice, so its
+  columns cannot be told apart, or `null`.
+- `duplicate_resident`: a name resident twice, so it no longer identifies one
+  adapter, or `null`.
+
+`routable` is `true` only when both lists are empty and both duplicates are
+`null`. It is computed by the same check a chat request runs, so a request that
+omits `lora` while `routable` is `false` is refused with
+`router_adapter_set_mismatch` instead of being routed. Loading or unloading an
+adapter changes the answer, and this endpoint shows the change before the next
+request does.
 
 Unload requires an id. Unknown ids are refused; unloading an adapter used by the
 applied mixture clears that mixture, while other resident adapters remain.

@@ -469,25 +469,6 @@ fn trained_pooling(pooling: &str) -> Result<crate::forward::cpu_f16::PoolingStra
     }
 }
 
-/// Check a gate artifact against the embedding model this server actually
-/// loaded, and return the pooling the routing path must use.
-///
-/// This is the pairing [`ServingRouter::new`] cannot see. That constructor
-/// checks the artifact against the gate it ships with, which says the artifact
-/// describes itself correctly and nothing about whether this server can
-/// reproduce the representation it names.
-///
-/// The identity compared is the served model id -- the name `/v1/models`
-/// publishes and `--model-id` sets -- not the `--model` path, which is
-/// machine-local and would refuse a correct artifact for having been trained
-/// on a box that stored the checkpoint elsewhere.
-///
-/// A name is weak evidence, and the refusal is deliberately one-directional
-/// because of it: two checkpoints can share a name, and fine-tuning changes
-/// the representation without changing the name. So a mismatch refuses, and a
-/// match is not a warrant of sameness. The width comparison below is the half
-/// that is actually checkable, and its passing is exactly what makes the
-/// unchecked half look settled.
 /// The identity recorded for a server's embedding model.
 ///
 /// A type rather than a `&str` because the defect it prevents was exactly a
@@ -531,6 +512,26 @@ impl EmbedderIdentity {
     }
 }
 
+/// Check a gate artifact against the embedding model this server actually
+/// loaded, and return the pooling the routing path must use.
+///
+/// This is the pairing [`ServingRouter::new`] cannot see. That constructor
+/// checks the artifact against the gate it ships with, which says the artifact
+/// describes itself correctly and nothing about whether this server can
+/// reproduce the representation it names.
+///
+/// The identity compared is the embedder's: the `--embedding-model`
+/// directory's basename, or `--embedding-model-id` when given. It is never the
+/// chat model's id, and never the full path, which is machine-local and would
+/// refuse a correct artifact for having been trained on a box that stored the
+/// checkpoint elsewhere.
+///
+/// A name is weak evidence, and the refusal is deliberately one-directional
+/// because of it: two checkpoints can share a name, and fine-tuning changes
+/// the representation without changing the name. So a mismatch refuses, and a
+/// match is not a warrant of sameness. The width comparison below is the half
+/// that is actually checkable, and its passing is exactly what makes the
+/// unchecked half look settled.
 pub fn check_representation(
     artifact: &RouterArtifact,
     embedder_identity: &EmbedderIdentity,
