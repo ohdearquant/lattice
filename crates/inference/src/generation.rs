@@ -791,10 +791,12 @@ impl DecodePolicy {
     /// Row R03 sibling of [`Self::transition`], for callers that cannot hand over raw
     /// `logits` (`decoder::driver::run` -- see that module's doc comment). Drives the exact
     /// same [`Self::transition_inner`] engine `transition` drives, so every ordering
-    /// guarantee `transition`'s own doc comment states holds identically here: `grammar_advance`
-    /// and `record_metadata` are the two backend callbacks that route through the session
-    /// (`DecoderSession::advance_grammar` / `DecoderSession::metadata`), in the same fixed
-    /// positions `transition`'s callbacks occupy.
+    /// guarantee `transition`'s own doc comment states holds identically here:
+    /// `grammar_advance` and `record_metadata` are the two backend callbacks, in the same
+    /// fixed positions `transition`'s callbacks occupy -- `grammar_advance` closes over the
+    /// driver's own owned grammar engine/state (`decoder::driver::run`'s doc comment; no
+    /// longer a `DecoderSession` method) and `record_metadata` routes through
+    /// `DecoderSession::metadata`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn transition_with_metadata(
         &mut self,

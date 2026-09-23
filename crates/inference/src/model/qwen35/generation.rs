@@ -113,7 +113,8 @@ impl Qwen35Model {
     /// `gen_cfg.temperature` go straight into [`QwenCpuSession::new`], which owns the RNG
     /// draw and the per-request `gdn_states`/`kv_cache`/`scratch` allocation from here on
     /// (see that constructor's own doc comment for why it captures exactly those two
-    /// fields), and `gen_cfg.grammar.clone()` seeds the session's own grammar state.
+    /// fields). `gen_cfg.grammar` is read by [`driver::run`] itself now, not by this
+    /// constructor -- the driver owns grammar transitions (ADR-090 D1).
     fn generate_via_driver(
         &self,
         prompt: &str,
@@ -157,13 +158,8 @@ impl Qwen35Model {
             cfg.vocab_size,
         )?;
 
-        let mut session = QwenCpuSession::new(
-            self,
-            prompt_ids.clone(),
-            gen_cfg.temperature,
-            gen_cfg.seed,
-            gen_cfg.grammar.clone(),
-        );
+        let mut session =
+            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
 
         // Non-streaming callers never cancel and never need raw-event/tail-flush
         // hooks; only the streaming dispatch target (`generate_streaming_via_driver`)
@@ -470,13 +466,8 @@ impl Qwen35Model {
             cfg.vocab_size,
         )?;
 
-        let mut session = QwenCpuSession::new(
-            self,
-            prompt_ids.clone(),
-            gen_cfg.temperature,
-            gen_cfg.seed,
-            gen_cfg.grammar.clone(),
-        );
+        let mut session =
+            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
 
         let should_cancel_cell = std::cell::RefCell::new(should_cancel);
         let cancel = FnMutCancellation(&should_cancel_cell);
@@ -2073,13 +2064,13 @@ mod tests {
     /// checkpoint.
     ///
     /// Mutation sensitivity (recorded at review time per the row's
-    /// acceptance criteria, not committed): routing `record_metadata` /
-    /// `advance_grammar` through the session at the wrong point (e.g.
-    /// scoring against pre-mask logits, or skipping the mid-loop
-    /// grammar-advance call) changes either `token_logprobs` or `token_ids`
-    /// here without necessarily changing the existing grammar-only /
-    /// logprobs-only tests above, which is exactly the combined-path gap
-    /// this test closes.
+    /// acceptance criteria, not committed): routing `record_metadata`
+    /// (through the session) / the grammar-advance step (through the
+    /// driver's own owned state) at the wrong point (e.g. scoring against
+    /// pre-mask logits, or skipping the mid-loop grammar-advance call)
+    /// changes either `token_logprobs` or `token_ids` here without
+    /// necessarily changing the existing grammar-only / logprobs-only tests
+    /// above, which is exactly the combined-path gap this test closes.
     #[test]
     fn grammar_and_logprobs_combined_equivalence_across_stop_strings_and_streaming() {
         let model = build_a_first_zero_model();

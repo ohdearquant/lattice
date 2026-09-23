@@ -7,9 +7,11 @@
 //! ADR-090 row C (`driver`) adds the one autoregressive loop over `&mut dyn DecoderSession`,
 //! and `model::qwen35::generation`'s `generate()`/`generate_with_trace()` are its production
 //! callers. Row R03 routes grammar-constrained decoding and `logprobs` capture through it too
-//! (`select` returns [`SelectOutcome`]; `advance_grammar`/`grammar_complete_without_continuation`
-//! and `metadata` are real per-step calls now, not reserved surface) -- see `driver`'s own
-//! module doc comment for the full per-step ordering.
+//! (`select` returns [`SelectOutcome`] and `metadata` is a real per-step call now, not reserved
+//! surface). Grammar ownership lives in `driver`, not in this trait: `select` reads a borrowed
+//! mask through [`SelectionRequest::grammar_mask`] and the driver calls `advance` /
+//! `is_complete_without_continuation` on its own owned engine and state -- see `driver`'s own
+//! module doc comment for the full per-step ordering and the reasoning for that split.
 //!
 //! Everything in this module is `pub(crate)`.
 
@@ -206,6 +208,13 @@ pub(crate) struct SelectionCandidate {
     pub(crate) prediction: PredictionId,
 }
 
+/// Grammar mask closure carried by [`SelectionRequest::grammar_mask`]: applies grammar
+/// masking to a session's own logits in place, or fails with the same error
+/// `crate::grammar::GrammarEngine::mask_logits` returns. Named as its own alias (rather than
+/// spelled out inline) purely to keep `SelectionRequest`'s and `decoder::driver::run`'s type
+/// signatures readable -- clippy's `type_complexity` lint flags the unaliased form.
+pub(crate) type GrammarMaskFn<'a> = dyn Fn(&mut [f32]) -> Result<(), InferenceError> + 'a;
+
 /// What a concrete session's `select` operation borrows to sample the next candidate.
 ///
 /// RNG ownership stays in the driver/session, never in this request: randomness crosses
@@ -217,23 +226,34 @@ pub(crate) struct SelectionCandidate {
 /// already-drawn values; reconciling that draw schedule with this boundary is row B/C
 /// work and is not solved here.
 ///
-/// Carries no `grammar` field (row R03 removed it): masking needs a mutable grammar state
-/// reachable from inside `select`, which a shared `&SelectionRequest` cannot carry, so the
-/// state now lives on the concrete session itself (constructed once, mutated across steps),
-/// not rebuilt per request. See `decoder::driver`'s module doc comment and
-/// `QwenCpuSession::select`/`select`'s own doc comment for the full reasoning.
+/// `grammar_mask` is the one field that is not `Copy`-trivial to reason about but still lets
+/// this type stay `#[derive(Copy)]`: a shared reference to a `dyn Fn` is `Copy` regardless of
+/// what the closure behind it captures. The driver builds this closure once per `run()` call
+/// over its own owned `GrammarEngine`/`GrammarState` (interior mutability via `RefCell`, since
+/// masking needs `&mut GrammarState` but `select` only ever sees `&SelectionRequest`), and
+/// hands a borrow of it to every step's request. `None` when no grammar was set on
+/// `GenerateConfig` -- the ADR-090 D1 owner of grammar transitions is the driver, not any
+/// concrete session, so a session with no grammar support simply never receives `Some` here.
+/// See `decoder::driver`'s module doc comment for the full per-step ordering.
 #[derive(Clone, Copy)]
 pub(crate) struct SelectionRequest<'a> {
     pub(crate) config: &'a GenerateConfig,
     pub(crate) history: &'a [u32],
+    pub(crate) grammar_mask: Option<&'a GrammarMaskFn<'a>>,
 }
 
 /// Outcome of [`DecoderSession::select`]: either a real sampled candidate, or a signal that
-/// grammar masking blocked every token AND the grammar state is already a valid accepting
-/// state with no further legal continuation -- generation ends here with no new token
-/// sampled. The "blocked and NOT a valid accept state" case is not a variant of this enum:
-/// it is a hard error (`InferenceError::GrammarConstraintBlocked`), returned directly from
-/// `select` via its `Result`, mirroring the pre-driver inline loops' identical distinction.
+/// grammar masking blocked every token, i.e. no finite logit remained after applying
+/// [`SelectionRequest::grammar_mask`]. This variant does not by itself distinguish "the
+/// grammar reached a valid accepting state with no further legal continuation" (a completed
+/// grammar -- generation ends here with no new token sampled) from "no legal continuation
+/// exists and the grammar is not in an accepting state" (a hard error): resolving that
+/// requires the grammar engine and state, which the session no longer holds (ADR-090 D1: the
+/// driver owns grammar transitions). The driver makes that call itself right after `select`
+/// returns this variant, via its own owned `is_complete_without_continuation` check, and
+/// returns `InferenceError::GrammarConstraintBlocked` directly (never as a variant of this
+/// enum) for the not-complete case -- mirroring the pre-driver inline loops' identical
+/// distinction, just relocated to the caller that still has the state to make it.
 pub(crate) enum SelectOutcome {
     Candidate(SelectionCandidate),
     GrammarExhausted,
@@ -414,25 +434,6 @@ pub(crate) trait DecoderSession {
         final_token: u32,
         request: &MetadataRequest,
     ) -> Result<TokenMetadata, InferenceError>;
-
-    /// Advances grammar state (if any) on the actually-emitted (post-reasoning-override)
-    /// token, mirroring the pre-driver inline loops' `engine.advance(gs, next_id)` call.
-    /// Must run inside `DecodePolicy::transition`'s fixed internal order, before the
-    /// EOS check -- see `decoder::driver`'s module doc comment. Default `true`: a session
-    /// with no grammar support has nothing to advance and never rejects a token on this
-    /// basis.
-    fn advance_grammar(&mut self, _next_id: u32) -> bool {
-        true
-    }
-
-    /// Whether the grammar state reached an accepting state with no further legal
-    /// continuation, as of the most recent [`Self::advance_grammar`] call. Read-only:
-    /// mirrors the pre-driver inline loops' `engine.is_complete_without_continuation(gs)`
-    /// check, made right after a successful advance, before the next `select`. Default
-    /// `false`: a session with no grammar support is never in a grammar-complete state.
-    fn grammar_complete_without_continuation(&self) -> bool {
-        false
-    }
 
     fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError>;
 }
@@ -719,6 +720,7 @@ mod tests {
         let request = SelectionRequest {
             config: &cfg,
             history: &history,
+            grammar_mask: None,
         };
         let candidate = match session
             .select(&request)

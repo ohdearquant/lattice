@@ -1,20 +1,33 @@
 //! The autoregressive driver (ADR-090 D1/D2, row C; grammar/logprobs routing
-//! added by row R03): one loop over `&mut dyn DecoderSession` that drives the
-//! existing [`DecodePolicy`] unchanged -- every canonical Qwen3.5 CPU
-//! generate/stream request now runs through this driver, no exceptions.
+//! added by row R03, grammar ownership relocated here in this rework): one loop
+//! over `&mut dyn DecoderSession` that drives the existing [`DecodePolicy`]
+//! unchanged -- every canonical Qwen3.5 CPU generate/stream request now runs
+//! through this driver, no exceptions.
 //!
-//! **Grammar.** Masking happens inside the session's own `select` (over logits
-//! this module still cannot see -- D1 forbids downcasting to reach them), against
-//! a `GrammarState` the session owns across its lifetime (constructed once,
-//! mutated by every `select`/`advance_grammar` call -- see `QwenCpuSession`'s
-//! module doc comment). Advance runs inside `DecodePolicy::transition_with_metadata`'s
-//! fixed internal order, before the EOS check, via the `grammar_advance` callback
-//! this driver wires to [`DecoderSession::advance_grammar`]. Step 0 (the
+//! **Grammar.** This driver, not the session, owns the [`GrammarEngine`] and
+//! [`GrammarState`] (built from `gen_cfg.grammar`; `None` when no grammar is
+//! set): ADR-090 D1 names grammar transitions as the driver's responsibility,
+//! and a per-session copy would be exactly the duplication this refactor exists
+//! to remove -- every future session (Gemma CPU, Metal Qwen, ...) would
+//! otherwise have to reimplement it. State needs interior mutability
+//! (`RefCell`) because masking (`GrammarEngine::mask_logits`) takes `&mut
+//! GrammarState` while [`DecoderSession::select`] only ever sees `&
+//! SelectionRequest` -- see [`SelectionRequest::grammar_mask`]'s own doc
+//! comment. Each step, this driver builds (once, before the loop) a closure
+//! over that engine/state and hands the session a borrow of it through
+//! `grammar_mask`; the session applies the mask to its own logits and reports
+//! [`SelectOutcome::GrammarExhausted`] when every token is blocked, without
+//! itself knowing whether that is a completed grammar or a real error --
+//! resolving that ambiguity is this driver's job (`grammar_complete` below),
+//! since only the driver still holds the engine and state. `advance` runs
+//! inside `DecodePolicy::transition_with_metadata`'s fixed internal order,
+//! before the EOS check, via the `grammar_advance` closure this driver builds
+//! over its own owned state (no longer a session method). Step 0 (the
 //! prefill-derived first token) has no `transition` call of its own to route
 //! this through -- `DecodePolicy::init`/`init_with_metadata` build the policy but
 //! run no per-step control sequence -- so this driver makes the identical
-//! `advance_grammar` call directly, in the same position `generate_inline`'s
-//! manual code made it (mask -> sample -> **advance** -> EOS check -> push).
+//! `advance` call directly, in the same position `generate_inline`'s manual
+//! code made it (mask -> sample -> **advance** -> EOS check -> push).
 //!
 //! **Logprobs.** `DecodePolicy::init_with_metadata` / `transition_with_metadata`
 //! (row R03 siblings of `init`/`transition`, sharing the same private engine --
@@ -25,6 +38,17 @@
 //! [`DecoderSession::metadata`], scored against the SAME prediction the
 //! actually-emitted token's candidate came from -- D1's "Metadata identity"
 //! role (the final token scored against the prediction's pre-advance view).
+//! Unchanged by this rework: logprobs stay session-scored, driver-called.
+//!
+//! **Capabilities are a hard error, not a debug assertion.** D3: capabilities
+//! are negotiated per session, and "one driver over many sessions" (D1) means
+//! a session that does not declare a control this call actually uses is a
+//! caller bug this driver refuses outright (`InferenceError::InvalidInput`),
+//! in every build -- a `debug_assert!` here would silently no-op in release
+//! and let a session ignore a control it never claimed to support. See
+//! `check_capabilities` below and its test module for the mutation-sensitive
+//! proof (a fake session declaring `grammar: false` is refused; one declaring
+//! `grammar: true` for the same request is not).
 //!
 //! **The `ended_without_reopening` trace exception.** The driver's standing
 //! invariant is `consumed == opened - 1` (see the comment above the final
@@ -37,13 +61,14 @@
 //! path so the final assertion can state both invariants instead of silently
 //! weakening the general one.
 use super::{
-    AcceptedToken, Cancellation, DecoderSession, FinishDisposition, MetadataRequest, SelectOutcome,
-    SelectionRequest,
+    AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
+    GrammarMaskFn, MetadataRequest, SelectOutcome, SelectionRequest,
 };
 use crate::error::InferenceError;
 use crate::generation::{
     DecodePolicy, GenerateConfig, StepOutcome, StopCheckOutcome, TokenLogprob,
 };
+use crate::grammar::{GrammarEngine, pda::GrammarState};
 use crate::stop_reason::StopReason;
 use std::cell::RefCell;
 
@@ -73,6 +98,37 @@ pub(crate) struct DriverResult {
     /// its own local of the same name, to skip a redundant tail-flush attempt.
     pub(crate) confirmed_stop_string_match: bool,
     pub(crate) trace: DriverTrace,
+}
+
+/// Refuses (`InferenceError::InvalidInput`) when `gen_cfg` requests a control `caps` does not
+/// declare -- see this module's doc comment ("Capabilities are a hard error, not a debug
+/// assertion"). Checked once, at the top of [`run`], before any session call.
+fn check_capabilities(
+    caps: ExecutionCapabilities,
+    gen_cfg: &GenerateConfig,
+) -> Result<(), InferenceError> {
+    if !caps.grammar && gen_cfg.grammar.is_some() {
+        return Err(InferenceError::InvalidInput(
+            "session does not declare grammar support but gen_cfg.grammar is set".into(),
+        ));
+    }
+    if !caps.logprobs && gen_cfg.logprobs.is_some() {
+        return Err(InferenceError::InvalidInput(
+            "session does not declare logprobs support but gen_cfg.logprobs is set".into(),
+        ));
+    }
+    if !caps.stop_strings && !gen_cfg.stop_strings.is_empty() {
+        return Err(InferenceError::InvalidInput(
+            "session does not declare stop_strings support but gen_cfg.stop_strings is set".into(),
+        ));
+    }
+    if !caps.reasoning_budget && gen_cfg.reasoning_budget.is_some() {
+        return Err(InferenceError::InvalidInput(
+            "session does not declare reasoning_budget support but gen_cfg.reasoning_budget is set"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Runs prefill, then the prefill-derived first token, then the standard
@@ -121,31 +177,64 @@ pub(crate) fn run(
 ) -> Result<DriverResult, InferenceError> {
     // D3: capabilities are negotiated per session, and "one driver over many sessions" (D1)
     // means a session that does not declare a control this call actually uses is a caller
-    // bug, not this driver's problem to route around silently.
+    // bug -- a hard error in every build, not this driver's problem to route around silently.
     let caps = *session.capabilities();
-    debug_assert!(
-        caps.grammar || gen_cfg.grammar.is_none(),
-        "session does not declare grammar support but gen_cfg.grammar is set"
-    );
-    debug_assert!(
-        caps.logprobs || gen_cfg.logprobs.is_none(),
-        "session does not declare logprobs support but gen_cfg.logprobs is set"
-    );
-    debug_assert!(
-        caps.stop_strings || gen_cfg.stop_strings.is_empty(),
-        "session does not declare stop_strings support but gen_cfg.stop_strings is set"
-    );
-    debug_assert!(
-        caps.reasoning_budget || gen_cfg.reasoning_budget.is_none(),
-        "session does not declare reasoning_budget support but gen_cfg.reasoning_budget is set"
-    );
+    check_capabilities(caps, gen_cfg)?;
 
-    // `RefCell<&mut dyn DecoderSession>`: `grammar_advance` and `record_metadata` below are
-    // two independent closures that both need mutable session access, passed as sibling
-    // arguments to the same `transition_with_metadata` call -- two simultaneous `&mut
-    // session` captures the borrow checker rejects outright, even though the closures are
-    // only ever called sequentially, never concurrently. Same pattern this crate already
-    // uses for the identical shape (`FnMutCancellation`, `on_raw_event_cell`, `detok_cell` in
+    // Driver-owned grammar engine + state (ADR-090 D1; moved off the session by this row's
+    // rework -- see this module's doc comment). `grammar_state` needs interior mutability:
+    // `GrammarEngine::mask_logits`/`advance` take `&mut GrammarState`, but the mask closure
+    // below is reached through `&SelectionRequest` (shared borrow) and `grammar_advance` is
+    // called from inside `DecodePolicy::transition_with_metadata` without a `&mut` path back
+    // to this local. `None` on either side of these three bindings when `gen_cfg.grammar` is
+    // `None` -- every one of them then behaves as documented "no grammar" default.
+    let grammar_engine: Option<&GrammarEngine> = gen_cfg.grammar.as_deref();
+    let grammar_state: Option<RefCell<GrammarState>> =
+        grammar_engine.map(|engine| RefCell::new(engine.initial_state()));
+
+    // Built once, borrowed by every `SelectionRequest` below (`Option<&dyn Fn(..)>` stays
+    // `Copy`, so `SelectionRequest` does not have to give that up -- see its own doc
+    // comment). Boxed because a `match`'s two arms are two different anonymous closure
+    // types; the trait object is the point where they unify.
+    let grammar_mask: Option<Box<GrammarMaskFn<'_>>> = match (grammar_engine, &grammar_state) {
+        (Some(engine), Some(state)) => Some(Box::new(move |logits: &mut [f32]| {
+            engine.mask_logits(&mut state.borrow_mut(), logits)?;
+            Ok(())
+        })),
+        _ => None,
+    };
+
+    // Advances the driver-owned grammar state on the actually-emitted token, replacing the
+    // removed `DecoderSession::advance_grammar`. `true` (accept, nothing to advance) when no
+    // grammar is set -- the same default that trait method used to return.
+    let grammar_advance = |next_id: u32| -> bool {
+        match (grammar_engine, &grammar_state) {
+            (Some(engine), Some(state)) => engine.advance(&mut state.borrow_mut(), next_id),
+            _ => true,
+        }
+    };
+
+    // Whether the grammar reached an accepting state with no further legal continuation, as
+    // of the most recent `grammar_advance` call. Replaces the removed
+    // `DecoderSession::grammar_complete_without_continuation`; `false` (never complete) when
+    // no grammar is set. Called both to disambiguate `SelectOutcome::GrammarExhausted` (see
+    // `SelectOutcome`'s doc comment) and, post-`Emitted`, as the same proactive check the
+    // pre-driver loops made.
+    let grammar_complete = || -> bool {
+        match (grammar_engine, &grammar_state) {
+            (Some(engine), Some(state)) => engine.is_complete_without_continuation(&state.borrow()),
+            _ => false,
+        }
+    };
+
+    // `RefCell<&mut dyn DecoderSession>`: `record_metadata` below and the surrounding
+    // `select`/`decode`/`finish` calls all need mutable session access from different
+    // closures and call sites within this same function body -- two simultaneous `&mut
+    // session` captures the borrow checker rejects outright, even though they are only ever
+    // called sequentially, never concurrently. (`grammar_advance` above needs no session
+    // access at all now -- the driver owns grammar state directly -- but the other closures
+    // still do.) Same pattern this crate already uses for the identical shape
+    // (`FnMutCancellation`, `on_raw_event_cell`, `detok_cell` in
     // `model::qwen35::generation`'s `generate_streaming_via_driver`).
     let session = RefCell::new(session);
 
@@ -196,18 +285,29 @@ pub(crate) fn run(
     let request0 = SelectionRequest {
         config: gen_cfg,
         history: &all_ids,
+        grammar_mask: grammar_mask.as_deref(),
     };
     let outcome0 = session.borrow_mut().select(&request0)?;
     let candidate0 = match outcome0 {
-        // Blocked before any sample, and the grammar state is already a valid accept
-        // state -- generate_inline's identical step-0 branch: no token is ever
-        // sampled, so this is `stopped: true` (a completed grammar, not a rejected
-        // one), unlike the advance-rejection case below. No prediction was opened
-        // (`select` returned before calling `PredictionLedger::open`), so `trace`
-        // stays at its untouched default -- there is nothing for the final
-        // `debug_assert_eq!` to reconcile because this return skips it entirely,
-        // exactly like the EOS-at-step-0 return below.
+        // `select` reported every token blocked but cannot itself tell a completed
+        // grammar from a real dead end (`SelectOutcome`'s doc comment) -- this driver
+        // still holds the engine/state, so it makes that call here. Blocked-and-complete
+        // is generate_inline's identical step-0 branch: no token is ever sampled, so this
+        // is `stopped: true` (a completed grammar, not a rejected one), unlike the
+        // advance-rejection case below. No prediction was opened (`select` returned
+        // before calling `PredictionLedger::open`), so `trace` stays at its untouched
+        // default -- there is nothing for the final `debug_assert_eq!` to reconcile
+        // because this return skips it entirely, exactly like the EOS-at-step-0 return
+        // below. Blocked-and-NOT-complete mirrors the pre-driver loops' identical hard
+        // error, just raised here instead of inside `select`.
         SelectOutcome::GrammarExhausted => {
+            if !grammar_complete() {
+                return Err(InferenceError::GrammarConstraintBlocked(
+                    "grammar constraint blocked every token; \
+                     no legal continuation exists in the current grammar state"
+                        .into(),
+                ));
+            }
             session.borrow_mut().finish(FinishDisposition::Reusable)?;
             return Ok(DriverResult {
                 generated_ids: Vec::new(),
@@ -227,15 +327,13 @@ pub(crate) fn run(
     // is_complete_without_continuation -> EOS check -> push sequence. Step 0 has no
     // `transition` call to route this through (`DecodePolicy::init`/`init_with_metadata`
     // build the policy but run no per-step control sequence), so this driver makes the
-    // identical call directly, in the same position. `grammar_output`'s `stop_reason` is
-    // unconditionally `Grammar` regardless of its `stopped` argument (see
-    // `model::qwen35::generation::grammar_output`), which this mirrors: a rejected
-    // candidate at step 0 is `stopped: false` (no completed grammar, nothing to answer
-    // with) -- distinct from the exhaustion-before-sampling case above.
-    if !session
-        .borrow_mut()
-        .advance_grammar(candidate0.candidate_id)
-    {
+    // identical call directly, in the same position -- now against its own owned state
+    // rather than through the removed `DecoderSession::advance_grammar`.
+    // `grammar_output`'s `stop_reason` is unconditionally `Grammar` regardless of its
+    // `stopped` argument (see `model::qwen35::generation::grammar_output`), which this
+    // mirrors: a rejected candidate at step 0 is `stopped: false` (no completed grammar,
+    // nothing to answer with) -- distinct from the exhaustion-before-sampling case above.
+    if !grammar_advance(candidate0.candidate_id) {
         session.borrow_mut().finish(FinishDisposition::Reusable)?;
         return Ok(DriverResult {
             generated_ids: Vec::new(),
@@ -246,7 +344,7 @@ pub(crate) fn run(
             trace,
         });
     }
-    let grammar_complete_at_step0 = session.borrow().grammar_complete_without_continuation();
+    let grammar_complete_at_step0 = grammar_complete();
 
     if is_eos(candidate0.candidate_id) {
         session.borrow_mut().finish(FinishDisposition::Reusable)?;
@@ -367,16 +465,28 @@ pub(crate) fn run(
             let request = SelectionRequest {
                 config: gen_cfg,
                 history: &all_ids,
+                grammar_mask: grammar_mask.as_deref(),
             };
             let outcome = session.borrow_mut().select(&request)?;
             let candidate = match outcome {
                 // Mid-loop mirror of `decode_loop`/`decode_loop_with_stops`'s
-                // mask-blocked-and-complete branch: no new prediction was opened this
-                // iteration, so `trace.opened` stays where it was -- exactly matching
-                // `trace.consumed` (this iteration's `decode()` did run), not the
-                // standing `consumed + 1` invariant. `ended_without_reopening` flags
-                // this for the final assertion below.
+                // mask-blocked-and-complete branch. As at step 0, `select` cannot itself
+                // tell a completed grammar from a real dead end, so this driver resolves
+                // it via its own owned state before deciding how the loop ends. The
+                // completed case: no new prediction was opened this iteration, so
+                // `trace.opened` stays where it was -- exactly matching `trace.consumed`
+                // (this iteration's `decode()` did run), not the standing `consumed + 1`
+                // invariant. `ended_without_reopening` flags this for the final assertion
+                // below. The not-complete case raises the same hard error `select` used
+                // to raise directly.
                 SelectOutcome::GrammarExhausted => {
+                    if !grammar_complete() {
+                        return Err(InferenceError::GrammarConstraintBlocked(
+                            "grammar constraint blocked every token; \
+                             no legal continuation exists in the current grammar state"
+                                .into(),
+                        ));
+                    }
                     stopped = true;
                     stop_reason = StopReason::Grammar;
                     ended_without_reopening = true;
@@ -392,7 +502,7 @@ pub(crate) fn run(
                 &mut token_logprobs,
                 candidate.candidate_id,
                 generated_len_before,
-                |next_id| session.borrow_mut().advance_grammar(next_id),
+                grammar_advance,
                 &is_eos,
                 |next_id| {
                     generated_ids.push(next_id);
@@ -449,15 +559,15 @@ pub(crate) fn run(
                 } => {
                     pending = candidate.prediction;
                     // Mirrors `decode_loop`/`decode_loop_with_stops`'s post-`Emitted`
-                    // `grammar_complete_without_continuation` check, run BEFORE the
-                    // answer-budget check -- proactively catching a grammar that just
-                    // reached an accepting state with no legal continuation, rather
-                    // than waiting for the next iteration's `select` to discover the
-                    // same thing via `SelectOutcome::GrammarExhausted`. This path opened
-                    // a real prediction this iteration (`trace.opened` above), so the
-                    // standing `opened == consumed + 1` invariant holds here --
+                    // grammar-complete check, run BEFORE the answer-budget check --
+                    // proactively catching a grammar that just reached an accepting state
+                    // with no legal continuation, rather than waiting for the next
+                    // iteration's `select` to discover the same thing via
+                    // `SelectOutcome::GrammarExhausted`. This path opened a real prediction
+                    // this iteration (`trace.opened` above), so the standing
+                    // `opened == consumed + 1` invariant holds here --
                     // `ended_without_reopening` is not set.
-                    if session.borrow().grammar_complete_without_continuation() {
+                    if grammar_complete() {
                         stopped = true;
                         stop_reason = StopReason::Grammar;
                         break;
@@ -546,4 +656,164 @@ pub(crate) fn run(
         confirmed_stop_string_match,
         trace,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoder::{PredictionId, StepStamp, TokenMetadata};
+    use crate::grammar::GrammarSpec;
+    use std::sync::Arc;
+
+    /// A one-token grammar (`root ::= "a"`) over a one-token vocabulary -- just enough for
+    /// `gen_cfg.grammar` to be `Some`, which is all [`check_capabilities`] inspects. Neither
+    /// test below reaches masking: `FakeSession::prefill` errors out before `select` is ever
+    /// called, so the grammar is never actually run.
+    fn a_trivial_grammar() -> Arc<GrammarEngine> {
+        Arc::new(
+            GrammarEngine::new(
+                &GrammarSpec::Gbnf("root ::= \"a\"\n".into()),
+                vec![b"a".to_vec()],
+            )
+            .expect("trivial one-token grammar must compile"),
+        )
+    }
+
+    /// Declares a fixed [`ExecutionCapabilities`] and otherwise never runs: every method past
+    /// `capabilities`/`prefill` panics if reached, so a test that gets past
+    /// [`check_capabilities`] fails at `prefill`'s distinct sentinel error rather than at a
+    /// silent no-op -- the two refusal points cannot be confused with each other.
+    struct FakeSession {
+        caps: ExecutionCapabilities,
+    }
+
+    impl DecoderSession for FakeSession {
+        fn capabilities(&self) -> &ExecutionCapabilities {
+            &self.caps
+        }
+
+        fn prefill(&mut self, _cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
+            Err(InferenceError::Inference(
+                "FakeSession::prefill reached -- check_capabilities let this request through"
+                    .into(),
+            ))
+        }
+
+        fn decode(
+            &mut self,
+            _accepted: &AcceptedToken,
+            _cancel: &dyn Cancellation,
+        ) -> Result<StepStamp, InferenceError> {
+            unreachable!("FakeSession::prefill always errors before decode is reached")
+        }
+
+        fn select(
+            &mut self,
+            _request: &SelectionRequest<'_>,
+        ) -> Result<SelectOutcome, InferenceError> {
+            unreachable!("FakeSession::prefill always errors before select is reached")
+        }
+
+        fn metadata(
+            &mut self,
+            _prediction: PredictionId,
+            _final_token: u32,
+            _request: &MetadataRequest,
+        ) -> Result<TokenMetadata, InferenceError> {
+            unreachable!("FakeSession::prefill always errors before metadata is reached")
+        }
+
+        fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
+            unreachable!("FakeSession::prefill always errors before finish is reached")
+        }
+    }
+
+    fn run_with_capabilities(caps: ExecutionCapabilities) -> Result<DriverResult, InferenceError> {
+        let mut session = FakeSession { caps };
+        let gen_cfg = GenerateConfig {
+            grammar: Some(a_trivial_grammar()),
+            ..Default::default()
+        };
+        let cancel = || false;
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        run(
+            &mut session,
+            &gen_cfg,
+            None,
+            &[0u32],
+            999,
+            false,
+            &cancel,
+            |_next_id| String::new(),
+            &mut text,
+            &mut offsets,
+            |_delta, _id| true,
+            || {},
+            String::new,
+        )
+    }
+
+    // -----------------------------------------------------------------
+    // Rework item 2: an undeclared-but-requested control is a hard
+    // `InferenceError`, in every build -- not a `debug_assert!` a release
+    // binary silently drops. A session declaring `grammar: false` while
+    // `gen_cfg.grammar` is set must be refused before any session method
+    // past `capabilities` is ever called.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn undeclared_grammar_capability_is_a_hard_error() {
+        let result = run_with_capabilities(ExecutionCapabilities {
+            grammar: false,
+            ..ExecutionCapabilities::default()
+        });
+        match result {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("grammar"),
+                    "refusal message should name the missing capability, got: {msg}"
+                );
+            }
+            Err(other_err) => panic!(
+                "a session declaring grammar: false with gen_cfg.grammar set must be refused \
+                 with InvalidInput before any session method past capabilities() runs; got a \
+                 different error instead: {other_err:?}"
+            ),
+            Ok(_) => panic!(
+                "a session declaring grammar: false with gen_cfg.grammar set must be refused; \
+                 got Ok(_) instead"
+            ),
+        }
+    }
+
+    /// Passing control for the test above: the same request, against a session that DOES
+    /// declare grammar support, must get past `check_capabilities` -- proven by reaching
+    /// `FakeSession::prefill`'s distinct sentinel error rather than the capability refusal.
+    /// Without this control, the test above could pass for the wrong reason (e.g. a
+    /// `check_capabilities` that always refuses regardless of `caps`).
+    #[test]
+    fn declared_grammar_capability_passes_the_check() {
+        let result = run_with_capabilities(ExecutionCapabilities {
+            grammar: true,
+            ..ExecutionCapabilities::default()
+        });
+        match result {
+            Err(InferenceError::Inference(msg)) => {
+                assert!(
+                    msg.contains("FakeSession::prefill reached"),
+                    "a session declaring grammar: true must get past check_capabilities and \
+                     reach prefill; got a different error instead: {msg}"
+                );
+            }
+            Err(other_err) => panic!(
+                "expected FakeSession::prefill's sentinel error (proving check_capabilities let \
+                 the request through); got a different error instead: {other_err:?}"
+            ),
+            Ok(_) => panic!(
+                "expected FakeSession::prefill's sentinel error; got Ok(_) instead -- \
+                 FakeSession::prefill should be unreachable-if-not-erroring"
+            ),
+        }
+    }
 }

@@ -45,15 +45,15 @@
 //! `DecodePolicy::init`/`transition`, which is what reaches `record_logprob` ->
 //! `compute_step_logprobs` -- the same value this session captures.
 //!
-//! **Grammar state (row R03)**: owned by this session, not by `SelectionRequest` or the
-//! driver -- `grammar_engine`/`grammar_state` are seeded once at construction from
-//! `GenerateConfig::grammar`'s `initial_state()` (mirroring `generate_inline`'s identical
-//! per-request seeding) and mutated in place by every `select`/`advance_grammar` call across
-//! the session's lifetime. `select` masks before sampling; `advance_grammar` (a separate
-//! [`DecoderSession`] method, called by the driver after the sampled candidate is known, from
-//! inside `DecodePolicy::transition`'s fixed per-step order) advances after. A per-call
-//! reinitialized `GrammarState` would silently restart grammar progress every step; this
-//! session avoids that by owning the state across its own lifetime instead.
+//! **Grammar state (row R03, re-owned by `decoder::driver` in this rework)**: this session
+//! holds no grammar engine or state of its own. ADR-090 D1 names the driver as the owner of
+//! grammar transitions, so a per-model session that carried its own copy would be exactly the
+//! duplication every future session (Gemma CPU, Metal Qwen, ...) would have to reimplement.
+//! Each `select` call instead receives a borrowed mask through
+//! [`SelectionRequest::grammar_mask`] (`None` when no grammar is set) and applies it to its
+//! own logits before sampling, via [`has_finite_logit`] to detect "every token blocked" --
+//! see `decoder::driver`'s module doc comment for who owns the engine/state and where
+//! `advance`/`is_complete_without_continuation` are called from.
 
 use super::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
@@ -62,12 +62,10 @@ use super::{
 };
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
-use crate::grammar::{GrammarEngine, pda::GrammarState};
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{ForwardScratch, KvCache, force_serial_prefill, initial_rng_state};
 use crate::model::qwen35::{prefill_tokens, sample_token};
 use crate::sampling::compute_step_logprobs;
-use std::sync::Arc;
 
 /// When a grammar engine blocks every token via `mask_logits`, every logit becomes
 /// `NEG_INFINITY`. Without this guard the sampler's non-finite-max short-circuit would
@@ -105,11 +103,6 @@ pub(crate) struct QwenCpuSession<'model> {
     rng_state: u64,
     temperature: f32,
     ledger: PredictionLedger,
-    // Row R03: grammar state now lives on the session (constructed once, mutated across
-    // every `select`/`advance_grammar` call), not rebuilt per `SelectionRequest` -- see
-    // `decoder::driver`'s module doc comment and `SelectionRequest`'s own doc comment for why.
-    grammar_engine: Option<Arc<GrammarEngine>>,
-    grammar_state: Option<GrammarState>,
 }
 
 impl<'model> QwenCpuSession<'model> {
@@ -117,16 +110,13 @@ impl<'model> QwenCpuSession<'model> {
     /// `Qwen35Model::generate` itself allocates per call. `temperature` and `seed` are the
     /// two `GenerateConfig` fields this session must capture at construction (see the module
     /// doc comment on why `metadata` and the RNG draw need them independent of any later
-    /// `SelectionRequest`). `grammar` seeds this session's own `GrammarState` from the
-    /// engine's `initial_state()` exactly once, mirroring `generate_inline`'s
-    /// `gen_cfg.grammar.as_ref().map(|g| g.initial_state())` -- `None` when no grammar is
-    /// set (zero-cost for unconstrained generation).
+    /// `SelectionRequest`). No `grammar` parameter: the driver owns the grammar engine and
+    /// state now (module doc comment) and hands this session a mask per step instead.
     pub(crate) fn new(
         model: &'model Qwen35Model,
         prompt_ids: Vec<u32>,
         temperature: f32,
         seed: Option<u64>,
-        grammar: Option<Arc<GrammarEngine>>,
     ) -> Self {
         let cfg = &model.config;
         let num_linear = cfg.num_linear_attention_layers();
@@ -135,7 +125,6 @@ impl<'model> QwenCpuSession<'model> {
             .map(|_| GatedDeltaNetState::new(cfg))
             .collect();
         let prompt_len = prompt_ids.len();
-        let grammar_state = grammar.as_ref().map(|g| g.initial_state());
 
         Self {
             model,
@@ -147,8 +136,6 @@ impl<'model> QwenCpuSession<'model> {
             rng_state: initial_rng_state(seed),
             temperature,
             ledger: PredictionLedger::new(),
-            grammar_engine: grammar,
-            grammar_state,
         }
     }
 }
@@ -256,35 +243,26 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
         })
     }
 
-    /// Masks the logits `prefill`/`decode` most recently left in `self.scratch` against
-    /// this session's own `grammar_state` (a no-op when no grammar was set at
-    /// construction), then samples via the exact `sample_token` `generate()` calls, and
-    /// opens a new ledger prediction for the sampled candidate.
+    /// Masks the logits `prefill`/`decode` most recently left in `self.scratch` through
+    /// `request.grammar_mask` (a no-op when `None` -- no grammar set), then samples via the
+    /// exact `sample_token` `generate()` calls, and opens a new ledger prediction for the
+    /// sampled candidate.
     ///
-    /// Mirrors `generate_inline`'s / `decode_loop`'s identical mask-before-sample sequence
-    /// exactly: mask in place, fail-closed via [`has_finite_logit`] when every token is
-    /// blocked, distinguishing "already a valid accept state" (returns
-    /// [`SelectOutcome::GrammarExhausted`]; the driver's caller decides what that means at
-    /// its call site) from "no legal token exists at all" (a hard
-    /// `GrammarConstraintBlocked` error, matching the pre-driver loops' identical error and
-    /// message). Grammar *advance* is a separate operation
-    /// ([`DecoderSession::advance_grammar`]), called by the driver after this sampled
-    /// candidate is known -- masking and advancing are two different points in the legacy
-    /// per-step sequence, and this method only ever does the first.
+    /// Mirrors `generate_inline`'s / `decode_loop`'s mask-before-sample sequence, minus the
+    /// part that moved to the driver: this method masks in place and fails closed via
+    /// [`has_finite_logit`] when every token is blocked, but does not itself decide whether
+    /// that is a completed grammar or a real error -- it always reports
+    /// [`SelectOutcome::GrammarExhausted`] and leaves that call to whichever caller still
+    /// holds the grammar engine and state (see `SelectOutcome`'s and `decoder::driver`'s
+    /// doc comments). Grammar *advance* is likewise not this method's job any more: the
+    /// driver calls it directly on its own owned state after the sampled candidate is known.
     fn select(&mut self, request: &SelectionRequest<'_>) -> Result<SelectOutcome, InferenceError> {
         let vocab_size = self.model.config.vocab_size;
 
-        if let (Some(engine), Some(gs)) = (&self.grammar_engine, &mut self.grammar_state) {
-            engine.mask_logits(gs, &mut self.scratch.logits[..vocab_size])?;
+        if let Some(mask) = request.grammar_mask {
+            mask(&mut self.scratch.logits[..vocab_size])?;
             if !has_finite_logit(&self.scratch.logits[..vocab_size]) {
-                if engine.is_complete_without_continuation(gs) {
-                    return Ok(SelectOutcome::GrammarExhausted);
-                }
-                return Err(InferenceError::GrammarConstraintBlocked(
-                    "grammar constraint blocked every token; \
-                     no legal continuation exists in the current grammar state"
-                        .into(),
-                ));
+                return Ok(SelectOutcome::GrammarExhausted);
             }
         }
 
@@ -339,26 +317,6 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
         })
     }
 
-    /// Advances `self.grammar_state` on the actually-emitted token (a no-op returning
-    /// `true` when no grammar was set), via the exact `engine.advance(gs, next_id)` call
-    /// `decode_loop`/`decode_loop_with_stops`'s `grammar_advance` closure made.
-    fn advance_grammar(&mut self, next_id: u32) -> bool {
-        match (&self.grammar_engine, &mut self.grammar_state) {
-            (Some(engine), Some(gs)) => engine.advance(gs, next_id),
-            _ => true,
-        }
-    }
-
-    /// Mirrors the free function `grammar_complete_without_continuation` the pre-driver
-    /// loops called right after a successful advance, via the exact
-    /// `engine.is_complete_without_continuation(gs)` call.
-    fn grammar_complete_without_continuation(&self) -> bool {
-        match (&self.grammar_engine, &self.grammar_state) {
-            (Some(engine), Some(gs)) => engine.is_complete_without_continuation(gs),
-            _ => false,
-        }
-    }
-
     /// `Poisoned` invalidates whatever prediction is still live, through the same
     /// `PredictionLedger::invalidate` a cancellation or failure would use (D2: a poisoned
     /// session's typed state must never be made to look reusable by patching a sequence
@@ -411,7 +369,7 @@ mod tests {
         );
         let prompt_len = prompt_ids.len();
 
-        let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), None);
+        let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7));
 
         let cancel = cancel_false();
         let stamp = session
@@ -432,6 +390,7 @@ mod tests {
         let request = SelectionRequest {
             config: &gen_cfg,
             history: &history,
+            grammar_mask: None,
         };
         let candidate = match session
             .select(&request)
@@ -502,7 +461,7 @@ mod tests {
         let prompt_ids = tokenize(&model, "abc");
         assert!(!prompt_ids.is_empty());
 
-        let mut session = QwenCpuSession::new(&model, prompt_ids, 0.0, Some(7), None);
+        let mut session = QwenCpuSession::new(&model, prompt_ids, 0.0, Some(7));
 
         let pre_gdn: Vec<(Vec<f32>, Vec<f32>)> = session
             .gdn_states
@@ -559,7 +518,7 @@ mod tests {
         let model = tiny_zero_model();
         let prompt_ids = tokenize(&model, "abc");
         let prompt_len = prompt_ids.len();
-        let mut session = QwenCpuSession::new(&model, prompt_ids, 0.0, Some(7), None);
+        let mut session = QwenCpuSession::new(&model, prompt_ids, 0.0, Some(7));
 
         FORCE_SERIAL_PREFILL.store(true, std::sync::atomic::Ordering::SeqCst);
         let result = session.prefill(&cancel_false());
@@ -582,7 +541,7 @@ mod tests {
     fn cancelled_decode_consumes_nothing_and_finish_poisoned_invalidates() {
         let model = tiny_zero_model();
         let prompt_ids = tokenize(&model, "abc");
-        let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), None);
+        let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7));
         session
             .prefill(&cancel_false())
             .expect("prefill must succeed");
@@ -595,6 +554,7 @@ mod tests {
         let request = SelectionRequest {
             config: &gen_cfg,
             history: &prompt_ids,
+            grammar_mask: None,
         };
         let candidate = match session.select(&request).expect("select must succeed") {
             SelectOutcome::Candidate(c) => c,
@@ -641,7 +601,7 @@ mod tests {
         assert!(!prompt_ids.is_empty());
         let prompt_len = prompt_ids.len();
 
-        let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(1234), None);
+        let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(1234));
 
         let cancel = cancel_false();
         let stamp = session
@@ -658,6 +618,7 @@ mod tests {
         let request = SelectionRequest {
             config: &gen_cfg,
             history: &prompt_ids,
+            grammar_mask: None,
         };
         let candidate = match session.select(&request).expect("select must succeed") {
             SelectOutcome::Candidate(c) => c,
