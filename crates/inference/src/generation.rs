@@ -33,6 +33,11 @@ pub struct GenerateConfig {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    /// Min-p: keep tokens with probability at least `min_p * max_probability`,
+    /// applied before top-p. 0.0 or NaN = disabled (the default); other
+    /// values clamp to `[0.0, 1.0]`. See `crate::sampling::SamplingConfig::min_p`
+    /// and `crate::sampling::Sampler::with_min_p` for the shared semantics.
+    pub min_p: f32,
     pub repetition_penalty: f32,
     /// Random seed for sampling. `None` = seed from system time.
     pub seed: Option<u64>,
@@ -77,6 +82,7 @@ impl std::fmt::Debug for GenerateConfig {
             .field("temperature", &self.temperature)
             .field("top_k", &self.top_k)
             .field("top_p", &self.top_p)
+            .field("min_p", &self.min_p)
             .field("repetition_penalty", &self.repetition_penalty)
             .field("seed", &self.seed)
             .field("stop_token_ids", &self.stop_token_ids)
@@ -97,6 +103,7 @@ impl Default for GenerateConfig {
             temperature: 0.7,
             top_k: 50,
             top_p: 0.9,
+            min_p: 0.0,
             repetition_penalty: 1.1,
             seed: None,
             stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],

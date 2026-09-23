@@ -299,9 +299,10 @@ fn run_boundary_gate(_model_dir: &Path) {
         return;
     }
     panic!(
-        "a gemma-4-e2b-it checkpoint is present but the `f16` feature is not enabled -- the \
-         real BF16 checkpoint cannot be loaded without it. Set LATTICE_GEMMA4_GATE_SKIP=1 to \
-         explicitly skip (only for general-purpose test runs that are not targeting this gate)."
+        "a gemma-4-e2b-it checkpoint is present but the `f16` feature is not enabled -- this \
+         gate's pinned invocation contract requires --features f16. Set \
+         LATTICE_GEMMA4_GATE_SKIP=1 to explicitly skip (only for general-purpose test runs that \
+         are not targeting this gate)."
     );
 }
 
@@ -312,9 +313,10 @@ fn run_gate(_model_dir: &Path) {
         return;
     }
     panic!(
-        "a gemma-4-e2b-it checkpoint is present but the `f16` feature is not enabled -- the \
-         real BF16 checkpoint cannot be loaded without it. Set LATTICE_GEMMA4_GATE_SKIP=1 to \
-         explicitly skip (only for general-purpose test runs that are not targeting this gate)."
+        "a gemma-4-e2b-it checkpoint is present but the `f16` feature is not enabled -- this \
+         gate's pinned invocation contract requires --features f16. Set \
+         LATTICE_GEMMA4_GATE_SKIP=1 to explicitly skip (only for general-purpose test runs that \
+         are not targeting this gate)."
     );
 }
 

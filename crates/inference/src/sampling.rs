@@ -112,6 +112,11 @@ pub struct SamplingConfig {
     pub top_k: usize,
     /// Top-p (nucleus): keep tokens whose cumulative probability <= p. 1.0 = disabled.
     pub top_p: f32,
+    /// Min-p: keep tokens with probability at least `min_p * max_probability`,
+    /// applied before top-p. 0.0 or NaN = disabled; other values clamp to
+    /// `[0.0, 1.0]`. Read by [`Sampler::new`], which seeds its own out-of-band
+    /// state from this field; [`Sampler::with_min_p`] overrides it afterward.
+    pub min_p: f32,
     /// Repetition penalty multiplier. 1.0 = no penalty.
     pub repetition_penalty: f32,
 }
@@ -122,6 +127,7 @@ impl Default for SamplingConfig {
             temperature: 0.7,
             top_k: 50,
             top_p: 0.9,
+            min_p: 0.0,
             repetition_penalty: 1.1,
         }
     }
@@ -134,6 +140,7 @@ impl SamplingConfig {
             temperature: 0.0,
             top_k: 1,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
         }
     }
@@ -441,16 +448,17 @@ impl Rng {
 pub struct Sampler {
     config: SamplingConfig,
     /// Min-p: keep tokens with probability at least `min_p * max_probability`.
-    /// 0.0 or NaN = disabled; all other values clamp to `[0.0, 1.0]`. Carried
-    /// out-of-band from `SamplingConfig` (which is exhaustively constructible
-    /// through the public API at published `0.7.1`, so it cannot gain a field
-    /// without a major break); set via [`with_min_p`](Self::with_min_p).
+    /// 0.0 or NaN = disabled; all other values clamp to `[0.0, 1.0]`. Seeded
+    /// from `config.min_p` at construction; [`with_min_p`](Self::with_min_p)
+    /// overrides it afterward. Kept as its own field (rather than reading
+    /// `self.config.min_p` at every `sample` call) so `with_min_p` can diverge
+    /// from the config without mutating it.
     min_p: f32,
     /// Top-n-sigma: mask logits below `max_logit - top_n_sigma *
     /// population_stddev` before candidate selection. 0.0, negative, or
-    /// non-finite = disabled. Carried out-of-band from `SamplingConfig` for
-    /// the same published-API reason as `min_p`; set via
-    /// [`with_top_n_sigma`](Self::with_top_n_sigma).
+    /// non-finite = disabled. Unlike `min_p`, `SamplingConfig`/`GenerateConfig`
+    /// have no `top_n_sigma` field yet, so this stays carried out-of-band; set
+    /// via [`with_top_n_sigma`](Self::with_top_n_sigma).
     top_n_sigma: f32,
     rng: Rng,
     /// Token IDs seen since the last `reset`: prompt tokens (from `seed_history`)
@@ -477,9 +485,10 @@ impl Sampler {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x853c_49e6_748f_ea9b);
+        let min_p = config.min_p;
         Self {
             config,
-            min_p: 0.0,
+            min_p,
             top_n_sigma: 0.0,
             rng: Rng::new(seed),
             recent_tokens: Vec::new(),
@@ -1418,6 +1427,7 @@ mod tests {
         let logits = vec![0.0, 100.0, 99.0];
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let config = SamplingConfig {
+                min_p: 0.0,
                 temperature: bad,
                 top_k: 2,
                 top_p: 1.0,
@@ -1435,6 +1445,7 @@ mod tests {
     #[test]
     fn test_sampler_nan_fails_closed_to_argmax() {
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
@@ -1460,6 +1471,7 @@ mod tests {
         let logits = vec![10.0, 11.0, 9.0];
         for tiny in [1e-45_f32, 1e-40, 1e-39] {
             let config = SamplingConfig {
+                min_p: 0.0,
                 temperature: tiny,
                 top_k: 2,
                 top_p: 1.0,
@@ -1519,6 +1531,7 @@ mod tests {
         let logits = vec![10.0, 11.0, 9.0];
         for band in [f32::MIN_POSITIVE, 1e-37_f32, 1e-36] {
             let config = SamplingConfig {
+                min_p: 0.0,
                 temperature: band,
                 top_k: 2,
                 top_p: 1.0,
@@ -1592,6 +1605,7 @@ mod tests {
     #[test]
     fn test_top_k_limits_candidates() {
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 1.0,
             top_k: 2,
             top_p: 1.0,
@@ -1616,6 +1630,7 @@ mod tests {
     #[test]
     fn test_repetition_penalty_reduces_probability() {
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 0.0, // greedy
             top_k: 0,
             top_p: 1.0,
@@ -1640,6 +1655,7 @@ mod tests {
     #[test]
     fn test_greedy_sub_one_penalty_boosts_recent_token() {
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 0.0, // greedy fast path
             top_k: 0,
             top_p: 1.0,
@@ -1663,6 +1679,7 @@ mod tests {
     #[test]
     fn test_greedy_sub_one_penalty_recent_argmax_unchanged() {
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 0.0, // greedy fast path
             top_k: 0,
             top_p: 1.0,
@@ -1681,6 +1698,7 @@ mod tests {
     #[test]
     fn test_top_p_nucleus_sampling() {
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 1.0,
             top_k: 0,
             top_p: 0.5,
@@ -1758,6 +1776,7 @@ mod tests {
     #[test]
     fn top_n_sigma_preserves_poisoned_distribution_fallbacks() {
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
@@ -1782,6 +1801,7 @@ mod tests {
     fn top_n_sigma_interacts_with_the_existing_sampling_pipeline() {
         let logits = [10.0_f32, 9.5, 9.0, 8.0, 7.0, 2.0, 1.0, 0.0];
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 2.0,
             top_k: 6,
             top_p: 0.67,
@@ -1824,6 +1844,7 @@ mod tests {
     #[test]
     fn top_n_sigma_runs_after_repetition_penalty() {
         let mut sampler = Sampler::new(SamplingConfig {
+            min_p: 0.0,
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
@@ -1968,6 +1989,7 @@ mod tests {
         // and excludes token 2 (0.0) regardless of min-p.
         for seed in [0x1234_5678_9abc_def0, 0x9e37_79b9_7f4a_7c15] {
             let mut sampler = Sampler::new(SamplingConfig {
+                min_p: 0.0,
                 temperature: 2.0,
                 top_k: 2,
                 top_p: 0.9,
@@ -2002,6 +2024,7 @@ mod tests {
     fn min_p_interacts_with_penalty_temperature_top_k_and_top_p() {
         let logits = [8.0, 3.0, 0.0];
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 2.0,
             top_k: 2,
             top_p: 0.9,
@@ -2608,6 +2631,7 @@ mod tests {
         // Regression: top_k=0 used to make select_top_k return empty, so the sampler
         // could only ever emit token 0. With it disabled it must sample across the vocab.
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 1.0,
             top_k: 0,   // disabled
             top_p: 1.0, // disabled
@@ -2738,6 +2762,7 @@ mod tests {
         // penalty per occurrence compounds it (penalty^N) and silently over-suppresses
         // common tokens as a sequence grows.
         let mut s = Sampler::new(SamplingConfig {
+            min_p: 0.0,
             temperature: 0.0,
             top_k: 1,
             top_p: 1.0,
@@ -2792,6 +2817,7 @@ mod tests {
     #[test]
     fn test_seed_history_penalizes_prompt_token_on_first_sample() {
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 0.0, // greedy
             top_k: 1,
             top_p: 1.0,
@@ -2818,6 +2844,7 @@ mod tests {
     #[test]
     fn test_uncapped_history_penalizes_tokens_beyond_64() {
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 0.0, // greedy
             top_k: 1,
             top_p: 1.0,
@@ -2852,6 +2879,7 @@ mod tests {
     #[test]
     fn test_penalty_applied_exactly_once_for_repeated_history_token() {
         let config = SamplingConfig {
+            min_p: 0.0,
             temperature: 0.0, // greedy
             top_k: 1,
             top_p: 1.0,
@@ -3126,6 +3154,7 @@ mod tests {
         let previous_ids: Vec<u32> = (0..64u32).map(|i| (i * 4099) % VOCAB_SIZE as u32).collect();
 
         let cfg = SamplingConfig {
+            min_p: 0.0,
             temperature: 0.7,
             top_k: 40,
             top_p: 0.9,

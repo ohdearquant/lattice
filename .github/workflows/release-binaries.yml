@@ -94,9 +94,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `mixture` is what compiles the adapter-router gate in. Without it
+          # `ServingRouter` is the compiled-out form whose `new()` returns a
+          # build refusal, so a released binary accepts `--router-state` only to
+          # refuse it -- the feature would be absent from every binary anyone
+          # actually runs, however green CI is.
+          #
+          # macOS only, and deliberately not a default feature. Routing applies
+          # adapters, adapters need `ModelBackend::Metal`, and only this row has
+          # Metal; the two linux rows have nothing to route on. Default features
+          # are the crate's public surface for `cargo install` and library
+          # consumers, which is a different question from what this repo ships.
+          # The `mixture` CI step proves it builds on ubuntu, so this is a
+          # shipping choice rather than a portability one.
           - runner: macos-latest
             target: aarch64-apple-darwin
-            features: f16,metal-gpu
+            features: f16,metal-gpu,mixture
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             features: f16

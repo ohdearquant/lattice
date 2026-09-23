@@ -58,6 +58,9 @@ pub mod weights;
 /// and [`model`].
 pub mod batch;
 pub(crate) mod bounded_read;
+/// The on-disk router gate artifact: version, trained-adapter names, payload.
+/// Deliberately free of the `mixture` gate — see the module doc comment.
+pub mod router_state;
 // ADR-090 row C routes `model::qwen35::generation`'s `generate()` (by way of
 // `generate_with_trace()`) through `QwenCpuSession` and `decoder::driver::run`
 // whenever `gen_cfg.grammar.is_none() && gen_cfg.logprobs.is_none()` -- the
