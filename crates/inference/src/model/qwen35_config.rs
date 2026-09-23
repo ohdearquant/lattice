@@ -3489,6 +3489,7 @@ mod tests {
         );
 
         let no_think = GenerateConfig {
+            min_p: 0.0,
             enable_thinking: false,
             ..GenerateConfig::default()
         };

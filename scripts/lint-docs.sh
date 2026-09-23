@@ -167,6 +167,10 @@ echo "=== Source Marker Provenance (#818) ==="
 "$script_dir/lint-source-markers.sh" --selftest
 "$script_dir/lint-source-markers.sh"
 
+echo "=== LoRA Route Parity (ADR-095 D4) ==="
+"$script_dir/lint-lora-routes.sh" --selftest
+"$script_dir/lint-lora-routes.sh"
+
 if [ "$markdown_skipped" -eq 1 ]; then
     echo "=== Doc Lint Passed (Markdown checks SKIPPED: deno not found) ==="
 else

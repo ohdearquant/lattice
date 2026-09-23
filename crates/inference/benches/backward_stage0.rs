@@ -10,6 +10,11 @@ use std::time::Duration;
 
 const TINY: &str = "tiny";
 const QWEN35_08B: &str = "qwen35_0_8b";
+// The LM head projects hidden state onto the full vocabulary, so its output width is
+// `vocab_size` rather than `intermediate_size`: ~69x more matrix elements than the
+// QWEN35_08B row above. Without this shape the stage-0 baseline never measures the
+// widest matmul on the training path.
+const QWEN35_08B_LM_HEAD: &str = "qwen35_0_8b_lm_head";
 
 struct Rng(u64);
 
@@ -67,7 +72,12 @@ fn bench_cross_entropy_backward(c: &mut Criterion) {
 
 fn bench_linear_vjp(c: &mut Criterion) {
     let mut group = c.benchmark_group("backward_stage0/linear_vjp");
-    for (name, d_in, d_out) in [(TINY, 64, 192), (QWEN35_08B, 1024, 3584)] {
+    let lm_head = Qwen35Config::qwen35_0_8b();
+    for (name, d_in, d_out) in [
+        (TINY, 64, 192),
+        (QWEN35_08B, 1024, 3584),
+        (QWEN35_08B_LM_HEAD, lm_head.hidden_size, lm_head.vocab_size),
+    ] {
         let mut rng = Rng::new(0x11EA + d_out as u64);
         let weights = rng.vector(d_out * d_in, 0.02);
         let grad = rng.vector(d_out, 0.1);
@@ -88,7 +98,17 @@ fn bench_linear_vjp(c: &mut Criterion) {
 
 fn bench_lora_vjp(c: &mut Criterion) {
     let mut group = c.benchmark_group("backward_stage0/lora_vjp");
-    for (name, rank, d_in, d_out) in [(TINY, 4, 64, 192), (QWEN35_08B, 16, 1024, 3584)] {
+    let lm_head = Qwen35Config::qwen35_0_8b();
+    for (name, rank, d_in, d_out) in [
+        (TINY, 4, 64, 192),
+        (QWEN35_08B, 16, 1024, 3584),
+        (
+            QWEN35_08B_LM_HEAD,
+            16,
+            lm_head.hidden_size,
+            lm_head.vocab_size,
+        ),
+    ] {
         let mut rng = Rng::new(0x10A0 + d_out as u64);
         let grad = rng.vector(d_out, 0.1);
         let x = rng.vector(d_in, 0.1);
