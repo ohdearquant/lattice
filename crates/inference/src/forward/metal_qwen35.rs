@@ -1107,6 +1107,18 @@ mod inner {
         #[allow(dead_code)]
         // pre-final hidden retained for MTP chaining; not yet consumed by callers
         final_hidden: Vec<f32>, // pre-final hidden of last verified row
+        // The pre-final hidden state produced by processing `tokens[0]` (the real
+        // `pending_token`), i.e. the state that predicted `tokens[1]`.
+        // On a K=1 draft rejection the caller must restore
+        // `self.session.last_pre_final_hidden` to THIS value rather than leaving it
+        // at whatever `forward_step_inner`'s capture-hidden side effect last wrote
+        // for `tokens[1]` -- the *draft* token's hidden, from a verify step whose KV/
+        // GDN mutations get rolled back but whose `last_pre_final_hidden` write does
+        // not. `verify_tokens_batch_gemm_dispatch` does not need this: its own
+        // repair-replay in `rollback_speculative_state_to`'s `batch_repair_token`
+        // branch already restores `last_pre_final_hidden` correctly on reject, so it
+        // leaves this empty.
+        pending_hidden: Vec<f32>,
     }
 
     struct MetalStepOutput {
@@ -4562,6 +4574,7 @@ mod inner {
             self.checkpoint_gdn_to_slot(0, GdnStateTrafficScope::MtpVerify)?;
             let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
             let mut final_hidden = Vec::new();
+            let mut pending_hidden = Vec::new();
             for (i, &token) in tokens.iter().enumerate() {
                 #[cfg(feature = "gdn-state-counters")]
                 let out = self.forward_step_inner_with_traffic_scope(
@@ -4578,12 +4591,20 @@ mod inner {
                     crate::forward::signpost::Scope::NotDecode,
                 );
                 self.checkpoint_gdn_to_slot(i + 1, GdnStateTrafficScope::MtpVerify)?;
+                if i == 0 {
+                    // Captured before the loop overwrites
+                    // `out.pre_final_hidden` with the *next* (possibly rejected)
+                    // token's hidden -- this is the value a K=1 reject must restore
+                    // `self.session.last_pre_final_hidden` to.
+                    pending_hidden = out.pre_final_hidden.clone();
+                }
                 all_logits.push(out.logits);
                 final_hidden = out.pre_final_hidden;
             }
             Ok(MetalVerifyOutput {
                 logits: all_logits,
                 final_hidden,
+                pending_hidden,
             })
         }
 
@@ -5318,6 +5339,11 @@ mod inner {
             Ok(MetalVerifyOutput {
                 logits: all_logits,
                 final_hidden,
+                // Not needed on this path -- see `MetalVerifyOutput::pending_hidden`'s
+                // doc comment: the batch-repair replay in
+                // `rollback_speculative_state_to` already restores
+                // `last_pre_final_hidden` correctly on reject.
+                pending_hidden: Vec::new(),
             })
         }
 
@@ -5330,6 +5356,25 @@ mod inner {
             position: usize,
         ) -> MetalMtpForwardOutput {
             objc::rc::autoreleasepool(|| self.mtp_forward_one_dispatch(pending_token, position))
+        }
+
+        /// RMSNorm for the MTP head's two CPU-computed pre-fc norms
+        /// (`pre_fc_norm_embedding`, `pre_fc_norm_hidden`). Applies this
+        /// architecture's shifted convention, `x * inv_rms * (1.0 + gamma)`,
+        /// matching every GPU-kernel RMSNorm in this forward pass and the
+        /// model's own `final_norm`. Plain `gamma` (no `+1`) is a different,
+        /// incompatible convention and silently inverts the sign of most
+        /// channels on a checkpoint whose norm weights center negative.
+        fn mtp_pre_fc_rmsnorm(x: &mut [f32], gamma: &[f32], eps: f32) {
+            debug_assert_eq!(x.len(), gamma.len());
+            let mut sum_sq = 0.0f32;
+            for &v in x.iter() {
+                sum_sq += v * v;
+            }
+            let inv_rms = 1.0 / (sum_sq / x.len() as f32 + eps).sqrt();
+            for (v, &g) in x.iter_mut().zip(gamma.iter()) {
+                *v = *v * inv_rms * (1.0 + g);
+            }
         }
 
         /// Draft one extra token using the MTP module.
@@ -5385,14 +5430,7 @@ mod inner {
                         hidden,
                     )
                 };
-                let mut sum_sq = 0.0f32;
-                for &v in normed_embed.iter() {
-                    sum_sq += v * v;
-                }
-                let inv_rms = 1.0 / (sum_sq / hidden as f32 + cfg.rms_norm_eps).sqrt();
-                for (v, &g) in normed_embed.iter_mut().zip(gamma.iter()) {
-                    *v = *v * inv_rms * g;
-                }
+                Self::mtp_pre_fc_rmsnorm(&mut normed_embed, gamma, cfg.rms_norm_eps);
             }
 
             // 3. CPU RMSNorm of target pre-final hidden using pre_fc_norm_hidden weights.
@@ -5410,14 +5448,7 @@ mod inner {
                         hidden,
                     )
                 };
-                let mut sum_sq = 0.0f32;
-                for &v in normed_hidden.iter() {
-                    sum_sq += v * v;
-                }
-                let inv_rms = 1.0 / (sum_sq / hidden as f32 + cfg.rms_norm_eps).sqrt();
-                for (v, &g) in normed_hidden.iter_mut().zip(gamma.iter()) {
-                    *v = *v * inv_rms * g;
-                }
+                Self::mtp_pre_fc_rmsnorm(&mut normed_hidden, gamma, cfg.rms_norm_eps);
             }
 
             // 4. CPU concat [normed_embed || normed_hidden] into fused buffer (2*hidden).
@@ -9134,6 +9165,15 @@ mod inner {
                     let t_rb = std::time::Instant::now();
                     let _ = self.rollback_speculative_state_to(pos + 1);
                     metrics.rollback_ms += t_rb.elapsed().as_secs_f64() * 1000.0;
+                    // The sequential verifier's rollback restores GDN state and the KV
+                    // cache cursor but not `last_pre_final_hidden`, which
+                    // `verify_tokens_batched` last wrote for the rejected draft token.
+                    // Restore it to the hidden state that predicted the target's real
+                    // replacement, or the next MTP draft is fed the wrong input. The
+                    // batch-GEMM verifier's own repair-replay already handles this.
+                    if !use_batch {
+                        self.session.last_pre_final_hidden = verify_out.pending_hidden.clone();
+                    }
                 }
 
                 // Delegate the pure emit/stop/continue decision to `mtp_greedy_round`.
@@ -18449,6 +18489,95 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        /// `mtp_pre_fc_rmsnorm` must apply the shifted `(1.0 + gamma)` convention,
+        /// not plain `gamma`. Hand-computed: x=[2,2,2,2], gamma=[0.5,0.5,0.5,0.5],
+        /// eps=0 -> sum_sq=16, mean=4, inv_rms=0.5. Shifted: 2*0.5*(1+0.5)=1.5.
+        /// Plain gamma would give 2*0.5*0.5=0.5 -- a clean, non-degenerate
+        /// (non-zero, non-one) numeric difference, not a sign-only tolerance.
+        #[test]
+        fn mtp_pre_fc_rmsnorm_applies_shifted_convention() {
+            let mut x = vec![2.0f32; 4];
+            let gamma = vec![0.5f32; 4];
+            MetalQwen35State::mtp_pre_fc_rmsnorm(&mut x, &gamma, 0.0);
+            for &v in &x {
+                assert!(
+                    (v - 1.5).abs() < 1e-6,
+                    "got {v}, expected 1.5 under the shifted (1.0 + gamma) convention \
+                     (2 * inv_rms(0.5) * (1.0 + 0.5)); plain gamma would give 0.5"
+                );
+            }
+        }
+
+        /// Regression test on the PRODUCTION `mtp_forward_one` path (not a test-only
+        /// duplicate): a synthetic MTP fixture whose `pre_fc_norm_embedding` weight is
+        /// uniformly -0.5 and whose `fc` connects the embedding half of the concat as
+        /// an identity (`synthetic_mtp_weights_for_test`), with attention/MLP weights
+        /// zero so `layer_output == fc_output == normed_embed` exactly. Feeding token 2
+        /// (`tiny_metal_qwen35_fixture`'s one-hot embedding: component 0 is the only
+        /// nonzero value, +1.0) leaves `normed_embed` nonzero only at index 0, so its
+        /// sign after the final norm (a GPU kernel, always shifted-convention, always
+        /// scales by a positive factor) is exactly `pre_fc_norm_embedding`'s effective
+        /// scale: `1.0 + (-0.5) = +0.5` under the fix, `-0.5` under the bug. The tied
+        /// lm_head's row for token 2 has `embed_tokens[2][0] = +1.0`
+        /// (`tiny_metal_qwen35_fixture`'s `token % 3 == 2` convention), so
+        /// `output.logits[2]` inherits that sign directly: positive under the fix,
+        /// negative under the bug.
+        #[test]
+        fn mtp_forward_one_uses_shifted_pre_fc_norm_convention() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut engine = MetalQwen35Engine::new(&weights, &cfg)
+                .expect("tiny MetalQwen35Engine with MTP fixture constructs");
+            let mut mtp_weights = synthetic_mtp_weights_for_test(&engine.device, &cfg);
+            mtp_weights.pre_fc_norm_embedding = make_buffer(
+                &engine.device,
+                &vec![-0.5f32; cfg.hidden_size],
+                "test.mtp.pre_fc_norm_embedding.negative",
+            );
+            engine.mtp_weights = Some(mtp_weights);
+            let session = engine.new_session(16).expect("tiny MTP session constructs");
+            let mut state = MetalQwen35State {
+                engine,
+                session,
+                lora: None,
+                use_gdn_chunked: true,
+                use_kv_f16: false,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled: false,
+                path_proof: PathProofCounters::default(),
+            };
+            assert!(
+                state.session.mtp.is_some(),
+                "MTP fixture must populate session.mtp"
+            );
+
+            // token 2's embedding is one-hot: component 0 is +1.0, everything else 0
+            // (`tiny_metal_qwen35_fixture`'s convention, also relied on by the #1341
+            // test immediately below). `last_pre_final_hidden` is left at its default
+            // (zero-length / zeroed) so the hidden half of the concat contributes
+            // nothing measurable here -- this test isolates the embedding-half norm.
+            state.session.last_pre_final_hidden = vec![0.0f32; cfg.hidden_size];
+            let out = state.mtp_forward_one(2u32, 0);
+
+            assert_eq!(out.logits.len(), cfg.vocab_size);
+            assert!(
+                out.logits[2] > 0.0,
+                "logits[2] = {} must be POSITIVE under the shifted (1.0 + gamma) \
+                 convention (effective scale 1.0 + (-0.5) = +0.5 applied to the \
+                 embedding's +1.0 component, propagated through the identity `fc` and \
+                 zero attention/MLP to the final norm and the tied lm_head row for \
+                 token 2, embed_tokens[2][0] = +1.0); a negative value here means \
+                 pre_fc_norm_embedding regressed to plain `gamma` (effective scale \
+                 -0.5), inverting the sign of every channel it touches",
+                out.logits[2]
+            );
+        }
+
         // Issue #1341: a K=1 draft rejection must leave the MTP KV cache cursor at the
         // row `mtp_forward_one` actually wrote, not one row past it. `mtp_forward_one`
         // writes exactly one row (for `pending_token`) and advances `mtp.cache.seq_len`
@@ -18568,6 +18697,98 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  `mtp_forward_one` wrote this round; got {mtp_seq_len}, which means the \
                  next `mtp_forward_one` call will skip a slot and the attention window \
                  will read a never-written row"
+            );
+        }
+
+        // `verify_tokens_batched`'s sequential-verifier path leaves
+        // `last_pre_final_hidden` set to the hidden state captured while processing
+        // the rejected draft token, because `forward_step_inner` writes that field
+        // for every token it processes, with no distinction between "provisional,
+        // pending verification" and "committed". A K=1 rollback undoes the GDN/KV
+        // mutations but not this field, so the next `mtp_forward_one` call is fed
+        // the wrong token's hidden state. This test isolates the field: after a
+        // forced K=1 reject, `last_pre_final_hidden` must equal the hidden state
+        // from processing ONLY the real `pending_token`, not the rejected draft.
+        #[test]
+        fn generate_greedy_mtp_restores_correct_hidden_after_k1_reject() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            use crate::generation::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+
+            // Reference: the hidden state that processing ONLY the real
+            // `pending_token` (2) at position 0 produces -- no draft token involved.
+            // This is what `last_pre_final_hidden` must equal after the K=1 reject
+            // round below, per `mtp_forward_one`'s documented pairing contract
+            // ("pairs `pending_token`'s embedding with `last_pre_final_hidden` --
+            // the hidden state that predicted it").
+            let mut reference_state =
+                metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
+            let _ = reference_state.forward_step_inner(
+                2,
+                0,
+                true,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            let expected_hidden = reference_state.session.last_pre_final_hidden.clone();
+            assert!(
+                !expected_hidden.is_empty(),
+                "reference forward_step_inner call must capture a hidden state"
+            );
+
+            let mut state = metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(true),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+            let mut prefill_logits = vec![-1.0f32; cfg.vocab_size];
+            prefill_logits[2] = 100.0;
+            let out = state.generate_greedy_mtp(&prefill_logits, 0, &tokenizer, &gen_cfg);
+            assert!(
+                !out.stopped,
+                "test assumes round 1 does not hit EOS; got {out:?}"
+            );
+            assert_eq!(
+                state.session.kv_cache.seq_len, 1,
+                "test setup assumption violated: expected round 1 to reject the \
+                 constant draft (token 0) in favor of the target's own prediction \
+                 (token 2)"
+            );
+
+            let actual_hidden = &state.session.last_pre_final_hidden;
+            assert_eq!(
+                actual_hidden.len(),
+                expected_hidden.len(),
+                "last_pre_final_hidden length changed unexpectedly"
+            );
+            let max_abs_diff = actual_hidden
+                .iter()
+                .zip(expected_hidden.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs_diff < 1e-5,
+                "last_pre_final_hidden after a K=1 reject must equal the hidden state \
+                 that predicted the real continuation (from processing pending_token \
+                 alone), not the rejected draft's hidden state; \
+                 max_abs_diff={max_abs_diff} actual={actual_hidden:?} \
+                 expected={expected_hidden:?}"
             );
         }
 
