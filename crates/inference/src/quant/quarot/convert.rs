@@ -3511,8 +3511,7 @@ mod tests {
     /// a converter that marks itself validated without ever running the
     /// quality gate) makes this test fail on the
     /// `record.state == PromotionState::Unpromoted` assertion. Restoring
-    /// the real field makes it pass again. See REPORT.md for the recorded
-    /// before/after run output.
+    /// the real field makes it pass again.
     #[test]
     fn convert_quarot_qwen35_writes_unpromoted_promotion_marker() {
         let tmp = tempfile::tempdir().unwrap();
