@@ -615,9 +615,12 @@ pub(crate) fn multi_head_attention_batched(
         if seq_len == 0 {
             continue;
         }
-        // Per-sequence quadratic-in-seq_len scratch (scores is
-        // [num_heads, seq_len, seq_len]): reuse the single-sequence overflow
-        // guard, since this is exactly that shape check applied per segment.
+        // Per-sequence overflow guard: hidden_size == num_heads * head_dim and
+        // seq_len * hidden_size fit a usize. The score scratch below is now a
+        // single head's [seq_len, seq_len] matrix rather than the full
+        // [num_heads, seq_len, seq_len] buffer (#1480), but `num_heads >= 1`
+        // means `num_heads * seq_len * seq_len` not overflowing (checked here)
+        // still dominates the single-head `seq_len * seq_len` product.
         assert_standard_no_overflow(seq_len, hidden_size, num_heads, head_dim);
 
         let row_start = start * hidden_size;
@@ -626,12 +629,43 @@ pub(crate) fn multi_head_attention_batched(
         let mut q_head = vec![0.0f32; seq_len * head_dim];
         let mut k_head = vec![0.0f32; seq_len * head_dim];
         let mut v_all_t = vec![0.0f32; hidden_size * seq_len];
+        // One head's score matrix at a time (#1480): peak quadratic-in-seq_len
+        // scratch is bounded by `seq_len^2`, independent of `num_heads`,
+        // instead of allocating the full `[num_heads, seq_len, seq_len]`
+        // buffer up front.
         let mut scores_head = vec![0.0f32; seq_len * seq_len];
-        let mut scores = vec![0.0f32; num_heads * seq_len * seq_len];
         let mut context_head = vec![0.0f32; seq_len * head_dim];
 
-        // Q*K^T via SIMD matmul_bt, one head at a time (mirrors
-        // multi_head_attention_in_place's single-sequence loop exactly).
+        // Transpose V once for this sequence (#673 acceptable-minimum), ahead
+        // of the fused per-head loop below: one [hidden_size, seq_len]
+        // transpose instead of `num_heads` separate [head_dim, seq_len]
+        // transposes; identical element count moved, one loop instead of
+        // `num_heads` smaller loops. Moving it ahead of the head loop doesn't
+        // change what it computes: it reads only from `v` and writes only to
+        // `v_all_t`, independent of `scores_head`.
+        for i in 0..seq_len {
+            let v_row_start = row_start + i * hidden_size;
+            for d in 0..hidden_size {
+                v_all_t[d * seq_len + i] = v[v_row_start + d];
+            }
+        }
+
+        // Fused per-head score/softmax/context (#1480): compute one head's
+        // scores, scale, softmax, and context aggregation before moving on to
+        // the next head, so only one `[seq_len, seq_len]` matrix is live at a
+        // time instead of `num_heads` of them. The scale multiply keeps the
+        // same op order as before fusion (matmul_bt, then `score * scale`
+        // elementwise), and `softmax_attention` is called with `num_heads=1`
+        // over this head's own scratch, which is bit-identical to the row
+        // range that head occupied inside the old `[num_heads, seq_len,
+        // seq_len]` buffer: `softmax_attention` operates per-row within a
+        // head with no cross-head coupling (`forward/cpu/softmax.rs`'s
+        // scalar, NEON, and AVX2 paths all index rows as
+        // `(h * seq_len + s) * seq_len`, so head 0 of a 1-head call reads
+        // exactly the row range head `h` occupied before). No masking: every
+        // row in this sequence's packed region is real, so softmax runs over
+        // the raw scaled scores directly (still through the same fail-closed
+        // `softmax_attention` kernel as every other path).
         for h in 0..num_heads {
             let head_offset = h * head_dim;
 
@@ -656,40 +690,15 @@ pub(crate) fn multi_head_attention_batched(
                 head_dim,
                 seq_len,
             );
-
-            let scores_offset = h * seq_len * seq_len;
-            for (idx, &score) in scores_head.iter().enumerate() {
-                scores[scores_offset + idx] = score * scale;
+            for score in scores_head[..seq_len * seq_len].iter_mut() {
+                *score *= scale;
             }
-        }
 
-        // No masking: every row in this sequence's packed region is real, so
-        // softmax runs over the raw scaled scores directly (still through the
-        // same fail-closed `softmax_attention` kernel as every other path).
-        softmax_attention(&mut scores, seq_len, num_heads);
+            softmax_attention(&mut scores_head[..seq_len * seq_len], seq_len, 1);
 
-        // Transpose V once for this sequence (#673 acceptable-minimum):
-        // one [hidden_size, seq_len] transpose instead of `num_heads`
-        // separate [head_dim, seq_len] transposes; identical element
-        // count moved, one loop instead of `num_heads` smaller loops.
-        for i in 0..seq_len {
-            let v_row_start = row_start + i * hidden_size;
-            for d in 0..hidden_size {
-                v_all_t[d * seq_len + i] = v[v_row_start + d];
-            }
-        }
-
-        // scores*V context aggregation, writing directly into this
-        // sequence's `concat_b` region (#673): removes the intermediate
-        // `context` buffer and its extra full-hidden-size copy pass.
-        for h in 0..num_heads {
-            let head_offset = h * head_dim;
-
-            let scores_offset = h * seq_len * seq_len;
-            let scores_head = &scores[scores_offset..scores_offset + seq_len * seq_len];
             let v_head_t = &v_all_t[head_offset * seq_len..(head_offset + head_dim) * seq_len];
             matmul_bt(
-                scores_head,
+                &scores_head[..seq_len * seq_len],
                 v_head_t,
                 &mut context_head[..seq_len * head_dim],
                 seq_len,
@@ -1777,5 +1786,163 @@ mod tests {
                 "seq1 row element {i} mismatch: batched={g} single={e}"
             );
         }
+    }
+
+    /// #1480 regression: the per-sequence score/softmax/context loop was
+    /// fused (one head's `[seq_len, seq_len]` matrix live at a time) to bound
+    /// peak quadratic scratch at `seq_len^2` regardless of `num_heads`,
+    /// instead of allocating the full `[num_heads, seq_len, seq_len]` buffer
+    /// per call. A NaN anywhere in one packed segment's input row propagates
+    /// through that segment's own Q/K/V and attention output (IEEE 754: any
+    /// arithmetic touching a NaN operand yields NaN, including `0.0 * NaN`),
+    /// but must never leak across the `cu_seqlens` boundary into a sibling
+    /// segment's output -- each segment's `q`/`k`/`v` slice and `concat_b`
+    /// region are disjoint, so a segment-indexing regression in the fused
+    /// loop would show up here as the sibling segment losing finiteness.
+    #[test]
+    fn nan_in_one_packed_segment_does_not_leak_into_a_sibling_segment() {
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let intermediate_size = hidden_size;
+
+        let identity_8x8: Vec<f32> = {
+            let mut m = vec![0.0f32; hidden_size * hidden_size];
+            for i in 0..hidden_size {
+                m[i * hidden_size + i] = 1.0;
+            }
+            m
+        };
+        let zero_bias_8: Vec<f32> = vec![0.0; hidden_size];
+        let ones_8: Vec<f32> = vec![1.0; hidden_size];
+        let fused_qkv_weight: Vec<f32> = identity_8x8
+            .iter()
+            .chain(identity_8x8.iter())
+            .chain(identity_8x8.iter())
+            .copied()
+            .collect();
+        let fused_qkv_bias: Vec<f32> = vec![0.0; 3 * hidden_size];
+
+        let layer = TransformerLayerWeights {
+            query_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            query_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            key_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            key_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            value_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            value_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            attn_output_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            attn_output_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            attn_layer_norm_weight: Tensor1D {
+                data: &ones_8,
+                len: hidden_size,
+            },
+            attn_layer_norm_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            ffn_intermediate_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: intermediate_size,
+                cols: hidden_size,
+            },
+            ffn_intermediate_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: intermediate_size,
+            },
+            ffn_output_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: intermediate_size,
+                cols: hidden_size,
+            },
+            ffn_output_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            ffn_layer_norm_weight: Tensor1D {
+                data: &ones_8,
+                len: hidden_size,
+            },
+            ffn_layer_norm_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+        };
+
+        // Two segments of 3 tokens each; poison one dimension of segment 0's
+        // middle token. Values are deterministic and nonzero so a genuinely
+        // broken fusion (e.g. sharing scratch across segments) would surface
+        // as more than just the expected lanes going non-finite.
+        let mut hidden_states: Vec<f32> =
+            (0..6 * hidden_size).map(|i| 1.0 + i as f32 * 0.1).collect();
+        let poisoned_row = 1; // segment 0's middle token
+        hidden_states[poisoned_row * hidden_size] = f32::NAN;
+        let cu_seqlens = vec![0usize, 3, 6];
+        let total = 6;
+        let used_hidden = total * hidden_size;
+
+        let mut q = vec![0.0f32; used_hidden];
+        let mut k = vec![0.0f32; used_hidden];
+        let mut v = vec![0.0f32; used_hidden];
+        let mut qkv = vec![0.0f32; 3 * used_hidden];
+        let mut concat = vec![0.0f32; used_hidden];
+        let mut output = vec![0.0f32; used_hidden];
+
+        multi_head_attention_batched(
+            &hidden_states,
+            &layer,
+            &fused_qkv_weight,
+            &fused_qkv_bias,
+            &cu_seqlens,
+            hidden_size,
+            num_heads,
+            head_dim,
+            &mut q,
+            &mut k,
+            &mut v,
+            &mut qkv,
+            &mut concat,
+            &mut output,
+            &NoopLoraHook,
+            0,
+        );
+
+        let seg0 = &output[0..3 * hidden_size];
+        let seg1 = &output[3 * hidden_size..6 * hidden_size];
+        assert!(
+            seg0.iter().any(|v| !v.is_finite()),
+            "the poisoned segment should show the propagated non-finite value: {seg0:?}"
+        );
+        assert!(
+            seg1.iter().all(|v| v.is_finite()),
+            "a NaN in one packed segment must not leak into a sibling segment's output: {seg1:?}"
+        );
     }
 }
