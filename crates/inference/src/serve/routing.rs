@@ -834,8 +834,9 @@ mod tests {
 
         let mut rep = representation(4);
         rep.loader_format = crate::serve::embeddings::BERT_ENCODER_LOADER.into();
-        let err = ServedRouter::new(resolved(rep), &identity("gme-qwen35"), 4)
-            .expect_err("a gate trained through the other binary's loader must refuse at startup");
+        let Err(err) = ServedRouter::new(resolved(rep), &identity("gme-qwen35"), 4) else {
+            panic!("a gate trained through the other binary's loader must refuse at startup")
+        };
         assert_eq!(err.code(), "router_representation_loader_mismatch");
         assert!(
             err.message()
