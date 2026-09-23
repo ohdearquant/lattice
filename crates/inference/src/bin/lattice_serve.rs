@@ -199,9 +199,11 @@ mod imp {
         /// structured-output v0 design note's stage split).
         vocab_bytes: Arc<Vec<Vec<u8>>>,
         /// Bounded (32-entry, LRU) single-flight cache of compiled
-        /// `GrammarEngine`s, keyed by canonicalized admitted schema JSON
-        /// (structured-output v0 design note, stage 2). `Arc`-shared so
-        /// every clone of `AppState` (one per request) hits the same cache.
+        /// `GrammarEngine`s, keyed by [`grammar_cache_key`] on the
+        /// canonicalized admitted schema JSON *and* the `vocab_bytes` this
+        /// request was compiled against (structured-output v0 design note,
+        /// stage 2). `Arc`-shared so every clone of `AppState` (one per
+        /// request) hits the same cache.
         grammar_cache: Arc<GrammarCache>,
         /// The optional embedding model loaded via `--embedding-model`
         /// (issue #584). `None` when the flag was not passed at startup, in
@@ -863,6 +865,62 @@ mod imp {
         out
     }
 
+    /// Cache key for [`GrammarCache::get_or_compile`].
+    ///
+    /// The `GrammarEngine` a lookup resolves to was compiled from *two*
+    /// inputs -- the admitted schema (`canonical_schema_key`) and the
+    /// vocabulary handed to `GrammarEngine::new` -- but only the schema used
+    /// to be reflected in the key. Keyed on the schema alone, a cache cannot
+    /// tell two different vocabularies compiled against the same schema
+    /// apart: the second vocabulary's lookup would hit the first
+    /// vocabulary's entry and silently serve a grammar built for the wrong
+    /// tokenizer.
+    ///
+    /// This key holds a clone of the `vocab_bytes` `Arc` itself, not just its
+    /// address: an address alone names an allocation only
+    /// for as long as that exact allocation is alive, and the whole point of
+    /// a *stale* cache entry is that its vocabulary may no longer be alive
+    /// anywhere else -- a later, unrelated `vocab_bytes` allocation (a
+    /// reloaded model, a swapped tokenizer) can then legitimately land at the
+    /// freed address and collide with the stale entry's key. Storing the
+    /// `Arc` inside the key -- used as a `HashMap` key via [`PartialEq`]/
+    /// [`Eq`]/[`Hash`] impls below keyed on [`Arc::ptr_eq`] and the pointer
+    /// address, never on vocabulary *contents* -- keeps that allocation
+    /// alive for as long as the entry (or in-flight compile slot) sits in
+    /// the cache, so the address it names cannot be freed and reused while
+    /// a stale entry could still alias it. Comparing/hashing by pointer
+    /// rather than by content keeps this the same O(1)-per-request cost as
+    /// before: no hashing of a (possibly ~250K-entry) vocabulary on every
+    /// admitted request.
+    #[derive(Clone)]
+    struct GrammarCacheKey {
+        vocab_bytes: Arc<Vec<Vec<u8>>>,
+        schema_key: String,
+    }
+
+    impl PartialEq for GrammarCacheKey {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.vocab_bytes, &other.vocab_bytes)
+                && self.schema_key == other.schema_key
+        }
+    }
+
+    impl Eq for GrammarCacheKey {}
+
+    impl std::hash::Hash for GrammarCacheKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            (Arc::as_ptr(&self.vocab_bytes) as *const () as usize).hash(state);
+            self.schema_key.hash(state);
+        }
+    }
+
+    fn grammar_cache_key(vocab_bytes: &Arc<Vec<Vec<u8>>>, schema: &Value) -> GrammarCacheKey {
+        GrammarCacheKey {
+            vocab_bytes: Arc::clone(vocab_bytes),
+            schema_key: canonical_schema_key(schema),
+        }
+    }
+
     /// Stage 2 design note: shipped default capacity for the LRU compiled-
     /// grammar cache.
     const GRAMMAR_CACHE_CAPACITY: usize = 32;
@@ -896,16 +954,16 @@ mod imp {
         /// `order` (front = least-recently-used, back = most-recently-used);
         /// `ready` itself has no ordering, so eviction always consults
         /// `order`, never `ready`'s iteration order.
-        ready: HashMap<String, Arc<GrammarEngine>>,
-        order: VecDeque<String>,
+        ready: HashMap<GrammarCacheKey, Arc<GrammarEngine>>,
+        order: VecDeque<GrammarCacheKey>,
         /// Keys currently being compiled by exactly one thread; every other
         /// concurrent request for the same key waits on the listed slot
         /// instead of starting a second, redundant compile.
-        compiling: HashMap<String, Arc<CompileSlot>>,
+        compiling: HashMap<GrammarCacheKey, Arc<CompileSlot>>,
     }
 
     /// Bounded LRU cache of compiled `GrammarEngine`s keyed by
-    /// `canonical_schema_key`, with single-flight compilation (structured-
+    /// [`grammar_cache_key`], with single-flight compilation (structured-
     /// output v0 design note §"Schema-to-grammar compilation and cache
     /// placement"). Only successfully admitted-and-compiled schemas are
     /// cached -- a rejected or over-budget schema is never inserted, so a
@@ -952,7 +1010,7 @@ mod imp {
         /// condvar nobody will ever notify again.
         fn get_or_compile(
             &self,
-            key: String,
+            key: GrammarCacheKey,
             compile: impl FnOnce() -> Result<GrammarEngine, String> + std::panic::UnwindSafe,
         ) -> Result<Arc<GrammarEngine>, CacheError> {
             use std::sync::PoisonError;
@@ -1124,11 +1182,15 @@ mod imp {
         }
         // Compile before enqueueing (design note §"Schema-to-grammar
         // compilation and cache placement"), via the bounded single-flight
-        // cache (stage 2): a schema already compiled by an earlier request
-        // is served without touching the vocabulary clone or the compiler
-        // at all; a schema currently being compiled by a concurrent request
-        // is waited on instead of independently recompiled.
-        let key = canonical_schema_key(schema);
+        // cache (stage 2): a schema already compiled against this same
+        // vocabulary by an earlier request is served without touching the
+        // vocabulary clone or the compiler at all; a schema currently being
+        // compiled by a concurrent request is waited on instead of
+        // independently recompiled. The key names both the schema and the
+        // vocabulary (#1557; see `grammar_cache_key`) so a differently
+        // loaded vocabulary can never resolve to a grammar compiled for a
+        // different one.
+        let key = grammar_cache_key(vocab_bytes, schema);
         let schema_for_compile = schema.clone();
         let vocab_bytes = Arc::clone(vocab_bytes);
         let engine = grammar_cache
@@ -3284,7 +3346,20 @@ mod imp {
     /// file of their choosing. The startup warning covers it; an allow-root is the
     /// obvious next control and is deliberately not invented here.
     async fn lora_list(State(s): State<AppState>) -> Json<Value> {
-        Json(serde_json::json!(s.jobs.adapter_index()))
+        // Assembled by the shared helper so this binary and `lattice serve`
+        // cannot answer the same route with different shapes. They already
+        // did: this returned the bare residency snapshot while the other had
+        // gained the `router` key, and nothing caught it -- the route was
+        // registered correctly in both, which is all a route-table mechanism
+        // can see (ADR-095 decision 4, item 4).
+        //
+        // `None` because this binary has no `--router-state` yet, so it
+        // reports `{"enabled": false}`: the same shape, honestly filled. The
+        // flags are the next step, not a silent omission.
+        Json(lattice_inference::serve::lora::lora_list_body(
+            &s.jobs.adapter_index(),
+            None,
+        ))
     }
 
     /// Repeated exact `(name, path)` identities share one resident id and lifetime:
@@ -4151,6 +4226,75 @@ mod imp {
         // no running worker behind it (issue #832's `test_client_and_jobs`
         // seam, receiver half discarded) is a faithful stand-in: no GPU, no
         // model load.
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        /// ADR-095 decision 4: every entry in the shared route list is registered
+        /// in THIS binary. A route added to the list and forgotten here reds this
+        /// test.
+        ///
+        /// The assertion is only that the response is not 404. A 405 or a 4xx from
+        /// validation both count as registered -- the test asks whether the route
+        /// exists and nothing else, because anything more would need the state the
+        /// two binaries do not share. Asserting a specific status would make this
+        /// a behaviour test that passes or fails for reasons unrelated to
+        /// registration.
+        #[tokio::test]
+        async fn every_shared_lora_route_is_registered_in_this_binary() {
+            use lattice_inference::serve::lora::LORA_ROUTES;
+            use tower::ServiceExt;
+
+            assert!(
+                !LORA_ROUTES.is_empty(),
+                "the route list is empty, so this test would pass while checking nothing"
+            );
+
+            for (path, methods) in LORA_ROUTES {
+                for method in *methods {
+                    let request = axum::http::Request::builder()
+                        .method(*method)
+                        .uri(*path)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from("{}"))
+                        .expect("fixture request must build");
+                    let response = router(test_app_state())
+                        .oneshot(request)
+                        .await
+                        .expect("router must produce a response, not a transport error");
+                    assert_ne!(
+                        response.status(),
+                        axum::http::StatusCode::NOT_FOUND,
+                        "{method} {path} is in LORA_ROUTES but not registered in this binary"
+                    );
+                    // A 405 means the path exists under a DIFFERENT method, so the listed
+                    // method is not registered either; checking 404 alone would pass it.
+                    assert_ne!(
+                        response.status(),
+                        axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                        "{method} {path} is in LORA_ROUTES but this binary registers {path} under another method"
+                    );
+                }
+            }
+
+            // The must-not-match control: the same machinery reports 404 for a
+            // path nobody registered. Without it, a router that answered
+            // everything -- a catch-all fallback, say -- would pass the loop above
+            // while proving nothing about any individual route.
+            let request = axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/lora/definitely-not-a-route")
+                .body(axum::body::Body::empty())
+                .expect("control request must build");
+            let response = router(test_app_state())
+                .oneshot(request)
+                .await
+                .expect("router must produce a response");
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "an unregistered path did not 404, so the loop above cannot distinguish \
+                 a registered route from a router that answers everything"
+            );
+        }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         fn test_app_state() -> AppState {
@@ -5430,7 +5574,11 @@ mod imp {
         #[test]
         fn grammar_cache_hit_returns_same_engine_without_recompiling() {
             let cache = GrammarCache::new(GRAMMAR_CACHE_CAPACITY);
-            let key = canonical_schema_key(&serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap());
+            let vocab = cache_test_vocab();
+            let key = grammar_cache_key(
+                &vocab,
+                &serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap(),
+            );
             let first = cache
                 .get_or_compile(key.clone(), || {
                     compile_schema_for_cache_test(SCHEMA_CACHE_TEST_BOOL)
@@ -5451,11 +5599,17 @@ mod imp {
         #[test]
         fn grammar_cache_evicts_least_recently_used_at_capacity() {
             let cache = GrammarCache::new(2);
-            let key_a =
-                canonical_schema_key(&serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap());
-            let key_b =
-                canonical_schema_key(&serde_json::from_str(SCHEMA_CACHE_TEST_NULL).unwrap());
-            let key_c = canonical_schema_key(
+            let vocab = cache_test_vocab();
+            let key_a = grammar_cache_key(
+                &vocab,
+                &serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap(),
+            );
+            let key_b = grammar_cache_key(
+                &vocab,
+                &serde_json::from_str(SCHEMA_CACHE_TEST_NULL).unwrap(),
+            );
+            let key_c = grammar_cache_key(
+                &vocab,
                 &serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap(),
             );
 
@@ -5505,7 +5659,9 @@ mod imp {
         #[test]
         fn grammar_cache_single_flight_collapses_concurrent_identical_requests() {
             let cache = Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY));
-            let key = canonical_schema_key(
+            let vocab = cache_test_vocab();
+            let key = grammar_cache_key(
+                &vocab,
                 &serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap(),
             );
             const N: usize = 8;
@@ -5556,7 +5712,9 @@ mod imp {
         #[test]
         fn grammar_cache_panic_in_compile_notifies_waiters_with_internal_error() {
             let cache = Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY));
-            let key = canonical_schema_key(
+            let vocab = cache_test_vocab();
+            let key = grammar_cache_key(
+                &vocab,
                 &serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap(),
             );
             const N: usize = 8;
@@ -5638,6 +5796,7 @@ mod imp {
         #[test]
         fn grammar_cache_hits_across_reordered_but_equivalent_top_level_keys() {
             let cache = GrammarCache::new(GRAMMAR_CACHE_CAPACITY);
+            let vocab = cache_test_vocab();
             const EMPTY_OBJ_REORDERED: &str =
                 r#"{"additionalProperties":false,"required":[],"properties":{},"type":"object"}"#;
             let v1: Value = serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap();
@@ -5645,17 +5804,130 @@ mod imp {
             assert_eq!(canonical_schema_key(&v1), canonical_schema_key(&v2));
 
             let first = cache
-                .get_or_compile(canonical_schema_key(&v1), || {
+                .get_or_compile(grammar_cache_key(&vocab, &v1), || {
                     compile_schema_for_cache_test(SCHEMA_CACHE_TEST_EMPTY_OBJECT)
                 })
                 .expect("v1 must compile");
             let second = cache
-                .get_or_compile(canonical_schema_key(&v2), || {
+                .get_or_compile(grammar_cache_key(&vocab, &v2), || {
                     panic!("v2's canonical key must hit the entry compiled for v1")
                 })
                 .expect("v2 must hit cache");
             assert!(Arc::ptr_eq(&first, &second));
             assert_eq!(cache.compile_count(), 1);
+        }
+
+        /// #1557: two different vocabularies compiled against the *same*
+        /// schema must never share a cache entry. Before the fix, the cache
+        /// was keyed on `canonical_schema_key(schema)` alone, so `vocab_b`'s
+        /// lookup would hit the entry `vocab_a` had already compiled and
+        /// silently hand back a `GrammarEngine` built for `vocab_a`'s
+        /// (different-sized) vocabulary.
+        #[test]
+        fn grammar_cache_does_not_share_entries_across_different_vocabularies() {
+            let vocab_a: Arc<Vec<Vec<u8>>> = Arc::new(
+                ["true", "false", "null", "{", "}", "0", "1", "2", "3"]
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect(),
+            );
+            let vocab_b = cache_test_vocab();
+            assert_ne!(
+                vocab_a.len(),
+                vocab_b.len(),
+                "test fixture needs two distinguishably-sized vocabularies"
+            );
+
+            let schema: Value = serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap();
+            let cache = GrammarCache::new(GRAMMAR_CACHE_CAPACITY);
+
+            let engine_a = cache
+                .get_or_compile(grammar_cache_key(&vocab_a, &schema), || {
+                    let spec = GrammarSpec::JsonSchema(schema.clone());
+                    GrammarEngine::new(&spec, (*vocab_a).clone())
+                        .map_err(|e| format!("vocab_a compile failed: {e}"))
+                })
+                .expect("vocab_a must compile");
+            let engine_b = cache
+                .get_or_compile(grammar_cache_key(&vocab_b, &schema), || {
+                    let spec = GrammarSpec::JsonSchema(schema.clone());
+                    GrammarEngine::new(&spec, (*vocab_b).clone())
+                        .map_err(|e| format!("vocab_b compile failed: {e}"))
+                })
+                .expect("vocab_b must compile");
+
+            assert_eq!(
+                cache.compile_count(),
+                2,
+                "two different vocabularies against the same schema must each compile their \
+                 own entry, not share one"
+            );
+            assert!(
+                !Arc::ptr_eq(&engine_a, &engine_b),
+                "vocab_a's and vocab_b's lookups must not resolve to the same cached engine"
+            );
+
+            // Directly exercise the returned engine rather than trusting the
+            // pointer check alone: `mask_logits` rejects a `logits` buffer
+            // shorter than the engine's own `vocab_size`
+            // (`validate_logits_len`), so handing it a buffer sized to
+            // `vocab_b.len()` (5) only succeeds if `engine_b` really was
+            // compiled against `vocab_b`. Had the cache wrongly served
+            // `vocab_a`'s entry (`vocab_size` 9), this same call would
+            // reject the length-5 buffer.
+            let mut state = engine_b.initial_state();
+            let mut logits = vec![0.0f32; vocab_b.len()];
+            engine_b
+                .mask_logits(&mut state, &mut logits)
+                .expect("engine_b must accept a logits buffer sized to vocab_b, not vocab_a");
+        }
+
+        /// The cache key must pin the exact `vocab_bytes` allocation it
+        /// names, not merely record its address. Written against
+        /// `grammar_cache_key`/`get_or_compile` as opaque behaviour (never
+        /// naming `GrammarCacheKey`'s fields or type) so an address-only
+        /// `String` key would still compile here and fail by assertion.
+        ///
+        /// A `Weak` observes the allocation from outside without itself
+        /// keeping it alive. If the cache's key holds only an address, the
+        /// allocation dies the moment every other handle to it (here, the
+        /// test's own `vocab_a`) is dropped, and a later, unrelated
+        /// `vocab_bytes` allocation can legitimately land at that freed
+        /// address -- reintroducing #1557's original collision through the
+        /// address alone, exactly because the two are then *not*
+        /// simultaneously alive.
+        #[test]
+        fn grammar_cache_key_keeps_its_vocabulary_allocation_alive() {
+            let vocab_a: Arc<Vec<Vec<u8>>> = Arc::new(
+                ["true", "false", "null", "{", "}", "0", "1", "2", "3"]
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect(),
+            );
+            let weak = Arc::downgrade(&vocab_a);
+            let schema: Value = serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap();
+            let cache = GrammarCache::new(GRAMMAR_CACHE_CAPACITY);
+
+            cache
+                .get_or_compile(grammar_cache_key(&vocab_a, &schema), || {
+                    let spec = GrammarSpec::JsonSchema(schema.clone());
+                    GrammarEngine::new(&spec, (*vocab_a).clone())
+                        .map_err(|e| format!("vocab_a compile failed: {e}"))
+                })
+                .expect("vocab_a must compile");
+
+            // Drop the caller's only other handle. The cache's own key is
+            // now the sole thing that can still be keeping this allocation
+            // alive.
+            drop(vocab_a);
+
+            assert!(
+                weak.upgrade().is_some(),
+                "the grammar cache's key must keep its vocabulary allocation alive for as long \
+                 as the entry sits in the cache -- otherwise the allocator can hand the freed \
+                 address to an unrelated later vocabulary, and an address-only key would then \
+                 alias the two"
+            );
         }
 
         // ── admit_v0_schema: golden accept per construct ────────────────────
@@ -6223,7 +6495,10 @@ mod imp {
         #[tokio::test]
         async fn lora_list_reads_confirmed_index() {
             let Json(value) = lora_list(State(test_app_state())).await;
-            assert_eq!(value, serde_json::json!({"adapters":[],"applied":[]}));
+            assert_eq!(
+                value,
+                serde_json::json!({"adapters":[],"applied":[],"router":{"enabled":false}})
+            );
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

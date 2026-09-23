@@ -2318,9 +2318,9 @@ mod tests {
             .expect("official Qwen3.5-VL vision dims (1152/4304) must be accepted");
     }
 
-    // Reading BF16/F16 safetensors tensors requires the `f16` feature (not default);
-    // without it `get_f32_tensor` returns `InvalidSafetensors` for every such tensor.
-    #[cfg(feature = "f16")]
+    // BF16/F16 safetensors tensors decode to f32 unconditionally (no feature
+    // gate); this runs in every feature set and self-skips when the checkpoint
+    // is absent.
     #[test]
     fn loads_real_fp16_checkpoint_with_correct_shapes() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());

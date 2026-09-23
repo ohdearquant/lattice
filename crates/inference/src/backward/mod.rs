@@ -1,4 +1,5 @@
-//! Backward-pass module index for `attention_gqa`, `gradcheck`, `ops`, and `tape`.
+//! Backward-pass module index for `attention_gqa`, `gradcheck`, `ops`, `simd`
+//! (test and `test-utils` builds only), and `tape`.
 pub mod attention_gqa;
 pub mod gradcheck;
 pub mod ops;

@@ -31,8 +31,9 @@ pub use cached::CachedEmbeddingService;
 pub use native::NativeEmbeddingService;
 #[cfg(feature = "native")]
 pub use prepared::{
-    CheckpointAttestor, MAX_ATTESTATION_REPORT_BYTES, MIN_ATTESTATION_REPORT_BYTES,
-    NativeResourceBudget, OpaqueAttestationReport,
+    AttestationAlgorithm, CheckpointAttestor, MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES,
+    MIN_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES, NativeResourceBudget,
+    SupplementaryAttestationEvidence,
 };
 
 /// **Stable**: default maximum batch size to prevent OOM.

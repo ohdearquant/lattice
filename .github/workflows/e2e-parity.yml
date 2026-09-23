@@ -1282,14 +1282,25 @@ jobs:
       # eval_perplexity's load_cfg_for_q4 reads config.json from the Q4 dir — so
       # copy it in (the tokenizer is supplied separately via --tokenizer-dir).
       - name: Generate ephemeral Q4 artifact
+        id: generate-q4-artifact
         run: |
           target/release/quantize_q4 \
             --model-dir ~/.lattice/models/qwen3.5-0.8b \
             --output-dir "$RUNNER_TEMP/qwen3.5-0.8b-q4"
           cp ~/.lattice/models/qwen3.5-0.8b/config.json "$RUNNER_TEMP/qwen3.5-0.8b-q4/config.json"
 
+      # This gate consumes the previous step's output, unlike the earlier
+      # fail-closed gates in this job (which are independent of each other and
+      # correctly use `!cancelled()` alone so one failure still lets the rest
+      # report). `!cancelled()` alone does not distinguish "producer ran and
+      # succeeded" from "producer was skipped because an earlier step in this
+      # job failed": in the latter case this step used to run anyway, find no
+      # Q4 directory, and fail with a directory error that pointed at the
+      # wrong subsystem instead of the real upstream failure. Requiring the
+      # producer step's own outcome makes a skipped/failed producer yield a
+      # skipped gate here rather than a misattributed one.
       - name: Run Q4 PPL regression gate
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.generate-q4-artifact.outcome == 'success' }}
         env:
           LATTICE_PPL_Q4_DIR: ${{ runner.temp }}/qwen3.5-0.8b-q4
           LATTICE_PPL_TOKENIZER_DIR: ~/.lattice/models/qwen3.5-0.8b

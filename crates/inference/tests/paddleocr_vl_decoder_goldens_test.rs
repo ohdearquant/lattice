@@ -22,16 +22,16 @@
 
 #[test]
 fn decoder_forward_matches_hf_reference() {
-    // The pinned checkpoint stores every text tensor as BF16; reading it
-    // through `SafetensorsFile` requires the `f16` feature. Without it the
-    // gate skips (or panics under enforce) exactly like a missing checkpoint,
-    // mirroring `vision_s3_vit_forward_test.rs`.
+    // BF16/F16 safetensors tensors decode to f32 unconditionally (no feature
+    // gate); this gate still requires --features f16 as its pinned invocation
+    // contract, enforced below exactly like a missing checkpoint, mirroring
+    // `vision_s3_vit_forward_test.rs`.
     #[cfg(not(feature = "f16"))]
     {
         if std::env::var("LATTICE_POCR_GATE_ENFORCE").as_deref() == Ok("1") {
             panic!(
-                "LATTICE_POCR_GATE_ENFORCE=1 but the `f16` feature is not enabled — the \
-                 checkpoint's BF16 tensors require it"
+                "LATTICE_POCR_GATE_ENFORCE=1 but the `f16` feature is not enabled — this \
+                 gate's pinned invocation contract requires --features f16"
             );
         }
         eprintln!("SKIP paddleocr_vl_decoder_goldens_test: f16 feature disabled");
@@ -40,10 +40,10 @@ fn decoder_forward_matches_hf_reference() {
     gate::run();
 }
 
-/// Everything that needs the `f16` feature (the BF16 checkpoint read and
-/// the golden comparison) lives here so the default-feature build carries
-/// no unreachable items — `cargo clippy --all-targets -D warnings` without
-/// `f16` is a CI gate.
+/// Gated on `f16` as this gate's pinned invocation contract, not because the
+/// checkpoint read needs it (BF16 decodes to f32 unconditionally). Kept
+/// together so the default-feature build carries no unreachable items —
+/// `cargo clippy --all-targets -D warnings` without `f16` is a CI gate.
 #[cfg(feature = "f16")]
 mod gate {
     use lattice_inference::model::ernie45::{Ernie45Config, Ernie45Model, Ernie45Weights};
