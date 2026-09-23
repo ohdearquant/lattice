@@ -219,6 +219,193 @@ fn drift_metric_known_displacement() {
     }
 }
 
+/// `DriftReport.converged` must reflect the solver's actual outcome rather than a
+/// hardcoded `true` on the unbalanced path, whose solver config has no strictness
+/// flag of its own.
+#[test]
+fn drift_report_surfaces_actual_convergence_state_on_unbalanced_path() {
+    // Source: two points at (0, 0) and (1, 0); target shifted right by 2 units.
+    let source_emb: Vec<Vec<f32>> = vec![vec![0.0, 0.0], vec![1.0, 0.0]];
+    let target_emb: Vec<Vec<f32>> = vec![vec![2.0, 0.0], vec![3.0, 0.0]];
+    let source_records: Vec<EmbeddingRecord<'_, usize>> = source_emb
+        .iter()
+        .enumerate()
+        .map(|(i, emb)| EmbeddingRecord::uniform(i, emb))
+        .collect();
+    let target_records: Vec<EmbeddingRecord<'_, usize>> = target_emb
+        .iter()
+        .enumerate()
+        .map(|(i, emb)| EmbeddingRecord::uniform(i, emb))
+        .collect();
+
+    let converging_config = DriftConfig {
+        compute_divergence: false,
+        solver_mode: DriftSolverMode::Unbalanced {
+            tau_source: 1.0,
+            tau_target: 1.0,
+        },
+        sinkhorn: SinkhornConfig {
+            epsilon: 0.1,
+            max_iterations: 500,
+            convergence_threshold: 1e-5,
+            ..SinkhornConfig::default()
+        },
+        ..DriftConfig::default()
+    };
+    let report =
+        detect_drift_records(&source_records, &target_records, &converging_config).unwrap();
+    assert!(
+        report.converged,
+        "a solve given enough iterations should report converged = true"
+    );
+
+    // Same problem, capped at zero iterations: the solver cannot possibly converge,
+    // and the report must say so instead of defaulting to "converged".
+    let non_converging_config = DriftConfig {
+        sinkhorn: SinkhornConfig {
+            max_iterations: 0,
+            ..converging_config.sinkhorn
+        },
+        ..converging_config
+    };
+    let report =
+        detect_drift_records(&source_records, &target_records, &non_converging_config).unwrap();
+    assert!(
+        !report.converged,
+        "a solve capped at zero iterations must not be reported as converged"
+    );
+}
+
+/// `error_on_non_convergence` must be honoured on the unbalanced path too, not only
+/// by the balanced solver that carries the flag itself.
+#[test]
+fn unbalanced_drift_honours_error_on_non_convergence() {
+    let source_emb: Vec<Vec<f32>> = vec![vec![0.0, 0.0], vec![1.0, 0.0]];
+    let target_emb: Vec<Vec<f32>> = vec![vec![2.0, 0.0], vec![3.0, 0.0]];
+    let source_records: Vec<EmbeddingRecord<'_, usize>> = source_emb
+        .iter()
+        .enumerate()
+        .map(|(i, emb)| EmbeddingRecord::uniform(i, emb))
+        .collect();
+    let target_records: Vec<EmbeddingRecord<'_, usize>> = target_emb
+        .iter()
+        .enumerate()
+        .map(|(i, emb)| EmbeddingRecord::uniform(i, emb))
+        .collect();
+    let strict = DriftConfig {
+        compute_divergence: false,
+        solver_mode: DriftSolverMode::Unbalanced {
+            tau_source: 1.0,
+            tau_target: 1.0,
+        },
+        sinkhorn: SinkhornConfig {
+            epsilon: 0.1,
+            max_iterations: 0,
+            convergence_threshold: 1e-5,
+            error_on_non_convergence: true,
+            ..SinkhornConfig::default()
+        },
+        ..DriftConfig::default()
+    };
+    let result = detect_drift_records(&source_records, &target_records, &strict);
+    assert!(
+        matches!(result, Err(SinkhornError::NonConvergence { .. })),
+        "a strict config must refuse a non-converged unbalanced solve, got {result:?}"
+    );
+
+    let permissive = DriftConfig {
+        sinkhorn: SinkhornConfig {
+            error_on_non_convergence: false,
+            ..strict.sinkhorn
+        },
+        ..strict
+    };
+    let report = detect_drift_records(&source_records, &target_records, &permissive).unwrap();
+    assert!(!report.converged);
+}
+
+/// A slice mixing more than one embedding model has no single distance to report;
+/// `detect_drift_records` must refuse it rather than silently labelling the report
+/// with whichever model the first record happened to carry.
+#[test]
+fn detect_drift_records_refuses_mixed_model_source() {
+    let source_a = [0.0f32, 0.0];
+    let source_b = [1.0f32, 0.0];
+    let target_emb = [2.0f32, 0.0];
+
+    let source_records = vec![
+        EmbeddingRecord {
+            id: 0usize,
+            embedding: &source_a,
+            weight: 1.0,
+            model: Some("bge-small"),
+        },
+        EmbeddingRecord {
+            id: 1usize,
+            embedding: &source_b,
+            weight: 1.0,
+            model: Some("me5-small"),
+        },
+    ];
+    let target_records = vec![EmbeddingRecord::uniform(0usize, &target_emb)];
+
+    let config = DriftConfig::default();
+    let result = detect_drift_records(&source_records, &target_records, &config);
+
+    assert!(
+        matches!(
+            &result,
+            Err(SinkhornError::MixedModelInput { axis: "source", .. })
+        ),
+        "expected a MixedModelInput refusal naming the source axis, got {result:?}"
+    );
+}
+
+/// Positive control for the mixed-model refusal above: records that agree on
+/// `model` (or leave it unset) must still resolve to a single label as before.
+#[test]
+fn detect_drift_records_labels_agreeing_models() {
+    let source_a = [0.0f32, 0.0];
+    let source_b = [1.0f32, 0.0];
+    let target_a = [2.0f32, 0.0];
+    let target_b = [3.0f32, 0.0];
+
+    let source_records = vec![
+        EmbeddingRecord {
+            id: 0usize,
+            embedding: &source_a,
+            weight: 1.0,
+            model: Some("bge-small"),
+        },
+        EmbeddingRecord {
+            id: 1usize,
+            embedding: &source_b,
+            weight: 1.0,
+            model: Some("bge-small"),
+        },
+    ];
+    let target_records = vec![
+        EmbeddingRecord {
+            id: 0usize,
+            embedding: &target_a,
+            weight: 1.0,
+            model: Some("me5-small"),
+        },
+        EmbeddingRecord {
+            id: 1usize,
+            embedding: &target_b,
+            weight: 1.0,
+            model: Some("me5-small"),
+        },
+    ];
+
+    let config = DriftConfig::default();
+    let report = detect_drift_records(&source_records, &target_records, &config).unwrap();
+
+    assert_eq!(report.source_model.as_deref(), Some("bge-small"));
+    assert_eq!(report.target_model.as_deref(), Some("me5-small"));
+}
+
 /// Test 6: Unbalanced solver allows mass mismatch.
 #[test]
 fn unbalanced_solver_mass_mismatch() {

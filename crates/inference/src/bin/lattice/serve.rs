@@ -1008,10 +1008,19 @@ fn spawn_cpu_style_streaming_generation(
 /// without materializing a `Vec<Message>` entry for each one -- there is
 /// no separate raw-bytes pass over `messages` ahead of that parse.
 ///
-/// `to_bytes(.., REQUEST_BODY_LIMIT_BYTES)` enforces the same cap the
-/// router's `DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES)` layer
-/// already applies to the underlying body stream, so the existing 413
-/// behavior below is unchanged.
+/// `to_bytes(.., REQUEST_BODY_LIMIT_BYTES)` below is the SOLE enforcement
+/// of the request body cap on this route, not a second layer on top of
+/// the router's `DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES)`.
+/// `DefaultBodyLimit` works by inserting a request extension that only
+/// extractors built on `Bytes`/`BytesMut` -- and anything layered on
+/// them, e.g. `Json<T>`, `Form<T>`, multipart -- read via
+/// `RequestExt::into_limited_body` (axum-core 0.8's
+/// `extract::request_parts` and `ext_traits::request`). `Body`'s own
+/// `FromRequest` impl returns the request body unwrapped
+/// (`req.into_body()`) and never consults that extension, so the layer
+/// does not bound a handler that takes `body: axum::body::Body`
+/// directly, this one included. The existing 413 behavior below comes
+/// entirely from this explicit `to_bytes` call.
 ///
 /// Switching from `Json` to a raw body also dropped `Json`'s own
 /// Content-Type enforcement (a security gap: a body with a valid JSON
