@@ -260,7 +260,8 @@ pub fn accumulate_planned_elements(
 }
 
 /// One adapter's contribution to a single blended `(layer_idx, module)`
-/// projection: everything [`plan_blend`] needs, and nothing else.
+/// projection: everything [`plan_blend`] and [`plan_grouped`] need, and
+/// nothing else.
 ///
 /// Deliberately narrower than either caller's own per-layer type
 /// (`lattice_inference::forward::metal_qwen35::LoraLayerData` also carries
@@ -285,10 +286,11 @@ pub struct BlendProjection<'a> {
 /// contributing adapter's rank summed, at the group's agreed `(d_in, d_out)`.
 ///
 /// `module` borrows from the same `BlendProjection<'a>` inputs `plan_blend`
-/// was given, rather than cloning each group's module name: every caller
-/// (`blend_lora_layer_data`, the adapter residency registry's `publish`) has
-/// the underlying `String` alive for the plan's entire lifetime, so this
-/// avoids one allocation per `(layer_idx, module)` group.
+/// or `plan_grouped` was given, rather than cloning each group's module
+/// name: every caller (`blend_lora_layer_data`, the adapter residency
+/// registry's `publish`) has the underlying `String` alive for the plan's
+/// entire lifetime, so this avoids one allocation per `(layer_idx, module)`
+/// group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedProjection<'a> {
     /// Transformer layer index (0-based).
@@ -303,27 +305,159 @@ pub struct PlannedProjection<'a> {
     pub d_out: usize,
 }
 
-/// Pre-allocation planning for a LoRA blend.
+/// Pre-allocation planning for a LoRA blend, given projections already
+/// grouped by `(layer_idx, module)`.
 ///
-/// This is the planning half of `blend_lora_layer_data`
-/// (`lattice_inference::forward::metal_qwen35`): group `projections` by
-/// `(layer_idx, module)`, bound the aggregate blend size across every group
-/// against [`MAX_BLEND_TOTAL_ELEMENTS`], then within each group require
-/// every entry to agree on `(d_in, d_out)` and bound the summed rank against
-/// [`MAX_BLEND_RANK_TOTAL`]. It never sees an A/B buffer
-/// (`check_buffer_lengths` stays with the caller that owns them, since this
-/// leaf crate never receives one) and never sees a per-request mixture
-/// weight (`check_finite_weight` is about a request's router output, not
-/// this residency-shaped question).
+/// This is [`plan_blend`]'s planning core, split out so a caller that has
+/// already grouped its projections for its own purposes —
+/// `blend_lora_layer_data` (`lattice_inference::forward::metal_qwen35`)
+/// groups its inputs by `(layer_idx, module)` to build the blended A/B
+/// buffers regardless — can hand that grouping straight to the checks below
+/// instead of paying for a second `HashMap` and per-group `Vec` just to
+/// re-derive a grouping it already has. `plan_blend` itself is now a thin
+/// wrapper: it groups a flat iterator of projections and calls this
+/// function.
 ///
-/// Both the blend itself and the adapter residency registry's state
-/// publication call this (issue #1735) — the ONE copy of these three
-/// checks, so a `GET /v1/lora` report of whether the resident set can be
-/// blended and the blend a routed request actually runs cannot disagree.
+/// Bounds the aggregate blend size across every group against
+/// [`MAX_BLEND_TOTAL_ELEMENTS`] (pass 1), then within each group requires
+/// every entry to agree on `(d_in, d_out)` and bounds the summed rank
+/// against [`MAX_BLEND_RANK_TOTAL`] (pass 2) — the same two passes, in the
+/// same order, with the same error strings, as `plan_blend` ran directly
+/// over its own grouping. It never sees an A/B buffer
+/// (`check_buffer_lengths` stays with the caller that owns them) and never
+/// sees a per-request mixture weight (`check_finite_weight` is about a
+/// request's router output, not this residency-shaped question).
+///
+/// `groups` is walked twice — once (cloned) for pass 1, once (moved) for
+/// pass 2 — and each group's own entries are walked twice within pass 2 (see
+/// that pass's comment for why it isn't one combined loop), which is why
+/// both `G` and `I` carry a `Clone` bound. For the iterator shapes every
+/// current caller passes (a `Map` over a `Vec`'s or `HashMap`'s own
+/// borrowing `Iter`, with non-capturing closures), cloning is a pointer
+/// copy, not an allocation.
+///
+/// # Preconditions
+///
+/// The caller guarantees each `(layer_idx, module)` key appears in `groups`
+/// at most once and that every group's entries are non-empty (a
+/// `HashMap`-based grouping pass, as both `plan_blend` and
+/// `blend_lora_layer_data` run, satisfies this by construction: a key only
+/// exists in the map because at least one projection was pushed into it).
+/// An empty group is treated as a caller bug reported through `Err`, naming
+/// the offending `(layer_idx, module)` — never a panic, never an
+/// out-of-bounds index into an empty group.
+///
+/// # Errors
+///
+/// Returns `Err` when:
+/// - any group in `groups` is empty;
+/// - the aggregate blend size across every group exceeds
+///   `MAX_BLEND_TOTAL_ELEMENTS`;
+/// - two entries in the same group disagree on `(d_in, d_out)`;
+/// - the summed rank for one group exceeds `MAX_BLEND_RANK_TOTAL`;
+/// - rank accumulation or a size product overflows `usize`.
+pub fn plan_grouped<'a, G, I>(ctx: &str, groups: G) -> Result<Vec<PlannedProjection<'a>>, String>
+where
+    G: IntoIterator<Item = (usize, &'a str, I)> + Clone,
+    I: IntoIterator<Item = BlendProjection<'a>> + Clone,
+{
+    // Pass 1: bound the TOTAL planned allocation across every group before
+    // validating any individual group's dimensions -- an oversized
+    // aggregate rejects before the per-group dims walk in pass 2, mirroring
+    // the original two-pass order. Each group's entries are consumed
+    // exactly once here (the first entry for `(d_in, d_out)`, then the rest
+    // for the rank sum), so this pass needs no `Clone` of a group's own
+    // entries -- only `groups.clone()` itself, to leave `groups` available
+    // for pass 2 below.
+    let mut planned_elems: usize = 0;
+    for (layer_idx, module, entries) in groups.clone() {
+        let mut iter = entries.into_iter();
+        let first = iter.next().ok_or_else(|| {
+            format!("{ctx}: layer {layer_idx} module '{module}' has an empty projection group")
+        })?;
+        let mut group_rank = accumulate_rank(0, first.rank, ctx)?;
+        for entry in iter {
+            group_rank = accumulate_rank(group_rank, entry.rank, ctx)?;
+        }
+        let group_elems =
+            checked_group_elements(ctx, layer_idx, module, group_rank, first.d_in, first.d_out)?;
+        planned_elems = accumulate_planned_elements(planned_elems, group_elems, ctx)?;
+    }
+    check_aggregate_elements_cap(planned_elems, ctx)?;
+
+    // Pass 2: per group, require every entry to agree on `(d_in, d_out)`
+    // *before* summing rank. Kept as two separate walks -- a dims-match walk
+    // over the full group, then a fresh rank sum -- rather than merged into
+    // one loop that checks dims and accumulates rank per entry: a merged
+    // loop can have an earlier entry's `accumulate_rank` overflow before a
+    // later entry's dims mismatch is ever reached, which would report the
+    // overflow instead of the mismatch for that input. The original
+    // (pre-split) code ran its whole dims-match loop to completion before
+    // its rank-sum loop ever started, so a dims mismatch anywhere in the
+    // group always won that race; two walks here preserve exactly that
+    // order. This is the one place a group's entries need their own
+    // `Clone`: the dims-match walk clones them, the rank-sum walk consumes
+    // the original.
+    let mut result = Vec::new();
+    for (layer_idx, module, entries) in groups {
+        let mut dims_iter = entries.clone().into_iter().enumerate();
+        let (_, first) = dims_iter.next().ok_or_else(|| {
+            format!("{ctx}: layer {layer_idx} module '{module}' has an empty projection group")
+        })?;
+        let d_in = first.d_in;
+        let d_out = first.d_out;
+
+        // Entry 0 trivially matches itself (`d_in == d_in`, `d_out ==
+        // d_out`); `dims_iter` already consumed it above extracting `first`,
+        // so this only re-checks entries 1..N -- the same entries whose
+        // check could ever fail in the original all-entries-including-0 loop.
+        for (idx, entry) in dims_iter {
+            check_dims_match(
+                ctx,
+                layer_idx,
+                module,
+                d_in,
+                d_out,
+                idx,
+                entry.d_in,
+                entry.d_out,
+            )?;
+        }
+
+        let mut rank_total: usize = 0;
+        for entry in entries {
+            rank_total = accumulate_rank(rank_total, entry.rank, ctx)?;
+        }
+        check_rank_total_cap(rank_total, ctx)?;
+
+        result.push(PlannedProjection {
+            layer_idx,
+            module,
+            rank_total,
+            d_in,
+            d_out,
+        });
+    }
+    Ok(result)
+}
+
+/// Pre-allocation planning for a LoRA blend, from a flat, ungrouped iterator
+/// of projections.
+///
+/// Groups `projections` by `(layer_idx, module)` and hands the grouping to
+/// [`plan_grouped`], which runs the actual checks (see its own docs for the
+/// full pass-by-pass description). Both the blend itself and the adapter
+/// residency registry's state publication call this (issue #1735) — the ONE
+/// copy of these checks, so a `GET /v1/lora` report of whether the resident
+/// set can be blended and the blend a routed request actually runs cannot
+/// disagree. `blend_lora_layer_data` (`lattice_inference::forward::metal_qwen35`)
+/// already groups its inputs to build the blended A/B buffers regardless, so
+/// it calls [`plan_grouped`] directly instead of this function, to avoid
+/// grouping the same projections a second time.
 ///
 /// `ctx` is reproduced verbatim in every returned message, exactly like
-/// every other function in this module: `blend_lora_layer_data` passes its
-/// own name, so this refactor leaves its error text unchanged.
+/// every other function in this module: callers pass their own name, so
+/// this refactor leaves their error text unchanged.
 ///
 /// # Errors
 ///
@@ -349,56 +483,13 @@ pub fn plan_blend<'a>(
             .push(projection);
     }
 
-    // Bound the TOTAL planned allocation across every (layer_idx, module)
-    // group before validating any individual group's dimensions -- an
-    // oversized aggregate rejects before the per-entry dims walk below,
-    // mirroring `blend_lora_layer_data`'s original two-pass order.
-    let mut planned_elems: usize = 0;
-    for (&(layer_idx, module), entries) in &grouped {
-        let first = &entries[0]; // each key was inserted with >=1 entry
-        let mut group_rank: usize = 0;
-        for entry in entries {
-            group_rank = accumulate_rank(group_rank, entry.rank, ctx)?;
-        }
-        let group_elems =
-            checked_group_elements(ctx, layer_idx, module, group_rank, first.d_in, first.d_out)?;
-        planned_elems = accumulate_planned_elements(planned_elems, group_elems, ctx)?;
-    }
-    check_aggregate_elements_cap(planned_elems, ctx)?;
-
-    let mut result = Vec::with_capacity(grouped.len());
-    for ((layer_idx, module), entries) in grouped {
-        let d_in = entries[0].d_in;
-        let d_out = entries[0].d_out;
-
-        for (idx, entry) in entries.iter().enumerate() {
-            check_dims_match(
-                ctx,
-                layer_idx,
-                module,
-                d_in,
-                d_out,
-                idx,
-                entry.d_in,
-                entry.d_out,
-            )?;
-        }
-
-        let mut rank_total: usize = 0;
-        for entry in &entries {
-            rank_total = accumulate_rank(rank_total, entry.rank, ctx)?;
-        }
-        check_rank_total_cap(rank_total, ctx)?;
-
-        result.push(PlannedProjection {
-            layer_idx,
-            module,
-            rank_total,
-            d_in,
-            d_out,
-        });
-    }
-    Ok(result)
+    // `.iter().copied()` hands each group's already-collected
+    // `Vec<BlendProjection<'a>>` to `plan_grouped` without any further
+    // allocation (`BlendProjection` is `Copy`).
+    let groups = grouped
+        .iter()
+        .map(|(&(layer_idx, module), entries)| (layer_idx, module, entries.iter().copied()));
+    plan_grouped(ctx, groups)
 }
 
 /// Reject an aggregate element count exceeding [`MAX_BLEND_TOTAL_ELEMENTS`].
@@ -766,5 +857,147 @@ mod tests {
     #[test]
     fn plan_blend_of_no_projections_is_trivially_feasible() {
         assert_eq!(plan_blend("ctx", []), Ok(Vec::new()));
+    }
+
+    /// `plan_grouped` over projections already grouped by `(layer_idx,
+    /// module)` must plan the same set (up to group order) as `plan_blend`
+    /// grouping the same projections itself, for a feasible multi-group
+    /// input -- the whole point of splitting `plan_grouped` out is that a
+    /// caller who already has the grouping gets an identical plan without
+    /// paying for `plan_blend`'s own re-grouping.
+    #[test]
+    fn plan_grouped_matches_plan_blend_on_a_feasible_multi_group_set() {
+        let groups: Vec<(usize, &str, Vec<BlendProjection<'_>>)> = vec![
+            (
+                0,
+                "q_proj",
+                vec![
+                    BlendProjection {
+                        layer_idx: 0,
+                        module: "q_proj",
+                        rank: 8,
+                        d_in: 4,
+                        d_out: 4,
+                    },
+                    BlendProjection {
+                        layer_idx: 0,
+                        module: "q_proj",
+                        rank: 4,
+                        d_in: 4,
+                        d_out: 4,
+                    },
+                ],
+            ),
+            (
+                1,
+                "k_proj",
+                vec![BlendProjection {
+                    layer_idx: 1,
+                    module: "k_proj",
+                    rank: 2,
+                    d_in: 6,
+                    d_out: 6,
+                }],
+            ),
+        ];
+        let flattened: Vec<BlendProjection<'_>> = groups
+            .iter()
+            .flat_map(|(_, _, entries)| entries.iter().copied())
+            .collect();
+
+        let mut via_grouped =
+            plan_grouped("ctx", groups).expect("a feasible pre-grouped set must plan");
+        let mut via_blend = plan_blend("ctx", flattened).expect("the same set flattened must plan");
+
+        via_grouped.sort_by_key(|p| (p.layer_idx, p.module));
+        via_blend.sort_by_key(|p| (p.layer_idx, p.module));
+        assert_eq!(via_grouped, via_blend);
+    }
+
+    /// `plan_grouped` must refuse with the exact same error string as
+    /// `plan_blend` on each of the three refusal fixtures above, so a
+    /// caller that switches from `plan_blend` to `plan_grouped` (as
+    /// `blend_lora_layer_data` does) sees no change in its own error text.
+    #[test]
+    fn plan_grouped_matches_plan_blend_error_strings_on_refusals() {
+        // Refusal (1): summed rank over budget.
+        let rank_over_budget = vec![
+            BlendProjection {
+                layer_idx: 0,
+                module: "q_proj",
+                rank: MAX_BLEND_RANK_TOTAL,
+                d_in: 1,
+                d_out: 1,
+            },
+            BlendProjection {
+                layer_idx: 0,
+                module: "q_proj",
+                rank: 1,
+                d_in: 1,
+                d_out: 1,
+            },
+        ];
+        let err_blend = plan_blend("ctx", rank_over_budget.clone())
+            .expect_err("summed rank exceeding the cap must refuse");
+        let err_grouped = plan_grouped("ctx", vec![(0usize, "q_proj", rank_over_budget)])
+            .expect_err("summed rank exceeding the cap must refuse");
+        assert_eq!(err_blend, err_grouped);
+
+        // Refusal (2): aggregate over budget, one entry per group so each
+        // group's `plan_grouped` list mirrors `plan_blend`'s own grouping.
+        let rank = MAX_BLEND_RANK_TOTAL;
+        let d_in = 2048usize;
+        let d_out = 2048usize;
+        let aggregate_over_budget: Vec<BlendProjection<'_>> = (0..65usize)
+            .map(|layer_idx| BlendProjection {
+                layer_idx,
+                module: "q_proj",
+                rank,
+                d_in,
+                d_out,
+            })
+            .collect();
+        let err_blend = plan_blend("ctx", aggregate_over_budget.clone())
+            .expect_err("aggregate over-budget must refuse");
+        let aggregate_groups: Vec<(usize, &str, Vec<BlendProjection<'_>>)> = aggregate_over_budget
+            .iter()
+            .map(|p| (p.layer_idx, p.module, vec![*p]))
+            .collect();
+        let err_grouped =
+            plan_grouped("ctx", aggregate_groups).expect_err("aggregate over-budget must refuse");
+        assert_eq!(err_blend, err_grouped);
+
+        // Refusal (3): dimension mismatch within one group.
+        let dimension_mismatch = vec![
+            BlendProjection {
+                layer_idx: 0,
+                module: "q_proj",
+                rank: 4,
+                d_in: 4,
+                d_out: 4,
+            },
+            BlendProjection {
+                layer_idx: 0,
+                module: "q_proj",
+                rank: 4,
+                d_in: 8,
+                d_out: 4,
+            },
+        ];
+        let err_blend =
+            plan_blend("ctx", dimension_mismatch.clone()).expect_err("a d_in mismatch must refuse");
+        let err_grouped = plan_grouped("ctx", vec![(0usize, "q_proj", dimension_mismatch)])
+            .expect_err("a d_in mismatch must refuse");
+        assert_eq!(err_blend, err_grouped);
+    }
+
+    /// An empty group is a caller bug reported through `Err`, never a panic
+    /// (there is no `entries[0]` to index into).
+    #[test]
+    fn plan_grouped_rejects_an_empty_group() {
+        let groups: Vec<(usize, &str, Vec<BlendProjection<'_>>)> =
+            vec![(0usize, "q_proj", Vec::new())];
+        let err = plan_grouped("ctx", groups).expect_err("an empty group must refuse, not panic");
+        assert!(err.contains("empty"), "got: {err}");
     }
 }

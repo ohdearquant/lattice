@@ -1847,18 +1847,28 @@ mod inner {
         // a `GET /v1/lora` report of whether the resident set can be blended
         // and this function's own refusal can never disagree. It sees only
         // each entry's shape, never an A/B buffer.
-        let projections = grouped.iter().flat_map(|(_, entries)| {
-            entries
-                .iter()
-                .map(|(layer, _)| lattice_fann::lora::BlendProjection {
-                    layer_idx: layer.layer_idx,
-                    module: layer.module.as_str(),
-                    rank: layer.rank,
-                    d_in: layer.d_in,
-                    d_out: layer.d_out,
-                })
+        //
+        // `grouped` above is already the grouping `plan_blend` would build
+        // internally from a flat iterator, so this calls `plan_grouped`
+        // directly over `grouped`'s own entries instead of `plan_blend`,
+        // skipping a second `HashMap` and per-group `Vec` that would
+        // otherwise re-derive the same grouping from scratch on every blend.
+        let groups = grouped.iter().map(|(&(layer_idx, module), entries)| {
+            (
+                layer_idx,
+                module,
+                entries
+                    .iter()
+                    .map(|(layer, _)| lattice_fann::lora::BlendProjection {
+                        layer_idx: layer.layer_idx,
+                        module: layer.module.as_str(),
+                        rank: layer.rank,
+                        d_in: layer.d_in,
+                        d_out: layer.d_out,
+                    }),
+            )
         });
-        let planned = lattice_fann::lora::plan_blend("blend_lora_layer_data", projections)
+        let planned = lattice_fann::lora::plan_grouped("blend_lora_layer_data", groups)
             .map_err(InferenceError::InvalidInput)?;
 
         let mut result: Vec<LoraLayerData> = Vec::with_capacity(planned.len());
@@ -1876,7 +1886,7 @@ mod inner {
 
             // Validate source slice lengths before any allocation: a malformed adapter
             // whose A or B buffer is the wrong size would cause out-of-bounds copies.
-            // `plan_blend` never sees these buffers, so this check stays here.
+            // `plan_grouped` never sees these buffers, so this check stays here.
             for (idx, (entry, _)) in entries.iter().enumerate() {
                 lattice_fann::lora::check_buffer_lengths(
                     "blend_lora_layer_data",
