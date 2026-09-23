@@ -4265,6 +4265,13 @@ mod imp {
                         axum::http::StatusCode::NOT_FOUND,
                         "{method} {path} is in LORA_ROUTES but not registered in this binary"
                     );
+                    // A 405 means the path exists under a DIFFERENT method, so the listed
+                    // method is not registered either; checking 404 alone would pass it.
+                    assert_ne!(
+                        response.status(),
+                        axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                        "{method} {path} is in LORA_ROUTES but this binary registers {path} under another method"
+                    );
                 }
             }
 
