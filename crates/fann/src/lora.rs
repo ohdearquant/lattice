@@ -283,12 +283,18 @@ pub struct BlendProjection<'a> {
 
 /// The planned shape of one blended `(layer_idx, module)` projection: every
 /// contributing adapter's rank summed, at the group's agreed `(d_in, d_out)`.
+///
+/// `module` borrows from the same `BlendProjection<'a>` inputs `plan_blend`
+/// was given, rather than cloning each group's module name: every caller
+/// (`blend_lora_layer_data`, the adapter residency registry's `publish`) has
+/// the underlying `String` alive for the plan's entire lifetime, so this
+/// avoids one allocation per `(layer_idx, module)` group.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedProjection {
+pub struct PlannedProjection<'a> {
     /// Transformer layer index (0-based).
     pub layer_idx: usize,
     /// Projection module name.
-    pub module: String,
+    pub module: &'a str,
     /// Summed rank across every adapter contributing to this projection.
     pub rank_total: usize,
     /// Input dimension, agreed by every contributing adapter.
@@ -332,13 +338,13 @@ pub struct PlannedProjection {
 pub fn plan_blend<'a>(
     ctx: &str,
     projections: impl IntoIterator<Item = BlendProjection<'a>>,
-) -> Result<Vec<PlannedProjection>, String> {
+) -> Result<Vec<PlannedProjection<'a>>, String> {
     use std::collections::HashMap;
 
-    let mut grouped: HashMap<(usize, String), Vec<BlendProjection<'a>>> = HashMap::new();
+    let mut grouped: HashMap<(usize, &'a str), Vec<BlendProjection<'a>>> = HashMap::new();
     for projection in projections {
         grouped
-            .entry((projection.layer_idx, projection.module.to_string()))
+            .entry((projection.layer_idx, projection.module))
             .or_default()
             .push(projection);
     }
@@ -348,14 +354,14 @@ pub fn plan_blend<'a>(
     // oversized aggregate rejects before the per-entry dims walk below,
     // mirroring `blend_lora_layer_data`'s original two-pass order.
     let mut planned_elems: usize = 0;
-    for ((layer_idx, module), entries) in &grouped {
+    for (&(layer_idx, module), entries) in &grouped {
         let first = &entries[0]; // each key was inserted with >=1 entry
         let mut group_rank: usize = 0;
         for entry in entries {
             group_rank = accumulate_rank(group_rank, entry.rank, ctx)?;
         }
         let group_elems =
-            checked_group_elements(ctx, *layer_idx, module, group_rank, first.d_in, first.d_out)?;
+            checked_group_elements(ctx, layer_idx, module, group_rank, first.d_in, first.d_out)?;
         planned_elems = accumulate_planned_elements(planned_elems, group_elems, ctx)?;
     }
     check_aggregate_elements_cap(planned_elems, ctx)?;
@@ -369,7 +375,7 @@ pub fn plan_blend<'a>(
             check_dims_match(
                 ctx,
                 layer_idx,
-                &module,
+                module,
                 d_in,
                 d_out,
                 idx,

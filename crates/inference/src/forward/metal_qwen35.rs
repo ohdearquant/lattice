@@ -1828,11 +1828,13 @@ mod inner {
         }
 
         // Group by (layer_idx, module): collect refs to layer data and effective weights.
-        let mut grouped: HashMap<(usize, String), Vec<(&LoraLayerData, f32)>> = HashMap::new();
+        // Keyed by `&str` borrowed from each layer's own `module: String` (which
+        // outlives this function body via `inputs`), not a per-layer clone.
+        let mut grouped: HashMap<(usize, &str), Vec<(&LoraLayerData, f32)>> = HashMap::new();
         for (layers, weight) in inputs {
             for layer in *layers {
                 grouped
-                    .entry((layer.layer_idx, layer.module.clone()))
+                    .entry((layer.layer_idx, layer.module.as_str()))
                     .or_default()
                     .push((layer, *weight));
             }
@@ -1861,15 +1863,13 @@ mod inner {
 
         let mut result: Vec<LoraLayerData> = Vec::with_capacity(planned.len());
         for plan in planned {
-            let entries = grouped
-                .get(&(plan.layer_idx, plan.module.clone()))
-                .ok_or_else(|| {
-                    InferenceError::Inference(format!(
-                        "blend_lora_layer_data: planned group (layer {}, module {}) is absent \
+            let entries = grouped.get(&(plan.layer_idx, plan.module)).ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "blend_lora_layer_data: planned group (layer {}, module {}) is absent \
                          from the grouped adapter set",
-                        plan.layer_idx, plan.module
-                    ))
-                })?;
+                    plan.layer_idx, plan.module
+                ))
+            })?;
             let d_in = plan.d_in;
             let d_out = plan.d_out;
             let rank_total = plan.rank_total;
@@ -1925,7 +1925,7 @@ mod inner {
 
             result.push(LoraLayerData {
                 layer_idx: plan.layer_idx,
-                module: plan.module,
+                module: plan.module.to_string(),
                 a: a_blend,
                 b: b_blend,
                 rank: rank_total,
