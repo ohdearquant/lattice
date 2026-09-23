@@ -12259,6 +12259,7 @@ mod inner {
             cfg: &Qwen35Config,
             prefix: &str,
             layer_idx: usize,
+            moe_layers_already_sized: usize,
         ) -> Result<MetalFfnWeights, String> {
             use crate::forward::moe_expert_cache::{
                 ExpertSlotCache, MoeExpertCacheConfig, moe_expert_cache_num_slots,
@@ -12279,17 +12280,35 @@ mod inner {
             // f16-resident for Qwen3.5-35B-A3B, independent of how many
             // experts a token actually activates — see PLAN.md §1). Instead,
             // size a bounded LRU cache of per-expert slots against this
-            // device's memory budget: `num_experts` slots (the "zero-eviction
-            // fast path", functionally the old eager behavior but lazily
-            // populated and evictable) when that fits under 0.85 ×
-            // recommendedMaxWorkingSetSize split evenly across every MoE
-            // layer, else auto-shrunk (floored at `top_k`, below which the
-            // cache cannot serve even one token's routed-expert set).
+            // device's *remaining* memory budget: `num_experts` slots (the
+            // "zero-eviction fast path", functionally the old eager behavior
+            // but lazily populated and evictable) when that fits under 0.85
+            // × recommendedMaxWorkingSetSize minus what this device already
+            // has allocated (fixed model buffers, KV/GDN/prefix state, and
+            // any earlier MoE layer's own cache slots), split evenly across
+            // the MoE layers not yet sized (this layer included), else
+            // auto-shrunk (floored at `top_k`, below which the cache cannot
+            // serve even one token's routed-expert set). `moe_layers_
+            // already_sized` must be this layer's live ordinal among MoE
+            // layers processed so far on this device — every earlier one
+            // already built its own `ExpertSlotCache` buffers, which are
+            // part of `current_allocated_size()` by the time this call
+            // runs, so dividing by the *total* MoE layer count on every
+            // call (instead of by the layers not yet sized) would subtract
+            // each already-sized layer's bytes from the numerator while
+            // still dividing by a constant denominator that includes them,
+            // geometrically starving later layers. See
+            // `moe_expert_cache_num_slots`'s doc comment for exactly which
+            // residency classes `current_allocated_size()` covers, which it
+            // doesn't (CPU-side allocations and the OS/process reserve),
+            // and the known limitation this does not close (later layers'
+            // not-yet-loaded dense weights are also invisible to it).
             let gate_up_bytes_per_expert = (2 * inter * hidden * 2) as u64; // f16
             let down_bytes_per_expert = (hidden * inter * 2) as u64; // f16
             let per_expert_bytes_total = gate_up_bytes_per_expert + down_bytes_per_expert;
             let num_moe_layers = cfg.num_active_layers();
             let max_working = device.recommended_max_working_set_size();
+            let already_allocated = device.current_allocated_size();
             let cache_cfg = MoeExpertCacheConfig::from_env()
                 .map_err(|e| format!("from_q4_dir: MoE layer {layer_idx}: {e}"))?;
             let num_slots = moe_expert_cache_num_slots(
@@ -12299,6 +12318,8 @@ mod inner {
                 per_expert_bytes_total,
                 num_moe_layers,
                 max_working,
+                already_allocated,
+                moe_layers_already_sized,
             )
             .map_err(|e| format!("from_q4_dir: MoE layer {layer_idx}: {e}"))?;
 
@@ -12851,7 +12872,23 @@ mod inner {
                         // / `.experts.down_proj` fused per-layer arrays, plus every other MoE
                         // tensor here, are Q4-quantized). `MetalFfnWeights::Dense`'s
                         // `mlp.{gate,up,down}_proj.weight` files do not exist for this layer.
-                        Self::load_moe_ffn_q4(&device, q4_dir, cfg, &prefix, i)?
+                        //
+                        // `layer_weights.len()` is this layer's live ordinal among MoE
+                        // layers already sized on this device: `is_moe()` is a whole-
+                        // checkpoint flag (every active layer takes this branch when
+                        // true, per `Qwen35Config::is_moe`), and every prior iteration
+                        // of this loop already pushed its `(attn, common)` pair before
+                        // this one runs — so `layer_weights.len()` is exactly the count
+                        // of MoE layers whose `ExpertSlotCache` buffers are already
+                        // resident, never a guess.
+                        Self::load_moe_ffn_q4(
+                            &device,
+                            q4_dir,
+                            cfg,
+                            &prefix,
+                            i,
+                            layer_weights.len(),
+                        )?
                     } else {
                         let (gate_raw, _) = load_q4_raw_timed(
                             &format!("{prefix}.mlp.gate_proj.weight"),
