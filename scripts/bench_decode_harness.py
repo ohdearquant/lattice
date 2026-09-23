@@ -367,6 +367,10 @@ def validate_jsonl(path: Path) -> list[dict]:
             except ObservationValidationError as exc:
                 raise ObservationValidationError(f"{path}:{line_no}: {exc}") from exc
             rows.append(row)
+    if not rows:
+        raise ObservationValidationError(
+            f"{path}: no observations found (file is empty or contains only blank lines)"
+        )
     return rows
 
 
