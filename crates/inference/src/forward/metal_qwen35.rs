@@ -1107,6 +1107,14 @@ mod inner {
         #[allow(dead_code)]
         // pre-final hidden retained for MTP chaining; not yet consumed by callers
         final_hidden: Vec<f32>, // pre-final hidden of last verified row
+        // Raw (pre-final-RMSNorm) hidden state of the FIRST verified row (the
+        // pending token's own position). On a full MTP accept the second
+        // verified row commits as a real token, and its MTP-cache entry pairs
+        // that token's embedding with this hidden state — the target's own
+        // pre-final hidden from one position earlier, matching the pairing
+        // `mtp_prefill_append`'s doc comment establishes (lattice#1396).
+        // Empty when the session carries no MTP head.
+        first_pre_final_hidden: Vec<f32>,
     }
 
     struct MetalStepOutput {
@@ -4562,6 +4570,7 @@ mod inner {
             self.checkpoint_gdn_to_slot(0, GdnStateTrafficScope::MtpVerify)?;
             let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
             let mut final_hidden = Vec::new();
+            let mut first_pre_final_hidden = Vec::new();
             for (i, &token) in tokens.iter().enumerate() {
                 #[cfg(feature = "gdn-state-counters")]
                 let out = self.forward_step_inner_with_traffic_scope(
@@ -4579,11 +4588,19 @@ mod inner {
                 );
                 self.checkpoint_gdn_to_slot(i + 1, GdnStateTrafficScope::MtpVerify)?;
                 all_logits.push(out.logits);
+                if i == 0 {
+                    // lattice#1396: the pending token's own pre-final hidden,
+                    // needed to append the accepted draft's MTP-cache row —
+                    // captured here for free (this step already computes it)
+                    // before the next iteration's `final_hidden` overwrite.
+                    first_pre_final_hidden = out.pre_final_hidden.clone();
+                }
                 final_hidden = out.pre_final_hidden;
             }
             Ok(MetalVerifyOutput {
                 logits: all_logits,
                 final_hidden,
+                first_pre_final_hidden,
             })
         }
 
@@ -5315,9 +5332,27 @@ mod inner {
                 Vec::new()
             };
 
+            // lattice#1396: raw pre-final hidden of the FIRST verified row (the
+            // pending token's own position), needed to append the accepted
+            // draft's MTP-cache row. `activations.residual` holds this value
+            // untouched: the layer loop's own end-of-layer fused add+copy
+            // (`dispatch_add_and_copy`) leaves `residual[i] == hidden[i]` for
+            // every one of the `n` verified rows right after the last layer,
+            // and unlike `activations.hidden`, `residual` is never written
+            // again by the batch RMSNorm dispatched above — that dispatch
+            // only mutates `hidden` in place. No extra GPU dispatch is needed;
+            // this is a second CPU-side read of an already-computed buffer,
+            // the same pattern the MTP prefill capture uses on `hidden` itself.
+            let first_pre_final_hidden = if self.session.mtp.is_some() {
+                unsafe { read_buffer(&self.session.activations.residual, hidden) }
+            } else {
+                Vec::new()
+            };
+
             Ok(MetalVerifyOutput {
                 logits: all_logits,
                 final_hidden,
+                first_pre_final_hidden,
             })
         }
 
@@ -9122,13 +9157,33 @@ mod inner {
                 };
 
                 // GPU state mutations must happen before the pure decision function:
-                // - Accept: clear batch_repair_token (rollback won't run this round).
+                // - Accept: clear batch_repair_token (rollback won't run this round),
+                //   and append the MTP-cache row `mtp_forward_one` never writes for
+                //   the accepted draft token itself.
                 // - Reject: roll back KV cache and GDN state to pos+1.
                 let accepted = rs.accepted_count == 1;
                 if accepted {
                     if let Some(ref mut p) = self.session.gdn_checkpoints {
                         p.batch_repair_token = None;
                     }
+                    // lattice#1396: `mtp_forward_one` above wrote only the row for
+                    // `pending_token` at `pos`; a full accept commits `draft.token_id`
+                    // at `pos + 1` without ever giving it its own MTP-cache row, so
+                    // the next round's `mtp_forward_one(bonus_token, pos + 2)` lands
+                    // one physical slot behind its RoPE position (a positional hole
+                    // per accepted transition). `mtp_prefill_append` is the same
+                    // K/V-only append primitive `mtp_prefill` uses to backfill
+                    // historical prompt positions — a prefilled position is only
+                    // ever a future key, exactly this case. Pair the accepted
+                    // token's embedding with `first_pre_final_hidden`, the verify
+                    // pass's pre-final hidden for `pending_token`'s own position
+                    // (the hidden state that predicted the accepted draft), matching
+                    // the pairing `mtp_prefill_append`'s own doc comment establishes.
+                    self.mtp_prefill_append(
+                        draft.token_id,
+                        &verify_out.first_pre_final_hidden,
+                        pos + 1,
+                    );
                     metrics.accepted_extra_tokens += 1;
                 } else {
                     let t_rb = std::time::Instant::now();
@@ -18531,6 +18586,99 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  `mtp_forward_one` wrote this round; got {mtp_seq_len}, which means the \
                  next `mtp_forward_one` call will skip a slot and the attention window \
                  will read a never-written row"
+            );
+        }
+
+        // lattice#1396: a K=1 full accept must give the MTP cache a row for the
+        // accepted draft token, not just for `pending_token`. `mtp_forward_one`
+        // writes exactly one row (for `pending_token`) and advances
+        // `mtp.cache.seq_len` by 1 before verification runs; on a full accept the
+        // draft token commits as a real, generated token at `pos + 1` without ever
+        // getting its own MTP-cache row, so the cursor stalls at `c0 + 1` instead of
+        // `c0 + 2` and the next round's `mtp_forward_one` call lands one physical
+        // slot behind its own RoPE position -- a positional hole per accepted
+        // transition (the issue's exact defect).
+        //
+        // Reuses `rollback_speculative_state_to_preserves_mtp_cursor_after_k1_reject`'s
+        // constant-zero-draft fixture (the draft head always predicts token 0), but
+        // forces `pending_first == 0` instead of `2`: token 0's real-model
+        // next-token prediction is token 0 itself (`0 % 3 == 0` gives it the
+        // negative-embedding residue class the target's zero-attention/zero-FFN
+        // stack turns into the logit maximum, and 0 is the first index in that
+        // class), which matches the constant draft (token 0) exactly -- a
+        // deterministic full accept, driven through the real `generate_greedy_mtp`
+        // path.
+        #[test]
+        fn full_accept_appends_mtp_cache_row_for_accepted_draft_token() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            use crate::generation::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
+            assert!(
+                state.session.mtp.is_some(),
+                "constant-draft MTP fixture must populate session.mtp"
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(true),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            // Force `pending_first == 0` directly rather than relying on a real
+            // prefill, mirroring the sibling reject test's technique.
+            let mut prefill_logits = vec![-1.0f32; cfg.vocab_size];
+            prefill_logits[0] = 100.0;
+
+            let pos_before = state.session.kv_cache.seq_len;
+            assert_eq!(pos_before, 0);
+            let out = state.generate_greedy_mtp(&prefill_logits, 0, &tokenizer, &gen_cfg);
+            assert!(
+                !out.stopped,
+                "test assumes round 1 does not hit EOS; got {out:?}"
+            );
+
+            // K=1 full accept keeps `pending_token` (0) AND the draft (0), advancing
+            // the target KV cache by 2; a K=1 reject would advance it by only 1.
+            let kv_seq_len = state.session.kv_cache.seq_len;
+            assert_eq!(
+                kv_seq_len, 2,
+                "test setup assumption violated: expected round 1 to accept the \
+                 constant draft (token 0), matching the target's own prediction for \
+                 pending token 0, advancing the target KV cache by 2; got \
+                 {kv_seq_len}, meaning the draft was rejected instead"
+            );
+
+            // The defect under test: after a full accept, the MTP cache cursor must
+            // reach `c0 + 2` (one row for `pending_token`, one for the accepted
+            // draft token), holding a row at every logical position through the
+            // accepted token -- not `c0 + 1` with the accepted draft's own position
+            // left as a hole.
+            let mtp_seq_len = state.session.mtp.as_ref().unwrap().cache.seq_len;
+            assert_eq!(
+                mtp_seq_len, 2,
+                "K=1 full accept must leave the MTP cursor two rows past where it \
+                 started: one row `mtp_forward_one` wrote for `pending_token`, one \
+                 row the accept arm must append for the accepted draft token; got \
+                 {mtp_seq_len}, meaning the accepted draft's own row was never \
+                 appended and the next round's `mtp_forward_one` will land one \
+                 physical slot behind its RoPE position"
             );
         }
 
