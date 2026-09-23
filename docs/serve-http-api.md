@@ -698,9 +698,10 @@ right now:
 
 `routable` is `true` only when both lists are empty, both duplicates are
 `null`, and `blend_refusal` is `null`. It is computed by the same checks a
-chat request runs, so a request that omits `lora` while `routable` is `false`
-is refused with `router_adapter_set_mismatch` (a name mismatch) or
-`lora_apply_failed` (a blend refusal) instead of being routed. Loading or
+chat request runs. A request that omits `lora` while a name check fails is
+refused with `router_adapter_set_mismatch` before routing. When only
+`blend_refusal` is set, the request is routed and then fails when the blend
+executes, with `400 lora_apply_failed`. Loading or
 unloading an adapter changes the answer, and this endpoint shows the change
 before the next request does.
 

@@ -1863,9 +1863,13 @@ mod inner {
         for plan in planned {
             let entries = grouped
                 .get(&(plan.layer_idx, plan.module.clone()))
-                .expect(
-                    "plan_blend groups the identical (layer_idx, module) set built from `grouped` above",
-                );
+                .ok_or_else(|| {
+                    InferenceError::Inference(format!(
+                        "blend_lora_layer_data: planned group (layer {}, module {}) is absent \
+                         from the grouped adapter set",
+                        plan.layer_idx, plan.module
+                    ))
+                })?;
             let d_in = plan.d_in;
             let d_out = plan.d_out;
             let rank_total = plan.rank_total;

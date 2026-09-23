@@ -122,9 +122,9 @@ pub struct Routability {
     /// set can pass every check above -- nothing missing, nothing
     /// unexpected, no duplicate on either side -- and still refuse to
     /// blend, because a routed request applies every resident adapter and
-    /// the blend has its own rank and size budget. Carried here rather than
-    /// left to a caller re-deriving it, for the same reason the other
-    /// fields are: `route` and this report must read the same verdict.
+    /// the blend has its own rank and size budget. `route` does not refuse
+    /// on this field: a routed request over such a set fails when the blend
+    /// executes, with the same planning check that produced this reason.
     pub blend_refusal: Option<String>,
 }
 
