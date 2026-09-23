@@ -835,6 +835,33 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # #1393: the two typed Metal GDN-state tests added alongside #1267
+      # (`metal_gdn_state_pairs_buffers_with_explicit_geometry`,
+      # `metal_gdn_state_layer_index_drives_each_real_recurrence_pair`) had no
+      # filter that selected them: `--lib q4` and `--lib forward::metal::` are
+      # both substring filters against this test's full path
+      # (`forward::metal_qwen35::inner::tests::layers::metal_gdn_state_...`),
+      # and neither "q4" nor "forward::metal::" occurs in it (the module is
+      # `metal_qwen35`, not `metal`), so a device-equipped runner never ran
+      # them. `metal_gdn_state_` is a substring unique to these two tests in
+      # this crate and matches nothing else. The env var turns a runner with
+      # no Metal device from a green early return into a failure, matching
+      # the Q4/grammar/f16-KV steps' convention; the exact "2 passed" grep
+      # guards against a silently zero-matching filter the same way those
+      # steps do.
+      - name: inference — Metal GDN state buffer geometry and recurrence (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-gdn-state.log"
+          if ! cargo test -p lattice-inference --features f16,metal-gpu --lib metal_gdn_state_ -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -Eq '^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: inference — Metal MTP cursor preflight (macOS only)
         if: runner.os == 'macOS'
         env:
