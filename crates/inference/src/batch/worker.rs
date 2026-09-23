@@ -816,6 +816,7 @@ mod tests {
         worker.submit(InferenceRequest {
             prompt_ids: vec![3], // token 3 is in the prompt; must be penalized
             sampling: SamplingConfig {
+                min_p: 0.0,
                 temperature: 0.0, // greedy fast path
                 top_k: 1,
                 top_p: 1.0,
