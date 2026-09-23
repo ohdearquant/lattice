@@ -259,6 +259,142 @@ pub fn accumulate_planned_elements(
         .ok_or_else(|| format!("{ctx}: aggregate blend element count overflowed usize"))
 }
 
+/// One adapter's contribution to a single blended `(layer_idx, module)`
+/// projection: everything [`plan_blend`] needs, and nothing else.
+///
+/// Deliberately narrower than either caller's own per-layer type
+/// (`lattice_inference::forward::metal_qwen35::LoraLayerData` also carries
+/// the A/B tensors) — this leaf crate cannot depend on that type anyway (the
+/// dependency direction runs the other way, `inference` depends on `fann`),
+/// and a blend *plan* never touches a buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct BlendProjection<'a> {
+    /// Transformer layer index (0-based).
+    pub layer_idx: usize,
+    /// Projection module name (e.g. `"q_proj"`, `"o_proj"`).
+    pub module: &'a str,
+    /// This adapter's rank for this projection.
+    pub rank: usize,
+    /// Input dimension.
+    pub d_in: usize,
+    /// Output dimension.
+    pub d_out: usize,
+}
+
+/// The planned shape of one blended `(layer_idx, module)` projection: every
+/// contributing adapter's rank summed, at the group's agreed `(d_in, d_out)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedProjection {
+    /// Transformer layer index (0-based).
+    pub layer_idx: usize,
+    /// Projection module name.
+    pub module: String,
+    /// Summed rank across every adapter contributing to this projection.
+    pub rank_total: usize,
+    /// Input dimension, agreed by every contributing adapter.
+    pub d_in: usize,
+    /// Output dimension, agreed by every contributing adapter.
+    pub d_out: usize,
+}
+
+/// Pre-allocation planning for a LoRA blend.
+///
+/// This is the planning half of `blend_lora_layer_data`
+/// (`lattice_inference::forward::metal_qwen35`): group `projections` by
+/// `(layer_idx, module)`, bound the aggregate blend size across every group
+/// against [`MAX_BLEND_TOTAL_ELEMENTS`], then within each group require
+/// every entry to agree on `(d_in, d_out)` and bound the summed rank against
+/// [`MAX_BLEND_RANK_TOTAL`]. It never sees an A/B buffer
+/// (`check_buffer_lengths` stays with the caller that owns them, since this
+/// leaf crate never receives one) and never sees a per-request mixture
+/// weight (`check_finite_weight` is about a request's router output, not
+/// this residency-shaped question).
+///
+/// Both the blend itself and the adapter residency registry's state
+/// publication call this (issue #1735) — the ONE copy of these three
+/// checks, so a `GET /v1/lora` report of whether the resident set can be
+/// blended and the blend a routed request actually runs cannot disagree.
+///
+/// `ctx` is reproduced verbatim in every returned message, exactly like
+/// every other function in this module: `blend_lora_layer_data` passes its
+/// own name, so this refactor leaves its error text unchanged.
+///
+/// # Errors
+///
+/// Returns `Err` when:
+/// - the aggregate blend size across every projection exceeds
+///   `MAX_BLEND_TOTAL_ELEMENTS`;
+/// - two entries in the same `(layer_idx, module)` group disagree on
+///   `(d_in, d_out)`;
+/// - the summed rank for one `(layer_idx, module)` group exceeds
+///   `MAX_BLEND_RANK_TOTAL`;
+/// - rank accumulation or a size product overflows `usize`.
+pub fn plan_blend<'a>(
+    ctx: &str,
+    projections: impl IntoIterator<Item = BlendProjection<'a>>,
+) -> Result<Vec<PlannedProjection>, String> {
+    use std::collections::HashMap;
+
+    let mut grouped: HashMap<(usize, String), Vec<BlendProjection<'a>>> = HashMap::new();
+    for projection in projections {
+        grouped
+            .entry((projection.layer_idx, projection.module.to_string()))
+            .or_default()
+            .push(projection);
+    }
+
+    // Bound the TOTAL planned allocation across every (layer_idx, module)
+    // group before validating any individual group's dimensions -- an
+    // oversized aggregate rejects before the per-entry dims walk below,
+    // mirroring `blend_lora_layer_data`'s original two-pass order.
+    let mut planned_elems: usize = 0;
+    for ((layer_idx, module), entries) in &grouped {
+        let first = &entries[0]; // each key was inserted with >=1 entry
+        let mut group_rank: usize = 0;
+        for entry in entries {
+            group_rank = accumulate_rank(group_rank, entry.rank, ctx)?;
+        }
+        let group_elems =
+            checked_group_elements(ctx, *layer_idx, module, group_rank, first.d_in, first.d_out)?;
+        planned_elems = accumulate_planned_elements(planned_elems, group_elems, ctx)?;
+    }
+    check_aggregate_elements_cap(planned_elems, ctx)?;
+
+    let mut result = Vec::with_capacity(grouped.len());
+    for ((layer_idx, module), entries) in grouped {
+        let d_in = entries[0].d_in;
+        let d_out = entries[0].d_out;
+
+        for (idx, entry) in entries.iter().enumerate() {
+            check_dims_match(
+                ctx,
+                layer_idx,
+                &module,
+                d_in,
+                d_out,
+                idx,
+                entry.d_in,
+                entry.d_out,
+            )?;
+        }
+
+        let mut rank_total: usize = 0;
+        for entry in &entries {
+            rank_total = accumulate_rank(rank_total, entry.rank, ctx)?;
+        }
+        check_rank_total_cap(rank_total, ctx)?;
+
+        result.push(PlannedProjection {
+            layer_idx,
+            module,
+            rank_total,
+            d_in,
+            d_out,
+        });
+    }
+    Ok(result)
+}
+
 /// Reject an aggregate element count exceeding [`MAX_BLEND_TOTAL_ELEMENTS`].
 pub fn check_aggregate_elements_cap(planned_elems: usize, ctx: &str) -> Result<(), String> {
     if planned_elems > MAX_BLEND_TOTAL_ELEMENTS {
@@ -486,5 +622,143 @@ mod tests {
     #[test]
     fn validate_target_modules_empty_is_ok() {
         assert!(validate_target_modules(&[], KNOWN_LORA_TARGET_MODULES).is_ok());
+    }
+
+    /// A feasible set: two adapters contributing to the same projection,
+    /// well under both caps and agreeing on shape.
+    #[test]
+    fn plan_blend_accepts_a_feasible_set() {
+        let planned = plan_blend(
+            "ctx",
+            [
+                BlendProjection {
+                    layer_idx: 0,
+                    module: "q_proj",
+                    rank: 8,
+                    d_in: 4,
+                    d_out: 4,
+                },
+                BlendProjection {
+                    layer_idx: 0,
+                    module: "q_proj",
+                    rank: 4,
+                    d_in: 4,
+                    d_out: 4,
+                },
+            ],
+        )
+        .expect("a feasible set must plan");
+        assert_eq!(planned.len(), 1, "one projection group in, one plan out");
+        assert_eq!(planned[0].layer_idx, 0);
+        assert_eq!(planned[0].module, "q_proj");
+        assert_eq!(planned[0].rank_total, 12);
+        assert_eq!((planned[0].d_in, planned[0].d_out), (4, 4));
+    }
+
+    /// Refusal (1): the summed rank for one projection exceeds the cap.
+    #[test]
+    fn plan_blend_rejects_rank_over_budget() {
+        let err = plan_blend(
+            "ctx",
+            [
+                BlendProjection {
+                    layer_idx: 0,
+                    module: "q_proj",
+                    rank: MAX_BLEND_RANK_TOTAL,
+                    d_in: 1,
+                    d_out: 1,
+                },
+                BlendProjection {
+                    layer_idx: 0,
+                    module: "q_proj",
+                    rank: 1,
+                    d_in: 1,
+                    d_out: 1,
+                },
+            ],
+        )
+        .expect_err("summed rank exceeding the cap must refuse");
+        assert!(err.contains("exceeds MAX_BLEND_RANK_TOTAL"), "got: {err}");
+
+        // The must-pass control: exactly at the cap succeeds, so the arm
+        // above is refusing the OVER-budget case and not every input.
+        assert!(
+            plan_blend(
+                "ctx",
+                [BlendProjection {
+                    layer_idx: 0,
+                    module: "q_proj",
+                    rank: MAX_BLEND_RANK_TOTAL,
+                    d_in: 1,
+                    d_out: 1,
+                }],
+            )
+            .is_ok()
+        );
+    }
+
+    /// Refusal (2): the aggregate blend size across every projection
+    /// exceeds the cap, even though each individual projection is within
+    /// its own per-group rank budget.
+    #[test]
+    fn plan_blend_rejects_aggregate_over_budget() {
+        let rank = MAX_BLEND_RANK_TOTAL; // exactly at the per-group cap
+        let d_in = 2048usize;
+        let d_out = 2048usize;
+        // 65 distinct (layer_idx, module) groups: 4096*(2048+2048)*65 =
+        // 1,090,519,040 > MAX_BLEND_TOTAL_ELEMENTS (1<<30).
+        let projections: Vec<BlendProjection<'_>> = (0..65usize)
+            .map(|layer_idx| BlendProjection {
+                layer_idx,
+                module: "q_proj",
+                rank,
+                d_in,
+                d_out,
+            })
+            .collect();
+        let err = plan_blend("ctx", projections).expect_err("aggregate over-budget must refuse");
+        assert!(
+            err.contains("aggregate") || err.contains("MAX_BLEND_TOTAL_ELEMENTS"),
+            "got: {err}"
+        );
+    }
+
+    /// Refusal (3): two adapters disagree on a projection's input or output
+    /// width.
+    #[test]
+    fn plan_blend_rejects_dimension_mismatch() {
+        let err = plan_blend(
+            "ctx",
+            [
+                BlendProjection {
+                    layer_idx: 0,
+                    module: "q_proj",
+                    rank: 4,
+                    d_in: 4,
+                    d_out: 4,
+                },
+                BlendProjection {
+                    layer_idx: 0,
+                    module: "q_proj",
+                    rank: 4,
+                    d_in: 8,
+                    d_out: 4,
+                },
+            ],
+        )
+        .expect_err("a d_in mismatch must refuse");
+        assert!(err.contains("mismatched dimensions"), "got: {err}");
+    }
+
+    /// An empty input plans to an empty (trivially feasible) result, rather
+    /// than refusing -- the "must not be empty" rule belongs to
+    /// `blend_lora_layer_data`'s own calling contract (a zero-adapter
+    /// mixture means "base model", handled before it ever reaches a plan),
+    /// not to plan feasibility itself. This matters for the residency
+    /// registry, which must report a zero-adapter resident set as
+    /// blend-feasible rather than refusing.
+    #[test]
+    fn plan_blend_of_no_projections_is_trivially_feasible() {
+        assert_eq!(plan_blend("ctx", []), Ok(Vec::new()));
     }
 }

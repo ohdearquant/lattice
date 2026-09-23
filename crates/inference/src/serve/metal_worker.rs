@@ -1671,6 +1671,7 @@ pub fn test_client_and_jobs_with_adapters(
         .unwrap_or_else(std::sync::PoisonError::into_inner) = AdapterIndex {
         adapters,
         applied: Vec::new(),
+        ..Default::default()
     };
     (client, jobs)
 }

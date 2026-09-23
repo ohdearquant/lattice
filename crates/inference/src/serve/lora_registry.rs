@@ -236,6 +236,27 @@ impl ResidencyRegistry {
             .map(|adapter| adapter.metadata.clone())
             .collect();
         adapters.sort_by_key(|adapter| adapter.id);
+
+        // A routed request applies EVERY resident adapter (ADR-094 decision
+        // 2), so that is exactly the set a blend feasibility report has to
+        // cover -- not just the adapters an operator most recently applied.
+        // Computed via the SAME shared plan `blend_lora_layer_data` itself
+        // runs (issue #1735), so this can never disagree with the blend a
+        // routed request actually meets.
+        let projections = self.residents.values().flat_map(|adapter| {
+            adapter
+                .layers
+                .iter()
+                .map(|layer| lattice_fann::lora::BlendProjection {
+                    layer_idx: layer.layer_idx,
+                    module: layer.module.as_str(),
+                    rank: layer.rank,
+                    d_in: layer.d_in,
+                    d_out: layer.d_out,
+                })
+        });
+        let blend_refusal = lattice_fann::lora::plan_blend("lora_residency", projections).err();
+
         // Only whole snapshots are assigned; recovering a poisoned lock cannot expose
         // a partially mutated metadata record.
         *self
@@ -244,6 +265,7 @@ impl ResidencyRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = AdapterIndex {
             adapters,
             applied: self.applied.clone(),
+            blend_refusal,
         };
     }
 }
@@ -717,6 +739,132 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("90")
+        );
+    }
+
+    /// Loads one adapter with the given rank and projection shape, all at
+    /// `(layer_idx=0, module="q_proj")` -- shaped so a caller loading two of
+    /// these can sum their ranks at the SAME projection.
+    fn load_shaped(
+        registry: &mut ResidencyRegistry,
+        name: &str,
+        rank: usize,
+        d_in: usize,
+        d_out: usize,
+    ) -> u32 {
+        registry
+            .load(
+                name.into(),
+                format!("{name}.safetensors"),
+                vec![LoraLayerData {
+                    layer_idx: 0,
+                    module: "q_proj".into(),
+                    a: vec![0.0f32; rank * d_in],
+                    b: vec![0.0f32; d_out * rank],
+                    rank,
+                    d_in,
+                    d_out,
+                }],
+                LoraDescriptor {
+                    rank,
+                    alpha: 1.0,
+                    target_modules: vec!["q_proj".into()],
+                    dtype: "f32".into(),
+                },
+            )
+            .unwrap()
+    }
+
+    fn matching_artifact(names: &[&str]) -> crate::router_state::RouterArtifact {
+        crate::router_state::RouterArtifact {
+            version: 1,
+            adapter_names: names.iter().map(|n| (*n).to_string()).collect(),
+            representation: crate::router_state::TrainedRepresentation {
+                embedding_model: "gme-qwen35".into(),
+                pooling: "mean_visual".into(),
+                prompt_source: "last_user_message".into(),
+                loader_format: "test".into(),
+                input_width: 4,
+            },
+            gate_bytes: vec![0],
+        }
+    }
+
+    /// Issue #1735: `GET /v1/lora` reports a blend refusal for a resident
+    /// set whose names match the gate exactly but whose summed rank exceeds
+    /// the shared budget, and the identical set reduced to fit reports
+    /// routable.
+    #[test]
+    fn a_resident_set_over_the_rank_budget_is_unroutable_and_reduced_is_routable() {
+        // Two adapters at the SAME (layer_idx, module), so their ranks sum:
+        // over budget (2049 + 2049 = 4098 > MAX_BLEND_RANK_TOTAL = 4096).
+        let mut over = registry();
+        load_shaped(&mut over, "a", 2049, 1, 1);
+        load_shaped(&mut over, "b", 2049, 1, 1);
+        let over_state = crate::serve::routing::routability(
+            &matching_artifact(&["a", "b"]),
+            &over.index.read().unwrap(),
+        );
+        assert!(!over_state.routable(), "the summed rank exceeds the budget");
+        assert!(
+            over_state
+                .blend_refusal
+                .as_deref()
+                .is_some_and(|m| m.contains("MAX_BLEND_RANK_TOTAL")),
+            "got: {:?}",
+            over_state.blend_refusal
+        );
+
+        // The identical shape, reduced to fit (2000 + 2000 = 4000 <= 4096).
+        let mut fits = registry();
+        load_shaped(&mut fits, "a", 2000, 1, 1);
+        load_shaped(&mut fits, "b", 2000, 1, 1);
+        let fits_state = crate::serve::routing::routability(
+            &matching_artifact(&["a", "b"]),
+            &fits.index.read().unwrap(),
+        );
+        assert!(fits_state.routable(), "reduced to fit, the set must route");
+        assert_eq!(fits_state.blend_refusal, None);
+    }
+
+    /// Consistency (issue #1735): for the same resident set, the published
+    /// plan's verdict must equal what `apply` -- the real blend -- does.
+    /// This is the property the whole refactor exists for: one shared
+    /// function computes both, so they cannot disagree.
+    #[test]
+    fn the_published_blend_refusal_agrees_with_what_apply_actually_does() {
+        let mut slot = Slot::default();
+
+        let mut over = registry();
+        let a = load_shaped(&mut over, "a", 2049, 1, 1);
+        let b = load_shaped(&mut over, "b", 2049, 1, 1);
+        assert!(
+            over.index.read().unwrap().blend_refusal.is_some(),
+            "published state must already flag the over-budget set"
+        );
+        let selection = [
+            LoraSelection { id: a, scale: 1.0 },
+            LoraSelection { id: b, scale: 1.0 },
+        ];
+        assert!(
+            over.apply(&selection, &mut slot).is_err(),
+            "the real blend must refuse exactly when the published plan says it will"
+        );
+
+        let mut fits = registry();
+        let a = load_shaped(&mut fits, "a", 2000, 1, 1);
+        let b = load_shaped(&mut fits, "b", 2000, 1, 1);
+        assert!(
+            fits.index.read().unwrap().blend_refusal.is_none(),
+            "published state must not flag a set within budget"
+        );
+        let selection = [
+            LoraSelection { id: a, scale: 1.0 },
+            LoraSelection { id: b, scale: 1.0 },
+        ];
+        assert!(
+            fits.apply(&selection, &mut slot).is_ok(),
+            "the real blend must succeed exactly when the published plan says it will"
         );
     }
 }

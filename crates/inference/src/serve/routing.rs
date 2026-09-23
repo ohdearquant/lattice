@@ -115,6 +115,17 @@ pub struct Routability {
     /// remedies -- one is a bad artifact, the other is a residency an operator
     /// can fix -- and a single field would make the report name neither.
     pub duplicate_resident: Option<String>,
+    /// Why a blend of the FULL resident set would refuse at execution
+    /// (issue #1735), or `None` when it would not.
+    ///
+    /// Independent of whether the trained set matches residency BY NAME: a
+    /// set can pass every check above -- nothing missing, nothing
+    /// unexpected, no duplicate on either side -- and still refuse to
+    /// blend, because a routed request applies every resident adapter and
+    /// the blend has its own rank and size budget. Carried here rather than
+    /// left to a caller re-deriving it, for the same reason the other
+    /// fields are: `route` and this report must read the same verdict.
+    pub blend_refusal: Option<String>,
 }
 
 impl Routability {
@@ -124,10 +135,13 @@ impl Routability {
             && self.unexpected.is_empty()
             && self.duplicate_trained.is_none()
             && self.duplicate_resident.is_none()
+            && self.blend_refusal.is_none()
     }
 }
 
-/// Compare the artifact's trained set against residency, in both directions.
+/// Compare the artifact's trained set against residency, in both directions,
+/// and carry the resident set's own blend feasibility (issue #1735) beside
+/// it -- one refusal reason, however it arose.
 pub fn routability(artifact: &RouterArtifact, resident: &AdapterIndex) -> Routability {
     let trained = &artifact.adapter_names;
     let live: Vec<String> = resident.adapters.iter().map(|a| a.name.clone()).collect();
@@ -136,6 +150,7 @@ pub fn routability(artifact: &RouterArtifact, resident: &AdapterIndex) -> Routab
         unexpected: missing(&live, trained),
         duplicate_trained: first_duplicate(trained),
         duplicate_resident: first_duplicate(&live),
+        blend_refusal: resident.blend_refusal.clone(),
     }
 }
 
@@ -709,6 +724,7 @@ mod tests {
                 })
                 .collect(),
             applied: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1028,6 +1044,34 @@ mod tests {
         assert!(!state.routable());
         assert_eq!(state.missing, vec!["legal".to_string()]);
         assert_eq!(state.unexpected, vec!["medical".to_string()]);
+    }
+
+    /// Issue #1735: a resident set matching the trained names exactly, with
+    /// no duplicate on either side, still refuses when the FULL resident set
+    /// cannot be blended -- the case `duplicate_*`/`missing`/`unexpected`
+    /// alone cannot see, because a routed request blends every resident
+    /// adapter, not just the ones a name comparison flags.
+    #[test]
+    fn a_blend_refusal_is_not_routable_even_though_the_names_agree() {
+        let mut resident = resident(&[(0, "technical"), (1, "legal")]);
+        resident.blend_refusal = Some("summed rank exceeds MAX_BLEND_RANK_TOTAL".to_string());
+        let state = routability(&artifact(&["technical", "legal"]), &resident);
+        assert!(
+            state.missing.is_empty() && state.unexpected.is_empty(),
+            "the names agree; only the blend budget refuses"
+        );
+        assert!(!state.routable(), "a blend refusal must not be routable");
+        assert_eq!(
+            state.blend_refusal.as_deref(),
+            Some("summed rank exceeds MAX_BLEND_RANK_TOTAL")
+        );
+
+        resident.blend_refusal = None;
+        let state = routability(&artifact(&["technical", "legal"]), &resident);
+        assert!(
+            state.routable(),
+            "with no blend refusal, the names still agree"
+        );
     }
 
     /// Reported separately from the set differences, because routing refuses

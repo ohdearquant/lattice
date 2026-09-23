@@ -2725,6 +2725,7 @@ mod tests {
                 serde_json::from_str::<LoraSelection>(r#"{"id":0,"scale":1.0}"#)
                     .expect("selection"),
             ],
+            ..Default::default()
         };
 
         let body = lattice_inference::serve::lora::lora_list_body(&index, None);
@@ -2792,15 +2793,42 @@ mod tests {
             serde_json::json!([]),
             "nothing is missing when the trained set is resident"
         );
+        assert_eq!(
+            body["router"]["blend_refusal"],
+            serde_json::Value::Null,
+            "no blend refusal is published for this fixture, so the router block reports none"
+        );
+
+        // Issue #1735: a resident set matching the trained names exactly can
+        // still refuse to route because the full set cannot be BLENDED, not
+        // because any name comparison fails. `routable` and the reason must
+        // both reflect it, additively -- `adapters`/`applied` untouched.
+        let mut over_budget = index.clone();
+        over_budget.blend_refusal = Some("summed rank exceeds MAX_BLEND_RANK_TOTAL".to_string());
+        let body = lattice_inference::serve::lora::lora_list_body(
+            &over_budget,
+            Some(resolved.report("gme-qwen35")),
+        );
+        assert!(
+            body["adapters"].is_array() && body["applied"].is_array(),
+            "a blend refusal must not change the residency snapshot's shape"
+        );
+        assert_eq!(
+            body["router"]["routable"], false,
+            "the names match exactly, but the blend refuses"
+        );
+        assert_eq!(body["router"]["missing"], serde_json::json!([]));
+        assert_eq!(body["router"]["unexpected"], serde_json::json!([]));
+        assert_eq!(
+            body["router"]["blend_refusal"],
+            "summed rank exceeds MAX_BLEND_RANK_TOTAL"
+        );
 
         // The other direction, against a residency that genuinely lacks the
         // trained name. Both arms are here because a routable-only assertion
         // passes against a `routable` hard-coded true, and a missing-only
         // assertion passes against one hard-coded false.
-        let empty = AdapterIndex {
-            adapters: vec![],
-            applied: vec![],
-        };
+        let empty = AdapterIndex::default();
         let body = lattice_inference::serve::lora::lora_list_body(
             &empty,
             Some(resolved.report("gme-qwen35")),
