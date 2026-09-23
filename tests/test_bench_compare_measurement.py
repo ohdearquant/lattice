@@ -2408,13 +2408,20 @@ class SystemBashEntrypoints(unittest.TestCase):
                                      "--gpu-handoff", "compare", "--", implementation, *args])
 
     def test_ordinary_command_reaches_supervisor_with_exact_arguments(self):
+        # --entrypoint must always be forwarded: it is what lets a wrapped
+        # command that is itself a self-supervising Python entry point (one
+        # that calls ensure_python_entrypoint) receive the liveness pipe it
+        # looks for instead of refusing with "LATTICE_BENCH_SUPERVISOR_FD is
+        # not set". An ordinary command never reads that pipe, so the flag
+        # is unconditional here, matching bench-compare.sh and
+        # bench_supervise_entry, which already pass it unconditionally too.
         command = ["printf", "%s", "two words", ""]
         for durable in (False, True):
             with self.subTest(durable=durable):
                 flags = ["--durable"] if durable else []
                 forwarded, _ = self.run_wrapper("bench-command.sh", ["--label", "fixture label", *flags, "--", *command])
                 quiet = ["--quiet"] if durable else []
-                self.assertEqual(forwarded, ["run", "--label", "fixture label", *quiet, "--", *command])
+                self.assertEqual(forwarded, ["run", "--label", "fixture label", *quiet, "--entrypoint", "--", *command])
 
     def test_command_handoff_reaches_supervisor_with_exact_arguments(self):
         command = ["cargo", "bench", "--", "two words", ""]
@@ -2423,7 +2430,7 @@ class SystemBashEntrypoints(unittest.TestCase):
                 flags = ["--durable"] if durable else []
                 forwarded, _ = self.run_wrapper("bench-command.sh", ["--gpu-handoff", "--label", "fixture label", *flags, "--", *command])
                 quiet = ["--quiet"] if durable else []
-                self.assertEqual(forwarded, ["run", "--label", "fixture label", *quiet,
+                self.assertEqual(forwarded, ["run", "--label", "fixture label", *quiet, "--entrypoint",
                                              "--gpu-handoff", "command", "--", *command])
 
 

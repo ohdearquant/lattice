@@ -41,9 +41,9 @@ pub use simd::{SimdConfig, simd_config};
 
 #[cfg(feature = "native")]
 pub use service::{
-    CachedEmbeddingService, CheckpointAttestor, MAX_ATTESTATION_REPORT_BYTES,
-    MIN_ATTESTATION_REPORT_BYTES, NativeEmbeddingService, NativeResourceBudget,
-    OpaqueAttestationReport,
+    AttestationAlgorithm, CachedEmbeddingService, CheckpointAttestor,
+    MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES, MIN_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES,
+    NativeEmbeddingService, NativeResourceBudget, SupplementaryAttestationEvidence,
 };
 
 /// Utility functions for vector operations.

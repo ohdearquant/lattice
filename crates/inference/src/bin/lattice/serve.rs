@@ -35,6 +35,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 
 /// Request body cap: 1 MiB.  Requests above this return HTTP 413.
 /// ADR-080 C2 (#782): `lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES`
@@ -412,6 +413,93 @@ pub struct AppState {
     /// model directory; every `/v1/embeddings` request then fails closed
     /// with `vision_unsupported`.
     pub embedding_model: Option<Arc<lattice_inference::serve::embeddings::EmbeddingModel>>,
+    /// Bounded concurrent-job admission for `/v1/embeddings`'s pooled
+    /// `embed_items` `spawn_blocking` calls (issue #1397), mirroring
+    /// `lattice_serve.rs`'s `EmbeddingState::admission` for its own
+    /// `/v1/embeddings` route: see [`EMBEDDING_MAX_CONCURRENT_JOBS`].
+    /// Always constructed, independent of whether `embedding_model` is
+    /// `Some` -- when no vision-language checkpoint is loaded, `embeddings()`
+    /// already fails closed on `embedding_model` before this is ever
+    /// touched.
+    pub embedding_admission: Arc<Semaphore>,
+    /// The router gate loaded at startup from `--router-state`, or `None` on a
+    /// server with no router configured.
+    ///
+    /// `None` is a served state, not a failure: a request that omits `lora`
+    /// selects the base model, which is what omitting the field has always
+    /// done. What is NOT a served state is a configured router that would not
+    /// load — startup refuses that rather than arriving here as `None`, since
+    /// the two are indistinguishable from this field alone.
+    ///
+    /// Gated to Metal builds for the same reason every other adapter surface
+    /// here is: routing selects resident adapters, and a build without Metal
+    /// cannot make one resident (see `adapter_unsupported_build`). A
+    /// `--router-state` passed to such a build is refused at startup rather
+    /// than loaded into a field nothing on that build could ever apply.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub router_state: Option<Arc<lattice_inference::serve::routing::ServedRouter>>,
+}
+
+/// See [`AppState::embedding_admission`]. Same cap `lattice_serve.rs` uses
+/// for its own pooled embedding route (`EMBEDDING_MAX_CONCURRENT_JOBS`
+/// there): each admitted job here is additionally bounded to
+/// `lattice_inference::serve::embeddings::MAX_EMBEDDING_TOTAL_TOKENS`
+/// aggregate scaffold tokens by the budget check `embeddings()` runs inside
+/// the admitted `spawn_blocking` job (see
+/// [`check_pooled_embedding_total_tokens`]'s doc comment for why that check
+/// runs after admission rather than before it, unlike the sibling route), so
+/// aggregate pooled-decoder work across concurrent requests is bounded by
+/// (this cap) x (that per-request budget) rather than growing with however
+/// many requests arrive at once. Fixed rather than a CLI flag: like the
+/// sibling route, CPU-bound pooled forward passes have no hardware queue
+/// depth to model, this cap exists purely to bound aggregate memory and CPU
+/// contention.
+pub(crate) const EMBEDDING_MAX_CONCURRENT_JOBS: usize = 4;
+
+/// Acquires one pooled-embedding admission slot for
+/// [`AppState::embedding_admission`], mirroring `lattice_serve.rs`'s
+/// `try_acquire_embedding_slot`. Synchronous and non-blocking: a full
+/// admission cap is rejected immediately, before any tokenization, image
+/// preprocessing, or `spawn_blocking` work runs.
+///
+/// # Errors
+///
+/// Returns [`ApiError::ServiceUnavailable`] (`server_busy`) when
+/// [`EMBEDDING_MAX_CONCURRENT_JOBS`] jobs are already outstanding.
+fn try_acquire_embedding_slot(
+    admission: &Arc<Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::ServiceUnavailable {
+            message: "too many outstanding /v1/embeddings requests; retry shortly".to_string(),
+        })
+}
+
+/// Runs one pooled-embedding job (`check_pooled_embedding_total_tokens` then
+/// `embed_items`) on the blocking thread pool with `permit` moved into the
+/// closure, so the admission slot releases
+/// when the job finishes rather than when the caller's `.await` is dropped
+/// -- mirrors `lattice_serve.rs`'s `run_embedding_encode`, for the identical
+/// reason: a `spawn_blocking` task already under way is not cancelled by
+/// dropping its `JoinHandle` (e.g. a disconnected client dropping the
+/// request future), so a permit held only in the caller's stack frame would
+/// release on disconnect while the job kept running -- letting repeated
+/// disconnects admit unbounded concurrent jobs past the cap. Generic over
+/// the closure's return type (unlike the sibling, which is concrete to its
+/// own `Vec<Vec<f32>>` result) since `embed_items` returns an
+/// `(EmbeddingDatum, EmbeddingsUsage)` pair already wrapped in `ApiError`
+/// rather than `InferenceError`.
+async fn run_pooled_embedding_job<T: Send + 'static>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<Result<T, ApiError>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
 }
 
 // -----------------------------------------------------------------------
@@ -1139,6 +1227,43 @@ async fn chat_completions_with_request(
     // prompt, so role/content validation and allocation happen once.
     #[cfg(feature = "metal-gpu")]
     let chat_messages = _normalized_messages;
+
+    // ADR-093 decision 1: the selection is decided ONCE, here at prefill, and held for every token
+    // this request generates. Placed after normalization so the gate reads the same text the model
+    // will, rather than a second rendering of the request that could drift from it.
+    //
+    // Rebinds the RESOLVED value rather than writing back to `req.lora`. Every consumer below
+    // reads `requested`, which was resolved above, so a write to the raw field here would be
+    // discarded in silence -- the request would route, report that it routed, and serve the base
+    // model.
+    //
+    // `is_routable` is the whole condition. An explicit list is a stated intent and an explicit
+    // `[]` is a caller pinning the base model; routing over either would overrule the caller while
+    // looking like a default.
+    //
+    // The routed selection takes the same two checks the caller's field took above, because it is
+    // a different producer of the same value and those checks ran before it existed. An empty
+    // result means the gate declined (no user turn to read), which is the base model -- the
+    // original resolution already says that, so it stands rather than being restated as an
+    // `Explicit` list that names nothing.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let requested = match state
+        .router_state
+        .clone()
+        .filter(|_| requested.is_routable())
+    {
+        None => requested,
+        Some(served) => {
+            let routed = route_selection(&state, &served, &chat_messages).await?;
+            if routed.is_empty() {
+                requested
+            } else {
+                lattice_inference::serve::lora::validate_scales(&routed)?;
+                adapter_client(&state)?.validate_lora(&routed)?;
+                lattice_inference::serve::lora::RequestedAdapters::Explicit(routed)
+            }
+        }
+    };
     // CPU-only builds never render `_normalized_messages` (the CPU
     // closures below capture only `cpu_model`/`prompt`/`gen_cfg`) -- drop
     // it here instead of letting it ride, unused, across the
@@ -1540,7 +1665,8 @@ pub async fn embeddings(
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
     use lattice_inference::serve::embeddings::{
-        EmbeddingsRequest, embed_items, normalize_embedding_items, parse_pooling,
+        EmbeddingsRequest, check_pooled_embedding_total_tokens, embed_items,
+        normalize_embedding_items, parse_pooling,
     };
 
     lattice_inference::serve::require_json_content_type(&headers)?;
@@ -1584,14 +1710,34 @@ pub async fn embeddings(
     };
     let model_id = state.model_id.clone();
 
-    let (data, usage) = tokio::task::spawn_blocking(move || embed_items(&embedder, items, pooling))
-        .await
-        .map_err(|e| {
-            eprintln!("task join error: {e}");
-            ApiError::Internal {
-                message: "inference failed".to_string(),
-            }
-        })??;
+    // #1397: bounded concurrent-job admission FIRST, mirroring
+    // `lattice_serve.rs`'s `try_acquire_embedding_slot` / `run_embedding_encode`
+    // -- rejects with 503 `server_busy` before any tokenization, image
+    // preprocessing, or `spawn_blocking` work runs, and the permit is moved
+    // into the blocking closure so a disconnected client cannot free the
+    // slot before the job itself finishes. Deliberately NOT mirroring the
+    // sibling route's within-request ORDER of budget-then-admission: see
+    // `check_pooled_embedding_total_tokens`'s doc comment for why this
+    // route's aggregate token-budget check has to run AFTER admission,
+    // inside the job below, instead of before it.
+    let permit = try_acquire_embedding_slot(&state.embedding_admission)?;
+
+    let (data, usage) = run_pooled_embedding_job(permit, move || {
+        // #1397: aggregate token-budget check, mirroring `lattice_serve.rs`'s
+        // `check_embeddings_total_tokens` -- runs inside the admitted job,
+        // before `embed_items`, so a request already admitted past the
+        // concurrency cap is still rejected before its actual pooled-decoder
+        // work starts.
+        check_pooled_embedding_total_tokens(&embedder, &items)?;
+        embed_items(&embedder, items, pooling)
+    })
+    .await
+    .map_err(|e| {
+        eprintln!("task join error: {e}");
+        ApiError::Internal {
+            message: "inference failed".to_string(),
+        }
+    })??;
 
     Ok(
         Json(lattice_inference::serve::embeddings::EmbeddingsResponse {
@@ -1650,13 +1796,101 @@ fn adapter_unsupported_build() -> ApiError {
 pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiError> {
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
-        Ok(Json(serde_json::json!(adapter_client(&state)?.adapter_index())).into_response())
+        // ADR-095 decision 3: the response says which gate is serving, because
+        // "routing is enabled" and "routing ran with the gate I pinned" are
+        // different claims.
+        //
+        // `pinned` is reported beside the version rather than left for the
+        // reader to infer, because the version alone cannot carry it. An
+        // earlier draft of this comment said it could. A server reporting
+        // version 7 reports the same number whether --router-pin selected it
+        // or whether 7 is simply the highest version written so far, and the
+        // two only diverge at the next refit and restart -- which is when
+        // nobody is looking and is the entire scenario a pin exists for.
+        let index = adapter_client(&state)?.adapter_index();
+        let body = match state.router_state.as_deref() {
+            None => lattice_inference::serve::lora::lora_list_body(&index, None),
+            Some(served) => served.with_report(|report| {
+                lattice_inference::serve::lora::lora_list_body(&index, Some(report))
+            }),
+        };
+        Ok(Json(body).into_response())
     }
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
         let _ = state;
         Err(adapter_unsupported_build())
     }
+}
+
+/// Choose the adapters for one request from the learned gate.
+///
+/// FAIL CLOSED WHEN THE TRAINED SET IS NOT RESIDENT, which is a decision and not a detail. The
+/// gate's columns are labelled by the artifact's adapter names, so a set that does not match
+/// cannot be routed at all. The alternative -- skip routing and serve the base model -- is the
+/// failure this ADR family refuses everywhere else: the operator configured routing, the server
+/// says routing is enabled, and the only place the truth appears is in the answers. The refusal
+/// names both lists side by side, so "which adapter moved" is answered where it is asked.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+async fn route_selection(
+    state: &AppState,
+    served: &Arc<lattice_inference::serve::routing::ServedRouter>,
+    messages: &[ChatMessage],
+) -> Result<Vec<lattice_inference::serve::lora::LoraSelection>, ApiError> {
+    use lattice_inference::serve::routing::{PromptSource, context_text};
+
+    // No user turn means no text under the rule the gate was trained on. Serving the base model is
+    // right here and is NOT the silent degradation above: there is nothing to route ON, rather
+    // than a routable request being quietly skipped.
+    let turns = messages.iter().map(|m| {
+        (
+            matches!(
+                m.role,
+                lattice_inference::forward::metal_qwen35::ChatRole::User
+            ),
+            m.content.as_str(),
+        )
+    });
+    let Some(text) = context_text(PromptSource::SERVED, turns) else {
+        return Ok(Vec::new());
+    };
+
+    // Startup refuses a router without an embedding model, so this is unreachable rather than
+    // merely unlikely -- and it says so instead of unwrapping.
+    let embedder = state.embedding_model.clone().ok_or_else(|| ApiError::Internal {
+        message: "routing is configured but no embedding model is loaded; startup should have                   refused this configuration"
+            .to_string(),
+    })?;
+
+    let pooling = served.pooling();
+    let owned = text.to_string();
+    // Same convention as the embeddings route: the pooled forward pass is synchronous CPU work and
+    // does not belong on an async worker thread.
+    let context_vector = tokio::task::spawn_blocking(move || embedder.embed_text(&owned, pooling))
+        .await
+        .map_err(|_| ApiError::Internal {
+            message: "the routing embedder panicked".to_string(),
+        })?
+        .map_err(|err| ApiError::Internal {
+            message: format!("could not embed the routing context: {err}"),
+        })?;
+
+    let resident = adapter_client(state)?.adapter_index();
+    // Every trained column. Top-k would need a number this decision has no evidence for, and
+    // `trained_order` has already required the resident set to match the artifact's, so this width
+    // is always routable.
+    //
+    // What this does NOT do, stated because an earlier version of this comment said the gate
+    // decides the weight here: it does not, and that is ADR-091 decision 1, not an oversight.
+    // Uniform `1/k` is the default until that ADR's evidence gate passes. `ServingRouter::new`
+    // builds the router with `AdapterRouter::new`, whose `WeightPolicy::default()` is `Uniform`,
+    // and no serving path calls `set_weight_policy` — so every selected adapter receives `1.0 / k`
+    // and, with `k` equal to the column count, the gate's scores change neither the selection nor
+    // the weights. A response from this path is therefore the same for any gate, a zeroed one
+    // included, which is what any acceptance run over it can and cannot claim. Turning the softmax
+    // on is ADR-091's evidence gate, not a flag.
+    let k = served.with_report(|report| report.artifact.adapter_names.len());
+    served.route(&resident, &context_vector, k)
 }
 
 /// Make a PEFT or MLX adapter resident without applying it to generation.
@@ -1669,20 +1903,34 @@ pub async fn lora_load(
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    lattice_inference::serve::require_json_content_type(&headers)?;
-    let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
-        .await
-        .map_err(|err| {
-            eprintln!("invalid request body: {err}");
-            ApiError::BadRequest {
-                message: "invalid JSON request body".to_string(),
-                code: "invalid_request_body",
-            }
-        })?;
-    let (path, name) = lattice_inference::serve::lora::parse_lora_load(&bytes)?;
+    // ORDERING RULE (ADR-095 decision 4). A refusal that is a property of the
+    // BUILD answers before anything is read, because it is true of every
+    // request: there is no request this build could have accepted, so reading
+    // one only decides which wrong answer to give. A refusal that is a
+    // property of the RUNTIME answers AFTER content-type, body cap and parse,
+    // so a malformed request gets the malformed-request answer whatever the
+    // runtime state happens to be.
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        let _ = (&state, headers, body);
+        Err(adapter_unsupported_build())
+    }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
+        lattice_inference::serve::require_json_content_type(&headers)?;
+        let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
+            .await
+            .map_err(|err| {
+                eprintln!("invalid request body: {err}");
+                ApiError::BadRequest {
+                    message: "invalid JSON request body".to_string(),
+                    code: "invalid_request_body",
+                }
+            })?;
+        let (path, name) = lattice_inference::serve::lora::parse_lora_load(&bytes)?;
+
+        // Runtime, so it follows the parse.
         let client = adapter_client(&state)?;
         let prepared = lattice_inference::serve::lora::prepare_adapter_load(&path, &name)?;
         let receiver = client.submit_adapter_command(prepared.command)?;
@@ -1706,11 +1954,6 @@ pub async fn lora_load(
             )),
         }
     }
-    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    {
-        let _ = (&state, path, name);
-        Err(adapter_unsupported_build())
-    }
 }
 
 /// Remove one resident identifier, refusing unknown ids.
@@ -1719,9 +1962,20 @@ pub async fn lora_unload(
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    // Backend refusal keeps its own diagnosis even for a bodyless CPU request.
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    let client = adapter_client(&state)?;
+    // ORDERING RULE (ADR-095 decision 4). A refusal that is a property of the
+    // BUILD answers before anything is read, because it is true of every
+    // request: there is no request this build could have accepted, so reading
+    // one only decides which wrong answer to give. A refusal that is a
+    // property of the RUNTIME answers AFTER content-type, body cap and parse,
+    // so a malformed request gets the malformed-request answer whatever the
+    // runtime state happens to be.
+    // The comment this replaced said the backend refusal "keeps its own
+    // diagnosis even for a bodyless CPU request". That argument carries for
+    // the COMPILED-OUT arm, which is why it still answers first. It does not
+    // carry for `adapter_client`, which is a worker lookup: a malformed
+    // request is malformed whether or not a worker happens to be running, and
+    // resolving the worker first made a malformed unload answer differently
+    // from a malformed load on this same binary.
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
         let _ = (&state, headers, body);
@@ -1738,6 +1992,8 @@ pub async fn lora_unload(
             })?;
         let id = lattice_inference::serve::lora::parse_lora_unload(&bytes)?;
 
+        // Runtime, so it follows the parse.
+        let client = adapter_client(&state)?;
         let receiver = client.submit_adapter_command(
             lattice_inference::serve::metal_worker::AdapterCommand::Unload { id },
         )?;
@@ -1913,6 +2169,9 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             };
             (state, unblock_tx, started_rx)
         }
@@ -2440,6 +2699,133 @@ mod tests {
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
             ));
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    #[test]
+    fn the_router_key_is_added_beside_residency_and_never_wraps_it() {
+        // The regression this pins. Adding the router as
+        // `json!({"adapters": index, "router": ...})` reads like an additive
+        // change and silently rewrites two existing fields: top-level
+        // `adapters` stops being an array and `applied` moves a level down.
+        // Asserting only that `router` is present would pass against that bug,
+        // so the pre-existing keys are asserted in their ORIGINAL positions.
+        use lattice_inference::router_state::{ResolvedRouter, RouterArtifact};
+        use lattice_inference::serve::lora::{AdapterIndex, AdapterMetadata, LoraSelection};
+
+        let index = AdapterIndex {
+            adapters: vec![AdapterMetadata {
+                id: 0,
+                name: "technical".into(),
+                path: "/p/a.safetensors".into(),
+                rank: 8,
+                layers: 24,
+            }],
+            applied: vec![
+                serde_json::from_str::<LoraSelection>(r#"{"id":0,"scale":1.0}"#)
+                    .expect("selection"),
+            ],
+        };
+
+        let body = lattice_inference::serve::lora::lora_list_body(&index, None);
+        assert!(
+            body["adapters"].is_array(),
+            "top-level adapters must stay an array, got {}",
+            body["adapters"]
+        );
+        assert_eq!(body["adapters"][0]["name"], "technical");
+        assert!(
+            body["applied"].is_array(),
+            "applied must stay at the top level, got {body}"
+        );
+        assert_eq!(body["applied"][0]["id"], 0);
+        assert_eq!(body["router"]["enabled"], false);
+
+        // A gate that is serving reports its version AND whether a pin put it
+        // there; the version alone cannot distinguish the two.
+        let resolved = ResolvedRouter {
+            artifact: RouterArtifact {
+                version: 7,
+                adapter_names: vec!["technical".into()],
+                representation: lattice_inference::router_state::TrainedRepresentation {
+                    embedding_model: "gme-qwen35".into(),
+                    pooling: "mean_visual".into(),
+                    prompt_source: "last_user_message".into(),
+                    loader_format: lattice_inference::serve::embeddings::QWEN35_F16_DECODER_LOADER
+                        .into(),
+                    input_width: 4,
+                },
+                gate_bytes: vec![1, 2, 3],
+            },
+            pinned: true,
+        };
+        let body = lattice_inference::serve::lora::lora_list_body(
+            &index,
+            Some(resolved.report("gme-qwen35")),
+        );
+        assert!(
+            body["adapters"].is_array(),
+            "residency shape must not depend on the router"
+        );
+        assert!(body["applied"].is_array());
+        assert_eq!(body["router"]["enabled"], true);
+        assert_eq!(body["router"]["pinned"], true);
+        assert_eq!(body["router"]["adapter_names"][0], "technical");
+        assert_eq!(
+            body["router"]["embedder"], "gme-qwen35",
+            "the endpoint reports what THIS server embeds with, so an operator              can compare it against the checkpoint they think they passed"
+        );
+        assert!(
+            body["router"]["version"]
+                .as_str()
+                .is_some_and(|v| v.starts_with("7:")),
+            "version label carries the counter, got {}",
+            body["router"]["version"]
+        );
+
+        assert_eq!(
+            body["router"]["routable"], true,
+            "this fixture's trained name IS resident, so routing can run"
+        );
+        assert_eq!(
+            body["router"]["missing"],
+            serde_json::json!([]),
+            "nothing is missing when the trained set is resident"
+        );
+
+        // The other direction, against a residency that genuinely lacks the
+        // trained name. Both arms are here because a routable-only assertion
+        // passes against a `routable` hard-coded true, and a missing-only
+        // assertion passes against one hard-coded false.
+        let empty = AdapterIndex {
+            adapters: vec![],
+            applied: vec![],
+        };
+        let body = lattice_inference::serve::lora::lora_list_body(
+            &empty,
+            Some(resolved.report("gme-qwen35")),
+        );
+        assert_eq!(
+            body["router"]["routable"], false,
+            "a trained name that is not resident cannot be routed to"
+        );
+        assert_eq!(
+            body["router"]["missing"][0], "technical",
+            "an operator must be able to see the 400s coming, and by name"
+        );
+
+        let unpinned = ResolvedRouter {
+            pinned: false,
+            ..resolved
+        };
+        assert_eq!(
+            lattice_inference::serve::lora::lora_list_body(
+                &index,
+                Some(unpinned.report("gme-qwen35"))
+            )["router"]["pinned"],
+            false,
+            "an unpinned gate must not report itself pinned"
+        );
     }
 
     #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -3372,6 +3758,75 @@ mod tests {
     // `#[cfg(test)]`-only fixtures across the bin/lib compilation
     // boundary, only a real Cargo feature crosses it.
     // -----------------------------------------------------------------------
+    /// ADR-095 decision 4: every entry in the shared route list is registered
+    /// in THIS binary. A route added to the list and forgotten here reds this
+    /// test.
+    ///
+    /// The assertion is only that the response is not 404. A 405 or a 4xx from
+    /// validation both count as registered -- the test asks whether the route
+    /// exists and nothing else, because anything more would need the state the
+    /// two binaries do not share. Asserting a specific status would make this
+    /// a behaviour test that passes or fails for reasons unrelated to
+    /// registration.
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn every_shared_lora_route_is_registered_in_this_binary() {
+        use lattice_inference::serve::lora::LORA_ROUTES;
+        use tower::ServiceExt;
+
+        assert!(
+            !LORA_ROUTES.is_empty(),
+            "the route list is empty, so this test would pass while checking nothing"
+        );
+
+        for (path, methods) in LORA_ROUTES {
+            for method in *methods {
+                let request = axum::http::Request::builder()
+                    .method(*method)
+                    .uri(*path)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .expect("fixture request must build");
+                let response = router(tiny_state(64))
+                    .oneshot(request)
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_ne!(
+                    response.status(),
+                    axum::http::StatusCode::NOT_FOUND,
+                    "{method} {path} is in LORA_ROUTES but not registered in this binary"
+                );
+                // A 405 means the path exists under a DIFFERENT method, so the listed
+                // method is not registered either; checking 404 alone would pass it.
+                assert_ne!(
+                    response.status(),
+                    axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path} is in LORA_ROUTES but this binary registers {path} under another method"
+                );
+            }
+        }
+
+        // The must-not-match control: the same machinery reports 404 for a
+        // path nobody registered. Without it, a router that answered
+        // everything -- a catch-all fallback, say -- would pass the loop above
+        // while proving nothing about any individual route.
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/lora/definitely-not-a-route")
+            .body(axum::body::Body::empty())
+            .expect("control request must build");
+        let response = router(tiny_state(64))
+            .oneshot(request)
+            .await
+            .expect("router must produce a response");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "an unregistered path did not 404, so the loop above cannot distinguish \
+             a registered route from a router that answers everything"
+        );
+    }
+
     #[cfg(feature = "test-utils")]
     fn tiny_state(max_tokens_cap: usize) -> AppState {
         let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
@@ -3382,6 +3837,9 @@ mod tests {
             model_id: "test-model".to_string(),
             request_counter: Arc::new(AtomicU64::new(0)),
             embedding_model: None,
+            embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            router_state: None,
         }
     }
 
@@ -3486,6 +3944,9 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             };
 
             let response = router(state)
@@ -3567,6 +4028,15 @@ mod tests {
                 .expect("request fixture must build")
         }
 
+        fn post_lora_unload(body: &str) -> axum::http::Request<Body> {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/lora/unload")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request fixture must build")
+        }
+
         /// The route has to be registered on the router, not merely written: a
         /// handler nobody routed to is a 404 that reads exactly like an unsupported
         /// build. Both arms assert a non-404 status.
@@ -3610,13 +4080,7 @@ mod tests {
         #[tokio::test]
         async fn lora_unload_on_a_cpu_backend_refuses_by_name() {
             let response = router(tiny_state(64))
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method("POST")
-                        .uri("/v1/lora/unload")
-                        .body(Body::empty())
-                        .expect("request fixture must build"),
-                )
+                .oneshot(post_lora_unload(r#"{"id":0}"#))
                 .await
                 .expect("router must return a response");
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -3626,6 +4090,11 @@ mod tests {
             );
         }
 
+        /// Gated to the supported build on purpose. On a build with no Metal
+        /// compiled in, the refusal is true of every request, so it answers before
+        /// anything is read and no request ever reaches the content-type check --
+        /// which is the arm `the_build_refusal_precedes_the_request_contract` pins.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[tokio::test]
         async fn lora_load_without_json_content_type_is_415() {
             let response = router(tiny_state(64))
@@ -3643,7 +4112,10 @@ mod tests {
 
         /// Request-contract failures are answered before the backend question, so
         /// this arm distinguishes itself from `lora_unsupported_backend` on the same
-        /// CPU state: a malformed body is the caller's error whatever the backend is.
+        /// CPU state: a malformed body is the caller's error whatever the *runtime*
+        /// state is. It says nothing about a build that cannot serve the route at
+        /// all, hence the gate.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[tokio::test]
         async fn lora_load_rejects_an_unknown_field_before_asking_the_backend() {
             let response = router(tiny_state(64))
@@ -3656,6 +4128,47 @@ mod tests {
             assert_eq!(
                 json_body(response).await["error"]["code"],
                 "invalid_request"
+            );
+        }
+
+        /// Unload's half of the same rule. `adapter_client` used to answer first
+        /// here, so a malformed unload body got the backend's answer while the
+        /// identical mistake on load got the caller's. Same order, both routes.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[tokio::test]
+        async fn lora_unload_rejects_an_unknown_field_before_asking_the_backend() {
+            let response = router(tiny_state(64))
+                .oneshot(post_lora_unload(r#"{"id":0,"path":"/tmp/a"}"#))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["code"],
+                "invalid_request"
+            );
+        }
+
+        /// The inverse of the two gated arms above. A refusal that is a property
+        /// of the build is true of every request, so it answers before the request
+        /// is read: this body is malformed twice over -- no JSON content type and an
+        /// unknown field -- and still gets the build's answer, not the caller's.
+        #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+        #[tokio::test]
+        async fn the_build_refusal_precedes_the_request_contract() {
+            let response = router(tiny_state(64))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/lora/load")
+                        .body(Body::from(r#"{"path":"/tmp/a.safetensors","scale":2.0}"#))
+                        .expect("request fixture must build"),
+                )
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["code"],
+                "lora_unsupported_backend"
             );
         }
 
@@ -3792,6 +4305,216 @@ mod tests {
                     .iter()
                     .any(|e| e == "/v1/embeddings")
             );
+        }
+
+        // ── admission cap + token budget (issue #1397) ──
+
+        /// A request that fills the last free admission slot (holding
+        /// `EMBEDDING_MAX_CONCURRENT_JOBS - 1` permits externally leaves
+        /// exactly one) must be admitted; one more held permit (the cap
+        /// itself now fully outstanding) must get the documented 503
+        /// `server_busy` envelope, before any `spawn_blocking` work runs.
+        /// Both boundaries in one test so the admitted case is proven on
+        /// the exact state the refused case then tightens by one permit.
+        #[tokio::test]
+        async fn admission_cap_admits_at_cap_and_refuses_past_it() {
+            let state = state_with_embedder();
+            let admission = state.embedding_admission.clone();
+            let mut held: Vec<_> = (0..EMBEDDING_MAX_CONCURRENT_JOBS - 1)
+                .map(|_| {
+                    admission
+                        .clone()
+                        .try_acquire_owned()
+                        .expect("slot must be available below the cap")
+                })
+                .collect();
+
+            let response = router(state.clone())
+                .oneshot(post_embeddings(serde_json::json!({"input": "a"})))
+                .await
+                .expect("router must return a response");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a request that fills the last free slot (at the cap) must be admitted"
+            );
+
+            held.push(
+                admission
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("the cap-th slot must still be available"),
+            );
+            let response = router(state)
+                .oneshot(post_embeddings(serde_json::json!({"input": "a"})))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "server_busy");
+            drop(held);
+        }
+
+        /// Regression coverage for the admission-control hole issue #1397
+        /// describes: a client disconnecting mid-request must not release
+        /// the admission permit early while the already-started
+        /// `spawn_blocking` job keeps running -- repeated disconnects could
+        /// otherwise accumulate unbounded concurrent jobs past
+        /// `EMBEDDING_MAX_CONCURRENT_JOBS`. Exercises
+        /// [`run_pooled_embedding_job`] directly (the same helper
+        /// `embeddings()` calls) with a deterministic channel-gated
+        /// closure, mirroring `lattice_serve.rs`'s
+        /// `embedding_permit_survives_dropped_request_future`.
+        ///
+        /// `tokio::spawn` + `JoinHandle::abort()` simulates axum dropping a
+        /// disconnected client's handler future mid-`.await`: at the point
+        /// of `abort()` the task is suspended awaiting the inner
+        /// `spawn_blocking` `JoinHandle` (not actively running), so tokio
+        /// drops the task's future there -- the same event a dropped
+        /// request future produces.
+        #[tokio::test]
+        async fn pooled_embedding_permit_survives_dropped_request_future() {
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = admission
+                .clone()
+                .try_acquire_owned()
+                .expect("single slot must be admitted");
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let mut started_tx = Some(started_tx);
+
+            let task = tokio::spawn(run_pooled_embedding_job(permit, move || {
+                started_tx
+                    .take()
+                    .expect("closure runs exactly once")
+                    .send(())
+                    .expect("test task must still be waiting on started_rx");
+                // Deterministic handshake, not a sleep: blocks until the
+                // test explicitly lets the "embed_items" job finish.
+                release_rx
+                    .recv()
+                    .expect("release_tx must not be dropped before sending");
+                Ok::<(), ApiError>(())
+            }));
+
+            started_rx
+                .await
+                .expect("job must signal that it started running");
+
+            // Simulate the client disconnecting: cancel the outstanding
+            // request future while the blocking job is still in flight.
+            task.abort();
+            let join_result = task.await;
+            assert!(
+                join_result.is_err() && join_result.unwrap_err().is_cancelled(),
+                "aborted task must resolve as cancelled"
+            );
+
+            assert_eq!(
+                admission.available_permits(),
+                0,
+                "admission slot must stay held while the embed_items job is still running, \
+                 not release just because the request future was dropped"
+            );
+
+            // Let the blocking job finish and confirm the slot frees up.
+            release_tx
+                .send(())
+                .expect("blocking closure must still be waiting on release_rx");
+            for _ in 0..200 {
+                if admission.available_permits() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                admission.available_permits(),
+                1,
+                "admission slot must free once the embed_items job actually completes"
+            );
+        }
+
+        /// Aggregate scaffold-token budget (`MAX_EMBEDDING_TOTAL_TOKENS`):
+        /// every item individually fits the tiny model's 512-token context
+        /// window (each item is well under that), but the sum across items
+        /// exceeds the request-wide budget, so the aggregate gate -- not
+        /// the per-item window check -- must be what rejects this request.
+        #[tokio::test]
+        async fn aggregate_token_budget_exceeded_400() {
+            use lattice_inference::serve::embeddings::MAX_EMBEDDING_TOTAL_TOKENS;
+            // `tiny_embedding_model`'s vocab has no merges, so each "a"
+            // character tokenizes to its own token (see that fixture's doc
+            // comment): 480 tokens per item, comfortably under the tiny
+            // model's 512-token context window, times 80 items comfortably
+            // clears the 32,768-token aggregate budget.
+            const {
+                assert!(
+                    80 * 480 > MAX_EMBEDDING_TOTAL_TOKENS,
+                    "fixture must actually exceed the budget it tests"
+                );
+            }
+            let item = "a".repeat(480);
+            let items: Vec<serde_json::Value> =
+                std::iter::repeat_n(serde_json::Value::String(item), 80).collect();
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({ "input": items })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "batch_token_budget_exceeded");
+        }
+
+        /// Priority ordering: with the admission cap fully
+        /// held, a request that would ALSO fail the aggregate token budget
+        /// must still be refused by admission (503 `server_busy`), not by
+        /// the budget check (400 `batch_token_budget_exceeded`) --
+        /// `check_pooled_embedding_total_tokens` runs inside the admitted
+        /// `spawn_blocking` job, after `try_acquire_embedding_slot`, so a
+        /// request that never gets a permit never reaches it. This is
+        /// busy-before-budget, deliberately not the sibling route's own
+        /// within-request order: see `check_pooled_embedding_total_tokens`'s
+        /// doc comment. Reverting the fix (running the budget check before
+        /// admission, on the handler thread) turns this 503 into a 400 --
+        /// the two error codes are asserted separately so that mutation is
+        /// visible in the failure message, not just a boolean.
+        #[tokio::test]
+        async fn admission_refusal_takes_priority_over_token_budget() {
+            use lattice_inference::serve::embeddings::MAX_EMBEDDING_TOTAL_TOKENS;
+            const {
+                assert!(
+                    80 * 480 > MAX_EMBEDDING_TOTAL_TOKENS,
+                    "fixture must actually exceed the budget it tests"
+                );
+            }
+            let state = state_with_embedder();
+            let admission = state.embedding_admission.clone();
+            let held: Vec<_> = (0..EMBEDDING_MAX_CONCURRENT_JOBS)
+                .map(|_| {
+                    admission
+                        .clone()
+                        .try_acquire_owned()
+                        .expect("slot must be available below the cap")
+                })
+                .collect();
+
+            let item = "a".repeat(480);
+            let items: Vec<serde_json::Value> =
+                std::iter::repeat_n(serde_json::Value::String(item), 80).collect();
+            let response = router(state)
+                .oneshot(post_embeddings(serde_json::json!({ "input": items })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a fully-held admission cap must refuse before the budget check ever \
+                 runs, even for a request that would also fail that check"
+            );
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "server_busy");
+            drop(held);
         }
     }
 
@@ -4133,6 +4856,9 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             }
         }
 
@@ -4584,6 +5310,9 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             }
         }
 
@@ -4786,6 +5515,9 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             };
             let request = axum::http::Request::builder()
                 .method("POST")
@@ -4929,6 +5661,9 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             }
         }
 

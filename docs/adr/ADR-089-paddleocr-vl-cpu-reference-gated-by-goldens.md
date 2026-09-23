@@ -53,8 +53,9 @@ port, and a Metal path written against a wrong CPU reference would carry the err
 
 `forward::metal_ernie45::MetalErnie45State::new(&config, &weights, max_seq_len)` uploads an
 `Ernie45Weights` decoder into persistent f32 buffers. The implementation requires macOS and `metal-gpu`;
-the same API returns an availability error on unsupported builds. The separate `f16` feature is needed to
-load the shipped BF16 checkpoint, not to execute already-loaded f32 weights.
+the same API returns an availability error on unsupported builds. BF16/F16 safetensors decode to f32
+unconditionally; the separate `f16` feature gates this family's own pinned invocation contract (see
+the goldens' `--features f16` requirement above) and F8 tensor materialization, not weight loading.
 
 `prefill(&mut self, ids, logits)` recomputes one complete text sequence. The caller supplies exactly
 `ids.len() * config.vocab_size` f32 output elements, laid out as contiguous token-major rows. Positions begin

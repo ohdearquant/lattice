@@ -19,13 +19,11 @@ pub(crate) fn sample_token(
     previous_ids: &[u32],
     rng_state: &mut u64,
 ) -> u32 {
-    // `GenerateConfig` cannot carry `min_p` or `top_n_sigma` (it is
-    // exhaustively constructible through the public API at published `0.7.1`;
-    // adding any field is a major break -- see
-    // `crate::sampling::Sampler::with_min_p` / `with_top_n_sigma`), and no
-    // production entry point sets either yet, so both paths are always
-    // disabled here.
-    crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0, 0.0)
+    // `min_p` is read from `GenerateConfig` (0.0 = disabled, its default, when
+    // no caller sets it). `top_n_sigma` has no `GenerateConfig` field yet --
+    // see `crate::sampling::Sampler::with_top_n_sigma` -- and no production
+    // entry point sets it, so that path stays disabled here.
+    crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, cfg.min_p, 0.0)
 }
 
 /// Reference oracle: the original allocating implementation of `sample_token`,
@@ -673,6 +671,7 @@ mod tests {
 
         // Path A: Sampler — internal Rng seeded to `seed` via `with_seed`.
         let config_a = SamplingConfig {
+            min_p: 0.0,
             temperature,
             top_k,
             top_p,
@@ -718,6 +717,7 @@ mod tests {
             ..Default::default()
         };
         let mut sampler = Sampler::new(SamplingConfig {
+            min_p: 0.0,
             temperature: cfg.temperature,
             top_k: cfg.top_k,
             top_p: cfg.top_p,
@@ -727,9 +727,12 @@ mod tests {
         .with_min_p(min_p);
         let sampler_tokens: Vec<u32> = (0..draws).map(|_| sampler.sample(&logits)).collect();
 
-        // `sample_token` cannot carry `min_p` through `GenerateConfig` (see its
-        // doc comment), so the optimized path is exercised directly through the
-        // shared engine it delegates to, with `min_p` passed explicitly.
+        // `sample_token` now reads `min_p` straight from `GenerateConfig` (see
+        // `sample_token_reads_min_p_from_generate_config` below for that
+        // production-adapter proof). This test instead exercises the shared
+        // engine (`sample_full_logits`) directly with `min_p` passed
+        // explicitly, decoupled from `cfg`, so it can compare `Sampler`, the
+        // optimized engine, and the reference oracle under one shared value.
         let mut optimized_rng = seed;
         let optimized_tokens: Vec<u32> = (0..draws)
             .map(|_| {
@@ -756,6 +759,65 @@ mod tests {
         assert_eq!(optimized_tokens, reference_tokens);
     }
 
+    /// Production-adapter proof (issue tracked as a follow-up to the
+    /// min-p sampling work): `min_p_is_active_and_identical_across_cpu_sampling_paths`
+    /// above exercises the shared engine with `min_p` passed as an explicit
+    /// argument, never through `GenerateConfig`, so a future regression that
+    /// re-hardcoded `sample_token`'s `min_p` argument back to `0.0` would pass
+    /// every existing test while silently disabling min-p for every real
+    /// caller (`lattice`/`lattice_serve`'s CPU decode loop, and the Qwen CPU
+    /// forward paths in general, all call `sample_token`, never
+    /// `sample_full_logits` directly). This test instead drives `sample_token`
+    /// itself -- the actual production adapter -- through `GenerateConfig.min_p`
+    /// and proves the configured value changes which tokens survive.
+    #[test]
+    fn sample_token_reads_min_p_from_generate_config() {
+        // Same three-candidate distribution as
+        // `min_p_is_active_and_identical_across_cpu_sampling_paths`: token 0 is
+        // the mode, token 1 carries ~0.49 relative probability (the tail a
+        // min_p=0.5 floor removes), token 2 sits further below the floor.
+        let logits = [0.0, 0.49_f32.ln(), 0.1_f32.ln()];
+        let seed = 0x5870_5870_5870_5870;
+        let draws = 128;
+
+        let disabled = GenerateConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut rng_disabled = seed;
+        let tokens_without_min_p: Vec<u32> = (0..draws)
+            .map(|_| sample_token(&logits, &disabled, &[], &mut rng_disabled))
+            .collect();
+
+        let enabled = GenerateConfig {
+            min_p: 0.5,
+            ..disabled.clone()
+        };
+        let mut rng_enabled = seed;
+        let tokens_with_min_p: Vec<u32> = (0..draws)
+            .map(|_| sample_token(&logits, &enabled, &[], &mut rng_enabled))
+            .collect();
+
+        assert!(
+            tokens_without_min_p.contains(&1),
+            "control: with GenerateConfig.min_p left at its 0.0 default, the \
+             ~0.49-relative-probability tail (token 1) must be drawn at least \
+             once across {draws} draws over the same seed stream, or this test \
+             cannot tell min_p apart from a no-op"
+        );
+        assert!(
+            tokens_with_min_p.iter().all(|&t| t == 0),
+            "GenerateConfig.min_p = 0.5 must reach `sample_token` -- the actual \
+             production decode adapter, not just the lower-level \
+             `sample_full_logits` engine -- and remove token 1 (0.49 relative \
+             probability) and token 2 (0.1) from every draw"
+        );
+    }
+
     #[test]
     fn top_n_sigma_is_active_and_identical_across_cpu_sampling_paths() {
         use crate::sampling::{Sampler, SamplingConfig};
@@ -771,6 +833,7 @@ mod tests {
             ..Default::default()
         };
         let sampler_cfg = SamplingConfig {
+            min_p: 0.0,
             temperature: cfg.temperature,
             top_k: cfg.top_k,
             top_p: cfg.top_p,
@@ -790,10 +853,13 @@ mod tests {
             sampler.seed_history(&[0]);
             let sampler_token = sampler.sample(&logits);
 
-            // `sample_token` cannot carry `min_p` / `top_n_sigma` through
-            // `GenerateConfig` (see its doc comment), so the optimized path is
-            // exercised directly through the shared engine it delegates to,
-            // with both passed explicitly.
+            // `sample_token` now reads `min_p` straight from `GenerateConfig`,
+            // but `top_n_sigma` still has no `GenerateConfig` field (see
+            // `crate::sampling::Sampler::with_top_n_sigma`) and no production
+            // entry point sets it. This test continues to exercise the shared
+            // engine directly with both values passed explicitly, decoupled
+            // from `cfg`, so it can compare all three pipelines under one
+            // shared value.
             let mut optimized_rng = seed;
             let optimized_token = crate::sampling::sample_full_logits(
                 &logits,
@@ -948,6 +1014,7 @@ mod tests {
         // Path A: Sampler (CandidateSet::sample_min_p_top_p_with_scratch). Keeps {0,1,2}
         // (idx 2 wins the rank-3 tie by lower id), ordered [0,1,2] (lower id first).
         let config_a = SamplingConfig {
+            min_p: 0.0,
             temperature,
             top_k,
             top_p,
@@ -1125,6 +1192,7 @@ mod tests {
             temperature: cfg.temperature,
             top_k: cfg.top_k,
             top_p: cfg.top_p,
+            min_p: cfg.min_p,
             repetition_penalty: cfg.repetition_penalty,
         })
         .with_seed(seed)

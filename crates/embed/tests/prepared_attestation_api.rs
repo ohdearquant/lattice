@@ -1,9 +1,12 @@
 #![cfg(feature = "native")]
 
 use lattice_embed::{
-    CheckpointAttestor, EmbedError, MAX_ATTESTATION_REPORT_BYTES, MIN_ATTESTATION_REPORT_BYTES,
-    OpaqueAttestationReport,
+    AttestationAlgorithm, CheckpointAttestor, EmbedError,
+    MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES, MIN_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES,
+    SupplementaryAttestationEvidence,
 };
+
+const TEST_DIGEST: [u8; 32] = [0x77; 32];
 
 struct FixedAttestor {
     report: Vec<u8>,
@@ -30,26 +33,39 @@ impl CheckpointAttestor for FixedAttestor {
         Ok(())
     }
 
-    fn finish(self) -> lattice_embed::Result<OpaqueAttestationReport> {
-        OpaqueAttestationReport::try_from_bytes(self.report)
+    fn finish(self) -> lattice_embed::Result<SupplementaryAttestationEvidence> {
+        SupplementaryAttestationEvidence::try_new(
+            AttestationAlgorithm::Sha256V1,
+            TEST_DIGEST,
+            self.report,
+        )
     }
 }
 
-fn finish<A: CheckpointAttestor>(attestor: A) -> lattice_embed::Result<OpaqueAttestationReport> {
+fn finish<A: CheckpointAttestor>(
+    attestor: A,
+) -> lattice_embed::Result<SupplementaryAttestationEvidence> {
     attestor.finish()
 }
 
 #[test]
 fn attestation_report_accepts_exact_closed_bounds() {
-    let minimum =
-        OpaqueAttestationReport::try_from_bytes(vec![0x11; MIN_ATTESTATION_REPORT_BYTES]).unwrap();
+    let minimum = SupplementaryAttestationEvidence::try_new(
+        AttestationAlgorithm::Sha256V1,
+        TEST_DIGEST,
+        vec![0x11; MIN_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES],
+    )
+    .unwrap();
     assert_eq!(minimum.as_bytes(), &[0x11]);
 
     let maximum = finish(FixedAttestor {
-        report: vec![0x22; MAX_ATTESTATION_REPORT_BYTES],
+        report: vec![0x22; MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES],
     })
     .unwrap();
-    assert_eq!(maximum.as_bytes().len(), MAX_ATTESTATION_REPORT_BYTES);
+    assert_eq!(
+        maximum.as_bytes().len(),
+        MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES
+    );
     assert!(maximum.as_bytes().iter().all(|byte| *byte == 0x22));
 }
 
@@ -57,16 +73,21 @@ fn attestation_report_accepts_exact_closed_bounds() {
 fn attestation_report_rejects_outside_closed_bounds() {
     for bytes in [
         Vec::new(),
-        vec![0x33; MAX_ATTESTATION_REPORT_BYTES.saturating_add(1)],
+        vec![0x33; MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES.saturating_add(1)],
     ] {
         let length = bytes.len();
-        let error = OpaqueAttestationReport::try_from_bytes(bytes).unwrap_err();
+        let error = SupplementaryAttestationEvidence::try_new(
+            AttestationAlgorithm::Sha256V1,
+            TEST_DIGEST,
+            bytes,
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             EmbedError::AttestationReportSize {
                 length: actual,
-                min: MIN_ATTESTATION_REPORT_BYTES,
-                max: MAX_ATTESTATION_REPORT_BYTES,
+                min: MIN_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES,
+                max: MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES,
             } if actual == length
         ));
     }

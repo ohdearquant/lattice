@@ -178,15 +178,72 @@ impl MoeExpertCacheConfig {
 ///   is nothing more to cache).
 /// - Otherwise, default to `num_experts` (the "zero-eviction fast path": all
 ///   experts fit, laziness only defers *when* each is dequantized, not
-///   whether it ultimately stays resident) **if** that fits under
-///   `0.85 * recommended_max_working_set_size` split evenly across every
-///   MoE layer.
+///   whether it ultimately stays resident) **if** that fits under the
+///   *remaining* headroom: `0.85 * recommended_max_working_set_size` minus
+///   `already_allocated_bytes`, split evenly across the MoE layers not yet
+///   sized (`num_moe_layers - moe_layers_already_sized`, current layer
+///   included) — not across every MoE layer in the checkpoint.
 /// - If it doesn't fit, auto-shrink to the largest `num_slots` that does,
 ///   floored at `top_k`.
-/// - If even `top_k` slots' worth of bytes don't fit the per-layer budget,
-///   return `Err` — this checkpoint's expert shape cannot run a functioning
-///   cache on this device, full stop (no silent degradation to a
-///   non-functional cache size).
+/// - If even `top_k` slots' worth of bytes don't fit the remaining per-layer
+///   budget, return `Err` — this checkpoint's expert shape cannot run a
+///   functioning cache on this device (or there is no headroom left once
+///   the caller's own device-side allocations are accounted for), full
+///   stop (no silent degradation to a non-functional cache size).
+///
+/// `already_allocated_bytes` is the caller's own measurement of bytes
+/// already committed on the *device* at sizing time (e.g.
+/// `Device::current_allocated_size()`) — it is subtracted from the 0.85×
+/// threshold before the remainder is split across layers, so a device that
+/// already holds other resident buffers gets a correspondingly smaller MoE
+/// budget instead of a budget computed as if the device were empty. This
+/// covers exactly the classes `current_allocated_size()` covers: Metal
+/// device-side allocations already built at call time (fixed model
+/// buffers, the KV cache, GatedDeltaNet/prefix state, GPU-visible scratch,
+/// and any earlier MoE layer's own expert-cache slots). It does **not**
+/// cover CPU-side host allocations (e.g. the CPU-resident weights this
+/// loader has not yet converted to Metal buffers) or the OS/process
+/// reserve — those are not visible to this counter, so the resulting
+/// budget is a partial remainder, not a complete one. The subtraction is
+/// saturating: if `already_allocated_bytes` is at or above the 0.85×
+/// threshold, the remaining per-layer budget is `0` rather than wrapping
+/// to a huge value, which would otherwise silently admit every expert
+/// instead of the auto-shrink-to-fit (or `Err`) this function exists to
+/// guarantee.
+///
+/// `moe_layers_already_sized` is the 0-based count of MoE layers on this
+/// device that have already been through this function (and therefore
+/// already hold their own `ExpertSlotCache` buffers, which
+/// `already_allocated_bytes` includes) — the caller's live loop counter,
+/// never a guess. **This is required, not cosmetic**: this loader builds
+/// every MoE layer's expert-cache slots eagerly (`ExpertSlotCache::new`
+/// calls `device.new_buffer` for every slot at construction, before any
+/// expert is actually resolved), in sequence, one MoE layer at a time. So
+/// `already_allocated_bytes` at layer k already includes layers
+/// `0..k`'s own slot buffers. Dividing the remaining headroom by the
+/// *total* `num_moe_layers` on every call — instead of by the layers not
+/// yet sized — double-counts that: each already-sized layer's bytes are
+/// subtracted from the numerator but its slot budget is still divided
+/// across every layer including the ones already done, so the shares
+/// shrink geometrically and later layers end up starved relative to
+/// earlier ones (with `already_allocated_bytes` fixed at 0 for every call,
+/// `moe_layers_already_sized` is irrelevant and this reduces to dividing
+/// by a constant, matching the old behavior). Dividing by
+/// `num_moe_layers - moe_layers_already_sized` instead means that if each
+/// layer consumes exactly the budget it was given, every layer receives
+/// the same share of the *original* remaining headroom (see the sequential
+/// simulation test).
+///
+/// **Known limitation, not fixed here**: at layer k's sizing time, only
+/// layers `0..k`'s weights (dense and MoE) are loaded — this loader builds
+/// each layer's attention and FFN weights together, one layer at a time —
+/// so layers `k+1..` are invisible to `current_allocated_size()`. Their
+/// dense (non-expert) weight footprint is not yet subtracted from anyone's
+/// budget, so earlier layers can still see more apparent headroom than
+/// will actually remain once every later layer's dense weights are also
+/// loaded. This function has no way to see bytes that are not resident
+/// yet; closing this gap would need the caller to pass a forecast of the
+/// remaining dense-weight footprint, which is out of scope for this fix.
 pub fn moe_expert_cache_num_slots(
     cfg: &MoeExpertCacheConfig,
     num_experts: usize,
@@ -194,6 +251,8 @@ pub fn moe_expert_cache_num_slots(
     per_expert_bytes: u64,
     num_moe_layers: usize,
     recommended_max_working_set_size: u64,
+    already_allocated_bytes: u64,
+    moe_layers_already_sized: usize,
 ) -> Result<usize, String> {
     if num_experts == 0 {
         return Err("moe_expert_cache_num_slots: num_experts must be > 0".to_string());
@@ -215,18 +274,43 @@ pub fn moe_expert_cache_num_slots(
     // `num_experts` and reconstruct the ~61 GiB fully-resident allocation
     // Stage 1 exists to avoid.
     let num_moe_layers = num_moe_layers.max(1) as u64;
+    let moe_layers_already_sized = moe_layers_already_sized as u64;
+    // Layers not yet sized, current one included — see this function's doc
+    // comment for why dividing by the constant `num_moe_layers` on every
+    // call double-counts already-sized layers' own slot buffers (they are
+    // subtracted from the numerator via `already_allocated_bytes` but were
+    // still being divided across every layer, including themselves and
+    // every other already-sized layer, geometrically starving later
+    // layers). `.max(1)` guards the same as-good-as-impossible
+    // already-past-the-end case `num_moe_layers.max(1)` above guards
+    // (a caller passing `moe_layers_already_sized >= num_moe_layers` is a
+    // caller bug, not a reason to divide by zero).
+    let layers_remaining = num_moe_layers
+        .saturating_sub(moe_layers_already_sized)
+        .max(1);
     let threshold = (recommended_max_working_set_size as f64 * 0.85) as u64;
-    let per_layer_budget = threshold / num_moe_layers;
+    // Saturating: `already_allocated_bytes` can legitimately be >= threshold
+    // (recommendedMaxWorkingSetSize is advisory, not a hard ceiling — a
+    // process can be sitting above it under memory pressure). A bare `-`
+    // would wrap to near `u64::MAX` in that case, turning `per_layer_budget`
+    // effectively unbounded and admitting every expert instead of shrinking
+    // or erroring. Saturating to `0` instead routes that case through the
+    // "even top_k doesn't fit" `Err` below, which is the safe outcome this
+    // function already guarantees for a too-tight budget.
+    let remaining = threshold.saturating_sub(already_allocated_bytes);
+    let per_layer_budget = remaining / layers_remaining;
 
     let min_required_bytes = per_expert_bytes.saturating_mul(top_k as u64);
     if min_required_bytes > per_layer_budget {
         return Err(format!(
             "moe_expert_cache_num_slots: even the minimum top_k={top_k} concurrently-resident \
              expert slots need {min_required_bytes} bytes/layer, which exceeds this device's \
-             per-layer MoE budget of {per_layer_budget} bytes (0.85 × \
-             recommendedMaxWorkingSetSize={recommended_max_working_set_size} / \
-             {num_moe_layers} MoE layers). This checkpoint's expert shape cannot fit even the \
-             lazy dequant-on-demand cache on this device."
+             remaining per-layer MoE budget of {per_layer_budget} bytes (0.85 × \
+             recommendedMaxWorkingSetSize={recommended_max_working_set_size}, minus \
+             {already_allocated_bytes} bytes already allocated on the device, / \
+             {layers_remaining} of {num_moe_layers} MoE layers not yet sized \
+             [{moe_layers_already_sized} already sized]). This checkpoint's expert shape cannot \
+             fit even the lazy dequant-on-demand cache on this device."
         ));
     }
 
@@ -989,20 +1073,38 @@ mod tests {
         // binding upper bound — the case the original clamp-only-to-
         // num_experts logic was designed for.
         assert_eq!(
-            moe_expert_cache_num_slots(&cfg(Some(1)), 256, 8, 6_291_456, 40, 400_000_000_000)
+            moe_expert_cache_num_slots(&cfg(Some(1)), 256, 8, 6_291_456, 40, 400_000_000_000, 0, 0)
                 .unwrap(),
             8,
             "below top_k clamps up"
         );
         assert_eq!(
-            moe_expert_cache_num_slots(&cfg(Some(9999)), 256, 8, 6_291_456, 40, 400_000_000_000)
-                .unwrap(),
+            moe_expert_cache_num_slots(
+                &cfg(Some(9999)),
+                256,
+                8,
+                6_291_456,
+                40,
+                400_000_000_000,
+                0,
+                0,
+            )
+            .unwrap(),
             256,
             "above num_experts clamps down to num_experts when the budget has headroom to spare"
         );
         assert_eq!(
-            moe_expert_cache_num_slots(&cfg(Some(64)), 256, 8, 6_291_456, 40, 400_000_000_000)
-                .unwrap(),
+            moe_expert_cache_num_slots(
+                &cfg(Some(64)),
+                256,
+                8,
+                6_291_456,
+                40,
+                400_000_000_000,
+                0,
+                0
+            )
+            .unwrap(),
             64,
             "in-range passes through unchanged"
         );
@@ -1020,20 +1122,47 @@ mod tests {
         // num_experts]`-only bound.
         let budget_max = 135;
         assert_eq!(
-            moe_expert_cache_num_slots(&cfg(Some(9999)), 256, 8, 6_291_456, 40, 40_000_000_000)
-                .unwrap(),
+            moe_expert_cache_num_slots(
+                &cfg(Some(9999)),
+                256,
+                8,
+                6_291_456,
+                40,
+                40_000_000_000,
+                0,
+                0
+            )
+            .unwrap(),
             budget_max,
             "an override far above num_experts must cap at the working-set budget, not num_experts"
         );
         assert_eq!(
-            moe_expert_cache_num_slots(&cfg(Some(200)), 256, 8, 6_291_456, 40, 40_000_000_000)
-                .unwrap(),
+            moe_expert_cache_num_slots(
+                &cfg(Some(200)),
+                256,
+                8,
+                6_291_456,
+                40,
+                40_000_000_000,
+                0,
+                0
+            )
+            .unwrap(),
             budget_max,
             "an override below num_experts but above the budget must still be capped at the budget"
         );
         assert_eq!(
-            moe_expert_cache_num_slots(&cfg(Some(100)), 256, 8, 6_291_456, 40, 40_000_000_000)
-                .unwrap(),
+            moe_expert_cache_num_slots(
+                &cfg(Some(100)),
+                256,
+                8,
+                6_291_456,
+                40,
+                40_000_000_000,
+                0,
+                0
+            )
+            .unwrap(),
             100,
             "an override under the budget passes through unchanged"
         );
@@ -1043,7 +1172,7 @@ mod tests {
     fn default_zero_eviction_fast_path_when_everything_fits() {
         // Small synthetic-test-sized shapes: everything should fit easily,
         // defaulting to num_experts (zero-eviction fast path).
-        let n = moe_expert_cache_num_slots(&cfg(None), 4, 1, 4096, 1, 8_000_000_000).unwrap();
+        let n = moe_expert_cache_num_slots(&cfg(None), 4, 1, 4096, 1, 8_000_000_000, 0, 0).unwrap();
         assert_eq!(n, 4);
     }
 
@@ -1061,6 +1190,8 @@ mod tests {
             per_expert_bytes as u64,
             40,
             28 * 1024 * 1024 * 1024,
+            0,
+            0,
         )
         .unwrap();
         assert!(
@@ -1073,8 +1204,8 @@ mod tests {
     #[test]
     fn errors_when_even_top_k_does_not_fit() {
         // Absurdly tiny device budget: even 1 slot (top_k=1) can't fit.
-        let err =
-            moe_expert_cache_num_slots(&cfg(None), 4, 1, 10_000_000_000, 1, 1_000_000).unwrap_err();
+        let err = moe_expert_cache_num_slots(&cfg(None), 4, 1, 10_000_000_000, 1, 1_000_000, 0, 0)
+            .unwrap_err();
         assert!(
             err.contains("cannot fit even the lazy dequant-on-demand cache"),
             "unexpected error message: {err}"
@@ -1083,13 +1214,215 @@ mod tests {
 
     #[test]
     fn rejects_zero_num_experts_or_top_k() {
-        assert!(moe_expert_cache_num_slots(&cfg(None), 0, 1, 100, 1, 1_000_000_000).is_err());
-        assert!(moe_expert_cache_num_slots(&cfg(None), 4, 0, 100, 1, 1_000_000_000).is_err());
+        assert!(moe_expert_cache_num_slots(&cfg(None), 0, 1, 100, 1, 1_000_000_000, 0, 0).is_err());
+        assert!(moe_expert_cache_num_slots(&cfg(None), 4, 0, 100, 1, 1_000_000_000, 0, 0).is_err());
     }
 
     #[test]
     fn rejects_top_k_exceeding_num_experts() {
-        assert!(moe_expert_cache_num_slots(&cfg(None), 4, 5, 100, 1, 1_000_000_000).is_err());
+        assert!(moe_expert_cache_num_slots(&cfg(None), 4, 5, 100, 1, 1_000_000_000, 0, 0).is_err());
+    }
+
+    // ── Residency budget: `already_allocated_bytes` (issue: the budget was a
+    // fraction of device capacity, not capacity minus what is already
+    // resident) ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn already_allocated_bytes_shrinks_the_slot_budget() {
+        // Same 256-expert / top_k=8 / 40-layer / 6 MiB-per-expert / 40 GB
+        // shape as `env_override_capped_at_working_set_budget_even_when_
+        // below_num_experts`, where zero already-allocated bytes gives a
+        // budget-derived maximum of 135 slots. With 4 GB already resident
+        // on the device, the remaining per-layer budget must shrink
+        // accordingly (750_000_000 / 6_291_456 = 119), strictly less than
+        // the zero-residency figure — proving the parameter actually moves
+        // the result rather than being wired in and ignored.
+        let with_zero_resident =
+            moe_expert_cache_num_slots(&cfg(None), 256, 8, 6_291_456, 40, 40_000_000_000, 0, 0)
+                .unwrap();
+        assert_eq!(with_zero_resident, 135);
+
+        let with_4gb_resident = moe_expert_cache_num_slots(
+            &cfg(None),
+            256,
+            8,
+            6_291_456,
+            40,
+            40_000_000_000,
+            4_000_000_000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            with_4gb_resident, 119,
+            "4 GB already resident on the device must reduce the remaining per-layer budget, \
+             and therefore the slot count, below the zero-residency figure"
+        );
+        assert!(with_4gb_resident < with_zero_resident);
+    }
+
+    #[test]
+    fn already_allocated_at_or_above_threshold_errs_instead_of_wrapping() {
+        // `already_allocated_bytes` can legitimately reach or exceed 0.85 ×
+        // recommendedMaxWorkingSetSize: the working-set size is advisory,
+        // not a hard ceiling, so a process under memory pressure can sit
+        // above it. This is the underflow case: `threshold -
+        // already_allocated_bytes` would be negative in unsigned
+        // arithmetic. A bare (non-saturating) subtraction wraps to a value
+        // near `u64::MAX`, which turns `per_layer_budget` effectively
+        // unbounded and admits every expert (`budget_max_slots` clamps up
+        // to `num_experts`) instead of shrinking or erroring — silently
+        // reconstructing the fully-resident cache #682 Stage 1 exists to
+        // avoid. The safe behavior is for the remaining per-layer budget to
+        // saturate at 0, which — with a nonzero per-expert size — is below
+        // even the top_k floor, so this must return `Err` (the same "even
+        // top_k doesn't fit" outcome `errors_when_even_top_k_does_not_fit`
+        // exercises), never `Ok` with a slot count computed from a wrapped
+        // budget.
+        let recommended_max_working_set_size = 40_000_000_000u64;
+        let threshold = (recommended_max_working_set_size as f64 * 0.85) as u64;
+
+        // Exactly at the threshold: remaining budget saturates to exactly 0.
+        let err_at = moe_expert_cache_num_slots(
+            &cfg(None),
+            256,
+            8,
+            6_291_456,
+            40,
+            recommended_max_working_set_size,
+            threshold,
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            err_at.contains("cannot fit even the lazy dequant-on-demand cache"),
+            "unexpected error message at threshold: {err_at}"
+        );
+
+        // Above the threshold: this is exactly the case a bare `threshold -
+        // already_allocated_bytes` cannot represent in u64.
+        let err_above = moe_expert_cache_num_slots(
+            &cfg(None),
+            256,
+            8,
+            6_291_456,
+            40,
+            recommended_max_working_set_size,
+            threshold + 1_000_000_000,
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            err_above.contains("cannot fit even the lazy dequant-on-demand cache"),
+            "unexpected error message above threshold: {err_above}"
+        );
+
+        // An explicit `cfg.num_slots` override must not escape the same
+        // guard: the working-set budget is derived and enforced
+        // unconditionally (see the comment at the override-clamp call
+        // site), so a garbage-large override must still error rather than
+        // being granted a slot count derived from a wrapped budget.
+        let err_override = moe_expert_cache_num_slots(
+            &cfg(Some(9999)),
+            256,
+            8,
+            6_291_456,
+            40,
+            recommended_max_working_set_size,
+            threshold + 1_000_000_000,
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            err_override.contains("cannot fit even the lazy dequant-on-demand cache"),
+            "unexpected error message for an override above threshold: {err_override}"
+        );
+    }
+
+    #[test]
+    fn sequential_layer_sizing_gets_equal_shares_not_geometric_shrink() {
+        // Simulates what the real loader does: call this pure function once
+        // per MoE layer, in order, feeding each layer's ACTUAL consumed
+        // bytes (slots * per_expert_bytes — not its budget, which may
+        // differ under integer truncation) into the next call's
+        // `already_allocated_bytes`, exactly like `ExpertSlotCache::new`
+        // committing real Metal buffers before the next layer is sized.
+        //
+        // Numbers are chosen so every quantity divides evenly and the
+        // prediction below is exact, tolerance 0 — not a real-world shape,
+        // deliberately, so a geometric-shrink defect cannot hide behind
+        // integer-rounding noise. (The production Qwen3.5-35B-A3B shape
+        // used elsewhere in this file does not divide evenly, and would
+        // show at most a +/-1 slot drift from truncation leftover
+        // accumulating across layers — a rounding residual, not the
+        // geometric-shrink defect this test targets.)
+        //
+        // recommended_max_working_set_size = 52_941_177 => threshold
+        // (0.85x, truncated) = 45_000_000 exactly. Starting resident
+        // baseline (nonzero, as if dense model weights are already loaded)
+        // = 5_000_000, so the headroom available to MoE sizing is
+        // 40_000_000 over 8 layers = 5_000_000/layer. At 1_000_000
+        // bytes/expert that is exactly 5 slots/layer (top_k=4 <= 5, so no
+        // auto-shrink-to-top_k and no Err).
+        //
+        // PREDICTION (stated before running): every one of the 8 layers
+        // gets EXACTLY 5 slots (tolerance 0 — see above), and the running
+        // total after all 8 layers lands at EXACTLY the threshold
+        // (45_000_000), never over it.
+        //
+        // This must FAIL against the constant-denominator formula (divide the remaining
+        // budget by the constant `num_moe_layers` on every call, ignoring
+        // how many layers have already been sized): layer 0 still gets 5
+        // slots (already_allocated_bytes == baseline for the very first
+        // call, so both formulas agree there), but layer 1's
+        // already-consumed 5_000_000 bytes are subtracted from the
+        // numerator while the denominator stays 8 instead of dropping to
+        // 7, so layer 1 gets floor(4_375_000 / 1_000_000) = 4 slots, and by
+        // layer 2 the remaining per-layer budget (3_875_000) is below
+        // min_required_bytes (4 * 1_000_000 = 4_000_000) and the call
+        // returns `Err` outright.
+        let num_experts = 256;
+        let top_k = 4;
+        let per_expert_bytes: u64 = 1_000_000;
+        let num_moe_layers = 8;
+        let recommended_max_working_set_size: u64 = 52_941_177;
+        let threshold = (recommended_max_working_set_size as f64 * 0.85) as u64;
+        assert_eq!(
+            threshold, 45_000_000,
+            "sanity-check the chosen R truncates as predicted"
+        );
+        let baseline_resident: u64 = 5_000_000;
+
+        let mut already_allocated = baseline_resident;
+        for moe_layers_already_sized in 0..num_moe_layers {
+            let slots = moe_expert_cache_num_slots(
+                &cfg(None),
+                num_experts,
+                top_k,
+                per_expert_bytes,
+                num_moe_layers,
+                recommended_max_working_set_size,
+                already_allocated,
+                moe_layers_already_sized,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "layer {moe_layers_already_sized}/{num_moe_layers} unexpectedly errored \
+                     (already_allocated={already_allocated}): {e}"
+                )
+            });
+            assert_eq!(
+                slots, 5,
+                "layer {moe_layers_already_sized}/{num_moe_layers} got {slots} slots, expected \
+                 exactly 5 (equal share) — already_allocated={already_allocated}"
+            );
+            already_allocated += slots as u64 * per_expert_bytes;
+        }
+        assert_eq!(
+            already_allocated, threshold,
+            "sum of every layer's actual consumption must land exactly at the threshold, never \
+             over it"
+        );
     }
 
     /// Serializes every test below that mutates the real process
