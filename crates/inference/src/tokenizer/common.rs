@@ -879,11 +879,16 @@ pub(crate) fn parse_rendered_added_tokens(root: &JsonValue) -> HashMap<u32, Stri
             continue;
         };
         // Absent "special" defaults to false (matches HF AddedToken), so render it.
-        if object
-            .get("special")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false)
-        {
+        // A "special" value that parses as neither true nor false (a string, a
+        // number, ...) fails closed to special rather than reusing `false` via
+        // `unwrap_or` -- a malformed flag must never silently admit a token to
+        // literal-text rendering (#1722).
+        let is_special = match object.get("special") {
+            None => false,
+            Some(JsonValue::Bool(value)) => *value,
+            Some(_) => true,
+        };
+        if is_special {
             continue;
         }
         let Some(content) = object.get("content").and_then(JsonValue::as_str) else {
