@@ -1169,8 +1169,8 @@ mod tests {
     /// Two runs identical in every respect except ewc_lambda must produce
     /// byte-identical RouterDelta::network_bytes.
     ///
-    /// This pins the Phase-2 boundary: v1 uses project_delta (Fisher
-    /// null-space damping), which does not read ewc_lambda.  The test fails
+    /// This pins the Phase-2 boundary: v1 uses project_delta (Fisher-weighted
+    /// damping), which does not read ewc_lambda.  The test fails
     /// the moment someone wires ewc_lambda into the update path without
     /// revisiting the design.
     ///

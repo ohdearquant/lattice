@@ -141,12 +141,15 @@ impl DiagonalFisher {
     /// from an unvalidated caller-supplied gradient upstream). The exact rule:
     /// `F_ref` is accumulated in `f64` (see below); if that `F_ref` is itself
     /// non-finite (a NaN entry poisons the sum into NaN, an infinite entry
-    /// poisons it into +-inf), **every** coordinate of `delta` is set to `0.0`
-    /// — the reference magnitude cannot be trusted, so the whole update is
-    /// blocked rather than divided by, or allowed to propagate, a non-finite
-    /// value. If `F_ref` is finite but one coordinate's own scale factor still
-    /// comes out non-finite, **only that coordinate** is set to `0.0`. Both
-    /// cases mirror the effect (not the exact per-coordinate boundary) of the
+    /// poisons it into +-inf), every coordinate of the common prefix — the
+    /// first `min(self.values.len(), delta.len())` entries — is set to `0.0`
+    /// — the reference magnitude cannot be trusted, so that part of the
+    /// update is blocked rather than divided by, or allowed to propagate, a
+    /// non-finite value. Elements of `delta` beyond the Fisher's length are
+    /// left unchanged, as on every other path through this method. If
+    /// `F_ref` is finite but one coordinate's own scale factor still comes
+    /// out non-finite, **only that coordinate** is set to `0.0`. Both cases
+    /// mirror the effect (not the exact per-coordinate boundary) of the
     /// max-normalised formula this replaced, which zeroed a coordinate
     /// whenever its own scale computation went non-finite.
     ///
@@ -169,11 +172,14 @@ impl DiagonalFisher {
         if !f_ref.is_finite() {
             // A NaN entry poisons the sum into NaN; an infinite entry poisons
             // it into +-inf. F_ref cannot be trusted as a reference magnitude
-            // either way — block the whole update instead of dividing by (or
-            // propagating) a non-finite value. Checked before the degenerate
+            // either way — block the common prefix instead of dividing by (or
+            // propagating) a non-finite value. Elements of `delta` beyond
+            // `self.values.len()` are left unchanged, matching the zipped
+            // per-coordinate loop below. Checked before the degenerate
             // "no signal" comparison below because `NaN < 1e-8` is false, so a
             // NaN F_ref would otherwise fall through to per-coordinate damping.
-            delta.fill(0.0);
+            let m = n.min(delta.len());
+            delta[..m].fill(0.0);
             return;
         }
 
@@ -224,7 +230,7 @@ mod tests {
     /// the old max-normalised formula zeroed the argmax coordinate exactly).
     /// Zero-Fisher entries pass through unchanged.
     #[test]
-    fn ewc_high_fisher_blocks() {
+    fn ewc_high_fisher_damps_strongly() {
         let mut fisher = DiagonalFisher::new(5, 0.9).unwrap();
         // decay=0.9 → F[0] = 0.9*0 + 0.1*100² = 1000; F[1..5] = 0.
         fisher
@@ -390,7 +396,7 @@ mod tests {
     /// coordinate zeroed) rather than turned into NaN by a poisoned `F_ref`.
     ///
     /// Mutation that defeats this: computing `F_ref` without the
-    /// `!f_ref.is_finite()` guard (review finding on commit 5554751b).
+    /// `!f_ref.is_finite()` guard.
     #[test]
     fn ewc_nan_fisher_entry_zeroes_delta_without_propagating_nan() {
         let fisher = DiagonalFisher {
@@ -413,11 +419,39 @@ mod tests {
         }
     }
 
+    /// The non-finite `F_ref` branch must zero only the common prefix
+    /// (`min(self.values.len(), delta.len())`), leaving any `delta`
+    /// coordinates beyond the Fisher's length untouched — matching every
+    /// other path through `project_delta`, which only ever touches the
+    /// zipped prefix.
+    ///
+    /// Mutation that defeats this: zeroing the whole `delta` slice instead of
+    /// just its common prefix in the non-finite `F_ref` branch.
+    #[test]
+    fn non_finite_fisher_blocks_only_the_common_prefix() {
+        for value in [f32::NAN, f32::INFINITY] {
+            let fisher = DiagonalFisher {
+                values: vec![value],
+                anchor: vec![0.0; 1],
+                decay: 0.9,
+            };
+            let mut delta = vec![1.0_f32, 2.0];
+            fisher.project_delta(&mut delta);
+
+            assert_eq!(
+                delta,
+                vec![0.0, 2.0],
+                "non-finite Fisher (value={value}) must block only the common \
+                 prefix and leave the suffix untouched, got {delta:?}"
+            );
+        }
+    }
+
     /// An infinite Fisher entry must not propagate NaN/inf into `delta` either
     /// (an infinite entry poisons `F_ref` into `+inf`, and `inf / inf` is NaN).
     ///
     /// Mutation that defeats this: computing `F_ref` without the
-    /// `!f_ref.is_finite()` guard (review finding on commit 5554751b).
+    /// `!f_ref.is_finite()` guard.
     #[test]
     fn ewc_infinite_fisher_entry_zeroes_delta_without_propagating_nan_or_inf() {
         let fisher = DiagonalFisher {
@@ -448,7 +482,7 @@ mod tests {
     /// == 0` for every finite `v`, i.e. no damping at all).
     ///
     /// Mutation that defeats this: summing `self.values` in `f32` instead of
-    /// `f64` (review finding on commit 5554751b).
+    /// `f64`.
     #[test]
     fn ewc_large_finite_fisher_sum_does_not_overflow_f32_and_still_damps() {
         let fisher = DiagonalFisher {
