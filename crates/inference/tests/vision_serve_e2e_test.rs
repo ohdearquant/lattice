@@ -112,6 +112,21 @@ fn wait_for_health(port: u16, deadline: Instant) -> bool {
     false
 }
 
+/// How long to wait for `lattice_serve` to report healthy before treating the
+/// process as stuck. Defaults to 120s (loading a multimodal checkpoint on a
+/// local Apple-silicon machine fits comfortably inside that); overridable via
+/// `LATTICE_VISION_SERVE_HEALTH_TIMEOUT_SECS` because a hosted CI runner can be
+/// considerably slower for the same work, and a fixed deadline with no escape
+/// hatch turns a slow-but-healthy start into an indistinguishable panic.
+fn health_wait_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("LATTICE_VISION_SERVE_HEALTH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120),
+    )
+}
+
 fn post_chat_completion(port: u16, body: &serde_json::Value) -> serde_json::Value {
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let response = ureq::post(&url)
@@ -207,12 +222,18 @@ fn serve_chat_completions_reaches_vision_forward_path() {
         })
     };
 
-    if !wait_for_health(port, Instant::now() + Duration::from_secs(120)) {
+    let health_timeout = health_wait_timeout();
+    let health_wait_started = Instant::now();
+    if !wait_for_health(port, health_wait_started + health_timeout) {
         let output = stderr
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        panic!("lattice_serve did not become healthy; stderr:\n{output}");
+        panic!(
+            "lattice_serve did not become healthy after {:?} \
+             (override with LATTICE_VISION_SERVE_HEALTH_TIMEOUT_SECS); stderr:\n{output}",
+            health_wait_started.elapsed()
+        );
     }
 
     let image_response = post_chat_completion(

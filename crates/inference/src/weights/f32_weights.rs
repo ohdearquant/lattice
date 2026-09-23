@@ -390,72 +390,53 @@ impl SafetensorsFile {
                     )
                 }
             }
-            DType::F16 => {
-                #[cfg(feature = "f16")]
-                {
-                    (
-                        meta.converted_f32
-                            .get_or_init(|| {
-                                let (values, has_non_finite) = convert_f16_bytes_to_f32(bytes);
-                                let _ = meta.validated.get_or_init(|| {
-                                    let tensor = if has_non_finite {
-                                        crate::weights::ingress::IngestedTensor::decoded_f32(
-                                            source, name, shape, dtype_name, &values,
-                                        )
-                                    } else {
-                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
-                                            source, name, shape, dtype_name, &values,
-                                        )
-                                    };
-                                    crate::weights::ingress::validate_ingested_tensor(tensor)
-                                        .map_err(|e| e.to_string())
-                                });
-                                values.into_boxed_slice()
-                            })
-                            .as_ref(),
-                        true,
-                    )
-                }
-                #[cfg(not(feature = "f16"))]
-                {
-                    return Err(InferenceError::InvalidSafetensors(format!(
-                        "tensor {name} is F16 but lattice-inference was built without the f16 feature"
-                    )));
-                }
-            }
-            DType::BF16 => {
-                #[cfg(feature = "f16")]
-                {
-                    (
-                        meta.converted_f32
-                            .get_or_init(|| {
-                                let (values, has_non_finite) = convert_bf16_bytes_to_f32(bytes);
-                                let _ = meta.validated.get_or_init(|| {
-                                    let tensor = if has_non_finite {
-                                        crate::weights::ingress::IngestedTensor::decoded_f32(
-                                            source, name, shape, dtype_name, &values,
-                                        )
-                                    } else {
-                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
-                                            source, name, shape, dtype_name, &values,
-                                        )
-                                    };
-                                    crate::weights::ingress::validate_ingested_tensor(tensor)
-                                        .map_err(|e| e.to_string())
-                                });
-                                values.into_boxed_slice()
-                            })
-                            .as_ref(),
-                        true,
-                    )
-                }
-                #[cfg(not(feature = "f16"))]
-                {
-                    return Err(InferenceError::InvalidSafetensors(format!(
-                        "tensor {name} is BF16 but lattice-inference was built without the f16 feature"
-                    )));
-                }
-            }
+            // F16/BF16 -> f32 materialization is unconditional: the bit-conversion
+            // below always compiles and adds no dependency. `f16` still gates F8
+            // materialization (below) and the Cargo.toml targets that require it.
+            DType::F16 => (
+                meta.converted_f32
+                    .get_or_init(|| {
+                        let (values, has_non_finite) = convert_f16_bytes_to_f32(bytes);
+                        let _ = meta.validated.get_or_init(|| {
+                            let tensor = if has_non_finite {
+                                crate::weights::ingress::IngestedTensor::decoded_f32(
+                                    source, name, shape, dtype_name, &values,
+                                )
+                            } else {
+                                crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                    source, name, shape, dtype_name, &values,
+                                )
+                            };
+                            crate::weights::ingress::validate_ingested_tensor(tensor)
+                                .map_err(|e| e.to_string())
+                        });
+                        values.into_boxed_slice()
+                    })
+                    .as_ref(),
+                true,
+            ),
+            DType::BF16 => (
+                meta.converted_f32
+                    .get_or_init(|| {
+                        let (values, has_non_finite) = convert_bf16_bytes_to_f32(bytes);
+                        let _ = meta.validated.get_or_init(|| {
+                            let tensor = if has_non_finite {
+                                crate::weights::ingress::IngestedTensor::decoded_f32(
+                                    source, name, shape, dtype_name, &values,
+                                )
+                            } else {
+                                crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                    source, name, shape, dtype_name, &values,
+                                )
+                            };
+                            crate::weights::ingress::validate_ingested_tensor(tensor)
+                                .map_err(|e| e.to_string())
+                        });
+                        values.into_boxed_slice()
+                    })
+                    .as_ref(),
+                true,
+            ),
             DType::F8E4M3 => {
                 #[cfg(feature = "f16")]
                 {
@@ -1054,7 +1035,6 @@ fn copy_bytes_to_f32_owned(bytes: &[u8]) -> Vec<f32> {
     out
 }
 
-#[cfg(feature = "f16")]
 fn convert_f16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     debug_assert_eq!(bytes.len() % 2, 0);
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -1068,7 +1048,6 @@ fn convert_f16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     (out, has_non_finite)
 }
 
-#[cfg(feature = "f16")]
 fn convert_bf16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     debug_assert_eq!(bytes.len() % 2, 0);
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -3368,7 +3347,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "f16")]
     #[test]
     fn test_f16_tensor_rejects_nan_bit_pattern_through_safetensors_path() {
         let path = temp_path("lattice_weights_f16_nan");
@@ -3394,7 +3372,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "f16")]
     #[test]
     fn test_f16_tensor_rejects_infinity_bit_pattern_through_safetensors_path() {
         let path = temp_path("lattice_weights_f16_inf");
@@ -3416,7 +3393,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "f16")]
     #[test]
     fn test_bf16_tensor_rejects_nan_bit_pattern_through_safetensors_path() {
         let path = temp_path("lattice_weights_bf16_nan");
@@ -3442,7 +3418,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "f16")]
     #[test]
     fn test_bf16_tensor_rejects_infinity_bit_pattern_through_safetensors_path() {
         let path = temp_path("lattice_weights_bf16_inf");
@@ -3538,7 +3513,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "f16")]
     #[test]
     fn test_f16_widening_preserves_finite_edge_values() {
         let path = temp_path("lattice_weights_f16_fused_finite");
@@ -3576,7 +3550,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "f16")]
     #[test]
     fn test_f16_widening_skips_second_finite_scan() {
         let path = temp_path("lattice_weights_f16_fused_scan");
@@ -3598,7 +3571,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "f16")]
     #[test]
     fn test_bf16_widening_preserves_finite_edge_values() {
         let path = temp_path("lattice_weights_bf16_fused_finite");
@@ -3636,7 +3608,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "f16")]
     #[test]
     fn test_bf16_widening_skips_second_finite_scan() {
         let path = temp_path("lattice_weights_bf16_fused_scan");
@@ -3656,6 +3627,52 @@ mod tests {
             0,
             "fused BF16 validation must not rescan widened values"
         );
+    }
+
+    /// F16/BF16 -> f32 materialization must work in the DEFAULT feature build, with
+    /// no `f16` feature enabled: this is the regression a published checkpoint hits,
+    /// since most published safetensors checkpoints carry F16 or BF16 tensors and a
+    /// plain `cargo add lattice-inference` build must still load them.
+    ///
+    /// Builds a tiny in-memory safetensors buffer (via `from_bytes`, no filesystem)
+    /// containing one F16 tensor and one BF16 tensor, and loads both through
+    /// `get_f32_tensor` -- the same public load path a real checkpoint goes through.
+    #[test]
+    fn f16_and_bf16_tensors_materialize_to_f32_in_default_feature_build() {
+        // f16 bit patterns for 1.0 (0x3c00) and 2.0 (0x4000).
+        let f16_bytes: [u8; 4] = [0x00, 0x3c, 0x00, 0x40];
+        // bf16 bit patterns for 1.0 (0x3f80) and 2.0 (0x4000).
+        let bf16_bytes: [u8; 4] = [0x80, 0x3f, 0x00, 0x40];
+
+        let header = format!(
+            r#"{{"f16_t":{{"dtype":"F16","shape":[2],"data_offsets":[0,{}]}},"bf16_t":{{"dtype":"BF16","shape":[2],"data_offsets":[{},{}]}}}}"#,
+            f16_bytes.len(),
+            f16_bytes.len(),
+            f16_bytes.len() + bf16_bytes.len(),
+        );
+        let header_bytes = header.into_bytes();
+
+        let mut buf =
+            Vec::with_capacity(8 + header_bytes.len() + f16_bytes.len() + bf16_bytes.len());
+        buf.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&f16_bytes);
+        buf.extend_from_slice(&bf16_bytes);
+
+        let file = SafetensorsFile::from_bytes(buf)
+            .expect("in-memory safetensors buffer with F16/BF16 tensors must parse");
+
+        let (f16_values, f16_shape) = file
+            .get_f32_tensor("f16_t")
+            .expect("F16 tensor must materialize to f32 without the f16 feature");
+        assert_eq!(f16_shape, &[2]);
+        assert_eq!(f16_values, &[1.0f32, 2.0]);
+
+        let (bf16_values, bf16_shape) = file
+            .get_f32_tensor("bf16_t")
+            .expect("BF16 tensor must materialize to f32 without the f16 feature");
+        assert_eq!(bf16_shape, &[2]);
+        assert_eq!(bf16_values, &[1.0f32, 2.0]);
     }
 
     fn temp_dir(name: &str) -> TempDirGuard {

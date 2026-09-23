@@ -445,8 +445,19 @@ impl AdapterRouter {
         // Run gate network: returns a score per output unit.
         let scores = self.gate.forward(context_vector)?;
 
-        // Only the first `available.len()` outputs are meaningful; ignore extra
-        // outputs if the network is wider than the current adapter pool.
+        // `n` bounds the usable width in either direction of a size mismatch
+        // between the gate and `available`:
+        //   - gate wider than pool (scores.len() > available.len()): the extra
+        //     gate outputs have no adapter to map to, and are ignored.
+        //   - pool wider than gate (available.len() > scores.len()): adapters at
+        //     index >= n are never scored by this call and can never be selected,
+        //     for any context, as long as k stays within the check below. This is
+        //     recorded as pre-existing, deliberate behaviour of `AdapterRouter`,
+        //     not a bounds bug: a router that must cover a wider pool needs a
+        //     wider gate, which is a new `AdapterRouter`, not a change to this
+        //     function's contract. The width-agreement refusal for a live pool
+        //     belongs one layer up, at router construction, where the resident
+        //     adapter count is known before any request is scored.
         let n = available.len().min(scores.len());
 
         // Fail closed: if the gate has fewer outputs than adapters AND k exceeds
@@ -884,6 +895,39 @@ mod tests {
             matches!(result, Err(RouterError::GateTooNarrow { k: 4, usable: 3 })),
             "expected GateTooNarrow {{k:4, usable:3}}, got {result:?}"
         );
+    }
+
+    /// A pool wider than the gate, with `k` small enough to stay inside
+    /// `GateTooNarrow`, must not error and must never surface an adapter past
+    /// the gate's own output width. This is deliberate, pre-existing
+    /// `AdapterRouter` behaviour, not a bounds bug: a router that must cover a
+    /// wider pool needs a wider gate (a new `AdapterRouter`, not a change to
+    /// this function), and refusing a live width disagreement belongs one
+    /// layer up, at router construction, not inside `route` itself.
+    #[test]
+    fn route_pool_wider_than_gate_never_selects_the_unscored_adapter() {
+        // Two-output gate, three candidates. The gate scores favour index 1
+        // ("second"), so the top-1 and top-2 selections both exercise a real
+        // ranking rather than an arbitrary tie-break, and "third" has no
+        // scored column at all -- there is no score assignment under which it
+        // could win.
+        let mut router = AdapterRouter::new(scored_gate(1, &[1.0, 10.0]));
+        let available: Vec<AdapterId> = vec!["first".into(), "second".into(), "third".into()];
+
+        for k in [1usize, 2usize] {
+            let result = router
+                .route(&[0.0], &available, k)
+                .unwrap_or_else(|e| panic!("k={k}: expected Ok, got {e:?}"));
+            assert_eq!(
+                result.len(),
+                k,
+                "k={k}: full k must be satisfiable from the 2 scored adapters"
+            );
+            assert!(
+                result.iter().all(|(id, _)| id != "third"),
+                "k={k}: an adapter beyond the gate's own output width must never be selected, got {result:?}"
+            );
+        }
     }
 
     #[test]

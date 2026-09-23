@@ -122,6 +122,7 @@ mod route_predicate_tests {
 
     fn greedy_gen_cfg(stop_strings: Vec<String>) -> GenerateConfig {
         GenerateConfig {
+            min_p: 0.0,
             max_new_tokens: 4,
             temperature: 0.0,
             top_k: 1,
@@ -195,6 +196,7 @@ mod route_predicate_tests {
     #[test]
     fn mtp_route_blocked_by_set_reasoning_budget() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(64),
             ..greedy_gen_cfg(vec![])
         };
@@ -210,6 +212,7 @@ mod route_predicate_tests {
     #[test]
     fn self_spec_route_blocked_by_set_reasoning_budget() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(64),
             ..greedy_gen_cfg(vec![])
         };
@@ -233,6 +236,7 @@ mod route_predicate_tests {
     #[test]
     fn mtp_route_blocked_by_nonidentity_repetition_penalty() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             repetition_penalty: 1.1,
             ..greedy_gen_cfg(vec![])
         };
@@ -249,6 +253,7 @@ mod route_predicate_tests {
     #[test]
     fn self_spec_route_blocked_by_nonidentity_repetition_penalty() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             repetition_penalty: 1.1,
             ..greedy_gen_cfg(vec![])
         };
@@ -290,6 +295,7 @@ mod route_predicate_tests {
         // argmax token already in history: the penalized pick flips to the
         // runner-up.
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             repetition_penalty: 1.1,
             ..greedy_gen_cfg(vec![])
         };
@@ -327,6 +333,7 @@ mod route_predicate_tests {
     #[test]
     fn mtp_route_blocked_by_set_logprobs() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             logprobs: Some(0),
             ..greedy_gen_cfg(vec![])
         };
@@ -344,6 +351,7 @@ mod route_predicate_tests {
     #[test]
     fn self_spec_route_blocked_by_set_logprobs() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             logprobs: Some(0),
             ..greedy_gen_cfg(vec![])
         };
@@ -11276,12 +11284,9 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
-        // `GenerateConfig` cannot carry `min_p` (it is exhaustively
-        // constructible through the public API at published `0.7.1`; adding
-        // any field is a major break -- see
-        // `crate::sampling::Sampler::with_min_p`), and no production entry
-        // point sets it yet, so this path is always disabled.
-        sample_from_candidates_impl(candidates, cfg, previous_ids, rng_state, 0.0)
+        // `min_p` is read from `GenerateConfig` (0.0 = disabled, its default,
+        // when no caller sets it).
+        sample_from_candidates_impl(candidates, cfg, previous_ids, rng_state, cfg.min_p)
     }
 
     fn sample_from_candidates_impl(
@@ -11393,7 +11398,10 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
-        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0, 0.0)
+        // `min_p` is read from `GenerateConfig` (0.0 = disabled, its default,
+        // when no caller sets it). `top_n_sigma` has no `GenerateConfig` field
+        // yet and no production entry point sets it, so it stays disabled.
+        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, cfg.min_p, 0.0)
     }
 
     /// Signpost-traced sampling shared by every autoregressive decode loop's
@@ -12263,6 +12271,7 @@ mod inner {
             cfg: &Qwen35Config,
             prefix: &str,
             layer_idx: usize,
+            moe_layers_already_sized: usize,
         ) -> Result<MetalFfnWeights, String> {
             use crate::forward::moe_expert_cache::{
                 ExpertSlotCache, MoeExpertCacheConfig, moe_expert_cache_num_slots,
@@ -12283,17 +12292,35 @@ mod inner {
             // f16-resident for Qwen3.5-35B-A3B, independent of how many
             // experts a token actually activates — see PLAN.md §1). Instead,
             // size a bounded LRU cache of per-expert slots against this
-            // device's memory budget: `num_experts` slots (the "zero-eviction
-            // fast path", functionally the old eager behavior but lazily
-            // populated and evictable) when that fits under 0.85 ×
-            // recommendedMaxWorkingSetSize split evenly across every MoE
-            // layer, else auto-shrunk (floored at `top_k`, below which the
-            // cache cannot serve even one token's routed-expert set).
+            // device's *remaining* memory budget: `num_experts` slots (the
+            // "zero-eviction fast path", functionally the old eager behavior
+            // but lazily populated and evictable) when that fits under 0.85
+            // × recommendedMaxWorkingSetSize minus what this device already
+            // has allocated (fixed model buffers, KV/GDN/prefix state, and
+            // any earlier MoE layer's own cache slots), split evenly across
+            // the MoE layers not yet sized (this layer included), else
+            // auto-shrunk (floored at `top_k`, below which the cache cannot
+            // serve even one token's routed-expert set). `moe_layers_
+            // already_sized` must be this layer's live ordinal among MoE
+            // layers processed so far on this device — every earlier one
+            // already built its own `ExpertSlotCache` buffers, which are
+            // part of `current_allocated_size()` by the time this call
+            // runs, so dividing by the *total* MoE layer count on every
+            // call (instead of by the layers not yet sized) would subtract
+            // each already-sized layer's bytes from the numerator while
+            // still dividing by a constant denominator that includes them,
+            // geometrically starving later layers. See
+            // `moe_expert_cache_num_slots`'s doc comment for exactly which
+            // residency classes `current_allocated_size()` covers, which it
+            // doesn't (CPU-side allocations and the OS/process reserve),
+            // and the known limitation this does not close (later layers'
+            // not-yet-loaded dense weights are also invisible to it).
             let gate_up_bytes_per_expert = (2 * inter * hidden * 2) as u64; // f16
             let down_bytes_per_expert = (hidden * inter * 2) as u64; // f16
             let per_expert_bytes_total = gate_up_bytes_per_expert + down_bytes_per_expert;
             let num_moe_layers = cfg.num_active_layers();
             let max_working = device.recommended_max_working_set_size();
+            let already_allocated = device.current_allocated_size();
             let cache_cfg = MoeExpertCacheConfig::from_env()
                 .map_err(|e| format!("from_q4_dir: MoE layer {layer_idx}: {e}"))?;
             let num_slots = moe_expert_cache_num_slots(
@@ -12303,6 +12330,8 @@ mod inner {
                 per_expert_bytes_total,
                 num_moe_layers,
                 max_working,
+                already_allocated,
+                moe_layers_already_sized,
             )
             .map_err(|e| format!("from_q4_dir: MoE layer {layer_idx}: {e}"))?;
 
@@ -12855,7 +12884,23 @@ mod inner {
                         // / `.experts.down_proj` fused per-layer arrays, plus every other MoE
                         // tensor here, are Q4-quantized). `MetalFfnWeights::Dense`'s
                         // `mlp.{gate,up,down}_proj.weight` files do not exist for this layer.
-                        Self::load_moe_ffn_q4(&device, q4_dir, cfg, &prefix, i)?
+                        //
+                        // `layer_weights.len()` is this layer's live ordinal among MoE
+                        // layers already sized on this device: `is_moe()` is a whole-
+                        // checkpoint flag (every active layer takes this branch when
+                        // true, per `Qwen35Config::is_moe`), and every prior iteration
+                        // of this loop already pushed its `(attn, common)` pair before
+                        // this one runs — so `layer_weights.len()` is exactly the count
+                        // of MoE layers whose `ExpertSlotCache` buffers are already
+                        // resident, never a guess.
+                        Self::load_moe_ffn_q4(
+                            &device,
+                            q4_dir,
+                            cfg,
+                            &prefix,
+                            i,
+                            layer_weights.len(),
+                        )?
                     } else {
                         let (gate_raw, _) = load_q4_raw_timed(
                             &format!("{prefix}.mlp.gate_proj.weight"),
@@ -17682,6 +17727,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let with_logprobs = GenerateConfig {
+                min_p: 0.0,
                 logprobs: Some(5),
                 ..compact_sampling_config(1)
             };
@@ -17699,6 +17745,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[test]
         fn sampling_route_plan_preserves_grammar_and_repetition_gates() {
             let penalized = GenerateConfig {
+                min_p: 0.0,
                 repetition_penalty: 1.1,
                 ..compact_sampling_config(8)
             };
@@ -17719,6 +17766,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             )
             .expect("trivial grammar must compile");
             let constrained = GenerateConfig {
+                min_p: 0.0,
                 grammar: Some(std::sync::Arc::new(grammar)),
                 ..compact_sampling_config(8)
             };
@@ -17876,6 +17924,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             state.session.compact_result = sentinel_result.clone();
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -18486,6 +18535,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
@@ -24775,6 +24825,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29367,6 +29418,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29406,6 +29458,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  actually takes the MTP branch, not silently fall back"
             );
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29437,6 +29490,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29482,6 +29536,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29524,6 +29579,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29578,6 +29634,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29629,6 +29686,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = minimal_bpe_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 8,
                 temperature: 0.0,
                 top_k: 1,
@@ -30002,6 +30060,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// rather than pass on the wrong evidence.
         fn moe_rejection_gen_cfg() -> crate::generation::GenerateConfig {
             crate::generation::GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -30097,6 +30156,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30173,6 +30233,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30252,6 +30313,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = multibyte_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30330,6 +30392,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 8,
                 temperature: 0.0,
                 top_k: 1,
@@ -30422,6 +30485,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30515,6 +30579,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30617,6 +30682,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -31006,6 +31072,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 8,
                 temperature: 0.0,
                 top_k: 1,
@@ -31075,6 +31142,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 8,
                 temperature: 0.0,
                 top_k: 1,
@@ -31157,6 +31225,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 8,
                 temperature: 0.0,
                 top_k: 1,
@@ -31242,6 +31311,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 0,
                 temperature: 0.0,
                 top_k: 1,
@@ -31313,6 +31383,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -31360,6 +31431,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -31407,6 +31479,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -31462,6 +31535,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -31518,6 +31592,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 0,
                 temperature: 0.0,
                 top_k: 1,
@@ -31583,6 +31658,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 5,
                 temperature: 0.0,
                 top_k: 1,
@@ -31683,6 +31759,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = minimal_bpe_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -32942,8 +33019,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // boundary.  Skip lengths that exceed the model's max context.
             let sweep_lengths: &[usize] = &[1, 31, 32, 33, 64, 511, 512, 513, 1009];
 
-            // Evidence table: (len, all-position max_abs_diff, argmax flip count)
-            let mut evidence: Vec<(usize, f32, usize)> = Vec::new();
+            // Evidence table: (len, all-position max_abs_diff, argmax flip count, attempts used)
+            let mut evidence: Vec<(usize, f32, usize, usize)> = Vec::new();
             let mut any_flip = false;
 
             // The chunked scan is deterministic (gdn_chunked_b_vs_b_self_consistency), but
@@ -32995,7 +33072,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 // gdn_chunked_state_vs_serial_state_diff.
                 let mut best_max_abs = f32::MAX;
                 let mut best_flips = usize::MAX;
-                for _ in 0..ATTEMPTS {
+                let mut attempts_used = 0usize;
+                for attempt in 0..ATTEMPTS {
                     // Serial path (chunked OFF): per-position logits via all_logits.
                     state.use_gdn_chunked = false;
                     state.reset_state();
@@ -33024,6 +33102,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                             flips += 1;
                         }
                     }
+                    attempts_used = attempt + 1;
+                    eprintln!(
+                        "  len={n:4} attempt {attempt}: max_abs_diff={max_abs:.2e}  argmax_flips={flips}"
+                    );
 
                     if max_abs < best_max_abs {
                         best_max_abs = max_abs;
@@ -33035,9 +33117,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 }
 
                 eprintln!(
-                    "  len={n:4}: best-of-{ATTEMPTS} all-pos max_abs_diff={best_max_abs:.2e}  argmax_flips={best_flips}"
+                    "  len={n:4}: best-of-{attempts_used} all-pos max_abs_diff={best_max_abs:.2e}  argmax_flips={best_flips}"
                 );
-                evidence.push((n, best_max_abs, best_flips));
+                evidence.push((n, best_max_abs, best_flips, attempts_used));
                 if best_flips > 0 {
                     any_flip = true;
                 }
@@ -33047,9 +33129,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             state.use_gdn_chunked = true;
 
             eprintln!("Evidence table (boundary sweep, per-instance flag, no env mutation):");
-            eprintln!("  len | all-pos max_abs_diff | argmax_flips");
-            for (n, d, f) in &evidence {
-                eprintln!("  {n:4} | {d:.2e}             | {f}");
+            eprintln!("  len | all-pos max_abs_diff | argmax_flips | attempts");
+            for (n, d, f, a) in &evidence {
+                eprintln!("  {n:4} | {d:.2e}             | {f:<12} | {a}");
             }
 
             // Assert no argmax flips across all lengths and positions.
@@ -33060,7 +33142,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             // Assert all-position max_abs_diff stays within the evidence-based drift sentinel.
-            for (n, max_abs, _) in &evidence {
+            for (n, max_abs, _, _) in &evidence {
                 assert!(
                     *max_abs < MAX_ABS_BOUND,
                     "len={n}: all-position max_abs_diff={max_abs:.2e} exceeds #534 drift sentinel {MAX_ABS_BOUND:.2e}"
@@ -34737,6 +34819,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         fn cross_turn_test_gen_cfg(seed: u64, max_new_tokens: usize) -> GenerateConfig {
             GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens,
                 temperature: 0.0,
                 top_k: 1,
@@ -36450,6 +36533,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
@@ -36507,6 +36591,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
@@ -36578,6 +36663,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
@@ -36649,6 +36735,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
@@ -36933,6 +37020,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -37024,6 +37112,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .clone();
 
             let rejected_cfg = GenerateConfig {
+                min_p: 0.0,
                 logprobs: Some(0),
                 ..cross_turn_test_gen_cfg(9, 2)
             };
@@ -37086,6 +37175,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
 
             let gen_cfg = crate::generation::GenerateConfig {
+                min_p: 0.0,
                 enable_mtp: Some(true),
                 ..cross_turn_test_gen_cfg(1, 2)
             };
@@ -37153,6 +37243,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // logprobs + enable_mtp both set: logprobs must win (checked first).
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let both_capabilities_cfg = GenerateConfig {
+                min_p: 0.0,
                 enable_mtp: Some(true),
                 logprobs: Some(0),
                 ..cross_turn_test_gen_cfg(1, 2)
@@ -37177,6 +37268,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // tokenization discovers the prompt is empty).
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let logprobs_and_empty_cfg = GenerateConfig {
+                min_p: 0.0,
                 logprobs: Some(0),
                 ..cross_turn_test_gen_cfg(1, 2)
             };
@@ -37200,6 +37292,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // tokenization discovers the prompt is empty).
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let mtp_and_empty_cfg = GenerateConfig {
+                min_p: 0.0,
                 enable_mtp: Some(true),
                 ..cross_turn_test_gen_cfg(1, 2)
             };
@@ -37721,6 +37814,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     .expect("grammar engine builds over single-char vocab"),
             );
             crate::generation::GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens,
                 temperature: 0.0,
                 top_k: 1,
@@ -37766,6 +37860,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -37822,6 +37917,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -37886,6 +37982,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -38179,6 +38276,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -38233,6 +38331,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -38298,6 +38397,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,

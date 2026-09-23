@@ -282,7 +282,8 @@ impl<'a> IngestedTensor<'a> {
         }
     }
 
-    #[cfg(feature = "f16")]
+    // Used unconditionally by `f32_weights.rs`'s F16/BF16 materialization arms
+    // (always compiled) and, under the `f16` feature, by its F8 arms.
     pub(super) fn decoded_f32_known_finite(
         source: &'a str,
         tensor_name: &'a str,
