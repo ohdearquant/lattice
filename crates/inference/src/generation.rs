@@ -16,6 +16,7 @@
 //!
 //! Not to be confused with `model::qwen35::generation`, which is the Qwen CPU decode loop.
 
+use crate::error::InferenceError;
 use crate::grammar::GrammarEngine;
 use crate::model::qwen35::stop_strings::{
     StopStringMatcher, earliest_stop_match_from, stop_scan_search_start,
@@ -225,7 +226,12 @@ pub(crate) enum StepOutcome {
     /// per-step control (logprobs, reasoning-end capture, answer-budget
     /// accounting) has already been applied for it.
     Emitted {
-        /// The actually-emitted token id (post budget-override).
+        /// The actually-emitted token id (post budget-override). `driver::run`'s
+        /// production match arms destructure this variant with `{ answer_budget_exhausted, .. }`
+        /// (the driver already has the id from its own `candidate`/`session` bookkeeping), so
+        /// this field is read only by this module's own `transition`/`transition_with_metadata`
+        /// tests in a CPU production build.
+        #[allow(dead_code)]
         token_id: u32,
         /// Whether the answer-budget window has closed as of this token —
         /// the loop should break after this iteration (in addition to its
@@ -392,6 +398,15 @@ impl DecodePolicy {
     /// `false` for non-streaming callers (`Qwen35Model::generate`). An empty
     /// `stop_strings` always resolves to `Disabled` regardless of `streaming`.
     #[allow(clippy::too_many_arguments)]
+    // Row R03 (ADR-090) deleted every CPU production caller of the plain
+    // `init`/`transition` (the `generate_inline`/`decode_loop`/`decode_loop_with_stops`
+    // family): CPU production code now calls `init_with_metadata`/`transition_with_metadata`
+    // instead, which share this method's internals via `construct`/`transition_inner` but
+    // route metadata through a session rather than a direct logits slice. `init`/`transition`
+    // themselves stay byte-identical on purpose -- Metal's `metal_qwen35.rs` still calls them
+    // directly and is unbuildable/unverifiable outside the `metal-gpu` feature, so under a
+    // CPU-only (non-`metal-gpu`) build these are reachable only from this module's own tests.
+    #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
     pub(crate) fn init(
         gen_cfg: &GenerateConfig,
         think_close_id: Option<u32>,
@@ -402,13 +417,72 @@ impl DecodePolicy {
         first_generated_len: usize,
         streaming: bool,
     ) -> Self {
+        let policy = Self::construct(
+            gen_cfg,
+            think_close_id,
+            first_emitted_id,
+            first_generated_len,
+            streaming,
+        );
+        policy.record_logprob(token_logprobs, first_logits, first_emitted_id, temperature);
+        policy
+    }
+
+    /// Row R03 sibling of [`Self::init`], for callers that cannot hand over raw `logits`
+    /// (`decoder::driver::run`, whose `&mut dyn DecoderSession` has no logits accessor --
+    /// see that module's doc comment). Builds the identical policy state via the same
+    /// private [`Self::construct`] `init` uses, then records the first token's logprob (when
+    /// `gen_cfg.logprobs` requests it) through `record_metadata` instead of
+    /// `compute_step_logprobs` directly -- the caller's closure is expected to route to
+    /// `DecoderSession::metadata`, scored against the SAME prediction `first_emitted_id`'s
+    /// candidate came from, matching `init`'s "pre-advance scoring view" contract (D1).
+    /// `record_metadata` is never called when `gen_cfg.logprobs` is `None`, so a caller may
+    /// pass a closure that always reaches for the session without a redundant check of its
+    /// own.
+    pub(crate) fn init_with_metadata(
+        gen_cfg: &GenerateConfig,
+        think_close_id: Option<u32>,
+        token_logprobs: &mut Vec<TokenLogprob>,
+        first_emitted_id: u32,
+        first_generated_len: usize,
+        streaming: bool,
+        mut record_metadata: impl FnMut(u32, usize) -> Result<(f32, Vec<TopLogprob>), InferenceError>,
+    ) -> Result<Self, InferenceError> {
+        let policy = Self::construct(
+            gen_cfg,
+            think_close_id,
+            first_emitted_id,
+            first_generated_len,
+            streaming,
+        );
+        if let Some(top_n) = policy.logprobs {
+            let (logprob, top) = record_metadata(first_emitted_id, top_n)?;
+            token_logprobs.push(TokenLogprob {
+                token_id: first_emitted_id,
+                logprob,
+                top,
+            });
+        }
+        Ok(policy)
+    }
+
+    /// Shared construction, factored out of [`Self::init`] so [`Self::init_with_metadata`]
+    /// can build the identical policy state without also reproducing `init`'s
+    /// `compute_step_logprobs`-specific first-token recording.
+    fn construct(
+        gen_cfg: &GenerateConfig,
+        think_close_id: Option<u32>,
+        first_emitted_id: u32,
+        first_generated_len: usize,
+        streaming: bool,
+    ) -> Self {
         let thinking_closed = Some(first_emitted_id) == think_close_id;
         let reasoning_end_len = if thinking_closed {
             Some(first_generated_len)
         } else {
             None
         };
-        let policy = Self {
+        Self {
             reasoning_budget: gen_cfg.effective_reasoning_budget(),
             enable_thinking: gen_cfg.enable_thinking,
             max_new_tokens: gen_cfg.max_new_tokens,
@@ -417,9 +491,7 @@ impl DecodePolicy {
             thinking_closed,
             reasoning_end_len,
             stop_mode: StopMode::for_config(&gen_cfg.stop_strings, streaming),
-        };
-        policy.record_logprob(token_logprobs, first_logits, first_emitted_id, temperature);
-        policy
+        }
     }
 
     /// Total decode-loop iteration cap (`rb + max_new_tokens + 1` when budgeted,
@@ -497,7 +569,10 @@ impl DecodePolicy {
     ///
     /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`] / [`DecodePolicy::init`], which own the
-    /// full per-step ordering.
+    /// full per-step ordering. Row R03: those two are themselves
+    /// `metal-gpu`-only in a CPU production build (see the `cfg_attr` on
+    /// `init`'s own doc comment) -- this method inherits the same reachability.
+    #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
     fn record_logprob(
         &self,
         token_logprobs: &mut Vec<TokenLogprob>,
@@ -668,6 +743,10 @@ impl DecodePolicy {
     /// [`StepOutcome::Emitted`] once the token has been pushed and every
     /// remaining control, including a `Continue` stop-check, applied.
     #[allow(clippy::too_many_arguments)]
+    // Row R03: same `metal-gpu`-only-in-CPU-production-build reachability as
+    // `DecodePolicy::init` above -- see that method's doc comment. CPU
+    // production code now calls `transition_with_metadata` instead.
+    #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
     pub(crate) fn transition(
         &mut self,
         token_logprobs: &mut Vec<TokenLogprob>,
@@ -675,30 +754,117 @@ impl DecodePolicy {
         logits: &[f32],
         temperature: f32,
         generated_len_before: usize,
+        grammar_advance: impl FnMut(u32) -> bool,
+        is_eos: impl FnMut(u32) -> bool,
+        push: impl FnMut(u32),
+        decode_delta: impl FnMut(u32) -> String,
+        text: &mut String,
+        token_logprob_end_offsets: &mut Vec<usize>,
+        emit_confirmed: impl FnMut(&str, u32) -> bool,
+    ) -> StepOutcome {
+        self.transition_inner(
+            token_logprobs,
+            sampled_id,
+            generated_len_before,
+            grammar_advance,
+            is_eos,
+            push,
+            |token_id, top_n| Ok(compute_step_logprobs(logits, token_id, temperature, top_n)),
+            decode_delta,
+            text,
+            token_logprob_end_offsets,
+            emit_confirmed,
+        )
+        .expect(
+            "transition_inner's only Err path is a fallible record_metadata callback, and \
+             this closure (a direct compute_step_logprobs call) is infallible",
+        )
+    }
+
+    /// Row R03 sibling of [`Self::transition`], for callers that cannot hand over raw
+    /// `logits` (`decoder::driver::run` -- see that module's doc comment). Drives the exact
+    /// same [`Self::transition_inner`] engine `transition` drives, so every ordering
+    /// guarantee `transition`'s own doc comment states holds identically here: `grammar_advance`
+    /// and `record_metadata` are the two backend callbacks that route through the session
+    /// (`DecoderSession::advance_grammar` / `DecoderSession::metadata`), in the same fixed
+    /// positions `transition`'s callbacks occupy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transition_with_metadata(
+        &mut self,
+        token_logprobs: &mut Vec<TokenLogprob>,
+        sampled_id: u32,
+        generated_len_before: usize,
+        grammar_advance: impl FnMut(u32) -> bool,
+        is_eos: impl FnMut(u32) -> bool,
+        push: impl FnMut(u32),
+        record_metadata: impl FnMut(u32, usize) -> Result<(f32, Vec<TopLogprob>), InferenceError>,
+        decode_delta: impl FnMut(u32) -> String,
+        text: &mut String,
+        token_logprob_end_offsets: &mut Vec<usize>,
+        emit_confirmed: impl FnMut(&str, u32) -> bool,
+    ) -> Result<StepOutcome, InferenceError> {
+        self.transition_inner(
+            token_logprobs,
+            sampled_id,
+            generated_len_before,
+            grammar_advance,
+            is_eos,
+            push,
+            record_metadata,
+            decode_delta,
+            text,
+            token_logprob_end_offsets,
+            emit_confirmed,
+        )
+    }
+
+    /// The one per-step engine [`Self::transition`] and [`Self::transition_with_metadata`]
+    /// both drive, factored out so the fixed ordering (ADR-080 C3) is written exactly once.
+    /// `record_metadata(token_id, top_n)` replaces `transition`'s direct
+    /// `compute_step_logprobs(logits, ..)` call: it is called at the identical point in the
+    /// sequence (after `push`, before `capture_reasoning_end`) and ONLY when `self.logprobs`
+    /// is `Some(top_n)` -- a caller whose config has no `logprobs` set never has its closure
+    /// invoked, so `transition`'s wrapper closure (a direct, infallible
+    /// `compute_step_logprobs` call) and a driver's session-routed, fallible closure are both
+    /// safe to pass unconditionally.
+    #[allow(clippy::too_many_arguments)]
+    fn transition_inner(
+        &mut self,
+        token_logprobs: &mut Vec<TokenLogprob>,
+        sampled_id: u32,
+        generated_len_before: usize,
         mut grammar_advance: impl FnMut(u32) -> bool,
         mut is_eos: impl FnMut(u32) -> bool,
         mut push: impl FnMut(u32),
+        mut record_metadata: impl FnMut(u32, usize) -> Result<(f32, Vec<TopLogprob>), InferenceError>,
         mut decode_delta: impl FnMut(u32) -> String,
         text: &mut String,
         token_logprob_end_offsets: &mut Vec<usize>,
         mut emit_confirmed: impl FnMut(&str, u32) -> bool,
-    ) -> StepOutcome {
+    ) -> Result<StepOutcome, InferenceError> {
         let next_id = self.apply_override(generated_len_before, sampled_id);
 
         if !grammar_advance(next_id) {
-            return StepOutcome::GrammarStop;
+            return Ok(StepOutcome::GrammarStop);
         }
 
         self.note_emitted(next_id);
 
         if is_eos(next_id) {
-            return StepOutcome::Eos;
+            return Ok(StepOutcome::Eos);
         }
 
         push(next_id);
         let generated_len_after = generated_len_before + 1;
 
-        self.record_logprob(token_logprobs, logits, next_id, temperature);
+        if let Some(top_n) = self.logprobs {
+            let (logprob, top) = record_metadata(next_id, top_n)?;
+            token_logprobs.push(TokenLogprob {
+                token_id: next_id,
+                logprob,
+                top,
+            });
+        }
         self.capture_reasoning_end(generated_len_after);
 
         let delta = decode_delta(next_id);
@@ -710,15 +876,15 @@ impl DecodePolicy {
             |s| emit_confirmed(s, next_id),
         );
         match stop_outcome {
-            StopCheckOutcome::Stopped => return StepOutcome::Stopped,
-            StopCheckOutcome::Interrupted => return StepOutcome::Interrupted,
+            StopCheckOutcome::Stopped => return Ok(StepOutcome::Stopped),
+            StopCheckOutcome::Interrupted => return Ok(StepOutcome::Interrupted),
             StopCheckOutcome::Continue => {}
         }
 
-        StepOutcome::Emitted {
+        Ok(StepOutcome::Emitted {
             token_id: next_id,
             answer_budget_exhausted: self.answer_budget_exhausted(generated_len_after),
-        }
+        })
     }
 
     /// Natural-end flush (decode loop ended by cap/EOS/grammar-stop, not by

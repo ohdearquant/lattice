@@ -1,46 +1,51 @@
-//! The autoregressive driver (ADR-090 D1/D2, row C): one loop over `&mut dyn
-//! DecoderSession` that drives the existing [`DecodePolicy`] unchanged.
+//! The autoregressive driver (ADR-090 D1/D2, row C; grammar/logprobs routing
+//! added by row R03): one loop over `&mut dyn DecoderSession` that drives the
+//! existing [`DecodePolicy`] unchanged -- every canonical Qwen3.5 CPU
+//! generate/stream request now runs through this driver, no exceptions.
 //!
-//! **Scope, stated once here rather than at every call site.** This driver
-//! does not route grammar-constrained decoding, and callers must not invoke it
-//! with `gen_cfg.grammar.is_some()` (checked with a `debug_assert!` below, and
-//! enforced at the dispatch point in `model::qwen35::generation` by routing a
-//! set `grammar` to the pre-existing inline implementation instead). Two
-//! independent facts force this, not one:
+//! **Grammar.** Masking happens inside the session's own `select` (over logits
+//! this module still cannot see -- D1 forbids downcasting to reach them), against
+//! a `GrammarState` the session owns across its lifetime (constructed once,
+//! mutated by every `select`/`advance_grammar` call -- see `QwenCpuSession`'s
+//! module doc comment). Advance runs inside `DecodePolicy::transition_with_metadata`'s
+//! fixed internal order, before the EOS check, via the `grammar_advance` callback
+//! this driver wires to [`DecoderSession::advance_grammar`]. Step 0 (the
+//! prefill-derived first token) has no `transition` call of its own to route
+//! this through -- `DecodePolicy::init`/`init_with_metadata` build the policy but
+//! run no per-step control sequence -- so this driver makes the identical
+//! `advance_grammar` call directly, in the same position `generate_inline`'s
+//! manual code made it (mask -> sample -> **advance** -> EOS check -> push).
 //!
-//! 1. Grammar *masking* needs mutable access to a `GrammarState` at the exact
-//!    point a candidate is sampled, which happens inside `QwenCpuSession::select`
-//!    over logits this module cannot see (`&mut dyn DecoderSession` has no
-//!    such accessor, and D1 forbids downcasting to reach one).
-//! 2. Grammar *advance* must run inside `DecodePolicy::transition`'s fixed
-//!    internal order, before the EOS check -- which means it has to be a
-//!    closure this driver passes to `transition`, and that closure would need
-//!    to reach the *same* mutable `GrammarState` `select` used, across a call
-//!    the driver does not own. Nothing in the row-A trait provides that reach
-//!    without adding a method to it, which is a real API decision this row
-//!    does not make unilaterally.
+//! **Logprobs.** `DecodePolicy::init_with_metadata` / `transition_with_metadata`
+//! (row R03 siblings of `init`/`transition`, sharing the same private engine --
+//! see `crate::generation`) take a `record_metadata` callback instead of raw
+//! `logits: &[f32]`, called at the identical point in the fixed order
+//! (`init`'s / `transition`'s own doc comments) and ONLY when
+//! `gen_cfg.logprobs` is `Some`. This driver's callback routes to
+//! [`DecoderSession::metadata`], scored against the SAME prediction the
+//! actually-emitted token's candidate came from -- D1's "Metadata identity"
+//! role (the final token scored against the prediction's pre-advance view).
 //!
-//! This driver also does not route `gen_cfg.logprobs.is_some()`, for a
-//! narrower version of the same reason: `DecodePolicy::init`/`transition`
-//! (unchanged, per this row's own constraint) take raw `logits: &[f32]`
-//! directly, and `&mut dyn DecoderSession` exposes no way to read the logits
-//! a `select()` call just sampled from. Where `gen_cfg.logprobs.is_none()` is
-//! asserted at entry, this driver passes an empty, never-read slice for that
-//! parameter -- `DecodePolicy::record_logprob`'s own body returns before
-//! touching it whenever `self.logprobs` is `None` (`crate::generation`,
-//! `record_logprob`'s `let Some(top_n) = self.logprobs else { return; }`).
-//!
-//! Both gaps are named, not silently absorbed: see the row's report for why
-//! neither is exercised by the golden or by any pre-existing decode-loop-level
-//! test (grammar's own regression test only covers the pre-loop masking site
-//! this row does not touch; no test anywhere sets `logprobs` through the
-//! two loop helpers this row replaces).
-use super::{AcceptedToken, Cancellation, DecoderSession, FinishDisposition, SelectionRequest};
+//! **The `ended_without_reopening` trace exception.** The driver's standing
+//! invariant is `consumed == opened - 1` (see the comment above the final
+//! `debug_assert_eq!` below for the full derivation). Mid-loop grammar
+//! exhaustion (`SelectOutcome::GrammarExhausted` returned from a `select` that
+//! runs *after* that iteration's `decode()`) is the one termination mode that
+//! does not fit it: `decode()` already ran (`consumed` incremented), but the
+//! failed `select()` opened no new prediction, leaving `opened == consumed`
+//! instead of `consumed + 1`. `ended_without_reopening` flags exactly this one
+//! path so the final assertion can state both invariants instead of silently
+//! weakening the general one.
+use super::{
+    AcceptedToken, Cancellation, DecoderSession, FinishDisposition, MetadataRequest, SelectOutcome,
+    SelectionRequest,
+};
 use crate::error::InferenceError;
 use crate::generation::{
     DecodePolicy, GenerateConfig, StepOutcome, StopCheckOutcome, TokenLogprob,
 };
 use crate::stop_reason::StopReason;
+use std::cell::RefCell;
 
 /// Ledger-transition counters the driver maintains as it runs: one prediction
 /// is opened per `select` call, one is consumed per `decode` call. ADR-090
@@ -114,14 +119,18 @@ pub(crate) fn run(
     mut on_prefill_end: impl FnMut(),
     finish_tail: impl FnOnce() -> String,
 ) -> Result<DriverResult, InferenceError> {
-    debug_assert!(
-        gen_cfg.grammar.is_none() && gen_cfg.logprobs.is_none(),
-        "decoder::driver::run does not route grammar or logprobs; see the module doc comment"
-    );
     // D3: capabilities are negotiated per session, and "one driver over many sessions" (D1)
     // means a session that does not declare a control this call actually uses is a caller
     // bug, not this driver's problem to route around silently.
     let caps = *session.capabilities();
+    debug_assert!(
+        caps.grammar || gen_cfg.grammar.is_none(),
+        "session does not declare grammar support but gen_cfg.grammar is set"
+    );
+    debug_assert!(
+        caps.logprobs || gen_cfg.logprobs.is_none(),
+        "session does not declare logprobs support but gen_cfg.logprobs is set"
+    );
     debug_assert!(
         caps.stop_strings || gen_cfg.stop_strings.is_empty(),
         "session does not declare stop_strings support but gen_cfg.stop_strings is set"
@@ -130,6 +139,15 @@ pub(crate) fn run(
         caps.reasoning_budget || gen_cfg.reasoning_budget.is_none(),
         "session does not declare reasoning_budget support but gen_cfg.reasoning_budget is set"
     );
+
+    // `RefCell<&mut dyn DecoderSession>`: `grammar_advance` and `record_metadata` below are
+    // two independent closures that both need mutable session access, passed as sibling
+    // arguments to the same `transition_with_metadata` call -- two simultaneous `&mut
+    // session` captures the borrow checker rejects outright, even though the closures are
+    // only ever called sequentially, never concurrently. Same pattern this crate already
+    // uses for the identical shape (`FnMutCancellation`, `on_raw_event_cell`, `detok_cell` in
+    // `model::qwen35::generation`'s `generate_streaming_via_driver`).
+    let session = RefCell::new(session);
 
     // Cancellation checkpoint 1/3 (mirrors the pre-migration streaming entry's own
     // first checkpoint): before the prefill pass starts, so a client that already
@@ -150,7 +168,7 @@ pub(crate) fn run(
         });
     }
     let cancel_never = || false;
-    session.prefill(&cancel_never)?;
+    session.borrow_mut().prefill(&cancel_never)?;
     on_prefill_end();
 
     // Checkpoint 2/3: immediately after the prefill pass returns -- fired after
@@ -172,22 +190,66 @@ pub(crate) fn run(
     let mut all_ids: Vec<u32> = prompt_ids.to_vec();
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
-    // Never read: `record_logprob` no-ops whenever `self.logprobs` is `None`,
-    // which is asserted above for every call this driver makes.
-    let no_logits: Vec<f32> = Vec::new();
     let is_eos = |id: u32| id == eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
     // --- Step 0: the prefill-derived first token. ---
     let request0 = SelectionRequest {
         config: gen_cfg,
         history: &all_ids,
-        grammar: None,
     };
-    let candidate0 = session.select(&request0)?;
+    let outcome0 = session.borrow_mut().select(&request0)?;
+    let candidate0 = match outcome0 {
+        // Blocked before any sample, and the grammar state is already a valid accept
+        // state -- generate_inline's identical step-0 branch: no token is ever
+        // sampled, so this is `stopped: true` (a completed grammar, not a rejected
+        // one), unlike the advance-rejection case below. No prediction was opened
+        // (`select` returned before calling `PredictionLedger::open`), so `trace`
+        // stays at its untouched default -- there is nothing for the final
+        // `debug_assert_eq!` to reconcile because this return skips it entirely,
+        // exactly like the EOS-at-step-0 return below.
+        SelectOutcome::GrammarExhausted => {
+            session.borrow_mut().finish(FinishDisposition::Reusable)?;
+            return Ok(DriverResult {
+                generated_ids: Vec::new(),
+                token_logprobs: Vec::new(),
+                stopped: true,
+                stop_reason: StopReason::Grammar,
+                confirmed_stop_string_match: false,
+                trace,
+            });
+        }
+        SelectOutcome::Candidate(c) => c,
+    };
     trace.opened += 1;
 
+    // Grammar advance on the sampled candidate: generate_inline's manual
+    // mask -> sample -> **advance** -> [reject: stopped=false] ->
+    // is_complete_without_continuation -> EOS check -> push sequence. Step 0 has no
+    // `transition` call to route this through (`DecodePolicy::init`/`init_with_metadata`
+    // build the policy but run no per-step control sequence), so this driver makes the
+    // identical call directly, in the same position. `grammar_output`'s `stop_reason` is
+    // unconditionally `Grammar` regardless of its `stopped` argument (see
+    // `model::qwen35::generation::grammar_output`), which this mirrors: a rejected
+    // candidate at step 0 is `stopped: false` (no completed grammar, nothing to answer
+    // with) -- distinct from the exhaustion-before-sampling case above.
+    if !session
+        .borrow_mut()
+        .advance_grammar(candidate0.candidate_id)
+    {
+        session.borrow_mut().finish(FinishDisposition::Reusable)?;
+        return Ok(DriverResult {
+            generated_ids: Vec::new(),
+            token_logprobs: Vec::new(),
+            stopped: false,
+            stop_reason: StopReason::Grammar,
+            confirmed_stop_string_match: false,
+            trace,
+        });
+    }
+    let grammar_complete_at_step0 = session.borrow().grammar_complete_without_continuation();
+
     if is_eos(candidate0.candidate_id) {
-        session.finish(FinishDisposition::Reusable)?;
+        session.borrow_mut().finish(FinishDisposition::Reusable)?;
         return Ok(DriverResult {
             generated_ids: Vec::new(),
             token_logprobs: Vec::new(),
@@ -201,16 +263,27 @@ pub(crate) fn run(
     generated_ids.push(candidate0.candidate_id);
     all_ids.push(candidate0.candidate_id);
 
-    let mut policy = DecodePolicy::init(
+    let candidate0_prediction = candidate0.prediction;
+    let mut policy = DecodePolicy::init_with_metadata(
         gen_cfg,
         think_close_id,
         &mut token_logprobs,
         candidate0.candidate_id,
-        &no_logits,
-        gen_cfg.temperature,
         generated_ids.len(),
         streaming,
-    );
+        |final_token, top_n| {
+            session
+                .borrow_mut()
+                .metadata(
+                    candidate0_prediction,
+                    final_token,
+                    &MetadataRequest {
+                        top_logprobs: Some(top_n),
+                    },
+                )
+                .map(|m| (m.final_logprob, m.top))
+        },
+    )?;
 
     // `pending` is the one prediction that has been opened (via `select`) but
     // not yet consumed (via `decode`). The loop below consumes the PREVIOUS
@@ -228,7 +301,7 @@ pub(crate) fn run(
         |s| emit_confirmed(s, candidate0.candidate_id),
     ) {
         StopCheckOutcome::Stopped => {
-            session.finish(FinishDisposition::Reusable)?;
+            session.borrow_mut().finish(FinishDisposition::Reusable)?;
             return Ok(DriverResult {
                 generated_ids,
                 token_logprobs,
@@ -239,7 +312,7 @@ pub(crate) fn run(
             });
         }
         StopCheckOutcome::Interrupted => {
-            session.finish(FinishDisposition::Reusable)?;
+            session.borrow_mut().finish(FinishDisposition::Reusable)?;
             return Ok(DriverResult {
                 generated_ids,
                 token_logprobs,
@@ -253,90 +326,145 @@ pub(crate) fn run(
     }
 
     let cap = policy.cap();
-    let mut stopped = false;
-    let mut stop_reason = StopReason::Length;
+    // Set when step 0's advance succeeded AND immediately completed the grammar with
+    // no further continuation (generate_inline's step-0 `grammar_complete` branch,
+    // checked after `check_initial_stop` so a stop-string match still takes
+    // precedence, matching the legacy ordering exactly). The loop is skipped
+    // entirely and execution falls through to the natural-end tail-flush code below,
+    // exactly as `generate_inline`'s manual `if grammar_complete { return ... }`
+    // does -- except here the return is deferred to the bottom of this function so
+    // the SAME tail-flush/finish sequence every other natural end uses applies here
+    // too, rather than a third hand-written copy of it.
+    let mut stopped = grammar_complete_at_step0;
+    let mut stop_reason = if grammar_complete_at_step0 {
+        StopReason::Grammar
+    } else {
+        StopReason::Length
+    };
     let mut confirmed_stop_string_match = false;
+    // Flags the one termination mode whose trace relationship is `opened == consumed`
+    // rather than the standing `opened == consumed + 1` -- see the module doc comment.
+    let mut ended_without_reopening = false;
 
-    for _ in 1..cap {
-        // Checkpoint 3/3: top of every decode iteration, before this step's
-        // forward pass -- mirrors the pre-migration streaming entry's per-iteration
-        // checkpoint exactly (checked before `forward_step`, every iteration).
-        if cancel.is_cancelled() {
-            stop_reason = StopReason::Interrupt;
-            break;
-        }
-        let accepted = AcceptedToken {
-            final_id: *all_ids
-                .last()
-                .expect("all_ids holds the prompt plus at least the step-0 token"),
-            prediction: pending,
-        };
-        session.decode(&accepted, &cancel_never)?;
-        trace.consumed += 1;
-
-        let request = SelectionRequest {
-            config: gen_cfg,
-            history: &all_ids,
-            grammar: None,
-        };
-        let candidate = session.select(&request)?;
-        trace.opened += 1;
-
-        let generated_len_before = generated_ids.len();
-        let outcome = policy.transition(
-            &mut token_logprobs,
-            candidate.candidate_id,
-            &no_logits,
-            gen_cfg.temperature,
-            generated_len_before,
-            |_next_id| true, // no grammar on this path; see the module doc comment
-            &is_eos,
-            |next_id| {
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-            },
-            &mut decode_delta,
-            text,
-            token_logprob_end_offsets,
-            |s, id| emit_confirmed(s, id),
-        );
-
-        match outcome {
-            StepOutcome::GrammarStop => {
-                // Unreachable on this path (`grammar_advance` above always
-                // returns `true`), handled for exhaustiveness.
-                stopped = true;
-                stop_reason = StopReason::Grammar;
-                break;
-            }
-            StepOutcome::Eos => {
-                stopped = true;
-                stop_reason = StopReason::Eos;
-                break;
-            }
-            StepOutcome::Stopped => {
-                stopped = true;
-                confirmed_stop_string_match = true;
-                stop_reason = StopReason::Eos;
-                break;
-            }
-            StepOutcome::Interrupted => {
-                // Unreachable for `generate()`'s two non-streaming callers (their
-                // `emit_confirmed` always returns `true`); reachable for the
-                // streaming caller, whose `emit_confirmed` forwards `on_token`'s
-                // return value -- a caller that can no longer consume the stream
-                // (e.g. a dropped SSE receiver) stops generation here, same as the
-                // pre-migration streaming loop.
+    if !grammar_complete_at_step0 {
+        for _ in 1..cap {
+            // Checkpoint 3/3: top of every decode iteration, before this step's
+            // forward pass -- mirrors the pre-migration streaming entry's per-iteration
+            // checkpoint exactly (checked before `forward_step`, every iteration).
+            if cancel.is_cancelled() {
                 stop_reason = StopReason::Interrupt;
                 break;
             }
-            StepOutcome::Emitted {
-                answer_budget_exhausted,
-                ..
-            } => {
-                pending = candidate.prediction;
-                if answer_budget_exhausted {
+            let accepted = AcceptedToken {
+                final_id: *all_ids
+                    .last()
+                    .expect("all_ids holds the prompt plus at least the step-0 token"),
+                prediction: pending,
+            };
+            session.borrow_mut().decode(&accepted, &cancel_never)?;
+            trace.consumed += 1;
+
+            let request = SelectionRequest {
+                config: gen_cfg,
+                history: &all_ids,
+            };
+            let outcome = session.borrow_mut().select(&request)?;
+            let candidate = match outcome {
+                // Mid-loop mirror of `decode_loop`/`decode_loop_with_stops`'s
+                // mask-blocked-and-complete branch: no new prediction was opened this
+                // iteration, so `trace.opened` stays where it was -- exactly matching
+                // `trace.consumed` (this iteration's `decode()` did run), not the
+                // standing `consumed + 1` invariant. `ended_without_reopening` flags
+                // this for the final assertion below.
+                SelectOutcome::GrammarExhausted => {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    ended_without_reopening = true;
                     break;
+                }
+                SelectOutcome::Candidate(c) => c,
+            };
+            trace.opened += 1;
+
+            let generated_len_before = generated_ids.len();
+            let candidate_prediction = candidate.prediction;
+            let outcome = policy.transition_with_metadata(
+                &mut token_logprobs,
+                candidate.candidate_id,
+                generated_len_before,
+                |next_id| session.borrow_mut().advance_grammar(next_id),
+                &is_eos,
+                |next_id| {
+                    generated_ids.push(next_id);
+                    all_ids.push(next_id);
+                },
+                |final_token, top_n| {
+                    session
+                        .borrow_mut()
+                        .metadata(
+                            candidate_prediction,
+                            final_token,
+                            &MetadataRequest {
+                                top_logprobs: Some(top_n),
+                            },
+                        )
+                        .map(|m| (m.final_logprob, m.top))
+                },
+                &mut decode_delta,
+                text,
+                token_logprob_end_offsets,
+                |s, id| emit_confirmed(s, id),
+            )?;
+
+            match outcome {
+                StepOutcome::GrammarStop => {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
+                }
+                StepOutcome::Eos => {
+                    stopped = true;
+                    stop_reason = StopReason::Eos;
+                    break;
+                }
+                StepOutcome::Stopped => {
+                    stopped = true;
+                    confirmed_stop_string_match = true;
+                    stop_reason = StopReason::Eos;
+                    break;
+                }
+                StepOutcome::Interrupted => {
+                    // Unreachable for `generate()`'s two non-streaming callers (their
+                    // `emit_confirmed` always returns `true`); reachable for the
+                    // streaming caller, whose `emit_confirmed` forwards `on_token`'s
+                    // return value -- a caller that can no longer consume the stream
+                    // (e.g. a dropped SSE receiver) stops generation here, same as the
+                    // pre-migration streaming loop.
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
+                StepOutcome::Emitted {
+                    answer_budget_exhausted,
+                    ..
+                } => {
+                    pending = candidate.prediction;
+                    // Mirrors `decode_loop`/`decode_loop_with_stops`'s post-`Emitted`
+                    // `grammar_complete_without_continuation` check, run BEFORE the
+                    // answer-budget check -- proactively catching a grammar that just
+                    // reached an accepting state with no legal continuation, rather
+                    // than waiting for the next iteration's `select` to discover the
+                    // same thing via `SelectOutcome::GrammarExhausted`. This path opened
+                    // a real prediction this iteration (`trace.opened` above), so the
+                    // standing `opened == consumed + 1` invariant holds here --
+                    // `ended_without_reopening` is not set.
+                    if session.borrow().grammar_complete_without_continuation() {
+                        stopped = true;
+                        stop_reason = StopReason::Grammar;
+                        break;
+                    }
+                    if answer_budget_exhausted {
+                        break;
+                    }
                 }
             }
         }
@@ -358,11 +486,22 @@ pub(crate) fn run(
     // So the driver's standing invariant is `consumed == opened - 1`, and on a
     // natural finish `opened == generated_ids.len()`. A step routed around the
     // driver leaves BOTH short, which is what makes the trace a bypass detector.
-    debug_assert_eq!(
-        trace.consumed + 1,
-        trace.opened,
-        "exactly one prediction is open when the loop ends"
-    );
+    // `ended_without_reopening` (module doc comment) is the one termination mode
+    // that legitimately breaks this: a mid-loop `SelectOutcome::GrammarExhausted`
+    // runs `decode()` (incrementing `consumed`) but opens no new prediction, so
+    // `opened == consumed` there instead of `consumed + 1`.
+    if ended_without_reopening {
+        debug_assert_eq!(
+            trace.consumed, trace.opened,
+            "mid-loop grammar exhaustion opens no new prediction the iteration it fires"
+        );
+    } else {
+        debug_assert_eq!(
+            trace.consumed + 1,
+            trace.opened,
+            "exactly one prediction is open when the loop ends"
+        );
+    }
 
     // Final flush of the natural end, run through the SAME `StopMode` matcher the
     // loop above used -- mirrors the pre-migration streaming loop's own
@@ -379,7 +518,11 @@ pub(crate) fn run(
     // loop's `stopped_by_caller` gate, which it also sets on cancel).
     // Non-streaming callers pass a `finish_tail` returning an empty string AND run
     // in `StopMode::FullScan`, where `finish_stop` does nothing -- they do their own
-    // post-return tail handling.
+    // post-return tail handling. Also covers the step-0 grammar-complete case: its
+    // `decode_delta`/`check_initial_stop` call above already pushed the first
+    // token's decoded text into `text` (or into the throwaway buffer, for the
+    // fast/no-stop-strings path -- see `generate_via_driver`), so this flush behaves
+    // identically to a one-token natural end reached via the loop.
     if stop_reason != StopReason::Interrupt && !confirmed_stop_string_match {
         let tail = finish_tail();
         // The id here is never read: every `emit_confirmed` this driver's callers
@@ -393,7 +536,7 @@ pub(crate) fn run(
         }
     }
 
-    session.finish(FinishDisposition::Reusable)?;
+    session.borrow_mut().finish(FinishDisposition::Reusable)?;
 
     Ok(DriverResult {
         generated_ids,
