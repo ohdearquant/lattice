@@ -244,7 +244,7 @@ fn build_softmax_probs(adjusted: &[f32], indices: &[usize]) -> Option<Vec<(usize
     if !max_logit.is_finite() {
         return None;
     }
-    let mut probs: Vec<(usize, f32)> = indices
+    let probs: Vec<(usize, f32)> = indices
         .iter()
         .map(|&i| (i, (adjusted[i] - max_logit).exp()))
         .collect();
@@ -254,12 +254,27 @@ fn build_softmax_probs(adjusted: &[f32], indices: &[usize]) -> Option<Vec<(usize
     if !sum.is_finite() || sum <= 0.0 {
         return None;
     }
-    for (_, p) in &mut probs {
-        *p /= sum;
-    }
+    // Deliberately NOT normalized here (issue #1454 / duplicate #1473): `probs`
+    // is returned as raw, unnormalized softmax weights `exp(logit - max_logit)`,
+    // so the top survivor's weight is always exactly 1.0 (`exp(0.0)`).
+    // Normalization happens exactly once, in `apply_min_p`, after any min-p
+    // truncation -- mirroring `CandidateSet::sample_min_p_top_p_with_scratch`,
+    // which filters on these same unnormalized weights and normalizes a single
+    // time. The prior shape normalized here AND again in `apply_min_p` after
+    // truncation; both computed the same real-valued quotient, but through two
+    // f32 divisions instead of one, and the extra rounding step could move a
+    // cumulative sum across the draw threshold at f32 CDF boundaries relative
+    // to the engine, which never takes the extra step.
     Some(probs)
 }
 
+/// Truncate to survivors whose unnormalized weight is >= `min_p` relative to
+/// the top candidate (whose weight from `build_softmax_probs` is always
+/// exactly 1.0, so `probs[0].1 * min_p` below evaluates to exactly `min_p`),
+/// then normalize exactly once from the (possibly truncated) raw weights.
+/// Matches `CandidateSet::sample_min_p_top_p_with_scratch`: filter on
+/// unnormalized weights, normalize a single time, whether or not min-p
+/// truncated anything.
 #[cfg(test)]
 fn apply_min_p(probs: &mut Vec<(usize, f32)>, min_p: f32) {
     let min_p = if min_p.is_nan() {
@@ -267,20 +282,26 @@ fn apply_min_p(probs: &mut Vec<(usize, f32)>, min_p: f32) {
     } else {
         min_p.clamp(0.0, 1.0)
     };
-    if min_p == 0.0 || probs.is_empty() {
-        return;
+    if min_p > 0.0 && !probs.is_empty() {
+        let threshold = probs[0].1 * min_p;
+        let cutoff = probs
+            .iter()
+            .position(|&(_, weight)| weight < threshold)
+            .unwrap_or(probs.len())
+            .max(1);
+        probs.truncate(cutoff);
     }
 
-    let threshold = probs[0].1 * min_p;
-    let cutoff = probs
-        .iter()
-        .position(|&(_, probability)| probability < threshold)
-        .unwrap_or(probs.len())
-        .max(1);
-    probs.truncate(cutoff);
-    let sum: f32 = probs.iter().map(|(_, probability)| probability).sum();
-    for (_, probability) in probs {
-        *probability /= sum;
+    // `build_softmax_probs` already validated that the full-population sum of
+    // these unnormalized weights is finite and positive. Every individual
+    // weight is `exp(x)` for `x <= 0` (since `max_logit` is the maximum over
+    // this same index set), so each is in `(0, 1]` -- never non-finite -- and
+    // the `.max(1)` above guarantees at least the top survivor (weight 1.0)
+    // remains. A sum over any non-empty subset of such weights is therefore
+    // always finite and >= 1.0; no fallback branch is reachable here.
+    let sum: f32 = probs.iter().map(|(_, weight)| weight).sum();
+    for (_, weight) in probs.iter_mut() {
+        *weight /= sum;
     }
 }
 
@@ -1067,6 +1088,71 @@ mod tests {
             tokens_opt.contains(&4),
             "token 4 must be selectable once the penalty pushes token 3 below it \
              in the top-k ranking (test would be vacuous otherwise)"
+        );
+    }
+
+    /// Regression test for issue #1454 (duplicate: #1473): a fixed boundary
+    /// construction at which the reference oracle's `apply_min_p` used to
+    /// diverge from BOTH engine paths, because it normalized the softmax
+    /// distribution once in `build_softmax_probs` and again after min-p
+    /// truncation. The two divisions compute the same real-valued quotient as
+    /// the engine's single division, but the extra f32 rounding step moved a
+    /// cumulative sum across the draw threshold at this exact seed/logit/min_p
+    /// combination: pre-fix, `sample_token_reference` returned token 1 while
+    /// both `Sampler::sample` and `sample_full_logits` (independently) agreed
+    /// on token 0 -- proving the two production engine paths were already
+    /// self-consistent and the oracle was the outlier, not the engine.
+    ///
+    /// Mutation-sensitive: reverting `apply_min_p`/`build_softmax_probs` to
+    /// normalize twice reproduces `reference_token == 1` and fails this
+    /// assertion; verified by reverse-applying the fix (see the leg report).
+    #[test]
+    fn min_p_reference_oracle_matches_engine_at_f32_cdf_boundary_1454() {
+        use crate::sampling::{Sampler, SamplingConfig};
+
+        let logits = [-3.3551474_f32, -2.813463_f32];
+        let min_p = 0.4651115_f32;
+        let seed = 0xfe10_e067_caad_7327_u64;
+        let cfg = GenerateConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+
+        let mut sampler = Sampler::new(SamplingConfig {
+            temperature: cfg.temperature,
+            top_k: cfg.top_k,
+            top_p: cfg.top_p,
+            repetition_penalty: cfg.repetition_penalty,
+        })
+        .with_seed(seed)
+        .with_min_p(min_p);
+        let sampler_token = sampler.sample(&logits);
+
+        let mut optimized_rng = seed;
+        let optimized_token =
+            crate::sampling::sample_full_logits(&logits, &cfg, &[], &mut optimized_rng, min_p, 0.0);
+
+        let mut reference_rng = seed;
+        let reference_token =
+            sample_token_reference(&logits, &cfg, &[], &mut reference_rng, min_p, 0.0);
+
+        assert_eq!(
+            sampler_token, optimized_token,
+            "canonical Sampler and the optimized engine must agree with each \
+             other independently of the reference oracle"
+        );
+        assert_eq!(
+            optimized_token, 0,
+            "the engine must select token 0 at this boundary (sanity check on \
+             the fixed construction, so a change to this constant is visible)"
+        );
+        assert_eq!(
+            reference_token, optimized_token,
+            "the reference oracle must match the engine at this f32 CDF \
+             boundary; a double-normalizing apply_min_p returns token 1 here"
         );
     }
 }
