@@ -1299,6 +1299,46 @@ class RuntimeContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(calls, ["inference", "embed"])
 
+    def test_bench_command_forwards_entrypoint_to_self_supervising_python_target(self):
+        """bench-command.sh must pass --entrypoint to bench_supervision.py.
+
+        Without it, a wrapped command that is itself a self-supervising
+        Python entry point (one that calls ensure_python_entrypoint, like
+        scripts/bench_linkedin_post.py) sees LATTICE_BENCH_LOCK_STATUS and
+        concludes a supervisor is already present, then refuses because the
+        liveness pipe it looks for (LATTICE_BENCH_SUPERVISOR_FD) was never
+        created for it.
+        """
+        with _SupervisorSandbox() as sb:
+            wrapper = sb.root / "scripts" / "bench-command.sh"
+            shutil.copy2(REPO / "scripts" / "bench-command.sh", wrapper)
+            marker = Path(sb.tmp.name) / "self-supervising-target-ran"
+            target = sb.root / "scripts" / "self_supervising_target.py"
+            target.write_text(
+                "import sys\n"
+                f"sys.path.insert(0, {str(sb.helper.parent)!r})\n"
+                "from bench_supervision import ensure_python_entrypoint\n"
+                "ensure_python_entrypoint('fixture-target')\n"
+                f"open({str(marker)!r}, 'w').write('ran')\n"
+            )
+            env = {**os.environ}
+            for name in (
+                "LATTICE_BENCH_LOCK_STATUS",
+                "LATTICE_BENCH_LOCK_FDS",
+                "LATTICE_BENCH_SUPERVISOR_FD",
+            ):
+                env.pop(name, None)
+            result = subprocess.run(
+                ["bash", str(wrapper), "--label", "fixture", "--", sys.executable, str(target)],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("LATTICE_BENCH_SUPERVISOR_FD is not set", result.stderr)
+            self.assertTrue(marker.exists())
+
     def test_recipe_outcome_one_is_not_reclassified_as_supervision_failure(self):
         with _SupervisorSandbox() as sb:
             entrypoint = sb.root / "scripts" / "outcome_entrypoint.sh"
