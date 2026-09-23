@@ -14,6 +14,7 @@ src/bin/bench_gdn_prefill_ab.rs	crate::forward::metal_qwen35::inner::bench_suppo
 src/bin/bench_gdn_prefill_ab.rs	crate::forward::metal_qwen35::inner::bench_support::max_prefill
 src/bin/bench_gdn_prefill_ab.rs	crate::forward::metal_qwen35::inner::bench_support::vocab_size
 src/bin/bench_gdn_prefill_ab.rs	crate::forward::metal_qwen35::MetalQwen35State
+src/bin/bench_gdn_prefill_ab.rs	crate::model::qwen35_config::Qwen35Config
 src/bin/bench_gdn_prefill_ab.rs	crate::model::qwen35::model::Qwen35Model
 src/bin/bench_logit_dump.rs	crate::forward::metal_qwen35::MetalQwen35State
 src/bin/bench_logit_dump.rs	crate::model::qwen35_config::Qwen35Config
