@@ -199,8 +199,8 @@ Three ways to get `lattice`, in order of convenience:
 **1. `cargo install` (from [crates.io](https://crates.io/crates/lattice-inference)):**
 
 ```bash
-# CPU build (Linux/macOS). f16 is required to load the BF16/F16 safetensors
-# that HuggingFace checkpoints ship in.
+# CPU build (Linux/macOS). BF16/F16 safetensors load in every feature set;
+# the f16 feature adds F8_E4M3/F8_E5M2 tensor loading and no dependencies.
 cargo install lattice-inference --bin lattice --features f16
 
 # With Metal GPU (macOS only)
@@ -242,8 +242,8 @@ for a few versions ([#633](https://github.com/ohdearquant/lattice/issues/633)).
 git clone https://github.com/ohdearquant/lattice
 cd lattice
 
-# CLI binary (chat + serve). The f16 feature is required to load the
-# BF16/F16 safetensors that HuggingFace checkpoints ship in.
+# CLI binary (chat + serve). BF16/F16 safetensors load in every feature
+# set; the f16 feature adds F8_E4M3/F8_E5M2 tensor loading and no dependencies.
 cargo build --release -p lattice-inference --bin lattice --features f16
 
 # Interactive chat
