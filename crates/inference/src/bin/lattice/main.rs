@@ -252,6 +252,7 @@ async fn main() {
             use std::path::Path;
             use std::sync::Arc;
             use std::sync::atomic::AtomicU64;
+            use tokio::sync::Semaphore;
 
             // Derive a model identifier from the path basename when --model-id
             // is not provided.
@@ -496,6 +497,7 @@ async fn main() {
                 model_id: served_model_id.clone(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model,
+                embedding_admission: Arc::new(Semaphore::new(serve::EMBEDDING_MAX_CONCURRENT_JOBS)),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: router_artifact,
             };

@@ -86,6 +86,7 @@ pub trait Scheduler: Send {
 /// - New sequences are admitted only when:
 ///   1. `running + waiting < max_batch_size`
 ///   2. `kv_free_pages >= prefill_reserve_pages`
+///   3. a GDN state slot is free (one new admission consumes exactly one slot)
 /// - No eviction in Phase 1: when capacity is low, the waiting queue grows.
 ///
 /// # LoRA adapter grouping
@@ -130,7 +131,7 @@ impl Scheduler for FifoScheduler {
         waiting: &[SeqId],
         running: &[SeqId],
         kv_free_pages: usize,
-        _gdn_free_slots: usize,
+        gdn_free_slots: usize,
     ) -> SchedulerDecision {
         let mut decision = SchedulerDecision::default();
 
@@ -143,7 +144,15 @@ impl Scheduler for FifoScheduler {
         // AND we already have sequences running (don't starve a fresh empty batch).
         let can_admit = kv_free_pages >= self.config.prefill_reserve_pages || active_count == 0;
 
-        let admit_limit = if can_admit { capacity_remaining } else { 0 };
+        // Each newly admitted sequence consumes exactly one GDN state slot on its
+        // first prefill chunk (BatchWorker::step allocates from the pool as it
+        // processes decision.prefill), so admission can never outrun the free
+        // slot count regardless of how much batch/page capacity remains.
+        let admit_limit = if can_admit {
+            capacity_remaining.min(gdn_free_slots)
+        } else {
+            0
+        };
         for _ in 0..admit_limit {
             if let Some(seq_id) = self.admission_queue.pop_front() {
                 // The worker is responsible for actually transitioning the sequence
@@ -286,6 +295,51 @@ mod tests {
         // active_count == 0 → bypass memory guard.
         let dec = sched.select_batch(&[], &[], 0, 100);
         assert_eq!(dec.prefill.len(), 1);
+    }
+
+    #[test]
+    fn admission_capped_by_free_gdn_slots() {
+        let mut sched = small_sched(32, 512, 0);
+        for i in 1..=5 {
+            sched.enqueue(SeqId(i));
+        }
+        // Batch size (32) and pages (100, plenty) would allow all 5, but only
+        // 3 GDN state slots are free — admission must not exceed that.
+        let dec = sched.select_batch(&[], &[], 100, 3);
+        assert_eq!(dec.prefill.len(), 3);
+        let ids: std::collections::HashSet<SeqId> =
+            dec.prefill.iter().map(|&(id, _, _)| id).collect();
+        assert_eq!(ids, [SeqId(1), SeqId(2), SeqId(3)].into_iter().collect());
+        assert_eq!(sched.waiting_count(), 2);
+    }
+
+    #[test]
+    fn zero_free_gdn_slots_admits_none_but_running_still_decodes() {
+        let mut sched = small_sched(32, 512, 0);
+        sched.enqueue(SeqId(3));
+        // No GDN slots free at all: the new admission must be refused, while
+        // already-running sequences (which already hold their own slots) keep
+        // decoding uninterrupted.
+        let dec = sched.select_batch(&[], &[SeqId(1), SeqId(2)], 100, 0);
+        assert!(dec.prefill.is_empty());
+        assert_eq!(dec.decode.len(), 2);
+        assert!(dec.decode.contains(&SeqId(1)));
+        assert!(dec.decode.contains(&SeqId(2)));
+        assert_eq!(sched.waiting_count(), 1);
+    }
+
+    #[test]
+    fn admission_unaffected_when_gdn_slots_plentiful() {
+        // Same shape as `admission_respects_max_batch_size`, but pinning down
+        // that a free-slot count at or above capacity changes nothing: the
+        // max_batch_size bound alone still decides how many are admitted.
+        let mut sched = small_sched(2, 512, 0);
+        sched.enqueue(SeqId(1));
+        sched.enqueue(SeqId(2));
+        sched.enqueue(SeqId(3));
+        let dec = sched.select_batch(&[], &[], 100, 2);
+        assert_eq!(dec.prefill.len(), 2);
+        assert_eq!(sched.waiting_count(), 1);
     }
 
     // --- Decode ---

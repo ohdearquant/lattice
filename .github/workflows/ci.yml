@@ -274,18 +274,24 @@ jobs:
           pin-cargo-path: true
           shared-key: feature-matrix
           cache-on-failure: true
+      # The `--no-run` step compiles every test target under these features
+      # (lib, integration tests, feature-gated bins) and executes none of them,
+      # so a lib test that panicked on every run still passed it (#1375). Keep
+      # it for its compile coverage and run the lib tests in the next step,
+      # same as the `mixture` and `simulated-teacher` steps below.
       - name: tune — safetensors + inference-hook + serde (compile tests)
         run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --no-run
+      - name: tune — safetensors + inference-hook + serde (run lib tests)
+        run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --lib
       # `LoraConfig::validate` (the check `LoraAdapter::new` runs on every
       # construction path) deliberately does not enforce a known-module-name
       # allowlist — the adapter representation is model-neutral. The only
       # remaining enforcement of unknown/wrong-architecture target-module
       # names is `LoraAdapter::validate_against`/`validate_against_bert`,
-      # gated behind `inference-hook` like the rest of this step's compile
-      # target above, so the `--no-run` step only ever type-checks them.
-      # Build AND run this specific surface, same as the `mixture` and
-      # `simulated-teacher` steps below, so the fail-closed rejection tests
-      # cannot rot silently.
+      # gated behind `inference-hook` like the rest of the lib tests the step
+      # above now runs. This step stays because it pins their exact names
+      # below, so a rename or deletion could not hide behind an
+      # otherwise-passing aggregate count.
       - name: tune — LoRA validate_against rejection tests (build + run)
         run: |
           log="${RUNNER_TEMP:-/tmp}/lora-validate-against-tests.log"
@@ -301,21 +307,28 @@ jobs:
           grep -q 'test lora::tests::validate_against_tests::test_validate_against_unknown_module_errors ... ok' "$log"
           grep -q 'test lora::tests::validate_against_bert_tests::test_validate_against_bert_unknown_module_rejected ... ok' "$log"
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # Same split as above: `--no-run` compiles every `train-backward` test
+      # target, including the integration tests and bins that require the
+      # feature, and the next step runs the lib tests (#1375).
       - name: tune — train-backward (compile tests)
         run: cargo test -p lattice-tune --features train-backward --no-run
-      # That step compiles the train-backward surface and executes none of it,
-      # which is the whole gap for the GDN module-selection guards added in #1516.
-      # `crates/tune/src/lora/mod.rs` declares `pub mod train_core;` under
-      # `#[cfg(feature = "train-backward")]` while tune's defaults are
-      # `["std", "sqlite"]`, so `cargo test --workspace` never compiles that file
-      # and the step above never runs it: the arms proving a `Served` adapter's
-      # frozen factors stay exactly zero, and that the servable set is the one the
-      # Metal loader accepts, were enforced by nothing. Same treatment as the
-      # `validate_against`, `mixture` and `simulated-teacher` steps. Placed
-      # immediately after the compile step so the lib test binary is already built:
-      # the six tests are self-contained (synthetic dims and gradients, no
-      # checkpoint, no filesystem) and executed in 0.00s locally, so what this adds
-      # to the job is the assertions below, not build time.
+      - name: tune — train-backward (run lib tests)
+        run: cargo test -p lattice-tune --features train-backward --lib
+      # The lib-test step above now runs this whole surface, closing
+      # the gap that left the GDN module-selection guards added in #1516
+      # unenforced: `crates/tune/src/lora/mod.rs` declares `pub mod train_core;`
+      # under `#[cfg(feature = "train-backward")]` while tune's defaults are
+      # `["std", "sqlite"]`, so `cargo test --workspace` never compiled that file
+      # and nothing ran it — the arms proving a `Served` adapter's frozen factors
+      # stay exactly zero, and that the servable set is the one the Metal loader
+      # accepts, were enforced by nothing. Same treatment as the
+      # `validate_against`, `mixture` and `simulated-teacher` steps: this step
+      # stays because it pins their exact names below, so a rename or deletion
+      # could not hide behind an otherwise-passing aggregate count. Placed
+      # immediately after the step above so the lib test binary is already
+      # built: the six tests are self-contained (synthetic dims and gradients,
+      # no checkpoint, no filesystem) and executed in 0.00s locally, so what
+      # this adds to the job is the assertions below, not build time.
       - name: tune — GDN module selection guards (build + run)
         run: |
           log="${RUNNER_TEMP:-/tmp}/gdn-module-selection-tests.log"
@@ -506,23 +519,6 @@ jobs:
         run: cargo test --locked -p lattice-inference --features metal-gpu,f16 --test pipeline_boundary_contract -- --nocapture
       - name: fann — no default features
         run: cargo build -p lattice-fann --no-default-features
-      # Run this target alone. `-p lattice-embed` resolves lattice-embed's own
-      # `lattice-inference` feature table in isolation, which is the configuration
-      # a standalone `cargo build -p lattice-embed`, `cargo install lattice-embed`,
-      # or the wasm/npm build actually gets — and the one that drifted in #1094.
-      #
-      # Two things keep this out of the workspace-wide runs. The failure is
-      # runtime-only: `SafetensorsFile` returns `InvalidSafetensors` for a
-      # half-precision tensor rather than failing to build, so the `--no-run`
-      # steps above cannot observe it. And lattice-tune's optional
-      # `lattice-inference` dependency carries `features = ["f16"]`, so any
-      # invocation that activates tune's `inference-hook` or `train-backward`
-      # alongside lattice-embed unifies that `f16` into embed for free and the
-      # regression reads green. Neither tune feature is in its defaults today, so
-      # `cargo test --workspace` does not do this — but nothing enforces that,
-      # which is why the guard runs on the isolated resolve instead. See #1095.
-      - name: embed — f16 native dependency load guard (standalone, no workspace unification)
-        run: cargo test -p lattice-embed --test f16_feature_load_guard
       # `-p lattice-inference` in isolation, default features only, no `--features`
       # flag. Neither the pre-commit hook's `--workspace --all-targets` nor this
       # job's own `f16,metal-gpu` clippy step below can see what this catches:
@@ -902,6 +898,33 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # #1393: the two typed Metal GDN-state tests added alongside #1267
+      # (`metal_gdn_state_pairs_buffers_with_explicit_geometry`,
+      # `metal_gdn_state_layer_index_drives_each_real_recurrence_pair`) had no
+      # filter that selected them: `--lib q4` and `--lib forward::metal::` are
+      # both substring filters against this test's full path
+      # (`forward::metal_qwen35::inner::tests::layers::metal_gdn_state_...`),
+      # and neither "q4" nor "forward::metal::" occurs in it (the module is
+      # `metal_qwen35`, not `metal`), so a device-equipped runner never ran
+      # them. `metal_gdn_state_` is a substring unique to these two tests in
+      # this crate and matches nothing else. The env var turns a runner with
+      # no Metal device from a green early return into a failure, matching
+      # the Q4/grammar/f16-KV steps' convention; the exact "2 passed" grep
+      # guards against a silently zero-matching filter the same way those
+      # steps do.
+      - name: inference — Metal GDN state buffer geometry and recurrence (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-gdn-state.log"
+          if ! cargo test -p lattice-inference --features f16,metal-gpu --lib metal_gdn_state_ -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -Eq '^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: inference — Metal MTP cursor preflight (macOS only)
         if: runner.os == 'macOS'
         env:
@@ -1468,6 +1491,11 @@ jobs:
       # Uses disposable lock paths and stub commands; no benchmark runs.
       - name: python3 tests/test_bench_measurement_supervision.py
         run: python3 tests/test_bench_measurement_supervision.py -v
+      # scripts/lib/bench-python.sh's PYTHON_BIN override (lattice#1551): drives
+      # bench_require_python3 directly via a bash subprocess against fixture
+      # PATH/PYTHON_BIN combinations; no benchmark or cargo runs.
+      - name: python3 tests/test_bench_python_resolver.py
+        run: python3 tests/test_bench_python_resolver.py -v
       - name: python3 tests/test_perf_governor.py
         run: python3 tests/test_perf_governor.py -v
       # Four suites the orphaned-suite gate found running nowhere: 226 tests that

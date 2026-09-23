@@ -7,9 +7,10 @@ generic, query, or document/passage semantic role. Native builds provide two imp
 `CachedEmbeddingService`, which wraps any service with a process-local LRU.
 
 Native builds also expose the first dormant contracts for proposed ADR-088:
-`CheckpointAttestor`, `OpaqueAttestationReport`, and `NativeResourceBudget`. These values bound a
-future sealed-preparation protocol, but this slice does not expose a preparer or a prepared service
-and does not change either existing implementation's load or encode path.
+`CheckpointAttestor`, `AttestationAlgorithm`, `SupplementaryAttestationEvidence`, and
+`NativeResourceBudget`. These values bound a future sealed-preparation protocol, but this slice
+does not expose a preparer or a prepared service and does not change either existing
+implementation's load or encode path.
 
 The trait is the stable integration surface. Constructors and cache-management APIs on the
 native implementations are marked unstable and may change independently of the trait.
