@@ -32891,8 +32891,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // boundary.  Skip lengths that exceed the model's max context.
             let sweep_lengths: &[usize] = &[1, 31, 32, 33, 64, 511, 512, 513, 1009];
 
-            // Evidence table: (len, all-position max_abs_diff, argmax flip count)
-            let mut evidence: Vec<(usize, f32, usize)> = Vec::new();
+            // Evidence table: (len, all-position max_abs_diff, argmax flip count, attempts used)
+            let mut evidence: Vec<(usize, f32, usize, usize)> = Vec::new();
             let mut any_flip = false;
 
             // The chunked scan is deterministic (gdn_chunked_b_vs_b_self_consistency), but
@@ -32944,7 +32944,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 // gdn_chunked_state_vs_serial_state_diff.
                 let mut best_max_abs = f32::MAX;
                 let mut best_flips = usize::MAX;
-                for _ in 0..ATTEMPTS {
+                let mut attempts_used = 0usize;
+                for attempt in 0..ATTEMPTS {
                     // Serial path (chunked OFF): per-position logits via all_logits.
                     state.use_gdn_chunked = false;
                     state.reset_state();
@@ -32973,6 +32974,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                             flips += 1;
                         }
                     }
+                    attempts_used = attempt + 1;
+                    eprintln!(
+                        "  len={n:4} attempt {attempt}: max_abs_diff={max_abs:.2e}  argmax_flips={flips}"
+                    );
 
                     if max_abs < best_max_abs {
                         best_max_abs = max_abs;
@@ -32984,9 +32989,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 }
 
                 eprintln!(
-                    "  len={n:4}: best-of-{ATTEMPTS} all-pos max_abs_diff={best_max_abs:.2e}  argmax_flips={best_flips}"
+                    "  len={n:4}: best-of-{attempts_used} all-pos max_abs_diff={best_max_abs:.2e}  argmax_flips={best_flips}"
                 );
-                evidence.push((n, best_max_abs, best_flips));
+                evidence.push((n, best_max_abs, best_flips, attempts_used));
                 if best_flips > 0 {
                     any_flip = true;
                 }
@@ -32996,9 +33001,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             state.use_gdn_chunked = true;
 
             eprintln!("Evidence table (boundary sweep, per-instance flag, no env mutation):");
-            eprintln!("  len | all-pos max_abs_diff | argmax_flips");
-            for (n, d, f) in &evidence {
-                eprintln!("  {n:4} | {d:.2e}             | {f}");
+            eprintln!("  len | all-pos max_abs_diff | argmax_flips | attempts");
+            for (n, d, f, a) in &evidence {
+                eprintln!("  {n:4} | {d:.2e}             | {f:<12} | {a}");
             }
 
             // Assert no argmax flips across all lengths and positions.
@@ -33009,7 +33014,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             // Assert all-position max_abs_diff stays within the evidence-based drift sentinel.
-            for (n, max_abs, _) in &evidence {
+            for (n, max_abs, _, _) in &evidence {
                 assert!(
                     *max_abs < MAX_ABS_BOUND,
                     "len={n}: all-position max_abs_diff={max_abs:.2e} exceeds #534 drift sentinel {MAX_ABS_BOUND:.2e}"
