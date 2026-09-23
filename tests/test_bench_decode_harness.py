@@ -251,6 +251,20 @@ class ValidateJsonlTest(unittest.TestCase):
             with self.assertRaisesRegex(harness.ObservationValidationError, ":2:"):
                 harness.validate_jsonl(path)
 
+    def test_empty_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "obs.jsonl"
+            path.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(harness.ObservationValidationError, "no observations found"):
+                harness.validate_jsonl(path)
+
+    def test_blank_lines_only_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "obs.jsonl"
+            path.write_text("\n\n\n", encoding="utf-8")
+            with self.assertRaisesRegex(harness.ObservationValidationError, "no observations found"):
+                harness.validate_jsonl(path)
+
 
 # --------------------------------------------------------------------------
 # Profile configuration validation
@@ -1764,6 +1778,13 @@ class CliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "obs.jsonl"
             path.write_text("not json\n", encoding="utf-8")
+            rc = harness.main(["validate", str(path)])
+            self.assertEqual(rc, 1)
+
+    def test_validate_subcommand_fails_closed_on_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "obs.jsonl"
+            path.write_text("", encoding="utf-8")
             rc = harness.main(["validate", str(path)])
             self.assertEqual(rc, 1)
 

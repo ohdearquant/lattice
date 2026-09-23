@@ -77,10 +77,8 @@ EOF
         echo "lint-docs selftest: formatter did not receive the exact tracked Markdown set" >&2
         exit 1
     fi
-    if ! cmp -s "$expected" "$capture.lint"; then
-        echo "lint-docs selftest: linter did not receive the exact tracked Markdown set" >&2
-        exit 1
-    fi
+    # No `.lint` capture to check here: the script does not call `deno lint`
+    # (see the comment at its call site), so the fake deno never writes one.
     index_count_after=$(git ls-files | wc -l | tr -d '[:space:]')
     if [ "$index_count_after" -ne "$index_count_before" ]; then
         echo "lint-docs selftest: real index entry count changed: $index_count_before -> $index_count_after" >&2
@@ -133,7 +131,12 @@ if command -v deno >/dev/null 2>&1; then
     fi
     echo "=== Doc Linting $markdown_count tracked Markdown files (deno) ==="
     xargs -0 deno fmt --check <"$markdown_list"
-    xargs -0 deno lint <"$markdown_list" 2>/dev/null || true
+    # No `deno lint` call here: deno's linter refuses Markdown as an input type
+    # outright ("No target files found", exit 1) rather than accepting the file
+    # and reporting on it, so a call over this list can never pass and never
+    # produce a real diagnostic regardless of file content. Formatting is
+    # still checked above; a real Markdown *lint* needs a tool that accepts
+    # Markdown as a target, added as its own step with its own failure mode.
 
     if [ "$mode" = "--markdown-only" ]; then
         exit 0
@@ -149,7 +152,7 @@ elif [ "${LATTICE_REQUIRE_DENO:-0}" = "1" ]; then
     exit 127
 else
     markdown_skipped=1
-    echo "lint-docs: deno not found; skipping Markdown format, lint, and discovery self-test"
+    echo "lint-docs: deno not found; skipping Markdown format and discovery self-test"
 fi
 
 echo "=== Capability Matrix Fixture Check (#654) ==="
