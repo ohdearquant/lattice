@@ -35,8 +35,8 @@ during this exact interval. This is the FALLBACK figure the constraint
 allows: an interval-exact per-process reading (`top -l 2 -stats
 pid,ppid,cpu` on macOS, two `/proc/<pid>/stat` reads on Linux) would be more
 precise but is not implemented here. The artifact this script produces
-carries the decaying-average `ps` figure -- see fix/1515 REPORT.md for the
-disposition.
+carries the decaying-average `ps` figure described above, not an
+interval-exact one.
 
 PARSER SHARING. Idle-percent parsing (parse_top_idle / parse_proc_stat /
 linux_idle_pct below) is a PINNED COPY of quiet-probe.py's own parsers, not

@@ -5,6 +5,17 @@ use serde::Serialize;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use std::{collections::BTreeMap, path::Path};
 
+/// Label written into the pruning-plan artifact's `method` field.
+///
+/// `score_layer_importance` averages one last-token hidden-state cosine per
+/// calibration prompt, not per token position within a sequence. That is a
+/// different estimator from `lattice_inference::pruning::BlockInfluenceAccumulator`,
+/// which averages per-token cosines the way the published block-influence metric
+/// does. The label names the estimator this binary actually runs so a user
+/// comparing against either metric knows which one produced the numbers.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const PRUNE_SCORE_METHOD: &str = "last_token_block_change";
+
 #[derive(clap::Args, Debug)]
 pub(crate) struct Args {
     /// Q4 model directory produced by `quantize_q4` or `quantize_quarot`.
@@ -268,7 +279,7 @@ fn run_metal(args: &Args) -> Result<bool, String> {
         .collect();
     let artifact = PrunePlanArtifact {
         schema_version: 1,
-        method: "block_influence",
+        method: PRUNE_SCORE_METHOD,
         source_model: SourceModelArtifact {
             path: args.q4_dir.display().to_string(),
             sha256: model_sha256,

@@ -8,10 +8,11 @@
 // and destructive when every platform binary has already been placed there
 // by another means (e.g. downloaded prebuilt binaries) with no matching
 // fresh build sitting in --output-dir to reconcile against. This guard runs
-// before prepublishOnly's `napi artifacts` invocation and skips it entirely
-// when every platform in optionalDependencies already resolves its exact
-// `main`-named .node file, so a release whose platform packages are already
-// fully populated is not silently emptied out during `npm publish`.
+// as the first half of `prepublishOnly`, and skips its own `npm run
+// artifacts` call when every platform in optionalDependencies already
+// resolves its exact `main`-named .node file, so a release whose platform
+// packages are already fully populated is not silently emptied out during
+// `npm publish`.
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'

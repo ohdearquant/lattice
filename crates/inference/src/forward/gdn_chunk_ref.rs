@@ -4,10 +4,14 @@
 //! This is a line-by-line transcription of a validated NumPy reference
 //! (`sequential_gdn` / `chunkwise_gdn`, see
 //! `tests/fixtures/gdn_chunk/generate.py`) that already asserts chunkwise ==
-//! sequential to <= 1e-5. It exists purely as a parity oracle: the B=64 and
-//! B=128 Metal chunked-prefill kernels are validated against it (and,
-//! transitively, against the committed NumPy-generated fixtures), never a
-//! production path itself.
+//! sequential to <= 1e-5. It exists purely as a parity oracle: it validates
+//! the host chunkwise formulation against the host sequential formulation --
+//! including on real Qwen3.5 GDN-layer inputs captured from a live Metal
+//! prefill, not just synthetic fixtures -- never a production path itself.
+//! No test compares a Metal chunked-prefill kernel's own output or
+//! recurrent state against this oracle: `sequential_gdn` and `chunkwise_gdn`
+//! both run host-side, on the same captured inputs, and are compared only
+//! to each other.
 //!
 //! Matrices are flat row-major `Vec<f32>` / `&[f32]` with explicit
 //! `(rows, cols)` passed alongside — no `ndarray`/`nalgebra` dependency.

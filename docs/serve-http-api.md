@@ -3,7 +3,7 @@
 The README shows one bare `curl` example against `/v1/chat/completions`. This document covers
 the rest of the surface: exact request/response shapes, streaming, error responses, validation
 order, and behavior that is easy to get wrong if you only read the happy path. Everything below
-was verified against `crates/inference/src/bin/lattice.rs`'s `mod serve` (the `lattice serve`
+was verified against `crates/inference/src/bin/lattice/main.rs`'s `mod serve` (the `lattice serve`
 subcommand's implementation) and confirmed live against a running server built from this
 repository.
 
@@ -12,7 +12,7 @@ repository.
 This codebase has **two** separately built HTTP servers with confusingly similar names:
 
 - **`lattice serve`** — a subcommand of the unified `lattice` CLI binary
-  (`crates/inference/src/bin/lattice.rs`). This is the general-purpose, OpenAI-compatible server
+  (`crates/inference/src/bin/lattice/main.rs`). This is the general-purpose, OpenAI-compatible server
   the README documents (Quick Start and "### HTTP API" sections), with an active development
   history (unified-CLI ADR-063, SSE streaming, stop sequences, native Q4 checkpoint support,
   `lattice doctor` preflight). **This document is about `lattice serve`.**
@@ -20,7 +20,8 @@ This codebase has **two** separately built HTTP servers with confusingly similar
   (`crates/inference/src/bin/lattice_serve.rs`), purpose-built as the internal HTTP daemon the
   macOS Lattice Studio app spawns and talks to (introduced in PR #435). It has its own, narrower
   route set (`GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`,
-  `POST /v1/embeddings`, `GET /metrics`) and its own disconnect-cancellation behavior (PR
+  `POST /v1/embeddings`, `GET /v1/lora`, `POST /v1/lora/load`, `POST /v1/lora/unload`,
+  `GET /metrics`) and its own disconnect-cancellation behavior (PR
   #552/#606); `lattice serve` gained an equivalent mechanism later (ADR-080 C2, issue #744 — see
   "Streaming" below), so this is no longer a difference between the two binaries. It is not what
   the README's HTTP API section documents, and it is out of scope for this document -- with one
@@ -83,6 +84,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/lora", get(lora_list))
+        .route("/v1/lora/load", post(lora_load))
+        .route("/v1/lora/unload", post(lora_unload))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
 }
@@ -91,8 +95,9 @@ pub fn router(state: AppState) -> Router {
 `GET /` and `GET /v1/models` return an engine-identity document and a single-entry OpenAI model
 list, respectively. `POST /v1/embeddings` is always routed, but requires the server to have been
 started with `--model` pointed at a vision-language checkpoint; otherwise every request to it
-returns 400 `vision_unsupported` (see "`POST /v1/embeddings`" below). There is no `/v1/completions`
-or any admin/metrics endpoint.
+returns 400 `vision_unsupported` (see "`POST /v1/embeddings`" below). The three `/v1/lora*` routes
+are covered in "Resident LoRA adapters and per-request selection" below. There is no
+`/v1/completions` or any admin/metrics endpoint.
 
 Shut down with Ctrl-C, or with SIGTERM on Unix:
 
@@ -126,7 +131,7 @@ client or per unit time.
   requests before generation, but is a separate class of check from overload/rate control.
 - **CPU backend: not serialized by the server, but not free either.** Each CPU request's
   `generate` call runs as blocking work on a Tokio blocking-pool task
-  (`tokio::task::spawn_blocking`, `crates/inference/src/bin/lattice.rs`), so multiple CPU requests
+  (`tokio::task::spawn_blocking`, `crates/inference/src/bin/lattice/main.rs`), so multiple CPU requests
   can execute concurrently up to Tokio's blocking-pool size — this is not a hard concurrency-1
   limit, but concurrent CPU requests still contend for the same CPU cores and memory. There is no
   per-request admission cap on this path.
@@ -140,12 +145,12 @@ client or per unit time.
   `lattice serve` and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
   default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/inference/src/bin/lattice/main.rs`,
   `crates/inference/src/bin/lattice_serve.rs`). A request submitted while the cap is already full
-  is rejected at the worker's admission boundary (`MetalWorkerClient::submit`'s
-  `try_acquire_owned`, `crates/inference/src/serve/metal_worker.rs:446`) before any Metal
+  is rejected at the worker's admission boundary (`MetalWorkerClient::submit_with_lora`'s
+  `try_acquire_owned`, `crates/inference/src/serve/metal_worker.rs`) before any Metal
   generation work happens — the HTTP handler has already tokenized the rendered prompt during
-  request preparation ahead of that point (`prepare_chat_request`'s `tokenize_len` call,
-  `crates/inference/src/bin/lattice/serve.rs:1204`, versus the `submit` call at line 1329), so this
-  is not an end-to-end pre-tokenization guarantee, with:
+  request preparation ahead of that point (`prepare_chat_request`'s `tokenize_len` call in
+  `crates/inference/src/bin/lattice/serve.rs`, versus the later `submit_with_lora` call in the
+  same handler), so this is not an end-to-end pre-tokenization guarantee, with:
 
   ```json
   {
@@ -227,15 +232,18 @@ Notes on real fields you'll see:
 
 ```rust
 pub struct ChatCompletionRequest {
-    pub model: String,                              // required, must match the served model_id
+    pub lora: Option<Vec<LoraSelection>>,            // resident-adapter selection, three states; see "Resident LoRA adapters" below
+    pub model: Option<String>,                       // required, must match the served model_id
     pub messages: Vec<Message>,
     pub max_tokens: Option<usize>,
     pub max_completion_tokens: Option<usize>,        // alias; must agree with max_tokens if both set
     pub temperature: Option<f32>,                    // default 0.7, range [0.0, 2.0]
     pub top_p: Option<f32>,                          // default 0.9, range (0.0, 1.0]
+    pub top_k: Option<usize>,                        // accepted, ignored by this server (a daemon-only sampling extension)
+    pub repetition_penalty: Option<f32>,             // accepted, ignored by this server (a daemon-only sampling extension)
+    pub seed: Option<u64>,
     pub stream: Option<bool>,
     pub stop: Option<Value>,                         // string, or array of 1-4 non-empty strings
-    pub seed: Option<u64>,
     pub reasoning_budget: Option<usize>,             // optional; see "reasoning_budget" below
     pub response_format: Option<ResponseFormat>,     // only {"type": "text"} accepted
     pub tools: Option<Value>,                        // rejected if present
@@ -693,9 +701,9 @@ The server is stateless per request — there is no session/conversation ID — 
 carry the full conversation history in `messages`. That doesn't mean every request re-prefills that
 history from scratch: on a Metal/Q4-backed server, a text request that safely extends the previous
 turn reuses the retained KV/GDN prefix via `generate_streaming_with_prefix_cache_and_cancel`
-(`crates/inference/src/serve/metal_worker.rs:1218`) instead of a full re-prefill; a
+(called from `crates/inference/src/serve/metal_worker.rs`) instead of a full re-prefill; a
 vision-classified request always takes the separate `generate_multimodal_vision_with_cancel` path
-(`crates/inference/src/serve/metal_worker.rs:1166`) and never participates in that cache. The CPU
+(also called from `crates/inference/src/serve/metal_worker.rs`) and never participates in that cache. The CPU
 (safetensors) backend has no such cache and always re-prefills the full history. See
 [`docs/cross-turn-cache.md`](cross-turn-cache.md) for what counts as a safe extension:
 
