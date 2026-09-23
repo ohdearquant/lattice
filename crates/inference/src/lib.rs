@@ -254,9 +254,9 @@ pub use crate::tokenizer::{
 /// One `var_os` lookup and a few ASCII comparisons against short literals: no
 /// allocation, because one of these sits inside a per-round decode loop.
 ///
-/// Gated like its callers (see `check_mtp_not_requested`) so a non-metal-gpu build
-/// does not carry an unused function.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+/// Not gated to the Metal build: the offline-download gate (`download.rs`) and the
+/// CPU-fallback switch (`model/qwen.rs`) call this from code paths that compile on
+/// every platform and feature set, so it has to be available everywhere too.
 pub(crate) fn env_switch_enabled(name: &str) -> bool {
     match std::env::var_os(name) {
         None => false,
@@ -270,7 +270,6 @@ pub(crate) fn env_switch_enabled(name: &str) -> bool {
 /// The value half of [`env_switch_enabled`], separated so it is testable without
 /// mutating the process environment, which no test can do without racing every
 /// other test in the binary.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 pub(crate) fn switch_value_enabled(value: Option<&str>) -> bool {
     const OFF: [&str; 4] = ["0", "false", "no", "off"];
     match value {

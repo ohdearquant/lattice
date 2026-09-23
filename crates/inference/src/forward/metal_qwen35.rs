@@ -1333,8 +1333,9 @@ mod inner {
 
     /// Decide which GPU top-k route to take for a given `top_k` and env flags.
     ///
-    /// `compact_env`: `LATTICE_COMPACT_TOPK` is set.
-    /// `selection_env`: `LATTICE_COMPACT_TOPK_SELECT` is set (unlocks k>1 routes).
+    /// `compact_env`: `LATTICE_COMPACT_TOPK` is enabled (by value, not presence — see
+    /// `crate::env_switch_enabled`).
+    /// `selection_env`: `LATTICE_COMPACT_TOPK_SELECT` is enabled (unlocks k>1 routes).
     fn choose_gpu_topk_route(top_k: usize, compact_env: bool, selection_env: bool) -> GpuTopkRoute {
         // R1 benchmark (2026-04-26, M2 Max, vocab=248,320):
         //   CPU NEON argmax k=1 = 89 µs; GPU argmax k=1 = 240 µs (2.70×, t=137, p<<0.0001).
@@ -1403,9 +1404,9 @@ mod inner {
     impl SamplingRouteEnvironment {
         fn current() -> Self {
             Self {
-                compact: std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                selection: std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                approximate_top_p: std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
+                compact: crate::env_switch_enabled("LATTICE_COMPACT_TOPK"),
+                selection: crate::env_switch_enabled("LATTICE_COMPACT_TOPK_SELECT"),
+                approximate_top_p: crate::env_switch_enabled("LATTICE_COMPACT_TOPP_APPROX"),
             }
         }
     }
@@ -1669,7 +1670,7 @@ mod inner {
         // read by tests; written by set_position for future concurrent API
         pub(crate) position: usize,
         /// GDN state-traffic byte counters (issue #422). `None` unless both the
-        /// `gdn-state-counters` feature and `LATTICE_GDN_STATE_COUNTERS` are set.
+        /// `gdn-state-counters` feature is on and `LATTICE_GDN_STATE_COUNTERS` is enabled.
         #[cfg(feature = "gdn-state-counters")]
         pub(crate) gdn_state_traffic: Option<GdnStateTrafficCounters>,
     }
@@ -3496,7 +3497,7 @@ mod inner {
                 }
             });
 
-            let need_checkpoints = mtp.is_some() || std::env::var_os("LATTICE_SELF_SPEC").is_some();
+            let need_checkpoints = mtp.is_some() || crate::env_switch_enabled("LATTICE_SELF_SPEC");
             // Self-spec verifies `[pending_token] ++ draft_tokens` = `1 + SELF_SPEC_MAX_DRAFT`
             // tokens through `verify_tokens_batched`, which checkpoints slot 0 (pre-verify)
             // plus one slot per processed token. Pool size = max_tokens + 1, so we need
@@ -3536,7 +3537,7 @@ mod inner {
                 final_hidden_captured: std::sync::atomic::AtomicBool::new(false),
                 position: 0,
                 #[cfg(feature = "gdn-state-counters")]
-                gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
+                gdn_state_traffic: if crate::env_switch_enabled("LATTICE_GDN_STATE_COUNTERS") {
                     Some(GdnStateTrafficCounters::new(
                         GdnStateTrafficShape::try_from_config(cfg)
                             .map_err(|e| e.to_string())?
@@ -6295,10 +6296,10 @@ mod inner {
                 mrope_row_bufs.as_ref().map(|(c, s)| (c, s));
 
             // --- Per-phase timing (enabled by env LATTICE_PROFILE=1) ---
-            let profiling = std::env::var_os("LATTICE_PROFILE").is_some();
-            let decode_profiling = std::env::var_os("LATTICE_DECODE_PROFILE").is_some();
+            let profiling = crate::env_switch_enabled("LATTICE_PROFILE");
+            let decode_profiling = crate::env_switch_enabled("LATTICE_DECODE_PROFILE");
 
-            if std::env::var_os("LATTICE_GDN_CPU").is_some() {
+            if crate::env_switch_enabled("LATTICE_GDN_CPU") {
                 #[cfg(not(debug_assertions))]
                 panic!("LATTICE_GDN_CPU=1 is debug-only and cannot be used in release decode");
             }
@@ -9200,7 +9201,7 @@ mod inner {
                 }
             };
 
-            if std::env::var("LATTICE_MTP_VERBOSE").is_ok() {
+            if crate::env_switch_enabled("LATTICE_MTP_VERBOSE") {
                 eprintln!(
                     "[MTP] rounds={} mtp_fwd={} verify={} accepted_extra={} rollbacks={} fallbacks={} mtp_ms={:.1} verify_ms={:.1} rb_ms={:.1}",
                     metrics.rounds,
@@ -9528,7 +9529,7 @@ mod inner {
                 pending_token = next_pending;
             }
 
-            if std::env::var("LATTICE_SELF_SPEC_VERBOSE").is_ok() {
+            if crate::env_switch_enabled("LATTICE_SELF_SPEC_VERBOSE") {
                 eprintln!(
                     "[SELF_SPEC] rounds={} draft_fwd={} verify={} accepted_extra={} fallbacks={} draft_ms={:.1} verify_ms={:.1} rb_ms={:.1}",
                     metrics.rounds,
@@ -9801,7 +9802,7 @@ mod inner {
             // GDN-first self-speculative greedy path: env-gated, greedy only.
             let use_self_spec = super::self_spec_route_active(
                 self.session.gdn_checkpoints.is_some(),
-                std::env::var("LATTICE_SELF_SPEC").is_ok(),
+                crate::env_switch_enabled("LATTICE_SELF_SPEC"),
                 gen_cfg,
                 use_compact,
                 cfg.num_active_linear_attention_layers(),
@@ -13283,7 +13284,7 @@ mod inner {
                 }
             });
             let need_checkpoints =
-                mtp_weights_opt.is_some() || std::env::var_os("LATTICE_SELF_SPEC").is_some();
+                mtp_weights_opt.is_some() || crate::env_switch_enabled("LATTICE_SELF_SPEC");
             // Self-spec verifies `[pending_token] ++ draft_tokens` = `1 + SELF_SPEC_MAX_DRAFT`
             // tokens through `verify_tokens_batched`; pool size must cover one slot per token
             // plus the pre-verify base slot.
@@ -13358,7 +13359,7 @@ mod inner {
                     final_hidden_captured: std::sync::atomic::AtomicBool::new(false),
                     position: 0,
                     #[cfg(feature = "gdn-state-counters")]
-                    gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
+                    gdn_state_traffic: if crate::env_switch_enabled("LATTICE_GDN_STATE_COUNTERS") {
                         Some(GdnStateTrafficCounters::new(
                             GdnStateTrafficShape::try_from_config(cfg)
                                 .map_err(|e| e.to_string())?
@@ -15540,7 +15541,7 @@ mod inner {
             );
 
             assert!(
-                production_src.contains("std::env::var_os(\"LATTICE_GDN_CPU\")")
+                production_src.contains("crate::env_switch_enabled(\"LATTICE_GDN_CPU\")")
                     && production_src.contains(
                         "LATTICE_GDN_CPU=1 is debug-only and cannot be used in release decode"
                     ),
@@ -17618,6 +17619,47 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 selection: true,
                 approximate_top_p: false,
             }
+        }
+
+        /// Serializes tests in this module that mutate `LATTICE_COMPACT_TOPK` in the
+        /// real process environment. `set_var`/`remove_var` are `unsafe` because they
+        /// can race with a read on another thread; this is the same per-variable lock
+        /// convention `with_self_spec_env` (below) uses for `LATTICE_SELF_SPEC`.
+        fn with_compact_topk_env<R>(value: &str, f: impl FnOnce() -> R) -> R {
+            use std::sync::Mutex;
+            static ENV_LOCK: Mutex<()> = Mutex::new(());
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: only this serialized closure mutates LATTICE_COMPACT_TOPK; the
+            // lock forbids concurrent test threads from reading or writing it.
+            unsafe {
+                std::env::set_var("LATTICE_COMPACT_TOPK", value);
+            }
+            let r = f();
+            // SAFETY: same justification as above.
+            unsafe {
+                std::env::remove_var("LATTICE_COMPACT_TOPK");
+            }
+            r
+        }
+
+        /// `SamplingRouteEnvironment::current()` reads `LATTICE_COMPACT_TOPK` through
+        /// `env_switch_enabled`, by value, not presence (#1614): `=0` must disable
+        /// compact routing rather than enable it by merely being present.
+        #[test]
+        fn sampling_route_environment_reads_compact_topk_by_value_not_presence() {
+            let disabled = with_compact_topk_env("0", SamplingRouteEnvironment::current);
+            assert!(
+                !disabled.compact,
+                "LATTICE_COMPACT_TOPK=0 must not enable compact routing by presence"
+            );
+
+            let enabled = with_compact_topk_env("1", SamplingRouteEnvironment::current);
+            assert!(
+                enabled.compact,
+                "LATTICE_COMPACT_TOPK=1 must still enable compact routing"
+            );
         }
 
         #[test]
