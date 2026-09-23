@@ -213,10 +213,10 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
 
     /// Consumes `accepted.prediction` (rejecting a stale/foreign/already-consumed id through
     /// `PredictionLedger::consume`, mapped via `From<PredictionError>`), then runs one
-    /// `forward_step` at the current cache position -- the same `forward_step` call
-    /// `decode_loop` makes -- advancing `kv_cache.seq_len` and leaving the new position's
-    /// logits in `scratch.logits` for the next `select`. Consumption happens before the
-    /// forward pass so a stale id never advances session state.
+    /// `forward_step` at the current cache position -- the same `forward_step` call the
+    /// pre-driver `decode_loop` used to make -- advancing `kv_cache.seq_len` and leaving
+    /// the new position's logits in `scratch.logits` for the next `select`. Consumption
+    /// happens before the forward pass so a stale id never advances session state.
     fn decode(
         &mut self,
         accepted: &AcceptedToken,

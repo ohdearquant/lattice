@@ -177,6 +177,7 @@ impl Qwen35Model {
                 cfg.eos_token_id,
                 false,
                 &never_cancel,
+                |_generated_len| {},
                 |_next_id| String::new(),
                 &mut throwaway_text,
                 &mut throwaway_offsets,
@@ -212,6 +213,7 @@ impl Qwen35Model {
                 cfg.eos_token_id,
                 false,
                 &never_cancel,
+                |_generated_len| {},
                 |next_id| detok.push(&self.tokenizer, next_id),
                 &mut full,
                 &mut token_logprob_end_offsets,
@@ -402,12 +404,16 @@ impl Qwen35Model {
     ///    `Receiver`-style handle), while `decoder::Cancellation`'s blanket impl covers
     ///    only non-mutating `Fn` closures. [`FnMutCancellation`] bridges the two via a
     ///    `RefCell`, per that trait's own doc comment.
-    /// 2. **Raw-token eventing.** `decoder::driver::run` calls `decode_delta` exactly
-    ///    once per token that becomes part of `generated_ids`, immediately after the
-    ///    push, in generation order -- the same guarantee [`RawGenEvent::RawToken`]'s own
-    ///    doc comment relies on. A local counter incremented inside `decode_delta`
-    ///    therefore reproduces `index == generated_ids.len()` at push time exactly,
-    ///    without a dedicated driver parameter for it.
+    /// 2. **Raw-token eventing.** `decoder::driver::run` calls its dedicated `on_push`
+    ///    parameter exactly once per token that becomes part of `generated_ids`,
+    ///    immediately at the push, in generation order, with `generated_ids.len()` at
+    ///    that moment -- the same guarantee [`RawGenEvent::RawToken`]'s own doc comment
+    ///    relies on. This entry fires `RawToken` from that hook directly, using the
+    ///    length it is handed as the index, rather than from `decode_delta`: `decode_delta`
+    ///    runs later in `driver::run`'s fixed per-step order (after `record_metadata`'s
+    ///    session-scored logprob call whenever `gen_cfg.logprobs` is set), so firing from
+    ///    it would let the event's timing drift with that call's cost instead of marking
+    ///    the true push boundary.
     ///
     /// Always builds a real incremental detokenizer and real output buffers (unlike
     /// `generate_via_driver`'s fast/stop-strings split, which throws the delta away when
@@ -472,15 +478,17 @@ impl Qwen35Model {
         let should_cancel_cell = std::cell::RefCell::new(should_cancel);
         let cancel = FnMutCancellation(&should_cancel_cell);
 
-        // Shared via `RefCell` rather than plain captures: `decode_delta` (called once
-        // per pushed token) and `on_prefill_end` (called once, before any token) are two
-        // separate closures passed into the same `driver::run` call, and both need
-        // `on_raw_event`; `decode_delta` and `finish_tail` both need `detok`. Neither
-        // pair is ever live concurrently (`driver::run` calls them strictly
-        // sequentially, single-threaded), so the runtime borrow check never conflicts.
+        // Shared via `RefCell` rather than plain captures: `on_push` (called once per
+        // pushed token, before `decode_delta` runs for that same token -- see
+        // `driver::run`'s doc comment), `decode_delta` (also called once per pushed
+        // token), and `on_prefill_end` (called once, before any token) are three
+        // separate closures passed into the same `driver::run` call, and both `on_push`
+        // and `on_prefill_end` need `on_raw_event`; `decode_delta` and `finish_tail`
+        // both need `detok`. No two of these are ever live concurrently (`driver::run`
+        // calls them strictly sequentially, single-threaded), so the runtime borrow
+        // check never conflicts.
         let on_raw_event_cell = std::cell::RefCell::new(on_raw_event);
         let detok_cell = std::cell::RefCell::new(IncrementalDetokenizer::new());
-        let mut raw_token_index = 0usize;
         let mut text = String::new();
         let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
@@ -492,13 +500,19 @@ impl Qwen35Model {
             cfg.eos_token_id,
             true,
             &cancel,
-            |next_id| {
-                raw_token_index += 1;
+            // Fires `RawToken` at `driver::run`'s own `on_push` hook, i.e. immediately
+            // at the push that grows `generated_ids` to `generated_len` -- never from
+            // `decode_delta` below, which `driver::run` calls later in the fixed
+            // per-step order (after `record_metadata`'s session-scored logprob call
+            // whenever `gen_cfg.logprobs` is set). `generated_len` IS the index this
+            // event must report (`RawGenEvent::RawToken`'s own doc comment), so no
+            // local counter is needed to reproduce it.
+            |generated_len| {
                 (*on_raw_event_cell.borrow_mut())(RawGenEvent::RawToken {
-                    index: raw_token_index,
+                    index: generated_len,
                 });
-                detok_cell.borrow_mut().push(&self.tokenizer, next_id)
             },
+            |next_id| detok_cell.borrow_mut().push(&self.tokenizer, next_id),
             &mut text,
             &mut token_logprob_end_offsets,
             |delta, _next_id| on_token(delta),
@@ -1382,9 +1396,9 @@ mod tests {
     // Grammar wiring — end-to-end production-seam test (#397)
     // -----------------------------------------------------------------------
 
-    /// Proves that `generate()` calls `mask_logits` at the post-prefill wiring
-    /// site — i.e., the production call is real, not just the primitive tested
-    /// by `grammar_masking_blocks_argmax_token`.
+    /// Proves that `generate()` reaches real grammar masking at its first
+    /// (step-0) `select` call — i.e., the production wiring is real, not just
+    /// the primitive tested by `grammar_masking_blocks_argmax_token`.
     ///
     /// Strategy: build a minimal synthetic model (4 layers, 64-dim hidden,
     /// 97-token vocab), then construct a grammar engine whose vocabulary table
@@ -1392,19 +1406,25 @@ mod tests {
     /// empty entries (they can never advance the PDA), so the precomputed bitmask
     /// for the initial state is all-zeros: `mask_logits` sets every one of the 97
     /// logit positions to `NEG_INFINITY`. `has_finite_logit` then fires the
-    /// fail-closed guard inside `generate()`, which returns `Err(InvalidInput)`.
+    /// fail-closed guard inside `QwenCpuSession::select` (`decoder::qwen_cpu`),
+    /// which reports `SelectOutcome::GrammarExhausted`; since no token was
+    /// ever sampled, `decoder::driver::run` resolves that as
+    /// `Err(InferenceError::GrammarConstraintBlocked)`, not a completed grammar.
     ///
-    /// Coverage: the post-prefill masking site in `generate()` (the
-    /// `engine.mask_logits` call just before the first `sample_token`). The
-    /// decode-loop wiring sites — inside `decode_loop` and the inline streaming
-    /// loops — are reached only for tokens 2+ and are not separately covered
-    /// here; they would require additional forward-step iterations that cannot be
-    /// isolated without a controllable-output model.
+    /// Coverage: `select`'s masking call for the step-0 candidate. Every later
+    /// decode-loop token reaches the exact same `QwenCpuSession::select` call
+    /// site — there is no longer a separate "post-prefill" vs "decode-loop"
+    /// masking site to distinguish, since one driver loop calls `select` for
+    /// every token, step 0 included — so those later calls are not separately
+    /// covered here; they would require additional forward-step iterations
+    /// that cannot be isolated without a controllable-output model.
     ///
-    /// Mutation sensitivity: removing `engine.mask_logits(gs, ...)` from the
-    /// post-prefill site leaves logits at their raw (finite) model values.
-    /// `has_finite_logit` then returns `true`, no error is returned, and this
-    /// test's `assert!(result.is_err())` fails — proving the call is load-bearing.
+    /// Mutation sensitivity: removing the `request.grammar_mask` call from
+    /// `QwenCpuSession::select` leaves logits at their raw (finite) model
+    /// values. `has_finite_logit` then returns `true`, `select` reports a real
+    /// candidate instead of `GrammarExhausted`, and this test's assertion
+    /// against `Err(InferenceError::GrammarConstraintBlocked(_))` fails —
+    /// proving the call is load-bearing.
     ///
     /// The model-building helpers below mirror `lora_serving::build_model` in
     /// tests.rs; they are duplicated here to keep generation.rs self-contained
@@ -2968,7 +2988,8 @@ mod tests {
     /// but the active grammar forbids that token, decoding must **fail closed** — stop
     /// with `StopReason::Grammar` and NOT emit the forbidden `</think>`.
     ///
-    /// This pins the load-bearing weave in `decode_loop`: grammar `advance` runs on the
+    /// This pins the load-bearing weave in `DecodePolicy::transition_inner` (driven,
+    /// in production, via `decoder::driver::run`): grammar `advance` runs on the
     /// budget-FORCED token (`next_id`), not the pre-force `sampled_id`. Setup: grammar
     /// `root ::= "aa"` with a 7-entry grammar vocab (ids 0..=6); the tokenizer carries
     /// `</think>` at id 7 (outside the grammar vocab). All-zero weights → greedy always
@@ -3049,8 +3070,9 @@ mod tests {
     // drive `Qwen35Model::generate` through more than one distinguishable
     // decode position. The tests below construct `DecodePolicy` directly
     // instead, mirroring the exact call shape every decode loop above uses
-    // (`transition`'s closures wired the same way `decode_loop` wires them),
-    // to isolate the finalization ordering itself from sampling.
+    // (`transition`'s closures wired the same way `decoder::driver::run` wires
+    // `transition_with_metadata`'s), to isolate the finalization ordering
+    // itself from sampling.
 
     /// A budget-forced `</think>` that clears the grammar-advance and EOS
     /// checks must be emitted and have its own logprob recorded under the
@@ -4036,9 +4058,11 @@ mod tests {
     }
 
     /// PR #787: with `gen_cfg.logprobs`
-    /// left at its default (`None`), `DecodePolicy::record_logprob` (driven by
-    /// both `init` for the prefill token and `transition` for every token
-    /// after) must be a true no-op -- `token_logprobs` stays empty for the
+    /// left at its default (`None`), `DecodePolicy`'s logprobs gate (the
+    /// `if let Some(top_n) = self.logprobs` guard `init_with_metadata` and
+    /// `transition_inner` both apply in production, driven via
+    /// `decoder::driver::run`) must be a true no-op -- `token_logprobs` stays
+    /// empty for the
     /// whole generation, not just for the truncated-text case the test above
     /// covers. Replaces `sampling.rs`'s now-removed
     /// `test_record_logprob_noop_when_not_requested`: that free function no
@@ -4065,27 +4089,29 @@ mod tests {
         assert!(
             result.token_logprobs.is_empty(),
             "logprobs: None must record nothing across the whole generation \
-             (prefill token via init, decode tokens via transition); got {} entries",
+             (prefill token via init_with_metadata, decode tokens via \
+             transition_with_metadata); got {} entries",
             result.token_logprobs.len()
         );
     }
 
     /// PR #787: isolates
-    /// `DecodePolicy::init`'s first-step logprob ownership from
-    /// `transition`'s per-step logprob ownership, which
+    /// `DecodePolicy::init_with_metadata`'s first-step logprob ownership from
+    /// `transition_with_metadata`'s per-step logprob ownership, which
     /// `transition_records_one_logprob_per_generated_token` below already
     /// covers but does not itself distinguish. With `max_new_tokens: 1`,
-    /// `decode_loop`'s cap is 1, so its `for _ in 1..cap` loop body never
-    /// executes and `DecodePolicy::transition` is never called at all -- the
-    /// entire generation consists of the one prefill-derived token `init`
-    /// records. If that one `TokenLogprob` entry exists, it can only have
-    /// come from `init`.
+    /// `policy.cap()` is 1, so `decoder::driver::run`'s `for _ in 1..cap`
+    /// decode loop body never executes and `transition_with_metadata` is
+    /// never called at all -- the entire generation consists of the one
+    /// prefill-derived token `init_with_metadata` records. If that one
+    /// `TokenLogprob` entry exists, it can only have come from
+    /// `init_with_metadata`.
     ///
     /// Mutation sensitivity: removing the
-    /// `policy.record_logprob(token_logprobs, first_logits, ...)` call
-    /// inside `DecodePolicy::init` makes `token_logprobs` come back empty
-    /// while `token_ids` still has 1 entry -- this test fails with a length
-    /// mismatch (`0 != 1`) instead of passing.
+    /// `record_metadata(first_emitted_id, top_n)` call inside
+    /// `DecodePolicy::init_with_metadata` makes `token_logprobs` come back
+    /// empty while `token_ids` still has 1 entry -- this test fails with a
+    /// length mismatch (`0 != 1`) instead of passing.
     #[test]
     fn init_records_the_prefill_tokens_logprob_before_any_transition_call() {
         let model = build_tiny_zero_model();
@@ -4102,15 +4128,15 @@ mod tests {
         assert_eq!(
             result.generated_tokens, 1,
             "max_new_tokens: 1 must generate exactly the prefill-derived \
-             first token and never enter decode_loop; got {}",
+             first token and never run the decode loop; got {}",
             result.generated_tokens
         );
         assert_eq!(
             result.token_logprobs.len(),
             1,
             "the sole generated token's logprob must be recorded by \
-             DecodePolicy::init alone (transition is never called when \
-             max_new_tokens == 1); got {} entries",
+             DecodePolicy::init_with_metadata alone (transition_with_metadata \
+             is never called when max_new_tokens == 1); got {} entries",
             result.token_logprobs.len()
         );
         assert_eq!(

@@ -174,9 +174,10 @@ pub struct TokenLogprob {
 /// `stop_strings` match truncates `text` to the point where the match begins,
 /// but the token(s) whose decoded text completed the match are **not**
 /// removed from `token_ids`/`generated_tokens` — the implementation cannot
-/// "un-generate" a token once it has been decoded and appended (see
-/// `decode_loop_with_stops` / `earliest_stop_match` in
-/// `crate::model::qwen35::generation`). So for a `stop_strings` stop,
+/// "un-generate" a token once it has been decoded and appended (see the
+/// stop-strings branch of `Qwen35Model::generate_via_driver`, and
+/// `earliest_stop_match` / `earliest_stop_match_from` in
+/// `crate::model::qwen35::stop_strings`). So for a `stop_strings` stop,
 /// `token_ids.len()` (== `generated_tokens`) can exceed the number of tokens
 /// whose text actually survived in the truncated `text`. The EOS /
 /// `stop_token_ids` exclusion guarantee above does not extend to this case.
@@ -269,14 +270,23 @@ pub(crate) enum StopCheckOutcome {
 
 /// Backend-neutral decode-policy state (ADR-080 C3): reasoning-budget
 /// accounting and logprobs formatting, shared by every canonical/streaming
-/// decode loop — CPU [`decode_loop`], [`decode_loop_with_stops`], both
-/// branches of [`Qwen35Model::generate_streaming_with_cancel`], and the Metal
-/// `generate_streaming` / `generate_streaming_with_prefix_cache_and_cancel_inner`
-/// loops in `crate::forward::metal_qwen35` — via one atomic per-step
-/// transition ([`DecodePolicy::transition`]): each backend keeps
-/// `forward_step`, grammar masking, sampling, and its own token vectors
+/// decode step. Every canonical CPU generate/streaming request now routes
+/// through the one driver loop (`decoder::driver::run`), which drives this
+/// struct through [`DecodePolicy::transition_with_metadata`] -- the
+/// session-routed sibling that scores logprobs through a `DecoderSession`
+/// rather than a raw logits slice (ADR-090 row C, row R03).
+/// [`DecodePolicy::transition`] itself is unchanged and still drives the two
+/// Metal loops in `crate::forward::metal_qwen35`
+/// (`generate_streaming` / `generate_streaming_with_prefix_cache_and_cancel_inner`),
+/// which have no session type to route metadata through and so still hand
+/// `transition` a raw `logits: &[f32]` slice directly; in a CPU-only
+/// (non-`metal-gpu`) build it is otherwise reachable only from this module's
+/// own tests (see [`DecodePolicy::init`]'s doc comment). Both entry points
+/// funnel into the same private `transition_inner` engine, so the fixed
+/// per-step order below holds identically for CPU and Metal: each backend
+/// keeps `forward_step`, grammar masking, sampling, and its own token vectors
 /// (`generated_ids` / `all_ids` or the Metal equivalents) entirely to itself,
-/// hands `transition` the token its own pipeline just sampled plus three
+/// hands the transition the token its own pipeline just sampled plus three
 /// backend callbacks (grammar-advance, EOS/stop-token check, the push into
 /// its own vectors) and raw per-token I/O primitives for the stop check
 /// (`decode_delta`, a `text`/`token_logprob_end_offsets` buffer pair, and
@@ -342,8 +352,9 @@ enum StopMode {
     /// `gen_cfg.stop_strings` was empty at construction — there is nothing to
     /// match, so [`DecodePolicy::stop_check`] only threads decoded text
     /// through to the caller's sink (still needed for streaming callers'
-    /// `on_token`; a no-op for `decode_loop`, which has no text pipeline at
-    /// all).
+    /// `on_token`; a no-op for the driver's fast/no-stop-strings path
+    /// (`Qwen35Model::generate_via_driver`'s throwaway-buffer branch), which
+    /// has no text pipeline of its own).
     Disabled,
     /// Streaming incremental byte-holdback: the owned [`StopStringMatcher`]
     /// ensures a partial match never reaches the caller's confirmed-text
@@ -352,9 +363,11 @@ enum StopMode {
     /// streaming loops).
     Streaming(StopStringMatcher),
     /// Non-streaming full-text rescan, bounded to the suffix that could
-    /// contain a new match (`stop_scan_search_start`). Used only by CPU
-    /// `decode_loop_with_stops` (via `Qwen35Model::generate`'s stop-string
-    /// branch), which has no external consumer to hold text back from.
+    /// contain a new match (`stop_scan_search_start`). Used only by the
+    /// driver's non-streaming stop-strings branch
+    /// (`Qwen35Model::generate_via_driver`'s `stop_strings`-non-empty branch,
+    /// reached via the public `Qwen35Model::generate`), which has no
+    /// external consumer to hold text back from.
     FullScan {
         stop_strings: Vec<String>,
         max_stop: usize,
@@ -903,8 +916,9 @@ impl DecodePolicy {
     /// A no-op for `Disabled` beyond appending+emitting `tail` directly (there
     /// is nothing held back to reconcile) and for `FullScan` (the
     /// non-streaming caller owns its own tail-flush against its `full` buffer
-    /// directly, e.g. `decode_loop_with_stops`, since it has no external
-    /// consumer to hold text back from in the first place). Only `Streaming`
+    /// directly, e.g. `Qwen35Model::generate_via_driver`'s stop-strings
+    /// branch, since it has no external consumer to hold text back from in
+    /// the first place). Only `Streaming`
     /// mode's owned [`StopStringMatcher`] can be holding back up to
     /// `max_stop - 1` unconfirmed bytes that must be reconciled once the
     /// token source is exhausted — mirrors `StopStringMatcher::finish`

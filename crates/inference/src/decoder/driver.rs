@@ -69,6 +69,7 @@ use crate::generation::{
     DecodePolicy, GenerateConfig, StepOutcome, StopCheckOutcome, TokenLogprob,
 };
 use crate::grammar::{GrammarEngine, pda::GrammarState};
+use crate::model::qwen35_config::decode_cap;
 use crate::stop_reason::StopReason;
 use std::cell::RefCell;
 
@@ -85,17 +86,20 @@ pub(crate) struct DriverTrace {
     pub(crate) consumed: usize,
 }
 
-/// Everything [`run`] produces, mirroring the pieces `model::qwen35::generation`'s
-/// `generate()` currently assembles by hand from `decode_loop`/`decode_loop_with_stops`'s
-/// return value plus its own local `generated_ids`/`token_logprobs`.
+/// Everything [`run`] produces: `model::qwen35::generation`'s
+/// `generate_via_driver()`/`generate_streaming_via_driver()` read every field here
+/// directly off the returned value, replacing the by-hand assembly the deleted
+/// pre-driver `decode_loop`/`decode_loop_with_stops` functions used to require
+/// from their own local `generated_ids`/`token_logprobs`.
 pub(crate) struct DriverResult {
     pub(crate) generated_ids: Vec<u32>,
     pub(crate) token_logprobs: Vec<TokenLogprob>,
     pub(crate) stopped: bool,
     pub(crate) stop_reason: StopReason,
     /// Set only on [`StepOutcome::Stopped`] (a confirmed stop-string match);
-    /// the stop-string caller uses it exactly as `decode_loop_with_stops` uses
-    /// its own local of the same name, to skip a redundant tail-flush attempt.
+    /// `generate_via_driver`'s stop-strings branch reads this exactly as the
+    /// deleted `decode_loop_with_stops` read its own local of the same name,
+    /// to skip a redundant tail-flush attempt.
     pub(crate) confirmed_stop_string_match: bool,
     pub(crate) trace: DriverTrace,
 }
@@ -158,7 +162,22 @@ fn check_capabilities(
 /// function does not need to know which: `policy`'s own `StopMode` (fixed at
 /// construction from the real `gen_cfg.stop_strings`, exactly as today)
 /// decides whether the calls do real work or nothing, exactly as
-/// `decode_loop` already relies on for its own throwaway values.
+/// `model::qwen35::generation::Qwen35Model::generate_via_driver`'s fast-path
+/// branch already relies on for its own throwaway values.
+///
+/// `on_push` is called exactly once per token that becomes part of
+/// `generated_ids` -- both the prefill-derived step-0 token and every
+/// decode-loop token alike -- with `generated_ids.len()` immediately after
+/// the push that grew it to that length, and before anything else runs for
+/// that step: at step 0 that means before `DecodePolicy::init_with_metadata`
+/// scores the token's logprob, and in the loop it means before
+/// `DecodePolicy::transition_with_metadata`'s own `record_metadata` /
+/// `capture_reasoning_end` / `decode_delta` sequence. This is the hook a
+/// caller observing the true push boundary (e.g. a raw per-token
+/// lifecycle event) must use instead of piggy-backing on `decode_delta`:
+/// `decode_delta` runs later in the fixed per-step order, so anything
+/// timed off it drifts whenever `record_metadata` does real (session-scored)
+/// work, i.e. whenever `gen_cfg.logprobs` is set.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     session: &mut dyn DecoderSession,
@@ -168,6 +187,7 @@ pub(crate) fn run(
     eos_token_id: u32,
     streaming: bool,
     cancel: &dyn Cancellation,
+    mut on_push: impl FnMut(usize),
     mut decode_delta: impl FnMut(u32) -> String,
     text: &mut String,
     token_logprob_end_offsets: &mut Vec<usize>,
@@ -277,7 +297,14 @@ pub(crate) fn run(
 
     let mut trace = DriverTrace::default();
     let mut all_ids: Vec<u32> = prompt_ids.to_vec();
-    let mut generated_ids: Vec<u32> = Vec::new();
+    // Same reservation the earlier per-path decode loops made: the most tokens
+    // this request can ever emit is fixed up front by `gen_cfg`, independent of
+    // anything the session or policy decides later, so reserve it before the
+    // first push.
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(decode_cap(
+        gen_cfg.effective_reasoning_budget(),
+        gen_cfg.max_new_tokens,
+    ));
     let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
     let is_eos = |id: u32| id == eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
@@ -360,6 +387,7 @@ pub(crate) fn run(
 
     generated_ids.push(candidate0.candidate_id);
     all_ids.push(candidate0.candidate_id);
+    on_push(generated_ids.len());
 
     let candidate0_prediction = candidate0.prediction;
     let mut policy = DecodePolicy::init_with_metadata(
@@ -507,6 +535,7 @@ pub(crate) fn run(
                 |next_id| {
                     generated_ids.push(next_id);
                     all_ids.push(next_id);
+                    on_push(generated_ids.len());
                 },
                 |final_token, top_n| {
                     session
@@ -661,7 +690,9 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoder::{PredictionId, StepStamp, TokenMetadata};
+    use crate::decoder::{
+        PredictionId, PredictionLedger, SelectionCandidate, StepStamp, TokenMetadata,
+    };
     use crate::grammar::GrammarSpec;
     use std::sync::Arc;
 
@@ -745,6 +776,7 @@ mod tests {
             999,
             false,
             &cancel,
+            |_generated_len| {},
             |_next_id| String::new(),
             &mut text,
             &mut offsets,
@@ -815,5 +847,162 @@ mod tests {
                  FakeSession::prefill should be unreachable-if-not-erroring"
             ),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // `on_push` vs `metadata` ordering, with `gen_cfg.logprobs` set. `on_push`
+    // must fire for a token strictly before that token's `metadata` call (the
+    // session-scored logprob lookup `DecodePolicy::transition_inner`'s
+    // `record_metadata` callback routes to), for every generated token -- the
+    // prefill-derived first token included, not just the decode-loop tokens.
+    // -----------------------------------------------------------------
+
+    /// Mutation sensitivity: `run`'s `on_push` call sites (step 0, and the push
+    /// closure passed to `transition_with_metadata`) both fire before the metadata
+    /// call for that same token; a change that fires `on_push` from `decode_delta`
+    /// instead (the pre-fix design, which needed a caller-side counter because
+    /// `decode_delta` receives only a token id, never the push-time length) would
+    /// fire it *after* `metadata` at every step, since `transition_inner` calls
+    /// `record_metadata` before `decode_delta` in its fixed order -- see that
+    /// method's own doc comment. That reorders every pair in `events` to
+    /// `[Metadata, Push(n), Metadata, Push(n+1), ...]`, and the `assert_eq!` below
+    /// fails on the very first pair.
+    #[test]
+    fn on_push_fires_before_metadata_for_every_token_with_logprobs_enabled() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Event {
+            Push(usize),
+            Metadata,
+        }
+
+        /// Always accepts one fixed candidate token (never EOS, never a configured
+        /// stop token), drives `PredictionLedger` correctly through select/decode,
+        /// and records every `metadata` call into `events` -- enough to run a
+        /// `gen_cfg.logprobs`-enabled request through several full decode-loop
+        /// iterations and observe the `on_push`/`metadata` ordering for more than
+        /// just the prefill-derived first token.
+        struct RecordingSession {
+            caps: ExecutionCapabilities,
+            ledger: PredictionLedger,
+            events: std::rc::Rc<std::cell::RefCell<Vec<Event>>>,
+        }
+
+        const CANDIDATE_ID: u32 = 7;
+
+        impl DecoderSession for RecordingSession {
+            fn capabilities(&self) -> &ExecutionCapabilities {
+                &self.caps
+            }
+
+            fn prefill(&mut self, _cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
+                Ok(StepStamp {
+                    evaluated_len: 1,
+                    prediction: None,
+                })
+            }
+
+            fn decode(
+                &mut self,
+                accepted: &AcceptedToken,
+                _cancel: &dyn Cancellation,
+            ) -> Result<StepStamp, InferenceError> {
+                self.ledger.consume(accepted.prediction)?;
+                Ok(StepStamp {
+                    evaluated_len: 2,
+                    prediction: None,
+                })
+            }
+
+            fn select(
+                &mut self,
+                _request: &SelectionRequest<'_>,
+            ) -> Result<SelectOutcome, InferenceError> {
+                Ok(SelectOutcome::Candidate(SelectionCandidate {
+                    candidate_id: CANDIDATE_ID,
+                    prediction: self.ledger.open(),
+                }))
+            }
+
+            fn metadata(
+                &mut self,
+                prediction: PredictionId,
+                final_token: u32,
+                _request: &MetadataRequest,
+            ) -> Result<TokenMetadata, InferenceError> {
+                self.events.borrow_mut().push(Event::Metadata);
+                Ok(TokenMetadata {
+                    prediction,
+                    final_token_id: final_token,
+                    final_logprob: -0.1,
+                    top: Vec::new(),
+                })
+            }
+
+            fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
+                Ok(())
+            }
+        }
+
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Event>::new()));
+        let mut session = RecordingSession {
+            caps: ExecutionCapabilities {
+                logprobs: true,
+                ..ExecutionCapabilities::default()
+            },
+            ledger: PredictionLedger::new(),
+            events: events.clone(),
+        };
+        // `logprobs: Some(_)` is what makes `record_metadata` a real, non-skipped
+        // call at every step (see `DecodePolicy::transition_inner`'s doc comment) --
+        // the ordering this test exists to pin has no observable effect otherwise.
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            logprobs: Some(0),
+            ..Default::default()
+        };
+        let cancel = || false;
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        let events_for_push = events.clone();
+
+        let result = run(
+            &mut session,
+            &gen_cfg,
+            None,
+            &[0u32],
+            999, // eos_token_id; CANDIDATE_ID (7) and the default stop_token_ids
+            // (QWEN_CHAT_IM_END_TOKEN_ID, 248_046) never match it, so the loop
+            // runs to gen_cfg.max_new_tokens rather than stopping early.
+            false,
+            &cancel,
+            move |generated_len| {
+                events_for_push
+                    .borrow_mut()
+                    .push(Event::Push(generated_len));
+            },
+            |_next_id| String::new(),
+            &mut text,
+            &mut offsets,
+            |_delta, _id| true,
+            || {},
+            String::new,
+        )
+        .expect("a fixed non-EOS candidate with no grammar/stop-strings must run to the cap");
+
+        assert_eq!(
+            result.generated_ids,
+            vec![CANDIDATE_ID; 3],
+            "the fixed candidate must be accepted on every step"
+        );
+
+        let expected: Vec<Event> = (1..=3usize)
+            .flat_map(|index| [Event::Push(index), Event::Metadata])
+            .collect();
+        assert_eq!(
+            events.borrow().clone(),
+            expected,
+            "on_push must fire for token n strictly before that token's metadata call, for \
+             every one of the 3 generated tokens (the prefill-derived first token included)"
+        );
     }
 }

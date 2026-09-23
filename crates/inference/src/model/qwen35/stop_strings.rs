@@ -12,7 +12,8 @@
 // of the two a caller uses. This lets a deterministic test observe the *real*
 // scan cost incurred by the production call site in `StopStringMatcher::push`
 // (crates/inference/src/model/qwen35/stop_strings.rs) and
-// `decode_loop_with_stops` (crates/inference/src/model/qwen35/generation.rs):
+// `DecodePolicy::stop_check`'s `FullScan` branch
+// (crates/inference/src/generation.rs):
 // if either regresses back to the full-rescan `earliest_stop_match`, the
 // counter grows with `haystack.len()` on every call instead of with the
 // bounded window, and a linear-bound assertion over many pushes fails.
@@ -87,10 +88,11 @@ pub(crate) fn floor_char_boundary(s: &str, idx: usize) -> usize {
     idx
 }
 
-/// Shared by `StopStringMatcher::push` and `generation.rs`'s
-/// `decode_loop_with_stops` raw loop: the byte offset the next scan should
-/// start from, given `prev_len` (haystack length *before* this push's delta
-/// landed) and `max_stop` (the longest configured stop string). Both call
+/// Shared by `StopStringMatcher::push` and
+/// `crate::generation::DecodePolicy::stop_check`'s `FullScan` branch: the byte
+/// offset the next scan should start from, given `prev_len` (haystack length
+/// *before* this push's delta landed) and `max_stop` (the longest configured
+/// stop string). Both call
 /// sites must derive `search_start` through this one function — see
 /// `earliest_stop_match_from`'s doc comment for why bounding the scan to
 /// `[search_start..]` never misses a match.
@@ -622,7 +624,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Direct, deterministic proof that `stop_scan_search_start` (the helper
-    /// shared by `StopStringMatcher::push` and `decode_loop_with_stops`) is
+    /// shared by `StopStringMatcher::push` and
+    /// `crate::generation::DecodePolicy::stop_check`'s `FullScan` branch) is
     /// bounded by `max_stop - 1`, independent of how large the haystack has
     /// grown. This alone only guards the helper's own arithmetic, not
     /// whether production code actually calls it — see
