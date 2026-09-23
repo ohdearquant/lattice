@@ -35,6 +35,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 
 /// Request body cap: 1 MiB.  Requests above this return HTTP 413.
 /// ADR-080 C2 (#782): `lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES`
@@ -412,6 +413,77 @@ pub struct AppState {
     /// model directory; every `/v1/embeddings` request then fails closed
     /// with `vision_unsupported`.
     pub embedding_model: Option<Arc<lattice_inference::serve::embeddings::EmbeddingModel>>,
+    /// Bounded concurrent-job admission for `/v1/embeddings`'s pooled
+    /// `embed_items` `spawn_blocking` calls (issue #1397), mirroring
+    /// `lattice_serve.rs`'s `EmbeddingState::admission` for its own
+    /// `/v1/embeddings` route: see [`EMBEDDING_MAX_CONCURRENT_JOBS`].
+    /// Always constructed, independent of whether `embedding_model` is
+    /// `Some` -- when no vision-language checkpoint is loaded, `embeddings()`
+    /// already fails closed on `embedding_model` before this is ever
+    /// touched.
+    pub embedding_admission: Arc<Semaphore>,
+}
+
+/// See [`AppState::embedding_admission`]. Same cap `lattice_serve.rs` uses
+/// for its own pooled embedding route (`EMBEDDING_MAX_CONCURRENT_JOBS`
+/// there): each admitted job here is additionally bounded to
+/// `lattice_inference::serve::embeddings::MAX_EMBEDDING_TOTAL_TOKENS`
+/// aggregate scaffold tokens by the budget check `embeddings()` runs inside
+/// the admitted `spawn_blocking` job (see
+/// [`check_pooled_embedding_total_tokens`]'s doc comment for why that check
+/// runs after admission rather than before it, unlike the sibling route), so
+/// aggregate pooled-decoder work across concurrent requests is bounded by
+/// (this cap) x (that per-request budget) rather than growing with however
+/// many requests arrive at once. Fixed rather than a CLI flag: like the
+/// sibling route, CPU-bound pooled forward passes have no hardware queue
+/// depth to model, this cap exists purely to bound aggregate memory and CPU
+/// contention.
+pub(crate) const EMBEDDING_MAX_CONCURRENT_JOBS: usize = 4;
+
+/// Acquires one pooled-embedding admission slot for
+/// [`AppState::embedding_admission`], mirroring `lattice_serve.rs`'s
+/// `try_acquire_embedding_slot`. Synchronous and non-blocking: a full
+/// admission cap is rejected immediately, before any tokenization, image
+/// preprocessing, or `spawn_blocking` work runs.
+///
+/// # Errors
+///
+/// Returns [`ApiError::ServiceUnavailable`] (`server_busy`) when
+/// [`EMBEDDING_MAX_CONCURRENT_JOBS`] jobs are already outstanding.
+fn try_acquire_embedding_slot(
+    admission: &Arc<Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::ServiceUnavailable {
+            message: "too many outstanding /v1/embeddings requests; retry shortly".to_string(),
+        })
+}
+
+/// Runs one pooled-embedding job (`check_pooled_embedding_total_tokens` then
+/// `embed_items`) on the blocking thread pool with `permit` moved into the
+/// closure, so the admission slot releases
+/// when the job finishes rather than when the caller's `.await` is dropped
+/// -- mirrors `lattice_serve.rs`'s `run_embedding_encode`, for the identical
+/// reason: a `spawn_blocking` task already under way is not cancelled by
+/// dropping its `JoinHandle` (e.g. a disconnected client dropping the
+/// request future), so a permit held only in the caller's stack frame would
+/// release on disconnect while the job kept running -- letting repeated
+/// disconnects admit unbounded concurrent jobs past the cap. Generic over
+/// the closure's return type (unlike the sibling, which is concrete to its
+/// own `Vec<Vec<f32>>` result) since `embed_items` returns an
+/// `(EmbeddingDatum, EmbeddingsUsage)` pair already wrapped in `ApiError`
+/// rather than `InferenceError`.
+async fn run_pooled_embedding_job<T: Send + 'static>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<Result<T, ApiError>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
 }
 
 // -----------------------------------------------------------------------
@@ -1540,7 +1612,8 @@ pub async fn embeddings(
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
     use lattice_inference::serve::embeddings::{
-        EmbeddingsRequest, embed_items, normalize_embedding_items, parse_pooling,
+        EmbeddingsRequest, check_pooled_embedding_total_tokens, embed_items,
+        normalize_embedding_items, parse_pooling,
     };
 
     lattice_inference::serve::require_json_content_type(&headers)?;
@@ -1584,14 +1657,34 @@ pub async fn embeddings(
     };
     let model_id = state.model_id.clone();
 
-    let (data, usage) = tokio::task::spawn_blocking(move || embed_items(&embedder, items, pooling))
-        .await
-        .map_err(|e| {
-            eprintln!("task join error: {e}");
-            ApiError::Internal {
-                message: "inference failed".to_string(),
-            }
-        })??;
+    // #1397: bounded concurrent-job admission FIRST, mirroring
+    // `lattice_serve.rs`'s `try_acquire_embedding_slot` / `run_embedding_encode`
+    // -- rejects with 503 `server_busy` before any tokenization, image
+    // preprocessing, or `spawn_blocking` work runs, and the permit is moved
+    // into the blocking closure so a disconnected client cannot free the
+    // slot before the job itself finishes. Deliberately NOT mirroring the
+    // sibling route's within-request ORDER of budget-then-admission: see
+    // `check_pooled_embedding_total_tokens`'s doc comment for why this
+    // route's aggregate token-budget check has to run AFTER admission,
+    // inside the job below, instead of before it.
+    let permit = try_acquire_embedding_slot(&state.embedding_admission)?;
+
+    let (data, usage) = run_pooled_embedding_job(permit, move || {
+        // #1397: aggregate token-budget check, mirroring `lattice_serve.rs`'s
+        // `check_embeddings_total_tokens` -- runs inside the admitted job,
+        // before `embed_items`, so a request already admitted past the
+        // concurrency cap is still rejected before its actual pooled-decoder
+        // work starts.
+        check_pooled_embedding_total_tokens(&embedder, &items)?;
+        embed_items(&embedder, items, pooling)
+    })
+    .await
+    .map_err(|e| {
+        eprintln!("task join error: {e}");
+        ApiError::Internal {
+            message: "inference failed".to_string(),
+        }
+    })??;
 
     Ok(
         Json(lattice_inference::serve::embeddings::EmbeddingsResponse {
@@ -1913,6 +2006,7 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
             };
             (state, unblock_tx, started_rx)
         }
@@ -3382,6 +3476,7 @@ mod tests {
             model_id: "test-model".to_string(),
             request_counter: Arc::new(AtomicU64::new(0)),
             embedding_model: None,
+            embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
         }
     }
 
@@ -3486,6 +3581,7 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
             };
 
             let response = router(state)
@@ -3792,6 +3888,216 @@ mod tests {
                     .iter()
                     .any(|e| e == "/v1/embeddings")
             );
+        }
+
+        // ── admission cap + token budget (issue #1397) ──
+
+        /// A request that fills the last free admission slot (holding
+        /// `EMBEDDING_MAX_CONCURRENT_JOBS - 1` permits externally leaves
+        /// exactly one) must be admitted; one more held permit (the cap
+        /// itself now fully outstanding) must get the documented 503
+        /// `server_busy` envelope, before any `spawn_blocking` work runs.
+        /// Both boundaries in one test so the admitted case is proven on
+        /// the exact state the refused case then tightens by one permit.
+        #[tokio::test]
+        async fn admission_cap_admits_at_cap_and_refuses_past_it() {
+            let state = state_with_embedder();
+            let admission = state.embedding_admission.clone();
+            let mut held: Vec<_> = (0..EMBEDDING_MAX_CONCURRENT_JOBS - 1)
+                .map(|_| {
+                    admission
+                        .clone()
+                        .try_acquire_owned()
+                        .expect("slot must be available below the cap")
+                })
+                .collect();
+
+            let response = router(state.clone())
+                .oneshot(post_embeddings(serde_json::json!({"input": "a"})))
+                .await
+                .expect("router must return a response");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a request that fills the last free slot (at the cap) must be admitted"
+            );
+
+            held.push(
+                admission
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("the cap-th slot must still be available"),
+            );
+            let response = router(state)
+                .oneshot(post_embeddings(serde_json::json!({"input": "a"})))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "server_busy");
+            drop(held);
+        }
+
+        /// Regression coverage for the admission-control hole issue #1397
+        /// describes: a client disconnecting mid-request must not release
+        /// the admission permit early while the already-started
+        /// `spawn_blocking` job keeps running -- repeated disconnects could
+        /// otherwise accumulate unbounded concurrent jobs past
+        /// `EMBEDDING_MAX_CONCURRENT_JOBS`. Exercises
+        /// [`run_pooled_embedding_job`] directly (the same helper
+        /// `embeddings()` calls) with a deterministic channel-gated
+        /// closure, mirroring `lattice_serve.rs`'s
+        /// `embedding_permit_survives_dropped_request_future`.
+        ///
+        /// `tokio::spawn` + `JoinHandle::abort()` simulates axum dropping a
+        /// disconnected client's handler future mid-`.await`: at the point
+        /// of `abort()` the task is suspended awaiting the inner
+        /// `spawn_blocking` `JoinHandle` (not actively running), so tokio
+        /// drops the task's future there -- the same event a dropped
+        /// request future produces.
+        #[tokio::test]
+        async fn pooled_embedding_permit_survives_dropped_request_future() {
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = admission
+                .clone()
+                .try_acquire_owned()
+                .expect("single slot must be admitted");
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let mut started_tx = Some(started_tx);
+
+            let task = tokio::spawn(run_pooled_embedding_job(permit, move || {
+                started_tx
+                    .take()
+                    .expect("closure runs exactly once")
+                    .send(())
+                    .expect("test task must still be waiting on started_rx");
+                // Deterministic handshake, not a sleep: blocks until the
+                // test explicitly lets the "embed_items" job finish.
+                release_rx
+                    .recv()
+                    .expect("release_tx must not be dropped before sending");
+                Ok::<(), ApiError>(())
+            }));
+
+            started_rx
+                .await
+                .expect("job must signal that it started running");
+
+            // Simulate the client disconnecting: cancel the outstanding
+            // request future while the blocking job is still in flight.
+            task.abort();
+            let join_result = task.await;
+            assert!(
+                join_result.is_err() && join_result.unwrap_err().is_cancelled(),
+                "aborted task must resolve as cancelled"
+            );
+
+            assert_eq!(
+                admission.available_permits(),
+                0,
+                "admission slot must stay held while the embed_items job is still running, \
+                 not release just because the request future was dropped"
+            );
+
+            // Let the blocking job finish and confirm the slot frees up.
+            release_tx
+                .send(())
+                .expect("blocking closure must still be waiting on release_rx");
+            for _ in 0..200 {
+                if admission.available_permits() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                admission.available_permits(),
+                1,
+                "admission slot must free once the embed_items job actually completes"
+            );
+        }
+
+        /// Aggregate scaffold-token budget (`MAX_EMBEDDING_TOTAL_TOKENS`):
+        /// every item individually fits the tiny model's 512-token context
+        /// window (each item is well under that), but the sum across items
+        /// exceeds the request-wide budget, so the aggregate gate -- not
+        /// the per-item window check -- must be what rejects this request.
+        #[tokio::test]
+        async fn aggregate_token_budget_exceeded_400() {
+            use lattice_inference::serve::embeddings::MAX_EMBEDDING_TOTAL_TOKENS;
+            // `tiny_embedding_model`'s vocab has no merges, so each "a"
+            // character tokenizes to its own token (see that fixture's doc
+            // comment): 480 tokens per item, comfortably under the tiny
+            // model's 512-token context window, times 80 items comfortably
+            // clears the 32,768-token aggregate budget.
+            const {
+                assert!(
+                    80 * 480 > MAX_EMBEDDING_TOTAL_TOKENS,
+                    "fixture must actually exceed the budget it tests"
+                );
+            }
+            let item = "a".repeat(480);
+            let items: Vec<serde_json::Value> =
+                std::iter::repeat_n(serde_json::Value::String(item), 80).collect();
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({ "input": items })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "batch_token_budget_exceeded");
+        }
+
+        /// Priority ordering: with the admission cap fully
+        /// held, a request that would ALSO fail the aggregate token budget
+        /// must still be refused by admission (503 `server_busy`), not by
+        /// the budget check (400 `batch_token_budget_exceeded`) --
+        /// `check_pooled_embedding_total_tokens` runs inside the admitted
+        /// `spawn_blocking` job, after `try_acquire_embedding_slot`, so a
+        /// request that never gets a permit never reaches it. This is
+        /// busy-before-budget, deliberately not the sibling route's own
+        /// within-request order: see `check_pooled_embedding_total_tokens`'s
+        /// doc comment. Reverting the fix (running the budget check before
+        /// admission, on the handler thread) turns this 503 into a 400 --
+        /// the two error codes are asserted separately so that mutation is
+        /// visible in the failure message, not just a boolean.
+        #[tokio::test]
+        async fn admission_refusal_takes_priority_over_token_budget() {
+            use lattice_inference::serve::embeddings::MAX_EMBEDDING_TOTAL_TOKENS;
+            const {
+                assert!(
+                    80 * 480 > MAX_EMBEDDING_TOTAL_TOKENS,
+                    "fixture must actually exceed the budget it tests"
+                );
+            }
+            let state = state_with_embedder();
+            let admission = state.embedding_admission.clone();
+            let held: Vec<_> = (0..EMBEDDING_MAX_CONCURRENT_JOBS)
+                .map(|_| {
+                    admission
+                        .clone()
+                        .try_acquire_owned()
+                        .expect("slot must be available below the cap")
+                })
+                .collect();
+
+            let item = "a".repeat(480);
+            let items: Vec<serde_json::Value> =
+                std::iter::repeat_n(serde_json::Value::String(item), 80).collect();
+            let response = router(state)
+                .oneshot(post_embeddings(serde_json::json!({ "input": items })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a fully-held admission cap must refuse before the budget check ever \
+                 runs, even for a request that would also fail that check"
+            );
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "server_busy");
+            drop(held);
         }
     }
 
@@ -4133,6 +4439,7 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
             }
         }
 
@@ -4584,6 +4891,7 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
             }
         }
 
@@ -4786,6 +5094,7 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
             };
             let request = axum::http::Request::builder()
                 .method("POST")
@@ -4929,6 +5238,7 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
             }
         }
 
