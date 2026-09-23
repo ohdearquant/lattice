@@ -172,13 +172,16 @@ fn env_lookup(var: &str) -> Option<String> {
 #[cfg(not(feature = "f16"))]
 #[test]
 fn cpu_pre_migration_greedy_golden() {
-    // An absent feature enforces exactly like an absent checkpoint. The
-    // checkpoint is bf16 safetensors, which `from_safetensors` refuses without
-    // `f16`; compiling this target into a silent no-op is the skip-shaped
-    // failure the row forbids.
+    // An absent feature enforces exactly like an absent checkpoint: this
+    // golden's fail-closed contract (ADR-090 R03) requires the exact
+    // `--features f16` invocation documented above, so compiling this target
+    // into a silent no-op is the skip-shaped failure the row forbids. The
+    // loader itself no longer requires `f16` to decode bf16 safetensors; this
+    // panic enforces the pinned invocation, not a load-time capability.
     panic!(
-        "this target was built without the `f16` feature, but the checkpoint is \
-         bf16 and cannot be loaded without it. Re-run with --features f16."
+        "this target was built without the `f16` feature. The golden was \
+         captured under --features f16 and this gate enforces that exact \
+         invocation; re-run with --features f16."
     );
 }
 

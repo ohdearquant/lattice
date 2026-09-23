@@ -464,6 +464,7 @@ GATE_SCRIPT="$REPO/scripts/perf-bench-gate.py"
 print_execution_provenance() {
   echo "  head arm: $HEAD_MODE"
   echo "  gate: scripts/perf-bench-gate.py from the invoking checkout"
+  echo "  python: $PYTHON_BIN"
 }
 
 require_commit_clean_head() {

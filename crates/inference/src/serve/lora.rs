@@ -90,6 +90,103 @@ pub enum AdapterControlResult {
     Unloaded(u32),
 }
 
+/// Assemble the `GET /v1/lora` body: the residency snapshot with `router`
+/// added beside it.
+///
+/// A separate function because the shape is the thing that breaks and a
+/// handler's shape can only be checked by launching a server. It already broke
+/// once: adding the router key as `json!({"adapters": index, "router": ...})`
+/// reads like adding a field and is not. `AdapterIndex` serializes to
+/// `{"adapters": [...], "applied": [...]}`, so wrapping it turned the
+/// top-level `adapters` from an array into an object and moved `applied` a
+/// level down -- a breaking change to two existing fields, written while
+/// intending a purely additive one, and invisible without a test that holds
+/// the whole body.
+///
+/// It lives in the shared module rather than in either binary because the two
+/// binaries answer the SAME route: a body assembled in one of them is a body
+/// the other can drift from, and it did -- `lattice_serve` was still returning
+/// the bare residency snapshot after `lattice` gained the `router` key, so one
+/// server reported which gate was serving and the other did not. A route-table
+/// mechanism cannot see that: both registered the route correctly.
+///
+/// `router` is therefore merged in beside the snapshot's own keys rather than
+/// containing them.
+pub fn lora_list_body(
+    index: &AdapterIndex,
+    router: Option<crate::router_state::RouterReport<'_>>,
+) -> serde_json::Value {
+    // ADR-095 decision 3: the response says which gate is serving, because
+    // "routing is enabled" and "routing ran with the gate I pinned" are
+    // different claims.
+    //
+    // `pinned` is reported rather than left for the reader to infer, because
+    // the version alone cannot carry it. A server reporting version 7 reports
+    // the same number whether --router-pin selected it or whether 7 is simply
+    // the highest version written so far, and the two only diverge at the next
+    // refit and restart -- which is when nobody is looking, and is the entire
+    // scenario a pin exists for.
+    let router = match router {
+        None => serde_json::json!({"enabled": false}),
+        Some(report) => {
+            // "enabled" and "can route right now" are different claims, and
+            // the second one moves: adapters load and unload while the server
+            // runs, so a gate that was routable a minute ago is not. Routing
+            // refuses a set it cannot match, so without this an operator meets
+            // that refusal one 400 at a time with nothing on the surface that
+            // predicted it.
+            //
+            // Computed by the SAME predicate routing refuses on, not by a
+            // comparison written here. A second copy would drift, and the
+            // drift reads as this endpoint promising a route the next request
+            // declines.
+            let state = crate::serve::routing::routability(report.artifact, index);
+            serde_json::json!({
+                "enabled": true,
+                "version": report.artifact.version_label(),
+                "pinned": report.pinned,
+                "embedder": report.embedder,
+                "adapter_names": report.artifact.adapter_names,
+                "routable": state.routable(),
+                "missing": state.missing,
+                "unexpected": state.unexpected,
+                "duplicate_trained": state.duplicate_trained,
+                "duplicate_resident": state.duplicate_resident,
+            })
+        }
+    };
+    let mut body = serde_json::to_value(index).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(map) = body.as_object_mut() {
+        map.insert("router".into(), router);
+    }
+    body
+}
+
+/// Every `/v1/lora*` route, as data: path and methods, one copy (ADR-095
+/// decision 4).
+///
+/// Data rather than a shared constructor. The two binaries do not share a
+/// state type -- one carries a CPU-or-Metal backend, the other is
+/// Metal-worker-only with a metrics registry -- so a shared constructor would
+/// be generic over the state and take every handler as a parameter, replacing
+/// each `.route()` line with a handler argument. That relocates the
+/// duplication into a longer call while the handlers and the state, which are
+/// what actually drift, stay exactly where they are. A list has no state type
+/// to be generic over.
+///
+/// This list establishes only that a route is REGISTERED. Whether the two
+/// binaries' handlers behave the same is a separate question that no
+/// route-table mechanism can answer, and it is audited in the ADR rather than
+/// asserted here: the failure that motivated this decision was two binaries
+/// that both rejected a non-finite adapter scale, one at the HTTP boundary and
+/// one later inside `apply()`. Same route, same shared module, different
+/// reachable behaviour, both tables correct.
+pub const LORA_ROUTES: &[(&str, &[&str])] = &[
+    ("/v1/lora", &["GET"]),
+    ("/v1/lora/load", &["POST"]),
+    ("/v1/lora/unload", &["POST"]),
+];
+
 /// One contribution to an ordered request mixture.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

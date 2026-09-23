@@ -3346,7 +3346,20 @@ mod imp {
     /// file of their choosing. The startup warning covers it; an allow-root is the
     /// obvious next control and is deliberately not invented here.
     async fn lora_list(State(s): State<AppState>) -> Json<Value> {
-        Json(serde_json::json!(s.jobs.adapter_index()))
+        // Assembled by the shared helper so this binary and `lattice serve`
+        // cannot answer the same route with different shapes. They already
+        // did: this returned the bare residency snapshot while the other had
+        // gained the `router` key, and nothing caught it -- the route was
+        // registered correctly in both, which is all a route-table mechanism
+        // can see (ADR-095 decision 4, item 4).
+        //
+        // `None` because this binary has no `--router-state` yet, so it
+        // reports `{"enabled": false}`: the same shape, honestly filled. The
+        // flags are the next step, not a silent omission.
+        Json(lattice_inference::serve::lora::lora_list_body(
+            &s.jobs.adapter_index(),
+            None,
+        ))
     }
 
     /// Repeated exact `(name, path)` identities share one resident id and lifetime:
@@ -4213,6 +4226,75 @@ mod imp {
         // no running worker behind it (issue #832's `test_client_and_jobs`
         // seam, receiver half discarded) is a faithful stand-in: no GPU, no
         // model load.
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        /// ADR-095 decision 4: every entry in the shared route list is registered
+        /// in THIS binary. A route added to the list and forgotten here reds this
+        /// test.
+        ///
+        /// The assertion is only that the response is not 404. A 405 or a 4xx from
+        /// validation both count as registered -- the test asks whether the route
+        /// exists and nothing else, because anything more would need the state the
+        /// two binaries do not share. Asserting a specific status would make this
+        /// a behaviour test that passes or fails for reasons unrelated to
+        /// registration.
+        #[tokio::test]
+        async fn every_shared_lora_route_is_registered_in_this_binary() {
+            use lattice_inference::serve::lora::LORA_ROUTES;
+            use tower::ServiceExt;
+
+            assert!(
+                !LORA_ROUTES.is_empty(),
+                "the route list is empty, so this test would pass while checking nothing"
+            );
+
+            for (path, methods) in LORA_ROUTES {
+                for method in *methods {
+                    let request = axum::http::Request::builder()
+                        .method(*method)
+                        .uri(*path)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from("{}"))
+                        .expect("fixture request must build");
+                    let response = router(test_app_state())
+                        .oneshot(request)
+                        .await
+                        .expect("router must produce a response, not a transport error");
+                    assert_ne!(
+                        response.status(),
+                        axum::http::StatusCode::NOT_FOUND,
+                        "{method} {path} is in LORA_ROUTES but not registered in this binary"
+                    );
+                    // A 405 means the path exists under a DIFFERENT method, so the listed
+                    // method is not registered either; checking 404 alone would pass it.
+                    assert_ne!(
+                        response.status(),
+                        axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                        "{method} {path} is in LORA_ROUTES but this binary registers {path} under another method"
+                    );
+                }
+            }
+
+            // The must-not-match control: the same machinery reports 404 for a
+            // path nobody registered. Without it, a router that answered
+            // everything -- a catch-all fallback, say -- would pass the loop above
+            // while proving nothing about any individual route.
+            let request = axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/lora/definitely-not-a-route")
+                .body(axum::body::Body::empty())
+                .expect("control request must build");
+            let response = router(test_app_state())
+                .oneshot(request)
+                .await
+                .expect("router must produce a response");
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "an unregistered path did not 404, so the loop above cannot distinguish \
+                 a registered route from a router that answers everything"
+            );
+        }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         fn test_app_state() -> AppState {
@@ -6413,7 +6495,10 @@ mod imp {
         #[tokio::test]
         async fn lora_list_reads_confirmed_index() {
             let Json(value) = lora_list(State(test_app_state())).await;
-            assert_eq!(value, serde_json::json!({"adapters":[],"applied":[]}));
+            assert_eq!(
+                value,
+                serde_json::json!({"adapters":[],"applied":[],"router":{"enabled":false}})
+            );
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

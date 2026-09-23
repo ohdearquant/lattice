@@ -2464,6 +2464,7 @@ mod tests {
             // ids must be the same ids, and a divergence here means the fallback
             // drifted from the route that replaced it.
             let inline_cfg = GenerateConfig {
+                min_p: 0.0,
                 logprobs: Some(0),
                 ..cfg.clone()
             };
@@ -2590,6 +2591,7 @@ mod tests {
             // without this pair, a default trace on its own cannot distinguish "the
             // fallback correctly ran" from "the driver never ran at all".
             let inline_cfg = GenerateConfig {
+                min_p: 0.0,
                 logprobs: Some(0),
                 ..cfg.clone()
             };
@@ -3165,6 +3167,7 @@ mod tests {
     #[test]
     fn decode_policy_cap_ignores_reasoning_budget_when_thinking_disabled() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: false,
             max_new_tokens: 1,
@@ -3204,6 +3207,7 @@ mod tests {
     #[test]
     fn context_admission_ignores_reasoning_budget_when_thinking_disabled() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(3),
             enable_thinking: false,
             max_new_tokens: 2,
@@ -4328,6 +4332,7 @@ mod tests {
     #[test]
     fn forced_close_with_logprobs_records_the_post_override_token() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: true,
             logprobs: Some(0),
@@ -4398,6 +4403,7 @@ mod tests {
     #[test]
     fn transition_refuses_eos_on_the_stale_pre_override_sample() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: true,
             ..GenerateConfig::default()
@@ -4460,6 +4466,7 @@ mod tests {
     #[test]
     fn transition_refuses_to_force_close_a_second_time_once_already_closed() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: true,
             ..GenerateConfig::default()
@@ -4519,6 +4526,7 @@ mod tests {
     #[test]
     fn init_records_the_first_tokens_logprob_when_it_is_already_the_close_marker() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: true,
             logprobs: Some(0),
@@ -4563,6 +4571,7 @@ mod tests {
     #[test]
     fn answer_budget_exhausts_on_the_terminal_token_with_no_next_decode_expected() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: true,
             max_new_tokens: 1,
@@ -4620,6 +4629,7 @@ mod tests {
     #[test]
     fn transition_leaves_an_unspent_reasoning_budget_inert() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1_000),
             enable_thinking: true,
             logprobs: Some(0),

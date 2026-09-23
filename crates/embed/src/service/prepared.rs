@@ -3,11 +3,11 @@
 use crate::error::{EmbedError, Result};
 use std::num::{NonZeroU64, NonZeroUsize};
 
-/// **Unstable**: smallest accepted attestation report in bytes.
-pub const MIN_ATTESTATION_REPORT_BYTES: usize = 1;
+/// **Unstable**: smallest accepted supplementary attestation evidence payload in bytes.
+pub const MIN_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES: usize = 1;
 
-/// **Unstable**: largest accepted attestation report in bytes.
-pub const MAX_ATTESTATION_REPORT_BYTES: usize = 4096;
+/// **Unstable**: largest accepted supplementary attestation evidence payload in bytes.
+pub const MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES: usize = 4096;
 
 /// **Unstable**: finite shared admission ceilings for one prepared native resource domain.
 #[derive(Debug)]
@@ -71,30 +71,65 @@ impl NativeResourceBudget {
     }
 }
 
-/// **Unstable**: Lattice-owned immutable evidence produced by a caller attestor.
+/// **Unstable**: the digest algorithm bound to an attestation report (ADR-088 D1, D5).
 ///
-/// A successful attestor transfers these bytes into Lattice. The private representation exposes
-/// no mutable alias, and a future prepared service retains the value with its sealed model.
-#[derive(Debug, PartialEq, Eq)]
-pub struct OpaqueAttestationReport(Box<[u8]>);
+/// `Sha256V1` is the only defined value: Lattice's canonical checkpoint digest is always SHA-256
+/// over the fixed byte framing that names this algorithm. Carrying the tag as a typed field,
+/// rather than assuming it, means a future algorithm change cannot be confused with a digest
+/// produced by this version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttestationAlgorithm {
+    /// SHA-256 over the ADR-088 D5 canonical byte framing.
+    Sha256V1,
+}
 
-impl OpaqueAttestationReport {
-    /// Constructs a report after enforcing the closed public byte bound.
-    pub fn try_from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        let length = bytes.len();
-        if !(MIN_ATTESTATION_REPORT_BYTES..=MAX_ATTESTATION_REPORT_BYTES).contains(&length) {
+/// **Unstable**: Lattice-owned, digest-bound evidence produced by a caller attestor.
+///
+/// A successful attestor finishes into this value with the algorithm and digest it claims to
+/// bind, plus its bounded payload. The private representation exposes no mutable alias, and a
+/// future prepared service retains the value with its sealed model. Lattice always computes the
+/// canonical checkpoint digest itself (ADR-088 D5); this value is supplementary evidence only.
+/// No preparer exists yet to compute that canonical digest, so `digest` is recorded as claimed by
+/// the caller and validated only for the payload's length; once a preparer exists, publication
+/// will additionally require the bound algorithm and digest to equal Lattice's own canonical
+/// report before the evidence is accepted.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SupplementaryAttestationEvidence {
+    #[allow(dead_code)] // recorded for the future preparer's digest-binding check (ADR-088 D5)
+    algorithm: AttestationAlgorithm,
+    #[allow(dead_code)] // recorded for the future preparer's digest-binding check (ADR-088 D5)
+    digest: [u8; 32],
+    payload: Box<[u8]>,
+}
+
+impl SupplementaryAttestationEvidence {
+    /// Constructs evidence after enforcing the closed public payload byte bound.
+    pub fn try_new(
+        algorithm: AttestationAlgorithm,
+        digest: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<Self> {
+        let length = payload.len();
+        if !(MIN_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES
+            ..=MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES)
+            .contains(&length)
+        {
             return Err(EmbedError::AttestationReportSize {
                 length,
-                min: MIN_ATTESTATION_REPORT_BYTES,
-                max: MAX_ATTESTATION_REPORT_BYTES,
+                min: MIN_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES,
+                max: MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES,
             });
         }
-        Ok(Self(bytes.into_boxed_slice()))
+        Ok(Self {
+            algorithm,
+            digest,
+            payload: payload.into_boxed_slice(),
+        })
     }
 
-    /// Borrows the exact immutable report bytes.
+    /// Borrows the exact immutable evidence payload bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.payload
     }
 }
 
@@ -121,8 +156,8 @@ pub trait CheckpointAttestor: Send + 'static {
     /// Completes the current file after exactly its declared bytes were supplied.
     fn end_file(&mut self) -> Result<()>;
 
-    /// Finalizes this fresh pass and transfers its immutable report bytes.
-    fn finish(self) -> Result<OpaqueAttestationReport>;
+    /// Finalizes this fresh pass and transfers its bound, immutable evidence.
+    fn finish(self) -> Result<SupplementaryAttestationEvidence>;
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
