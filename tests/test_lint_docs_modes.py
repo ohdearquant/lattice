@@ -118,7 +118,11 @@ class LintDocsModeTests(unittest.TestCase):
             with self.subTest(strict=strict):
                 result, calls, checks = self.invoke(strict=strict, deno=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(calls, [["fmt", "--check", *_MARKDOWN], ["lint", *_MARKDOWN]])
+                # `deno lint` refuses Markdown categorically and can never
+                # pass or find anything over this list (see lint-docs.sh);
+                # the fake-deno harness would record a second ["lint", ...]
+                # row here if that dead call were reintroduced.
+                self.assertEqual(calls, [["fmt", "--check", *_MARKDOWN]])
                 self.assertIn("fake-deno:fmt", result.stdout)
                 self.assertIn("recursive tracked-Markdown selftest OK", result.stdout)
                 self.assertEqual(checks, _CHECKS)

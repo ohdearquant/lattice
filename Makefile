@@ -2,6 +2,8 @@
 
 setup:
 	rustup component add rustfmt clippy
+	@command -v rg >/dev/null 2>&1 || \
+	  echo "note: ripgrep (rg) is required by 'make lint-docs'; install it with your package manager"
 
 check:
 	cargo check --workspace
