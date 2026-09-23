@@ -6495,7 +6495,10 @@ mod imp {
         #[tokio::test]
         async fn lora_list_reads_confirmed_index() {
             let Json(value) = lora_list(State(test_app_state())).await;
-            assert_eq!(value, serde_json::json!({"adapters":[],"applied":[]}));
+            assert_eq!(
+                value,
+                serde_json::json!({"adapters":[],"applied":[],"router":{"enabled":false}})
+            );
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

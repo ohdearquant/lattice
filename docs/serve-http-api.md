@@ -687,6 +687,12 @@ right now:
 - `duplicate_resident`: a name resident twice, so it no longer identifies one
   adapter, or `null`.
 
+**`routable` covers adapter-name membership only, not whether the resident
+adapters can be blended.** Blend limits (the summed rank per layer and module,
+the total blend size, and conflicting projection shapes between adapters) are
+checked when a request executes, so a routed request over a set that exceeds
+them fails with `400 lora_apply_failed` even while `routable` is `true`.
+
 `routable` is `true` only when both lists are empty and both duplicates are
 `null`. It is computed by the same check a chat request runs, so a request that
 omits `lora` while `routable` is `false` is refused with
