@@ -33,8 +33,8 @@
 //! alongside) the `|states|` question this harness was written to settle.
 //!
 //! Output: `RESULT key=value ...` lines, one block per measurement,
-//! consumed by hand for the REPORT.md this binary was written to produce.
-//! Not a bench-gate harness (no Criterion, no `make bench-compare`).
+//! consumed by hand to write up the findings. Not a bench-gate harness
+//! (no Criterion, no `make bench-compare`).
 
 use lattice_inference::grammar::engine::{last_build_profile, probe_reachable_states};
 use lattice_inference::grammar::trie::ByteTrie;

@@ -19619,9 +19619,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// Mutation control for the `has_gdn_layers()` / `gdn_state_is_initial()` split:
         /// calling `gdn_state_is_initial()` on a session with zero GDN layers must panic
         /// rather than silently returning `true` (the pre-fix behavior, which conflated
-        /// "no buffers to check" with "buffers checked and clean"). See REPORT.md for the
-        /// paired before/after run that mutates this assertion away and observes the
-        /// control go blind.
+        /// "no buffers to check" with "buffers checked and clean"). Removing the
+        /// `num_layers > 0` assertion in `gdn_state_is_initial()` (letting it return `true`
+        /// for the empty case instead) makes this test fail on the missing panic; restoring
+        /// the assertion makes it pass again.
         #[test]
         fn gdn_state_is_initial_panics_on_empty_population() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
@@ -23783,11 +23784,16 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         ///   tiled_vs_ref  A: 2.9e-3  B: 2.7e-3
         ///   tiled_vs_naive A: 2.9e-3  B: 2.7e-3
         ///
-        /// Asserted bounds (5× headroom over measured):
-        ///   naive_vs_ref  < 1e-3   — naive is f32 throughout; only Q4 quantization error
-        ///   tiled_vs_ref  < 0.015  — half Xtg staging adds ~3e-3 on top of Q4 error;
-        ///                            accumulators stay f32 so this is well under a pure-f16 bound
-        ///   tiled_vs_naive < 0.012 — direct bound between the two GPU kernels
+        /// Asserted bounds (headroom over measured, per row):
+        ///   naive_vs_ref  < 1e-3   — naive and the CPU reference both consume the same
+        ///                            already-quantized Q4 bytes, so source quantization
+        ///                            error cancels; the residual is GPU-vs-CPU
+        ///                            implementation and reduction-order difference, not
+        ///                            quant step size (~300× headroom)
+        ///   tiled_vs_ref  < 0.015  — half Xtg staging adds ~3e-3 on top of that residual;
+        ///                            accumulators stay f32 so this is well under a
+        ///                            pure-f16 bound (~5× headroom)
+        ///   tiled_vs_naive < 0.012 — direct bound between the two GPU kernels (~4× headroom)
         ///
         /// If future changes restore f32 staging tiles, all three bounds still pass.
         /// If half precision is extended to accumulators, tiled_vs_ref would likely exceed 0.015.
@@ -23881,7 +23887,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     "[shape A 64×64×64] naive_vs_ref={naive_vs_ref:.4e}  \
                      tiled_vs_ref={tiled_vs_ref:.4e}  tiled_vs_naive={tiled_vs_naive:.4e}"
                 );
-                // Naive is f32 throughout; its error is purely Q4 quantization rounding.
+                // Naive and the CPU reference both consume the same already-quantized Q4
+                // bytes (see make_q4_weight_ref), so source quantization error cancels here;
+                // the residual is GPU-vs-CPU implementation and reduction-order difference.
                 // Measured 3.3e-6 on M1 (2026-06-24). Bound 1e-3 gives ~300× headroom.
                 // If this fails, the buffer layout or dequant convention is wrong.
                 assert!(
