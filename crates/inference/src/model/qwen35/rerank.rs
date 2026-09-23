@@ -529,13 +529,8 @@ mod tests {
     /// present locally. Self-skips (not `#[ignore]`) so it runs whenever the
     /// checkpoint is available and stays silent in environments without model
     /// weights on disk, mirroring `eval_perplexity`'s `tokenize_with_uncaps_long_corpus`.
-    /// Gated on `f16`: the real Qwen3.5-0.8B checkpoint stores `embed_tokens` as
-    /// BF16, which the loader rejects without this feature (see the other
-    /// `f16`-gated benches/examples in `Cargo.toml`), so without it there is no
-    /// safe way to distinguish "checkpoint absent" from "checkpoint present but
-    /// unloadable" and this test would spuriously fail on a machine that has
-    /// the checkpoint but built without the feature.
-    #[cfg(feature = "f16")]
+    /// The real checkpoint stores `embed_tokens` as BF16, which decodes to f32
+    /// unconditionally (no feature gate), so this runs in every feature set.
     #[test]
     fn rerank_real_checkpoint_smoke_and_latency() {
         let model_dir =

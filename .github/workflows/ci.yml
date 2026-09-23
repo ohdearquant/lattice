@@ -439,23 +439,6 @@ jobs:
         run: cargo test --locked -p lattice-inference --features metal-gpu,f16 --test pipeline_boundary_contract -- --nocapture
       - name: fann — no default features
         run: cargo build -p lattice-fann --no-default-features
-      # Run this target alone. `-p lattice-embed` resolves lattice-embed's own
-      # `lattice-inference` feature table in isolation, which is the configuration
-      # a standalone `cargo build -p lattice-embed`, `cargo install lattice-embed`,
-      # or the wasm/npm build actually gets — and the one that drifted in #1094.
-      #
-      # Two things keep this out of the workspace-wide runs. The failure is
-      # runtime-only: `SafetensorsFile` returns `InvalidSafetensors` for a
-      # half-precision tensor rather than failing to build, so the `--no-run`
-      # steps above cannot observe it. And lattice-tune's optional
-      # `lattice-inference` dependency carries `features = ["f16"]`, so any
-      # invocation that activates tune's `inference-hook` or `train-backward`
-      # alongside lattice-embed unifies that `f16` into embed for free and the
-      # regression reads green. Neither tune feature is in its defaults today, so
-      # `cargo test --workspace` does not do this — but nothing enforces that,
-      # which is why the guard runs on the isolated resolve instead. See #1095.
-      - name: embed — f16 native dependency load guard (standalone, no workspace unification)
-        run: cargo test -p lattice-embed --test f16_feature_load_guard
       # `-p lattice-inference` in isolation, default features only, no `--features`
       # flag. Neither the pre-commit hook's `--workspace --all-targets` nor this
       # job's own `f16,metal-gpu` clippy step below can see what this catches:
