@@ -33,6 +33,31 @@ const EXPECTED_HIDDEN_ACTIVATION: &str = "gelu_pytorch_tanh";
 /// G10, target `config.json`).
 const EXPECTED_FINAL_LOGIT_SOFTCAPPING: f32 = 30.0;
 
+/// The only top-level `architectures` value this loader supports (ADR-090
+/// Gemma admission, issue #1598 R04a): the pinned E2B fixture's
+/// target-decoder identity. A drafter/assistant Gemma 4 checkpoint carries
+/// a different value here -- see the admission check in
+/// [`Gemma4Config::from_config_json_str`] for what that architecture
+/// actually looks like and where that was established.
+const EXPECTED_ARCHITECTURE: &str = "Gemma4ForConditionalGeneration";
+
+/// The only top-level `model_type` value this loader supports (ADR-090
+/// Gemma admission, issue #1598 R04a).
+const EXPECTED_MODEL_TYPE: &str = "gemma4";
+
+/// The only `text_config.model_type` value this loader supports (ADR-090
+/// Gemma admission, issue #1598 R04a).
+const EXPECTED_TEXT_MODEL_TYPE: &str = "gemma4_text";
+
+/// The only `vocab_size_per_layer_input` value this loader supports
+/// (ADR-090 Gemma admission, issue #1598 R04a): equals the pinned
+/// fixture's own `vocab_size` and the documented `transformers` default
+/// (`vocab_size_per_layer_input: int = 262_144`,
+/// `configuration_gemma4.py`). See the admission check in
+/// [`Gemma4Config::from_config_json_str`] for why this field matters even
+/// though [`Gemma4Config`] never stores it.
+const EXPECTED_VOCAB_SIZE_PER_LAYER_INPUT: u64 = 262_144;
+
 /// Binding E2B global-layer schedule (ADR-082 G3, header/config-verified):
 /// `full_attention` at exactly these zero-based indices, `sliding_attention`
 /// everywhere else. This is an exact observable of the pinned checkpoint, not
@@ -192,6 +217,65 @@ struct HfGemma4TextConfig {
     tie_word_embeddings: bool,
     #[serde(default = "default_max_position_embeddings")]
     max_position_embeddings: usize,
+
+    /// Nested HF `model_type` (ADR-090 Gemma admission, issue #1598 R04a,
+    /// semantic-key admission): the pinned E2B fixture's `text_config`
+    /// ships `"gemma4_text"`. Placed after every other required field in
+    /// this struct so a text_config missing several fields at once still
+    /// reports the same first-missing field it did before this field
+    /// existed (see `partial_text_config_errors_naming_missing_field`).
+    model_type: String,
+
+    /// MoE gate (ADR-090 Gemma admission, issue #1598 R04a, semantic-key
+    /// admission): the pinned E2B fixture ships `false`, the documented
+    /// `transformers` default (`enable_moe_block: bool = False`,
+    /// `configuration_gemma4.py`). This loader's forward pass
+    /// (`gemma4_model.rs`) has no Mixture-of-Experts code path at all --
+    /// every layer runs the single dense GeGLU MLP via
+    /// [`super::gemma4_ops::gemma4_geglu_mlp`] -- so `true` would silently
+    /// run the wrong math rather than route through expert layers.
+    /// Untyped (`Option<serde_json::Value>`; absent and JSON `null` both
+    /// deserialize to `None`) so a non-bool shape is still caught by the
+    /// admission check below with a message naming the field, rather than
+    /// a bare serde type-mismatch error that would not.
+    #[serde(default)]
+    enable_moe_block: Option<serde_json::Value>,
+    /// MoE expert count (ADR-090 Gemma admission, issue #1598 R04a): the
+    /// pinned fixture ships this absent/null, matching the documented
+    /// default (`num_experts: int | None = None`). Only meaningful when
+    /// `enable_moe_block=true`, which this loader never admits; checked
+    /// independently in case a checkpoint sets it without the gate.
+    #[serde(default)]
+    num_experts: Option<serde_json::Value>,
+    /// MoE top-k routing width (ADR-090 Gemma admission, issue #1598
+    /// R04a): same absent/null contract as `num_experts`
+    /// (`top_k_experts: int | None = None`).
+    #[serde(default)]
+    top_k_experts: Option<serde_json::Value>,
+    /// MoE expert FFN width (ADR-090 Gemma admission, issue #1598 R04a):
+    /// same absent/null contract as `num_experts`. Named
+    /// `expert_intermediate_size` here to mirror the pinned fixture's own
+    /// spelling -- current upstream `transformers` `main` renamed this
+    /// field `moe_intermediate_size`, and llama.cpp's GGUF converter reads
+    /// either name for exactly that reason
+    /// (`find_hparam(["expert_intermediate_size", "moe_intermediate_size"])`,
+    /// `conversion/gemma.py`, read via the GitHub API 2026-09-23).
+    #[serde(default)]
+    expert_intermediate_size: Option<serde_json::Value>,
+    /// Per-layer-embedding vocabulary size (ADR-090 Gemma admission, issue
+    /// #1598 R04a): row count of the checkpoint's
+    /// `embed_tokens_per_layer` table. `gemma4_loading::load_weights`
+    /// derives that tensor's expected shape as `[vocab_size,
+    /// num_hidden_layers * hidden_size_per_layer_input]` -- it assumes
+    /// this field equals `vocab_size` and never reads it at all. The
+    /// documented default (262,144) equals the pinned fixture's
+    /// `vocab_size`, so absent or exactly that value is admitted; anything
+    /// else means the checkpoint's per-layer table is a different shape
+    /// than `Gemma4Model::compute_per_layer_inputs` assumes when it
+    /// indexes that table by token id. Untyped for the same reason as
+    /// `enable_moe_block`.
+    #[serde(default)]
+    vocab_size_per_layer_input: Option<serde_json::Value>,
 }
 
 /// Raw `text_config.rope_parameters`: two nested per-attention-type RoPE
@@ -222,10 +306,34 @@ struct HfRopeParamSlidingAttention {
 /// the same wrapper shape as Qwen3.5's `HfQwenConfigFile` in
 /// `qwen35_config.rs`. `text_config` is *not* `Option`: an absent
 /// `text_config` (e.g. `{}`) is a hard parse error naming `text_config`,
-/// never a silent substitution of the E2B preset.
+/// never a silent substitution of the E2B preset. `architectures` and
+/// `model_type` are the top-level role-admission fields (ADR-090 Gemma
+/// admission, issue #1598 R04a); `text_config` is declared first so a
+/// `{}` input still reports `text_config` as the first missing field, not
+/// one of these two (see `absent_text_config_errors_naming_field`).
 #[derive(Debug, serde::Deserialize)]
 struct HfGemma4ConfigFile {
     text_config: HfGemma4TextConfig,
+    /// Top-level HF architecture class name(s) (ADR-090 Gemma admission,
+    /// issue #1598 R04a): the pinned E2B fixture ships exactly
+    /// `["Gemma4ForConditionalGeneration"]`. A drafter/assistant Gemma 4
+    /// checkpoint is a materially different architecture -- no own token
+    /// embedding table, MTP-style `nextn_proj_pre`/`nextn_proj_post`
+    /// projection layers that read a *separate* target model's
+    /// embeddings, a `backbone_hidden_size` config field this loader has
+    /// no code path for -- and is registered under `architectures`
+    /// values `Gemma4AssistantForCausalLM` /
+    /// `Gemma4UnifiedAssistantForCausalLM` (`conversion/gemma.py` and
+    /// `src/models/gemma4-assistant.cpp` in `ggml-org/llama.cpp`, read via
+    /// the GitHub API 2026-09-23; upstream `transformers` `main` at the
+    /// same read has no dedicated assistant config/model class, so
+    /// `architectures` is the only place this distinction currently
+    /// surfaces on the HF side). Required (not `#[serde(default)]`): a
+    /// real Gemma 4 `config.json` always carries this field.
+    architectures: Vec<String>,
+    /// Top-level HF `model_type` (ADR-090 Gemma admission, issue #1598
+    /// R04a): the pinned E2B fixture ships `"gemma4"`.
+    model_type: String,
 }
 
 impl Gemma4Config {
@@ -313,6 +421,86 @@ impl Gemma4Config {
                 "invalid Gemma 4 config.json: use_bidirectional_attention ({mode}) is \
                  unsupported -- only an absent or null value (the pinned Gemma 4 E2B text \
                  profile) is supported by this loader"
+            )));
+        }
+
+        // Role admission (ADR-090 Gemma admission, issue #1598 R04a): only
+        // the pinned E2B target-decoder identity is supported. Checked
+        // before any Gemma4Config is constructed and before Self::validate
+        // -- and, reached through Gemma4Model::from_safetensors, before any
+        // weight I/O -- same position as the mode check above. See
+        // `HfGemma4ConfigFile::architectures`'s doc comment for what a
+        // drafter/assistant Gemma 4 checkpoint's architecture actually
+        // looks like and where that was established; it must not be
+        // silently admitted as this loader's E2B target-decoder geometry.
+        if parsed.architectures.len() != 1 || parsed.architectures[0] != EXPECTED_ARCHITECTURE {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: architectures ({:?}) is unsupported -- only \
+                 [{EXPECTED_ARCHITECTURE:?}] (the pinned Gemma 4 E2B target-decoder profile) is \
+                 supported by this loader",
+                parsed.architectures
+            )));
+        }
+        if parsed.model_type != EXPECTED_MODEL_TYPE {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: model_type ({:?}) is unsupported -- only \
+                 {EXPECTED_MODEL_TYPE:?} is supported by this loader",
+                parsed.model_type
+            )));
+        }
+        if raw.model_type != EXPECTED_TEXT_MODEL_TYPE {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: text_config.model_type ({:?}) is unsupported -- \
+                 only {EXPECTED_TEXT_MODEL_TYPE:?} is supported by this loader",
+                raw.model_type
+            )));
+        }
+
+        // Semantic-key admission (ADR-090 Gemma admission, issue #1598
+        // R04a): explicit checks on fixture-carried keys this loader does
+        // not model into Gemma4Config at all (unlike use_double_wide_mlp,
+        // hidden_activation and final_logit_softcapping above, which are
+        // already read into Gemma4Config and already validated). Each
+        // admits exactly the pinned value (or absent, where the fixture's
+        // value is the documented `transformers` default) and refuses
+        // anything else, naming the field. Never
+        // `#[serde(deny_unknown_fields)]`: a benign future HF key this
+        // loader genuinely doesn't model must still load.
+        if let Some(v) = &raw.enable_moe_block
+            && v != &serde_json::json!(false)
+        {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: enable_moe_block ({v}) is unsupported -- this \
+                 loader has no Mixture-of-Experts forward-pass code path, only the dense \
+                 GeGLU MLP"
+            )));
+        }
+        if let Some(v) = &raw.num_experts {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: num_experts ({v}) is unsupported -- this loader \
+                 has no Mixture-of-Experts forward-pass code path"
+            )));
+        }
+        if let Some(v) = &raw.top_k_experts {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: top_k_experts ({v}) is unsupported -- this loader \
+                 has no Mixture-of-Experts forward-pass code path"
+            )));
+        }
+        if let Some(v) = &raw.expert_intermediate_size {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: expert_intermediate_size ({v}) is unsupported -- \
+                 this loader has no Mixture-of-Experts forward-pass code path"
+            )));
+        }
+        if let Some(v) = &raw.vocab_size_per_layer_input
+            && v != &serde_json::json!(EXPECTED_VOCAB_SIZE_PER_LAYER_INPUT)
+        {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: vocab_size_per_layer_input ({v}) is \
+                 unsupported -- only absent or {EXPECTED_VOCAB_SIZE_PER_LAYER_INPUT} (the \
+                 pinned fixture's value, which this loader's embed_tokens_per_layer shape \
+                 derivation assumes equals vocab_size) is supported by this loader"
             )));
         }
 
