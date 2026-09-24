@@ -53,6 +53,11 @@ STATUS_ENV = "LATTICE_BENCH_LOCK_STATUS"
 FDS_ENV = "LATTICE_BENCH_LOCK_FDS"
 SUPERVISOR_FD_ENV = "LATTICE_BENCH_SUPERVISOR_FD"
 QUIET_ENV = "LATTICE_BENCH_QUIET_SUPERVISION"
+# Same name as bench-locks.py's own constant (#1643): once this process has
+# verified the inherited descriptors below, it is the one holding GPU_LOCK,
+# so its own non-handoff launch of `command` must name itself, not
+# bench-locks.py's now-waiting pid, as the marker.
+SUPERVISOR_MARKER_ENV = "LATTICE_GPU_LOCK_SUPERVISOR_PID"
 REFUSAL_EXIT = 2
 
 
@@ -426,6 +431,11 @@ def run_supervised(
         else:
             pass_fds = ()
         if plan is None:
+            # This process (verified above via verify_supervision) holds
+            # GPU_LOCK and does not hand it to `command`; a target under
+            # `command` that calls gpu_test_lock() itself would otherwise
+            # wait out its own 30-minute timeout against this pid (#1643).
+            child_env[SUPERVISOR_MARKER_ENV] = str(os.getpid())
             result = subprocess.run(
                 command,
                 check=False,

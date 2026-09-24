@@ -3206,6 +3206,108 @@ raise SystemExit(status)
                     self.module["read_frozen_plan"](root)
 
 
+class GpuLockSupervisorMarker(unittest.TestCase):
+    """#1643: a launch route that retains GPU_LOCK without handing it to the
+    child must name the pid actually holding it, so
+    lattice_inference::measurement::gpu_test_lock_for_path's non-handoff
+    branch can refuse fast instead of waiting out its own 30-minute timeout
+    against a lock this process is holding.
+    """
+
+    def test_bench_supervision_plain_route_marks_child_with_supervisor_pid(self):
+        """The pid named must be bench_supervision.py's own respawned pid,
+        not bench-locks.py's: bench-locks.py hands the descriptors
+        themselves off (LATTICE_BENCH_LOCK_FDS) to that respawned process,
+        which is the one actually holding GPU_LOCK when `command` starts."""
+        with _SupervisorSandbox() as sb:
+            marker = Path(sb.tmp.name) / "receipt"
+            code = (
+                "import os\n"
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text("
+                "os.environ.get('LATTICE_GPU_LOCK_SUPERVISOR_PID', '') "
+                "+ ':' + str(os.getppid()))\n"
+            )
+            result = sb.run([sys.executable, "-c", code])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            recorded_marker, _, ppid = marker.read_text().partition(":")
+            self.assertTrue(recorded_marker.isdigit(), recorded_marker)
+            self.assertEqual(recorded_marker, ppid)
+
+    def test_bench_locks_plain_route_marks_child_with_its_own_pid(self):
+        """bench-locks.py's non-`--pass-lock-fds` route retains both locks
+        itself, so a child that self-locks must be told this process's pid
+        rather than inherit an environment silent about the holder."""
+        with _SupervisorSandbox() as sb:
+            lib = sb.helper.parent
+            status = Path(sb.tmp.name) / "direct-status.txt"
+            marker = Path(sb.tmp.name) / "direct-receipt"
+            code = (
+                "import os\n"
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text("
+                "os.environ.get('LATTICE_GPU_LOCK_SUPERVISOR_PID', '') "
+                "+ ':' + str(os.getppid()))\n"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(lib / "bench-locks.py"),
+                    "--label",
+                    "fixture",
+                    "--status-file",
+                    str(status),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    code,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            recorded_marker, _, ppid = marker.read_text().partition(":")
+            self.assertTrue(recorded_marker.isdigit(), recorded_marker)
+            self.assertEqual(recorded_marker, ppid)
+
+    def test_bench_locks_pass_lock_fds_route_does_not_mark_its_immediate_child(self):
+        """--pass-lock-fds hands the descriptors themselves to its immediate
+        child (LATTICE_BENCH_LOCK_FDS) — a real handoff — so that child must
+        not also see the supervisor marker."""
+        with _SupervisorSandbox() as sb:
+            lib = sb.helper.parent
+            status = Path(sb.tmp.name) / "handoff-status.txt"
+            marker = Path(sb.tmp.name) / "handoff-receipt"
+            code = (
+                "import os\n"
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text("
+                "'present' if 'LATTICE_GPU_LOCK_SUPERVISOR_PID' in os.environ "
+                "else 'absent')\n"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(lib / "bench-locks.py"),
+                    "--label",
+                    "fixture",
+                    "--status-file",
+                    str(status),
+                    "--pass-lock-fds",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    code,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(), "absent")
+
+
 class _FailOnEmptyTestProgram(unittest.TestProgram):
     def runTests(self) -> None:
         if self.test.countTestCases() == 0:

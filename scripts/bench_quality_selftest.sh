@@ -181,6 +181,7 @@ run_bench() {
       -u LATTICE_BENCH_LOCK_FDS \
       -u LATTICE_BENCH_SUPERVISOR_FD \
       -u LATTICE_BENCH_QUIET \
+      -u LATTICE_GPU_LOCK_SUPERVISOR_PID \
       PATH="$SB/fake-bin:$PATH" \
       TMPDIR="$SB/tmp" \
       Q4_DIR="$SB/q4" \
