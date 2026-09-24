@@ -111,6 +111,7 @@ paths = [
     "crates/inference/src/bin/bench_decode_ab.rs",
     "crates/inference/src/bin/bench_decode_slopefit.rs",
     "crates/inference/src/bin/bench_gdn_prefill_ab.rs",
+    "crates/inference/src/bin/bench_gemma4_driver_pair.rs",
     "crates/inference/src/bin/bench_logit_dump.rs",
     "crates/inference/src/bin/bench_lora_mixture.rs",
     "crates/inference/src/bin/bench_vision_prefill_ab.rs",
