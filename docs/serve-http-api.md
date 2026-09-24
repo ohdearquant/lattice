@@ -653,7 +653,8 @@ selection is retried on the next request, never mistaken for a cache hit.
     "missing": [],
     "unexpected": [],
     "duplicate_trained": null,
-    "duplicate_resident": null
+    "duplicate_resident": null,
+    "blend_refusal": null
   }
 }
 ```
@@ -686,19 +687,23 @@ right now:
   columns cannot be told apart, or `null`.
 - `duplicate_resident`: a name resident twice, so it no longer identifies one
   adapter, or `null`.
+- `blend_refusal`: why blending the FULL resident set would refuse at
+  execution, or `null` when it would not. A routed request applies every
+  resident adapter, so this is computed over that same set: the summed rank
+  for one layer and module projection exceeding the shared budget, the
+  aggregate blend size exceeding its budget, or two adapters disagreeing on a
+  projection's input or output width. Computed by the same check the blend
+  itself runs (issue #1735), so this field and a `400 lora_apply_failed`
+  response can never disagree.
 
-**`routable` covers adapter-name membership only, not whether the resident
-adapters can be blended.** Blend limits (the summed rank per layer and module,
-the total blend size, and conflicting projection shapes between adapters) are
-checked when a request executes, so a routed request over a set that exceeds
-them fails with `400 lora_apply_failed` even while `routable` is `true`.
-
-`routable` is `true` only when both lists are empty and both duplicates are
-`null`. It is computed by the same check a chat request runs, so a request that
-omits `lora` while `routable` is `false` is refused with
-`router_adapter_set_mismatch` instead of being routed. Loading or unloading an
-adapter changes the answer, and this endpoint shows the change before the next
-request does.
+`routable` is `true` only when both lists are empty, both duplicates are
+`null`, and `blend_refusal` is `null`. It is computed by the same checks a
+chat request runs. A request that omits `lora` while a name check fails is
+refused with `router_adapter_set_mismatch` before routing. When only
+`blend_refusal` is set, the request is routed and then fails when the blend
+executes, with `400 lora_apply_failed`. Loading or
+unloading an adapter changes the answer, and this endpoint shows the change
+before the next request does.
 
 Unload requires an id. Unknown ids are refused; unloading an adapter used by the
 applied mixture clears that mixture, while other resident adapters remain.

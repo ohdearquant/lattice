@@ -152,6 +152,7 @@ pub fn lora_list_body(
                 "unexpected": state.unexpected,
                 "duplicate_trained": state.duplicate_trained,
                 "duplicate_resident": state.duplicate_resident,
+                "blend_refusal": state.blend_refusal,
             })
         }
     };
@@ -279,6 +280,21 @@ pub struct AdapterIndex {
     pub adapters: Vec<AdapterMetadata>,
     /// Ordered mixture currently materialized in the engine, empty for base.
     pub applied: Vec<LoraSelection>,
+    /// Why a blend of the FULL resident set (what a routed request actually
+    /// blends) would refuse at execution, or `None` when it would not.
+    /// Computed once per residency change (issue #1735) -- cached on
+    /// `ResidencyRegistry` and recomputed only in its `load` and `unload`,
+    /// the only two places a resident is added or removed, from the same
+    /// shared plan `blend_lora_layer_data` itself runs, so this can never
+    /// disagree with what a routed request meets. `publish` copies the
+    /// cached value into this field on every state change; it does not
+    /// re-plan.
+    ///
+    /// Never serialized at this struct's own top level: it belongs beside
+    /// `routable` in the `router` object `lora_list_body` builds, which is
+    /// where [`crate::serve::routing::routability`] reads it from.
+    #[serde(skip)]
+    pub blend_refusal: Option<String>,
 }
 
 impl AdapterIndex {
@@ -472,6 +488,7 @@ mod tests {
                 })
                 .collect(),
             applied: Vec::new(),
+            ..Default::default()
         };
         let unique = [
             LoraSelection { id: 7, scale: 0.0 },

@@ -1847,89 +1847,65 @@ mod inner {
         }
 
         // Group by (layer_idx, module): collect refs to layer data and effective weights.
-        let mut grouped: HashMap<(usize, String), Vec<(&LoraLayerData, f32)>> = HashMap::new();
+        // Keyed by `&str` borrowed from each layer's own `module: String` (which
+        // outlives this function body via `inputs`), not a per-layer clone.
+        let mut grouped: HashMap<(usize, &str), Vec<(&LoraLayerData, f32)>> = HashMap::new();
         for (layers, weight) in inputs {
             for layer in *layers {
                 grouped
-                    .entry((layer.layer_idx, layer.module.clone()))
+                    .entry((layer.layer_idx, layer.module.as_str()))
                     .or_default()
                     .push((layer, *weight));
             }
         }
 
-        // Bound the TOTAL planned allocation across every (layer_idx, module) group.
-        // The per-group MAX_BLEND_RANK_TOTAL cap bounds each projection, but a
-        // full-model adapter can keep every group near the cap and still drive a
-        // multi-GiB aggregate blend. Sum rank_total*(d_in+d_out) over all groups with
-        // checked arithmetic and fail closed before any allocation.
-        let mut planned_elems: usize = 0;
-        for ((layer_idx, module), entries) in &grouped {
-            let (first, _) = entries[0]; // each key was inserted with >=1 entry
-            let mut group_rank: usize = 0;
-            for (entry, _) in entries {
-                group_rank = lattice_fann::lora::accumulate_rank(
-                    group_rank,
-                    entry.rank,
-                    "blend_lora_layer_data",
-                )
-                .map_err(InferenceError::InvalidInput)?;
-            }
-            let group_elems = lattice_fann::lora::checked_group_elements(
-                "blend_lora_layer_data",
-                *layer_idx,
+        // Pre-allocation planning -- the per-group MAX_BLEND_RANK_TOTAL cap,
+        // the aggregate MAX_BLEND_TOTAL_ELEMENTS cap, and cross-adapter
+        // dimension agreement -- is the ONE shared check the adapter
+        // residency registry's state publication also runs (issue #1735), so
+        // a `GET /v1/lora` report of whether the resident set can be blended
+        // and this function's own refusal can never disagree. It sees only
+        // each entry's shape, never an A/B buffer.
+        //
+        // `grouped` above is already the grouping `plan_blend` would build
+        // internally from a flat iterator, so this calls `plan_grouped`
+        // directly over `grouped`'s own entries instead of `plan_blend`,
+        // skipping a second `HashMap` and per-group `Vec` that would
+        // otherwise re-derive the same grouping from scratch on every blend.
+        let groups = grouped.iter().map(|(&(layer_idx, module), entries)| {
+            (
+                layer_idx,
                 module,
-                group_rank,
-                first.d_in,
-                first.d_out,
+                entries
+                    .iter()
+                    .map(|(layer, _)| lattice_fann::lora::BlendProjection {
+                        layer_idx: layer.layer_idx,
+                        module: layer.module.as_str(),
+                        rank: layer.rank,
+                        d_in: layer.d_in,
+                        d_out: layer.d_out,
+                    }),
             )
-            .map_err(InferenceError::InvalidInput)?;
-            planned_elems = lattice_fann::lora::accumulate_planned_elements(
-                planned_elems,
-                group_elems,
-                "blend_lora_layer_data",
-            )
-            .map_err(InferenceError::InvalidInput)?;
-        }
-        lattice_fann::lora::check_aggregate_elements_cap(planned_elems, "blend_lora_layer_data")
+        });
+        let planned = lattice_fann::lora::plan_grouped("blend_lora_layer_data", groups)
             .map_err(InferenceError::InvalidInput)?;
 
-        let mut result: Vec<LoraLayerData> = Vec::with_capacity(grouped.len());
-        for ((layer_idx, module), entries) in grouped {
-            let (first, _) = entries[0];
-            let d_in = first.d_in;
-            let d_out = first.d_out;
-
-            // Validate dimension consistency across adapters for this projection.
-            for (idx, (entry, _)) in entries.iter().enumerate() {
-                lattice_fann::lora::check_dims_match(
-                    "blend_lora_layer_data",
-                    layer_idx,
-                    &module,
-                    d_in,
-                    d_out,
-                    idx,
-                    entry.d_in,
-                    entry.d_out,
-                )
-                .map_err(InferenceError::InvalidInput)?;
-            }
-
-            // Accumulate rank_total with overflow protection and a hard cap
-            // (MAX_BLEND_RANK_TOTAL is defined at module scope above this function).
-            let mut rank_total: usize = 0;
-            for (layer, _) in &entries {
-                rank_total = lattice_fann::lora::accumulate_rank(
-                    rank_total,
-                    layer.rank,
-                    "blend_lora_layer_data",
-                )
-                .map_err(InferenceError::InvalidInput)?;
-            }
-            lattice_fann::lora::check_rank_total_cap(rank_total, "blend_lora_layer_data")
-                .map_err(InferenceError::InvalidInput)?;
+        let mut result: Vec<LoraLayerData> = Vec::with_capacity(planned.len());
+        for plan in planned {
+            let entries = grouped.get(&(plan.layer_idx, plan.module)).ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "blend_lora_layer_data: planned group (layer {}, module {}) is absent \
+                         from the grouped adapter set",
+                    plan.layer_idx, plan.module
+                ))
+            })?;
+            let d_in = plan.d_in;
+            let d_out = plan.d_out;
+            let rank_total = plan.rank_total;
 
             // Validate source slice lengths before any allocation: a malformed adapter
             // whose A or B buffer is the wrong size would cause out-of-bounds copies.
+            // `plan_grouped` never sees these buffers, so this check stays here.
             for (idx, (entry, _)) in entries.iter().enumerate() {
                 lattice_fann::lora::check_buffer_lengths(
                     "blend_lora_layer_data",
@@ -1956,7 +1932,7 @@ mod inner {
 
             // A_blend: vertical stack of A matrices.
             let mut a_blend: Vec<f32> = Vec::with_capacity(a_buf_len);
-            for (layer, _) in &entries {
+            for (layer, _) in entries.iter() {
                 a_blend.extend_from_slice(&layer.a);
             }
 
@@ -1964,7 +1940,7 @@ mod inner {
             // B is row-major (d_out × rank); row r: b[r*rank..(r+1)*rank].
             let mut b_blend = vec![0.0f32; b_buf_len];
             let mut col_offset = 0usize;
-            for (layer, eff_weight) in &entries {
+            for (layer, eff_weight) in entries.iter() {
                 let r_e = layer.rank;
                 for row in 0..d_out {
                     let dst = row * rank_total + col_offset;
@@ -1977,8 +1953,8 @@ mod inner {
             }
 
             result.push(LoraLayerData {
-                layer_idx,
-                module,
+                layer_idx: plan.layer_idx,
+                module: plan.module.to_string(),
                 a: a_blend,
                 b: b_blend,
                 rank: rank_total,
