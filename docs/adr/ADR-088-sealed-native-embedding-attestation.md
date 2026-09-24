@@ -463,6 +463,23 @@ validated activation, position-embedding, decoder/cross-attention, and pooling-r
 profile, while actual tensor source dtypes and decode behavior are recorded from the sealed
 SafeTensors inventory rather than trusted from `torch_dtype`.
 
+#### Amendment, 2026-09-24: intra-tier order fixed for the three SentencePiece candidates
+
+Tier 5 above lists `tokenizer.model`, `sentencepiece.bpe.model`, and `spiece.model` as one
+precedence tier without ordering them against each other. That gap is externally visible: a
+selected SentencePiece candidate is rejected with a typed preparation error naming the
+unsupported tokenizer model, and naming one requires choosing among the present candidates
+whenever more than one is present. Filed as
+[#1479](https://github.com/ohdearquant/lattice/issues/1479).
+
+The order is fixed as the order both enumerations above already use: `tokenizer.model`, then
+`sentencepiece.bpe.model`, then `spiece.model`. When more than one SentencePiece candidate is
+present, the typed error names the first present candidate in that order. Every present
+candidate is still recorded in the inventory evidence regardless of which one the error names.
+This closes the gap with the first of the two options the issue recorded (a fixed order that
+makes the error deterministic) rather than the second, which would have changed the error to
+carry the whole present set instead of one candidate.
+
 ### D4 tokenizer semantic closure
 
 The tokenizer checks admit only WordPiece and BPE variants and cover declared behavior, not only
