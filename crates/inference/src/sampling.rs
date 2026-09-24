@@ -320,68 +320,42 @@ impl CandidateSet {
             top_p.clamp(0.0, 1.0)
         };
 
-        // Sort descending for deterministic top-p traversal.
-        self.candidates.sort_by(candidate_order);
+        // #1394 item 2, round 2: a real A/B measurement showed the round-1
+        // shape below (sort everything, *then* reject the min-p tail before
+        // exponentiating) never touched the actual cost — `sort_by` over the
+        // full (up to vocab-sized, `top_k == 0`) candidate set runs
+        // unconditionally either way, and that sort is what a paired
+        // bench-compare attributed the measured time to; the `exp()` calls
+        // the original issue named are cheap by comparison. Rejecting the
+        // min-p tail *before* sorting, so the sort itself only ever runs
+        // over the (typically much smaller) survivor set, is the version
+        // that can actually avoid the cost. See `min_p_prefilter_and_sort`'s
+        // doc comment for how a single linear scan finds what the full sort
+        // would have put first (and detects any NaN) without materializing
+        // the sort, and for the superset-margin argument that keeps the
+        // final answer byte-identical to the un-pre-filtered algorithm below.
+        let max_logit = if min_p > 0.0 {
+            match self.min_p_prefilter_and_sort(min_p) {
+                Ok(max_logit) => max_logit,
+                Err(token_id) => return token_id,
+            }
+        } else {
+            // Sort descending for deterministic top-p traversal. Untouched:
+            // `min_p == 0.0` must stay byte-identical to the pre-#1394
+            // algorithm, full sort included.
+            self.candidates.sort_by(candidate_order);
 
-        // Softmax — reuse the provided scratch buffer.
-        let max_logit = self.candidates[0].logit;
-        // A non-finite max (+INF, or all-NaN/-INF) makes (logit - max).exp() produce
-        // NaN probabilities, which the weighted-sample loop never selects — it would
-        // fall through to the worst candidate. The argmax (candidates[0] after the
-        // descending sort) is the correct answer for an infinite-logit token.
-        if !max_logit.is_finite() {
-            return self.candidates[0].token_id;
-        }
-
-        // Since every softmax weight shares the same normalizing denominator,
-        // `probability >= min_p * max_probability` is exactly equivalent to
-        // `exp(logit - max_logit) >= min_p`, i.e. `logit >= max_logit + ln(min_p)`.
-        // Candidates are already sorted by descending logit, so both forms agree
-        // on a single prefix/tail split. Rejecting the tail by the logit-space
-        // threshold *before* exponentiating means only the survivors ever pay for
-        // `exp`; with `top_k == 0` the tail is the entire vocabulary minus a
-        // handful of survivors, so the previous shape (`exp` every candidate,
-        // then throw most of them away) exponentiated on the order of 250k
-        // floats per token for a filter that typically keeps a few dozen.
-        if min_p > 0.0 {
-            // Preserve the fail-closed contract for direct CandidateSet callers: a
-            // NaN anywhere in the (still untruncated) set must fall back to argmax
-            // rather than silently sampling a poisoned distribution, even when the
-            // NaN sits past where min-p would have truncated. `candidate_order`
-            // sorts every NaN logit after every finite one (ties broken by
-            // ascending token_id), and `max_logit` is already confirmed finite
-            // above, so "some weight is non-finite" reduces to "the last candidate
-            // is NaN" — an O(1) check that needs no `exp()` at all, unlike the
-            // full-array scan this replaces.
-            if self.candidates.last().is_some_and(|c| c.logit.is_nan()) {
+            // Softmax — reuse the provided scratch buffer.
+            let max_logit = self.candidates[0].logit;
+            // A non-finite max (+INF, or all-NaN/-INF) makes (logit - max).exp() produce
+            // NaN probabilities, which the weighted-sample loop never selects — it would
+            // fall through to the worst candidate. The argmax (candidates[0] after the
+            // descending sort) is the correct answer for an infinite-logit token.
+            if !max_logit.is_finite() {
                 return self.candidates[0].token_id;
             }
-
-            // `ln` and `exp` are not exact float32 inverses, so `logit_threshold`
-            // can differ from the true real-valued cutoff by a few ULPs. `margin`
-            // widens the threshold *downward* (toward keeping more candidates) by
-            // well over an order of magnitude more than that rounding error,
-            // scaled by the magnitude of the values that produced it (so it stays
-            // proportionally generous regardless of how large `max_logit` or how
-            // negative `ln(min_p)` is). `prefix_len` is therefore guaranteed to be
-            // a superset of whatever the exact p-space test below would keep,
-            // never a subset — every candidate this prefix admits still runs
-            // through that untouched, byte-identical `exp` + `weight < min_p`
-            // comparison, so the boundary inclusion decision is unchanged from
-            // before. The logit threshold only decides how much of the
-            // definitely-rejected tail can skip `exp()` entirely.
-            let log_min_p = min_p.ln();
-            let logit_threshold = max_logit + log_min_p;
-            let margin = 256.0 * f32::EPSILON * (max_logit.abs() + log_min_p.abs()).max(1.0);
-            let safe_threshold = logit_threshold - margin;
-            let prefix_len = self
-                .candidates
-                .iter()
-                .position(|c| c.logit < safe_threshold)
-                .unwrap_or(self.candidates.len())
-                .max(1);
-            self.candidates.truncate(prefix_len);
-        }
+            max_logit
+        };
 
         probs.clear();
         probs.extend(self.candidates.iter().map(|c| (c.logit - max_logit).exp()));
@@ -448,6 +422,94 @@ impl CandidateSet {
             }
         }
         self.candidates.last().map(|c| c.token_id).unwrap_or(0)
+    }
+
+    /// #1394 item 2 (round 2): reject the min-p tail in logit space *before*
+    /// sorting, then sort only the survivors. Only called from
+    /// [`CandidateSet::sample_min_p_top_p_with_scratch`] when `min_p > 0.0`
+    /// (both call sites enforce this; the caller's `min_p == 0.0` path never
+    /// reaches here at all).
+    ///
+    /// A single linear pass over the still-unsorted candidates finds the
+    /// `candidate_order`-minimum -- the element `sort_by(candidate_order)`
+    /// would place at index 0 -- and whether any NaN logit is present, in
+    /// one scan. `candidate_order` is a total order over distinct token ids
+    /// (non-NaN ties break on ascending token_id; NaN sorts after every
+    /// non-NaN, NaN ties also break on ascending token_id), so the running
+    /// minimum under that comparator, after visiting every element, equals
+    /// `self.candidates[0]` after a full `sort_by(candidate_order)` -- without
+    /// ever materializing that sort.
+    ///
+    /// Returns `Err(token_id)` for the two fail-closed fallbacks the old,
+    /// unconditional post-sort checks used to cover; the caller must return
+    /// that token id directly, exactly as the pre-#1394 algorithm did:
+    /// - Any NaN logit anywhere in the set. `candidate_order` sorting NaN
+    ///   last means the running minimum is still the true numeric argmax
+    ///   whenever at least one non-NaN candidate exists (a NaN elsewhere can
+    ///   never displace it), and is the smallest-token-id NaN candidate --
+    ///   matching what a full sort would have put first -- when every
+    ///   candidate is NaN. Both cases are answered correctly by returning
+    ///   the running minimum's token id unconditionally.
+    /// - A non-finite (but non-NaN, i.e. +-inf) numeric maximum, once no NaN
+    ///   is present.
+    ///
+    /// Returns `Ok(max_logit)` once `self.candidates` has been narrowed to
+    /// the min-p survivors and sorted with the identical `candidate_order`
+    /// comparator, ready for the unchanged `exp` / p-space-cutoff / top-p /
+    /// sample tail shared with the `min_p == 0.0` path.
+    fn min_p_prefilter_and_sort(&mut self, min_p: f32) -> Result<f32, u32> {
+        let mut order_min = self.candidates[0];
+        let mut has_nan = order_min.logit.is_nan();
+        for c in &self.candidates[1..] {
+            has_nan |= c.logit.is_nan();
+            if candidate_order(c, &order_min) == std::cmp::Ordering::Less {
+                order_min = *c;
+            }
+        }
+
+        if has_nan {
+            return Err(order_min.token_id);
+        }
+        if !order_min.logit.is_finite() {
+            return Err(order_min.token_id);
+        }
+        let max_logit = order_min.logit;
+
+        // `ln` and `exp` are not exact float32 inverses, so `logit_threshold`
+        // can differ from the true real-valued cutoff by a few ULPs. `margin`
+        // widens the threshold *downward* (toward keeping more candidates) by
+        // well over an order of magnitude more than that rounding error,
+        // scaled by the magnitude of the values that produced it, so the
+        // survivors retained below are guaranteed to be a superset of
+        // whatever the exact p-space test further down the caller would
+        // keep, never a subset — every survivor still runs through that
+        // untouched, byte-identical `exp` + `weight < min_p` comparison, so
+        // the boundary inclusion decision is unchanged. The logit threshold
+        // only decides how many definitely-rejected candidates can skip
+        // `exp()` (and now the sort) entirely. `min_p` is clamped by the
+        // caller to `(0.0, 1.0]` here, so `log_min_p <= 0.0`, and `margin` is
+        // never negative, so `margin >= log_min_p` always holds -- which
+        // makes `max_logit >= safe_threshold` algebraically guaranteed:
+        // `order_min` always survives its own threshold, so `retain` below
+        // can never empty the candidate set.
+        let log_min_p = min_p.ln();
+        let logit_threshold = max_logit + log_min_p;
+        let margin = 256.0 * f32::EPSILON * (max_logit.abs() + log_min_p.abs()).max(1.0);
+        let safe_threshold = logit_threshold - margin;
+        self.candidates.retain(|c| c.logit >= safe_threshold);
+
+        // Every discarded candidate has `logit < safe_threshold <= max_logit`
+        // and every survivor has `logit >= safe_threshold`, and neither side
+        // carries a NaN (the `has_nan` check above already returned
+        // otherwise), so every survivor's logit is strictly greater than
+        // every discarded candidate's logit -- `candidate_order` therefore
+        // ranks every survivor strictly before every discarded candidate,
+        // regardless of how the survivors sort among themselves. Sorting
+        // only the survivors reproduces exactly the prefix (of the same
+        // length as the survivor count) that sorting the full set would
+        // have produced.
+        self.candidates.sort_by(candidate_order);
+        Ok(max_logit)
     }
 }
 
@@ -2435,9 +2497,10 @@ mod tests {
     /// injection site). Builds `CandidateSet`s directly so an actual NaN
     /// logit reaches `sample_min_p_top_p_with_scratch`, at several positions
     /// relative to where min-p would otherwise have truncated, and asserts
-    /// the optimized path's O(1) "last candidate is NaN" short-circuit
-    /// returns the same argmax fallback token as the reference's full-array
-    /// scan in every case. Only the returned token is compared, not the
+    /// the optimized path's pre-sort linear scan (`min_p_prefilter_and_sort`,
+    /// which detects any NaN before sorting or truncating anything) returns
+    /// the same argmax fallback token as the reference's full-array scan in
+    /// every case. Only the returned token is compared, not the
     /// `probs` scratch buffer: on this fail-closed path the optimized
     /// function returns before ever touching `probs` (the check now runs
     /// before the `exp()` pass, which is the whole point of moving it), while
@@ -2489,6 +2552,84 @@ mod tests {
                 );
                 // `probs_new`/`probs_ref` are deliberately not compared here — see the
                 // doc comment above.
+            }
+        }
+    }
+
+    /// #1394 item 2 (round 2): pins the order-equivalence claim
+    /// `min_p_prefilter_and_sort` relies on directly, at the level of the
+    /// candidate list itself rather than the final sampled output -- for
+    /// randomized logits including exact ties and NaNs, either (a) the
+    /// pre-sort-filter-then-sort survivors equal the prefix of the same
+    /// length that a full `sort_by(candidate_order)` produces, or (b) the
+    /// prefilter's fail-closed return equals the token id a full sort would
+    /// have put first. Builds `CandidateSet`s directly (not via
+    /// `select_top_k`) so injected NaN logits reach the function under test
+    /// unsanitized -- see the comment at the NaN injection site in
+    /// `min_p_logit_threshold_matches_reference_across_seeds` for why that
+    /// distinction matters.
+    #[test]
+    fn min_p_prefilter_sort_matches_full_sort_prefix() {
+        let mut seed: u64 = 0xF17E_5EED_1394_0002_u64;
+        let min_ps = [0.02_f32, 0.05, 0.1, 0.3, 0.5, 0.9, 0.999_999_9];
+        let vocab_size = 256usize;
+
+        for &min_p in &min_ps {
+            for case in 0..40u32 {
+                let mut logits = Vec::with_capacity(vocab_size);
+                for i in 0..vocab_size {
+                    let u = uniform_f32_from_u64(xorshift64_next(&mut seed));
+                    let mut logit = (u - 0.5) * 16.0;
+                    if i % 37 == 0 && i > 0 {
+                        // Force an exact tie with the previous logit,
+                        // exercising the ascending-token_id tie-break path.
+                        logit = logits[i - 1];
+                    }
+                    logits.push(logit);
+                }
+                if case % 5 == 0 {
+                    let idx = (seed as usize) % vocab_size;
+                    logits[idx] = f32::NAN;
+                }
+                let candidates: Vec<Candidate> = logits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &logit)| Candidate {
+                        token_id: i as u32,
+                        logit,
+                    })
+                    .collect();
+
+                let mut prefilter_set = CandidateSet {
+                    candidates: candidates.clone(),
+                };
+                let prefilter_result = prefilter_set.min_p_prefilter_and_sort(min_p);
+
+                let mut full_sorted = candidates.clone();
+                full_sorted.sort_by(candidate_order);
+
+                match prefilter_result {
+                    Err(token_id) => {
+                        assert_eq!(
+                            token_id, full_sorted[0].token_id,
+                            "min_p={min_p} case={case}: fail-closed token mismatch"
+                        );
+                    }
+                    Ok(max_logit) => {
+                        assert_eq!(
+                            max_logit, full_sorted[0].logit,
+                            "min_p={min_p} case={case}: max_logit mismatch"
+                        );
+                        let k = prefilter_set.candidates.len();
+                        assert_eq!(
+                            prefilter_set.candidates.as_slice(),
+                            &full_sorted[..k],
+                            "min_p={min_p} case={case}: prefilter+sort survivors \
+                             (len={k}) do not equal the full-sort prefix of the \
+                             same length"
+                        );
+                    }
+                }
             }
         }
     }
