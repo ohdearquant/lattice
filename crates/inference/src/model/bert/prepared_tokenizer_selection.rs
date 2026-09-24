@@ -90,13 +90,11 @@ impl PreparedBertTokenizerSelection {
     }
 }
 
-/// ADR-088 D4 lists the three SentencePiece candidates (`tokenizer.model`,
-/// `sentencepiece.bpe.model`, `spiece.model`) without ordering them against each
-/// other; it only orders the SentencePiece tier as a whole below WordPiece/BPE.
-/// This selector breaks the tie in the order D4 itself lists the three names,
-/// both where it introduces the recognized-file set and where it states the
-/// tokenizer precedence: `tokenizer.model`, then `sentencepiece.bpe.model`, then
-/// `spiece.model`.
+/// ADR-088 D4's 2026-09-24 amendment fixes the intra-tier order of the three
+/// SentencePiece candidates: `tokenizer.model`, then `sentencepiece.bpe.model`,
+/// then `spiece.model`. When more than one is present, the typed error names the
+/// first present candidate in that order; this selector implements that rule,
+/// not a choice made independently of the ADR.
 pub(super) fn select_prepared_bert_tokenizer_layout(
     presence: RawBertTokenizerCandidatePresence,
 ) -> Result<PreparedBertTokenizerSelection, PreparedBertTokenizerSelectionError> {

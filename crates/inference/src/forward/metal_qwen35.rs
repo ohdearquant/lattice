@@ -1691,10 +1691,6 @@ mod inner {
         /// an embedding of the caller's tokens and a stale vector from whatever
         /// ran last. A stale vector is well-formed, correctly sized, and wrong.
         pub(crate) final_hidden_captured: std::sync::atomic::AtomicBool,
-        /// Authoritative decode cursor; kept in sync with kv_cache.seq_len.
-        #[allow(dead_code)]
-        // read by tests; written by set_position for future concurrent API
-        pub(crate) position: usize,
         /// GDN state-traffic byte counters (issue #422). `None` unless both the
         /// `gdn-state-counters` feature is on and `LATTICE_GDN_STATE_COUNTERS` is enabled.
         #[cfg(feature = "gdn-state-counters")]
@@ -1702,9 +1698,20 @@ mod inner {
     }
 
     impl InferenceSession {
-        /// Set both the logical position and the KV cache sequence length atomically.
+        /// Authoritative decode cursor. Derived from `kv_cache.seq_len` rather
+        /// than stored separately, so the two can never drift (#1708): every
+        /// forward/prefill/rollback/verify path already advances or rewinds
+        /// `kv_cache.seq_len` as the single source of truth, and a duplicate
+        /// field only tracked a subset of those sites.
+        #[allow(dead_code)] // read by tests only; no production path branches on it
+        pub(crate) fn position(&self) -> usize {
+            self.kv_cache.seq_len
+        }
+
+        /// Jump the live cache cursor directly to `position` (cross-turn cache
+        /// restore, batched-prefill chunk advance), rather than the per-token
+        /// `+= 1` the forward-step paths use.
         pub(crate) fn set_position(&mut self, position: usize) {
-            self.position = position;
             self.kv_cache.seq_len = position;
         }
     }
@@ -3537,7 +3544,6 @@ mod inner {
                 mtp_prefill_hidden: Vec::new(),
                 capture_final_hidden: false,
                 final_hidden_captured: std::sync::atomic::AtomicBool::new(false),
-                position: 0,
                 #[cfg(feature = "gdn-state-counters")]
                 gdn_state_traffic: if crate::env_switch_enabled("LATTICE_GDN_STATE_COUNTERS") {
                     Some(GdnStateTrafficCounters::new(
@@ -7295,7 +7301,6 @@ mod inner {
                 false,
                 crate::forward::signpost::Scope::NotDecode,
             );
-            self.session.position = self.session.kv_cache.seq_len;
             Ok(output.logits)
         }
 
@@ -7335,7 +7340,6 @@ mod inner {
                 true,
                 crate::forward::signpost::Scope::NotDecode,
             );
-            self.session.position = self.session.kv_cache.seq_len;
             Ok((output.logits, output.pre_final_hidden))
         }
 
@@ -10859,7 +10863,6 @@ mod inner {
                 }
             }
             self.session.kv_cache.reset();
-            self.session.position = 0;
             if let Some(ref mut mtp) = self.session.mtp {
                 mtp.cache.reset();
             }
@@ -13459,7 +13462,6 @@ mod inner {
                     mtp_prefill_hidden: Vec::new(),
                     capture_final_hidden: false,
                     final_hidden_captured: std::sync::atomic::AtomicBool::new(false),
-                    position: 0,
                     #[cfg(feature = "gdn-state-counters")]
                     gdn_state_traffic: if crate::env_switch_enabled("LATTICE_GDN_STATE_COUNTERS") {
                         Some(GdnStateTrafficCounters::new(
@@ -19228,8 +19230,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_forward_rows_close("prefill logits", &ordinary_logits, &hidden_logits);
             assert_eq!(ordinary.session.kv_cache.seq_len, tokens.len());
             assert_eq!(with_hidden.session.kv_cache.seq_len, tokens.len());
-            assert_eq!(ordinary.session.position, tokens.len());
-            assert_eq!(with_hidden.session.position, tokens.len());
+            assert_eq!(ordinary.session.position(), tokens.len());
+            assert_eq!(with_hidden.session.position(), tokens.len());
             assert_eq!(hidden.len(), cfg.hidden_size);
             assert!(hidden.iter().all(|value| value.is_finite()));
             assert!(hidden.iter().any(|&value| value != 0.0));
@@ -19276,7 +19278,49 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_eq!(with_hidden.session.kv_cache.seq_len, tokens.len() + 1);
         }
 
-        /// `tiny_metal_qwen35_fixture` (used by the two tests above) has zero
+        /// #1708: `forward_step_decode` is the per-token step behind
+        /// `generate`/`generate_streaming*` — the main autoregressive decode
+        /// path. It only ever advances `kv_cache.seq_len`; with `position()`
+        /// derived from that same field rather than tracked separately, this
+        /// path can no longer leave the decode cursor stale.
+        #[test]
+        fn forward_step_decode_keeps_position_synced_with_seq_len() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (forward_step_decode_keeps_position_synced_with_seq_len)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            let tokens = [42_u32, 2, 5];
+            let _ = state.forward_prefill(&tokens);
+            assert_eq!(state.session.position(), tokens.len());
+            assert_eq!(state.session.kv_cache.seq_len, tokens.len());
+
+            let pos = state.session.kv_cache.seq_len;
+            let _ = state.forward_step_decode(7, pos);
+
+            assert_eq!(
+                state.session.kv_cache.seq_len,
+                tokens.len() + 1,
+                "forward_step_decode must advance the live cache cursor"
+            );
+            assert_eq!(
+                state.session.position(),
+                state.session.kv_cache.seq_len,
+                "forward_step_decode is the main decode path (#1708): position must \
+                 stay in sync with kv_cache.seq_len rather than go stale"
+            );
+        }
+
+        /// `tiny_metal_qwen35_fixture` (used by the tests above) has zero
         /// GDN/linear-attention layers — `has_gdn_layers()` is false for it — so
         /// neither proves explicit hidden readback works on a hybrid GDN+full
         /// session. This test mirrors their structure on `tiny_hybrid_fixture`
@@ -19527,7 +19571,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             state.reset_path_proof_counters();
 
             let seq_len_before = state.session.kv_cache.seq_len;
-            let position_before = state.session.position;
+            let position_before = state.session.position();
             let kv_before = snapshot_kv_bytes(&state);
             let gdn_before = snapshot_gdn_bytes(&state);
             let hidden_before = state.session.last_pre_final_hidden.clone();
@@ -19542,7 +19586,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             assert!(message.contains("try_forward_step"), "{message}");
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19559,7 +19603,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "infallible raw step wrapper must reject the same stale cursor"
             );
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19588,7 +19632,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut state = mtp_loaded_live_hybrid_state_for_guard_test();
 
             let seq_len_before = state.session.kv_cache.seq_len;
-            let position_before = state.session.position;
+            let position_before = state.session.position();
             let kv_before = snapshot_kv_bytes(&state);
             let gdn_before = snapshot_gdn_bytes(&state);
             let hidden_before = state.session.last_pre_final_hidden.clone();
@@ -19602,7 +19646,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             assert!(message.contains("try_forward_prefill"), "{message}");
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19616,7 +19660,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }));
             assert!(panic.is_err(), "raw prefill must reject a live session");
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19633,7 +19677,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             assert!(message.contains("forward_prefill_all_logits"), "{message}");
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19663,7 +19707,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut state = mtp_loaded_live_hybrid_state_for_guard_test();
 
             let seq_len_before = state.session.kv_cache.seq_len;
-            let position_before = state.session.position;
+            let position_before = state.session.position();
             let kv_before = snapshot_kv_bytes(&state);
             let gdn_before = snapshot_gdn_bytes(&state);
             let hidden_before = state.session.last_pre_final_hidden.clone();
@@ -19689,7 +19733,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(production_error.to_string().contains("production"));
 
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19729,7 +19773,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "rejection must not advance the KV cache cursor"
             );
             assert_eq!(
-                state.session.position, 0,
+                state.session.position(),
+                0,
                 "rejection must not advance the decode cursor"
             );
             assert_eq!(
@@ -19754,7 +19799,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .forward_step_with_hidden(42, 0)
                 .expect("position matching the live cache cursor succeeds");
             assert_eq!(state.session.kv_cache.seq_len, 1);
-            assert_eq!(state.session.position, 1);
+            assert_eq!(state.session.position(), 1);
             assert!(hidden_a.iter().any(|&value| value != 0.0));
 
             // Defect-1 repro, second call: token_b at position 1 is the correct
@@ -19767,7 +19812,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect_err("a stale position behind the live cache cursor must be rejected");
             assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
             assert_eq!(state.session.kv_cache.seq_len, 1);
-            assert_eq!(state.session.position, 1);
+            assert_eq!(state.session.position(), 1);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(state.snapshot_gdn_states(), gdn_before);
 
@@ -19775,7 +19820,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .forward_step_with_hidden(2, 1)
                 .expect("position matching the live cache cursor succeeds");
             assert_eq!(state.session.kv_cache.seq_len, 2);
-            assert_eq!(state.session.position, 2);
+            assert_eq!(state.session.position(), 2);
             assert!(hidden_b.iter().any(|&value| value != 0.0));
         }
 
@@ -19789,11 +19834,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut state = MetalQwen35State::new(&weights, &cfg, 16)
                 .expect("tiny MetalQwen35State fixture constructs");
 
-            assert_eq!(state.session.position, 0);
+            assert_eq!(state.session.position(), 0);
             assert_eq!(state.session.kv_cache.seq_len, 0);
 
             // Drive several raw steps and assert the documented decode cursor
-            // (`session.position`) agrees with the live cache cursor
+            // (`session.position()`) agrees with the live cache cursor
             // (`kv_cache.seq_len`) after every one of them, matching the
             // contract `forward_step_with_hidden` already keeps.
             for (position, token_id) in (0usize..3).zip([1u32, 2, 3]) {
@@ -19806,8 +19851,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     "kv_cache.seq_len must advance by one token per step"
                 );
                 assert_eq!(
-                    state.session.position, state.session.kv_cache.seq_len,
-                    "session.position must track the live cache cursor after try_forward_step"
+                    state.session.position(),
+                    state.session.kv_cache.seq_len,
+                    "session.position() must track the live cache cursor after try_forward_step"
                 );
             }
         }
@@ -20066,7 +20112,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "error must prove the KV half of the guard was false: {message}"
             );
             assert_eq!(state.session.kv_cache.seq_len, 0);
-            assert_eq!(state.session.position, 0);
+            assert_eq!(state.session.position(), 0);
             assert_eq!(
                 state.hidden_readback_path_proof_snapshot().prefill,
                 0,
@@ -20334,8 +20380,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let session_b = engine.new_session(16).expect("session_b constructs");
 
             // Both sessions start at position 0.
-            assert_eq!(session_a.position, 0, "session_a starts at position 0");
-            assert_eq!(session_b.position, 0, "session_b starts at position 0");
+            assert_eq!(session_a.position(), 0, "session_a starts at position 0");
+            assert_eq!(session_b.position(), 0, "session_b starts at position 0");
             assert_eq!(
                 session_a.kv_cache.seq_len, 0,
                 "session_a kv_cache starts empty"
@@ -20371,7 +20417,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .new_session(16)
                 .expect("fresh session constructs");
             assert_eq!(
-                fresh_session.position, 0,
+                fresh_session.position(),
+                0,
                 "fresh session position independent of state_a"
             );
             assert_eq!(
@@ -20381,7 +20428,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             // session_b was never touched; its state should match a fresh session.
             assert_eq!(
-                session_b.position, 0,
+                session_b.position(),
+                0,
                 "session_b untouched by state_a steps"
             );
             assert_eq!(
@@ -26184,7 +26232,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut state = MetalQwen35State::new(&weights, &cfg, 16)
                 .expect("moe prefill fixture must construct");
 
-            let initial_position = state.session.position;
+            let initial_position = state.session.position();
             let tokens = [1u32, 3, 5];
 
             for attempt in 0..2 {
@@ -26197,7 +26245,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                      not silently produce logits"
                 );
                 assert_eq!(
-                    state.session.position, initial_position,
+                    state.session.position(),
+                    initial_position,
                     "attempt {attempt}: session position must be unchanged by a rejected prefill"
                 );
                 // SAFETY: StorageModeShared, read-only; the guard panics before a
@@ -26360,7 +26409,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 })
                 .collect();
-            let position = state.session.position;
+            let position = state.session.position();
             let gdn_snapshot = state.snapshot_gdn_states();
             let next_logits = state.forward_step(next_input, token_ids.len());
             PrefillSchedulerArtifacts {
@@ -30199,13 +30248,14 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[test]
         fn forward_prefill_with_hidden_reports_moe_prefill_rejection() {
             with_moe_prefill_state(16, |_cfg, state| {
-                let position_before = state.session.position;
+                let position_before = state.session.position();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     state.forward_prefill_with_hidden(&[1u32, 3, 5])
                 }));
                 assert_moe_prefill_rejected(outcome, "forward_prefill_with_hidden");
                 assert_eq!(
-                    state.session.position, position_before,
+                    state.session.position(),
+                    position_before,
                     "the rejection runs before any dispatch, so session position must \
                      be untouched"
                 );
@@ -30219,13 +30269,14 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[test]
         fn forward_prefill_all_logits_reports_moe_prefill_rejection() {
             with_moe_prefill_state(16, |_cfg, state| {
-                let position_before = state.session.position;
+                let position_before = state.session.position();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     state.forward_prefill_all_logits(&[1u32, 3, 5])
                 }));
                 assert_moe_prefill_rejected(outcome, "forward_prefill_all_logits");
                 assert_eq!(
-                    state.session.position, position_before,
+                    state.session.position(),
+                    position_before,
                     "the rejection runs before any dispatch, so session position must \
                      be untouched"
                 );
@@ -32599,7 +32650,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
             // Both paths must advance the session cursor to the full prompt length.
             assert_eq!(state.session.kv_cache.seq_len, tokens.len());
-            assert_eq!(state.session.position, tokens.len());
+            assert_eq!(state.session.position(), tokens.len());
         }
 
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -32694,7 +32745,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "argmax mismatch on length-1 final chunk"
             );
             assert_eq!(state.session.kv_cache.seq_len, tokens.len());
-            assert_eq!(state.session.position, tokens.len());
+            assert_eq!(state.session.position(), tokens.len());
         }
 
         /// Experiment B regression gate: `forward_prefill_batched_chunk` now gates its
@@ -32791,7 +32842,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // The session cursor must have advanced through every chunk, including the
             // intermediate ones whose terminal tail was skipped.
             assert_eq!(state.session.kv_cache.seq_len, tokens.len());
-            assert_eq!(state.session.position, tokens.len());
+            assert_eq!(state.session.position(), tokens.len());
         }
 
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -33022,7 +33073,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 MetalQwen35State::new(&weights, &cfg, 8).expect("production fallback fixture");
             production.use_gdn_chunked = true;
             let _ = production.forward_prefill_batched_chunk(&[1, 2], 0, true, false, false);
-            assert_eq!(production.session.position, 2);
+            assert_eq!(production.session.position(), 2);
             assert_eq!(production.session.kv_cache.seq_len, 2);
 
             use crate::speculative::MtpTargetVerifier as _;
@@ -33037,7 +33088,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 panic.is_err(),
                 "isolated scheduler must reject unsupported chunked GDN"
             );
-            assert_eq!(isolated.session.position, 0);
+            assert_eq!(isolated.session.position(), 0);
             assert_eq!(isolated.session.kv_cache.seq_len, 0);
             assert_eq!(isolated.snapshot_gdn_states(), before);
         }
@@ -37995,7 +38046,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .token_ids
                 .clone();
             let kv_seq_len_before = state.session.kv_cache.seq_len;
-            let position_before = state.session.position;
+            let position_before = state.session.position();
 
             // Follow-up "ab": shares its full (2-token) length with the
             // entry AND the injected checkpoint at len=2 -> empty suffix.
@@ -38030,7 +38081,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "live KV length must be unchanged by a rejected request"
             );
             assert_eq!(
-                state.session.position, position_before,
+                state.session.position(),
+                position_before,
                 "live GDN position must be unchanged by a rejected request"
             );
 

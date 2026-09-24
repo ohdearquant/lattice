@@ -12,7 +12,7 @@ use crate::tokenizer::common::{
     vocab_txt_to_map,
 };
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,6 +46,18 @@ struct BpeInner {
     /// instead of silently dropping them. `special=true` markers are deliberately
     /// excluded so they stay swallowed (matching `skip_special_tokens=True`).
     added_render: HashMap<u32, String>,
+    /// Ids `added_tokens` marks special (`special: true`, or a `"special"`
+    /// value that is present but not a JSON boolean, which fails closed to
+    /// special -- see `common::parse_rendered_added_tokens`). Computed as
+    /// every id in `added_render`'s source map that did *not* make it into
+    /// `added_render` itself, i.e. the complement of the render set within
+    /// the full added-token set (mirrors `GemmaBpeTokenizer`'s
+    /// `special_skip_ids`). These ids must contribute no bytes anywhere --
+    /// `append_token_bytes` and `token_for_id` both check this set before
+    /// falling back to `added_render` or the base `vocab`, so a control
+    /// token declared special can never leak the base-vocab spelling it
+    /// happens to collide with (#1722).
+    special_skip_ids: HashSet<u32>,
     pad_id: u32,
     unk_id: Option<u32>,
     bos_id: Option<u32>,
@@ -219,6 +231,16 @@ impl BpeTokenizer {
         // lookup. Built once at construction; consulted by `token_for_id` only
         // when the base table misses (added-token ids exceed the base vocab range).
         let added_render: HashMap<u32, String> = rendered_added;
+        // The complement of `added_render` within the full added-token set: ids
+        // `added_tokens` declares (any `special` value) that did not make it into
+        // the render set are exactly the ids that read as special, including a
+        // non-boolean `"special"` value (`parse_rendered_added_tokens` fails that
+        // closed to special). Mirrors `GemmaBpeTokenizer`'s `special_skip_ids`.
+        let special_skip_ids: HashSet<u32> = added_tokens
+            .values()
+            .copied()
+            .filter(|id| !added_render.contains_key(id))
+            .collect();
         let mut merge_ranks: HashMap<String, HashMap<String, usize>> = HashMap::new();
         for (rank, (left, right)) in merges.into_iter().enumerate() {
             // First occurrence defines the rank: merges are listed in priority
@@ -272,6 +294,7 @@ impl BpeTokenizer {
             special_tokens,
             special_tokens_sorted,
             added_render,
+            special_skip_ids,
             pad_id,
             unk_id,
             bos_id,
@@ -313,6 +336,7 @@ impl BpeTokenizer {
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
             added_render: self.inner.added_render.clone(),
+            special_skip_ids: self.inner.special_skip_ids.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
             bos_id: self.inner.bos_id,
@@ -339,6 +363,7 @@ impl BpeTokenizer {
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
             added_render: self.inner.added_render.clone(),
+            special_skip_ids: self.inner.special_skip_ids.clone(),
             pad_id: self.inner.pad_id,
             unk_id,
             bos_id: self.inner.bos_id,
@@ -369,6 +394,7 @@ impl BpeTokenizer {
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
             added_render: self.inner.added_render.clone(),
+            special_skip_ids: self.inner.special_skip_ids.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
             bos_id: self.inner.bos_id,
@@ -393,6 +419,7 @@ impl BpeTokenizer {
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
             added_render: self.inner.added_render.clone(),
+            special_skip_ids: self.inner.special_skip_ids.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
             bos_id: self.inner.bos_id,
@@ -417,6 +444,7 @@ impl BpeTokenizer {
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
             added_render: self.inner.added_render.clone(),
+            special_skip_ids: self.inner.special_skip_ids.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
             bos_id: self.inner.bos_id,
@@ -446,10 +474,15 @@ impl BpeTokenizer {
     ///
     /// Reverse lookup for debugging.
     pub fn token_for_id(&self, id: u32) -> Option<&str> {
-        // Base vocab first; added tokens with `special=false` (think/tool/FIM
-        // markers) live beyond the base range, so fall back to `added_render` to
-        // render them as text instead of dropping them. `special=true` markers
-        // are absent from both maps and stay swallowed.
+        // An id `added_tokens` marks special stays swallowed even when it also
+        // exists in the base `vocab` -- checked first so that case can never fall
+        // through to the base-vocab spelling below (#1722). Added tokens with
+        // `special=false` (think/tool/FIM markers) live beyond the base range, so
+        // fall back to `added_render` to render them as text instead of dropping
+        // them.
+        if self.inner.special_skip_ids.contains(&id) {
+            return None;
+        }
         self.inner
             .id_to_token
             .get(id as usize)
@@ -528,7 +561,12 @@ impl BpeTokenizer {
     /// `vocab_bytes(vocab_size)?[i]` is the byte sequence that token `i` decodes
     /// to. Base BPE entries use GPT-2 byte-level reversal; renderable added tokens
     /// use their literal UTF-8 bytes. Unknown and skipped control-token slots are
-    /// empty so grammar masking fails closed across the model's full logit space.
+    /// empty so grammar masking fails closed across the model's full logit space --
+    /// including a `special: true` added-token id that also exists in the base
+    /// `vocab` (gets no bytes regardless of its base-vocab spelling), and a
+    /// base-vocab token containing a character outside the 256-entry GPT-2
+    /// byte-level alphabet (gets no bytes rather than a partially-decoded,
+    /// possibly-colliding sequence) (#1722).
     ///
     /// Used by [`GrammarEngine::new`](crate::grammar::GrammarEngine::new) to build
     /// the precomputed vocabulary partition for grammar-constrained decoding (ADR-046).
@@ -565,7 +603,9 @@ impl BpeTokenizer {
     ///
     /// Base BPE entries are GPT-2 byte-decoded. Added tokens with `special=false`
     /// are returned as literal UTF-8, while unknown and skipped special IDs return
-    /// `None`.
+    /// `None` -- even when the special id also exists in the base `vocab`. A
+    /// base-vocab entry containing a character outside the byte-level alphabet
+    /// also returns `None` rather than a partial decode (#1722).
     pub fn token_bytes_for_id(&self, id: u32) -> Option<Vec<u8>> {
         let byte_decoder = byte_decoder();
         let mut bytes = Vec::new();
@@ -579,6 +619,17 @@ impl BpeTokenizer {
         byte_decoder: &HashMap<char, u8>,
         out: &mut Vec<u8>,
     ) -> bool {
+        // An id `added_tokens` marks special must contribute no bytes even when
+        // it also exists in the base `vocab` -- checked before the base-vocab
+        // fallback below so that case can never leak the base-vocab spelling
+        // into the grammar byte table or decoded output (#1722). This is the
+        // single call site every consumer of token bytes goes through (the
+        // grammar vocabulary in `vocab_bytes`, `token_bytes_for_id`, this
+        // tokenizer's own `decode`, and the streaming detokenizer), so masking
+        // here masks it everywhere uniformly.
+        if self.inner.special_skip_ids.contains(&id) {
+            return false;
+        }
         if let Some(content) = self.inner.added_render.get(&id) {
             out.extend_from_slice(content.as_bytes());
             return true;
@@ -586,6 +637,20 @@ impl BpeTokenizer {
         let Some(token_str) = self.inner.id_to_token.get(id as usize) else {
             return false;
         };
+        // A base-vocab token containing a character outside the 256-entry
+        // GPT-2 byte-level alphabet is masked in full rather than partially
+        // decoded: `append_byte_decoded_token_bytes`'s `filter_map` drops only
+        // the unmappable characters, which would let this token decode to
+        // fewer bytes than its spelling implies and collide with an unrelated
+        // token that decodes to that same shortened sequence (#1722). Masking
+        // the whole token here -- exactly like a special id above -- closes
+        // that gap without refusing tokenizers this loader already accepts:
+        // non-byte-level test/synthetic vocabularies (e.g. a raw `" "` token)
+        // construct and tokenize as before, they just never contribute bytes
+        // to decode/grammar output for that one id.
+        if !token_str.chars().all(|ch| byte_decoder.contains_key(&ch)) {
+            return false;
+        }
         append_byte_decoded_token_bytes(token_str, byte_decoder, out);
         true
     }
@@ -2056,5 +2121,124 @@ mod tests {
         let merges = vec![("a".to_string(), "b".to_string())];
         let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
         assert_eq!(tokenizer.tokenize_to_ids("ab"), vec![1]);
+    }
+
+    #[test]
+    fn test_grammar_vocab_masks_special_added_token_also_in_base_vocab() {
+        // Regression (#1722): an `added_tokens` entry marked `special: true`
+        // whose id ALSO appears in `model.vocab` used to leak the base-vocab
+        // spelling into the grammar byte table and into decode, because
+        // nothing removed the id from `id_to_token`. This is the exact shape
+        // from the report: id 1 is both `model.vocab["<c>"]` and a special
+        // added token.
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+
+        let json = r#"{
+            "model":{"type":"BPE","vocab":{"a":0,"<c>":1},"merges":[]},
+            "added_tokens":[{"id":1,"content":"<c>","special":true}]
+        }"#;
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+
+        let vocab_bytes = tokenizer.vocab_bytes(2).unwrap();
+        assert!(
+            vocab_bytes[1].is_empty(),
+            "special id 1 must get no bytes even though it also appears in model.vocab, \
+             got {:?}",
+            vocab_bytes[1]
+        );
+        assert_eq!(
+            tokenizer.token_bytes_for_id(1),
+            None,
+            "token_bytes_for_id must return None for a special id, per its own doc"
+        );
+        assert_eq!(
+            tokenizer.token_for_id(1),
+            None,
+            "token_for_id must swallow a special id exactly like an id absent from vocab"
+        );
+        // Decode must swallow the special id exactly as it would if id 1 were
+        // absent from `model.vocab` entirely: the control token contributes
+        // zero bytes, and the surrounding content token still decodes.
+        assert_eq!(tokenizer.decode(&[0, 1]), Some("a".to_string()));
+
+        // A grammar that only accepts "a" must therefore mask id 1 out: before
+        // the fix, id 1 decoded to b"<c>" and nothing in this grammar's byte
+        // table would have masked it on structural grounds unrelated to this
+        // bug, so this assertion is the direct behavioral consequence lattice#1722
+        // reports (a grammar-illegal control token reachable through decoding).
+        let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+        let engine = GrammarEngine::new(&spec, vocab_bytes).unwrap();
+        let mut state = engine.initial_state();
+        let mut logits = vec![0.0; 2];
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("matching vocab length");
+        assert!(logits[0].is_finite(), "token \"a\" must stay grammar-legal");
+        assert_eq!(
+            logits[1],
+            f32::NEG_INFINITY,
+            "special id 1 must be masked even though its base-vocab spelling is <c>"
+        );
+    }
+
+    #[test]
+    fn test_non_boolean_special_flag_fails_closed_to_special() {
+        // A `"special"` value that is present but not a JSON boolean (here, a
+        // string) must fail closed to special rather than reading as `false`
+        // via `unwrap_or` (#1722): the id must be masked exactly like an
+        // explicit `special: true`, not rendered as literal text.
+        let json = r#"{
+            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+            "added_tokens":[{"id":50,"content":"<odd>","special":"true"}]
+        }"#;
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+        assert_eq!(tokenizer.token_bytes_for_id(50), None);
+        assert_eq!(tokenizer.token_for_id(50), None);
+        assert_eq!(tokenizer.decode(&[0, 50]), Some("a".to_string()));
+    }
+
+    #[test]
+    fn test_base_vocab_token_with_unmappable_char_masked_not_rejected() {
+        // Regression (#1722): `append_byte_decoded_token_bytes`'s `filter_map`
+        // silently drops any character outside the 256-entry GPT-2 byte-level
+        // alphabet, so a base-vocab token containing one unmappable character
+        // among otherwise-mappable ones used to decode to only the mappable
+        // remainder -- which can collide with an unrelated token that spells
+        // that same remainder outright. Construction must still succeed (a
+        // hard rejection here broke every non-byte-level test/synthetic
+        // vocabulary across the crate, e.g. a raw `" "` token id); instead the
+        // whole token is masked to no bytes, exactly like a special id.
+        //
+        // id 0 "a" is fully mappable. id 1 "好a" mixes one unmappable
+        // character ('好', U+597D, not one of the 256 GPT-2 byte-level
+        // characters) with a mappable one. Under the old partial-decode bug,
+        // id 1 would decode to the same single byte as id 0 ('a' -> 97) --
+        // exactly the collision this fix closes.
+        let mut vocab = HashMap::new();
+        vocab.insert("a".to_string(), 0u32);
+        vocab.insert("好a".to_string(), 1u32);
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+            .expect("a non-byte-level base-vocab token must not be refused at construction");
+
+        assert_eq!(tokenizer.token_bytes_for_id(0), Some(vec![b'a']));
+        assert_eq!(
+            tokenizer.token_bytes_for_id(1),
+            None,
+            "a base-vocab token with any unmappable character must mask to no bytes"
+        );
+
+        let vocab_bytes = tokenizer.vocab_bytes(2).unwrap();
+        assert!(
+            vocab_bytes[1].is_empty(),
+            "masked id must get an empty vocab_bytes entry, got {:?}",
+            vocab_bytes[1]
+        );
+        assert_ne!(
+            vocab_bytes[0], vocab_bytes[1],
+            "the masked id must not collide with the mappable token spelling its surviving bytes"
+        );
+
+        assert_eq!(tokenizer.decode(&[1]), Some(String::new()));
+        assert_eq!(tokenizer.decode(&[0, 1]), Some("a".to_string()));
     }
 }

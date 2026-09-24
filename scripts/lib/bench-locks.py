@@ -86,6 +86,15 @@ PENDING_DIR = "/tmp/lion-bench-window-pending"
 LOCK_EXIT = 75
 REFUSAL_EXIT = 2
 
+# Read by lattice_inference::measurement::gpu_test_lock_for_path (Rust side:
+# crates/inference/src/measurement.rs). Set on any launch route below where
+# this process retains GPU_LOCK and does not hand it to the child: a target
+# that calls gpu_test_lock() itself would otherwise wait out its own 30-minute
+# timeout against a lock this process is holding (#1643). The --pass-lock-fds
+# route below hands the descriptors themselves to its immediate child instead,
+# so it does not set this.
+SUPERVISOR_MARKER_ENV = "LATTICE_GPU_LOCK_SUPERVISOR_PID"
+
 
 def _log(msg: str) -> None:
     sys.stderr.write(f"[bench-locks] {msg}\n")
@@ -297,8 +306,13 @@ def main() -> int:
             return returncode
 
         # close_fds defaults True, so neither lock fd reaches cmd or anything
-        # cmd spawns. Both stay held here for cmd's whole lifetime.
-        return subprocess.call(cmd)
+        # cmd spawns. Both stay held here for cmd's whole lifetime. cmd is not
+        # handed the lock, so it must be told who holds it (see
+        # SUPERVISOR_MARKER_ENV above) rather than inherit an environment that
+        # says nothing about GPU_LOCK's holder.
+        plain_env = os.environ.copy()
+        plain_env[SUPERVISOR_MARKER_ENV] = str(os.getpid())
+        return subprocess.call(cmd, env=plain_env)
     finally:
         try:
             os.unlink(marker)
