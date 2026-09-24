@@ -18713,8 +18713,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         // Sibling of `synthetic_mtp_weights_for_test` with a NON-ZERO `fc` hidden
-        // half and NON-ZERO K/V projections (lattice#1396, packet
-        // 20260924/fix-1396b). `synthetic_mtp_weights_for_test`'s all-zero K/V
+        // half and NON-ZERO K/V projections (lattice#1396).
+        // `synthetic_mtp_weights_for_test`'s all-zero K/V
         // projections -- and `constant_zero_draft_mtp_weights_for_test`'s
         // additionally-zeroed `fc`, which collapses the fused hidden to zero
         // regardless of input -- make every MTP cache row identically zero no
@@ -18751,7 +18751,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // shifted by ONE output index (`fc_out[(j + 1) % hidden] +=
             // normed_hidden[j]`) -- deliberately NOT same-index identity.
             //
-            // Round-2 finding: `tiny_metal_qwen35_fixture`'s embeddings are
+            // `tiny_metal_qwen35_fixture`'s embeddings are
             // one-hot at dim 0 for every token, and this fixture's target
             // model has zero attn/FFN weights, so a pending token's own
             // pre-final hidden (what the accept arm pairs the appended row
@@ -19120,7 +19120,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        // lattice#1396 (packet 20260924/fix-1396b): `full_accept_appends_mtp_cache_row_for_accepted_draft_token`
+        // lattice#1396: `full_accept_appends_mtp_cache_row_for_accepted_draft_token`
         // (#1731) proves only that the appended row EXISTS (the cursor reaches
         // `c0 + 2`) -- its fixture has all-zero MTP K/V projection weights, so
         // the appended row's raw content is zero regardless of which hidden
@@ -19151,7 +19151,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         //     iteration (the draft token), `last_pre_final_hidden` holds the
         //     draft token's own pre-final hidden, overwriting the value the
         //     first iteration (`pending_token`) produced. A wrong-pairing
-        //     mutant that substitutes `self.session.last_pre_final_hidden`
+        //     change that substitutes `self.session.last_pre_final_hidden`
         //     for `verify_out.first_pre_final_hidden` at the accept-arm's
         //     `mtp_prefill_append` call therefore pairs the accepted token
         //     with the draft token's *own* re-verified hidden state instead
