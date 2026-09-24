@@ -1462,6 +1462,10 @@ jobs:
       # invoked, which keeps it in the same harness-plumbing scope as above.
       - name: python3 tests/test_bench_compare_measurement.py
         run: python3 tests/test_bench_compare_measurement.py -v
+      # The in-phase load sampler's self/foreign split under --gpu-handoff,
+      # driven against a real process tree shaped like the supervisor's.
+      - name: python3 tests/test_bench_phase_sampler_handoff_attribution.py
+        run: python3 tests/test_bench_phase_sampler_handoff_attribution.py -v
       # bench_quality.sh's canonical-artifact publication guard. Runs the
       # shipping script in a disposable repo with stub lattice/MLX scorers,
       # proving failures preserve the tracked TSV and a complete run publishes
