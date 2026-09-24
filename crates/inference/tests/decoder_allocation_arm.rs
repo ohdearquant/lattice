@@ -243,8 +243,14 @@ mod controls {
     }
 }
 
-/// The measurement. Prints one machine-readable record per case and asserts only
-/// what is true at any ref; the base-vs-head comparison is the caller's.
+/// The measurement. Prints two machine-readable records per case -- a `record`
+/// line for `generate` and a `record_streaming` line for `generate_streaming`
+/// with a no-op callback, in the same column layout -- and asserts only what is
+/// true at any ref; the base-vs-head comparison is the caller's.
+///
+/// Every `generate` measurement runs, and every `record` line is printed, before
+/// the first `generate_streaming` call, so the `record` lines stay comparable with
+/// runs that predate the streaming records.
 #[test]
 fn measure_generate_allocations() {
     use lattice_inference::GenerateConfig;
@@ -282,11 +288,7 @@ fn measure_generate_allocations() {
     println!("# decoder_allocation_arm records; large threshold {LARGE_ALLOC_BYTES} bytes");
     println!("# case\tcalls\tbytes\tlarge_calls\tmax_bytes");
 
-    let mut any = 0usize;
-    for case in cases {
-        let name = case["name"].as_str().expect("case has a name");
-        let prompt = case["prompt"].as_str().expect("case has a prompt");
-
+    let config_for = |case: &serde_json::Value| {
         let mut cfg = GenerateConfig::default();
         cfg.max_new_tokens = golden["max_new_tokens"].as_u64().expect("max_new_tokens") as usize;
         cfg.temperature = golden["generation"]["temperature"]
@@ -300,6 +302,14 @@ fn measure_generate_allocations() {
             .as_bool()
             .expect("enable_thinking");
         cfg.reasoning_budget = case["reasoning_budget"].as_u64().map(|v| v as usize);
+        cfg
+    };
+
+    let mut any = 0usize;
+    for case in cases {
+        let name = case["name"].as_str().expect("case has a name");
+        let prompt = case["prompt"].as_str().expect("case has a prompt");
+        let cfg = config_for(case);
 
         // Warm once OUTSIDE the measured window. The first generation pulls in
         // lazily-initialized state that belongs to neither arm, and attributing
@@ -326,9 +336,44 @@ fn measure_generate_allocations() {
         any += 1;
     }
 
+    println!("# record_streaming: generate_streaming with a no-op callback; columns as above");
+
+    let mut any_streaming = 0usize;
+    for case in cases {
+        let name = case["name"].as_str().expect("case has a name");
+        let prompt = case["prompt"].as_str().expect("case has a prompt");
+        let cfg = config_for(case);
+
+        // Warmed separately: the streaming entry is a different call path from
+        // `generate`, so the `generate` warm-up above does not stand in for it.
+        let _ = model.generate_streaming(prompt, &cfg, |_delta: &str| {});
+
+        reset();
+        let output = model
+            .generate_streaming(prompt, &cfg, |_delta: &str| {})
+            .unwrap_or_else(|e| panic!("case {name}: streaming generation failed: {e}"));
+        let rec = snapshot();
+        std::hint::black_box(&output);
+
+        assert!(
+            rec.calls > 0,
+            "case {name}: generate_streaming() recorded zero allocations, which is \
+             not a result but a dead counter"
+        );
+        println!(
+            "record_streaming\t{name}\t{}\t{}\t{}\t{}",
+            rec.calls, rec.bytes, rec.large_calls, rec.max_bytes
+        );
+        any_streaming += 1;
+    }
+
     assert!(
         any > 0,
         "the golden fixture declared no cases, so nothing was measured"
+    );
+    assert_eq!(
+        any_streaming, any,
+        "generate_streaming measured a different number of cases than generate"
     );
     println!("# measured {any} case(s)");
 }
