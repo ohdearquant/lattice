@@ -675,25 +675,64 @@ pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, Str
     })
 }
 
-/// Non-Unix posture (#1744): open-and-check-type only. This target has no
-/// portable equivalent of the Unix arm's `O_NONBLOCK`/`O_NOFOLLOW` open-time
-/// guard -- opening a FIFO or other blocking special file here can still
-/// hang this thread indefinitely, and a final-component symlink is followed
-/// rather than rejected -- nor of the mode/uid/ACL and parent-directory
-/// trust checks below ([`reject_if_mmap_parent_directory_chain_weak`],
+/// `SecurityIdentification << 16`, the `dwFlagsAndAttributes` impersonation
+/// level from `winbase.h` (`SECURITY_IDENTIFICATION` in `windows-sys`).
+#[cfg(windows)]
+const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+
+/// Opens `path` on a non-Unix target without handing a named-pipe server the
+/// right to impersonate this process.
+///
+/// A caller-controlled checkpoint path can name `\\.\pipe\...`. A plain
+/// `File::open` sets no security quality-of-service flags, so `CreateFileW`
+/// connects to the pipe at whatever impersonation level its server asks for,
+/// before any later `is_file()` check can refuse it. Opening with
+/// `SECURITY_IDENTIFICATION` lets the server identify this process but never
+/// act as it (`security_qos_flags` adds `SECURITY_SQOS_PRESENT` itself). A
+/// path-based pre-check would not help: `std::fs::metadata(path)` opens the
+/// path the same unrestricted way. The handle returned here feeds the
+/// handle-based `metadata()` check in the callers.
+#[cfg(windows)]
+fn open_with_pipe_impersonation_guard(path: &Path) -> Result<File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .security_qos_flags(SECURITY_IDENTIFICATION)
+        .open(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))
+}
+
+/// Targets that are neither Unix nor Windows (for example WASI) share no path
+/// namespace with named pipes, so there is no impersonation level to restrict.
+#[cfg(all(not(unix), not(windows)))]
+fn open_with_pipe_impersonation_guard(path: &Path) -> Result<File, String> {
+    File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))
+}
+
+/// Non-Unix posture (#1744): open-and-check-type, plus (Windows only)
+/// the pipe-impersonation guard on the open itself
+/// ([`open_with_pipe_impersonation_guard`]). This target has no portable
+/// equivalent of the Unix arm's `O_NONBLOCK`/`O_NOFOLLOW` open-time guard --
+/// opening a FIFO or other blocking special file here can still hang this
+/// thread indefinitely, and a final-component symlink is followed rather
+/// than rejected -- nor of the mode/uid/ACL and parent-directory trust
+/// checks below ([`reject_if_mmap_parent_directory_chain_weak`],
 /// [`reject_if_mmap_file_trust_boundary_weak`] both no-op off Unix, per
 /// their own doc comments): there is no portable equivalent of POSIX
 /// mode/uid bits to gate on here, and none of this claims Windows ACL
 /// parity. What this arm does enforce, identically to the Unix arm via the
 /// same [`reject_if_not_regular_file`] predicate: a checkpoint path naming a
 /// directory, FIFO, device, or socket is refused rather than opened and
-/// mapped. Whether a blocking open on such a path is even reachable on a
-/// non-Unix target needs confirming (#1744, following on from #1380's
-/// Unix-specific FIFO finding).
+/// mapped. On Windows a directory is refused earlier, by the open itself:
+/// without `FILE_FLAG_BACKUP_SEMANTICS`, `CreateFileW` fails on a directory
+/// with `ERROR_ACCESS_DENIED`. Whether a blocking open on a FIFO or device
+/// path is even reachable on a non-Unix target needs confirming (#1744,
+/// following on from the Unix-specific FIFO case in #1380).
 #[cfg(not(unix))]
 #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
 pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, String> {
-    let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let file = open_with_pipe_impersonation_guard(path)?;
     let meta = file
         .metadata()
         .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
@@ -812,21 +851,23 @@ pub(crate) fn open_regular_file_no_hang(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-/// Non-Unix posture (#1744): open-and-check-type only, matching
-/// [`open_trusted_mmap_file`]'s non-Unix arm and doc comment. This target has
-/// no portable equivalent of `O_NONBLOCK` here either, so an attacker-planted
-/// FIFO or other blocking special file at the checkpoint path can still hang
-/// this open -- the Unix arm's FIFO/device-DoS mitigation (this function's
-/// own doc comment above) is Unix-specific and this is not a claim of
-/// non-Unix parity for it; whether a blocking open is even reachable on a
-/// non-Unix target needs confirming (#1744). What this arm does enforce,
-/// identically to the Unix arm via the same
-/// [`reject_if_not_regular_file_no_hang`] predicate: a checkpoint path
-/// naming a directory or other non-regular-file node is refused after open
-/// rather than handed back to the caller.
+/// Non-Unix posture (#1744): open-and-check-type, plus (Windows only)
+/// the same pipe-impersonation guard on the open itself
+/// ([`open_with_pipe_impersonation_guard`]) as
+/// [`open_trusted_mmap_file`]'s non-Unix arm. This target has no portable
+/// equivalent of `O_NONBLOCK` here either, so an attacker-planted FIFO or
+/// other blocking special file at the checkpoint path can still hang this
+/// open -- the Unix arm's FIFO/device-DoS mitigation (this function's own
+/// doc comment above) is Unix-specific and this is not a claim of non-Unix
+/// parity for it; whether a blocking open is even reachable on a non-Unix
+/// target needs confirming (#1744). What this arm does enforce, identically
+/// to the Unix arm via the same [`reject_if_not_regular_file_no_hang`]
+/// predicate: a checkpoint path naming a directory or other non-regular-file
+/// node is refused. On Windows a directory is refused by the open itself, as
+/// in [`open_trusted_mmap_file`].
 #[cfg(not(unix))]
 pub(crate) fn open_regular_file_no_hang(path: &Path) -> Result<File, String> {
-    let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let file = open_with_pipe_impersonation_guard(path)?;
     let meta = file
         .metadata()
         .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
@@ -2190,18 +2231,15 @@ mod tests {
         );
     }
 
-    // Regression test for #1744: on a non-Unix target, `open_trusted_mmap_file`
-    // must refuse a directory at the checkpoint path through the public open
-    // fn end to end, the same way `open_trusted_mmap_file_rejects_a_directory`
-    // above proves for whichever cfg arm the local/CI platform compiles.
-    // This crate builds for `x86_64-pc-windows-msvc` (the npm prebuild
-    // matrix per #1744's issue text) but this repository does not run
-    // `cargo test` there today, so this test compiles and runs only on a
-    // non-Unix CI leg added for that purpose -- it cannot run on this
-    // (macOS) worktree.
-    #[cfg(not(unix))]
+    // Regression test for #1744: on Windows, `open_trusted_mmap_file` must
+    // refuse a directory at the checkpoint path. `CreateFileW` without
+    // `FILE_FLAG_BACKUP_SEMANTICS` fails on a directory, so the refusal comes
+    // from the open, not from the `is_file()` check. These tests run only on a
+    // Windows test job; this repository compiles the library for
+    // `x86_64-pc-windows-msvc` but does not run its tests there today.
+    #[cfg(windows)]
     #[test]
-    fn open_trusted_mmap_file_rejects_a_directory_on_non_unix() {
+    fn open_trusted_mmap_file_rejects_a_directory_on_windows() {
         let tmp = tempfile::tempdir().expect("tempdir create");
         let dir_path = tmp.path().join("planted_dir.q4");
         std::fs::create_dir(&dir_path).expect("create planted directory");
@@ -2209,16 +2247,15 @@ mod tests {
         let err = open_trusted_mmap_file(&dir_path)
             .expect_err("a directory must be rejected, not accepted, for a mmap load");
         assert!(
-            err.contains("not a regular file"),
-            "error must name the directory as the non-regular-file rejection cause; got: {err}"
+            err.contains("failed to open"),
+            "CreateFileW must refuse a directory before is_file() runs; got: {err}"
         );
     }
 
-    // Same shape as the test above, for `open_regular_file_no_hang`'s
-    // non-Unix arm. Non-Unix only, same reasoning.
-    #[cfg(not(unix))]
+    // Same shape as the test above, for `open_regular_file_no_hang`.
+    #[cfg(windows)]
     #[test]
-    fn open_regular_file_no_hang_rejects_a_directory_on_non_unix() {
+    fn open_regular_file_no_hang_rejects_a_directory_on_windows() {
         let tmp = tempfile::tempdir().expect("tempdir create");
         let dir_path = tmp.path().join("planted_dir.safetensors");
         std::fs::create_dir(&dir_path).expect("create planted directory");
@@ -2226,8 +2263,8 @@ mod tests {
         let err = open_regular_file_no_hang(&dir_path)
             .expect_err("a directory must be rejected, not accepted, for a mmap load");
         assert!(
-            err.contains("not a regular file"),
-            "error must name the directory as the non-regular-file rejection cause; got: {err}"
+            err.contains("failed to open"),
+            "CreateFileW must refuse a directory before is_file() runs; got: {err}"
         );
     }
 
