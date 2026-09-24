@@ -531,17 +531,23 @@ jobs:
       - name: inference — default-feature clippy, isolated (no workspace unification)
         run: cargo clippy -p lattice-inference --all-targets -- -D warnings
       # The R03 golden gate (`crates/inference/tests/cpu_pre_migration_greedy_golden.rs`)
-      # is declared `test = false`, which keeps it out of `cargo test --workspace` —
-      # it enforces by default and replays a 1.6 GiB checkpoint no runner has. That
-      # exclusion ALSO removes it from `--all-targets` above: measured, the step
+      # and the row D allocation arm (`crates/inference/tests/decoder_allocation_arm.rs`)
+      # are both declared `test = false`, which keeps them out of
+      # `cargo test --workspace` — each needs a 1.6 GiB checkpoint no runner has. That
+      # exclusion ALSO removes them from `--all-targets` above: measured, the step
       # before this one compiles `tests/quarot_q4_composed_golden.rs` and does not
-      # compile this file. So the target is linted by name, on both of its
-      # compilation arms — the file's `f16` and non-`f16` bodies are different code,
-      # and linting one says nothing about the other.
-      - name: inference — R03 golden gate lint (excluded from --all-targets by test = false)
+      # compile either file, and an unused variable added to the allocation arm fails
+      # `clippy --test decoder_allocation_arm` while `clippy --all-targets` stays
+      # green. So both targets are linted by name, on both compilation arms — the
+      # golden file's `f16` and non-`f16` bodies are different code, and the library
+      # the allocation arm calls into changes under `f16`, so linting one arm says
+      # nothing about the other.
+      - name: inference — R03 golden gate and allocation-arm lint (excluded from --all-targets by test = false)
         run: |
           cargo clippy -p lattice-inference --test cpu_pre_migration_greedy_golden -- -D warnings
           cargo clippy -p lattice-inference --test cpu_pre_migration_greedy_golden --features f16 -- -D warnings
+          cargo clippy -p lattice-inference --test decoder_allocation_arm -- -D warnings
+          cargo clippy -p lattice-inference --test decoder_allocation_arm --features f16 -- -D warnings
       # ...and its checkpoint-free controls DO run here. They are the part a runner
       # can verify: that the gate refuses an unset, relative or missing checkpoint
       # and refuses every bypass variable, plus the must-pass arms showing the
@@ -549,25 +555,49 @@ jobs:
       # a target nothing ever runs, which is the failure mode the gate itself is
       # written against. The filter is what keeps the checkpoint-replaying test out;
       # it is named here rather than hidden in a runtime skip branch.
+      #
+      # The minimum is the exact number of `#[test]` functions in `mod controls`, for
+      # the reason given on the allocation-arm step below: `0 passed` exits 0. A
+      # change that removes a control lowers this number; one that adds a control
+      # raises it. A failing run prints its output before exiting with cargo's status.
       - name: inference — R03 golden gate controls (no checkpoint required)
-        run: "cargo test -p lattice-inference --test cpu_pre_migration_greedy_golden -- controls::"
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p lattice-inference --test cpu_pre_migration_greedy_golden -- controls:: 2>&1) || {
+            status=$?
+            printf '%s\n' "$out"
+            exit "$status"
+          }
+          printf '%s\n' "$out"
+          passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
+          if [ -z "$passed" ] || [ "$passed" -lt 12 ]; then
+            echo "expected at least 12 passing golden-gate controls, parsed '${passed:-<none>}'" >&2
+            exit 1
+          fi
       # The row D allocation arm is `test = false` in the manifest, for two reasons
       # stated there: it installs its own `#[global_allocator]`, and its
       # measurement test needs a 1.6 GiB checkpoint no runner has. `test = false`
-      # keeps it out of the default set; `--all-targets` still COMPILES it and
-      # never RUNS it. So without this step its two checkpoint-free controls --
-      # the ones proving the counter sees zeroed allocations at all, and that a
-      # vocabulary-width buffer registers as large -- would be compiled forever and
-      # executed nowhere, which is precisely the shape they exist to catch.
+      # keeps it out of the default set and, because it removes the target from
+      # `--tests`, out of `--all-targets` as well: that clippy step neither compiles
+      # nor runs it. What compiles it is the by-name lint in the R03 lint step
+      # above; what runs its two checkpoint-free controls -- the ones proving the
+      # counter sees zeroed allocations at all, and that a vocabulary-width buffer
+      # registers as large -- is this step. Without it they would be executed
+      # nowhere, which is precisely the shape they exist to catch.
       #
       # The count assertion is not decoration. `cargo test` prints `0 passed` and
       # exits 0 for a renamed module, a deleted test, a misspelled filter, or a
       # target excluded by a cfg this command did not enable. Every one of those
-      # renders here as a green step, so the step reads the number it got.
+      # renders here as a green step, so the step reads the number it got. A
+      # failing run prints its output before exiting with cargo's status.
       - name: inference — R03 row D allocation-arm controls (no checkpoint required)
         run: |
           set -euo pipefail
-          out=$(cargo test -p lattice-inference --test decoder_allocation_arm -- controls:: 2>&1)
+          out=$(cargo test -p lattice-inference --test decoder_allocation_arm -- controls:: 2>&1) || {
+            status=$?
+            printf '%s\n' "$out"
+            exit "$status"
+          }
           printf '%s\n' "$out"
           passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
           if [ -z "$passed" ] || [ "$passed" -lt 2 ]; then
