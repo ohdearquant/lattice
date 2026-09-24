@@ -176,6 +176,35 @@ pub fn check_rank_total_cap(rank_total: usize, ctx: &str) -> Result<(), String> 
     }
 }
 
+/// Reject an entry whose own `(layer_idx, module)` disagrees with the group
+/// key it was placed under.
+///
+/// `plan_grouped` takes its grouping as given: the key comes from the
+/// `(usize, &str, I)` tuple a caller built, and each entry inside `I` also
+/// carries its own `layer_idx`/`module`. Nothing before this check compared
+/// the two, so a caller keeping them in sync by hand -- and every caller
+/// does, since a group is normally built by pushing an entry into the map
+/// slot for its own `(layer_idx, module)` -- had no instrument to catch a
+/// slip. An entry filed under the wrong key blends silently into the wrong
+/// projection's plan; this rejects that instead.
+pub fn check_group_key_match(
+    ctx: &str,
+    layer_idx: usize,
+    module: &str,
+    idx: usize,
+    entry_layer_idx: usize,
+    entry_module: &str,
+) -> Result<(), String> {
+    if entry_layer_idx != layer_idx || entry_module != module {
+        Err(format!(
+            "{ctx}: layer {layer_idx} module '{module}' group has a key mismatch at entry {idx} \
+             (entry is for layer {entry_layer_idx} module '{entry_module}')"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Reject mismatched `(d_in, d_out)` between the first entry of a projection
 /// group and a later entry being folded into it.
 #[allow(clippy::too_many_arguments)]
@@ -339,18 +368,21 @@ pub struct PlannedProjection<'a> {
 /// # Preconditions
 ///
 /// The caller guarantees each `(layer_idx, module)` key appears in `groups`
-/// at most once and that every group's entries are non-empty (a
-/// `HashMap`-based grouping pass, as both `plan_blend` and
-/// `blend_lora_layer_data` run, satisfies this by construction: a key only
-/// exists in the map because at least one projection was pushed into it).
-/// An empty group is treated as a caller bug reported through `Err`, naming
-/// the offending `(layer_idx, module)` — never a panic, never an
-/// out-of-bounds index into an empty group.
+/// at most once (a `HashMap`-based grouping pass, as both `plan_blend` and
+/// `blend_lora_layer_data` run, satisfies this by construction). Two other
+/// properties a caller's own grouping is expected to hold -- that every
+/// group is non-empty, and that every entry's own `layer_idx`/`module`
+/// agrees with the key it was filed under -- are checked rather than
+/// trusted: either is reported through `Err`, naming the offending
+/// `(layer_idx, module)`, never a panic, never an out-of-bounds index into
+/// an empty group, and never a plan built from an entry under the wrong key.
 ///
 /// # Errors
 ///
 /// Returns `Err` when:
 /// - any group in `groups` is empty;
+/// - an entry's own `(layer_idx, module)` disagrees with the group key it
+///   was placed under;
 /// - the aggregate blend size across every group exceeds
 ///   `MAX_BLEND_TOTAL_ELEMENTS`;
 /// - two entries in the same group disagree on `(d_in, d_out)`;
@@ -371,12 +403,14 @@ where
     // for pass 2 below.
     let mut planned_elems: usize = 0;
     for (layer_idx, module, entries) in groups.clone() {
-        let mut iter = entries.into_iter();
-        let first = iter.next().ok_or_else(|| {
+        let mut iter = entries.into_iter().enumerate();
+        let (_, first) = iter.next().ok_or_else(|| {
             format!("{ctx}: layer {layer_idx} module '{module}' has an empty projection group")
         })?;
+        check_group_key_match(ctx, layer_idx, module, 0, first.layer_idx, first.module)?;
         let mut group_rank = accumulate_rank(0, first.rank, ctx)?;
-        for entry in iter {
+        for (idx, entry) in iter {
+            check_group_key_match(ctx, layer_idx, module, idx, entry.layer_idx, entry.module)?;
             group_rank = accumulate_rank(group_rank, entry.rank, ctx)?;
         }
         let group_elems =
@@ -999,5 +1033,31 @@ mod tests {
             vec![(0usize, "q_proj", Vec::new())];
         let err = plan_grouped("ctx", groups).expect_err("an empty group must refuse, not panic");
         assert!(err.contains("empty"), "got: {err}");
+    }
+
+    /// An entry whose own `(layer_idx, module)` disagrees with the group key
+    /// it was filed under: grouped as `(0, "q_proj")` but the entry itself
+    /// says `(1, "k_proj")`. Without the group-key check in `plan_grouped`
+    /// (removing the `check_group_key_match` calls in its first pass would
+    /// do it), this entry blends silently into the `(0, "q_proj")` plan
+    /// instead of refusing, and the call succeeds where it must not.
+    #[test]
+    fn plan_grouped_rejects_an_entry_whose_own_key_disagrees_with_its_group() {
+        let groups: Vec<(usize, &str, Vec<BlendProjection<'_>>)> = vec![(
+            0usize,
+            "q_proj",
+            vec![BlendProjection {
+                layer_idx: 1,
+                module: "k_proj",
+                rank: 4,
+                d_in: 4,
+                d_out: 4,
+            }],
+        )];
+        let err = plan_grouped("ctx", groups)
+            .expect_err("an entry keyed differently from its group must refuse, not blend");
+        assert!(err.contains("q_proj"), "got: {err}");
+        assert!(err.contains("k_proj"), "got: {err}");
+        assert!(err.contains('0') && err.contains('1'), "got: {err}");
     }
 }

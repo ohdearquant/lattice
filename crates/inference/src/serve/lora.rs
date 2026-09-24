@@ -282,9 +282,13 @@ pub struct AdapterIndex {
     pub applied: Vec<LoraSelection>,
     /// Why a blend of the FULL resident set (what a routed request actually
     /// blends) would refuse at execution, or `None` when it would not.
-    /// Computed once per residency change (issue #1735), from the same
+    /// Computed once per residency change (issue #1735) -- cached on
+    /// `ResidencyRegistry` and recomputed only in its `load` and `unload`,
+    /// the only two places a resident is added or removed, from the same
     /// shared plan `blend_lora_layer_data` itself runs, so this can never
-    /// disagree with what a routed request meets.
+    /// disagree with what a routed request meets. `publish` copies the
+    /// cached value into this field on every state change; it does not
+    /// re-plan.
     ///
     /// Never serialized at this struct's own top level: it belongs beside
     /// `routable` in the `router` object `lora_list_body` builds, which is

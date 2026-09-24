@@ -42,8 +42,20 @@ pub(super) struct ResidencyRegistry {
     // Order determines concatenated rank order and hence floating-point reduction.
     applied: Vec<LoraSelection>,
     index: Arc<RwLock<AdapterIndex>>,
+    // Cached feasibility of a blend over the FULL resident set (issue #1735).
+    // Valid exactly as long as `residents` is unchanged: recomputed in `load`
+    // and `unload`, the only two places that add or remove a resident, and
+    // copied verbatim by `publish` -- never re-derived there. `apply` moves
+    // `applied`, not `residents`, so it never invalidates this cache even
+    // though it calls `publish` once or twice per call.
+    blend_refusal: Option<String>,
     #[cfg(test)]
     blends: usize,
+    // Counts calls to `recompute_blend_refusal`, i.e. how many times the
+    // full-resident-set plan actually re-runs -- distinct from `blends`,
+    // which counts real GPU blend uploads inside `apply`.
+    #[cfg(test)]
+    blend_plans: usize,
 }
 
 impl ResidencyRegistry {
@@ -56,8 +68,53 @@ impl ResidencyRegistry {
             next_id: Some(0),
             applied: Vec::new(),
             index,
+            // An empty resident set is trivially feasible (`plan_blend` of no
+            // projections returns `Ok`, never a refusal), so the starting
+            // cache is exactly what `recompute_blend_refusal` would compute
+            // here -- no need to run it over an empty map. This registry has
+            // no constructor that starts with residents already loaded; a
+            // future one would need to call `recompute_blend_refusal` after
+            // building `residents` instead of assuming this.
+            blend_refusal: None,
             #[cfg(test)]
             blends: 0,
+            #[cfg(test)]
+            blend_plans: 0,
+        }
+    }
+
+    /// Recompute the FULL resident set's blend feasibility (issue #1735) and
+    /// cache it on `self.blend_refusal`.
+    ///
+    /// Called only where residency changes -- `load` after inserting, `unload`
+    /// after removing -- because the resident set is the plan's entire input
+    /// and nothing else this registry does can move it. `publish` reads the
+    /// cache instead of re-running this on every call, including the two
+    /// calls `apply` can make in one invocation when it unloads a previous
+    /// blend before loading the next.
+    ///
+    /// A routed request applies EVERY resident adapter (ADR-094 decision 2),
+    /// so that is exactly the set a blend feasibility report has to cover --
+    /// not just the adapters an operator most recently applied. Computed via
+    /// the SAME shared plan `blend_lora_layer_data` itself runs, so this can
+    /// never disagree with the blend a routed request actually meets.
+    fn recompute_blend_refusal(&mut self) {
+        let projections = self.residents.values().flat_map(|adapter| {
+            adapter
+                .layers
+                .iter()
+                .map(|layer| lattice_fann::lora::BlendProjection {
+                    layer_idx: layer.layer_idx,
+                    module: layer.module.as_str(),
+                    rank: layer.rank,
+                    d_in: layer.d_in,
+                    d_out: layer.d_out,
+                })
+        });
+        self.blend_refusal = lattice_fann::lora::plan_blend("lora_residency", projections).err();
+        #[cfg(test)]
+        {
+            self.blend_plans += 1;
         }
     }
 
@@ -141,6 +198,9 @@ impl ResidencyRegistry {
         );
         self.identities.insert(identity, id);
         self.resident_bytes = total_bytes;
+        // Residency just changed: the cached plan is stale before `publish`
+        // copies it into `AdapterIndex`.
+        self.recompute_blend_refusal();
         self.publish();
         Ok(id)
     }
@@ -161,6 +221,9 @@ impl ResidencyRegistry {
         self.resident_bytes -= adapter.payload_bytes;
         self.identities
             .remove(&(adapter.metadata.name, adapter.metadata.path));
+        // Residency just changed: the cached plan is stale before `publish`
+        // copies it into `AdapterIndex`.
+        self.recompute_blend_refusal();
         self.publish();
         Ok(id)
     }
@@ -237,25 +300,13 @@ impl ResidencyRegistry {
             .collect();
         adapters.sort_by_key(|adapter| adapter.id);
 
-        // A routed request applies EVERY resident adapter (ADR-094 decision
-        // 2), so that is exactly the set a blend feasibility report has to
-        // cover -- not just the adapters an operator most recently applied.
-        // Computed via the SAME shared plan `blend_lora_layer_data` itself
-        // runs (issue #1735), so this can never disagree with the blend a
-        // routed request actually meets.
-        let projections = self.residents.values().flat_map(|adapter| {
-            adapter
-                .layers
-                .iter()
-                .map(|layer| lattice_fann::lora::BlendProjection {
-                    layer_idx: layer.layer_idx,
-                    module: layer.module.as_str(),
-                    rank: layer.rank,
-                    d_in: layer.d_in,
-                    d_out: layer.d_out,
-                })
-        });
-        let blend_refusal = lattice_fann::lora::plan_blend("lora_residency", projections).err();
+        // The cache, not a fresh plan: residency is unchanged since the last
+        // `recompute_blend_refusal` (`load`/`unload`), and `apply` -- which
+        // can call `publish` twice in one invocation -- never touches
+        // `residents`, so re-planning here would recompute the identical
+        // answer on every applied selection instead of only when the
+        // resident set itself moves.
+        let blend_refusal = self.blend_refusal.clone();
 
         // Only whole snapshots are assigned; recovering a poisoned lock cannot expose
         // a partially mutated metadata record.
@@ -640,6 +691,48 @@ mod tests {
         selection[0].scale = 1.0;
         registry.apply(&selection, &mut slot).unwrap();
         assert_eq!(registry.blends, 3);
+    }
+
+    /// The blend-feasibility plan (issue #1735) is cached on the registry and
+    /// recomputed only where residency itself moves -- `load` and `unload` --
+    /// never inside `apply`, however many times a selection changes or `apply`
+    /// calls `publish`. Reverting `publish` to recompute the plan itself
+    /// (re-adding a call to `recompute_blend_refusal` -- or the old inline
+    /// `plan_blend` over `self.residents` -- at the top of `publish`) makes
+    /// `blend_plans` climb past 2 on the first `apply` call below and this
+    /// test fails.
+    #[test]
+    fn apply_never_replans_feasibility_but_load_and_unload_do() {
+        let mut registry = registry();
+        let mut slot = Slot::default();
+        let a = load(&mut registry, "a");
+        let b = load(&mut registry, "b");
+        assert_eq!(registry.blend_plans, 2, "one recompute per load");
+
+        let mut selection = vec![
+            LoraSelection { id: a, scale: 0.5 },
+            LoraSelection { id: b, scale: 0.25 },
+        ];
+        registry.apply(&selection, &mut slot).unwrap();
+        registry.apply(&selection, &mut slot).unwrap();
+        selection.reverse();
+        registry.apply(&selection, &mut slot).unwrap();
+        selection[0].scale = 1.0;
+        registry.apply(&selection, &mut slot).unwrap();
+        assert_eq!(
+            registry.blends, 3,
+            "three distinct selections were actually blended"
+        );
+        assert_eq!(
+            registry.blend_plans, 2,
+            "apply() must read the cached plan, never recompute it"
+        );
+
+        registry.unload(a, &mut slot).unwrap();
+        assert_eq!(
+            registry.blend_plans, 3,
+            "unload changes residency and must recompute"
+        );
     }
 
     #[test]
