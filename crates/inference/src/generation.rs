@@ -924,32 +924,49 @@ impl DecodePolicy {
     /// token source is exhausted — mirrors `StopStringMatcher::finish`
     /// exactly, since that is the only mode this call does real work for.
     ///
-    /// Returns `true` when the tail flush itself completed a stop match
-    /// (`Streaming` only; always `false` for `Disabled`/`FullScan`).
+    /// Returns the same [`StopCheckOutcome`] the per-step [`Self::stop_check`]
+    /// does, with the same precedence: `Interrupted` when `emit_confirmed`
+    /// rejected any text this flush emitted (even if the tail also completed
+    /// a stop match), else `Stopped` when the matcher holds a stop match
+    /// (`Streaming` only), else `Continue`. `FullScan` always returns
+    /// `Continue`.
     pub(crate) fn finish_stop(
         &mut self,
         text: &mut String,
         tail: &str,
         mut emit_confirmed: impl FnMut(&str) -> bool,
-    ) -> bool {
+    ) -> StopCheckOutcome {
         match &mut self.stop_mode {
             StopMode::Disabled => {
-                if !tail.is_empty() {
-                    text.push_str(tail);
-                    emit_confirmed(tail);
+                if tail.is_empty() {
+                    return StopCheckOutcome::Continue;
                 }
-                false
+                text.push_str(tail);
+                if emit_confirmed(tail) {
+                    StopCheckOutcome::Continue
+                } else {
+                    StopCheckOutcome::Interrupted
+                }
             }
             StopMode::Streaming(matcher) => {
+                let mut interrupted = false;
                 matcher.finish(tail, &mut |s| {
                     if !s.is_empty() {
                         text.push_str(s);
-                        emit_confirmed(s);
+                        if !interrupted && !emit_confirmed(s) {
+                            interrupted = true;
+                        }
                     }
                 });
-                matcher.stopped()
+                if interrupted {
+                    StopCheckOutcome::Interrupted
+                } else if matcher.stopped() {
+                    StopCheckOutcome::Stopped
+                } else {
+                    StopCheckOutcome::Continue
+                }
             }
-            StopMode::FullScan { .. } => false,
+            StopMode::FullScan { .. } => StopCheckOutcome::Continue,
         }
     }
 }
@@ -1108,5 +1125,114 @@ mod tests {
             "documents WHY the entry guard is load-bearing: with max_new_tokens 0 \
              the first token would exhaust the answer budget immediately"
         );
+    }
+
+    fn outcome_name(outcome: &StopCheckOutcome) -> &'static str {
+        match outcome {
+            StopCheckOutcome::Continue => "Continue",
+            StopCheckOutcome::Stopped => "Stopped",
+            StopCheckOutcome::Interrupted => "Interrupted",
+        }
+    }
+
+    /// Builds a streaming policy for `stop_strings`, pushes `first_delta` through the
+    /// per-step check (accepting everything it emits), then runs `finish_stop(tail)` with
+    /// a sink answering `accept`. Returns the outcome, every string the flush handed the
+    /// sink (one entry per call), and the accumulated `text`.
+    fn finish_after(
+        stop_strings: &[&str],
+        first_delta: &str,
+        tail: &str,
+        accept: bool,
+    ) -> (StopCheckOutcome, Vec<String>, String) {
+        let cfg = GenerateConfig {
+            stop_strings: stop_strings.iter().map(|s| (*s).to_string()).collect(),
+            ..cfg_with(8, None)
+        };
+        let mut policy = DecodePolicy::construct(&cfg, None, 1, 1, true);
+        let mut logprobs = Vec::new();
+        let mut offsets = Vec::new();
+        let mut text = String::new();
+        let initial =
+            policy.check_initial_stop(&mut logprobs, &mut text, &mut offsets, first_delta, |_| {
+                true
+            });
+        assert_eq!(outcome_name(&initial), "Continue");
+        let mut flushed = Vec::new();
+        let outcome = policy.finish_stop(&mut text, tail, |s| {
+            flushed.push(s.to_string());
+            accept
+        });
+        (outcome, flushed, text)
+    }
+
+    #[test]
+    fn finish_stop_streaming_reports_a_rejected_tail_flush() {
+        // "ZZ" holds back one byte, so "b" of "ab" is still unconfirmed when the loop ends
+        // and reaches the sink only through the tail flush.
+        let (outcome, flushed, text) = finish_after(&["ZZ"], "ab", "c", false);
+        assert_eq!(flushed, vec!["bc".to_string()]);
+        assert_eq!(outcome_name(&outcome), "Interrupted");
+        assert_eq!(text, "abc");
+
+        let (outcome, flushed, _) = finish_after(&["ZZ"], "ab", "c", true);
+        assert_eq!(flushed, vec!["bc".to_string()]);
+        assert_eq!(
+            outcome_name(&outcome),
+            "Continue",
+            "control: the same flush accepted by the sink is not an interruption"
+        );
+    }
+
+    #[test]
+    fn finish_stop_streaming_rejection_wins_over_a_stop_match_in_the_tail() {
+        // The tail completes "ZZ", and the flush emits the text before it ("ab").
+        let (outcome, flushed, text) = finish_after(&["ZZ"], "a", "bZZ", false);
+        assert_eq!(flushed, vec!["ab".to_string()]);
+        assert_eq!(
+            outcome_name(&outcome),
+            "Interrupted",
+            "per-step stop_check reports Interrupted over Stopped; the tail flush must agree"
+        );
+        assert_eq!(text, "ab");
+
+        let (outcome, _, _) = finish_after(&["ZZ"], "a", "bZZ", true);
+        assert_eq!(
+            outcome_name(&outcome),
+            "Stopped",
+            "control: an accepted flush that completes a stop match reports Stopped"
+        );
+    }
+
+    #[test]
+    fn finish_stop_disabled_reports_a_rejected_tail_flush() {
+        let run = |tail: &str, accept: bool| {
+            let cfg = cfg_with(8, None);
+            let mut policy = DecodePolicy::construct(&cfg, None, 1, 1, true);
+            let mut text = String::new();
+            let mut calls = 0;
+            let outcome = policy.finish_stop(&mut text, tail, |_| {
+                calls += 1;
+                accept
+            });
+            (outcome, calls, text)
+        };
+
+        let (outcome, calls, text) = run("xy", false);
+        assert_eq!(outcome_name(&outcome), "Interrupted");
+        assert_eq!(calls, 1);
+        assert_eq!(text, "xy");
+
+        let (outcome, calls, _) = run("xy", true);
+        assert_eq!(outcome_name(&outcome), "Continue", "control: accepted tail");
+        assert_eq!(calls, 1);
+
+        let (outcome, calls, _) = run("", false);
+        assert_eq!(
+            outcome_name(&outcome),
+            "Continue",
+            "an empty tail emits nothing, so nothing can be rejected"
+        );
+        assert_eq!(calls, 0);
     }
 }
