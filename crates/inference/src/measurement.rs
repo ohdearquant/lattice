@@ -26,6 +26,13 @@ use std::time::{Duration, Instant};
 const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
 const GPU_MACHINE_LOCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const GPU_MACHINE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(500);
+// Set by scripts/lib/bench-locks.py and scripts/lib/bench_supervision.py on
+// every launch route where a supervisor holds this lock and does not hand it
+// to the child (#1643). Read only on the non-handoff path below: it never
+// substitutes for a real handoff, only tells a native acquisition that
+// waiting out GPU_MACHINE_LOCK_TIMEOUT is pointless, because the holder is
+// our own supervisor rather than an unrelated benchmark elsewhere.
+const SUPERVISOR_MARKER_ENV: &str = "LATTICE_GPU_LOCK_SUPERVISOR_PID";
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(120);
 const HANDOFF_FRAME_LIMIT: usize = 4096;
 const HANDOFF_ENV: [&str; 3] = [
@@ -67,21 +74,27 @@ struct HandoffReady {
 /// Serialize a GPU-driving test or measurement on the shared Metal device.
 ///
 /// The returned opaque guard must remain in scope for the entire GPU operation.
-/// Ordinary acquisition waits for at most 30 minutes. Explicitly admitted
-/// benchmarks retain the supervisor's shared lock description and wait for its
-/// invocation acknowledgement before measurement; invalid admission panics.
+/// Ordinary acquisition waits for at most 30 minutes, unless a
+/// `LATTICE_GPU_LOCK_SUPERVISOR_PID` marker names a live process already
+/// holding the lock without a handoff, in which case it panics immediately
+/// (#1643) rather than waiting out a timeout it can never win. Explicitly
+/// admitted benchmarks retain the supervisor's shared lock description and
+/// wait for its invocation acknowledgement before measurement; invalid
+/// admission panics.
 #[doc(hidden)]
 #[must_use = "the guard must remain in scope for the entire Metal operation"]
 pub fn gpu_test_lock() -> impl Sized {
     gpu_test_lock_for_path(
         Path::new(GPU_MACHINE_LOCK_PATH),
         HANDOFF_ENV.map(std::env::var_os),
+        std::env::var_os(SUPERVISOR_MARKER_ENV),
     )
 }
 
 fn gpu_test_lock_for_path(
     lock_path: &Path,
     handoff_signals: [Option<OsString>; 3],
+    supervisor_marker: Option<OsString>,
 ) -> GpuTestGuard {
     let process = GPU_LOCK
         .lock()
@@ -95,6 +108,7 @@ fn gpu_test_lock_for_path(
             lock_path,
             GPU_MACHINE_LOCK_TIMEOUT,
             GPU_MACHINE_LOCK_POLL_INTERVAL,
+            supervisor_marker,
         ),
     };
 
@@ -307,13 +321,55 @@ fn wait_for_handoff_io(deadline: Instant) -> Result<(), String> {
     Ok(())
 }
 
-fn acquire_machine_lock(lock_path: &Path, timeout: Duration, poll_interval: Duration) -> File {
+/// The pid `marker` names, if it parses to a positive pid and that pid is
+/// still alive. Absent, unparsable, non-positive, or naming a pid that
+/// `libc::kill(pid, 0)` reports as gone all return `None`: every one of those
+/// is a reason to fall back to today's bounded wait rather than to refuse, so
+/// the caller does not need to distinguish them.
+fn live_supervisor_pid(marker: Option<&OsStr>) -> Option<libc::pid_t> {
+    let pid: libc::pid_t = marker?.to_str()?.trim().parse().ok()?;
+    if pid <= 0 {
+        return None;
+    }
+    // SAFETY: signal 0 sends nothing; `kill` with it only probes whether
+    // `pid` names a process we could otherwise signal, which is exactly the
+    // liveness question here and has no other precondition.
+    (unsafe { libc::kill(pid, 0) } == 0).then_some(pid)
+}
+
+fn acquire_machine_lock(
+    lock_path: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+    supervisor_marker: Option<OsString>,
+) -> File {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(lock_path)
         .unwrap_or_else(|e| panic!("gpu_test_lock: cannot open {}: {e}", lock_path.display()));
+    match file.try_lock() {
+        Ok(()) => return file,
+        Err(std::fs::TryLockError::WouldBlock) => {
+            if let Some(pid) = live_supervisor_pid(supervisor_marker.as_deref()) {
+                panic!(
+                    "gpu_test_lock: the benchmark supervisor (pid {pid}) running this \
+                     command holds {} and did not hand it to this process; this target \
+                     takes the GPU lock itself, so it can never acquire it here. Run it \
+                     through the admitted `--gpu-handoff` route for cargo bench targets, \
+                     or see the guidance in CLAUDE.md for other targets.",
+                    lock_path.display()
+                );
+            }
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            panic!(
+                "gpu_test_lock: flock on {} failed: {e}",
+                lock_path.display()
+            )
+        }
+    }
     let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock() {
@@ -361,6 +417,7 @@ mod tests {
                 Path::new(&lock_path),
                 Duration::from_secs(5),
                 Duration::from_millis(10),
+                None,
             );
             return;
         }
@@ -371,6 +428,7 @@ mod tests {
             &lock_path,
             Duration::from_secs(5),
             Duration::from_millis(10),
+            None,
         );
         let ready = temp.path().join("child-ready");
         let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
@@ -414,6 +472,141 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn supervisor_marker_with_live_pid_refuses_fast_on_contention() {
+        let temp = tempfile::tempdir().expect("temporary lock-test directory");
+        let lock_path = temp.path().join("lock");
+        // A second open of the same path is a separate open-file description,
+        // so its flock contends with `acquire_machine_lock`'s own open below
+        // without needing a second process, the same pattern
+        // `handoff_proof_discriminates_lock_ownership` uses elsewhere in this
+        // module.
+        let holder = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open lock holder");
+        holder.try_lock().expect("hold the lock for contention");
+
+        let marker = Some(OsString::from(std::process::id().to_string()));
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_machine_lock(
+                &lock_path,
+                Duration::from_secs(60),
+                Duration::from_millis(10),
+                marker,
+            )
+        }));
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a live supervisor marker did not panic");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "did not refuse fast: waited {elapsed:?} against a 60 s timeout"
+        );
+        let message = result
+            .unwrap_err()
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("benchmark supervisor"),
+            "unexpected panic message: {message}"
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn supervisor_marker_absent_waits_out_the_short_timeout() {
+        let temp = tempfile::tempdir().expect("temporary lock-test directory");
+        let lock_path = temp.path().join("lock");
+        let holder = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open lock holder");
+        holder.try_lock().expect("hold the lock for contention");
+
+        let short_timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_machine_lock(&lock_path, short_timeout, Duration::from_millis(10), None)
+        }));
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "expected the bounded wait to panic once its injected timeout elapsed"
+        );
+        assert!(
+            elapsed >= short_timeout,
+            "returned before the injected timeout: waited {elapsed:?}, timeout {short_timeout:?}"
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn supervisor_marker_with_dead_pid_waits_out_the_short_timeout() {
+        let temp = tempfile::tempdir().expect("temporary lock-test directory");
+        let lock_path = temp.path().join("lock");
+        let holder = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open lock holder");
+        holder.try_lock().expect("hold the lock for contention");
+
+        // No real process holds this pid on Linux (pid_max is well under
+        // 2^31) or macOS (PID_MAX 99999), so this names a definitely-dead pid
+        // without racing an actual process's exit against being reaped.
+        let marker = Some(OsString::from(i32::MAX.to_string()));
+        let short_timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_machine_lock(&lock_path, short_timeout, Duration::from_millis(10), marker)
+        }));
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "expected the bounded wait to panic once its injected timeout elapsed"
+        );
+        assert!(
+            elapsed >= short_timeout,
+            "a dead-pid marker refused instead of waiting: waited {elapsed:?}, timeout {short_timeout:?}"
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn supervisor_marker_with_live_pid_acquires_when_uncontended() {
+        let temp = tempfile::tempdir().expect("temporary lock-test directory");
+        let lock_path = temp.path().join("lock");
+        let marker = Some(OsString::from(std::process::id().to_string()));
+
+        let file = acquire_machine_lock(
+            &lock_path,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            marker,
+        );
+
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open a second description on the same lock");
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "an uncontended acquisition with a live marker set did not hold the lock"
+        );
+        drop(file);
     }
 
     #[test]
@@ -470,7 +663,12 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("lock");
-        let owner = acquire_machine_lock(&path, Duration::from_secs(5), Duration::from_millis(10));
+        let owner = acquire_machine_lock(
+            &path,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            None,
+        );
         let independent = OpenOptions::new()
             .read(true)
             .write(true)
@@ -661,7 +859,7 @@ mod tests {
             let root = PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
             std::fs::write(root.join("started"), b"started").unwrap();
             let _guard =
-                gpu_test_lock_for_path(&root.join("lock"), HANDOFF_ENV.map(std::env::var_os));
+                gpu_test_lock_for_path(&root.join("lock"), HANDOFF_ENV.map(std::env::var_os), None);
             std::fs::write(root.join("entered"), b"entered").unwrap();
             return;
         }
@@ -670,8 +868,12 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path();
             let path = root.join("lock");
-            let owner =
-                acquire_machine_lock(&path, Duration::from_secs(5), Duration::from_millis(10));
+            let owner = acquire_machine_lock(
+                &path,
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+                None,
+            );
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .args([
@@ -744,7 +946,7 @@ mod tests {
             let root = PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
             std::fs::write(root.join("started"), b"started").unwrap();
             let _guard =
-                gpu_test_lock_for_path(&root.join("lock"), HANDOFF_ENV.map(std::env::var_os));
+                gpu_test_lock_for_path(&root.join("lock"), HANDOFF_ENV.map(std::env::var_os), None);
             std::fs::write(root.join("entered"), b"entered").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while !root.join("release").exists() {
@@ -765,6 +967,7 @@ mod tests {
                 &path,
                 Duration::from_secs(5),
                 Duration::from_millis(10),
+                None,
             ));
             let probe = OpenOptions::new()
                 .read(true)
