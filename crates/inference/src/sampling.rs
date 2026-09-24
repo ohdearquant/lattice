@@ -217,7 +217,9 @@ impl CandidateSet {
         best_id
     }
 
-    /// Scale logits by `1 / temperature`.  No-op when temperature is 1.0,
+    /// Scale logits by `1 / temperature` after subtracting the largest finite logit,
+    /// so the scaled maximum is 0.0 and no finite logit can overflow to +inf.
+    /// No-op when temperature is 1.0,
     /// non-positive, or non-finite (NaN/±inf) — none of those carry a valid
     /// scaling, and `1.0 / NaN` would poison every logit with NaN.
     ///
@@ -242,9 +244,21 @@ impl CandidateSet {
             }
             return;
         }
+        // Center on the largest finite logit before scaling. Scaling first overflows
+        // any logit above `temperature * f32::MAX` to +inf, and two overflowed logits
+        // then tie and break on token id instead of on value. Centered logits are
+        // <= 0, so the scaled maximum is exactly 0.0; anything that overflows to -inf
+        // instead had no probability mass to lose.
+        let center = self
+            .candidates
+            .iter()
+            .map(|c| c.logit)
+            .filter(|logit| logit.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
+        let center = if center.is_finite() { center } else { 0.0 };
         let inv = 1.0 / temperature;
         for c in &mut self.candidates {
-            c.logit *= inv;
+            c.logit = (c.logit - center) * inv;
         }
     }
 
@@ -700,10 +714,12 @@ impl Sampler {
             return token;
         }
 
-        let inv_temp = if self.config.temperature != 1.0 {
-            1.0 / self.config.temperature
+        // Scaling is centered on the finite `max_logit` so no logit overflows to
+        // +inf (see `select_top_k`).
+        let (inv_temp, center) = if self.config.temperature != 1.0 {
+            (1.0 / self.config.temperature, max_logit)
         } else {
-            1.0
+            (1.0, 0.0)
         };
 
         // Streaming min-heap top-k with fused temperature scaling.
@@ -712,6 +728,7 @@ impl Sampler {
             &self.logit_scratch,
             self.config.top_k,
             inv_temp,
+            center,
             &mut self.candidate_scratch,
         );
         if top_n_sigma_enabled {
@@ -881,18 +898,33 @@ pub(crate) fn sample_full_logits(
         // would otherwise poison the softmax sum from a non-max position,
         // #322-class); a non-finite max (every logit `-inf`, or a `+inf` logit)
         // also forces degeneracy, matching `sample_min_p_top_p_with_scratch`'s
-        // non-finite-max short-circuit. Scaling by a positive finite `inv_temp`
-        // (guaranteed by the `temperature_degenerate` check above) preserves
-        // both NaN-ness and finiteness, so scanning before the fused top-k scale
-        // is equivalent to scanning after it.
+        // non-finite-max short-circuit. Scaling alone does NOT preserve
+        // finiteness: `logit * inv_temp` overflows to +inf for any finite logit
+        // above `temperature * f32::MAX`. The fused top-k therefore subtracts
+        // the finite `max_logit` found here before multiplying by the positive
+        // finite `inv_temp` (guaranteed by the `temperature_degenerate` check
+        // above). That preserves NaN-ness and maps the maximum to exactly 0.0,
+        // so the scaled maximum stays finite and scanning before the fused
+        // top-k scale is equivalent to scanning after it.
         let (has_nan, max_logit) = scan_nan_or_nonfinite_max(logit_scratch);
         if has_nan || !max_logit.is_finite() {
             return argmax_f32(logit_scratch);
         }
+        let center = if cfg.temperature != 1.0 {
+            max_logit
+        } else {
+            0.0
+        };
 
         // Streaming min-heap top-k with fused temperature scaling — the softmax
         // draw below runs only over these k survivors, never the full vocabulary.
-        select_top_k(logit_scratch, cfg.top_k, inv_temp, candidate_scratch);
+        select_top_k(
+            logit_scratch,
+            cfg.top_k,
+            inv_temp,
+            center,
+            candidate_scratch,
+        );
         if top_n_sigma_enabled {
             // Same masked-survivor cleanup as `Sampler::sample`.
             candidate_scratch.retain(|candidate| candidate.logit != f32::NEG_INFINITY);
@@ -1330,20 +1362,29 @@ fn heap_build(heap: &mut [Candidate]) {
 }
 
 /// Runtime-dispatch top-k: NEON on aarch64 when detected, scalar otherwise.
-/// `inv_temp` is fused into the scan — candidates store scaled logits.
-fn select_top_k(logits: &[f32], k: usize, inv_temp: f32, out: &mut Vec<Candidate>) {
+/// Temperature is fused into the scan — candidates store `(logit - center) * inv_temp`.
+/// Callers that scale pass the finite max logit as `center`: scaling first would
+/// overflow any logit above `f32::MAX / inv_temp` to +inf and tie it with every
+/// other overflowed logit. `center = 0.0` leaves each logit exactly `logit * inv_temp`.
+fn select_top_k(logits: &[f32], k: usize, inv_temp: f32, center: f32, out: &mut Vec<Candidate>) {
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
             // SAFETY: NEON runtime-detected above.
-            unsafe { select_top_k_neon(logits, k, inv_temp, out) };
+            unsafe { select_top_k_neon(logits, k, inv_temp, center, out) };
             return;
         }
     }
-    select_top_k_scalar(logits, k, inv_temp, out);
+    select_top_k_scalar(logits, k, inv_temp, center, out);
 }
 
-fn select_top_k_scalar(logits: &[f32], k: usize, inv_temp: f32, out: &mut Vec<Candidate>) {
+fn select_top_k_scalar(
+    logits: &[f32],
+    k: usize,
+    inv_temp: f32,
+    center: f32,
+    out: &mut Vec<Candidate>,
+) {
     out.clear();
     if logits.is_empty() {
         return;
@@ -1357,11 +1398,11 @@ fn select_top_k_scalar(logits: &[f32], k: usize, inv_temp: f32, out: &mut Vec<Ca
         k.min(logits.len())
     };
 
-    // Phase 1: seed the heap with the first k elements, scaled by inv_temp.
+    // Phase 1: seed the heap with the first k elements, centered then scaled by inv_temp.
     // NaN seeds are replaced with NEG_INFINITY so the heap root is never NaN.
     // A NaN root would cause vcgtq_f32 to reject all finite candidates in Phase 2.
     out.extend(logits.iter().take(k).enumerate().map(|(i, &raw)| {
-        let scaled = raw * inv_temp;
+        let scaled = (raw - center) * inv_temp;
         Candidate {
             token_id: i as u32,
             logit: if scaled.is_nan() {
@@ -1375,7 +1416,7 @@ fn select_top_k_scalar(logits: &[f32], k: usize, inv_temp: f32, out: &mut Vec<Ca
 
     // Phase 2: scan the rest; evict the root whenever a better candidate arrives.
     for (i, &raw) in logits.iter().enumerate().skip(k) {
-        let logit = raw * inv_temp;
+        let logit = (raw - center) * inv_temp;
         let cand = Candidate {
             token_id: i as u32,
             logit,
@@ -1392,7 +1433,13 @@ fn select_top_k_scalar(logits: &[f32], k: usize, inv_temp: f32, out: &mut Vec<Ca
 /// when at least one element in the 4-wide batch beats the current heap root.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn select_top_k_neon(logits: &[f32], k: usize, inv_temp: f32, out: &mut Vec<Candidate>) {
+unsafe fn select_top_k_neon(
+    logits: &[f32],
+    k: usize,
+    inv_temp: f32,
+    center: f32,
+    out: &mut Vec<Candidate>,
+) {
     use std::arch::aarch64::*;
 
     out.clear();
@@ -1406,11 +1453,11 @@ unsafe fn select_top_k_neon(logits: &[f32], k: usize, inv_temp: f32, out: &mut V
         k.min(logits.len())
     };
 
-    // Phase 1: scalar heap seed (k ≤ 256, no NEON benefit here), scaled by inv_temp.
+    // Phase 1: scalar heap seed (k ≤ 256, no NEON benefit here), centered then scaled.
     // NaN seeds are replaced with NEG_INFINITY so the heap root is never NaN.
     // A NaN root would cause vcgtq_f32 to reject all finite candidates in Phase 2.
     out.extend(logits.iter().take(k).enumerate().map(|(i, &raw)| {
-        let scaled = raw * inv_temp;
+        let scaled = (raw - center) * inv_temp;
         Candidate {
             token_id: i as u32,
             logit: if scaled.is_nan() {
@@ -1425,14 +1472,15 @@ unsafe fn select_top_k_neon(logits: &[f32], k: usize, inv_temp: f32, out: &mut V
     let n = logits.len();
     let mut i = k;
     let inv_v = vdupq_n_f32(inv_temp);
+    let center_v = vdupq_n_f32(center);
 
-    // Phase 2: 4-wide threshold prefilter on scaled logits.
+    // Phase 2: 4-wide threshold prefilter on centered, scaled logits.
     while i + 4 <= n {
         let thresh = out[0].logit;
         let thresh_v = vdupq_n_f32(thresh);
         // SAFETY: loop bound guarantees 4 valid elements.
         let raw_v = vld1q_f32(logits.as_ptr().add(i));
-        let scaled_v = vmulq_f32(raw_v, inv_v);
+        let scaled_v = vmulq_f32(vsubq_f32(raw_v, center_v), inv_v);
         // Strict >: NaN input produces false (NaN never beats threshold).
         let mask = vcgtq_f32(scaled_v, thresh_v);
         // Horizontal OR: non-zero if any lane passed the threshold test.
@@ -1442,7 +1490,7 @@ unsafe fn select_top_k_neon(logits: &[f32], k: usize, inv_temp: f32, out: &mut V
             | vgetq_lane_u32::<3>(mask);
         if any != 0 {
             for j in 0..4usize {
-                let logit = *logits.get_unchecked(i + j) * inv_temp;
+                let logit = (*logits.get_unchecked(i + j) - center) * inv_temp;
                 let cand = Candidate {
                     token_id: (i + j) as u32,
                     logit,
@@ -1458,7 +1506,7 @@ unsafe fn select_top_k_neon(logits: &[f32], k: usize, inv_temp: f32, out: &mut V
 
     // Scalar tail for the final 0-3 elements.
     while i < n {
-        let logit = *logits.get_unchecked(i) * inv_temp;
+        let logit = (*logits.get_unchecked(i) - center) * inv_temp;
         let cand = Candidate {
             token_id: i as u32,
             logit,
@@ -2434,7 +2482,7 @@ mod tests {
 
                         let inv_temp = 1.0 / temperature;
                         let mut candidate_scratch = Vec::new();
-                        select_top_k(&logits, top_k, inv_temp, &mut candidate_scratch);
+                        select_top_k(&logits, top_k, inv_temp, 0.0, &mut candidate_scratch);
 
                         let r = uniform_f32_from_u64(xorshift64_next(&mut seed));
 
@@ -2954,11 +3002,11 @@ mod tests {
 
     fn check_top_k_parity(logits: &[f32], k: usize) {
         let mut scalar_out = Vec::new();
-        select_top_k_scalar(logits, k, 1.0, &mut scalar_out);
+        select_top_k_scalar(logits, k, 1.0, 0.0, &mut scalar_out);
         scalar_out.sort_by(candidate_order);
 
         let mut dispatch_out = Vec::new();
-        select_top_k(logits, k, 1.0, &mut dispatch_out);
+        select_top_k(logits, k, 1.0, 0.0, &mut dispatch_out);
         dispatch_out.sort_by(candidate_order);
 
         assert_eq!(
@@ -2979,7 +3027,7 @@ mod tests {
     fn test_select_top_k_basic() {
         let logits = vec![1.0f32, 5.0, 3.0, 9.0, 2.0, 7.0];
         let mut out = Vec::new();
-        select_top_k_scalar(&logits, 3, 1.0, &mut out);
+        select_top_k_scalar(&logits, 3, 1.0, 0.0, &mut out);
         out.sort_by(candidate_order);
         let ids: Vec<u32> = out.iter().map(|c| c.token_id).collect();
         assert_eq!(ids, vec![3, 5, 1], "top-3 from [1,5,3,9,2,7]");
@@ -2990,7 +3038,7 @@ mod tests {
         // Two tokens with logit=5.0; top-1 must select the lower token_id.
         let logits = vec![5.0f32, 5.0, 1.0];
         let mut out = Vec::new();
-        select_top_k_scalar(&logits, 1, 1.0, &mut out);
+        select_top_k_scalar(&logits, 1, 1.0, 0.0, &mut out);
         assert_eq!(out[0].token_id, 0, "tie: lower id must win");
     }
 
@@ -2999,7 +3047,7 @@ mod tests {
         // NaN at position 0 must not appear in top-k.
         let logits = vec![f32::NAN, 2.0, 9.0, 3.0];
         let mut out = Vec::new();
-        select_top_k_scalar(&logits, 2, 1.0, &mut out);
+        select_top_k_scalar(&logits, 2, 1.0, 0.0, &mut out);
         out.sort_by(candidate_order);
         let ids: Vec<u32> = out.iter().map(|c| c.token_id).collect();
         assert_eq!(ids, vec![2, 3], "NaN must not appear in top-2");
@@ -3024,7 +3072,7 @@ mod tests {
         // When two logits are equal, lower token_id must win.
         let logits = vec![5.0f32, 5.0, 5.0, 1.0, 1.0];
         let mut out = Vec::new();
-        select_top_k(&logits, 2, 1.0, &mut out);
+        select_top_k(&logits, 2, 1.0, 0.0, &mut out);
         out.sort_by(candidate_order);
         let ids: Vec<u32> = out.iter().map(|c| c.token_id).collect();
         assert_eq!(
@@ -3039,7 +3087,7 @@ mod tests {
         // NaN logits must never appear in top-k output from dispatch.
         let logits = vec![f32::NAN, 4.0, 9.0, f32::NAN, 7.0];
         let mut out = Vec::new();
-        select_top_k(&logits, 2, 1.0, &mut out);
+        select_top_k(&logits, 2, 1.0, 0.0, &mut out);
         out.sort_by(candidate_order);
         let ids: Vec<u32> = out.iter().map(|c| c.token_id).collect();
         assert_eq!(ids, vec![2, 4], "dispatch: NaN must not appear in top-2");
@@ -3064,11 +3112,11 @@ mod tests {
         logits.extend((1..=990u32).map(|x| x as f32));
         // k=10: both dispatch and scalar must agree after sorting
         let mut scalar_out = Vec::new();
-        select_top_k_scalar(&logits, 10, 1.0, &mut scalar_out);
+        select_top_k_scalar(&logits, 10, 1.0, 0.0, &mut scalar_out);
         scalar_out.sort_by(candidate_order);
 
         let mut dispatch_out = Vec::new();
-        select_top_k(&logits, 10, 1.0, &mut dispatch_out);
+        select_top_k(&logits, 10, 1.0, 0.0, &mut dispatch_out);
         dispatch_out.sort_by(candidate_order);
 
         assert_eq!(scalar_out.len(), dispatch_out.len());
@@ -3086,7 +3134,7 @@ mod tests {
         // inv_temp=0.5 halves all logits; top-2 must be token 3 (2.0) and token 2 (1.5).
         let logits = vec![1.0f32, 2.0, 3.0, 4.0];
         let mut out = Vec::new();
-        select_top_k(&logits, 2, 0.5, &mut out);
+        select_top_k(&logits, 2, 0.5, 0.0, &mut out);
         out.sort_by(candidate_order);
         assert_eq!(out[0].token_id, 3);
         assert_eq!(out[1].token_id, 2);
@@ -3100,15 +3148,82 @@ mod tests {
         );
     }
 
+    // Finite logits above `temperature * f32::MAX`: scaling them before centering
+    // overflows both to +inf, and the tie then breaks on the lower token id (0).
+    const HUGE_FINITE_LOGITS: [f32; 2] = [2e38, 3e38];
+
+    #[test]
+    fn apply_temperature_centers_huge_finite_logits_before_scaling() {
+        let mut cs = CandidateSet::from_full_logits(&HUGE_FINITE_LOGITS);
+        cs.apply_temperature(0.5);
+        assert_eq!(
+            cs.argmax(),
+            1,
+            "the larger finite logit must win after temperature scaling"
+        );
+    }
+
+    #[test]
+    fn select_top_k_centers_huge_finite_logits_before_scaling() {
+        // The padded row puts both huge logits in the NEON 4-wide prefilter (after the
+        // k = 1 seed), which the two-element row never reaches.
+        let padded = [0.0_f32, 2e38, 0.0, 0.0, 0.0, 3e38, 0.0, 0.0, 0.0];
+        for (logits, expected) in [(&HUGE_FINITE_LOGITS[..], 1u32), (&padded[..], 5)] {
+            let mut scalar_out = Vec::new();
+            select_top_k_scalar(logits, 1, 2.0, 3e38, &mut scalar_out);
+            let mut dispatch_out = Vec::new();
+            select_top_k(logits, 1, 2.0, 3e38, &mut dispatch_out);
+            for out in [&scalar_out, &dispatch_out] {
+                assert_eq!(out.len(), 1);
+                assert_eq!(
+                    out[0].token_id, expected,
+                    "top-1 must be the larger finite logit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sampler_centers_huge_finite_logits_before_scaling() {
+        // top_k = 2 keeps the fused top-k route; top_k = 1 takes the greedy fast path,
+        // which never scales. After centering the smaller logit's weight is exp(-2e38),
+        // exactly 0.0, so every seed must draw token 1.
+        let config = SamplingConfig {
+            min_p: 0.0,
+            temperature: 0.5,
+            top_k: 2,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(7);
+        assert_eq!(sampler.sample(&HUGE_FINITE_LOGITS), 1);
+    }
+
+    #[test]
+    fn sample_full_logits_centers_huge_finite_logits_before_scaling() {
+        let cfg = GenerateConfig {
+            temperature: 0.5,
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut rng_state = 7;
+        assert_eq!(
+            sample_full_logits(&HUGE_FINITE_LOGITS, &cfg, &[], &mut rng_state, 0.0, 0.0),
+            1
+        );
+    }
+
     #[test]
     fn test_select_top_k_zero_keeps_all() {
         // k == 0 ("disabled") must keep ALL candidates, never an empty set.
         let logits = vec![1.0f32, 5.0, 3.0, 9.0, 2.0];
         let mut scalar_out = Vec::new();
-        select_top_k_scalar(&logits, 0, 1.0, &mut scalar_out);
+        select_top_k_scalar(&logits, 0, 1.0, 0.0, &mut scalar_out);
         assert_eq!(scalar_out.len(), 5, "scalar: k=0 must keep all candidates");
         let mut dispatch_out = Vec::new();
-        select_top_k(&logits, 0, 1.0, &mut dispatch_out);
+        select_top_k(&logits, 0, 1.0, 0.0, &mut dispatch_out);
         assert_eq!(
             dispatch_out.len(),
             5,
