@@ -8,6 +8,16 @@
 
 use crate::error::{FannError, FannResult, validate_allocation_size};
 
+/// Damping strength for [`DiagonalFisher::project_delta`]'s Fisher-weighted shrinkage.
+///
+/// `project_delta` scales each coordinate by `1 / (1 + alpha * F_i / F_ref)`, where
+/// `F_ref` is the mean Fisher value. `alpha == 1.0` means a coordinate whose Fisher
+/// value equals the mean is damped to half its raw magnitude; larger `alpha` damps
+/// every coordinate more without ever reaching zero for a finite Fisher value. See
+/// `docs/training.md#fisher-weighted-delta-shrinkage` for the derivation and the
+/// properties this constant preserves (never zeroes, monotonic, scale-invariant in F).
+const PROJECT_DELTA_ALPHA: f32 = 1.0;
+
 /// A flat-slice EWC++ diagonal-Fisher forgetting guard.
 ///
 /// Tracks EMA importance and a matching parameter anchor for each entry.
@@ -112,19 +122,84 @@ impl DiagonalFisher {
 
     /// Damp the common prefix of a raw parameter update by Fisher importance.
     ///
-    /// Leaves `delta` unchanged when the estimate has no importance signal.
-    /// See [`docs/training.md`](../../docs/training.md#null-space-delta-projection) for the scaling rule and trade-offs.
+    /// Scales each coordinate by `1 / (1 + alpha * F_i / F_ref)`, the closed-form
+    /// minimiser of `||d - delta||^2 + alpha * sum_i (F_i / F_ref) * d_i^2` — a
+    /// per-coordinate ridge penalty proportional to relative Fisher importance.
+    /// Unlike the max-normalised linear damping this replaced (issue #1575), this
+    /// never zeroes a coordinate for a finite Fisher value: a uniform non-zero
+    /// Fisher scales every coordinate by exactly `1 / (1 + alpha)`, higher `F_i`
+    /// means strictly more damping, and the result is scale-invariant in `F`
+    /// (multiplying every `F_i` by the same positive constant leaves `delta`
+    /// unchanged, since only the ratio `F_i / F_ref` appears).
+    ///
+    /// Leaves `delta` unchanged when the estimate has no importance signal
+    /// (`F_ref` below the guard threshold) or when the Fisher holds no values.
+    ///
+    /// **Non-finite Fisher fails closed, never propagates NaN/inf.**
+    /// `observe_gradient` does not itself reject a non-finite gradient, so a
+    /// caller can hand this method a Fisher containing NaN or +-inf (reachable
+    /// from an unvalidated caller-supplied gradient upstream). The exact rule:
+    /// `F_ref` is accumulated in `f64` (see below); if that `F_ref` is itself
+    /// non-finite (a NaN entry poisons the sum into NaN, an infinite entry
+    /// poisons it into +-inf), every coordinate of the common prefix — the
+    /// first `min(self.values.len(), delta.len())` entries — is set to `0.0`
+    /// — the reference magnitude cannot be trusted, so that part of the
+    /// update is blocked rather than divided by, or allowed to propagate, a
+    /// non-finite value. Elements of `delta` beyond the Fisher's length are
+    /// left unchanged, as on every other path through this method. If
+    /// `F_ref` is finite but one coordinate's own scale factor still comes
+    /// out non-finite, **only that coordinate** is set to `0.0`. Both cases
+    /// mirror the effect (not the exact per-coordinate boundary) of the
+    /// max-normalised formula this replaced, which zeroed a coordinate
+    /// whenever its own scale computation went non-finite.
+    ///
+    /// `F_ref` is accumulated in `f64` rather than `f32` so that many
+    /// large-but-finite Fisher values cannot silently overflow the sum to
+    /// `+inf` — which would otherwise disable damping entirely (`v / inf ==
+    /// 0` for every finite `v`) without ever going through the non-finite
+    /// path above.
+    /// See [`docs/training.md`](../../docs/training.md#fisher-weighted-delta-shrinkage) for the derivation and trade-offs.
     pub fn project_delta(&self, delta: &mut [f32]) {
-        let f_max = self.values.iter().copied().fold(0.0_f32, f32::max);
-
-        // No importance signal has been observed yet — treat as identity.
-        if f_max < 1e-8 {
+        let n = self.values.len();
+        if n == 0 {
             return;
         }
 
-        // Damp high-Fisher updates while preserving low-Fisher ones — see docs/training.md.
+        // f64 accumulation: see the "large-but-finite" note in the doc comment.
+        let sum: f64 = self.values.iter().map(|&v| f64::from(v)).sum();
+        let f_ref = sum / n as f64;
+
+        if !f_ref.is_finite() {
+            // A NaN entry poisons the sum into NaN; an infinite entry poisons
+            // it into +-inf. F_ref cannot be trusted as a reference magnitude
+            // either way — block the common prefix instead of dividing by (or
+            // propagating) a non-finite value. Elements of `delta` beyond
+            // `self.values.len()` are left unchanged, matching the zipped
+            // per-coordinate loop below. Checked before the degenerate
+            // "no signal" comparison below because `NaN < 1e-8` is false, so a
+            // NaN F_ref would otherwise fall through to per-coordinate damping.
+            let m = n.min(delta.len());
+            delta[..m].fill(0.0);
+            return;
+        }
+
+        // No importance signal has been observed yet — treat as identity.
+        if f_ref < 1e-8 {
+            return;
+        }
+
+        // Fisher-weighted shrinkage: never reaches zero for finite F_i — see
+        // docs/training.md and the doc comment above.
         for (d, &v) in delta.iter_mut().zip(self.values.iter()) {
-            *d *= (1.0 - v / f_max).max(0.0);
+            let factor = 1.0 + f64::from(PROJECT_DELTA_ALPHA) * (f64::from(v) / f_ref);
+            // `factor` can still be non-finite for a single coordinate even
+            // when F_ref is finite (e.g. this entry's own value is +-inf but
+            // canceled out of the f64 sum) — block just that coordinate.
+            *d = if factor.is_finite() {
+                (f64::from(*d) / factor) as f32
+            } else {
+                0.0
+            };
         }
     }
 }
@@ -151,28 +226,289 @@ mod tests {
         );
     }
 
-    /// High-Fisher entry blocks its parameter's update; zero-Fisher entry passes.
+    /// High-Fisher entries are damped strongly, but never zeroed (issue #1575:
+    /// the old max-normalised formula zeroed the argmax coordinate exactly).
+    /// Zero-Fisher entries pass through unchanged.
     #[test]
-    fn ewc_high_fisher_blocks() {
-        let mut fisher = DiagonalFisher::new(2, 0.9).unwrap();
-        // decay=0.9 → F[0] = 0.9*0 + 0.1*100² = 1000; F[1] = 0.
-        fisher.observe_gradient(&[100.0, 0.0]).unwrap();
+    fn ewc_high_fisher_damps_strongly() {
+        let mut fisher = DiagonalFisher::new(5, 0.9).unwrap();
+        // decay=0.9 → F[0] = 0.9*0 + 0.1*100² = 1000; F[1..5] = 0.
+        fisher
+            .observe_gradient(&[100.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
 
-        let mut delta = vec![1.0_f32, 1.0];
+        let mut delta = vec![1.0_f32; 5];
         fisher.project_delta(&mut delta);
 
-        // F[0] == f_max → scale = (1 - 1000/1000).max(0) = 0 → blocked.
+        // F_ref = mean(1000, 0, 0, 0, 0) = 200 → scale[0] = 1/(1 + 1000/200) = 1/6.
         assert!(
-            delta[0].abs() < 1e-6,
-            "high-Fisher entry should be blocked, got {}",
+            delta[0].abs() > 1e-6,
+            "high-Fisher entry must not be zeroed, got {}",
             delta[0]
         );
-        // F[1] == 0 → scale = (1 - 0/1000).max(0) = 1 → passes through.
         assert!(
-            (delta[1] - 1.0).abs() < 1e-6,
-            "zero-Fisher entry should pass through, got {}",
-            delta[1]
+            delta[0].abs() < 1.0,
+            "high-Fisher entry must be damped, got {}",
+            delta[0]
         );
+
+        // F[1..5] == 0 → scale = 1/(1 + 0) = 1 → pass through unchanged.
+        for &d in &delta[1..] {
+            assert!(
+                (d - 1.0).abs() < 1e-6,
+                "zero-Fisher entry should pass through, got {d}"
+            );
+        }
+
+        // Strong damping: the high-Fisher coordinate shrinks at least 5x more
+        // than a zero-Fisher one (shrink factor = original magnitude / result).
+        let shrink_high = 1.0_f32 / delta[0];
+        let shrink_zero = 1.0_f32 / delta[1];
+        assert!(
+            shrink_high >= 5.0 * shrink_zero,
+            "high-Fisher coordinate should shrink >=5x more than a zero-Fisher one: \
+             shrink_high={shrink_high}, shrink_zero={shrink_zero}"
+        );
+    }
+
+    /// A uniform non-zero Fisher scales every coordinate by exactly
+    /// `1 / (1 + alpha)` — the defect this replaces zeroed every coordinate
+    /// instead (issue #1575: `F_max` equals every entry, so `1 - F_i/F_max = 0`).
+    #[test]
+    fn ewc_uniform_nonzero_fisher_scales_by_one_over_one_plus_alpha() {
+        let fisher = DiagonalFisher {
+            values: vec![2.0_f32; 4],
+            anchor: vec![0.0; 4],
+            decay: 0.9,
+        };
+        let original = vec![1.0_f32, -2.0, 3.0, -4.0];
+        let mut delta = original.clone();
+        fisher.project_delta(&mut delta);
+
+        let expected_scale = 1.0 / (1.0 + PROJECT_DELTA_ALPHA);
+        for (d, orig) in delta.iter().zip(original.iter()) {
+            assert!(
+                (d - orig * expected_scale).abs() < 1e-5,
+                "expected {} (= {orig} * {expected_scale}), got {d}",
+                orig * expected_scale
+            );
+            assert!(d.abs() > 1e-6, "no coordinate should be zeroed, got {d}");
+        }
+    }
+
+    /// First-step shape from `one_gradient_step` (crates/fann/src/training/router_update.rs):
+    /// on the first step the Fisher EMA starts at zero, so `F_i` is proportional to
+    /// `delta_i^2`. The largest-magnitude component must stay non-zero and must be
+    /// damped more than the smaller components (issue #1575's reachable scenario).
+    #[test]
+    fn ewc_first_step_shape_damps_largest_component_without_zeroing() {
+        let original = vec![10.0_f32, 1.0, -3.0];
+        // F_i proportional to delta_i^2 (the constant of proportionality is
+        // scale-invariant, so use 1.0 for the squared magnitude directly).
+        let fisher = DiagonalFisher {
+            values: original.iter().map(|d| d * d).collect(),
+            anchor: vec![0.0; 3],
+            decay: 0.9,
+        };
+        let mut delta = original.clone();
+        fisher.project_delta(&mut delta);
+
+        for (d, orig) in delta.iter().zip(original.iter()) {
+            assert!(
+                d.abs() > 1e-6,
+                "no coordinate should be zeroed, got {d} (from {orig})"
+            );
+        }
+
+        // Retained fraction per coordinate: d_i / original_i.
+        let retained: Vec<f32> = delta
+            .iter()
+            .zip(original.iter())
+            .map(|(d, o)| d / o)
+            .collect();
+        assert!(
+            retained[0] < retained[1],
+            "largest-magnitude component (idx 0) must be damped more than idx 1: {retained:?}"
+        );
+        assert!(
+            retained[0] < retained[2],
+            "largest-magnitude component (idx 0) must be damped more than idx 2: {retained:?}"
+        );
+    }
+
+    /// Higher Fisher value means strictly more damping (holding all other
+    /// coordinates, and hence F_ref, fixed by construction of the input vector).
+    #[test]
+    fn ewc_damping_monotonic_in_fisher_value() {
+        let values = vec![0.0_f32, 1.0, 2.0, 5.0, 10.0];
+        let fisher = DiagonalFisher {
+            values: values.clone(),
+            anchor: vec![0.0; values.len()],
+            decay: 0.9,
+        };
+        let mut delta = vec![1.0_f32; values.len()];
+        fisher.project_delta(&mut delta);
+
+        for w in delta.windows(2) {
+            assert!(
+                w[1] < w[0],
+                "damping must strictly increase with Fisher value: {delta:?}"
+            );
+        }
+    }
+
+    /// `project_delta` is scale-invariant in `F`: multiplying every Fisher value
+    /// by the same positive constant must not change the result, since only the
+    /// ratio `F_i / F_ref` appears in the scaling formula.
+    #[test]
+    fn ewc_project_delta_scale_invariant_in_fisher() {
+        let values = vec![0.5_f32, 3.0, 7.5];
+        let scaled: Vec<f32> = values.iter().map(|v| v * 1000.0).collect();
+        let original = vec![2.0_f32, -1.5, 0.25];
+
+        let fisher_a = DiagonalFisher {
+            values,
+            anchor: vec![0.0; 3],
+            decay: 0.9,
+        };
+        let fisher_b = DiagonalFisher {
+            values: scaled,
+            anchor: vec![0.0; 3],
+            decay: 0.9,
+        };
+
+        let mut delta_a = original.clone();
+        let mut delta_b = original.clone();
+        fisher_a.project_delta(&mut delta_a);
+        fisher_b.project_delta(&mut delta_b);
+
+        for (a, b) in delta_a.iter().zip(delta_b.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "project_delta must be scale-invariant in Fisher: {a} vs {b}"
+            );
+        }
+    }
+
+    /// A NaN Fisher entry must not propagate NaN into `delta`. `observe_gradient`
+    /// does not validate finiteness, so a caller-supplied non-finite gradient can
+    /// reach `project_delta` directly; the whole update must be blocked (every
+    /// coordinate zeroed) rather than turned into NaN by a poisoned `F_ref`.
+    ///
+    /// Mutation that defeats this: computing `F_ref` without the
+    /// `!f_ref.is_finite()` guard.
+    #[test]
+    fn ewc_nan_fisher_entry_zeroes_delta_without_propagating_nan() {
+        let fisher = DiagonalFisher {
+            values: vec![1.0_f32, f32::NAN, 2.0, 0.5],
+            anchor: vec![0.0; 4],
+            decay: 0.9,
+        };
+        let mut delta = vec![1.0_f32, 1.0, 1.0, 1.0];
+        fisher.project_delta(&mut delta);
+
+        for &d in &delta {
+            assert!(
+                !d.is_nan(),
+                "NaN must not reach the caller's delta: {delta:?}"
+            );
+            assert_eq!(
+                d, 0.0,
+                "a NaN Fisher entry must block the whole update: {delta:?}"
+            );
+        }
+    }
+
+    /// The non-finite `F_ref` branch must zero only the common prefix
+    /// (`min(self.values.len(), delta.len())`), leaving any `delta`
+    /// coordinates beyond the Fisher's length untouched — matching every
+    /// other path through `project_delta`, which only ever touches the
+    /// zipped prefix.
+    ///
+    /// Mutation that defeats this: zeroing the whole `delta` slice instead of
+    /// just its common prefix in the non-finite `F_ref` branch.
+    #[test]
+    fn non_finite_fisher_blocks_only_the_common_prefix() {
+        for value in [f32::NAN, f32::INFINITY] {
+            let fisher = DiagonalFisher {
+                values: vec![value],
+                anchor: vec![0.0; 1],
+                decay: 0.9,
+            };
+            let mut delta = vec![1.0_f32, 2.0];
+            fisher.project_delta(&mut delta);
+
+            assert_eq!(
+                delta,
+                vec![0.0, 2.0],
+                "non-finite Fisher (value={value}) must block only the common \
+                 prefix and leave the suffix untouched, got {delta:?}"
+            );
+        }
+    }
+
+    /// An infinite Fisher entry must not propagate NaN/inf into `delta` either
+    /// (an infinite entry poisons `F_ref` into `+inf`, and `inf / inf` is NaN).
+    ///
+    /// Mutation that defeats this: computing `F_ref` without the
+    /// `!f_ref.is_finite()` guard.
+    #[test]
+    fn ewc_infinite_fisher_entry_zeroes_delta_without_propagating_nan_or_inf() {
+        let fisher = DiagonalFisher {
+            values: vec![1.0_f32, f32::INFINITY, 2.0, 0.5],
+            anchor: vec![0.0; 4],
+            decay: 0.9,
+        };
+        let mut delta = vec![1.0_f32, 1.0, 1.0, 1.0];
+        fisher.project_delta(&mut delta);
+
+        for &d in &delta {
+            assert!(
+                d.is_finite(),
+                "NaN/inf must not reach the caller's delta: {delta:?}"
+            );
+            assert_eq!(
+                d, 0.0,
+                "an infinite Fisher entry must block the whole update: {delta:?}"
+            );
+        }
+    }
+
+    /// Many large-but-finite Fisher values must not silently disable damping via
+    /// an f32 sum overflowing to `+inf`. Four entries of `1e38` sum to `4e38`,
+    /// which overflows `f32::MAX` (~3.4e38) under naive sequential f32
+    /// summation but is well within `f64` range — `F_ref` must land at `1e38`
+    /// (finite) and damp normally, not at `+inf` (which would make `v / F_ref
+    /// == 0` for every finite `v`, i.e. no damping at all).
+    ///
+    /// Mutation that defeats this: summing `self.values` in `f32` instead of
+    /// `f64`.
+    #[test]
+    fn ewc_large_finite_fisher_sum_does_not_overflow_f32_and_still_damps() {
+        let fisher = DiagonalFisher {
+            values: vec![1e38_f32; 4],
+            anchor: vec![0.0; 4],
+            decay: 0.9,
+        };
+        let original = vec![2.0_f32, -2.0, 2.0, -2.0];
+        let mut delta = original.clone();
+        fisher.project_delta(&mut delta);
+
+        // F_ref = mean(1e38, 1e38, 1e38, 1e38) = 1e38 -> every coordinate's
+        // F_i / F_ref == 1 -> scale = 1 / (1 + alpha) = 0.5 for alpha = 1.0.
+        let expected_scale = 1.0 / (1.0 + PROJECT_DELTA_ALPHA);
+        for (d, orig) in delta.iter().zip(original.iter()) {
+            assert!(
+                d.is_finite(),
+                "an f32-overflowed sum must not reach the caller as NaN/inf: {delta:?}"
+            );
+            assert!(
+                (d - orig * expected_scale).abs() < 1e-2,
+                "expected {} (= {orig} * {expected_scale}), got {d} — did the sum overflow f32 \
+                 and disable damping (scale 1.0 instead of {expected_scale})?",
+                orig * expected_scale
+            );
+        }
     }
 
     /// With anchor=0, params=[2], Fisher≈1, lambda=1 → out accumulates ≈+2.

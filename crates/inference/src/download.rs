@@ -8,11 +8,13 @@ use std::path::{Path, PathBuf};
 /// Ensure that the model files exist locally, downloading them if needed.
 /// Cached artifacts are checksum-verified even when automatic download is unavailable.
 pub fn ensure_model_files(model_name: &str, cache_dir: &Path) -> Result<PathBuf, InferenceError> {
-    // Offline gate: when LATTICE_OFFLINE is set, never touch the network — a cache miss
-    // fails fast instead of implicitly fetching from Hugging Face. Downstream consumers
-    // (khive CI, sandboxed builds) set this. Reading the env here keeps the public
-    // signature stable while `ensure_model_files_inner` stays env-free and unit-testable.
-    let offline = std::env::var_os("LATTICE_OFFLINE").is_some();
+    // Offline gate: when LATTICE_OFFLINE is enabled, never touch the network — a cache
+    // miss fails fast instead of implicitly fetching from Hugging Face. Downstream
+    // consumers (khive CI, sandboxed builds) set this. Reading the env here keeps the
+    // public signature stable while `ensure_model_files_inner` stays env-free and
+    // unit-testable. By value, not presence: `LATTICE_OFFLINE=0` must mean "downloads
+    // are fine", not silently enable fail-closed offline mode.
+    let offline = crate::env_switch_enabled("LATTICE_OFFLINE");
     ensure_model_files_inner(model_name, cache_dir, offline)
 }
 
@@ -392,6 +394,68 @@ mod tests {
             "offline + cache miss must return ModelNotFound, got {res:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Serializes tests in this module that mutate `LATTICE_OFFLINE` in the real
+    /// process environment. `set_var`/`remove_var` are `unsafe` because they can race
+    /// with a read on another thread; this is the same per-variable lock convention
+    /// `metal_qwen35.rs`'s `with_self_spec_env` uses for `LATTICE_SELF_SPEC`. Restores
+    /// the prior value (including "was unset") on the way out, even if `f` panics.
+    fn with_lattice_offline_env<R>(value: &str, f: impl FnOnce() -> R) -> R {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("LATTICE_OFFLINE").ok();
+        // SAFETY: serialized by `ENV_LOCK` above — this lock only guards writers of
+        // LATTICE_OFFLINE against each other; it does not stop other tests from
+        // reading the environment concurrently.
+        unsafe {
+            std::env::set_var("LATTICE_OFFLINE", value);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: see above.
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var("LATTICE_OFFLINE", v),
+                None => std::env::remove_var("LATTICE_OFFLINE"),
+            }
+        }
+        match result {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// `ensure_model_files` reads `LATTICE_OFFLINE` through `env_switch_enabled`, by
+    /// value, not presence (#1614): `=0` must mean "downloads are fine", not enable
+    /// fail-closed offline mode by merely being present. `cache_dir` here is a plain
+    /// file, not a directory, so a cache miss that falls through to the download
+    /// attempt fails immediately and deterministically at `create_dir_all` — no
+    /// network access is made either way, so the test cannot hang or flake on it.
+    #[test]
+    fn lattice_offline_is_read_by_value_not_presence() {
+        let not_a_dir =
+            std::env::temp_dir().join(format!("lattice_offline_value_{}", std::process::id()));
+        let _ = std::fs::remove_file(&not_a_dir);
+        std::fs::write(&not_a_dir, b"not a directory").expect("write stand-in file");
+
+        let res =
+            with_lattice_offline_env("0", || ensure_model_files("all-minilm-l6-v2", &not_a_dir));
+
+        let _ = std::fs::remove_file(&not_a_dir);
+
+        match res {
+            Err(InferenceError::ModelNotFound(msg)) if msg.contains("LATTICE_OFFLINE") => {
+                panic!("LATTICE_OFFLINE=0 must not enable offline mode by presence, got: {msg}");
+            }
+            Err(_) => {
+                // Any other error (here: an Io error from the broken cache_dir) proves
+                // the offline branch was not taken, which is what this test checks.
+            }
+            Ok(_) => panic!("a broken cache_dir must not report success"),
+        }
     }
 
     /// Offline mode still serves a populated cache — it blocks the network, not cache reads.
