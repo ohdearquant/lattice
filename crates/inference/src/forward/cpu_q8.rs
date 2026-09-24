@@ -1290,7 +1290,10 @@ mod tests {
         let mut a_log = vec![0.0f32; num_heads];
         let mut dt_bias = vec![0.0f32; num_heads];
         a_log[0] = 100.0; // exp(100) overflows to +inf
-        dt_bias[0] = -100.0; // softplus(-100) underflows to 0.0
+        dt_bias[0] = -200.0; // exp(-200) underflows to 0.0 in f32, so softplus is exactly 0.0
+        // Zero in_proj_a makes alpha exactly 0, so softplus sees dt_bias alone. A nonzero
+        // softplus here makes inf * sp = inf, which never produces the NaN this test guards.
+        assert_eq!(softplus(dt_bias[0]), 0.0);
 
         let weights = Q8GatedDeltaNetWeights {
             in_proj_qkv: make_zero_q8(qkv_dim, hidden),

@@ -2746,9 +2746,13 @@ mod tests {
             kernel_size: cfg.linear_conv_kernel_dim,
             norm_weight: vec![0.0; cfg.linear_value_head_dim],
         };
-        // Overflow the decay gate on head 0: exp(100) -> +inf, softplus(-100) -> 0.
+        // Overflow the decay gate on head 0: exp(100) -> +inf, and exp(-200) underflows to
+        // 0.0 in f32, so softplus is exactly 0.0. Zero in_proj_a makes alpha exactly 0, so
+        // softplus sees dt_bias alone. A nonzero softplus makes inf * sp = inf, which never
+        // produces the NaN this test guards.
         weights.a_log[0] = 100.0;
-        weights.dt_bias[0] = -100.0;
+        weights.dt_bias[0] = -200.0;
+        assert_eq!(softplus(weights.dt_bias[0]), 0.0);
 
         let mut state = GatedDeltaNetState::new(&cfg);
         let input = vec![0.05f32; hidden];
