@@ -23,6 +23,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Qwen3.5 entry point wrapped over this module's typed vocabulary.
 pub(crate) mod qwen_cpu;
 
+/// Second concrete [`DecoderSession`] implementation (ADR-090 row R04): the Gemma 4 E2B
+/// text CPU entry point wrapped over this module's typed vocabulary.
+pub(crate) mod gemma_cpu;
+
 /// The autoregressive driver (ADR-090 row C): one loop over `&mut dyn DecoderSession`
 /// that drives [`DecodePolicy`](crate::generation::DecodePolicy) unchanged.
 pub(crate) mod driver;

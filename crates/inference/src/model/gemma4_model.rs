@@ -19,18 +19,42 @@
 //! crate's Qwen3.5 GQA attention, so that kernel is not reused here.
 
 use super::gemma4_cache::Gemma4KvCache;
-use super::gemma4_config::Gemma4Config;
+use super::gemma4_config::{Gemma4Config, resolve_stop_token_ids};
 use super::gemma4_loading::load_weights;
 use super::gemma4_ops::{
     gemma4_apply_rope, gemma4_geglu_mlp, gemma4_gelu_tanh, gemma4_logit_softcap, gemma4_rms_norm,
     gemma4_rope_cos_sin, gemma4_rope_inv_freq, gemma4_scaled_embedding,
 };
 use super::gemma4_weights::Gemma4Weights;
+use crate::decoder::Cancellation;
+use crate::decoder::driver;
+use crate::decoder::gemma_cpu::GemmaCpuSession;
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, rms_norm};
+use crate::generation::{GenerateConfig, GenerateOutput};
+use crate::model::qwen35::check_prompt_not_empty;
+use crate::model::qwen35_config::decode_cap;
+use crate::stop_reason::StopReason;
+use crate::tokenizer::common::Tokenizer;
 use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use crate::weights::SafetensorsFile;
 use std::path::Path;
+
+/// Adapts the streaming API's `should_cancel: impl FnMut() -> bool` (which may
+/// capture a `Receiver`-style handle and mutate on each poll) to
+/// `decoder::Cancellation`, whose blanket impl covers only non-mutating `Fn`
+/// closures (see that trait's own doc comment). Deliberately duplicated from
+/// `model::qwen35::generation`'s identical private adapter rather than
+/// shared: that one is private to its own module, and promoting either copy
+/// to a shared crate-visible helper for two call sites is not this row's job.
+struct FnMutCancellation<'a, F: FnMut() -> bool>(&'a std::cell::RefCell<F>);
+
+impl<F: FnMut() -> bool> Cancellation for FnMutCancellation<'_, F> {
+    fn is_cancelled(&self) -> bool {
+        let mut should_cancel = self.0.borrow_mut();
+        (*should_cancel)()
+    }
+}
 
 /// Per-layer captured hidden-state trace: `(layer_idx, hidden_state)` pairs,
 /// in the order layers were visited.
@@ -132,6 +156,81 @@ pub struct Gemma4Model {
     /// past `partial_rotary_factor * global_head_dim / 2`), length
     /// `global_head_dim / 2`.
     global_inv_freq: Vec<f32>,
+    /// Full stop-token set for [`Self::generate`]/[`Self::generate_with_trace`]/
+    /// [`Self::generate_streaming_with_cancel`] (issue #1597): `config.eos_token_id`
+    /// (`text_config`'s single id) unioned with the checkpoint's `generation_config.json` or
+    /// top-level `config.json` `eos_token_id` -- see
+    /// [`super::gemma4_config::resolve_stop_token_ids`]. Deliberately NOT a field on
+    /// [`Gemma4Config`]: every field of that struct is `pub` and the struct carries no
+    /// `#[non_exhaustive]`, so it is constructible outside this crate, and a new field there
+    /// would be a semver-major break. `generate_greedy`/`generate_greedy_with_probe` do not read
+    /// this at all -- they remain the fixed-count diagnostic entry points that never check EOS.
+    stop_token_ids: Vec<u32>,
+}
+
+/// UTF-8-boundary-safe streaming detokenizer for [`Gemma4Model::generate_streaming_via_driver`].
+/// `GemmaBpeTokenizer::decode` is stateless and re-walks its whole input on every call, so
+/// decoding one fresh id in isolation flushes every trailing `<0xXX>` byte-fallback run as
+/// incomplete (`U+FFFD` per byte) even when a later token would have completed it, garbling any
+/// multi-byte character split across byte-fallback tokens in both the stream and the final text.
+///
+/// The fix re-decodes the full `ids` list every call and holds back a trailing `U+FFFD` run until
+/// it resolves or generation ends -- O(n) per call / O(n^2) total, accepted for this **Unstable**
+/// path. Sound because an earlier run's flush is fixed once a later real token closes it, so the
+/// safe (non-`U+FFFD`-tail) prefix only grows and `emitted_len` can track it as a byte offset.
+struct IncrementalByteFallbackDetokenizer<'t> {
+    tokenizer: &'t GemmaBpeTokenizer,
+    /// Generated token ids seen so far, in order (excludes the prompt).
+    ids: Vec<u32>,
+    /// Byte offset of text already returned; always a valid `char` boundary of the current decode.
+    emitted_len: usize,
+}
+
+impl<'t> IncrementalByteFallbackDetokenizer<'t> {
+    fn new(tokenizer: &'t GemmaBpeTokenizer) -> Self {
+        Self {
+            tokenizer,
+            ids: Vec::new(),
+            emitted_len: 0,
+        }
+    }
+
+    /// Appends `next_id`, re-decodes the full id list, and returns only the newly safe suffix --
+    /// empty when `next_id` only extended a still-unresolved trailing byte-fallback run.
+    fn push(&mut self, next_id: u32) -> String {
+        self.ids.push(next_id);
+        let full = self.tokenizer.decode(&self.ids).unwrap_or_default();
+        let safe_len = safe_prefix_len(&full);
+        debug_assert!(
+            safe_len >= self.emitted_len,
+            "the safe (non-U+FFFD-tail) prefix can only grow as more ids are appended"
+        );
+        let delta = full[self.emitted_len..safe_len].to_string();
+        self.emitted_len = safe_len;
+        delta
+    }
+
+    /// End-of-generation flush: emits whatever is still held back, `U+FFFD` and all.
+    fn finish(&self) -> String {
+        let full = self.tokenizer.decode(&self.ids).unwrap_or_default();
+        full[self.emitted_len..].to_string()
+    }
+}
+
+/// Byte length of `full` after stripping a trailing run of `U+FFFD`. `U+FFFD` has exactly one
+/// source here: `flush_byte_fallback_run`'s error branch, one per byte of a fallback run that
+/// never assembled into valid UTF-8. Only a run at the tail is still open to more ids; an earlier
+/// run is already closed by a following real token and cannot change.
+fn safe_prefix_len(full: &str) -> usize {
+    let mut end = full.len();
+    for (byte_idx, ch) in full.char_indices().rev() {
+        if ch == '\u{FFFD}' {
+            end = byte_idx;
+        } else {
+            break;
+        }
+    }
+    end
 }
 
 impl Gemma4Model {
@@ -160,6 +259,7 @@ impl Gemma4Model {
             config.rope_theta,
             Some(config.partial_rotary_factor),
         );
+        let stop_token_ids = resolve_stop_token_ids(path, config.eos_token_id);
 
         Ok(Self {
             config,
@@ -167,12 +267,21 @@ impl Gemma4Model {
             tokenizer,
             local_inv_freq,
             global_inv_freq,
+            stop_token_ids,
         })
     }
 
     /// **Unstable**: access Gemma 4 configuration.
     pub fn config(&self) -> &Gemma4Config {
         &self.config
+    }
+
+    /// **Unstable**: the full stop-token set [`Self::generate`]/[`Self::generate_with_trace`]/
+    /// [`Self::generate_streaming_with_cancel`] halt on -- `config().eos_token_id` unioned with
+    /// the checkpoint's `generation_config.json` or top-level `config.json` `eos_token_id` (issue
+    /// #1597). `generate_greedy`/`generate_greedy_with_probe` ignore this entirely.
+    pub fn stop_token_ids(&self) -> &[u32] {
+        &self.stop_token_ids
     }
 
     /// **Unstable**: access the Gemma BPE tokenizer.
@@ -637,6 +746,347 @@ impl Gemma4Model {
 
         Ok((generated, final_logits, probe))
     }
+
+    /// **Unstable**: autoregressive text generation with full sampling-policy
+    /// support (temperature/top-k/top-p/min-p/seed), routed through the
+    /// shared decoder driver (ADR-090 row R04). `prompt_ids` is already
+    /// tokenized with BOS included by the caller -- same convention as
+    /// [`Self::generate_greedy`]/[`Self::generate_greedy_with_probe`], and
+    /// unlike `Qwen35Model::generate`'s `prompt: &str`. EOS-aware: stops on
+    /// any id in [`Self::stop_token_ids`] (the checkpoint's full loaded stop
+    /// set, issue #1597 -- not only `self.config.eos_token_id`) or in
+    /// `gen_cfg.stop_token_ids`, and excludes the terminating token from the
+    /// returned `token_ids`/`text` (the crate-wide stop-token contract,
+    /// `GenerateOutput`'s own doc comment). Runs no forward pass after the
+    /// last requested output (ADR-090 D2).
+    ///
+    /// `generate_greedy`/`generate_greedy_with_probe` are UNCHANGED by this
+    /// row and remain the fixed-count diagnostic entry points; this is a
+    /// separate, EOS-aware entry.
+    ///
+    /// **Landmine inherited from `GenerateConfig::default()`, not introduced
+    /// here**: the default `stop_token_ids` contains `QWEN_CHAT_IM_END_TOKEN_ID`
+    /// (248,046), a Qwen-specific id with no relationship to Gemma's chat
+    /// template. Gemma's vocabulary (262,144) is large enough that this id is
+    /// a valid, unrelated Gemma token, so a caller using
+    /// `GenerateConfig { .. Default::default() }` unmodified inherits an
+    /// early, semantically meaningless stop condition on that token id. This
+    /// is a pre-existing property of the shared `GenerateConfig` type (used by
+    /// 75+ call sites) and is out of scope to change here; callers that care
+    /// should set `stop_token_ids` explicitly.
+    ///
+    /// This session declares every [`crate::decoder::ExecutionCapabilities`]
+    /// field `false` (see `decoder::gemma_cpu`'s module doc comment): a
+    /// `gen_cfg` requesting grammar, logprobs, `stop_strings`, or a
+    /// reasoning budget is refused by [`driver::run`]'s `check_capabilities`
+    /// before any session method runs.
+    ///
+    /// Delegates to [`Self::generate_with_trace`] and discards the driver
+    /// trace, mirroring `Qwen35Model::generate`'s relationship to
+    /// `generate_with_trace` (ADR-090 row C, decomposition "Open question 3,
+    /// ANSWERED"): the trace exists for this migration's own tests to see,
+    /// not for callers of the public API.
+    pub fn generate(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+    ) -> Result<GenerateOutput, InferenceError> {
+        self.generate_with_trace(prompt_ids, gen_cfg)
+            .map(|(output, _trace)| output)
+    }
+
+    /// ADR-090 row R04 dispatch point, Gemma sibling of
+    /// `Qwen35Model::generate_with_trace`. Crate-private and not
+    /// `#[cfg(test)]`-gated, for the same reason that function is not: a
+    /// marker that only exists under `cfg(test)` would make the shipped path
+    /// and the tested path differ in the one respect the test observes --
+    /// `driver::DriverTrace`, which already exists and is model-agnostic;
+    /// this method is the only new surface Gemma needs to make it observable
+    /// to this crate's own tests.
+    pub(crate) fn generate_with_trace(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError> {
+        self.generate_via_driver(prompt_ids, gen_cfg)
+    }
+
+    /// Constructs a [`GemmaCpuSession`] and runs [`driver::run`] over it.
+    /// Mirrors `Qwen35Model::generate_via_driver`'s fast (no-stop-strings)
+    /// branch exactly; Gemma has no other branch to choose between, since
+    /// `GemmaCpuSession`'s `stop_strings` capability is permanently `false`
+    /// and any `gen_cfg.stop_strings` request is refused by
+    /// `driver::run`'s `check_capabilities` before this function's own body
+    /// would need to route around it.
+    ///
+    /// `think_close_id: None` unconditionally: Gemma has no reasoning-budget
+    /// support this row (`reasoning_budget` capability is `false`), so there
+    /// is no close-token to resolve -- `Qwen35Model::generate_via_driver`'s
+    /// `resolve_reasoning_close_token` call has no Gemma equivalent to call.
+    ///
+    /// The context-budget check below is a Gemma-local reimplementation of
+    /// `Qwen35Model`'s `check_context_budget`, not a call to it: that
+    /// function is Metal-gated at its only crate-visible path
+    /// (`#[cfg(all(target_os = "macos", feature = "metal-gpu"))]` in
+    /// `model::qwen35::mod`'s re-export list), so it does not exist at all on
+    /// a plain CPU build. [`decode_cap`] is the one piece of that check's
+    /// arithmetic that is already shared, model-agnostic infrastructure
+    /// (`driver::run` itself imports it directly), so this reuses that and
+    /// re-derives the rest of the bound inline rather than duplicating a
+    /// function this crate cannot reach from here.
+    fn generate_via_driver(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError> {
+        let cfg = &self.config;
+        let prompt_len = prompt_ids.len();
+
+        check_prompt_not_empty(prompt_len)?;
+
+        if gen_cfg.max_new_tokens == 0 {
+            return Ok((
+                GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
+                },
+                driver::DriverTrace::default(),
+            ));
+        }
+
+        let effective_new =
+            decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
+        let max_context = cfg.max_position_embeddings;
+        if prompt_len.saturating_add(effective_new) > max_context {
+            return Err(InferenceError::Inference(format!(
+                "prompt ({prompt_len} tokens) plus effective decode cap ({effective_new} \
+                 tokens; max_new_tokens={}) exceeds Gemma 4 context window ({max_context})",
+                gen_cfg.max_new_tokens
+            )));
+        }
+        let max_seq_len = prompt_len.saturating_add(effective_new);
+
+        let mut session = GemmaCpuSession::new(
+            self,
+            prompt_ids.to_vec(),
+            gen_cfg.temperature,
+            gen_cfg.seed,
+            max_seq_len,
+        )?;
+
+        // Non-streaming callers never cancel and never need a real
+        // per-token delta: `decoder::gemma_cpu`'s session declares
+        // `stop_strings: false`, so `driver::run` refuses any
+        // `gen_cfg.stop_strings` request before this call would need to
+        // route around it -- unlike `Qwen35Model::generate_via_driver`,
+        // there is no second (stop-strings-aware) branch here at all.
+        let never_cancel = || false;
+        let mut throwaway_text = String::new();
+        let mut throwaway_offsets: Vec<usize> = Vec::new();
+
+        // `driver::run` only checks a single `eos_token_id: u32` plus `gen_cfg.stop_token_ids`
+        // (issue #1597): `cfg.eos_token_id` below is `text_config`'s own id, so the
+        // checkpoint's real end-of-turn set (`self.stop_token_ids`, which already includes
+        // `cfg.eos_token_id`) is folded into a CLONE of `gen_cfg` here rather than the caller's
+        // own config -- extending `gen_cfg.stop_token_ids` in place would mutate a value the
+        // caller still owns.
+        let mut extended_gen_cfg = gen_cfg.clone();
+        extended_gen_cfg
+            .stop_token_ids
+            .extend(self.stop_token_ids.iter().copied());
+
+        let result = driver::run(
+            &mut session,
+            &extended_gen_cfg,
+            None,
+            prompt_ids,
+            cfg.eos_token_id,
+            false,
+            &never_cancel,
+            |_generated_len| {},
+            |_next_id| String::new(),
+            &mut throwaway_text,
+            &mut throwaway_offsets,
+            |_delta, _next_id| true,
+            || {},
+            String::new,
+        )?;
+
+        // `GemmaBpeTokenizer::decode` (the `Tokenizer` trait's real override
+        // for this tokenizer) always returns `Some` -- see that method's own
+        // implementation -- so `unwrap_or_default` never actually falls back
+        // in practice; it exists only to satisfy the trait's `Option<String>`
+        // signature, which allows for tokenizers with no decode support at
+        // all (the trait's default).
+        let text = self
+            .tokenizer
+            .decode(&result.generated_ids)
+            .unwrap_or_default();
+
+        Ok((
+            GenerateOutput {
+                text,
+                token_ids: result.generated_ids.clone(),
+                prompt_tokens: prompt_len,
+                generated_tokens: result.generated_ids.len(),
+                stopped: result.stopped,
+                stop_reason: Some(result.stop_reason),
+                token_logprobs: result.token_logprobs,
+            },
+            result.trace,
+        ))
+    }
+
+    /// **Unstable**: streaming sibling of [`Self::generate`], with
+    /// cancellation -- mirrors `Qwen35Model::generate_streaming_with_cancel`'s
+    /// signature shape (`on_token: impl FnMut(&str) -> bool`,
+    /// `should_cancel: impl FnMut() -> bool`). `should_cancel` is polled
+    /// before the prefill pass starts, immediately after it returns, and at
+    /// the top of every decode iteration (`driver::run`'s own three
+    /// checkpoints); `on_token` itself also stops generation the moment it
+    /// returns `false`. Both stopping paths report `stopped: false,
+    /// stop_reason: Some(StopReason::Interrupt)`, matching the Qwen CPU/Metal
+    /// contract.
+    ///
+    /// Deltas are UTF-8-boundary-safe: [`IncrementalByteFallbackDetokenizer`]
+    /// re-decodes the full generated-id list on every call and holds back a
+    /// trailing incomplete byte-fallback run (see that type's doc comment).
+    /// The concatenation of every streamed delta plus the `driver::run`
+    /// end-of-generation flush equals `Tokenizer::decode(&output.token_ids)`
+    /// -- the same text [`Self::generate`] returns for the same ids.
+    pub fn generate_streaming_with_cancel<F, C>(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+    ) -> Result<GenerateOutput, InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+    {
+        self.generate_streaming_via_driver(prompt_ids, gen_cfg, on_token, should_cancel)
+            .map(|(output, _trace)| output)
+    }
+
+    /// Driver-routed dispatch target for [`Self::generate_streaming_with_cancel`].
+    /// Mirrors [`Self::generate_via_driver`]'s preflight sequence exactly
+    /// (empty-prompt check, zero-`max_new_tokens` short-circuit,
+    /// context-budget bound, session construction); see this method's own
+    /// doc comment on `generate_streaming_with_cancel` for the UTF-8-boundary
+    /// -safe delta contract [`IncrementalByteFallbackDetokenizer`] provides.
+    fn generate_streaming_via_driver<F, C>(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+        mut on_token: F,
+        should_cancel: C,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+    {
+        let cfg = &self.config;
+        let prompt_len = prompt_ids.len();
+
+        check_prompt_not_empty(prompt_len)?;
+
+        if gen_cfg.max_new_tokens == 0 {
+            return Ok((
+                GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
+                },
+                driver::DriverTrace::default(),
+            ));
+        }
+
+        let effective_new =
+            decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
+        let max_context = cfg.max_position_embeddings;
+        if prompt_len.saturating_add(effective_new) > max_context {
+            return Err(InferenceError::Inference(format!(
+                "prompt ({prompt_len} tokens) plus effective decode cap ({effective_new} \
+                 tokens; max_new_tokens={}) exceeds Gemma 4 context window ({max_context})",
+                gen_cfg.max_new_tokens
+            )));
+        }
+        let max_seq_len = prompt_len.saturating_add(effective_new);
+
+        let mut session = GemmaCpuSession::new(
+            self,
+            prompt_ids.to_vec(),
+            gen_cfg.temperature,
+            gen_cfg.seed,
+            max_seq_len,
+        )?;
+
+        let should_cancel_cell = std::cell::RefCell::new(should_cancel);
+        let cancel = FnMutCancellation(&should_cancel_cell);
+
+        let mut text = String::new();
+        let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
+
+        // `RefCell`, not two separate closures each borrowing `detok` directly: `decode_delta`
+        // (`FnMut`) and `finish_tail` (`FnOnce`) are two distinct closures both alive for the
+        // whole `driver::run` call below, so the borrow checker needs interior mutability here --
+        // same shape as `driver.rs`'s own `RefCell<&mut dyn DecoderSession>` and
+        // `model::qwen35::generation::generate_streaming_via_driver`'s `detok_cell`, which this
+        // mirrors directly.
+        let detok_cell =
+            std::cell::RefCell::new(IncrementalByteFallbackDetokenizer::new(&self.tokenizer));
+
+        // See `generate_via_driver`'s identical clone-and-extend for why this is a clone of
+        // `gen_cfg` rather than an in-place mutation (issue #1597).
+        let mut extended_gen_cfg = gen_cfg.clone();
+        extended_gen_cfg
+            .stop_token_ids
+            .extend(self.stop_token_ids.iter().copied());
+
+        let result = driver::run(
+            &mut session,
+            &extended_gen_cfg,
+            None,
+            prompt_ids,
+            cfg.eos_token_id,
+            true,
+            &cancel,
+            |_generated_len| {},
+            // See this method's own doc comment on `generate_streaming_with_cancel` and
+            // `IncrementalByteFallbackDetokenizer`'s own doc comment for why a stateful,
+            // full-re-decode-per-call detokenizer (not a per-token `decode` call) is required
+            // for a correct, UTF-8-boundary-safe stream.
+            |next_id| detok_cell.borrow_mut().push(next_id),
+            &mut text,
+            &mut token_logprob_end_offsets,
+            |delta, _next_id| on_token(delta),
+            || {},
+            || detok_cell.borrow().finish(),
+        )?;
+
+        Ok((
+            GenerateOutput {
+                text,
+                token_ids: result.generated_ids.clone(),
+                prompt_tokens: prompt_len,
+                generated_tokens: result.generated_ids.len(),
+                stopped: result.stopped,
+                stop_reason: Some(result.stop_reason),
+                token_logprobs: result.token_logprobs,
+            },
+            result.trace,
+        ))
+    }
 }
 
 /// Row-wise softmax, fail-closed on non-finite input (this repo's softmax
@@ -679,6 +1129,694 @@ fn argmax(logits: &[f32]) -> u32 {
         }
     }
     best_idx as u32
+}
+
+/// Test-only tiny zero-weight synthetic Gemma 4 model (ADR-090 row R04,
+/// mirrors `model::qwen35::test_support::tiny_zero_model`'s all-zero-weight
+/// trick, and `gemma4_cache.rs`'s own `tests::tiny_config` precedent for
+/// bypassing [`Gemma4Config::validate`] entirely): 1 layer, non-shared global
+/// attention, hidden_size 8, vocab_size 16. Deliberately simpler than
+/// `gemma4_cache::tests::tiny_config`'s 6-layer fixture -- a single
+/// non-shared global layer has no donor-slot indirection to reason about at
+/// all, which this test-support builder does not need.
+///
+/// All-zero weights make every logit exactly `0.0` at every step
+/// (hand-verified end to end: RMSNorm of an all-zero vector is
+/// `0 / sqrt(0 + rms_norm_eps) = 0`, finite since `rms_norm_eps = 1e-6` keeps
+/// the denominator away from zero; RoPE rotation, the attention
+/// softmax-then-weighted-sum against all-zero V, GeGLU (`gelu_tanh(0) = 0`),
+/// and the final tanh soft-cap (`tanh(0/30) * 30 = 0`) all leave an all-zero
+/// input at exactly zero), so greedy sampling deterministically picks token
+/// id 0 (the first index satisfying strict `>` against `f32::NEG_INFINITY` in
+/// `argmax`/the crate's sampler) and every token's reporting log-probability
+/// under [`crate::sampling::compute_step_logprobs`] is exactly
+/// `-ln(vocab_size)` (a uniform distribution over equal logits).
+///
+/// Bypasses [`Gemma4Config::validate`] deliberately (the same choice
+/// `gemma4_cache::tests::tiny_config` already makes): `validate` hard-locks
+/// `layer_types`'s full_attention positions to the real 35-layer E2B schedule
+/// `[4, 9, 14, 19, 24, 29, 34]`, which a 1-layer config can never satisfy.
+///
+/// Reuses the real committed tokenizer fixture
+/// (`tests/fixtures/gemma4/tokenizer/tokenizer.json`) rather than
+/// hand-building a second synthetic one: no [`crate::decoder::DecoderSession`]
+/// method this builder exists to test ever reads `Gemma4Model::tokenizer`,
+/// and `Self::generate`'s own output-text decode is exercised separately by
+/// this module's `tests` module below.
+#[cfg(test)]
+pub(crate) fn tiny_zero_model() -> Gemma4Model {
+    use super::gemma4_config::Gemma4LayerType;
+    use super::gemma4_weights::Gemma4LayerWeights;
+
+    let hidden_size = 8;
+    let head_w = 8;
+    let per_layer_dim = 4;
+    let mlp_dim = 8;
+    let vocab_size = 16;
+
+    let config = Gemma4Config {
+        hidden_size,
+        num_hidden_layers: 1,
+        vocab_size,
+        intermediate_size: mlp_dim,
+        rms_norm_eps: 1e-6,
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        head_dim: head_w,
+        global_head_dim: head_w,
+        sliding_window: head_w,
+        attention_k_eq_v: false,
+        attention_bias: false,
+        rope_theta: 10_000.0,
+        rope_local_base_freq: 10_000.0,
+        partial_rotary_factor: 1.0,
+        layer_types: vec![Gemma4LayerType::FullAttention],
+        num_kv_shared_layers: 0,
+        use_double_wide_mlp_raw: false,
+        hidden_size_per_layer_input: per_layer_dim,
+        hidden_activation: "gelu_pytorch_tanh".to_string(),
+        final_logit_softcapping: 30.0,
+        tie_word_embeddings: true,
+        eos_token_id: 1,
+        max_position_embeddings: 1024,
+    };
+
+    let layer = Gemma4LayerWeights {
+        input_layernorm: vec![0.0; hidden_size],
+        post_attention_layernorm: vec![0.0; hidden_size],
+        pre_feedforward_layernorm: vec![0.0; hidden_size],
+        post_feedforward_layernorm: vec![0.0; hidden_size],
+        post_per_layer_input_norm: vec![0.0; hidden_size],
+        layer_scalar: 1.0,
+        per_layer_input_gate: vec![0.0; per_layer_dim * hidden_size],
+        per_layer_projection: vec![0.0; hidden_size * per_layer_dim],
+        q_proj: vec![0.0; head_w * hidden_size],
+        o_proj: vec![0.0; hidden_size * head_w],
+        q_norm: vec![0.0; head_w],
+        k_proj: Some(vec![0.0; head_w * hidden_size]),
+        v_proj: Some(vec![0.0; head_w * hidden_size]),
+        k_norm: Some(vec![0.0; head_w]),
+        gate_proj: vec![0.0; mlp_dim * hidden_size],
+        up_proj: vec![0.0; mlp_dim * hidden_size],
+        down_proj: vec![0.0; hidden_size * mlp_dim],
+    };
+
+    let weights = Gemma4Weights {
+        embed_tokens: vec![0.0; vocab_size * hidden_size],
+        embed_tokens_per_layer: vec![0.0; vocab_size * per_layer_dim],
+        norm: vec![0.0; hidden_size],
+        per_layer_model_projection: vec![0.0; per_layer_dim * hidden_size],
+        per_layer_projection_norm: vec![0.0; per_layer_dim],
+        layers: vec![layer],
+    };
+
+    let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("gemma4")
+        .join("tokenizer")
+        .join("tokenizer.json");
+    let tokenizer = GemmaBpeTokenizer::from_tokenizer_json(&tokenizer_path)
+        .expect("committed gemma4 tokenizer fixture must load");
+
+    let local_inv_freq = gemma4_rope_inv_freq(config.head_dim, config.rope_local_base_freq, None);
+    let global_inv_freq = gemma4_rope_inv_freq(
+        config.global_head_dim,
+        config.rope_theta,
+        Some(config.partial_rotary_factor),
+    );
+
+    let stop_token_ids = vec![config.eos_token_id];
+
+    Gemma4Model {
+        config,
+        weights,
+        tokenizer,
+        local_inv_freq,
+        global_inv_freq,
+        stop_token_ids,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoder::ExecutionCapabilities;
+    use crate::grammar::{GrammarEngine, GrammarSpec};
+
+    // These four byte-fallback ids -- 478, 382, 378, 366 (`<0xF0><0x90><0x8C><0x80>`), verified
+    // against the committed tokenizer fixture -- are the 4-byte UTF-8 encoding of U+10300; no
+    // proper prefix of them is valid UTF-8 alone. Reverting `push` to decode each id in isolation
+    // instead of re-decoding the accumulated `ids` list must fail the assertions below.
+    #[test]
+    fn incremental_detokenizer_resolves_a_byte_fallback_run_split_across_tokens() {
+        let model = tiny_zero_model();
+        let mut detok = IncrementalByteFallbackDetokenizer::new(&model.tokenizer);
+
+        assert_eq!(
+            detok.push(478),
+            "",
+            "1/4 bytes of a 4-byte sequence must not resolve yet"
+        );
+        assert_eq!(detok.push(382), "", "2/4 bytes must still be held back");
+        assert_eq!(detok.push(378), "", "3/4 bytes must still be held back");
+        assert_eq!(
+            detok.push(366),
+            "\u{10300}",
+            "the 4th byte completes the sequence: the delta must be the resolved \
+             character, not four individually-flushed U+FFFD replacement characters"
+        );
+        assert_eq!(
+            detok.finish(),
+            "",
+            "nothing left to flush once the sequence resolved"
+        );
+
+        // Cross-check: streamed text must equal the non-streaming path's full-batch decode
+        // of the same ids.
+        let ids = [478u32, 382, 378, 366];
+        assert_eq!(
+            model.tokenizer.decode(&ids).unwrap_or_default(),
+            "\u{10300}"
+        );
+    }
+
+    /// A run that never completes must flush at `finish()` exactly as a full-batch decode
+    /// would: one `U+FFFD` per unresolved byte, never a lossy collapsed replacement.
+    #[test]
+    fn incremental_detokenizer_flushes_a_genuinely_incomplete_run_at_finish() {
+        let model = tiny_zero_model();
+        let mut detok = IncrementalByteFallbackDetokenizer::new(&model.tokenizer);
+        assert_eq!(detok.push(478), "");
+        assert_eq!(detok.push(382), "");
+        assert_eq!(detok.push(378), "");
+
+        let expected_full = model.tokenizer.decode(&[478, 382, 378]).unwrap_or_default();
+        assert_eq!(
+            expected_full, "\u{FFFD}\u{FFFD}\u{FFFD}",
+            "control: the tokenizer's own decode over the same incomplete 3-byte run"
+        );
+        assert_eq!(detok.finish(), expected_full);
+    }
+
+    /// Capability refusal 1/4: a `gen_cfg.grammar` request is refused before
+    /// any session method runs, through the public `Gemma4Model::generate`
+    /// entry point end to end. `GemmaCpuSession`'s `grammar` capability is
+    /// permanently `false` (this row implements no grammar masking).
+    #[test]
+    fn generate_refuses_grammar_request() {
+        let model = tiny_zero_model();
+        let grammar = GrammarEngine::new(
+            &GrammarSpec::Gbnf("root ::= \"a\"\n".into()),
+            vec![b"a".to_vec()],
+        )
+        .expect("trivial one-token grammar must compile");
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            grammar: Some(std::sync::Arc::new(grammar)),
+            ..Default::default()
+        };
+        let err = model
+            .generate(&[2, 3], &gen_cfg)
+            .expect_err("a session declaring grammar: false must refuse a grammar request");
+        match err {
+            InferenceError::InvalidInput(msg) => {
+                assert!(msg.contains("grammar"), "message must name grammar: {msg}")
+            }
+            other => panic!("expected InvalidInput naming grammar, got: {other:?}"),
+        }
+    }
+
+    /// Capability refusal 2/4: a `gen_cfg.logprobs` request is refused the
+    /// same way. `GemmaCpuSession::metadata` is a real, working
+    /// implementation (see that module's doc comment), but is unreachable
+    /// because `check_capabilities` runs before `select`/`metadata` are ever
+    /// called.
+    #[test]
+    fn generate_refuses_logprobs_request() {
+        let model = tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            logprobs: Some(0),
+            ..Default::default()
+        };
+        let err = model
+            .generate(&[2, 3], &gen_cfg)
+            .expect_err("a session declaring logprobs: false must refuse a logprobs request");
+        match err {
+            InferenceError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("logprobs"),
+                    "message must name logprobs: {msg}"
+                )
+            }
+            other => panic!("expected InvalidInput naming logprobs, got: {other:?}"),
+        }
+    }
+
+    /// Capability refusal 3/4: a non-empty `gen_cfg.stop_strings` request is
+    /// refused the same way.
+    #[test]
+    fn generate_refuses_stop_strings_request() {
+        let model = tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            stop_strings: vec!["x".to_string()],
+            ..Default::default()
+        };
+        let err = model
+            .generate(&[2, 3], &gen_cfg)
+            .expect_err("a session declaring stop_strings: false must refuse a request");
+        match err {
+            InferenceError::InvalidInput(msg) => assert!(
+                msg.contains("stop_strings"),
+                "message must name stop_strings: {msg}"
+            ),
+            other => panic!("expected InvalidInput naming stop_strings, got: {other:?}"),
+        }
+    }
+
+    /// Capability refusal 4/4: a `gen_cfg.reasoning_budget` request is
+    /// refused the same way. `enable_thinking` must stay `true` (the
+    /// default) for this to reach the driver as `Some`, since
+    /// `GenerateConfig::effective_reasoning_budget` masks the raw field to
+    /// `None` whenever `enable_thinking` is `false` -- and
+    /// `check_capabilities` reads the raw `gen_cfg.reasoning_budget` field
+    /// directly, not the effective one, so this must set `enable_thinking`
+    /// explicitly rather than relying on the default.
+    #[test]
+    fn generate_refuses_reasoning_budget_request() {
+        let model = tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            reasoning_budget: Some(4),
+            enable_thinking: true,
+            ..Default::default()
+        };
+        let err = model
+            .generate(&[2, 3], &gen_cfg)
+            .expect_err("a session declaring reasoning_budget: false must refuse a request");
+        match err {
+            InferenceError::InvalidInput(msg) => assert!(
+                msg.contains("reasoning_budget"),
+                "message must name reasoning_budget: {msg}"
+            ),
+            other => panic!("expected InvalidInput naming reasoning_budget, got: {other:?}"),
+        }
+    }
+
+    /// Passing control for the four refusal tests above: the identical
+    /// tiny-model request shape, with every capability-gated field left at
+    /// its default (unset), must succeed -- proving the refusals above are
+    /// about the specific field each test sets, not about `generate` itself
+    /// being broken against this synthetic model.
+    #[test]
+    fn generate_succeeds_with_no_capability_gated_fields_set() {
+        let model = tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 2,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let output = model
+            .generate(&[2, 3], &gen_cfg)
+            .expect("a request with no capability-gated field set must succeed");
+        // All-zero weights -> greedy argmax always picks token id 0 (see
+        // `tiny_zero_model`'s doc comment) -> both requested tokens are 0,
+        // and `eos_token_id` (1) never matches, so the budget is exhausted
+        // rather than an early EOS stop.
+        assert_eq!(output.token_ids, vec![0, 0]);
+        assert_eq!(output.generated_tokens, 2);
+        assert!(!output.stopped);
+    }
+
+    /// `max_new_tokens` budget: generation stops exactly at the requested
+    /// count when nothing else (EOS, a stop token) intervenes first.
+    #[test]
+    fn generate_stops_at_max_new_tokens_budget() {
+        let model = tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let output = model
+            .generate(&[2, 3], &gen_cfg)
+            .expect("generation over the tiny model must succeed");
+        assert_eq!(output.token_ids.len(), 3);
+        assert_eq!(output.generated_tokens, 3);
+        assert!(
+            !output.stopped,
+            "reaching the token budget with no EOS/stop-token hit is NOT a `stopped` exit"
+        );
+        assert_eq!(output.stop_reason, Some(StopReason::Length));
+    }
+
+    /// EOS via `stop_token_ids`: greedy decode on the all-zero tiny model
+    /// always samples token id 0 (see `tiny_zero_model`'s doc comment), so
+    /// configuring `stop_token_ids: vec![0]` must stop generation at the
+    /// first token, before `max_new_tokens` is reached, and exclude the
+    /// stopping token from the output (the crate-wide stop-token contract).
+    #[test]
+    fn generate_stops_on_configured_stop_token_id() {
+        let model = tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![0],
+            ..Default::default()
+        };
+        let output = model
+            .generate(&[2, 3], &gen_cfg)
+            .expect("generation over the tiny model must succeed");
+        assert!(
+            output.token_ids.is_empty(),
+            "the stopping token (id 0, sampled at step 0) must be excluded from token_ids, \
+             per the crate-wide stop-token contract"
+        );
+        assert_eq!(output.generated_tokens, 0);
+        assert!(output.stopped);
+        assert_eq!(output.stop_reason, Some(StopReason::Eos));
+    }
+
+    /// Issue #1597: the model-level stop set (`Gemma4Model::stop_token_ids`, resolved at
+    /// load time from `generation_config.json`/top-level `config.json` -- see
+    /// `gemma4_config::resolve_stop_token_ids`) must end generation on its own, even when the
+    /// caller's own `gen_cfg.stop_token_ids` is empty. Distinct from
+    /// `generate_stops_on_configured_stop_token_id` above, which exercises `gen_cfg`'s own field;
+    /// this one never touches `gen_cfg.stop_token_ids` at all.
+    #[test]
+    fn generate_stops_on_model_level_stop_token_id() {
+        let mut model = tiny_zero_model();
+        // Greedy decode on the all-zero tiny model always samples token id 0 (see
+        // `tiny_zero_model`'s doc comment); configuring it here as a MODEL-level stop id
+        // (bypassing `resolve_stop_token_ids`, which this test does not exercise) isolates the
+        // extension `generate_via_driver`/`generate_streaming_via_driver` must apply.
+        model.stop_token_ids = vec![0];
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let output = model
+            .generate(&[2, 3], &gen_cfg)
+            .expect("generation over the tiny model must succeed");
+        assert!(
+            output.token_ids.is_empty(),
+            "the model-level stop id (0, sampled at step 0) must end generation even though \
+             gen_cfg.stop_token_ids never named it"
+        );
+        assert_eq!(output.generated_tokens, 0);
+        assert!(output.stopped);
+        assert_eq!(output.stop_reason, Some(StopReason::Eos));
+    }
+
+    #[test]
+    fn generate_streaming_stops_on_model_level_stop_token_id() {
+        // Streaming sibling of the test above, isolating generate_streaming_via_driver's
+        // own extension of the model-level stop ids into the driver call.
+        let mut model = tiny_zero_model();
+        model.stop_token_ids = vec![0];
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let output = model
+            .generate_streaming_with_cancel(&[2, 3], &gen_cfg, |_delta| true, || false)
+            .expect("generation over the tiny model must succeed");
+        assert!(output.token_ids.is_empty());
+        assert_eq!(output.generated_tokens, 0);
+        assert!(output.stopped);
+        assert_eq!(output.stop_reason, Some(StopReason::Eos));
+    }
+
+    /// `prompt_len + effective decode cap > max_position_embeddings` must be refused before any
+    /// KV-cache allocation or forward call. `max_new_tokens: usize::MAX` proves the ordering:
+    /// skipping the check would abort the process on an oversized allocation, not return `Err`.
+    #[test]
+    fn generate_refuses_when_prompt_plus_decode_cap_exceeds_context_window() {
+        let model = tiny_zero_model(); // max_position_embeddings: 1024
+        let prompt_ids = [2u32, 3u32];
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: usize::MAX,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let err = model.generate(&prompt_ids, &gen_cfg).expect_err(
+            "prompt_len + effective decode cap exceeding the context window must be refused",
+        );
+        match err {
+            InferenceError::Inference(msg) => assert!(
+                msg.contains("context window"),
+                "message must name the context-window bound: {msg}"
+            ),
+            other => panic!(
+                "expected InferenceError::Inference naming the context window, got: {other:?}"
+            ),
+        }
+    }
+
+    /// Streaming sibling of the test above: `generate_streaming_via_driver` runs the identical
+    /// preflight check. `on_token_calls == 0` proves no token was ever produced, since
+    /// `on_token` is only invoked from inside `driver::run`'s loop, which this must never reach.
+    #[test]
+    fn generate_streaming_refuses_when_prompt_plus_decode_cap_exceeds_context_window() {
+        let model = tiny_zero_model();
+        let prompt_ids = [2u32, 3u32];
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: usize::MAX,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let mut on_token_calls = 0usize;
+        let err = model
+            .generate_streaming_with_cancel(
+                &prompt_ids,
+                &gen_cfg,
+                |_delta| {
+                    on_token_calls += 1;
+                    true
+                },
+                || false,
+            )
+            .expect_err("the same context-window bound must be enforced on the streaming path");
+        match err {
+            InferenceError::Inference(msg) => assert!(
+                msg.contains("context window"),
+                "message must name the context-window bound: {msg}"
+            ),
+            other => panic!(
+                "expected InferenceError::Inference naming the context window, got: {other:?}"
+            ),
+        }
+        assert_eq!(
+            on_token_calls, 0,
+            "the over-budget refusal must fire before any token is streamed, i.e. before \
+             any forward pass runs"
+        );
+    }
+
+    /// Capabilities declared by `ExecutionCapabilities::default()` are all
+    /// `false` -- the baseline this row's session relies on to make its own
+    /// all-false declaration meaningful rather than accidental (if the
+    /// crate's own default ever flipped a field to `true`, "declares nothing"
+    /// and "declares everything false" would silently diverge).
+    #[test]
+    fn execution_capabilities_default_is_all_false() {
+        let caps = ExecutionCapabilities::default();
+        assert!(!caps.grammar);
+        assert!(!caps.logprobs);
+        assert!(!caps.stop_strings);
+        assert!(!caps.reasoning_budget);
+    }
+
+    /// Explicit opt-out for the checkpoint-gated driver-trace test below,
+    /// mirroring `tests/gemma4_e2e_forward_test.rs`'s own
+    /// `skip_allowed`/`resolve_model_dir` contract exactly (deliberately
+    /// duplicated, not shared -- see `crate::test_support`'s doc comment on
+    /// why this crate's checkpoint-dir resolver and the integration-test
+    /// binary's are two separate implementations on purpose: different
+    /// contracts, different crate boundaries).
+    #[cfg(feature = "f16")]
+    fn driver_trace_gate_skip_allowed() -> bool {
+        std::env::var("LATTICE_GEMMA4_GATE_SKIP").as_deref() == Ok("1")
+    }
+
+    #[cfg(feature = "f16")]
+    fn resolve_real_checkpoint_dir() -> Option<std::path::PathBuf> {
+        const VAR: &str = "LATTICE_GEMMA4_MODEL_DIR";
+        let raw =
+            std::env::var(VAR).unwrap_or_else(|_| "~/.lattice/models/gemma-4-e2b-it".to_string());
+        let path = if let Some(rest) = raw.strip_prefix("~/") {
+            std::path::PathBuf::from(std::env::var("HOME").ok()?).join(rest)
+        } else {
+            std::path::PathBuf::from(&raw)
+        };
+        if path.join("model.safetensors").exists() {
+            Some(path)
+        } else if driver_trace_gate_skip_allowed() {
+            eprintln!(
+                "LATTICE_GEMMA4_E2E_SKIPPED reason=missing_checkpoint path={}",
+                path.display()
+            );
+            None
+        } else {
+            panic!(
+                "{VAR}={} has no model.safetensors -- this driver-trace gate fails closed by \
+                 default on a missing checkpoint, mirroring \
+                 tests/gemma4_e2e_forward_test.rs's own contract. Set \
+                 LATTICE_GEMMA4_GATE_SKIP=1 to explicitly skip.",
+                path.display()
+            );
+        }
+    }
+
+    /// ADR-090 row R04 (#1597) driver-marker acceptance, checkpoint-gated.
+    /// Mirrors `model::qwen35::generation`'s own
+    /// `driver_trace_matches_ids_len_on_the_pre_migration_golden` test (same
+    /// rationale, same crate-boundary constraint -- see that test's and
+    /// `tests/gemma4_e2e_forward_test.rs`'s
+    /// `stage5_shared_driver_greedy_matches_hf_golden`'s own doc comments):
+    /// `generate_with_trace`/`driver::DriverTrace` are `pub(crate)` by
+    /// deliberate design, so the only place a test can assert the driver's
+    /// opened/consumed counts is inside this crate.
+    ///
+    /// Fail-closed by default via `resolve_real_checkpoint_dir` above: a
+    /// missing checkpoint panics unless `LATTICE_GEMMA4_GATE_SKIP=1` is set.
+    /// This is a stricter contract than this file's own pre-existing
+    /// `donor_mutation_tests::model_dir` helper (which always skips silently
+    /// on a missing checkpoint, with no panic path at all, despite that
+    /// module's doc comment claiming "same convention as
+    /// tests/gemma4_e2e_forward_test.rs" -- that claim does not hold against
+    /// the read source and predates this row; noted here, not fixed, since
+    /// correcting a pre-existing unrelated test is outside this row's scope).
+    #[cfg(feature = "f16")]
+    fn run_driver_trace_gate(model_dir: &Path) {
+        #[derive(serde::Deserialize)]
+        struct Golden {
+            input_ids: Vec<u32>,
+            greedy_tokens: Vec<u32>,
+        }
+        const FIXTURE: &str = include_str!("../../tests/fixtures/gemma4/stage5/e2e_golden.json");
+        let golden: Golden = serde_json::from_str(FIXTURE).expect("golden fixture parses");
+
+        let model = Gemma4Model::from_safetensors(model_dir).expect("loading real checkpoint");
+
+        // See `Gemma4Model::generate`'s own doc comment on why
+        // `stop_token_ids` must be cleared explicitly.
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let (output, trace) = model
+            .generate_with_trace(&golden.input_ids, &gen_cfg)
+            .expect("gemma4 shared-driver generate_with_trace");
+
+        assert!(
+            model.stop_token_ids().contains(&106),
+            "the checkpoint's loaded stop set must include the end-of-turn id"
+        );
+        let first_stop_idx = golden
+            .greedy_tokens
+            .iter()
+            .position(|id| model.stop_token_ids().contains(id));
+        let expected: Vec<u32> = match first_stop_idx {
+            Some(idx) => golden.greedy_tokens[..idx].to_vec(),
+            None => golden.greedy_tokens.clone(),
+        };
+        assert_eq!(
+            expected,
+            vec![9079, 236761],
+            "golden ids before the first stop id must be exactly these two"
+        );
+        assert!(
+            output.stopped,
+            "must stop on the checkpoint's own end-of-turn id (stop reason: {:?})",
+            output.stop_reason
+        );
+        assert_eq!(output.stop_reason, Some(StopReason::Eos));
+        assert_eq!(
+            output.token_ids, expected,
+            "driver-routed ids must match the HF golden up to the first stop id"
+        );
+        // On an EOS finish `decoder::driver::run` opens a prediction for the stop token
+        // and never emits it, so `opened` is one more than the emitted count.
+        assert_eq!(
+            trace.opened,
+            output.token_ids.len() + 1,
+            "opens the stop-token prediction it never emits"
+        );
+        assert_eq!(
+            trace.consumed + 1,
+            trace.opened,
+            "exactly one prediction stays open at finish"
+        );
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn generate_with_trace_matches_hf_golden_and_driver_trace_is_consistent() {
+        let Some(model_dir) = resolve_real_checkpoint_dir() else {
+            return;
+        };
+        run_driver_trace_gate(&model_dir);
+    }
+
+    /// Unconditional sibling of the checkpoint-gated test above: pins the same `DriverTrace`
+    /// invariant (`decode()` runs on the previous iteration's still-open prediction before
+    /// `select()` opens the current one, so `opened`/`consumed` lag by exactly one at a natural
+    /// finish) without needing a real checkpoint. Pins absolute counts, not only the relative
+    /// invariant: `max_new_tokens: 3` against the all-zero tiny model must open exactly 3
+    /// predictions and consume exactly 2.
+    #[test]
+    fn generate_with_trace_drives_the_session_in_the_exact_select_decode_count() {
+        let model = tiny_zero_model();
+        let prompt_ids = [2u32, 3u32];
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let (output, trace) = model
+            .generate_with_trace(&prompt_ids, &gen_cfg)
+            .expect("generation over the tiny model must succeed");
+
+        assert!(
+            !output.stopped,
+            "must run the full 3-token budget, no early EOS"
+        );
+        assert_eq!(output.token_ids.len(), 3);
+        assert_eq!(trace.opened, 3, "one select() per emitted token");
+        assert_eq!(
+            trace.consumed, 2,
+            "one decode() per emitted token except the last (its prediction is dropped \
+             via finish, not decoded)"
+        );
+        assert_eq!(
+            trace.consumed + 1,
+            trace.opened,
+            "the driver's own standing invariant (decoder/driver.rs module doc comment)"
+        );
+    }
 }
 
 /// Mutation-sensitivity proof for ADR-082 stage 5's declared negative test
