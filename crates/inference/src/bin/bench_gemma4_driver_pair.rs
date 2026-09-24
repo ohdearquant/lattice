@@ -3,7 +3,7 @@
 //! ([`Gemma4Model::generate_greedy`]) and its shared-driver path
 //! ([`Gemma4Model::generate_streaming_with_cancel`]) at the SAME token count and asserts the two
 //! produce identical token ids. CPU-only: no Metal dispatch, so it does not take
-//! `/tmp/lion-metal-gpu-test.lock`.
+//! the GPU measurement lock.
 //!
 //! **The driver stops itself at the model's end-of-turn id; the greedy path does not check EOS
 //! at all and always emits exactly the count it is given.** So the token count comparable output
