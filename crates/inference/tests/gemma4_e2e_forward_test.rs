@@ -22,6 +22,8 @@
 //! ```
 
 #[cfg(feature = "f16")]
+use lattice_inference::GenerateConfig;
+#[cfg(feature = "f16")]
 use lattice_inference::Tokenizer as _;
 #[cfg(feature = "f16")]
 use lattice_inference::model::gemma4_model::Gemma4Model;
@@ -326,6 +328,95 @@ fn stage5_e2e_greedy_and_per_layer_probe_match_hf_golden() {
         return;
     };
     run_gate(&model_dir);
+}
+
+#[cfg(feature = "f16")]
+fn run_shared_driver_gate(model_dir: &Path) {
+    let golden = load_golden();
+    let model =
+        Gemma4Model::from_safetensors(model_dir).expect("loading real gemma-4-e2b-it checkpoint");
+
+    // `stop_token_ids: vec![]` overrides `GenerateConfig::default()`'s
+    // `QWEN_CHAT_IM_END_TOKEN_ID` (248_046): Gemma's vocab_size (262_144) is
+    // large enough that this Qwen-specific id is a valid, unrelated Gemma
+    // token id, so leaving the default in place risks an early, semantically
+    // meaningless stop unrelated to this gate's own greedy-token-parity
+    // question (see `Gemma4Model::generate`'s own doc comment on this
+    // landmine).
+    // `GenerateConfig` is `#[non_exhaustive]` (`crates/inference/src/generation.rs:31`):
+    // this file compiles as a separate integration-test crate, so a struct-literal
+    // construction (including `..Default::default()` functional-update syntax, which
+    // is still struct-literal syntax) is rejected at that boundary (E0639). Starting
+    // from `GenerateConfig::default()` and assigning the fields this gate needs is the
+    // only construction this crate boundary allows.
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = 3;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.repetition_penalty = 1.0;
+    gen_cfg.stop_token_ids = vec![];
+    let output = model
+        .generate(&golden.input_ids, &gen_cfg)
+        .expect("gemma4 shared-driver generate");
+
+    // Gate 3, replayed through the shared decoder driver's public entry
+    // point: identical assertion to `run_gate`'s own greedy-token check
+    // above, over the SAME golden and the SAME real checkpoint, but through
+    // `Gemma4Model::generate` (ADR-090 row R04) instead of the fixed-count
+    // `generate_greedy_with_probe` diagnostic. `output.stopped` is asserted
+    // `false` first: if the run stopped early (e.g. one of the golden's 3
+    // greedy tokens happens to equal this checkpoint's real
+    // `eos_token_id` -- a real, checkpoint-dependent possibility `generate`'s
+    // EOS-aware contract introduces that the diagnostic path above never had
+    // to consider), `token_ids` would be shorter than 3 and the length
+    // assertion below would fail with a confusing message; asserting
+    // `!stopped` first names the actual condition directly.
+    assert!(
+        !output.stopped,
+        "the shared-driver path must not stop before 3 tokens for this golden prompt (stop \
+         reason: {:?}) -- if this fires, one of the golden's 3 greedy tokens likely equals \
+         this checkpoint's real eos_token_id, a real EOS-aware-vs-fixed-count behavioral \
+         difference from generate_greedy_with_probe that needs its own investigation, not a \
+         silently loosened assertion here",
+        output.stop_reason
+    );
+    assert_eq!(
+        output.token_ids, golden.greedy_tokens,
+        "shared-driver greedy tokens must match the HF golden exactly"
+    );
+}
+
+#[cfg(not(feature = "f16"))]
+fn run_shared_driver_gate(_model_dir: &Path) {
+    if skip_allowed() {
+        eprintln!("LATTICE_GEMMA4_E2E_SKIPPED reason=f16_feature_disabled");
+        return;
+    }
+    panic!(
+        "a gemma-4-e2b-it checkpoint is present but the `f16` feature is not enabled -- this \
+         gate's pinned invocation contract requires --features f16. Set \
+         LATTICE_GEMMA4_GATE_SKIP=1 to explicitly skip (only for general-purpose test runs that \
+         are not targeting this gate)."
+    );
+}
+
+/// ADR-090 row R04 (#1597): the same stage-5 golden, replayed through the shared decoder
+/// driver's public entry point (`Gemma4Model::generate`) instead of the fixed-count
+/// `generate_greedy_with_probe` diagnostic path
+/// [`stage5_e2e_greedy_and_per_layer_probe_match_hf_golden`] above exercises. Deliberately not a
+/// new file/module: both arms share one checkpoint resolution and skip/enforce convention. Does
+/// not touch, weaken, or duplicate that test's per-layer-probe or final-logits-top-8 assertions.
+///
+/// The `DriverTrace` opened/consumed assertion lives in `model::gemma4_model`'s own
+/// `#[cfg(test)]` unit tests, not here: `generate_with_trace` and `DriverTrace` are `pub(crate)`
+/// by design, and this file compiles as a separate integration-test crate that can only see
+/// `lattice_inference`'s `pub` surface. `model::qwen35`'s analogous driver-trace test hits the
+/// same crate-boundary constraint and resolves it the same way.
+#[test]
+fn stage5_shared_driver_greedy_matches_hf_golden() {
+    let Some(model_dir) = resolve_model_dir() else {
+        return;
+    };
+    run_shared_driver_gate(&model_dir);
 }
 
 /// Fixture-only check: the boundary golden parses and every case's
