@@ -171,6 +171,15 @@ struct HfGemma4TextConfig {
     sliding_window: usize,
     attention_k_eq_v: bool,
     attention_bias: bool,
+    /// Execution-profile admission gate (ADR-090 Gemma admission preflight,
+    /// issue #1598): the pinned E2B text profile always ships this field
+    /// absent or JSON `null`. Kept untyped (`Option<serde_json::Value>`)
+    /// rather than a bespoke enum so any non-null shape a different upstream
+    /// Gemma attention profile might use is still caught by the admission
+    /// check in [`Gemma4Config::from_config_json_str`] rather than silently
+    /// treated as this loader's E2B geometry.
+    #[serde(default)]
+    use_bidirectional_attention: Option<serde_json::Value>,
     rope_parameters: HfRopeParameters,
     layer_types: Vec<Gemma4LayerType>,
     num_kv_shared_layers: usize,
@@ -291,6 +300,21 @@ impl Gemma4Config {
         let parsed: HfGemma4ConfigFile = serde_json::from_str(json)
             .map_err(|e| InferenceError::Inference(format!("invalid Gemma 4 config.json: {e}")))?;
         let raw = parsed.text_config;
+
+        // Admission preflight (ADR-090 Gemma admission, issue #1598): only
+        // the pinned E2B text profile's absent/null use_bidirectional_attention
+        // is supported. This check runs before any Gemma4Config is
+        // constructed and before Self::validate -- and, reached through
+        // Gemma4Model::from_safetensors, before any weight I/O -- so a
+        // different attention profile is rejected here rather than silently
+        // admitted as this loader's E2B geometry.
+        if let Some(mode) = &raw.use_bidirectional_attention {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: use_bidirectional_attention ({mode}) is \
+                 unsupported -- only an absent or null value (the pinned Gemma 4 E2B text \
+                 profile) is supported by this loader"
+            )));
+        }
 
         let cfg = Gemma4Config {
             hidden_size: raw.hidden_size,
