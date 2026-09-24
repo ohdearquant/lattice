@@ -61,7 +61,27 @@ mod gpu {
         METAL.get_or_init(init_metal).as_ref()
     }
 
+    // lattice#1630: `new_command_buffer` hands back a borrowed reference to an
+    // autoreleased, unretained object (same contract as the Qwen3.5 engine's
+    // dispatch paths, lattice#1584); with no enclosing pool it survives until
+    // the calling thread's outermost pool drains, which on a long-lived
+    // serving worker never happens during a session. `run_gemm` is reached
+    // once per Metal matmul dispatch, so the wrapper below pools exactly one
+    // command buffer + encoder per call.
     fn run_gemm(
+        state: &MetalState,
+        pipeline: &ComputePipelineState,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+        m: u32,
+        n: u32,
+        k: u32,
+    ) {
+        objc::rc::autoreleasepool(|| run_gemm_dispatch(state, pipeline, a, b, c, m, n, k))
+    }
+
+    fn run_gemm_dispatch(
         state: &MetalState,
         pipeline: &ComputePipelineState,
         a: &[f32],

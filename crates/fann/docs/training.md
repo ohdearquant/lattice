@@ -263,35 +263,51 @@ perform the ordinary descent update only after both are present. This behavior
 lets multiple regularizers share one gradient buffer, but it also means a stale
 buffer will be counted again if the caller fails to clear it between updates.
 
-### Null-space delta projection
+### Fisher-weighted delta shrinkage
 
 `project_delta` offers a second, distinct use of the same Fisher estimate: given
 a raw parameter update `delta` (e.g. a policy-gradient step, not necessarily one
-this module computed), damp the components that touch high-Fisher parameters:
+this module computed), damp the components that touch high-Fisher parameters in
+proportion to their importance _relative to the mean_:
 
 ```text
-scale_i = max(0, 1 − F_i / F_max)
+F_ref   = mean_i(F_i)
+scale_i = 1 / (1 + alpha · F_i / F_ref)
 delta_i ← delta_i · scale_i
 ```
 
-Parameters at the maximum observed Fisher value are scaled to (near) zero —
-their update is blocked entirely. Parameters with `F_i = 0` pass through
-unchanged (`scale_i = 1`). This is a diagonal (per-parameter) approximation to
-projecting the update into the null space of the Fisher matrix; a full
-SVD-based null-space projection is more accurate but `O(n³)`, and is deferred
-in favor of this `O(n)` approximation, which is judged adequate for online
-continual learning where updates arrive one sample or small batch at a time.
+`scale_i` is the closed-form minimiser of
+`||d - delta||² + alpha · Σ_i (F_i / F_ref) · d_i²` — a per-coordinate ridge
+(ℓ2) penalty proportional to relative Fisher importance. `alpha`
+(`PROJECT_DELTA_ALPHA` in `ewc.rs`, default `1.0`) sets the damping strength.
+This formula replaced a max-normalised linear damping
+(`scale_i = max(0, 1 − F_i / F_max)`) that zeroed the coordinate at the maximum
+observed Fisher value outright, and zeroed _every_ coordinate whenever the
+Fisher was uniform and non-zero — reachable on the very first
+`one_gradient_step` call in `router_update.rs`, whose Fisher EMA starts at zero
+so `F_i` is proportional to that step's own `delta_i²` (issue #1575).
+
+The replacement never reaches zero for a finite `F_i`: a uniform non-zero
+Fisher scales every coordinate by exactly `1 / (1 + alpha)` (with the default
+`alpha = 1.0`, that's `0.5`), a higher `F_i` always produces strictly more
+damping than a lower one, and the scale is invariant to multiplying every
+`F_i` by the same positive constant, since only the ratio `F_i / F_ref`
+appears. Parameters with `F_i = 0` are damped the least, but only relative to
+whatever the rest of the vector observed — they no longer pass through
+completely unchanged unless the whole Fisher is zero.
 
 **Degenerate-Fisher guard**: if no gradient has ever been observed
-(`F_max < 1e-8`), `project_delta` returns immediately without modifying
-`delta` — there's no importance signal yet, so treating it as identity avoids
-a division by (near-)zero.
+(`F_ref < 1e-8`, i.e. the mean Fisher value rather than the maximum),
+`project_delta` returns immediately without modifying `delta` — there's no
+importance signal yet, so treating it as identity avoids dividing by
+(near-)zero. `project_delta` also returns unchanged when the Fisher holds no
+values at all (`num_params == 0`).
 
-Projection does not use the anchor and is not equivalent to adding the penalty
+Shrinkage does not use the anchor and is not equivalent to adding the penalty
 gradient. It is a direct, relative suppression of an already computed update:
-the largest Fisher entry receives scale zero, while lower-importance entries
-receive a scale relative to that maximum. Choose one approach deliberately, or
-combine them only when the resulting amount of protection is intended.
+every coordinate is damped in proportion to how far its Fisher value sits
+above (or below) the mean. Choose one approach deliberately, or combine them
+only when the resulting amount of protection is intended.
 
 ### API error contracts
 

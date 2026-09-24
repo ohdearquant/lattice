@@ -699,7 +699,7 @@ pub(crate) fn validate_q3_header_payload_bounds(
 /// version, or a header whose shape product disagrees with `original_len`.
 pub fn load_q3_file(path: &std::path::Path) -> Result<Q3Tensor, Box<dyn std::error::Error>> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
+    let mut f = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
     let file_len = f.metadata()?.len();
 
     let mut magic = [0u8; 4];
@@ -1055,6 +1055,47 @@ mod tests {
         let path = dir.join(format!("lattice_q3_badmagic_{}.q3", std::process::id()));
         std::fs::write(&path, b"KHQ4\x01\x00\x00\x00").unwrap();
         assert!(load_q3_file(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #1380: `load_q3_file` is the `.q3` sibling of the FIFO regression
+    // covering `load_q4_file`/`load_f16_tensor_file` -- same raw-open shape
+    // (a plain `File::open` before any file-type check), same fix. `mkfifo`
+    // (POSIX, not macOS-only) keeps this test portable to the Linux CI legs
+    // that run this suite.
+    #[test]
+    fn load_q3_file_rejects_a_fifo_without_blocking() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("lattice_q3_fifo_{}.q3", std::process::id()));
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must succeed to set up this test");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = path.clone();
+        // A pre-fix blocking `File::open` on this FIFO (no writer ever
+        // connects) would hang this thread forever; running the call on a
+        // detached thread and racing it against a deadline on
+        // `rx.recv_timeout` turns "hangs forever" into an observable test
+        // failure instead of an actually-hung test process.
+        std::thread::spawn(move || {
+            // `Box<dyn Error>` is not `Send` (no `+ Send` bound), so it
+            // cannot cross this channel -- map to its `Display` text first.
+            let result = load_q3_file(&probe_path).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        let result: Result<Q3Tensor, String> =
+            rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+                "load_q3_file did not return within 5s -- it blocked on the planted FIFO, \
+                 meaning the open-time regular-file guard regressed",
+            );
+        let err = result.expect_err("a FIFO must be rejected, not accepted, for a .q3 load");
+        assert!(
+            err.contains("not a regular file"),
+            "expected a not-a-regular-file refusal, got: {err}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

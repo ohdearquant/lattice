@@ -1019,7 +1019,7 @@ pub(crate) fn open_and_mmap_q4_file(
 ///
 /// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
 pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
-    let f = std::fs::File::open(path)?;
+    let f = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
     load_q4_from_open_file(f, path, None)
 }
 
@@ -1030,7 +1030,7 @@ pub(crate) fn load_q4_file_checked(
     path: &std::path::Path,
     expected_shape: &[usize],
 ) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
-    let f = std::fs::File::open(path)?;
+    let f = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
     load_q4_from_open_file(f, path, Some(expected_shape))
 }
 
@@ -1213,7 +1213,8 @@ pub fn load_f16_tensor_file_expecting(
     path: &std::path::Path,
     expected: &[usize],
 ) -> Result<(Vec<f32>, Vec<usize>), F16LoadError> {
-    let f = std::fs::File::open(path).map_err(|e| F16LoadError::Other(Box::new(e)))?;
+    let f = crate::weights::mmap_trust::open_regular_file_no_hang(path)
+        .map_err(|e| F16LoadError::Other(e.into()))?;
     load_f16_tensor_from_open_file_expecting(f, &path.display().to_string(), expected)
 }
 
@@ -1260,7 +1261,7 @@ pub(crate) fn load_f16_tensor_from_open_file_expecting(
 pub fn load_f16_tensor_file(
     path: &std::path::Path,
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
-    let f = std::fs::File::open(path)?;
+    let f = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
     load_f16_tensor_from_open_file(f, &path.display().to_string(), None)
 }
 
@@ -1271,7 +1272,7 @@ pub(crate) fn load_f16_tensor_file_checked(
     path: &std::path::Path,
     expected_shape: &[usize],
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
-    let f = std::fs::File::open(path)?;
+    let f = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
     load_f16_tensor_from_open_file(f, &path.display().to_string(), Some(expected_shape))
 }
 
@@ -1403,7 +1404,7 @@ pub(crate) fn read_q4_payload_bounded(
 ) -> Result<(Q4FileHeader, Vec<u8>), Box<dyn std::error::Error>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path)?;
+    let mut file = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
     let header = read_q4_header(&mut file)?;
     let file_len = file.metadata()?.len();
     if file_len < header.payload_offset {
@@ -2339,6 +2340,78 @@ mod tests {
         save_q4_file(&path, &q).unwrap();
         let reloaded = load_q4_file(&path).expect("the loader must accept what the writer emits");
         assert_eq!(reloaded.blocks, q.blocks);
+    }
+
+    // #1380: `load_q4_file` is a raw-open checkpoint loader entry point,
+    // structurally identical to the three the issue named, that used to
+    // call plain `File::open` before any file-type check ran. A FIFO
+    // planted at the `.q4` path -- an attacker or a misconfigured MTP
+    // sidecar directory -- blocked this call indefinitely. Proves the fix
+    // the same way as the other loader entry points: the call must return
+    // (any return) inside a deadline, and the return must specifically
+    // reject the FIFO as non-regular. `mkfifo` (POSIX, not macOS-only)
+    // keeps this test portable to the Linux CI legs that run this suite.
+    #[test]
+    fn load_q4_file_rejects_a_fifo_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("planted.q4");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must succeed to set up this test");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = path.clone();
+        std::thread::spawn(move || {
+            // `Box<dyn Error>` is not `Send` (no `+ Send` bound), so it
+            // cannot cross this channel -- map to its `Display` text first,
+            // same as the `.f16`/`.q3` siblings below.
+            let result = load_q4_file(&probe_path).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        let result: Result<Q4Tensor, String> =
+            rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+                "load_q4_file did not return within 5s -- it blocked on the planted FIFO, \
+                 meaning the open-time regular-file guard regressed",
+            );
+        let err = result.expect_err("a FIFO must be rejected, not accepted, for a .q4 load");
+        assert!(
+            err.contains("not a regular file"),
+            "expected a not-a-regular-file refusal, got: {err}"
+        );
+    }
+
+    // #1380: `load_f16_tensor_file` is the `.f16` sibling of the FIFO
+    // regression above -- same raw-open shape, same fix.
+    #[test]
+    fn load_f16_tensor_file_rejects_a_fifo_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("planted.f16");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must succeed to set up this test");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = path.clone();
+        std::thread::spawn(move || {
+            // `Box<dyn Error>` is not `Send` (no `+ Send` bound), so it
+            // cannot cross this channel -- map to its `Display` text first.
+            let result = load_f16_tensor_file(&probe_path).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        let result: Result<(Vec<f32>, Vec<usize>), String> =
+            rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+                "load_f16_tensor_file did not return within 5s -- it blocked on the planted \
+                 FIFO, meaning the open-time regular-file guard regressed",
+            );
+        let err = result.expect_err("a FIFO must be rejected, not accepted, for a .f16 load");
+        assert!(
+            err.contains("not a regular file"),
+            "expected a not-a-regular-file refusal, got: {err}"
+        );
     }
 
     #[test]

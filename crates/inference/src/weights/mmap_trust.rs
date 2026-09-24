@@ -586,7 +586,6 @@ impl std::io::Seek for TrustedMmapFile {
 #[cfg(unix)]
 #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
 pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, String> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 
     // `custom_flags` REPLACES the custom-flag bits on each call rather than
@@ -629,27 +628,7 @@ pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, Str
         ));
     }
 
-    let fd = file.as_raw_fd();
-    // SAFETY: `fd` is a valid, open descriptor for the duration of these
-    // two calls; `F_GETFL`/`F_SETFL` take/return an `int` and do not retain
-    // the fd past the call.
-    let flags = unsafe { fcntl(fd, F_GETFL) };
-    if flags == -1 {
-        return Err(format!(
-            "failed to read fd flags for {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: same fd, clearing exactly the `O_NONBLOCK` bit this function
-    // set when opening.
-    if unsafe { fcntl(fd, F_SETFL, flags & !O_NONBLOCK) } == -1 {
-        return Err(format!(
-            "failed to clear O_NONBLOCK for {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
+    clear_o_nonblock(&file, path)?;
 
     reject_if_mmap_parent_directory_chain_weak(path)?;
     reject_if_mmap_file_trust_boundary_weak(&file, path)?;
@@ -673,6 +652,103 @@ pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, Str
         prior: meta,
         path: path.to_path_buf(),
     })
+}
+
+/// Clear `O_NONBLOCK` on `file`'s descriptor once the caller's own open-time
+/// regular-file guard has run, so a subsequent read or mmap of the confirmed
+/// regular file behaves exactly as if the flag had never been set --
+/// `O_NONBLOCK` has no effect on regular-file I/O either way, so this is
+/// pure hygiene, not a behavior change for whatever the caller does next.
+/// Shared by every open-time guard in this module that sets `O_NONBLOCK`
+/// ([`open_trusted_mmap_file`], [`open_regular_file_no_hang`]) so the two
+/// `fcntl` calls exist in one place.
+#[cfg(unix)]
+fn clear_o_nonblock(file: &File, path: &Path) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is a valid, open descriptor for the duration of these
+    // two calls; `F_GETFL`/`F_SETFL` take/return an `int` and do not retain
+    // the fd past the call.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags == -1 {
+        return Err(format!(
+            "failed to read fd flags for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: same fd, clearing exactly the `O_NONBLOCK` bit the caller set
+    // when opening.
+    if unsafe { fcntl(fd, F_SETFL, flags & !O_NONBLOCK) } == -1 {
+        return Err(format!(
+            "failed to clear O_NONBLOCK for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Open `path` for a checkpoint loader that must follow a final-component
+/// symlink -- a HuggingFace hub-cache checkpoint stores its tensor file as a
+/// symlink into the blob store, so [`open_trusted_mmap_file`]'s `O_NOFOLLOW`
+/// would reject every such checkpoint outright (see that function's doc
+/// comment, and [`reject_if_open_mmap_file_untrusted`]'s, for the full
+/// reasoning). Guards against the same FIFO/device hang
+/// [`open_trusted_mmap_file`]'s "FIFO / device DoS" section documents: a
+/// plain, symlink-following `File::open` on a FIFO with no writer at the
+/// other end blocks the calling thread indefinitely, and the path here names
+/// a checkpoint file that is fully attacker- or mistake-controlled up to
+/// this point (nothing has validated it yet) (#1380).
+///
+/// Runs the identical open-time sequence [`open_trusted_mmap_file`] does --
+/// open with `O_NONBLOCK`, reject anything that is not a regular file, clear
+/// `O_NONBLOCK` -- with `O_NOFOLLOW` dropped, so a symlink at the final path
+/// component is followed rather than rejected at `open()`.
+///
+/// Unlike [`open_trusted_mmap_file`], this does not itself run the
+/// mode/uid/ACL or parent-directory trust checks and returns a plain
+/// [`File`] rather than a [`TrustedMmapFile`]: a caller that goes on to mmap
+/// the result runs [`reject_if_open_mmap_file_untrusted`] against it
+/// afterward (every symlink-following mmap loader in this crate already
+/// does); a caller that instead reads it into an owned buffer (lattice's own
+/// `.q4`/`.q3`/`.f16` sidecar files, which per this module's doc comment are
+/// never a hub-cache symlink and so have never gone through the mode/uid/ACL
+/// gate at all) uses the returned handle directly -- adding that gate to
+/// those callers is a separate, broader hardening step this function does
+/// not take on their behalf.
+#[cfg(unix)]
+pub(crate) fn open_regular_file_no_hang(path: &Path) -> Result<File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "refusing to load {}: not a regular file -- checkpoint loads \
+             must be a plain file on disk. FIFOs, devices, sockets, and \
+             directories are rejected here, before any trust check or \
+             blocking read, so an attacker-planted node at the model path \
+             cannot hang or misdirect the load.",
+            path.display()
+        ));
+    }
+
+    clear_o_nonblock(&file, path)?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_regular_file_no_hang(path: &Path) -> Result<File, String> {
+    File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))
 }
 
 /// Post-map integrity recheck, replacing a previous
@@ -1713,6 +1789,57 @@ mod tests {
             err.contains("not a regular file"),
             "error must name the directory as the non-regular-file rejection cause; got: {err}"
         );
+    }
+
+    // Regression test for #1380: `open_regular_file_no_hang` is the
+    // symlink-following counterpart of `open_trusted_mmap_file` this issue
+    // added -- a FIFO planted at the checkpoint path must still be rejected
+    // FAST, not by hanging the calling thread, exactly as
+    // `open_trusted_mmap_file_rejects_a_fifo_without_blocking` proves for
+    // the `O_NOFOLLOW` flavor above.
+    #[test]
+    fn open_regular_file_no_hang_rejects_a_fifo_without_blocking() {
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let path = tmp.path().join("planted.safetensors");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must succeed to set up this test");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = path.clone();
+        std::thread::spawn(move || {
+            let result = open_regular_file_no_hang(&probe_path);
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "open_regular_file_no_hang did not return within 5s -- it blocked on the \
+             planted FIFO, meaning the O_NONBLOCK open-time guard regressed",
+        );
+        let err = result.expect_err("a FIFO must be rejected, not accepted, for a mmap load");
+        assert!(
+            err.contains("not a regular file"),
+            "error must name the FIFO as the non-regular-file rejection cause; got: {err}"
+        );
+    }
+
+    // Unlike `open_trusted_mmap_file`, this function must follow a
+    // final-component symlink rather than reject it -- that is the entire
+    // reason it exists (HuggingFace hub-cache checkpoints symlink
+    // `model.safetensors` into the blob store).
+    #[test]
+    fn open_regular_file_no_hang_follows_a_symlinked_final_component() {
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let real_path = tmp.path().join("real.safetensors");
+        std::fs::write(&real_path, b"a real checkpoint-shaped regular file")
+            .expect("write real fixture");
+
+        let symlink_path = tmp.path().join("model.safetensors");
+        std::os::unix::fs::symlink(&real_path, &symlink_path).expect("create symlink fixture");
+
+        open_regular_file_no_hang(&symlink_path)
+            .expect("a symlink at the final path component must be followed, not rejected");
     }
 
     // A normal regular file must still be accepted end-to-end through
