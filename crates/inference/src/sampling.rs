@@ -332,18 +332,66 @@ impl CandidateSet {
         if !max_logit.is_finite() {
             return self.candidates[0].token_id;
         }
-        probs.clear();
-        probs.extend(self.candidates.iter().map(|c| (c.logit - max_logit).exp()));
 
         // Since every softmax weight shares the same normalizing denominator,
         // `probability >= min_p * max_probability` is exactly equivalent to
-        // `exp(logit - max_logit) >= min_p`. Filtering the unnormalized
-        // weights avoids an extra normalization pass. Candidates are already
-        // sorted by descending logit, so the survivors form one prefix.
+        // `exp(logit - max_logit) >= min_p`, i.e. `logit >= max_logit + ln(min_p)`.
+        // Candidates are already sorted by descending logit, so both forms agree
+        // on a single prefix/tail split. Rejecting the tail by the logit-space
+        // threshold *before* exponentiating means only the survivors ever pay for
+        // `exp`; with `top_k == 0` the tail is the entire vocabulary minus a
+        // handful of survivors, so the previous shape (`exp` every candidate,
+        // then throw most of them away) exponentiated on the order of 250k
+        // floats per token for a filter that typically keeps a few dozen.
         if min_p > 0.0 {
-            // Preserve the fail-closed contract for direct CandidateSet callers:
-            // a NaN after the first below-threshold finite weight must not be hidden
-            // by truncation and turn a poisoned distribution into a normal draw.
+            // Preserve the fail-closed contract for direct CandidateSet callers: a
+            // NaN anywhere in the (still untruncated) set must fall back to argmax
+            // rather than silently sampling a poisoned distribution, even when the
+            // NaN sits past where min-p would have truncated. `candidate_order`
+            // sorts every NaN logit after every finite one (ties broken by
+            // ascending token_id), and `max_logit` is already confirmed finite
+            // above, so "some weight is non-finite" reduces to "the last candidate
+            // is NaN" — an O(1) check that needs no `exp()` at all, unlike the
+            // full-array scan this replaces.
+            if self.candidates.last().is_some_and(|c| c.logit.is_nan()) {
+                return self.candidates[0].token_id;
+            }
+
+            // `ln` and `exp` are not exact float32 inverses, so `logit_threshold`
+            // can differ from the true real-valued cutoff by a few ULPs. `margin`
+            // widens the threshold *downward* (toward keeping more candidates) by
+            // well over an order of magnitude more than that rounding error,
+            // scaled by the magnitude of the values that produced it (so it stays
+            // proportionally generous regardless of how large `max_logit` or how
+            // negative `ln(min_p)` is). `prefix_len` is therefore guaranteed to be
+            // a superset of whatever the exact p-space test below would keep,
+            // never a subset — every candidate this prefix admits still runs
+            // through that untouched, byte-identical `exp` + `weight < min_p`
+            // comparison, so the boundary inclusion decision is unchanged from
+            // before. The logit threshold only decides how much of the
+            // definitely-rejected tail can skip `exp()` entirely.
+            let log_min_p = min_p.ln();
+            let logit_threshold = max_logit + log_min_p;
+            let margin = 256.0 * f32::EPSILON * (max_logit.abs() + log_min_p.abs()).max(1.0);
+            let safe_threshold = logit_threshold - margin;
+            let prefix_len = self
+                .candidates
+                .iter()
+                .position(|c| c.logit < safe_threshold)
+                .unwrap_or(self.candidates.len())
+                .max(1);
+            self.candidates.truncate(prefix_len);
+        }
+
+        probs.clear();
+        probs.extend(self.candidates.iter().map(|c| (c.logit - max_logit).exp()));
+
+        if min_p > 0.0 {
+            // Dead in practice after the NaN check above (no remaining candidate
+            // can carry a NaN logit, and none but a possible index 0 can be +inf,
+            // which `max_logit.is_finite()` already excluded) — kept as the same
+            // defense-in-depth fail-closed check the pre-existing algorithm ran,
+            // now scoped to the (small) surviving prefix instead of the full set.
             if probs.iter().any(|weight| !weight.is_finite()) {
                 return self.candidates[0].token_id;
             }
@@ -2133,6 +2181,316 @@ mod tests {
             0,
             "a NaN after the min-p cutoff must preserve the argmax fail-closed fallback"
         );
+    }
+
+    /// Reference oracle for #1394 item 2: the min-p algorithm exactly as it
+    /// stood before the logit-threshold tail rejection in
+    /// `CandidateSet::sample_min_p_top_p_with_scratch` -- exponentiate every
+    /// sorted candidate first, then filter the unnormalized weights against
+    /// `min_p`. Kept byte-for-byte (down to the `.max(1)` cutoffs and the
+    /// fail-closed NaN scan) purely for the differential tests below; not used
+    /// on any production path.
+    fn sample_min_p_top_p_reference(
+        cs: &mut CandidateSet,
+        min_p: f32,
+        top_p: f32,
+        r: f32,
+        probs: &mut Vec<f32>,
+    ) -> u32 {
+        if cs.candidates.is_empty() {
+            return 0;
+        }
+        let min_p = if min_p.is_nan() {
+            0.0
+        } else {
+            min_p.clamp(0.0, 1.0)
+        };
+        let top_p = if top_p.is_nan() {
+            1.0
+        } else {
+            top_p.clamp(0.0, 1.0)
+        };
+
+        cs.candidates.sort_by(candidate_order);
+        let max_logit = cs.candidates[0].logit;
+        if !max_logit.is_finite() {
+            return cs.candidates[0].token_id;
+        }
+        probs.clear();
+        probs.extend(cs.candidates.iter().map(|c| (c.logit - max_logit).exp()));
+
+        if min_p > 0.0 {
+            if probs.iter().any(|weight| !weight.is_finite()) {
+                return cs.candidates[0].token_id;
+            }
+            let cutoff = probs
+                .iter()
+                .position(|&weight| weight < min_p)
+                .unwrap_or(probs.len())
+                .max(1);
+            probs.truncate(cutoff);
+            cs.candidates.truncate(cutoff);
+        }
+
+        let sum: f32 = probs.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 {
+            return cs.candidates[0].token_id;
+        }
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+
+        if top_p < 1.0 {
+            let mut cumsum = 0.0f32;
+            let mut cutoff = probs.len();
+            for (i, &p) in probs.iter().enumerate() {
+                cumsum += p;
+                if cumsum >= top_p {
+                    cutoff = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(cutoff);
+            cs.candidates.truncate(cutoff);
+            let sum: f32 = probs.iter().sum();
+            for p in probs.iter_mut() {
+                *p /= sum;
+            }
+        }
+
+        let mut cumsum = 0.0f32;
+        for (c, &p) in cs.candidates.iter().zip(probs.iter()) {
+            cumsum += p;
+            if r < cumsum {
+                return c.token_id;
+            }
+        }
+        cs.candidates.last().map(|c| c.token_id).unwrap_or(0)
+    }
+
+    /// #1394 item 2: at logit offsets straddling the exact log-space threshold
+    /// by as little as 1e-7 (comparable to the ULP of `ln(0.5)` itself, ~4e-8),
+    /// the optimized path's logit-threshold prefix must still land on the same
+    /// side as the reference algorithm's exact `exp(logit - max) < min_p` test
+    /// -- either by classifying the candidate identically outright, or by
+    /// pulling it into the exact-recheck prefix so the untouched p-space
+    /// comparison decides it. Both the selected token and the full final
+    /// probability vector must match exactly (not just to a tolerance): with
+    /// the same survivor set, both paths run the identical `exp`/normalize
+    /// sequence in the identical order, so bit-exact equality is the correct
+    /// expectation, not merely a close one.
+    #[test]
+    fn min_p_logit_threshold_boundary_band_matches_reference() {
+        let ln_half = 0.5_f32.ln();
+        for &eps in &[-1e-3_f32, -1e-5, -1e-7, 0.0, 1e-7, 1e-5, 1e-3] {
+            let boundary_logit = ln_half + eps;
+            let build = || {
+                CandidateSet::from_candidates(vec![
+                    Candidate {
+                        token_id: 0,
+                        logit: 0.0,
+                    },
+                    Candidate {
+                        token_id: 1,
+                        logit: boundary_logit,
+                    },
+                    Candidate {
+                        token_id: 2,
+                        logit: -5.0,
+                    },
+                ])
+            };
+            for &r in &[0.05_f32, 0.3, 0.6, 0.8, 0.95] {
+                let mut probs_new = Vec::new();
+                let mut cs_new = build();
+                let token_new = cs_new.sample_min_p_top_p_with_scratch(0.5, 1.0, r, &mut probs_new);
+
+                let mut probs_ref = Vec::new();
+                let mut cs_ref = build();
+                let token_ref =
+                    sample_min_p_top_p_reference(&mut cs_ref, 0.5, 1.0, r, &mut probs_ref);
+
+                assert_eq!(
+                    token_new, token_ref,
+                    "boundary eps={eps:e} r={r}: optimized vs reference token mismatch"
+                );
+                assert_eq!(
+                    probs_new, probs_ref,
+                    "boundary eps={eps:e} r={r}: final probability vectors differ"
+                );
+            }
+        }
+    }
+
+    /// #1394 item 2: differential test between the pre-optimization reference
+    /// algorithm above and the production logit-threshold path, over many
+    /// seeded random logit vectors x min_p x temperature x top_k (including
+    /// top_k=0, the full-vocabulary case the issue calls out). The selected
+    /// token must match exactly (both draw off the same `r` against the same
+    /// cumulative distribution), and the final probabilities to within 1 ULP:
+    /// both paths compute a surviving candidate's weight with the identical
+    /// `(logit - max_logit).exp()` expression in the identical sorted order,
+    /// so the only way probabilities could differ is a different survivor set
+    /// -- exactly what a length/value mismatch here would catch. Every case
+    /// generated in this run held bitwise (0 ULP); 1 ULP is declared as the
+    /// tolerance rather than 0 because a future libm rounding change to `exp`
+    /// could move both call sites (they are literally the same expression) by
+    /// the same sub-ULP amount without being a regression in this algorithm.
+    #[test]
+    fn min_p_logit_threshold_matches_reference_across_seeds() {
+        let min_ps = [0.0_f32, 0.02, 0.05, 0.1, 0.3, 0.5, 0.7, 0.999_999_9, 1.0];
+        let temperatures = [1.0_f32, 0.7, 2.0];
+        let top_ks = [0usize, 8, 64];
+        let vocab_size = 512usize;
+
+        let mut seed: u64 = 0x0C0F_FEE1_5BAD_5EED_u64;
+
+        for &min_p in &min_ps {
+            for &temperature in &temperatures {
+                for &top_k in &top_ks {
+                    for case in 0..20u32 {
+                        let mut logits = Vec::with_capacity(vocab_size);
+                        for i in 0..vocab_size {
+                            let u = uniform_f32_from_u64(xorshift64_next(&mut seed));
+                            let mut logit = (u - 0.5) * 16.0;
+                            if i % 251 == 0 && i > 0 {
+                                // Force an exact tie with the previous logit
+                                // occasionally, exercising the tie-break path.
+                                logit = logits[i - 1];
+                            }
+                            logits.push(logit);
+                        }
+                        if case % 7 == 0 {
+                            // `select_top_k`'s Phase 1 seed pass sanitizes every
+                            // NaN scaled logit to NEG_INFINITY before a
+                            // `Candidate` is ever built (see its own doc
+                            // comment), for every `top_k` including 0 (whose
+                            // `take(k)` covers the whole vocabulary) -- so a
+                            // NaN injected upstream of `select_top_k` can never
+                            // reach `CandidateSet` as an actual NaN here. This
+                            // still exercises a real, distinct edge case
+                            // (a finite-weight NEG_INFINITY tail candidate,
+                            // `exp(-inf - max) == 0.0`), just not the
+                            // fail-closed NaN contract -- that is covered
+                            // separately by
+                            // `min_p_logit_threshold_matches_reference_with_nan_candidates`
+                            // below, which builds a `CandidateSet` directly.
+                            let idx = (seed as usize) % vocab_size;
+                            logits[idx] = f32::NAN;
+                        }
+
+                        let inv_temp = 1.0 / temperature;
+                        let mut candidate_scratch = Vec::new();
+                        select_top_k(&logits, top_k, inv_temp, &mut candidate_scratch);
+
+                        let r = uniform_f32_from_u64(xorshift64_next(&mut seed));
+
+                        let mut probs_new = Vec::new();
+                        let mut cs_new = CandidateSet {
+                            candidates: candidate_scratch.clone(),
+                        };
+                        let token_new =
+                            cs_new.sample_min_p_top_p_with_scratch(min_p, 0.95, r, &mut probs_new);
+
+                        let mut probs_ref = Vec::new();
+                        let mut cs_ref = CandidateSet {
+                            candidates: candidate_scratch,
+                        };
+                        let token_ref = sample_min_p_top_p_reference(
+                            &mut cs_ref,
+                            min_p,
+                            0.95,
+                            r,
+                            &mut probs_ref,
+                        );
+
+                        assert_eq!(
+                            token_new, token_ref,
+                            "min_p={min_p} temperature={temperature} top_k={top_k} \
+                             case={case} r={r}: optimized vs reference token mismatch"
+                        );
+                        assert_eq!(
+                            probs_new.len(),
+                            probs_ref.len(),
+                            "min_p={min_p} temperature={temperature} top_k={top_k} \
+                             case={case} r={r}: final probability vector lengths differ"
+                        );
+                        for (i, (&a, &b)) in probs_new.iter().zip(probs_ref.iter()).enumerate() {
+                            let ulp_distance = a.to_bits().abs_diff(b.to_bits());
+                            assert!(
+                                ulp_distance <= 1,
+                                "min_p={min_p} temperature={temperature} top_k={top_k} \
+                                 case={case} r={r} index={i}: probability {a} vs \
+                                 reference {b} differ by {ulp_distance} ULP"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// #1394 item 2: differential test for the NaN fail-closed contract itself
+    /// (the fuzz test above cannot reach it -- see the comment at its NaN
+    /// injection site). Builds `CandidateSet`s directly so an actual NaN
+    /// logit reaches `sample_min_p_top_p_with_scratch`, at several positions
+    /// relative to where min-p would otherwise have truncated, and asserts
+    /// the optimized path's O(1) "last candidate is NaN" short-circuit
+    /// returns the same argmax fallback token as the reference's full-array
+    /// scan in every case. Only the returned token is compared, not the
+    /// `probs` scratch buffer: on this fail-closed path the optimized
+    /// function returns before ever touching `probs` (the check now runs
+    /// before the `exp()` pass, which is the whole point of moving it), while
+    /// the reference populates `probs` with the NaN-poisoned weights first --
+    /// a real difference in leftover scratch-buffer content, but not an
+    /// output difference, since no caller reads `probs`/`prob_scratch` after
+    /// the call; only the returned token is part of the observable contract.
+    #[test]
+    fn min_p_logit_threshold_matches_reference_with_nan_candidates() {
+        // logits, chosen so a NaN can land strictly before, at, or after
+        // where min_p=0.5 (threshold weight 0.5 relative to max) truncates:
+        // max=4.0; token weight 0.5*max survivor at logit ln(0.5)+4.0≈3.307;
+        // token 2 (1.0) and token 4 (0.5) sit below the cutoff.
+        let base = [
+            (0u32, 4.0_f32),
+            (1u32, 3.5_f32), // weight exp(-0.5) ≈ 0.6065, survives min_p=0.5
+            (2u32, 1.0_f32), // weight exp(-3.0) ≈ 0.0498, pruned by min_p=0.5
+            (3u32, 0.5_f32), // weight exp(-3.5) ≈ 0.0302, pruned by min_p=0.5
+        ];
+
+        for nan_token in [0u32, 1, 2, 3] {
+            let build = || {
+                CandidateSet::from_candidates(
+                    base.iter()
+                        .map(|&(token_id, logit)| Candidate {
+                            token_id,
+                            logit: if token_id == nan_token {
+                                f32::NAN
+                            } else {
+                                logit
+                            },
+                        })
+                        .collect(),
+                )
+            };
+            for &r in &[0.1_f32, 0.5, 0.9] {
+                let mut probs_new = Vec::new();
+                let mut cs_new = build();
+                let token_new = cs_new.sample_min_p_top_p_with_scratch(0.5, 1.0, r, &mut probs_new);
+
+                let mut probs_ref = Vec::new();
+                let mut cs_ref = build();
+                let token_ref =
+                    sample_min_p_top_p_reference(&mut cs_ref, 0.5, 1.0, r, &mut probs_ref);
+
+                assert_eq!(
+                    token_new, token_ref,
+                    "nan_token={nan_token} r={r}: optimized vs reference token mismatch"
+                );
+                // `probs_new`/`probs_ref` are deliberately not compared here — see the
+                // doc comment above.
+            }
+        }
     }
 
     #[test]
