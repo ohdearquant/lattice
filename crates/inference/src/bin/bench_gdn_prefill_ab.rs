@@ -61,6 +61,276 @@ fn main() {
     }
 }
 
+/// Canonical model identity used to key `prod_anchor_band`, matched on the
+/// FINAL PATH COMPONENT of `LATTICE_MODEL_DIR` (trailing slash tolerated),
+/// not a substring of the whole path. This harness has only ever loaded, and
+/// its production-anchor bands have only ever been calibrated against, the
+/// one checkpoint directory named exactly `qwen3.5-0.8b` (see the module
+/// doc's "Scope guard: 0.8B path ONLY" and `LATTICE_MODEL_DIR`'s own default
+/// below). `None` covers every model directory that does not match exactly,
+/// including a differently-sized checkpoint (`qwen3.5-27b`) or a
+/// differently-quantized variant of the same checkpoint distributed under a
+/// suffixed directory name (`qwen3.5-0.8b-q4`) — a substring match would
+/// wrongly recognize both of those as the calibrated checkpoint.
+#[cfg(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "bench-internals"
+))]
+fn model_identity(model_dir_str: &str) -> Option<&'static str> {
+    let trimmed = model_dir_str.trim_end_matches('/');
+    let component = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    match component {
+        "qwen3.5-0.8b" | "qwen3.5-0_8b" => Some("qwen3.5-0.8b"),
+        _ => None,
+    }
+}
+
+/// Mirrors `forward::metal_qwen35::QuantFormat` (crates/inference/src/forward/
+/// metal_qwen35.rs, `from_env`/`from_model_size`/`resolve` ~1521-1558). That
+/// type and its resolver methods are `pub(crate)`/private, unreachable from
+/// this bin (a separate compilation unit from `lattice-inference`'s own
+/// integration tests/benches), so the parsing is duplicated here rather than
+/// exposing new public API for one caller. The anchor key below must reflect
+/// the SAME effective format `MetalQwen35Engine::new` resolves for the loaded
+/// checkpoint (env var override first, model-size default otherwise) — a
+/// substring-only `(model, length)` key ignored this entirely, so a run under
+/// `LATTICE_QUANT_FORMAT=Q4_0` was scored against a band calibrated under the
+/// default Q8_0 dispatch.
+///
+/// Keep this table in sync with the engine's resolver by hand; the
+/// `quant_format_mirror_tests` module below pins the parse table so a drift
+/// between the two copies shows up as a test failure here rather than a
+/// silently wrong anchor comparison.
+#[cfg(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "bench-internals"
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuantFormat {
+    Q8_0,
+    Q4_0,
+}
+
+#[cfg(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "bench-internals"
+))]
+impl QuantFormat {
+    /// Mirrors `QuantFormat::from_env`, but takes the env value as a
+    /// parameter (rather than reading `std::env::var` itself) so tests can
+    /// exercise every branch without mutating process environment.
+    /// Case-insensitive; an unrecognized non-empty value returns `None` —
+    /// same as unset — matching the engine's own fall-through to the
+    /// model-size default rather than treating a typo'd value as an error.
+    fn from_env_value(value: Option<&str>) -> Option<Self> {
+        match value?.to_uppercase().as_str() {
+            "Q8_0" | "Q8" => Some(QuantFormat::Q8_0),
+            "Q4_0" | "Q4" => Some(QuantFormat::Q4_0),
+            _ => None,
+        }
+    }
+
+    /// Mirrors `QuantFormat::from_model_size` exactly (same estimator, same
+    /// 2B-parameter threshold).
+    fn from_model_size(cfg: &lattice_inference::model::qwen35_config::Qwen35Config) -> Self {
+        let h = cfg.hidden_size;
+        let i = cfg.intermediate_size;
+        let n = cfg.num_hidden_layers;
+        let v = cfg.vocab_size;
+        let est_params = n * (4 * h * h + 3 * h * i) + v * h;
+        if est_params > 2_000_000_000 {
+            QuantFormat::Q4_0
+        } else {
+            QuantFormat::Q8_0
+        }
+    }
+
+    /// Mirrors `QuantFormat::resolve`'s precedence: env override first, then
+    /// the model-size default.
+    fn resolve(
+        cfg: &lattice_inference::model::qwen35_config::Qwen35Config,
+        env_value: Option<&str>,
+    ) -> Self {
+        Self::from_env_value(env_value).unwrap_or_else(|| Self::from_model_size(cfg))
+    }
+}
+
+/// Production-total anchor bands, versioned to a measured baseline and keyed
+/// on `(model, quant_format, length)`.
+///
+/// Baseline: re-measured at d96c26fccce846db9174e1c1ad15ebb0f2bf6856 on the
+/// qwen3.5-0.8b checkpoint, from four ABBA arms (base1/head1/head2/base2) on
+/// an idle machine, unmodified production dispatch, warmup>=2 repeats>=5:
+/// 1.227x @1024, 1.154x @4096. Bands are baseline -20%/+20%, floored at 1.0
+/// (a ratio below 1.0 would mean chunking made the production path slower,
+/// which is a different alarm than "this anchor is stale"). Full derivation
+/// and the underlying per-arm data: issue #1654.
+///
+/// The re-measurement ran with `LATTICE_QUANT_FORMAT` unset, i.e. under
+/// `QuantFormat::from_model_size`'s default for this checkpoint. The 0.8B
+/// checkpoint's estimated parameter count sits well under the 2B threshold
+/// that function checks, so that default is `Q8_0` — the calibrated regime
+/// below is keyed on `QuantFormat::Q8_0` for exactly that reason, not an
+/// arbitrary choice. A run under `LATTICE_QUANT_FORMAT=Q4_0` exercises a
+/// different quantization's kernels/dispatch and has no calibrated band.
+///
+/// The previous baseline recorded here (2.415x @1024, 2.072x @4096, 1.476x
+/// @16384) is removed rather than kept under a guessed identity: those
+/// ratios run roughly double this checkpoint's measured behavior and no
+/// model they were actually calibrated against could be established (see
+/// #1654) — carrying them forward keyed to a name would repeat the defect
+/// this `(model, length)` key exists to close.
+///
+/// 16384 has no re-measured baseline under this method and is left with no
+/// calibrated band for any model until one exists; it takes the `None` arm
+/// below unconditionally.
+///
+/// Anchors go stale as unrelated optimizations land: when this flag fires on
+/// an otherwise-clean idle run, re-measure the baseline at current HEAD and
+/// update these constants (with the new SHA) rather than widening the band.
+/// A `(model, quant_format, length)` triple with no calibrated band returns
+/// `None`, and the caller skips the tight check instead of comparing against
+/// a band calibrated for a different checkpoint, a different quantization,
+/// or a different length.
+#[cfg(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "bench-internals"
+))]
+fn prod_anchor_band(model: Option<&str>, quant: QuantFormat, length: usize) -> Option<(f64, f64)> {
+    match (model, quant, length) {
+        (Some("qwen3.5-0.8b"), QuantFormat::Q8_0, 1024) => Some((1.00, 1.47)),
+        (Some("qwen3.5-0.8b"), QuantFormat::Q8_0, 4096) => Some((1.00, 1.38)),
+        _ => None,
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "bench-internals"
+))]
+mod prod_anchor_band_tests {
+    use super::{QuantFormat, model_identity, prod_anchor_band};
+
+    #[test]
+    fn calibrated_pair_returns_its_band() {
+        assert_eq!(
+            prod_anchor_band(Some("qwen3.5-0.8b"), QuantFormat::Q8_0, 1024),
+            Some((1.00, 1.47))
+        );
+        assert_eq!(
+            prod_anchor_band(Some("qwen3.5-0.8b"), QuantFormat::Q8_0, 4096),
+            Some((1.00, 1.38))
+        );
+    }
+
+    /// The band is calibrated under Q8_0 (the 0.8B checkpoint's model-size
+    /// default) only. The same model+length under the other format has no
+    /// calibrated band — this is the defect the quant-format key exists to
+    /// close: a `(model, length)` key with no format component would return
+    /// `Some((1.00, 1.47))` here regardless of which quantization produced
+    /// the ratio.
+    #[test]
+    fn other_format_at_a_calibrated_pair_is_skipped() {
+        assert_eq!(
+            prod_anchor_band(Some("qwen3.5-0.8b"), QuantFormat::Q4_0, 1024),
+            None
+        );
+        assert_eq!(
+            prod_anchor_band(Some("qwen3.5-0.8b"), QuantFormat::Q4_0, 4096),
+            None
+        );
+    }
+
+    /// 16384 has no re-measured baseline (issue #1654): it must stay
+    /// uncalibrated for the calibrated model+format too, not just for an
+    /// unknown one, and it must never fall back to the old length-only
+    /// constant.
+    #[test]
+    fn calibrated_model_at_16384_is_skipped() {
+        assert_eq!(
+            prod_anchor_band(Some("qwen3.5-0.8b"), QuantFormat::Q8_0, 16384),
+            None
+        );
+    }
+
+    /// Length 1024 has a calibrated band, but only for qwen3.5-0.8b. An
+    /// unidentified (or differently identified) model must not reuse it —
+    /// this is the defect #1654 reports: a length-only key would return
+    /// `Some((1.00, 1.47))` here regardless of which model produced the
+    /// ratio.
+    #[test]
+    fn uncalibrated_model_at_a_calibrated_length_is_skipped() {
+        assert_eq!(prod_anchor_band(None, QuantFormat::Q8_0, 1024), None);
+    }
+
+    #[test]
+    fn unknown_length_is_skipped_even_for_the_calibrated_model() {
+        assert_eq!(
+            prod_anchor_band(Some("qwen3.5-0.8b"), QuantFormat::Q8_0, 2048),
+            None
+        );
+    }
+
+    #[test]
+    fn model_identity_recognizes_only_the_calibrated_checkpoint() {
+        assert_eq!(model_identity("models/qwen3.5-0.8b"), Some("qwen3.5-0.8b"));
+        assert_eq!(model_identity("models/qwen3.5-0_8b"), Some("qwen3.5-0.8b"));
+        assert_eq!(model_identity("/abs/qwen3.5-0.8b/"), Some("qwen3.5-0.8b"));
+        assert_eq!(model_identity("models/qwen3.5-27b"), None);
+    }
+
+    /// A substring match (the defect this tightening closes) would wrongly
+    /// recognize both of these as the calibrated 0.8B checkpoint: the first
+    /// is a differently-quantized variant of it, the second merely contains
+    /// "0.8b" inside an unrelated directory name.
+    #[test]
+    fn suffixed_or_embedded_component_is_not_the_calibrated_checkpoint() {
+        assert_eq!(model_identity("models/qwen3.5-0.8b-q4"), None);
+        assert_eq!(model_identity("models/foo-0.8b-bar"), None);
+    }
+
+    /// Pins the mirrored parse table (`QuantFormat::from_env_value`) against
+    /// the engine's own `QuantFormat::from_env` spellings — case-insensitive,
+    /// both the short and long form of each recognized value.
+    #[test]
+    fn from_env_value_accepts_the_engines_recognized_spellings() {
+        assert_eq!(
+            QuantFormat::from_env_value(Some("Q8_0")),
+            Some(QuantFormat::Q8_0)
+        );
+        assert_eq!(
+            QuantFormat::from_env_value(Some("q8")),
+            Some(QuantFormat::Q8_0)
+        );
+        assert_eq!(
+            QuantFormat::from_env_value(Some("Q4_0")),
+            Some(QuantFormat::Q4_0)
+        );
+        assert_eq!(
+            QuantFormat::from_env_value(Some("q4")),
+            Some(QuantFormat::Q4_0)
+        );
+    }
+
+    /// An unset env var and an unrecognized value must resolve identically —
+    /// both fall through to `from_model_size`, matching
+    /// `QuantFormat::resolve` in the engine exactly (the engine's own
+    /// `from_env` returns `None` on an unrecognized value rather than
+    /// erroring, and `resolve` then falls back to the size default).
+    #[test]
+    fn unrecognized_env_value_resolves_same_as_unset() {
+        assert_eq!(QuantFormat::from_env_value(None), None);
+        assert_eq!(QuantFormat::from_env_value(Some("bogus")), None);
+        assert_eq!(QuantFormat::from_env_value(Some("")), None);
+    }
+}
+
 #[cfg(all(
     target_os = "macos",
     feature = "metal-gpu",
@@ -131,8 +401,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- SCOPE GUARD: 0.8B path only (name check is advisory; the hard check is
-    // the config-shape assert after Metal init below). ---
-    if !model_dir_str.contains("0.8b") && !model_dir_str.contains("0_8b") {
+    // the config-shape assert after Metal init below). Uses the same identity
+    // check the production-anchor band lookup below keys its calibration on. ---
+    if model_identity(&model_dir_str).is_none() {
         eprintln!(
             "[bench] WARNING: LATTICE_MODEL_DIR={model_dir_str} does not look like the 0.8B \
              checkpoint. This harness only measures configs supporting the chunked GDN \
@@ -143,6 +414,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[bench] loading {model_dir_str}");
     let model = Qwen35Model::from_safetensors(dir).map_err(|e| format!("load model: {e}"))?;
     let cfg = model.config().clone();
+    // Resolve the SAME effective quant format `MetalQwen35State::new` below resolves
+    // internally (via `MetalQwen35Engine::new` -> `QuantFormat::resolve`), so the
+    // production-anchor key matches the regime actually dispatched, not just the
+    // model directory. Read once, with the same env-var-first precedence.
+    let quant_env = std::env::var("LATTICE_QUANT_FORMAT").ok();
+    let effective_quant_format = QuantFormat::resolve(&cfg, quant_env.as_deref());
+    eprintln!("[bench] effective quant format = {effective_quant_format:?}");
     let max_len_needed = *lengths.iter().max().expect("BENCH_LENGTHS non-empty");
     // A little headroom above the longest sweep length.
     let max_cache_len = max_len_needed + 512;
@@ -295,23 +573,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             max: xs[n - 1],
             iqr_pct_of_median,
             suspect: iqr_pct_of_median > 15.0,
-        }
-    }
-
-    /// Production-total anchor bands, versioned to a measured baseline.
-    ///
-    /// Baseline: 2026-07-08 idle-machine run at f8c302f9e (serial_prod_total /
-    /// chunked_prod_total, unmodified production dispatch, warmup>=2 repeats>=5):
-    /// 2.415x @1024, 2.072x @4096, 1.476x @16384. Bands are baseline -20%/+20%.
-    /// Anchors go stale as unrelated optimizations land: when this flag fires on an
-    /// otherwise-clean idle run, re-measure the baseline at current HEAD and update
-    /// these constants (with the new SHA) rather than widening the band.
-    fn prod_anchor_band(length: usize) -> Option<(f64, f64)> {
-        match length {
-            1024 => Some((1.93, 2.90)),
-            4096 => Some((1.66, 2.49)),
-            16384 => Some((1.18, 1.77)),
-            _ => None,
         }
     }
 
@@ -714,15 +975,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             f64::NAN
         };
-        let band = prod_anchor_band(length);
+        let model = model_identity(&model_dir_str);
+        let band = prod_anchor_band(model, effective_quant_format, length);
         let prod_anchor_flag = match band {
             Some((lo, hi)) => !(lo..=hi).contains(&prod_ratio) || prod_ratio.is_nan(),
             None => false,
         };
         if band.is_none() {
             println!(
-                "# len={length}: no production-anchor band calibrated for this length \
-                 (bands: 1024/4096/16384); tight anchor skipped"
+                "# len={length}: no production-anchor band calibrated for model={} \
+                 quant={effective_quant_format:?} at this length (bands: qwen3.5-0.8b @ \
+                 Q8_0 1024/4096); tight anchor skipped",
+                model.unwrap_or("unrecognized"),
             );
         }
 
@@ -775,12 +1039,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if prod_anchor_flag {
             let (lo, hi) = band.expect("prod_anchor_flag only set when band is Some");
+            // `band` is only `Some` when `model_identity` matched AND the effective
+            // quant format was the calibrated one, so this unwrap is safe.
+            let model_name = model.unwrap_or("?");
             length_flags.push(format!(
                 "FLAG[production_total_anchor]: serial_prod_total/chunked_prod_total=\
                  {prod_ratio:.3}x at len={length} is outside the expected {lo:.2}-{hi:.2}x band \
-                 (baseline 2026-07-08 @ f8c302f9e) — measured under the unmodified production \
-                 dispatch path (single command buffer per chunk, same regime the baseline was \
-                 measured under). Do NOT trust this length's speedup claim."
+                 (baseline @ d96c26fccce846db9174e1c1ad15ebb0f2bf6856 on {model_name} under \
+                 {effective_quant_format:?}, four ABBA arms, ±20%/floor-1.0 rule — see issue \
+                 #1654) — measured under the unmodified production dispatch path (single \
+                 command buffer per chunk, same regime the baseline was measured under). Do \
+                 NOT trust this length's speedup claim."
             ));
         }
         if length_flags.is_empty() {

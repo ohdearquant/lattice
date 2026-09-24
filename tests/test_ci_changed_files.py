@@ -2125,6 +2125,52 @@ class E2eReporterWorkflowTests(unittest.TestCase):
                 self._assert_reporting_contract(mutated)
 
 
+class Q4PplGateProducerDependencyWorkflowTests(unittest.TestCase):
+    """issue #1582: the PPL gate step must not run when its input producer
+    ("Generate ephemeral Q4 artifact") was skipped or failed. `!cancelled()`
+    alone cannot tell "producer ran and succeeded" from "producer was
+    skipped because an earlier step in this job failed", so a skipped
+    producer used to let this step run anyway and fail on a missing Q4
+    directory -- a misattributed error pointing at the wrong subsystem.
+    """
+
+    def setUp(self) -> None:
+        self.workflow = (
+            _ROOT / ".github/workflows/e2e-parity.yml"
+        ).read_text(encoding="utf-8")
+
+    def _assert_gate_depends_on_producer(self, workflow: str) -> None:
+        job = _workflow_job(workflow, "q4-vision-gates")
+        producer = _workflow_step(job, "Generate ephemeral Q4 artifact")
+        self.assertIn("id: generate-q4-artifact", producer)
+        gate = _workflow_step(job, "Run Q4 PPL regression gate")
+        self.assertRegex(
+            gate,
+            r"(?m)^        if: \$\{\{ !cancelled\(\) && "
+            r"steps\.generate-q4-artifact\.outcome == 'success' \}\}$",
+        )
+
+    def test_gate_depends_on_the_producer_step_outcome(self) -> None:
+        self._assert_gate_depends_on_producer(self.workflow)
+
+    def test_contract_rejects_reverting_to_bare_cancelled_check(self) -> None:
+        job = _workflow_job(self.workflow, "q4-vision-gates")
+        gate = _workflow_step(job, "Run Q4 PPL regression gate")
+        old = (
+            "if: ${{ !cancelled() && "
+            "steps.generate-q4-artifact.outcome == 'success' }}"
+        )
+        self.assertIn(old, gate)
+        # The pre-fix condition (issue #1582): a skipped producer still let
+        # this step run and fail on a missing Q4 directory.
+        mutated_gate = gate.replace(old, "if: ${{ !cancelled() }}", 1)
+        mutated_job = job.replace(gate, mutated_gate, 1)
+        mutated_workflow = self.workflow.replace(job, mutated_job, 1)
+
+        with self.assertRaises(AssertionError):
+            self._assert_gate_depends_on_producer(mutated_workflow)
+
+
 class E2eParityChangeClassificationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

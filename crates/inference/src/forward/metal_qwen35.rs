@@ -122,6 +122,7 @@ mod route_predicate_tests {
 
     fn greedy_gen_cfg(stop_strings: Vec<String>) -> GenerateConfig {
         GenerateConfig {
+            min_p: 0.0,
             max_new_tokens: 4,
             temperature: 0.0,
             top_k: 1,
@@ -195,6 +196,7 @@ mod route_predicate_tests {
     #[test]
     fn mtp_route_blocked_by_set_reasoning_budget() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(64),
             ..greedy_gen_cfg(vec![])
         };
@@ -210,6 +212,7 @@ mod route_predicate_tests {
     #[test]
     fn self_spec_route_blocked_by_set_reasoning_budget() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(64),
             ..greedy_gen_cfg(vec![])
         };
@@ -233,6 +236,7 @@ mod route_predicate_tests {
     #[test]
     fn mtp_route_blocked_by_nonidentity_repetition_penalty() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             repetition_penalty: 1.1,
             ..greedy_gen_cfg(vec![])
         };
@@ -249,6 +253,7 @@ mod route_predicate_tests {
     #[test]
     fn self_spec_route_blocked_by_nonidentity_repetition_penalty() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             repetition_penalty: 1.1,
             ..greedy_gen_cfg(vec![])
         };
@@ -290,6 +295,7 @@ mod route_predicate_tests {
         // argmax token already in history: the penalized pick flips to the
         // runner-up.
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             repetition_penalty: 1.1,
             ..greedy_gen_cfg(vec![])
         };
@@ -327,6 +333,7 @@ mod route_predicate_tests {
     #[test]
     fn mtp_route_blocked_by_set_logprobs() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             logprobs: Some(0),
             ..greedy_gen_cfg(vec![])
         };
@@ -344,6 +351,7 @@ mod route_predicate_tests {
     #[test]
     fn self_spec_route_blocked_by_set_logprobs() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             logprobs: Some(0),
             ..greedy_gen_cfg(vec![])
         };
@@ -1107,6 +1115,24 @@ mod inner {
         #[allow(dead_code)]
         // pre-final hidden retained for MTP chaining; not yet consumed by callers
         final_hidden: Vec<f32>, // pre-final hidden of last verified row
+        // Raw (pre-final-RMSNorm) hidden state of the FIRST verified row (the
+        // pending token's own position), i.e. the state that predicted
+        // `tokens[1]`. Two consumers:
+        // - On a full MTP accept the second verified row commits as a real
+        //   token, and its MTP-cache entry pairs that token's embedding with
+        //   this hidden state, matching the pairing `mtp_prefill_append`'s doc
+        //   comment establishes (lattice#1396).
+        // - On a K=1 draft rejection on the sequential verifier, the caller
+        //   restores `self.session.last_pre_final_hidden` to this value rather
+        //   than leaving it at whatever `forward_step_inner`'s capture-hidden
+        //   side effect last wrote for `tokens[1]` -- the *draft* token's
+        //   hidden, from a verify step whose KV/GDN mutations get rolled back
+        //   but whose `last_pre_final_hidden` write does not. The batch-GEMM
+        //   verifier's own repair-replay already restores it, so that caller
+        //   does not read this field on reject.
+        // The batch-GEMM path leaves it empty when the session carries no MTP
+        // head.
+        first_pre_final_hidden: Vec<f32>,
     }
 
     struct MetalStepOutput {
@@ -1333,8 +1359,9 @@ mod inner {
 
     /// Decide which GPU top-k route to take for a given `top_k` and env flags.
     ///
-    /// `compact_env`: `LATTICE_COMPACT_TOPK` is set.
-    /// `selection_env`: `LATTICE_COMPACT_TOPK_SELECT` is set (unlocks k>1 routes).
+    /// `compact_env`: `LATTICE_COMPACT_TOPK` is enabled (by value, not presence — see
+    /// `crate::env_switch_enabled`).
+    /// `selection_env`: `LATTICE_COMPACT_TOPK_SELECT` is enabled (unlocks k>1 routes).
     fn choose_gpu_topk_route(top_k: usize, compact_env: bool, selection_env: bool) -> GpuTopkRoute {
         // R1 benchmark (2026-04-26, M2 Max, vocab=248,320):
         //   CPU NEON argmax k=1 = 89 µs; GPU argmax k=1 = 240 µs (2.70×, t=137, p<<0.0001).
@@ -1403,9 +1430,9 @@ mod inner {
     impl SamplingRouteEnvironment {
         fn current() -> Self {
             Self {
-                compact: std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                selection: std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                approximate_top_p: std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
+                compact: crate::env_switch_enabled("LATTICE_COMPACT_TOPK"),
+                selection: crate::env_switch_enabled("LATTICE_COMPACT_TOPK_SELECT"),
+                approximate_top_p: crate::env_switch_enabled("LATTICE_COMPACT_TOPP_APPROX"),
             }
         }
     }
@@ -1664,20 +1691,27 @@ mod inner {
         /// an embedding of the caller's tokens and a stale vector from whatever
         /// ran last. A stale vector is well-formed, correctly sized, and wrong.
         pub(crate) final_hidden_captured: std::sync::atomic::AtomicBool,
-        /// Authoritative decode cursor; kept in sync with kv_cache.seq_len.
-        #[allow(dead_code)]
-        // read by tests; written by set_position for future concurrent API
-        pub(crate) position: usize,
         /// GDN state-traffic byte counters (issue #422). `None` unless both the
-        /// `gdn-state-counters` feature and `LATTICE_GDN_STATE_COUNTERS` are set.
+        /// `gdn-state-counters` feature is on and `LATTICE_GDN_STATE_COUNTERS` is enabled.
         #[cfg(feature = "gdn-state-counters")]
         pub(crate) gdn_state_traffic: Option<GdnStateTrafficCounters>,
     }
 
     impl InferenceSession {
-        /// Set both the logical position and the KV cache sequence length atomically.
+        /// Authoritative decode cursor. Derived from `kv_cache.seq_len` rather
+        /// than stored separately, so the two can never drift (#1708): every
+        /// forward/prefill/rollback/verify path already advances or rewinds
+        /// `kv_cache.seq_len` as the single source of truth, and a duplicate
+        /// field only tracked a subset of those sites.
+        #[allow(dead_code)] // read by tests only; no production path branches on it
+        pub(crate) fn position(&self) -> usize {
+            self.kv_cache.seq_len
+        }
+
+        /// Jump the live cache cursor directly to `position` (cross-turn cache
+        /// restore, batched-prefill chunk advance), rather than the per-token
+        /// `+= 1` the forward-step paths use.
         pub(crate) fn set_position(&mut self, position: usize) {
-            self.position = position;
             self.kv_cache.seq_len = position;
         }
     }
@@ -1820,89 +1854,65 @@ mod inner {
         }
 
         // Group by (layer_idx, module): collect refs to layer data and effective weights.
-        let mut grouped: HashMap<(usize, String), Vec<(&LoraLayerData, f32)>> = HashMap::new();
+        // Keyed by `&str` borrowed from each layer's own `module: String` (which
+        // outlives this function body via `inputs`), not a per-layer clone.
+        let mut grouped: HashMap<(usize, &str), Vec<(&LoraLayerData, f32)>> = HashMap::new();
         for (layers, weight) in inputs {
             for layer in *layers {
                 grouped
-                    .entry((layer.layer_idx, layer.module.clone()))
+                    .entry((layer.layer_idx, layer.module.as_str()))
                     .or_default()
                     .push((layer, *weight));
             }
         }
 
-        // Bound the TOTAL planned allocation across every (layer_idx, module) group.
-        // The per-group MAX_BLEND_RANK_TOTAL cap bounds each projection, but a
-        // full-model adapter can keep every group near the cap and still drive a
-        // multi-GiB aggregate blend. Sum rank_total*(d_in+d_out) over all groups with
-        // checked arithmetic and fail closed before any allocation.
-        let mut planned_elems: usize = 0;
-        for ((layer_idx, module), entries) in &grouped {
-            let (first, _) = entries[0]; // each key was inserted with >=1 entry
-            let mut group_rank: usize = 0;
-            for (entry, _) in entries {
-                group_rank = lattice_fann::lora::accumulate_rank(
-                    group_rank,
-                    entry.rank,
-                    "blend_lora_layer_data",
-                )
-                .map_err(InferenceError::InvalidInput)?;
-            }
-            let group_elems = lattice_fann::lora::checked_group_elements(
-                "blend_lora_layer_data",
-                *layer_idx,
+        // Pre-allocation planning -- the per-group MAX_BLEND_RANK_TOTAL cap,
+        // the aggregate MAX_BLEND_TOTAL_ELEMENTS cap, and cross-adapter
+        // dimension agreement -- is the ONE shared check the adapter
+        // residency registry's state publication also runs (issue #1735), so
+        // a `GET /v1/lora` report of whether the resident set can be blended
+        // and this function's own refusal can never disagree. It sees only
+        // each entry's shape, never an A/B buffer.
+        //
+        // `grouped` above is already the grouping `plan_blend` would build
+        // internally from a flat iterator, so this calls `plan_grouped`
+        // directly over `grouped`'s own entries instead of `plan_blend`,
+        // skipping a second `HashMap` and per-group `Vec` that would
+        // otherwise re-derive the same grouping from scratch on every blend.
+        let groups = grouped.iter().map(|(&(layer_idx, module), entries)| {
+            (
+                layer_idx,
                 module,
-                group_rank,
-                first.d_in,
-                first.d_out,
+                entries
+                    .iter()
+                    .map(|(layer, _)| lattice_fann::lora::BlendProjection {
+                        layer_idx: layer.layer_idx,
+                        module: layer.module.as_str(),
+                        rank: layer.rank,
+                        d_in: layer.d_in,
+                        d_out: layer.d_out,
+                    }),
             )
-            .map_err(InferenceError::InvalidInput)?;
-            planned_elems = lattice_fann::lora::accumulate_planned_elements(
-                planned_elems,
-                group_elems,
-                "blend_lora_layer_data",
-            )
-            .map_err(InferenceError::InvalidInput)?;
-        }
-        lattice_fann::lora::check_aggregate_elements_cap(planned_elems, "blend_lora_layer_data")
+        });
+        let planned = lattice_fann::lora::plan_grouped("blend_lora_layer_data", groups)
             .map_err(InferenceError::InvalidInput)?;
 
-        let mut result: Vec<LoraLayerData> = Vec::with_capacity(grouped.len());
-        for ((layer_idx, module), entries) in grouped {
-            let (first, _) = entries[0];
-            let d_in = first.d_in;
-            let d_out = first.d_out;
-
-            // Validate dimension consistency across adapters for this projection.
-            for (idx, (entry, _)) in entries.iter().enumerate() {
-                lattice_fann::lora::check_dims_match(
-                    "blend_lora_layer_data",
-                    layer_idx,
-                    &module,
-                    d_in,
-                    d_out,
-                    idx,
-                    entry.d_in,
-                    entry.d_out,
-                )
-                .map_err(InferenceError::InvalidInput)?;
-            }
-
-            // Accumulate rank_total with overflow protection and a hard cap
-            // (MAX_BLEND_RANK_TOTAL is defined at module scope above this function).
-            let mut rank_total: usize = 0;
-            for (layer, _) in &entries {
-                rank_total = lattice_fann::lora::accumulate_rank(
-                    rank_total,
-                    layer.rank,
-                    "blend_lora_layer_data",
-                )
-                .map_err(InferenceError::InvalidInput)?;
-            }
-            lattice_fann::lora::check_rank_total_cap(rank_total, "blend_lora_layer_data")
-                .map_err(InferenceError::InvalidInput)?;
+        let mut result: Vec<LoraLayerData> = Vec::with_capacity(planned.len());
+        for plan in planned {
+            let entries = grouped.get(&(plan.layer_idx, plan.module)).ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "blend_lora_layer_data: planned group (layer {}, module {}) is absent \
+                         from the grouped adapter set",
+                    plan.layer_idx, plan.module
+                ))
+            })?;
+            let d_in = plan.d_in;
+            let d_out = plan.d_out;
+            let rank_total = plan.rank_total;
 
             // Validate source slice lengths before any allocation: a malformed adapter
             // whose A or B buffer is the wrong size would cause out-of-bounds copies.
+            // `plan_grouped` never sees these buffers, so this check stays here.
             for (idx, (entry, _)) in entries.iter().enumerate() {
                 lattice_fann::lora::check_buffer_lengths(
                     "blend_lora_layer_data",
@@ -1929,7 +1939,7 @@ mod inner {
 
             // A_blend: vertical stack of A matrices.
             let mut a_blend: Vec<f32> = Vec::with_capacity(a_buf_len);
-            for (layer, _) in &entries {
+            for (layer, _) in entries.iter() {
                 a_blend.extend_from_slice(&layer.a);
             }
 
@@ -1937,7 +1947,7 @@ mod inner {
             // B is row-major (d_out × rank); row r: b[r*rank..(r+1)*rank].
             let mut b_blend = vec![0.0f32; b_buf_len];
             let mut col_offset = 0usize;
-            for (layer, eff_weight) in &entries {
+            for (layer, eff_weight) in entries.iter() {
                 let r_e = layer.rank;
                 for row in 0..d_out {
                     let dst = row * rank_total + col_offset;
@@ -1950,8 +1960,8 @@ mod inner {
             }
 
             result.push(LoraLayerData {
-                layer_idx,
-                module,
+                layer_idx: plan.layer_idx,
+                module: plan.module.to_string(),
                 a: a_blend,
                 b: b_blend,
                 rank: rank_total,
@@ -3496,7 +3506,7 @@ mod inner {
                 }
             });
 
-            let need_checkpoints = mtp.is_some() || std::env::var_os("LATTICE_SELF_SPEC").is_some();
+            let need_checkpoints = mtp.is_some() || crate::env_switch_enabled("LATTICE_SELF_SPEC");
             // Self-spec verifies `[pending_token] ++ draft_tokens` = `1 + SELF_SPEC_MAX_DRAFT`
             // tokens through `verify_tokens_batched`, which checkpoints slot 0 (pre-verify)
             // plus one slot per processed token. Pool size = max_tokens + 1, so we need
@@ -3534,9 +3544,8 @@ mod inner {
                 mtp_prefill_hidden: Vec::new(),
                 capture_final_hidden: false,
                 final_hidden_captured: std::sync::atomic::AtomicBool::new(false),
-                position: 0,
                 #[cfg(feature = "gdn-state-counters")]
-                gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
+                gdn_state_traffic: if crate::env_switch_enabled("LATTICE_GDN_STATE_COUNTERS") {
                     Some(GdnStateTrafficCounters::new(
                         GdnStateTrafficShape::try_from_config(cfg)
                             .map_err(|e| e.to_string())?
@@ -4562,6 +4571,7 @@ mod inner {
             self.checkpoint_gdn_to_slot(0, GdnStateTrafficScope::MtpVerify)?;
             let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
             let mut final_hidden = Vec::new();
+            let mut first_pre_final_hidden = Vec::new();
             for (i, &token) in tokens.iter().enumerate() {
                 #[cfg(feature = "gdn-state-counters")]
                 let out = self.forward_step_inner_with_traffic_scope(
@@ -4579,11 +4589,20 @@ mod inner {
                 );
                 self.checkpoint_gdn_to_slot(i + 1, GdnStateTrafficScope::MtpVerify)?;
                 all_logits.push(out.logits);
+                if i == 0 {
+                    // lattice#1396: the pending token's own pre-final hidden,
+                    // needed to append the accepted draft's MTP-cache row and
+                    // to restore `last_pre_final_hidden` on a K=1 reject —
+                    // captured here for free (this step already computes it)
+                    // before the next iteration's `final_hidden` overwrite.
+                    first_pre_final_hidden = out.pre_final_hidden.clone();
+                }
                 final_hidden = out.pre_final_hidden;
             }
             Ok(MetalVerifyOutput {
                 logits: all_logits,
                 final_hidden,
+                first_pre_final_hidden,
             })
         }
 
@@ -5315,9 +5334,27 @@ mod inner {
                 Vec::new()
             };
 
+            // lattice#1396: raw pre-final hidden of the FIRST verified row (the
+            // pending token's own position), needed to append the accepted
+            // draft's MTP-cache row. `activations.residual` holds this value
+            // untouched: the layer loop's own end-of-layer fused add+copy
+            // (`dispatch_add_and_copy`) leaves `residual[i] == hidden[i]` for
+            // every one of the `n` verified rows right after the last layer,
+            // and unlike `activations.hidden`, `residual` is never written
+            // again by the batch RMSNorm dispatched above — that dispatch
+            // only mutates `hidden` in place. No extra GPU dispatch is needed;
+            // this is a second CPU-side read of an already-computed buffer,
+            // the same pattern the MTP prefill capture uses on `hidden` itself.
+            let first_pre_final_hidden = if self.session.mtp.is_some() {
+                unsafe { read_buffer(&self.session.activations.residual, hidden) }
+            } else {
+                Vec::new()
+            };
+
             Ok(MetalVerifyOutput {
                 logits: all_logits,
                 final_hidden,
+                first_pre_final_hidden,
             })
         }
 
@@ -5330,6 +5367,25 @@ mod inner {
             position: usize,
         ) -> MetalMtpForwardOutput {
             objc::rc::autoreleasepool(|| self.mtp_forward_one_dispatch(pending_token, position))
+        }
+
+        /// RMSNorm for the MTP head's two CPU-computed pre-fc norms
+        /// (`pre_fc_norm_embedding`, `pre_fc_norm_hidden`). Applies this
+        /// architecture's shifted convention, `x * inv_rms * (1.0 + gamma)`,
+        /// matching every GPU-kernel RMSNorm in this forward pass and the
+        /// model's own `final_norm`. Plain `gamma` (no `+1`) is a different,
+        /// incompatible convention and silently inverts the sign of most
+        /// channels on a checkpoint whose norm weights center negative.
+        fn mtp_pre_fc_rmsnorm(x: &mut [f32], gamma: &[f32], eps: f32) {
+            debug_assert_eq!(x.len(), gamma.len());
+            let mut sum_sq = 0.0f32;
+            for &v in x.iter() {
+                sum_sq += v * v;
+            }
+            let inv_rms = 1.0 / (sum_sq / x.len() as f32 + eps).sqrt();
+            for (v, &g) in x.iter_mut().zip(gamma.iter()) {
+                *v = *v * inv_rms * (1.0 + g);
+            }
         }
 
         /// Draft one extra token using the MTP module.
@@ -5385,14 +5441,7 @@ mod inner {
                         hidden,
                     )
                 };
-                let mut sum_sq = 0.0f32;
-                for &v in normed_embed.iter() {
-                    sum_sq += v * v;
-                }
-                let inv_rms = 1.0 / (sum_sq / hidden as f32 + cfg.rms_norm_eps).sqrt();
-                for (v, &g) in normed_embed.iter_mut().zip(gamma.iter()) {
-                    *v = *v * inv_rms * g;
-                }
+                Self::mtp_pre_fc_rmsnorm(&mut normed_embed, gamma, cfg.rms_norm_eps);
             }
 
             // 3. CPU RMSNorm of target pre-final hidden using pre_fc_norm_hidden weights.
@@ -5410,14 +5459,7 @@ mod inner {
                         hidden,
                     )
                 };
-                let mut sum_sq = 0.0f32;
-                for &v in normed_hidden.iter() {
-                    sum_sq += v * v;
-                }
-                let inv_rms = 1.0 / (sum_sq / hidden as f32 + cfg.rms_norm_eps).sqrt();
-                for (v, &g) in normed_hidden.iter_mut().zip(gamma.iter()) {
-                    *v = *v * inv_rms * g;
-                }
+                Self::mtp_pre_fc_rmsnorm(&mut normed_hidden, gamma, cfg.rms_norm_eps);
             }
 
             // 4. CPU concat [normed_embed || normed_hidden] into fused buffer (2*hidden).
@@ -6295,10 +6337,10 @@ mod inner {
                 mrope_row_bufs.as_ref().map(|(c, s)| (c, s));
 
             // --- Per-phase timing (enabled by env LATTICE_PROFILE=1) ---
-            let profiling = std::env::var_os("LATTICE_PROFILE").is_some();
-            let decode_profiling = std::env::var_os("LATTICE_DECODE_PROFILE").is_some();
+            let profiling = crate::env_switch_enabled("LATTICE_PROFILE");
+            let decode_profiling = crate::env_switch_enabled("LATTICE_DECODE_PROFILE");
 
-            if std::env::var_os("LATTICE_GDN_CPU").is_some() {
+            if crate::env_switch_enabled("LATTICE_GDN_CPU") {
                 #[cfg(not(debug_assertions))]
                 panic!("LATTICE_GDN_CPU=1 is debug-only and cannot be used in release decode");
             }
@@ -7253,14 +7295,13 @@ mod inner {
             self.check_forward_step_capacity(position)?;
             self.check_live_cursor("try_forward_step", position)?;
             self.cross_turn_prefix_cache.clear();
-            Ok(self
-                .forward_step_inner(
-                    token_id,
-                    position,
-                    false,
-                    crate::forward::signpost::Scope::NotDecode,
-                )
-                .logits)
+            let output = self.forward_step_inner(
+                token_id,
+                position,
+                false,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            Ok(output.logits)
         }
 
         /// **Unstable**: fallible single-token forward with explicit hidden readback.
@@ -7299,7 +7340,6 @@ mod inner {
                 true,
                 crate::forward::signpost::Scope::NotDecode,
             );
-            self.session.position = self.session.kv_cache.seq_len;
             Ok((output.logits, output.pre_final_hidden))
         }
 
@@ -9122,18 +9162,48 @@ mod inner {
                 };
 
                 // GPU state mutations must happen before the pure decision function:
-                // - Accept: clear batch_repair_token (rollback won't run this round).
+                // - Accept: clear batch_repair_token (rollback won't run this round),
+                //   and append the MTP-cache row `mtp_forward_one` never writes for
+                //   the accepted draft token itself.
                 // - Reject: roll back KV cache and GDN state to pos+1.
                 let accepted = rs.accepted_count == 1;
                 if accepted {
                     if let Some(ref mut p) = self.session.gdn_checkpoints {
                         p.batch_repair_token = None;
                     }
+                    // lattice#1396: `mtp_forward_one` above wrote only the row for
+                    // `pending_token` at `pos`; a full accept commits `draft.token_id`
+                    // at `pos + 1` without ever giving it its own MTP-cache row, so
+                    // the next round's `mtp_forward_one(bonus_token, pos + 2)` lands
+                    // one physical slot behind its RoPE position (a positional hole
+                    // per accepted transition). `mtp_prefill_append` is the same
+                    // K/V-only append primitive `mtp_prefill` uses to backfill
+                    // historical prompt positions — a prefilled position is only
+                    // ever a future key, exactly this case. Pair the accepted
+                    // token's embedding with `first_pre_final_hidden`, the verify
+                    // pass's pre-final hidden for `pending_token`'s own position
+                    // (the hidden state that predicted the accepted draft), matching
+                    // the pairing `mtp_prefill_append`'s own doc comment establishes.
+                    self.mtp_prefill_append(
+                        draft.token_id,
+                        &verify_out.first_pre_final_hidden,
+                        pos + 1,
+                    );
                     metrics.accepted_extra_tokens += 1;
                 } else {
                     let t_rb = std::time::Instant::now();
                     let _ = self.rollback_speculative_state_to(pos + 1);
                     metrics.rollback_ms += t_rb.elapsed().as_secs_f64() * 1000.0;
+                    // The sequential verifier's rollback restores GDN state and the KV
+                    // cache cursor but not `last_pre_final_hidden`, which
+                    // `verify_tokens_batched` last wrote for the rejected draft token.
+                    // Restore it to the hidden state that predicted the target's real
+                    // replacement, or the next MTP draft is fed the wrong input. The
+                    // batch-GEMM verifier's own repair-replay already handles this.
+                    if !use_batch {
+                        self.session.last_pre_final_hidden =
+                            verify_out.first_pre_final_hidden.clone();
+                    }
                 }
 
                 // Delegate the pure emit/stop/continue decision to `mtp_greedy_round`.
@@ -9200,7 +9270,7 @@ mod inner {
                 }
             };
 
-            if std::env::var("LATTICE_MTP_VERBOSE").is_ok() {
+            if crate::env_switch_enabled("LATTICE_MTP_VERBOSE") {
                 eprintln!(
                     "[MTP] rounds={} mtp_fwd={} verify={} accepted_extra={} rollbacks={} fallbacks={} mtp_ms={:.1} verify_ms={:.1} rb_ms={:.1}",
                     metrics.rounds,
@@ -9528,7 +9598,7 @@ mod inner {
                 pending_token = next_pending;
             }
 
-            if std::env::var("LATTICE_SELF_SPEC_VERBOSE").is_ok() {
+            if crate::env_switch_enabled("LATTICE_SELF_SPEC_VERBOSE") {
                 eprintln!(
                     "[SELF_SPEC] rounds={} draft_fwd={} verify={} accepted_extra={} fallbacks={} draft_ms={:.1} verify_ms={:.1} rb_ms={:.1}",
                     metrics.rounds,
@@ -9801,7 +9871,7 @@ mod inner {
             // GDN-first self-speculative greedy path: env-gated, greedy only.
             let use_self_spec = super::self_spec_route_active(
                 self.session.gdn_checkpoints.is_some(),
-                std::env::var("LATTICE_SELF_SPEC").is_ok(),
+                crate::env_switch_enabled("LATTICE_SELF_SPEC"),
                 gen_cfg,
                 use_compact,
                 cfg.num_active_linear_attention_layers(),
@@ -10793,7 +10863,6 @@ mod inner {
                 }
             }
             self.session.kv_cache.reset();
-            self.session.position = 0;
             if let Some(ref mut mtp) = self.session.mtp {
                 mtp.cache.reset();
             }
@@ -11272,12 +11341,9 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
-        // `GenerateConfig` cannot carry `min_p` (it is exhaustively
-        // constructible through the public API at published `0.7.1`; adding
-        // any field is a major break -- see
-        // `crate::sampling::Sampler::with_min_p`), and no production entry
-        // point sets it yet, so this path is always disabled.
-        sample_from_candidates_impl(candidates, cfg, previous_ids, rng_state, 0.0)
+        // `min_p` is read from `GenerateConfig` (0.0 = disabled, its default,
+        // when no caller sets it).
+        sample_from_candidates_impl(candidates, cfg, previous_ids, rng_state, cfg.min_p)
     }
 
     fn sample_from_candidates_impl(
@@ -11389,7 +11455,10 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
-        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0, 0.0)
+        // `min_p` is read from `GenerateConfig` (0.0 = disabled, its default,
+        // when no caller sets it). `top_n_sigma` has no `GenerateConfig` field
+        // yet and no production entry point sets it, so it stays disabled.
+        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, cfg.min_p, 0.0)
     }
 
     /// Signpost-traced sampling shared by every autoregressive decode loop's
@@ -12259,6 +12328,7 @@ mod inner {
             cfg: &Qwen35Config,
             prefix: &str,
             layer_idx: usize,
+            moe_layers_already_sized: usize,
         ) -> Result<MetalFfnWeights, String> {
             use crate::forward::moe_expert_cache::{
                 ExpertSlotCache, MoeExpertCacheConfig, moe_expert_cache_num_slots,
@@ -12279,17 +12349,35 @@ mod inner {
             // f16-resident for Qwen3.5-35B-A3B, independent of how many
             // experts a token actually activates — see PLAN.md §1). Instead,
             // size a bounded LRU cache of per-expert slots against this
-            // device's memory budget: `num_experts` slots (the "zero-eviction
-            // fast path", functionally the old eager behavior but lazily
-            // populated and evictable) when that fits under 0.85 ×
-            // recommendedMaxWorkingSetSize split evenly across every MoE
-            // layer, else auto-shrunk (floored at `top_k`, below which the
-            // cache cannot serve even one token's routed-expert set).
+            // device's *remaining* memory budget: `num_experts` slots (the
+            // "zero-eviction fast path", functionally the old eager behavior
+            // but lazily populated and evictable) when that fits under 0.85
+            // × recommendedMaxWorkingSetSize minus what this device already
+            // has allocated (fixed model buffers, KV/GDN/prefix state, and
+            // any earlier MoE layer's own cache slots), split evenly across
+            // the MoE layers not yet sized (this layer included), else
+            // auto-shrunk (floored at `top_k`, below which the cache cannot
+            // serve even one token's routed-expert set). `moe_layers_
+            // already_sized` must be this layer's live ordinal among MoE
+            // layers processed so far on this device — every earlier one
+            // already built its own `ExpertSlotCache` buffers, which are
+            // part of `current_allocated_size()` by the time this call
+            // runs, so dividing by the *total* MoE layer count on every
+            // call (instead of by the layers not yet sized) would subtract
+            // each already-sized layer's bytes from the numerator while
+            // still dividing by a constant denominator that includes them,
+            // geometrically starving later layers. See
+            // `moe_expert_cache_num_slots`'s doc comment for exactly which
+            // residency classes `current_allocated_size()` covers, which it
+            // doesn't (CPU-side allocations and the OS/process reserve),
+            // and the known limitation this does not close (later layers'
+            // not-yet-loaded dense weights are also invisible to it).
             let gate_up_bytes_per_expert = (2 * inter * hidden * 2) as u64; // f16
             let down_bytes_per_expert = (hidden * inter * 2) as u64; // f16
             let per_expert_bytes_total = gate_up_bytes_per_expert + down_bytes_per_expert;
             let num_moe_layers = cfg.num_active_layers();
             let max_working = device.recommended_max_working_set_size();
+            let already_allocated = device.current_allocated_size();
             let cache_cfg = MoeExpertCacheConfig::from_env()
                 .map_err(|e| format!("from_q4_dir: MoE layer {layer_idx}: {e}"))?;
             let num_slots = moe_expert_cache_num_slots(
@@ -12299,6 +12387,8 @@ mod inner {
                 per_expert_bytes_total,
                 num_moe_layers,
                 max_working,
+                already_allocated,
+                moe_layers_already_sized,
             )
             .map_err(|e| format!("from_q4_dir: MoE layer {layer_idx}: {e}"))?;
 
@@ -12851,7 +12941,23 @@ mod inner {
                         // / `.experts.down_proj` fused per-layer arrays, plus every other MoE
                         // tensor here, are Q4-quantized). `MetalFfnWeights::Dense`'s
                         // `mlp.{gate,up,down}_proj.weight` files do not exist for this layer.
-                        Self::load_moe_ffn_q4(&device, q4_dir, cfg, &prefix, i)?
+                        //
+                        // `layer_weights.len()` is this layer's live ordinal among MoE
+                        // layers already sized on this device: `is_moe()` is a whole-
+                        // checkpoint flag (every active layer takes this branch when
+                        // true, per `Qwen35Config::is_moe`), and every prior iteration
+                        // of this loop already pushed its `(attn, common)` pair before
+                        // this one runs — so `layer_weights.len()` is exactly the count
+                        // of MoE layers whose `ExpertSlotCache` buffers are already
+                        // resident, never a guess.
+                        Self::load_moe_ffn_q4(
+                            &device,
+                            q4_dir,
+                            cfg,
+                            &prefix,
+                            i,
+                            layer_weights.len(),
+                        )?
                     } else {
                         let (gate_raw, _) = load_q4_raw_timed(
                             &format!("{prefix}.mlp.gate_proj.weight"),
@@ -13283,7 +13389,7 @@ mod inner {
                 }
             });
             let need_checkpoints =
-                mtp_weights_opt.is_some() || std::env::var_os("LATTICE_SELF_SPEC").is_some();
+                mtp_weights_opt.is_some() || crate::env_switch_enabled("LATTICE_SELF_SPEC");
             // Self-spec verifies `[pending_token] ++ draft_tokens` = `1 + SELF_SPEC_MAX_DRAFT`
             // tokens through `verify_tokens_batched`; pool size must cover one slot per token
             // plus the pre-verify base slot.
@@ -13356,9 +13462,8 @@ mod inner {
                     mtp_prefill_hidden: Vec::new(),
                     capture_final_hidden: false,
                     final_hidden_captured: std::sync::atomic::AtomicBool::new(false),
-                    position: 0,
                     #[cfg(feature = "gdn-state-counters")]
-                    gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
+                    gdn_state_traffic: if crate::env_switch_enabled("LATTICE_GDN_STATE_COUNTERS") {
                         Some(GdnStateTrafficCounters::new(
                             GdnStateTrafficShape::try_from_config(cfg)
                                 .map_err(|e| e.to_string())?
@@ -15540,7 +15645,7 @@ mod inner {
             );
 
             assert!(
-                production_src.contains("std::env::var_os(\"LATTICE_GDN_CPU\")")
+                production_src.contains("crate::env_switch_enabled(\"LATTICE_GDN_CPU\")")
                     && production_src.contains(
                         "LATTICE_GDN_CPU=1 is debug-only and cannot be used in release decode"
                     ),
@@ -17620,6 +17725,57 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
+        /// Serializes tests in this module that mutate `LATTICE_COMPACT_TOPK` in the
+        /// real process environment. `set_var`/`remove_var` are `unsafe` because they
+        /// can race with a read on another thread; this is the same per-variable lock
+        /// convention `with_self_spec_env` (below) uses for `LATTICE_SELF_SPEC`.
+        /// Restores the prior value (including "was unset") on the way out, even if
+        /// `f` panics.
+        fn with_compact_topk_env<R>(value: &str, f: impl FnOnce() -> R) -> R {
+            use std::sync::Mutex;
+            static ENV_LOCK: Mutex<()> = Mutex::new(());
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prior = std::env::var("LATTICE_COMPACT_TOPK").ok();
+            // SAFETY: serialized by `ENV_LOCK` above — this lock only guards writers
+            // of LATTICE_COMPACT_TOPK against each other; it does not stop other
+            // tests from reading the environment concurrently.
+            unsafe {
+                std::env::set_var("LATTICE_COMPACT_TOPK", value);
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            // SAFETY: see above.
+            unsafe {
+                match &prior {
+                    Some(v) => std::env::set_var("LATTICE_COMPACT_TOPK", v),
+                    None => std::env::remove_var("LATTICE_COMPACT_TOPK"),
+                }
+            }
+            match result {
+                Ok(r) => r,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+
+        /// `SamplingRouteEnvironment::current()` reads `LATTICE_COMPACT_TOPK` through
+        /// `env_switch_enabled`, by value, not presence (#1614): `=0` must disable
+        /// compact routing rather than enable it by merely being present.
+        #[test]
+        fn sampling_route_environment_reads_compact_topk_by_value_not_presence() {
+            let disabled = with_compact_topk_env("0", SamplingRouteEnvironment::current);
+            assert!(
+                !disabled.compact,
+                "LATTICE_COMPACT_TOPK=0 must not enable compact routing by presence"
+            );
+
+            let enabled = with_compact_topk_env("1", SamplingRouteEnvironment::current);
+            assert!(
+                enabled.compact,
+                "LATTICE_COMPACT_TOPK=1 must still enable compact routing"
+            );
+        }
+
         #[test]
         fn sampling_route_plan_composes_block_first_then_legacy_fallback() {
             for (top_k, expected_route, expected_topk) in [
@@ -17679,6 +17835,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let with_logprobs = GenerateConfig {
+                min_p: 0.0,
                 logprobs: Some(5),
                 ..compact_sampling_config(1)
             };
@@ -17696,6 +17853,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[test]
         fn sampling_route_plan_preserves_grammar_and_repetition_gates() {
             let penalized = GenerateConfig {
+                min_p: 0.0,
                 repetition_penalty: 1.1,
                 ..compact_sampling_config(8)
             };
@@ -17716,6 +17874,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             )
             .expect("trivial grammar must compile");
             let constrained = GenerateConfig {
+                min_p: 0.0,
                 grammar: Some(std::sync::Arc::new(grammar)),
                 ..compact_sampling_config(8)
             };
@@ -17873,6 +18032,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             state.session.compact_result = sentinel_result.clone();
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -18412,6 +18572,95 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        /// `mtp_pre_fc_rmsnorm` must apply the shifted `(1.0 + gamma)` convention,
+        /// not plain `gamma`. Hand-computed: x=[2,2,2,2], gamma=[0.5,0.5,0.5,0.5],
+        /// eps=0 -> sum_sq=16, mean=4, inv_rms=0.5. Shifted: 2*0.5*(1+0.5)=1.5.
+        /// Plain gamma would give 2*0.5*0.5=0.5 -- a clean, non-degenerate
+        /// (non-zero, non-one) numeric difference, not a sign-only tolerance.
+        #[test]
+        fn mtp_pre_fc_rmsnorm_applies_shifted_convention() {
+            let mut x = vec![2.0f32; 4];
+            let gamma = vec![0.5f32; 4];
+            MetalQwen35State::mtp_pre_fc_rmsnorm(&mut x, &gamma, 0.0);
+            for &v in &x {
+                assert!(
+                    (v - 1.5).abs() < 1e-6,
+                    "got {v}, expected 1.5 under the shifted (1.0 + gamma) convention \
+                     (2 * inv_rms(0.5) * (1.0 + 0.5)); plain gamma would give 0.5"
+                );
+            }
+        }
+
+        /// Regression test on the PRODUCTION `mtp_forward_one` path (not a test-only
+        /// duplicate): a synthetic MTP fixture whose `pre_fc_norm_embedding` weight is
+        /// uniformly -0.5 and whose `fc` connects the embedding half of the concat as
+        /// an identity (`synthetic_mtp_weights_for_test`), with attention/MLP weights
+        /// zero so `layer_output == fc_output == normed_embed` exactly. Feeding token 2
+        /// (`tiny_metal_qwen35_fixture`'s one-hot embedding: component 0 is the only
+        /// nonzero value, +1.0) leaves `normed_embed` nonzero only at index 0, so its
+        /// sign after the final norm (a GPU kernel, always shifted-convention, always
+        /// scales by a positive factor) is exactly `pre_fc_norm_embedding`'s effective
+        /// scale: `1.0 + (-0.5) = +0.5` under the fix, `-0.5` under the bug. The tied
+        /// lm_head's row for token 2 has `embed_tokens[2][0] = +1.0`
+        /// (`tiny_metal_qwen35_fixture`'s `token % 3 == 2` convention), so
+        /// `output.logits[2]` inherits that sign directly: positive under the fix,
+        /// negative under the bug.
+        #[test]
+        fn mtp_forward_one_uses_shifted_pre_fc_norm_convention() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut engine = MetalQwen35Engine::new(&weights, &cfg)
+                .expect("tiny MetalQwen35Engine with MTP fixture constructs");
+            let mut mtp_weights = synthetic_mtp_weights_for_test(&engine.device, &cfg);
+            mtp_weights.pre_fc_norm_embedding = make_buffer(
+                &engine.device,
+                &vec![-0.5f32; cfg.hidden_size],
+                "test.mtp.pre_fc_norm_embedding.negative",
+            );
+            engine.mtp_weights = Some(mtp_weights);
+            let session = engine.new_session(16).expect("tiny MTP session constructs");
+            let mut state = MetalQwen35State {
+                engine,
+                session,
+                lora: None,
+                use_gdn_chunked: true,
+                use_kv_f16: false,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled: false,
+                path_proof: PathProofCounters::default(),
+            };
+            assert!(
+                state.session.mtp.is_some(),
+                "MTP fixture must populate session.mtp"
+            );
+
+            // token 2's embedding is one-hot: component 0 is +1.0, everything else 0
+            // (`tiny_metal_qwen35_fixture`'s convention, also relied on by the #1341
+            // test immediately below). `last_pre_final_hidden` is left at its default
+            // (zero-length / zeroed) so the hidden half of the concat contributes
+            // nothing measurable here -- this test isolates the embedding-half norm.
+            state.session.last_pre_final_hidden = vec![0.0f32; cfg.hidden_size];
+            let out = state.mtp_forward_one(2u32, 0);
+
+            assert_eq!(out.logits.len(), cfg.vocab_size);
+            assert!(
+                out.logits[2] > 0.0,
+                "logits[2] = {} must be POSITIVE under the shifted (1.0 + gamma) \
+                 convention (effective scale 1.0 + (-0.5) = +0.5 applied to the \
+                 embedding's +1.0 component, propagated through the identity `fc` and \
+                 zero attention/MLP to the final norm and the tied lm_head row for \
+                 token 2, embed_tokens[2][0] = +1.0); a negative value here means \
+                 pre_fc_norm_embedding regressed to plain `gamma` (effective scale \
+                 -0.5), inverting the sign of every channel it touches",
+                out.logits[2]
+            );
+        }
+
         // Issue #1341: a K=1 draft rejection must leave the MTP KV cache cursor at the
         // row `mtp_forward_one` actually wrote, not one row past it. `mtp_forward_one`
         // writes exactly one row (for `pending_token`) and advances `mtp.cache.seq_len`
@@ -18483,6 +18732,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
@@ -18531,6 +18781,193 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  `mtp_forward_one` wrote this round; got {mtp_seq_len}, which means the \
                  next `mtp_forward_one` call will skip a slot and the attention window \
                  will read a never-written row"
+            );
+        }
+
+        // `verify_tokens_batched`'s sequential-verifier path leaves
+        // `last_pre_final_hidden` set to the hidden state captured while processing
+        // the rejected draft token, because `forward_step_inner` writes that field
+        // for every token it processes, with no distinction between "provisional,
+        // pending verification" and "committed". A K=1 rollback undoes the GDN/KV
+        // mutations but not this field, so the next `mtp_forward_one` call is fed
+        // the wrong token's hidden state. This test isolates the field: after a
+        // forced K=1 reject, `last_pre_final_hidden` must equal the hidden state
+        // from processing ONLY the real `pending_token`, not the rejected draft.
+        #[test]
+        fn generate_greedy_mtp_restores_correct_hidden_after_k1_reject() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            use crate::generation::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+
+            // Reference: the hidden state that processing ONLY the real
+            // `pending_token` (2) at position 0 produces -- no draft token involved.
+            // This is what `last_pre_final_hidden` must equal after the K=1 reject
+            // round below, per `mtp_forward_one`'s documented pairing contract
+            // ("pairs `pending_token`'s embedding with `last_pre_final_hidden` --
+            // the hidden state that predicted it").
+            let mut reference_state =
+                metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
+            let _ = reference_state.forward_step_inner(
+                2,
+                0,
+                true,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            let expected_hidden = reference_state.session.last_pre_final_hidden.clone();
+            assert!(
+                !expected_hidden.is_empty(),
+                "reference forward_step_inner call must capture a hidden state"
+            );
+
+            let mut state = metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
+            let gen_cfg = GenerateConfig {
+                min_p: 0.0,
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(true),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+            let mut prefill_logits = vec![-1.0f32; cfg.vocab_size];
+            prefill_logits[2] = 100.0;
+            let out = state.generate_greedy_mtp(&prefill_logits, 0, &tokenizer, &gen_cfg);
+            assert!(
+                !out.stopped,
+                "test assumes round 1 does not hit EOS; got {out:?}"
+            );
+            assert_eq!(
+                state.session.kv_cache.seq_len, 1,
+                "test setup assumption violated: expected round 1 to reject the \
+                 constant draft (token 0) in favor of the target's own prediction \
+                 (token 2)"
+            );
+
+            let actual_hidden = &state.session.last_pre_final_hidden;
+            assert_eq!(
+                actual_hidden.len(),
+                expected_hidden.len(),
+                "last_pre_final_hidden length changed unexpectedly"
+            );
+            let max_abs_diff = actual_hidden
+                .iter()
+                .zip(expected_hidden.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs_diff < 1e-5,
+                "last_pre_final_hidden after a K=1 reject must equal the hidden state \
+                 that predicted the real continuation (from processing pending_token \
+                 alone), not the rejected draft's hidden state; \
+                 max_abs_diff={max_abs_diff} actual={actual_hidden:?} \
+                 expected={expected_hidden:?}"
+            );
+        }
+
+        // lattice#1396: a K=1 full accept must give the MTP cache a row for the
+        // accepted draft token, not just for `pending_token`. `mtp_forward_one`
+        // writes exactly one row (for `pending_token`) and advances
+        // `mtp.cache.seq_len` by 1 before verification runs; on a full accept the
+        // draft token commits as a real, generated token at `pos + 1` without ever
+        // getting its own MTP-cache row, so the cursor stalls at `c0 + 1` instead of
+        // `c0 + 2` and the next round's `mtp_forward_one` call lands one physical
+        // slot behind its own RoPE position -- a positional hole per accepted
+        // transition (the issue's exact defect).
+        //
+        // Reuses `rollback_speculative_state_to_preserves_mtp_cursor_after_k1_reject`'s
+        // constant-zero-draft fixture (the draft head always predicts token 0), but
+        // forces `pending_first == 0` instead of `2`: token 0's real-model
+        // next-token prediction is token 0 itself (`0 % 3 == 0` gives it the
+        // negative-embedding residue class the target's zero-attention/zero-FFN
+        // stack turns into the logit maximum, and 0 is the first index in that
+        // class), which matches the constant draft (token 0) exactly -- a
+        // deterministic full accept, driven through the real `generate_greedy_mtp`
+        // path.
+        #[test]
+        fn full_accept_appends_mtp_cache_row_for_accepted_draft_token() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            use crate::generation::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
+            assert!(
+                state.session.mtp.is_some(),
+                "constant-draft MTP fixture must populate session.mtp"
+            );
+
+            let gen_cfg = GenerateConfig {
+                min_p: 0.0,
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(true),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            // Force `pending_first == 0` directly rather than relying on a real
+            // prefill, mirroring the sibling reject test's technique.
+            let mut prefill_logits = vec![-1.0f32; cfg.vocab_size];
+            prefill_logits[0] = 100.0;
+
+            let pos_before = state.session.kv_cache.seq_len;
+            assert_eq!(pos_before, 0);
+            let out = state.generate_greedy_mtp(&prefill_logits, 0, &tokenizer, &gen_cfg);
+            assert!(
+                !out.stopped,
+                "test assumes round 1 does not hit EOS; got {out:?}"
+            );
+
+            // K=1 full accept keeps `pending_token` (0) AND the draft (0), advancing
+            // the target KV cache by 2; a K=1 reject would advance it by only 1.
+            let kv_seq_len = state.session.kv_cache.seq_len;
+            assert_eq!(
+                kv_seq_len, 2,
+                "test setup assumption violated: expected round 1 to accept the \
+                 constant draft (token 0), matching the target's own prediction for \
+                 pending token 0, advancing the target KV cache by 2; got \
+                 {kv_seq_len}, meaning the draft was rejected instead"
+            );
+
+            // The defect under test: after a full accept, the MTP cache cursor must
+            // reach `c0 + 2` (one row for `pending_token`, one for the accepted
+            // draft token), holding a row at every logical position through the
+            // accepted token -- not `c0 + 1` with the accepted draft's own position
+            // left as a hole.
+            let mtp_seq_len = state.session.mtp.as_ref().unwrap().cache.seq_len;
+            assert_eq!(
+                mtp_seq_len, 2,
+                "K=1 full accept must leave the MTP cursor two rows past where it \
+                 started: one row `mtp_forward_one` wrote for `pending_token`, one \
+                 row the accept arm must append for the accepted draft token; got \
+                 {mtp_seq_len}, meaning the accepted draft's own row was never \
+                 appended and the next round's `mtp_forward_one` will land one \
+                 physical slot behind its RoPE position"
             );
         }
 
@@ -18793,8 +19230,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_forward_rows_close("prefill logits", &ordinary_logits, &hidden_logits);
             assert_eq!(ordinary.session.kv_cache.seq_len, tokens.len());
             assert_eq!(with_hidden.session.kv_cache.seq_len, tokens.len());
-            assert_eq!(ordinary.session.position, tokens.len());
-            assert_eq!(with_hidden.session.position, tokens.len());
+            assert_eq!(ordinary.session.position(), tokens.len());
+            assert_eq!(with_hidden.session.position(), tokens.len());
             assert_eq!(hidden.len(), cfg.hidden_size);
             assert!(hidden.iter().all(|value| value.is_finite()));
             assert!(hidden.iter().any(|&value| value != 0.0));
@@ -18841,7 +19278,49 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_eq!(with_hidden.session.kv_cache.seq_len, tokens.len() + 1);
         }
 
-        /// `tiny_metal_qwen35_fixture` (used by the two tests above) has zero
+        /// #1708: `forward_step_decode` is the per-token step behind
+        /// `generate`/`generate_streaming*` — the main autoregressive decode
+        /// path. It only ever advances `kv_cache.seq_len`; with `position()`
+        /// derived from that same field rather than tracked separately, this
+        /// path can no longer leave the decode cursor stale.
+        #[test]
+        fn forward_step_decode_keeps_position_synced_with_seq_len() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (forward_step_decode_keeps_position_synced_with_seq_len)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            let tokens = [42_u32, 2, 5];
+            let _ = state.forward_prefill(&tokens);
+            assert_eq!(state.session.position(), tokens.len());
+            assert_eq!(state.session.kv_cache.seq_len, tokens.len());
+
+            let pos = state.session.kv_cache.seq_len;
+            let _ = state.forward_step_decode(7, pos);
+
+            assert_eq!(
+                state.session.kv_cache.seq_len,
+                tokens.len() + 1,
+                "forward_step_decode must advance the live cache cursor"
+            );
+            assert_eq!(
+                state.session.position(),
+                state.session.kv_cache.seq_len,
+                "forward_step_decode is the main decode path (#1708): position must \
+                 stay in sync with kv_cache.seq_len rather than go stale"
+            );
+        }
+
+        /// `tiny_metal_qwen35_fixture` (used by the tests above) has zero
         /// GDN/linear-attention layers — `has_gdn_layers()` is false for it — so
         /// neither proves explicit hidden readback works on a hybrid GDN+full
         /// session. This test mirrors their structure on `tiny_hybrid_fixture`
@@ -19092,7 +19571,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             state.reset_path_proof_counters();
 
             let seq_len_before = state.session.kv_cache.seq_len;
-            let position_before = state.session.position;
+            let position_before = state.session.position();
             let kv_before = snapshot_kv_bytes(&state);
             let gdn_before = snapshot_gdn_bytes(&state);
             let hidden_before = state.session.last_pre_final_hidden.clone();
@@ -19107,7 +19586,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             assert!(message.contains("try_forward_step"), "{message}");
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19124,7 +19603,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "infallible raw step wrapper must reject the same stale cursor"
             );
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19153,7 +19632,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut state = mtp_loaded_live_hybrid_state_for_guard_test();
 
             let seq_len_before = state.session.kv_cache.seq_len;
-            let position_before = state.session.position;
+            let position_before = state.session.position();
             let kv_before = snapshot_kv_bytes(&state);
             let gdn_before = snapshot_gdn_bytes(&state);
             let hidden_before = state.session.last_pre_final_hidden.clone();
@@ -19167,7 +19646,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             assert!(message.contains("try_forward_prefill"), "{message}");
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19181,7 +19660,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }));
             assert!(panic.is_err(), "raw prefill must reject a live session");
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19198,7 +19677,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             assert!(message.contains("forward_prefill_all_logits"), "{message}");
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19228,7 +19707,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut state = mtp_loaded_live_hybrid_state_for_guard_test();
 
             let seq_len_before = state.session.kv_cache.seq_len;
-            let position_before = state.session.position;
+            let position_before = state.session.position();
             let kv_before = snapshot_kv_bytes(&state);
             let gdn_before = snapshot_gdn_bytes(&state);
             let hidden_before = state.session.last_pre_final_hidden.clone();
@@ -19254,7 +19733,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(production_error.to_string().contains("production"));
 
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
-            assert_eq!(state.session.position, position_before);
+            assert_eq!(state.session.position(), position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
@@ -19294,7 +19773,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "rejection must not advance the KV cache cursor"
             );
             assert_eq!(
-                state.session.position, 0,
+                state.session.position(),
+                0,
                 "rejection must not advance the decode cursor"
             );
             assert_eq!(
@@ -19319,7 +19799,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .forward_step_with_hidden(42, 0)
                 .expect("position matching the live cache cursor succeeds");
             assert_eq!(state.session.kv_cache.seq_len, 1);
-            assert_eq!(state.session.position, 1);
+            assert_eq!(state.session.position(), 1);
             assert!(hidden_a.iter().any(|&value| value != 0.0));
 
             // Defect-1 repro, second call: token_b at position 1 is the correct
@@ -19332,7 +19812,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect_err("a stale position behind the live cache cursor must be rejected");
             assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
             assert_eq!(state.session.kv_cache.seq_len, 1);
-            assert_eq!(state.session.position, 1);
+            assert_eq!(state.session.position(), 1);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(state.snapshot_gdn_states(), gdn_before);
 
@@ -19340,8 +19820,42 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .forward_step_with_hidden(2, 1)
                 .expect("position matching the live cache cursor succeeds");
             assert_eq!(state.session.kv_cache.seq_len, 2);
-            assert_eq!(state.session.position, 2);
+            assert_eq!(state.session.position(), 2);
             assert!(hidden_b.iter().any(|&value| value != 0.0));
+        }
+
+        #[test]
+        fn try_forward_step_keeps_session_position_in_sync_with_kv_cache_cursor() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            assert_eq!(state.session.position(), 0);
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+
+            // Drive several raw steps and assert the documented decode cursor
+            // (`session.position()`) agrees with the live cache cursor
+            // (`kv_cache.seq_len`) after every one of them, matching the
+            // contract `forward_step_with_hidden` already keeps.
+            for (position, token_id) in (0usize..3).zip([1u32, 2, 3]) {
+                state
+                    .try_forward_step(token_id, position)
+                    .expect("position matching the live cache cursor succeeds");
+                assert_eq!(
+                    state.session.kv_cache.seq_len,
+                    position + 1,
+                    "kv_cache.seq_len must advance by one token per step"
+                );
+                assert_eq!(
+                    state.session.position(),
+                    state.session.kv_cache.seq_len,
+                    "session.position() must track the live cache cursor after try_forward_step"
+                );
+            }
         }
 
         #[test]
@@ -19598,7 +20112,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "error must prove the KV half of the guard was false: {message}"
             );
             assert_eq!(state.session.kv_cache.seq_len, 0);
-            assert_eq!(state.session.position, 0);
+            assert_eq!(state.session.position(), 0);
             assert_eq!(
                 state.hidden_readback_path_proof_snapshot().prefill,
                 0,
@@ -19866,8 +20380,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let session_b = engine.new_session(16).expect("session_b constructs");
 
             // Both sessions start at position 0.
-            assert_eq!(session_a.position, 0, "session_a starts at position 0");
-            assert_eq!(session_b.position, 0, "session_b starts at position 0");
+            assert_eq!(session_a.position(), 0, "session_a starts at position 0");
+            assert_eq!(session_b.position(), 0, "session_b starts at position 0");
             assert_eq!(
                 session_a.kv_cache.seq_len, 0,
                 "session_a kv_cache starts empty"
@@ -19903,7 +20417,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .new_session(16)
                 .expect("fresh session constructs");
             assert_eq!(
-                fresh_session.position, 0,
+                fresh_session.position(),
+                0,
                 "fresh session position independent of state_a"
             );
             assert_eq!(
@@ -19913,7 +20428,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             // session_b was never touched; its state should match a fresh session.
             assert_eq!(
-                session_b.position, 0,
+                session_b.position(),
+                0,
                 "session_b untouched by state_a steps"
             );
             assert_eq!(
@@ -24727,6 +25243,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -25715,7 +26232,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut state = MetalQwen35State::new(&weights, &cfg, 16)
                 .expect("moe prefill fixture must construct");
 
-            let initial_position = state.session.position;
+            let initial_position = state.session.position();
             let tokens = [1u32, 3, 5];
 
             for attempt in 0..2 {
@@ -25728,7 +26245,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                      not silently produce logits"
                 );
                 assert_eq!(
-                    state.session.position, initial_position,
+                    state.session.position(),
+                    initial_position,
                     "attempt {attempt}: session position must be unchanged by a rejected prefill"
                 );
                 // SAFETY: StorageModeShared, read-only; the guard panics before a
@@ -25891,7 +26409,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 })
                 .collect();
-            let position = state.session.position;
+            let position = state.session.position();
             let gdn_snapshot = state.snapshot_gdn_states();
             let next_logits = state.forward_step(next_input, token_ids.len());
             PrefillSchedulerArtifacts {
@@ -29318,6 +29836,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29357,6 +29876,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  actually takes the MTP branch, not silently fall back"
             );
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29388,6 +29908,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29433,6 +29954,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29475,6 +29997,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29529,6 +30052,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29580,6 +30104,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = minimal_bpe_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 8,
                 temperature: 0.0,
                 top_k: 1,
@@ -29723,13 +30248,14 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[test]
         fn forward_prefill_with_hidden_reports_moe_prefill_rejection() {
             with_moe_prefill_state(16, |_cfg, state| {
-                let position_before = state.session.position;
+                let position_before = state.session.position();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     state.forward_prefill_with_hidden(&[1u32, 3, 5])
                 }));
                 assert_moe_prefill_rejected(outcome, "forward_prefill_with_hidden");
                 assert_eq!(
-                    state.session.position, position_before,
+                    state.session.position(),
+                    position_before,
                     "the rejection runs before any dispatch, so session position must \
                      be untouched"
                 );
@@ -29743,13 +30269,14 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[test]
         fn forward_prefill_all_logits_reports_moe_prefill_rejection() {
             with_moe_prefill_state(16, |_cfg, state| {
-                let position_before = state.session.position;
+                let position_before = state.session.position();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     state.forward_prefill_all_logits(&[1u32, 3, 5])
                 }));
                 assert_moe_prefill_rejected(outcome, "forward_prefill_all_logits");
                 assert_eq!(
-                    state.session.position, position_before,
+                    state.session.position(),
+                    position_before,
                     "the rejection runs before any dispatch, so session position must \
                      be untouched"
                 );
@@ -29951,6 +30478,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// rather than pass on the wrong evidence.
         fn moe_rejection_gen_cfg() -> crate::generation::GenerateConfig {
             crate::generation::GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -30046,6 +30574,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30122,6 +30651,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30201,6 +30731,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = multibyte_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30279,6 +30810,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 8,
                 temperature: 0.0,
                 top_k: 1,
@@ -30371,6 +30903,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30464,6 +30997,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30566,6 +31100,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let base_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 6,
                 temperature: 0.0,
                 top_k: 1,
@@ -30955,6 +31490,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 8,
                 temperature: 0.0,
                 top_k: 1,
@@ -31024,6 +31560,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 8,
                 temperature: 0.0,
                 top_k: 1,
@@ -31106,6 +31643,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 8,
                 temperature: 0.0,
                 top_k: 1,
@@ -31191,6 +31729,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 0,
                 temperature: 0.0,
                 top_k: 1,
@@ -31262,6 +31801,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -31309,6 +31849,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -31356,6 +31897,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -31411,6 +31953,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -31467,6 +32010,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 0,
                 temperature: 0.0,
                 top_k: 1,
@@ -31532,6 +32076,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 5,
                 temperature: 0.0,
                 top_k: 1,
@@ -31632,6 +32177,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let tokenizer = minimal_bpe_tokenizer();
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -32104,7 +32650,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
             // Both paths must advance the session cursor to the full prompt length.
             assert_eq!(state.session.kv_cache.seq_len, tokens.len());
-            assert_eq!(state.session.position, tokens.len());
+            assert_eq!(state.session.position(), tokens.len());
         }
 
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -32199,7 +32745,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "argmax mismatch on length-1 final chunk"
             );
             assert_eq!(state.session.kv_cache.seq_len, tokens.len());
-            assert_eq!(state.session.position, tokens.len());
+            assert_eq!(state.session.position(), tokens.len());
         }
 
         /// Experiment B regression gate: `forward_prefill_batched_chunk` now gates its
@@ -32296,7 +32842,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // The session cursor must have advanced through every chunk, including the
             // intermediate ones whose terminal tail was skipped.
             assert_eq!(state.session.kv_cache.seq_len, tokens.len());
-            assert_eq!(state.session.position, tokens.len());
+            assert_eq!(state.session.position(), tokens.len());
         }
 
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -32527,7 +33073,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 MetalQwen35State::new(&weights, &cfg, 8).expect("production fallback fixture");
             production.use_gdn_chunked = true;
             let _ = production.forward_prefill_batched_chunk(&[1, 2], 0, true, false, false);
-            assert_eq!(production.session.position, 2);
+            assert_eq!(production.session.position(), 2);
             assert_eq!(production.session.kv_cache.seq_len, 2);
 
             use crate::speculative::MtpTargetVerifier as _;
@@ -32542,7 +33088,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 panic.is_err(),
                 "isolated scheduler must reject unsupported chunked GDN"
             );
-            assert_eq!(isolated.session.position, 0);
+            assert_eq!(isolated.session.position(), 0);
             assert_eq!(isolated.session.kv_cache.seq_len, 0);
             assert_eq!(isolated.snapshot_gdn_states(), before);
         }
@@ -32891,8 +33437,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // boundary.  Skip lengths that exceed the model's max context.
             let sweep_lengths: &[usize] = &[1, 31, 32, 33, 64, 511, 512, 513, 1009];
 
-            // Evidence table: (len, all-position max_abs_diff, argmax flip count)
-            let mut evidence: Vec<(usize, f32, usize)> = Vec::new();
+            // Evidence table: (len, all-position max_abs_diff, argmax flip count, attempts used)
+            let mut evidence: Vec<(usize, f32, usize, usize)> = Vec::new();
             let mut any_flip = false;
 
             // The chunked scan is deterministic (gdn_chunked_b_vs_b_self_consistency), but
@@ -32944,7 +33490,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 // gdn_chunked_state_vs_serial_state_diff.
                 let mut best_max_abs = f32::MAX;
                 let mut best_flips = usize::MAX;
-                for _ in 0..ATTEMPTS {
+                let mut attempts_used = 0usize;
+                for attempt in 0..ATTEMPTS {
                     // Serial path (chunked OFF): per-position logits via all_logits.
                     state.use_gdn_chunked = false;
                     state.reset_state();
@@ -32973,6 +33520,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                             flips += 1;
                         }
                     }
+                    attempts_used = attempt + 1;
+                    eprintln!(
+                        "  len={n:4} attempt {attempt}: max_abs_diff={max_abs:.2e}  argmax_flips={flips}"
+                    );
 
                     if max_abs < best_max_abs {
                         best_max_abs = max_abs;
@@ -32984,9 +33535,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 }
 
                 eprintln!(
-                    "  len={n:4}: best-of-{ATTEMPTS} all-pos max_abs_diff={best_max_abs:.2e}  argmax_flips={best_flips}"
+                    "  len={n:4}: best-of-{attempts_used} all-pos max_abs_diff={best_max_abs:.2e}  argmax_flips={best_flips}"
                 );
-                evidence.push((n, best_max_abs, best_flips));
+                evidence.push((n, best_max_abs, best_flips, attempts_used));
                 if best_flips > 0 {
                     any_flip = true;
                 }
@@ -32996,9 +33547,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             state.use_gdn_chunked = true;
 
             eprintln!("Evidence table (boundary sweep, per-instance flag, no env mutation):");
-            eprintln!("  len | all-pos max_abs_diff | argmax_flips");
-            for (n, d, f) in &evidence {
-                eprintln!("  {n:4} | {d:.2e}             | {f}");
+            eprintln!("  len | all-pos max_abs_diff | argmax_flips | attempts");
+            for (n, d, f, a) in &evidence {
+                eprintln!("  {n:4} | {d:.2e}             | {f:<12} | {a}");
             }
 
             // Assert no argmax flips across all lengths and positions.
@@ -33009,7 +33560,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             // Assert all-position max_abs_diff stays within the evidence-based drift sentinel.
-            for (n, max_abs, _) in &evidence {
+            for (n, max_abs, _, _) in &evidence {
                 assert!(
                     *max_abs < MAX_ABS_BOUND,
                     "len={n}: all-position max_abs_diff={max_abs:.2e} exceeds #534 drift sentinel {MAX_ABS_BOUND:.2e}"
@@ -34686,6 +35237,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         fn cross_turn_test_gen_cfg(seed: u64, max_new_tokens: usize) -> GenerateConfig {
             GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens,
                 temperature: 0.0,
                 top_k: 1,
@@ -36399,6 +36951,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
@@ -36456,6 +37009,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
@@ -36527,6 +37081,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
@@ -36598,6 +37153,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 1,
                 temperature: 0.0,
                 top_k: 1,
@@ -36882,6 +37438,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -36973,6 +37530,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .clone();
 
             let rejected_cfg = GenerateConfig {
+                min_p: 0.0,
                 logprobs: Some(0),
                 ..cross_turn_test_gen_cfg(9, 2)
             };
@@ -37035,6 +37593,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
 
             let gen_cfg = crate::generation::GenerateConfig {
+                min_p: 0.0,
                 enable_mtp: Some(true),
                 ..cross_turn_test_gen_cfg(1, 2)
             };
@@ -37102,6 +37661,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // logprobs + enable_mtp both set: logprobs must win (checked first).
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let both_capabilities_cfg = GenerateConfig {
+                min_p: 0.0,
                 enable_mtp: Some(true),
                 logprobs: Some(0),
                 ..cross_turn_test_gen_cfg(1, 2)
@@ -37126,6 +37686,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // tokenization discovers the prompt is empty).
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let logprobs_and_empty_cfg = GenerateConfig {
+                min_p: 0.0,
                 logprobs: Some(0),
                 ..cross_turn_test_gen_cfg(1, 2)
             };
@@ -37149,6 +37710,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // tokenization discovers the prompt is empty).
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let mtp_and_empty_cfg = GenerateConfig {
+                min_p: 0.0,
                 enable_mtp: Some(true),
                 ..cross_turn_test_gen_cfg(1, 2)
             };
@@ -37484,7 +38046,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .token_ids
                 .clone();
             let kv_seq_len_before = state.session.kv_cache.seq_len;
-            let position_before = state.session.position;
+            let position_before = state.session.position();
 
             // Follow-up "ab": shares its full (2-token) length with the
             // entry AND the injected checkpoint at len=2 -> empty suffix.
@@ -37519,7 +38081,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "live KV length must be unchanged by a rejected request"
             );
             assert_eq!(
-                state.session.position, position_before,
+                state.session.position(),
+                position_before,
                 "live GDN position must be unchanged by a rejected request"
             );
 
@@ -37669,6 +38232,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     .expect("grammar engine builds over single-char vocab"),
             );
             crate::generation::GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens,
                 temperature: 0.0,
                 top_k: 1,
@@ -37714,6 +38278,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -37770,6 +38335,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -37834,6 +38400,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -38127,6 +38694,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -38181,6 +38749,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -38246,6 +38815,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             let gen_cfg = GenerateConfig {
+                min_p: 0.0,
                 max_new_tokens: 2,
                 temperature: 0.0,
                 top_k: 1,
@@ -42359,36 +42929,60 @@ mod self_spec_eos_tests {
     }
 }
 
-/// lattice#1584: no production Metal dispatch may create a command buffer outside an
-/// autorelease pool.
+/// lattice#1630 (widening lattice#1584): no production Metal dispatch anywhere under
+/// `crates/inference/src` may create a command buffer outside an autorelease pool.
 ///
 /// `metal-rs`'s `new_command_buffer` returns a borrowed reference to an autoreleased,
 /// unretained object, so a command buffer created with no enclosing pool survives until
 /// the thread's outermost pool drains, which on the long-lived serving worker never
-/// happens during a session. The measured cost on the decode funnel was 1.3-1.5 KB per
-/// step.
+/// happens during a session. The measured cost on the Qwen3.5 decode funnel was 1.3-1.5
+/// KB per step (lattice#1584).
 ///
-/// The guard is written over the discovered population rather than over a list of known
-/// sites, because the defect this fixes was that nine sibling dispatch paths were never
-/// swept together: a tenth one added later is exactly the case a hand-written list would
-/// miss. Every function in the production region that creates a command buffer must be a
-/// `*_dispatch` body reached through a pooling wrapper of the same base name, or appear
-/// in `EXEMPT` with its reason.
+/// lattice#1584's guard scanned this file's population alone, so the GEMM dispatch in
+/// `metal_gemm.rs` and the Qwen3-Embedding forward in `metal.rs` were never swept: same
+/// unpooled `new_command_buffer` call, different file. Rather than hand-listing those two
+/// files as a second known-sites population (the exact gap that let them go unswept the
+/// first time), this guard walks `crates/inference/src` itself and scans every file it
+/// finds, so a future production module that dispatches Metal work is discovered
+/// automatically. Every function in a discovered file's production region that creates a
+/// command buffer must be a `*_dispatch` body reached through a pooling wrapper of the
+/// same base name, or appear in `EXEMPT` with its reason.
 #[cfg(test)]
 mod metal_command_buffer_pool_tests {
     use super::public_scheduling_entry_point_tests::strip_comments_and_strings;
     use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
 
-    /// A bench fixture, not a serving path: the process that runs it exits after the
-    /// measurement, and pooling inside it would change a timed region. It would stop
-    /// being exempt the moment anything long-lived called it.
-    const EXEMPT: [&str; 1] = ["run_once"];
+    /// Exemptions from the pooling requirement, as `(file, function)` pairs so a
+    /// same-named function in a different file is not exempted by accident.
+    ///
+    /// `run_once`: a bench fixture, not a serving path — the process that runs it exits
+    /// after the measurement, and pooling inside it would change a timed region. It would
+    /// stop being exempt the moment anything long-lived called it.
+    const EXEMPT: &[(&str, &str)] = &[("forward/metal_qwen35.rs", "run_once")];
 
-    fn body_end(source: &str, from: usize) -> usize {
-        let open = from
-            + source[from..]
-                .find('{')
-                .expect("function declaration has a body");
+    /// Files this guard must find `new_command_buffer` in on every run — a floor under
+    /// the directory walk, not its ceiling: any other file the walk turns up is still
+    /// scanned and enforced. Catches the walk itself breaking (an exclusion rule drawn
+    /// too wide, a rename) before that reads as "nothing left to fix".
+    const EXPECTED_FILES: &[&str] = &[
+        "forward/metal.rs",
+        "forward/metal_gemm.rs",
+        "forward/metal_qwen35.rs",
+    ];
+
+    /// Finds the end of the brace-delimited block opening at or after `from`, by depth
+    /// count. Returns `None` rather than panicking when no such block exists (a
+    /// bodyless `mod name;` item) or the count never returns to zero (this scanner's
+    /// documented blind spot: it does not understand raw strings, so a raw string
+    /// containing its own `"` and brace characters — e.g. an embedded JSON fixture —
+    /// can desync its notion of what is source vs. string content for the rest of the
+    /// file). Both cases are directory-wide-walk realities the single hand-scoped
+    /// region this guard used before lattice#1630 never had to face: callers treat an
+    /// unresolvable span as "not a function/module worth blanking" and move on, since
+    /// the file that produced it is judged on its own content, not on this guess.
+    fn body_end(source: &str, from: usize) -> Option<usize> {
+        let open = from + source[from..].find('{')?;
         let mut depth = 0usize;
         for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
             match byte {
@@ -42396,13 +42990,13 @@ mod metal_command_buffer_pool_tests {
                 b'}' => {
                     depth -= 1;
                     if depth == 0 {
-                        return open + offset + 1;
+                        return Some(open + offset + 1);
                     }
                 }
                 _ => {}
             }
         }
-        panic!("unterminated function body at byte {from}");
+        None
     }
 
     /// Overwrites every `#[cfg(..test..)] mod NAME { .. }` with spaces, preserving length
@@ -42428,7 +43022,27 @@ mod metal_command_buffer_pool_tests {
             if !declaration.starts_with("mod ") {
                 continue;
             }
-            let end = body_end(source, index + skipped);
+            let decl_start = index + skipped;
+            // `mod name;` declares an external file with no inline body here to hide a
+            // command-buffer call in; that file is its own entry in the directory walk,
+            // judged on its own content. Only `mod name { .. }` has inline text to blank.
+            let brace_pos = source[decl_start..].find('{');
+            let semi_pos = source[decl_start..].find(';');
+            let is_external = match (brace_pos, semi_pos) {
+                (Some(b), Some(s)) => s < b,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if is_external {
+                index = decl_start + semi_pos.unwrap_or(0) + 1;
+                continue;
+            }
+            let Some(end) = body_end(source, decl_start) else {
+                // Can't bound this module; leave it unblanked rather than guess. Only
+                // matters if the file goes on to match `new_command_buffer`, which the
+                // caller checks independently of what this pass managed to blank.
+                continue;
+            };
             for byte in out[start..end].iter_mut() {
                 if *byte != b'\n' {
                     *byte = b' ';
@@ -42461,72 +43075,153 @@ mod metal_command_buffer_pool_tests {
                 index = name_start;
                 continue;
             }
-            let end = body_end(source, name_start + name_len);
+            // A "fn " match with no resolvable body is not a real function declaration
+            // in this scan (a bodyless trait/extern signature, or fallout from the raw-
+            // string blind spot noted on `body_end`); skip it rather than treat a parse
+            // failure elsewhere in the file as this guard's failure.
+            let Some(end) = body_end(source, name_start + name_len) else {
+                index = name_start + name_len;
+                continue;
+            };
             functions.push((name, start, end));
             index = end;
         }
         functions
     }
 
-    #[test]
-    fn every_production_command_buffer_creator_runs_inside_an_autorelease_pool() {
-        let source = include_str!("metal_qwen35.rs");
-        let region = source
-            .split_once("mod inner {")
-            .expect("real Metal implementation exists")
-            .1
-            .split_once("// Target-independent numerical support follows")
-            .expect("real Metal implementation has a stable end marker")
-            .0;
-        let scrubbed = blank_test_modules(&strip_comments_and_strings(region));
-        assert_eq!(
-            scrubbed.len(),
-            region.len(),
-            "scrubbing must preserve offsets"
-        );
-
-        let functions = enclosing_functions(&scrubbed);
-        let mut creators: BTreeSet<&str> = BTreeSet::new();
-        let mut sites = 0usize;
-        let mut cursor = 0usize;
-        while let Some(found) = scrubbed[cursor..].find("new_command_buffer") {
-            let at = cursor + found;
-            cursor = at + "new_command_buffer".len();
-            sites += 1;
-            let owner = functions
-                .iter()
-                .rev()
-                .find(|(_, start, end)| *start <= at && at < *end)
-                .unwrap_or_else(|| {
-                    panic!("command buffer creation at byte {at} sits in no function")
-                });
-            creators.insert(owner.0);
-        }
-        assert!(
-            sites > 0,
-            "found no command buffer creation at all: the scanner, not the source, changed"
-        );
-
-        for name in creators {
-            if EXEMPT.contains(&name) {
-                continue;
-            }
-            let base = name.strip_suffix("_dispatch").unwrap_or_else(|| {
+    /// Recursively collects every `.rs` file under `dir`, skipping directories named
+    /// `tests`, `benches`, or `examples`: those hold harnesses whose process exits after
+    /// the measurement, exactly the population this guard has always excluded ("the
+    /// remaining `new_command_buffer` sites in the tree are in benches, examples and
+    /// tests, whose processes exit after the measurement" — lattice#1630).
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("failed to read directory {}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| {
                 panic!(
-                    "{name} creates a Metal command buffer with no autorelease pool \
-                     (lattice#1584). Rename it to {name}_dispatch and add a wrapper \
-                     `fn {name}(..) {{ objc::rc::autoreleasepool(|| self.{name}_dispatch(..)) }}`, \
-                     or add it to EXEMPT with the reason it cannot leak."
+                    "failed to read a directory entry under {}: {e}",
+                    dir.display()
                 )
             });
-            let wrapper_start = scrubbed
-                .find(&format!("fn {base}("))
-                .unwrap_or_else(|| panic!("{name} has no wrapper named {base}"));
-            let wrapper = &scrubbed[wrapper_start..body_end(&scrubbed, wrapper_start + 3)];
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if matches!(name, "tests" | "benches" | "examples") {
+                    continue;
+                }
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn every_production_command_buffer_creator_runs_inside_an_autorelease_pool() {
+        let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "directory walk under {} found no .rs files at all: the walk, not the \
+             source, broke",
+            src_root.display()
+        );
+
+        let mut discovered: BTreeSet<String> = BTreeSet::new();
+        let mut total_sites = 0usize;
+
+        for path in &files {
+            let relative = path.strip_prefix(&src_root).unwrap_or(path);
+            let label = relative.to_string_lossy().replace('\\', "/");
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+
+            // `metal_qwen35.rs` carries a large non-Metal prelude and suffix (chat
+            // template helpers, MTP resolution, target-independent numerical support)
+            // around its production `mod inner { .. }` Metal implementation; scope to
+            // that region, as this guard always has, so unrelated code — or this guard's
+            // own source below — can't be mistaken for (or hide) a dispatch site.
+            let scoped: String = if label == "forward/metal_qwen35.rs" {
+                let (_, rest) = source
+                    .split_once("mod inner {")
+                    .expect("metal_qwen35.rs must still declare its production `mod inner`");
+                let (region, _) = rest
+                    .split_once("// Target-independent numerical support follows")
+                    .expect("metal_qwen35.rs must still carry its stable end-of-Metal marker");
+                region.to_string()
+            } else {
+                source
+            };
+
+            let scrubbed = blank_test_modules(&strip_comments_and_strings(&scoped));
+            assert_eq!(
+                scrubbed.len(),
+                scoped.len(),
+                "scrubbing must preserve offsets ({label})"
+            );
+
+            if !scrubbed.contains("new_command_buffer") {
+                continue;
+            }
+            discovered.insert(label.clone());
+
+            let functions = enclosing_functions(&scrubbed);
+            let mut creators: BTreeSet<&str> = BTreeSet::new();
+            let mut cursor = 0usize;
+            while let Some(found) = scrubbed[cursor..].find("new_command_buffer") {
+                let at = cursor + found;
+                cursor = at + "new_command_buffer".len();
+                total_sites += 1;
+                let owner = functions
+                    .iter()
+                    .rev()
+                    .find(|(_, start, end)| *start <= at && at < *end)
+                    .unwrap_or_else(|| {
+                        panic!("{label}: command buffer creation at byte {at} sits in no function")
+                    });
+                creators.insert(owner.0);
+            }
+
+            for name in creators {
+                if EXEMPT.contains(&(label.as_str(), name)) {
+                    continue;
+                }
+                let base = name.strip_suffix("_dispatch").unwrap_or_else(|| {
+                    panic!(
+                        "{label}: {name} creates a Metal command buffer with no autorelease \
+                         pool (lattice#1630). Rename it to {name}_dispatch and add a wrapper \
+                         `fn {name}(..) {{ objc::rc::autoreleasepool(|| self.{name}_dispatch(..)) }}`, \
+                         or add it to EXEMPT with the reason it cannot leak."
+                    )
+                });
+                let wrapper_start = scrubbed
+                    .find(&format!("fn {base}("))
+                    .unwrap_or_else(|| panic!("{label}: {name} has no wrapper named {base}"));
+                let wrapper_end = body_end(&scrubbed, wrapper_start + 3)
+                    .unwrap_or_else(|| panic!("{label}: wrapper {base} has no resolvable body"));
+                let wrapper = &scrubbed[wrapper_start..wrapper_end];
+                assert!(
+                    wrapper.contains("objc::rc::autoreleasepool")
+                        && wrapper.contains(&format!("{name}(")),
+                    "{label}: {base} must be the pooling wrapper that calls {name} (lattice#1630)"
+                );
+            }
+        }
+
+        assert!(
+            total_sites > 0,
+            "found no command buffer creation at all across the discovered files: the \
+             scanner, not the source, changed"
+        );
+        for expected in EXPECTED_FILES {
             assert!(
-                wrapper.contains("objc::rc::autoreleasepool")
-                    && wrapper.contains(&format!("{name}(")),
-                "{base} must be the pooling wrapper that calls {name} (lattice#1584)"
+                discovered.contains(*expected),
+                "discovery did not find a `new_command_buffer` call in {expected}: the \
+                 walk is broken (expected at least: {EXPECTED_FILES:?}, discovered: \
+                 {discovered:?})"
             );
         }
     }

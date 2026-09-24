@@ -163,6 +163,7 @@ fn compact_and_full_logit_readback_differ_in_bytes_while_both_count_one() {
     // arm actually resolves a block-top-k route instead of falling back.
     const LOCAL_K: usize = 8;
     let base = || GenerateConfig {
+        min_p: 0.0,
         max_new_tokens: 1,
         top_k: LOCAL_K,
         // top_p < 1.0 requires the approximate-top-p opt-in, which this test
@@ -186,6 +187,7 @@ fn compact_and_full_logit_readback_differ_in_bytes_while_both_count_one() {
     let compact_plan = plan_sampling_route(&base(), true, environment);
     let exact_plan = plan_sampling_route(
         &GenerateConfig {
+            min_p: 0.0,
             logprobs: Some(1),
             ..base()
         },

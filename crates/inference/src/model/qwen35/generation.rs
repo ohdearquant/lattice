@@ -1,6 +1,13 @@
 //! Qwen3.5 generation, streaming generation, prefill/decode loops, stop-streamer utilities, and stop-token helpers.
 use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
+// Row R03 deleted this module's last production callers of `sample_token`/`DecodePolicy`/
+// `StepOutcome` (the `generate_inline`/`generate_streaming_inline`/`decode_loop`/
+// `decode_loop_with_stops` family): production CPU generation now routes entirely through
+// `QwenCpuSession`/`decoder::driver::run`. This module's own tests still exercise
+// `DecodePolicy`/`StepOutcome`/`sample_token` directly (see `mod tests` below), so the
+// import is `#[cfg(test)]`-gated rather than deleted.
+#[cfg(test)]
 use super::sampling::sample_token;
 use super::stop_strings::earliest_stop_match;
 use crate::attention::gdn::GatedDeltaNetState;
@@ -8,11 +15,9 @@ use crate::decoder::Cancellation;
 use crate::decoder::driver;
 use crate::decoder::qwen_cpu::QwenCpuSession;
 use crate::error::InferenceError;
-use crate::generation::{
-    DecodePolicy, GenerateConfig, GenerateOutput, StepOutcome, StopCheckOutcome, TokenLogprob,
-    truncate_token_logprobs_to_retained_text,
-};
-use crate::grammar::pda::GrammarState;
+#[cfg(test)]
+use crate::generation::{DecodePolicy, StepOutcome};
+use crate::generation::{GenerateConfig, GenerateOutput, truncate_token_logprobs_to_retained_text};
 use crate::model::qwen35_config::{Qwen35Config, decode_cap};
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
@@ -83,13 +88,11 @@ impl Qwen35Model {
             .map(|(output, _trace)| output)
     }
 
-    /// ADR-090 row C dispatch point. Routes through [`Self::generate_via_driver`] (the new
-    /// `decoder::driver::run` over a [`crate::decoder::qwen_cpu::QwenCpuSession`]) whenever
-    /// neither grammar nor logprobs is requested, and falls back to
-    /// [`Self::generate_inline`] (the pre-migration implementation, unchanged) otherwise --
-    /// see `decoder::driver`'s module doc comment for why those two flags are the boundary:
-    /// the driver's `&mut dyn DecoderSession` has no way to reach the mutable grammar state
-    /// `select` samples against, nor the raw logits a logprobs capture needs.
+    /// ADR-090 row C dispatch point (row R03: unconditional -- every canonical Qwen3.5 CPU
+    /// generate/stream request now routes through [`Self::generate_via_driver`]
+    /// (`decoder::driver::run` over a [`crate::decoder::qwen_cpu::QwenCpuSession`]), grammar
+    /// and logprobs included; the pre-driver `generate_inline`/`decode_loop`/
+    /// `decode_loop_with_stops` fallback this comment used to describe is deleted).
     ///
     /// Crate-private and not `#[cfg(test)]`-gated (decomposition "Open question 3,
     /// ANSWERED"): a marker that only exists under `cfg(test)` would make the shipped path
@@ -99,380 +102,24 @@ impl Qwen35Model {
         prompt: &str,
         gen_cfg: &GenerateConfig,
     ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError> {
-        if gen_cfg.grammar.is_some() || gen_cfg.logprobs.is_some() {
-            return self
-                .generate_inline(prompt, gen_cfg)
-                .map(|output| (output, driver::DriverTrace::default()));
-        }
         self.generate_via_driver(prompt, gen_cfg)
     }
 
-    /// Pre-migration implementation (ADR-090 row C keeps this verbatim as the grammar/logprobs
-    /// fallback): unchanged body, unchanged behaviour, pinned by the e2e-parity CI gate and by
-    /// the `cpu_pre_migration_greedy_golden` integration test.
-    fn generate_inline(
-        &self,
-        prompt: &str,
-        gen_cfg: &GenerateConfig,
-    ) -> Result<GenerateOutput, InferenceError> {
-        let cfg = &self.config;
-
-        let mut rng_state = initial_rng_state(gen_cfg.seed);
-
-        let input = self.tokenizer.tokenize(prompt);
-        let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-        let prompt_len = prompt_ids.len();
-
-        // #856: single shared preflight, see `check_prompt_not_empty` (same
-        // module) for the full CPU/Metal unification rationale.
-        check_prompt_not_empty(prompt_len)?;
-
-        // max_new_tokens == 0 means "generate nothing": return before sampling so
-        // we never emit a token the caller did not ask for. Mirrors the identical
-        // guard in generate_streaming, which this function is otherwise a copy of.
-        if gen_cfg.max_new_tokens == 0 {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                stopped: false,
-                stop_reason: Some(StopReason::Length),
-                token_logprobs: vec![],
-            });
-        }
-
-        // Context preflight. apply_partial_rope indexes the precomputed cos/sin
-        // table unchecked, so a position at or past max_context() is an
-        // out-of-bounds slice access — a release panic, not a clean error. The
-        // decode loop runs `1..decode_cap(reasoning_budget, max_new_tokens)`
-        // (the budget-extended cap, equal to max_new_tokens when reasoning is
-        // unbudgeted), reaching at most position prompt_len + cap - 2. We adopt
-        // the stricter OpenAI-style "prompt plus requested completion fits the
-        // window" bound prompt_len + cap <= max_context: it matches the HTTP
-        // server (bin/lattice.rs) verbatim, so direct and HTTP generation agree
-        // on when a request is too long. Strictly safe (it can only reject one
-        // extra edge request, never admit a panic). Same guard in
-        // generate_streaming — using decode_cap is what makes a budgeted request
-        // (which decodes past max_new_tokens) preflight against its true reach.
-        // #922: shared with the Metal entry points via `check_context_budget`.
-        let max_context = self.max_context();
-        check_context_budget(
-            prompt_len,
-            gen_cfg.effective_reasoning_budget(),
-            gen_cfg.max_new_tokens,
-            max_context,
-        )?;
-        let effective_new =
-            decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
-
-        let num_linear = cfg.num_linear_attention_layers();
-        let num_full = cfg.num_full_attention_layers();
-        let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-            .map(|_| GatedDeltaNetState::new(cfg))
-            .collect();
-        let mut kv_cache = KvCache::new(num_full);
-        let mut scratch = ForwardScratch::new();
-
-        // Initialise per-request grammar state when grammar-constrained decoding
-        // is requested. None when no grammar is set (zero-cost for unconstrained
-        // generation). Shared by every canonical Qwen3.5 entry point.
-        let mut grammar_state: Option<GrammarState> =
-            gen_cfg.grammar.as_ref().map(|g| g.initial_state());
-
-        // Budget forcing: resolve and validate the </think> token id up front,
-        // before any early-success return below (grammar-blocked-at-step-0,
-        // grammar-advance failure, first-token EOS/stop) can return Ok without
-        // ever having confirmed an active reasoning budget is enforceable.
-        // Mirrors the Metal `generate_streaming_with_cancel` placement (see
-        // `MetalQwen35State`), which resolves this before its own
-        // should_cancel/prefill/grammar/EOS checks for the same reason.
-        let think_close_id = resolve_reasoning_close_token(
-            &self.tokenizer,
-            gen_cfg.reasoning_budget,
-            gen_cfg.enable_thinking,
-            cfg.vocab_size,
-        )?;
-
-        let mut generated_ids: Vec<u32> = Vec::with_capacity(effective_new);
-        let mut all_ids = prompt_ids.clone();
-        // Empty `Vec` costs no heap allocation until pushed to, so this is
-        // zero-cost when `gen_cfg.logprobs` is `None` (the default path).
-        let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
-
-        // Prompt prefill: try the batched (dense-config) path first, which
-        // performs one layer pass over all prompt positions plus a single
-        // final-token vocab projection, instead of `prompt_len` full
-        // `forward_step` calls (each of which computes an unused vocab
-        // projection for every non-final prompt token). Falls back to the
-        // serial `prefill_tokens` loop for MoE (`UnsupportedModel`) *before*
-        // any `gdn_states` / `kv_cache` mutation, so the fallback always
-        // starts from pristine state. See
-        // `Qwen35Model::prefill_tokens_batched_for_generate` for the
-        // logits-equivalence argument.
-        let prefill_logits: Vec<f32> = if force_serial_prefill() {
-            // Test-only escape hatch (compiles to `false` unconditionally
-            // outside `#[cfg(test)]`; see `force_serial_prefill` below) used by
-            // the delegation parity test to reproduce the pre-delegation
-            // behaviour for a byte-for-byte token comparison against the
-            // batched path.
-            prefill_tokens(
-                self,
-                &prompt_ids,
-                &mut gdn_states,
-                &mut kv_cache,
-                &mut scratch,
-            );
-            kv_cache.seq_len = prompt_len;
-            scratch.logits[..cfg.vocab_size].to_vec()
-        } else {
-            match self.prefill_tokens_batched_for_generate(
-                &prompt_ids,
-                &mut gdn_states,
-                &mut kv_cache,
-            ) {
-                Ok(logits) => logits,
-                Err(InferenceError::UnsupportedModel(_)) => {
-                    prefill_tokens(
-                        self,
-                        &prompt_ids,
-                        &mut gdn_states,
-                        &mut kv_cache,
-                        &mut scratch,
-                    );
-                    kv_cache.seq_len = prompt_len;
-                    scratch.logits[..cfg.vocab_size].to_vec()
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        // `scratch` may not have been touched by the batched path (it only
-        // mutates its own private `PrefillScratch`), so its `logits` buffer
-        // can still be its initial zero-length `Vec::new()`. Ensure capacity
-        // before copying the prefill result in, whichever path produced it.
-        scratch.ensure_capacity(cfg, prompt_len);
-        scratch.logits[..cfg.vocab_size].copy_from_slice(&prefill_logits);
-
-        // Apply grammar mask on the post-prefill logit buffer before the first
-        // sample. mask_logits sets every disallowed token to NEG_INFINITY in-place,
-        // so the sampler only sees the grammar-permitted candidate set.
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
-            // If the grammar blocked every token the sampler's non-finite-max
-            // short-circuit would silently return token 0. An accepting state
-            // terminates normally; an incomplete state remains a hard error.
-            if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
-                if engine.is_complete_without_continuation(gs) {
-                    return Ok(grammar_output(String::new(), &[], prompt_len, true, vec![]));
-                }
-                return Err(InferenceError::GrammarConstraintBlocked(
-                    "grammar constraint blocked every token at step 0; \
-                     no legal first token exists in the current grammar state"
-                        .into(),
-                ));
-            }
-        }
-
-        let next_id = sample_token(
-            &scratch.logits[..cfg.vocab_size],
-            gen_cfg,
-            &all_ids,
-            &mut rng_state,
-        );
-
-        // Advance grammar state after sampling. advance() returns false when the
-        // grammar has no valid continuation for the selected token, signalling the
-        // end of grammar-constrained generation. Keep the same early-return
-        // contract across the canonical direct and streaming paths.
-        let grammar_complete =
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                if !engine.advance(gs, next_id) {
-                    return Ok(grammar_output(
-                        String::new(),
-                        &[],
-                        prompt_len,
-                        false,
-                        vec![],
-                    ));
-                }
-                engine.is_complete_without_continuation(gs)
-            } else {
-                false
-            };
-
-        if should_stop_token(cfg, gen_cfg, next_id) {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                stopped: true,
-                stop_reason: Some(StopReason::Eos),
-                token_logprobs: vec![],
-            });
-        }
-
-        generated_ids.push(next_id);
-        all_ids.push(next_id);
-
-        // think_close_id was already resolved and validated above, before the
-        // grammar/EOS early-return paths. Seeds thinking_closed from the
-        // prefill token so budget=1 works. Mirrors generate_streaming exactly;
-        // disabled (reasoning_budget=None) → None/false → no-op, byte-identical to
-        // pre-feature behaviour (e2e-parity pinned).
-        // `DecodePolicy::init` (PR #787) constructs
-        // the policy AND records this prefill-derived first token's logprob
-        // in the same call -- replaces the freestanding `record_logprob(...)`
-        // call this site used to make independently of the policy.
-        let mut policy = DecodePolicy::init(
-            gen_cfg,
-            think_close_id,
-            &mut token_logprobs,
-            next_id,
-            &scratch.logits[..cfg.vocab_size],
-            gen_cfg.temperature,
-            generated_ids.len(),
-            false,
-        );
-
-        if gen_cfg.stop_strings.is_empty() {
-            // Fast path: no string-level stops. Behaviour byte-for-byte identical
-            // to before this feature was added; the e2e-parity CI gate pins this.
-            if grammar_complete {
-                return Ok(grammar_output(
-                    decode_tokens(&self.tokenizer, &generated_ids),
-                    &generated_ids,
-                    prompt_len,
-                    true,
-                    token_logprobs,
-                ));
-            }
-            let (stopped, loop_stop_reason) = decode_loop(
-                self,
-                gen_cfg,
-                &mut all_ids,
-                &mut generated_ids,
-                &mut rng_state,
-                &mut gdn_states,
-                &mut kv_cache,
-                &mut scratch,
-                &mut grammar_state,
-                &mut policy,
-                &mut token_logprobs,
-            )?;
-
-            let text = decode_tokens(&self.tokenizer, &generated_ids);
-
-            Ok(GenerateOutput {
-                text,
-                token_ids: generated_ids.clone(),
-                prompt_tokens: prompt_len,
-                generated_tokens: generated_ids.len(),
-                stopped,
-                stop_reason: Some(loop_stop_reason),
-                token_logprobs,
-            })
-        } else {
-            // String-stop path: accumulate decoded text and check after every token.
-            let mut detok = IncrementalDetokenizer::new();
-            let first_delta = detok.push(&self.tokenizer, next_id);
-            let mut full = String::new();
-
-            // Tracks, per recorded `token_logprobs` entry, the length of `full`
-            // immediately after that token's delta landed — grown in lockstep
-            // with token_logprobs (both gated on gen_cfg.logprobs.is_some()), so
-            // a stop-string truncation can drop exactly the trailing entries
-            // whose text didn't fully survive. See
-            // `truncate_token_logprobs_to_retained_text`.
-            let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
-
-            // Check stop strings after the first token (PR #787): routed
-            // through the policy's owned
-            // stop-mode adapter (`check_initial_stop`) instead of the free
-            // `earliest_stop_match` call this site used to make directly --
-            // `full`/`token_logprob_end_offsets` are populated by the adapter
-            // itself, not by this call site.
-            if matches!(
-                policy.check_initial_stop(
-                    &mut token_logprobs,
-                    &mut full,
-                    &mut token_logprob_end_offsets,
-                    &first_delta,
-                    |_| true,
-                ),
-                StopCheckOutcome::Stopped
-            ) {
-                // generated_ids already contains next_id; we cannot un-generate it,
-                // so token_ids/generated_tokens reflect all tokens up to the match.
-                return Ok(GenerateOutput {
-                    text: full,
-                    token_ids: generated_ids.clone(),
-                    prompt_tokens: prompt_len,
-                    generated_tokens: generated_ids.len(),
-                    stopped: true,
-                    stop_reason: Some(StopReason::Eos),
-                    token_logprobs,
-                });
-            }
-
-            if grammar_complete {
-                let tail = detok.finish();
-                if !tail.is_empty() {
-                    full.push_str(&tail);
-                }
-                return Ok(grammar_output(
-                    full,
-                    &generated_ids,
-                    prompt_len,
-                    true,
-                    token_logprobs,
-                ));
-            }
-
-            let (stopped, loop_stop_reason) = decode_loop_with_stops(
-                self,
-                gen_cfg,
-                &mut all_ids,
-                &mut generated_ids,
-                &mut rng_state,
-                &mut gdn_states,
-                &mut kv_cache,
-                &mut scratch,
-                &mut detok,
-                &mut full,
-                &mut grammar_state,
-                &mut policy,
-                &mut token_logprobs,
-                &mut token_logprob_end_offsets,
-            )?;
-
-            Ok(GenerateOutput {
-                text: full,
-                token_ids: generated_ids.clone(),
-                prompt_tokens: prompt_len,
-                generated_tokens: generated_ids.len(),
-                stopped,
-                stop_reason: Some(loop_stop_reason),
-                token_logprobs,
-            })
-        }
-    }
-
-    /// ADR-090 row C: `generate()`'s grammar/logprobs-free path, constructing a
-    /// [`QwenCpuSession`] and running [`driver::run`] over it instead of the two
-    /// hand-written loops [`Self::generate_inline`] still owns for the fallback case.
-    /// Every preflight step through `think_close_id` resolution is unchanged from
-    /// [`Self::generate_inline`] -- only the decode mechanics after prefill are
-    /// re-routed. `gen_cfg.seed` and `gen_cfg.temperature` go straight into
-    /// [`QwenCpuSession::new`], which owns the RNG draw and the per-request
-    /// `gdn_states`/`kv_cache`/`scratch` allocation from here on (see that
-    /// constructor's own doc comment for why it captures exactly those two fields).
+    /// ADR-090 row C, extended by row R03 to every canonical Qwen3.5 CPU generate request
+    /// (grammar and logprobs included -- no exceptions remain): constructs a
+    /// [`QwenCpuSession`] and runs [`driver::run`] over it. Every preflight step through
+    /// `think_close_id` resolution is unchanged from the pre-driver implementation -- only
+    /// the decode mechanics after prefill are re-routed. `gen_cfg.seed` and
+    /// `gen_cfg.temperature` go straight into [`QwenCpuSession::new`], which owns the RNG
+    /// draw and the per-request `gdn_states`/`kv_cache`/`scratch` allocation from here on
+    /// (see that constructor's own doc comment for why it captures exactly those two
+    /// fields). `gen_cfg.grammar` is read by [`driver::run`] itself now, not by this
+    /// constructor -- the driver owns grammar transitions (ADR-090 D1).
     fn generate_via_driver(
         &self,
         prompt: &str,
         gen_cfg: &GenerateConfig,
     ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError> {
-        debug_assert!(gen_cfg.grammar.is_none() && gen_cfg.logprobs.is_none());
         let cfg = &self.config;
 
         let input = self.tokenizer.tokenize(prompt);
@@ -530,6 +177,7 @@ impl Qwen35Model {
                 cfg.eos_token_id,
                 false,
                 &never_cancel,
+                |_generated_len| {},
                 |_next_id| String::new(),
                 &mut throwaway_text,
                 &mut throwaway_offsets,
@@ -565,6 +213,7 @@ impl Qwen35Model {
                 cfg.eos_token_id,
                 false,
                 &never_cancel,
+                |_generated_len| {},
                 |next_id| detok.push(&self.tokenizer, next_id),
                 &mut full,
                 &mut token_logprob_end_offsets,
@@ -722,14 +371,10 @@ impl Qwen35Model {
             .map(|(output, _trace)| output)
     }
 
-    /// ADR-092 arm 1 dispatch point, streaming sibling of [`Self::generate_with_trace`]:
-    /// routes through [`Self::generate_streaming_via_driver`] (`decoder::driver::run` over
-    /// a [`QwenCpuSession`], same as the non-streaming driver route) whenever neither
-    /// grammar nor logprobs is requested, and falls back to
-    /// [`Self::generate_streaming_inline`] (the pre-migration implementation, unchanged)
-    /// otherwise -- same routing predicate as `generate_with_trace`, for the same reason:
-    /// the driver's `&mut dyn DecoderSession` has no way to reach the mutable grammar
-    /// state `select` samples against, nor the raw logits a logprobs capture needs.
+    /// ADR-092 arm 1 dispatch point, streaming sibling of [`Self::generate_with_trace`]
+    /// (row R03: unconditional, same as that function -- routes through
+    /// [`Self::generate_streaming_via_driver`] for every canonical Qwen3.5 CPU streaming
+    /// request, grammar and logprobs included).
     ///
     /// Crate-private and not `#[cfg(test)]`-gated, matching `generate_with_trace`: a
     /// marker that only exists under `cfg(test)` would make the shipped path and the
@@ -747,31 +392,28 @@ impl Qwen35Model {
         C: FnMut() -> bool,
         O: FnMut(RawGenEvent),
     {
-        if gen_cfg.grammar.is_some() || gen_cfg.logprobs.is_some() {
-            return self
-                .generate_streaming_inline(prompt, gen_cfg, on_token, should_cancel, on_raw_event)
-                .map(|output| (output, driver::DriverTrace::default()));
-        }
         self.generate_streaming_via_driver(prompt, gen_cfg, on_token, should_cancel, on_raw_event)
     }
 
-    /// Driver-routed dispatch target for the shape `decoder::driver::run` accepts (no
-    /// grammar, no logprobs) -- streaming sibling of [`Self::generate_via_driver`], which
-    /// it mirrors closely: same tokenize/preflight/context-budget/reasoning-close
+    /// Driver-routed dispatch target -- streaming sibling of [`Self::generate_via_driver`],
+    /// which it mirrors closely: same tokenize/preflight/context-budget/reasoning-close
     /// sequence, same [`QwenCpuSession`], same `driver::run` call. Two differences, both
-    /// load-bearing for the streaming contract [`Self::generate_streaming_inline`]
-    /// documents:
+    /// load-bearing for the streaming contract:
     ///
     /// 1. **Cancellation.** `should_cancel` here is `FnMut` (it may capture a
     ///    `Receiver`-style handle), while `decoder::Cancellation`'s blanket impl covers
     ///    only non-mutating `Fn` closures. [`FnMutCancellation`] bridges the two via a
     ///    `RefCell`, per that trait's own doc comment.
-    /// 2. **Raw-token eventing.** `decoder::driver::run` calls `decode_delta` exactly
-    ///    once per token that becomes part of `generated_ids`, immediately after the
-    ///    push, in generation order -- the same guarantee [`RawGenEvent::RawToken`]'s own
-    ///    doc comment relies on. A local counter incremented inside `decode_delta`
-    ///    therefore reproduces `index == generated_ids.len()` at push time exactly,
-    ///    without a dedicated driver parameter for it.
+    /// 2. **Raw-token eventing.** `decoder::driver::run` calls its dedicated `on_push`
+    ///    parameter exactly once per token that becomes part of `generated_ids`,
+    ///    immediately at the push, in generation order, with `generated_ids.len()` at
+    ///    that moment -- the same guarantee [`RawGenEvent::RawToken`]'s own doc comment
+    ///    relies on. This entry fires `RawToken` from that hook directly, using the
+    ///    length it is handed as the index, rather than from `decode_delta`: `decode_delta`
+    ///    runs later in `driver::run`'s fixed per-step order (after `record_metadata`'s
+    ///    session-scored logprob call whenever `gen_cfg.logprobs` is set), so firing from
+    ///    it would let the event's timing drift with that call's cost instead of marking
+    ///    the true push boundary.
     ///
     /// Always builds a real incremental detokenizer and real output buffers (unlike
     /// `generate_via_driver`'s fast/stop-strings split, which throws the delta away when
@@ -792,7 +434,6 @@ impl Qwen35Model {
         C: FnMut() -> bool,
         O: FnMut(RawGenEvent),
     {
-        debug_assert!(gen_cfg.grammar.is_none() && gen_cfg.logprobs.is_none());
         let cfg = &self.config;
 
         let input = self.tokenizer.tokenize(prompt);
@@ -837,15 +478,17 @@ impl Qwen35Model {
         let should_cancel_cell = std::cell::RefCell::new(should_cancel);
         let cancel = FnMutCancellation(&should_cancel_cell);
 
-        // Shared via `RefCell` rather than plain captures: `decode_delta` (called once
-        // per pushed token) and `on_prefill_end` (called once, before any token) are two
-        // separate closures passed into the same `driver::run` call, and both need
-        // `on_raw_event`; `decode_delta` and `finish_tail` both need `detok`. Neither
-        // pair is ever live concurrently (`driver::run` calls them strictly
-        // sequentially, single-threaded), so the runtime borrow check never conflicts.
+        // Shared via `RefCell` rather than plain captures: `on_push` (called once per
+        // pushed token, before `decode_delta` runs for that same token -- see
+        // `driver::run`'s doc comment), `decode_delta` (also called once per pushed
+        // token), and `on_prefill_end` (called once, before any token) are three
+        // separate closures passed into the same `driver::run` call, and both `on_push`
+        // and `on_prefill_end` need `on_raw_event`; `decode_delta` and `finish_tail`
+        // both need `detok`. No two of these are ever live concurrently (`driver::run`
+        // calls them strictly sequentially, single-threaded), so the runtime borrow
+        // check never conflicts.
         let on_raw_event_cell = std::cell::RefCell::new(on_raw_event);
         let detok_cell = std::cell::RefCell::new(IncrementalDetokenizer::new());
-        let mut raw_token_index = 0usize;
         let mut text = String::new();
         let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
@@ -857,13 +500,19 @@ impl Qwen35Model {
             cfg.eos_token_id,
             true,
             &cancel,
-            |next_id| {
-                raw_token_index += 1;
+            // Fires `RawToken` at `driver::run`'s own `on_push` hook, i.e. immediately
+            // at the push that grows `generated_ids` to `generated_len` -- never from
+            // `decode_delta` below, which `driver::run` calls later in the fixed
+            // per-step order (after `record_metadata`'s session-scored logprob call
+            // whenever `gen_cfg.logprobs` is set). `generated_len` IS the index this
+            // event must report (`RawGenEvent::RawToken`'s own doc comment), so no
+            // local counter is needed to reproduce it.
+            |generated_len| {
                 (*on_raw_event_cell.borrow_mut())(RawGenEvent::RawToken {
-                    index: raw_token_index,
+                    index: generated_len,
                 });
-                detok_cell.borrow_mut().push(&self.tokenizer, next_id)
             },
+            |next_id| detok_cell.borrow_mut().push(&self.tokenizer, next_id),
             &mut text,
             &mut token_logprob_end_offsets,
             |delta, _next_id| on_token(delta),
@@ -892,702 +541,6 @@ impl Qwen35Model {
             },
             result.trace,
         ))
-    }
-
-    /// Pre-migration implementation (ADR-092 arm 1 keeps this verbatim as the
-    /// grammar/logprobs fallback): unchanged body, unchanged behaviour, pinned by the
-    /// e2e-parity CI gate. Was `generate_streaming_with_observer` before this row; see
-    /// that function (now a thin dispatcher) for the public entry point.
-    fn generate_streaming_inline<F, C, O>(
-        &self,
-        prompt: &str,
-        gen_cfg: &GenerateConfig,
-        mut on_token: F,
-        mut should_cancel: C,
-        mut on_raw_event: O,
-    ) -> Result<GenerateOutput, InferenceError>
-    where
-        F: FnMut(&str) -> bool,
-        C: FnMut() -> bool,
-        O: FnMut(RawGenEvent),
-    {
-        let cfg = &self.config;
-
-        let mut rng_state = initial_rng_state(gen_cfg.seed);
-
-        let input = self.tokenizer.tokenize(prompt);
-        let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-        let prompt_len = prompt_ids.len();
-
-        // #856: single shared preflight, see `check_prompt_not_empty` (same
-        // module) for the full CPU/Metal unification rationale.
-        check_prompt_not_empty(prompt_len)?;
-
-        // max_new_tokens == 0 means "generate nothing": return before sampling so
-        // we never emit a token the caller did not ask for.
-        if gen_cfg.max_new_tokens == 0 {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                stopped: false,
-                stop_reason: Some(StopReason::Length),
-                token_logprobs: vec![],
-            });
-        }
-
-        // Context preflight: see generate() for the full rationale and the exact
-        // vs. adopted-bound discussion. apply_partial_rope indexes the RoPE table
-        // unchecked, so a request past max_context() would panic in the decode
-        // loop; this mirrors the HTTP server's total-token contract verbatim.
-        // decode_cap accounts for a budgeted request decoding past max_new_tokens.
-        // #922: shared with the Metal entry points via `check_context_budget`.
-        let max_context = self.max_context();
-        check_context_budget(
-            prompt_len,
-            gen_cfg.effective_reasoning_budget(),
-            gen_cfg.max_new_tokens,
-            max_context,
-        )?;
-        let effective_new =
-            decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
-
-        let num_linear = cfg.num_linear_attention_layers();
-        let num_full = cfg.num_full_attention_layers();
-        let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-            .map(|_| GatedDeltaNetState::new(cfg))
-            .collect();
-        let mut kv_cache = KvCache::new(num_full);
-        let mut scratch = ForwardScratch::new();
-
-        // Per-request grammar state, mirroring the generate() path above.
-        let mut grammar_state: Option<GrammarState> =
-            gen_cfg.grammar.as_ref().map(|g| g.initial_state());
-
-        // Budget forcing: resolve and validate the </think> token id up front,
-        // before any early-success return below (should_cancel, grammar-
-        // blocked-at-step-0, grammar-advance failure, first-token EOS/stop)
-        // can return Ok without ever having confirmed an active reasoning
-        // budget is enforceable. Mirrors the Metal
-        // `generate_streaming_with_cancel` placement (see `MetalQwen35State`),
-        // which resolves this before its own
-        // should_cancel/prefill/grammar/EOS checks for the same reason.
-        let think_close_id = resolve_reasoning_close_token(
-            &self.tokenizer,
-            gen_cfg.reasoning_budget,
-            gen_cfg.enable_thinking,
-            cfg.vocab_size,
-        )?;
-
-        let mut generated_ids: Vec<u32> = Vec::with_capacity(effective_new);
-        let mut all_ids = prompt_ids.clone();
-        // Empty `Vec` costs no heap allocation until pushed to, so this is
-        // zero-cost when `gen_cfg.logprobs` is `None` (the default path).
-        let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
-
-        // Checked independently of `on_token`: a client that disconnected
-        // between dequeue and here must not pay for the (potentially large)
-        // prefill pass below. Mirrors the Metal
-        // `generate_streaming_with_cancel`'s first `should_cancel` checkpoint.
-        if should_cancel() {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                stopped: false, // caller interrupted the stream, not a stop condition
-                stop_reason: Some(StopReason::Interrupt),
-                token_logprobs: vec![],
-            });
-        }
-
-        // Prompt prefill: try the batched (dense-config) path first, which
-        // performs one layer pass over all prompt positions plus a single
-        // final-token vocab projection, instead of `prompt_len` full
-        // `forward_step` calls (each of which computes an unused vocab
-        // projection for every non-final prompt token). Falls back to the
-        // serial `prefill_tokens` loop for MoE (`UnsupportedModel`) *before*
-        // any `gdn_states` / `kv_cache` mutation, so the fallback always
-        // starts from pristine state. See
-        // `Qwen35Model::prefill_tokens_batched_for_generate` for the
-        // logits-equivalence argument.
-        let prefill_logits: Vec<f32> = if force_serial_prefill() {
-            // Test-only escape hatch (compiles to `false` unconditionally
-            // outside `#[cfg(test)]`; see `force_serial_prefill` below) used by
-            // the delegation parity test to reproduce the pre-delegation
-            // behaviour for a byte-for-byte token comparison against the
-            // batched path.
-            prefill_tokens(
-                self,
-                &prompt_ids,
-                &mut gdn_states,
-                &mut kv_cache,
-                &mut scratch,
-            );
-            kv_cache.seq_len = prompt_len;
-            scratch.logits[..cfg.vocab_size].to_vec()
-        } else {
-            match self.prefill_tokens_batched_for_generate(
-                &prompt_ids,
-                &mut gdn_states,
-                &mut kv_cache,
-            ) {
-                Ok(logits) => logits,
-                Err(InferenceError::UnsupportedModel(_)) => {
-                    prefill_tokens(
-                        self,
-                        &prompt_ids,
-                        &mut gdn_states,
-                        &mut kv_cache,
-                        &mut scratch,
-                    );
-                    kv_cache.seq_len = prompt_len;
-                    scratch.logits[..cfg.vocab_size].to_vec()
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        // `scratch` may not have been touched by the batched path (it only
-        // mutates its own private `PrefillScratch`), so its `logits` buffer
-        // can still be its initial zero-length `Vec::new()`. Ensure capacity
-        // before copying the prefill result in, whichever path produced it.
-        scratch.ensure_capacity(cfg, prompt_len);
-        scratch.logits[..cfg.vocab_size].copy_from_slice(&prefill_logits);
-
-        // Prefill logits are ready -- the true prefill/decode boundary.
-        // Fired here, immediately, before the cancellation check and grammar
-        // masking below: both of those can return early (a post-prefill
-        // disconnect, or a step-0 grammar block with no legal first token),
-        // and prefill itself already completed by this point regardless of
-        // what either of those checks decides, so a caller observing raw
-        // events must still see prefill end even on those early-return
-        // paths -- not just on the eventual-first-token path.
-        on_raw_event(RawGenEvent::PrefillEnd);
-
-        // The prefill call itself cannot be interrupted mid-flight, so this
-        // is the earliest point a disconnect that happened *during* prefill
-        // can be observed -- before paying for grammar masking or sampling
-        // on its output. Mirrors the Metal `generate_streaming_with_cancel`'s
-        // second `should_cancel` checkpoint.
-        if should_cancel() {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                stopped: false, // caller interrupted the stream, not a stop condition
-                stop_reason: Some(StopReason::Interrupt),
-                token_logprobs: vec![],
-            });
-        }
-
-        // Grammar mask on the post-prefill logits, identical to the generate() path.
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
-            if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
-                if engine.is_complete_without_continuation(gs) {
-                    return Ok(grammar_output(String::new(), &[], prompt_len, true, vec![]));
-                }
-                return Err(InferenceError::GrammarConstraintBlocked(
-                    "grammar constraint blocked every token at step 0; \
-                     no legal first token exists in the current grammar state"
-                        .into(),
-                ));
-            }
-        }
-
-        // Test-only seam: stamp "first sample
-        // entered" right at the point sampling actually begins, so a test can
-        // assert PrefillEnd fired before this instant, not merely before the
-        // RawToken callback further below. No-op outside `cfg(test)`.
-        #[cfg(test)]
-        test_record_first_sample_entry();
-
-        let next_id = sample_token(
-            &scratch.logits[..cfg.vocab_size],
-            gen_cfg,
-            &all_ids,
-            &mut rng_state,
-        );
-
-        // Grammar advance after sampling the first token, mirroring generate().
-        let grammar_complete =
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                if !engine.advance(gs, next_id) {
-                    return Ok(grammar_output(
-                        String::new(),
-                        &[],
-                        prompt_len,
-                        false,
-                        vec![],
-                    ));
-                }
-                engine.is_complete_without_continuation(gs)
-            } else {
-                false
-            };
-
-        if should_stop_token(cfg, gen_cfg, next_id) {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                stopped: true,
-                stop_reason: Some(StopReason::Eos),
-                token_logprobs: vec![],
-            });
-        }
-
-        // think_close_id was already resolved and validated above, before the
-        // should_cancel/grammar/EOS early-return paths -- seeds the
-        // thinking_closed state from the prefill token so budget=1 works, and
-        // is bound before the token is committed to `generated_ids` or
-        // emitted to the streaming observer below, so a resolution failure
-        // returns Err without ever having sent a RawToken event for this
-        // generation.
-        generated_ids.push(next_id);
-        all_ids.push(next_id);
-        // Raw-token event for the prefill-derived first token, fired from the
-        // exact point it becomes part of `generated_ids` -- symmetric with
-        // the decode-loop `push` closures below, so the event count always
-        // equals `GenerateOutput.generated_tokens`.
-        on_raw_event(RawGenEvent::RawToken {
-            index: generated_ids.len(),
-        });
-        // `DecodePolicy::init` (PR #787) constructs
-        // the policy AND records this prefill-derived first token's logprob
-        // in the same call -- replaces the freestanding `record_logprob(...)`
-        // call this site used to make independently of the policy.
-        let mut policy = DecodePolicy::init(
-            gen_cfg,
-            think_close_id,
-            &mut token_logprobs,
-            next_id,
-            &scratch.logits[..cfg.vocab_size],
-            gen_cfg.temperature,
-            generated_ids.len(),
-            true,
-        );
-
-        // Incremental detokenization: emit only complete-UTF-8 text deltas. A
-        // byte-level BPE codepoint can span several tokens, so we buffer raw bytes
-        // and never stream a partial codepoint (see IncrementalDetokenizer).
-        let mut detok = IncrementalDetokenizer::new();
-
-        if gen_cfg.stop_strings.is_empty() {
-            // Fast path: no string-level stops. Behaviour byte-for-byte identical
-            // to before this feature was added; the e2e-parity CI gate pins this.
-            // `text` is the caller-owned full output — the detokenizer itself only
-            // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
-            let mut text = String::new();
-            let mut throwaway_offsets: Vec<usize> = Vec::new();
-            let delta = detok.push(&self.tokenizer, next_id);
-            // PR #787: routed through
-            // the policy's owned stop-mode adapter (always `Disabled` here,
-            // since `gen_cfg.stop_strings` is empty) instead of a manual
-            // `text.push_str` + `on_token` call.
-            if matches!(
-                policy.check_initial_stop(
-                    &mut token_logprobs,
-                    &mut text,
-                    &mut throwaway_offsets,
-                    &delta,
-                    |s| on_token(s),
-                ),
-                StopCheckOutcome::Interrupted
-            ) {
-                return Ok(GenerateOutput {
-                    text,
-                    token_ids: generated_ids.clone(),
-                    prompt_tokens: prompt_len,
-                    generated_tokens: generated_ids.len(),
-                    stopped: false, // caller interrupted the stream, not a stop condition
-                    stop_reason: Some(StopReason::Interrupt),
-                    token_logprobs,
-                });
-            }
-
-            if grammar_complete {
-                return Ok(grammar_output(
-                    text,
-                    &generated_ids,
-                    prompt_len,
-                    true,
-                    token_logprobs,
-                ));
-            }
-
-            let mut stopped = false;
-            let mut stopped_by_caller = false;
-            let mut stop_reason = StopReason::Length;
-            // Decode loop (mirrors decode_loop free function exactly).
-            // cap = rb + max_new_tokens + 1 when budgeting (the +1 is the forced
-            // </think> delimiter); max_new_tokens otherwise (parity-safe).
-            let cap = policy.cap();
-            for _ in 1..cap {
-                // Checked before any per-step work, independent of whether this
-                // iteration's delta ends up non-empty -- closes the gap where a
-                // run of tokens decoding to an incomplete UTF-8 tail would
-                // otherwise never reach the on_token check below.
-                if should_cancel() {
-                    stopped_by_caller = true;
-                    stop_reason = StopReason::Interrupt;
-                    break;
-                }
-                let pos = kv_cache.seq_len;
-                let Some(&last_token) = all_ids.last() else {
-                    return Err(InferenceError::Inference("empty generation state".into()));
-                };
-
-                self.forward_step(
-                    last_token,
-                    pos,
-                    &mut gdn_states,
-                    &mut kv_cache,
-                    &mut scratch,
-                );
-                kv_cache.seq_len += 1;
-
-                // Grammar mask before sampling; fail closed on an all-blocked step.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
-                    if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
-                        if engine.is_complete_without_continuation(gs) {
-                            stopped = true;
-                            stop_reason = StopReason::Grammar;
-                            break;
-                        }
-                        return Err(InferenceError::GrammarConstraintBlocked(
-                            "grammar constraint blocked every token; \
-                             no legal continuation exists in the current grammar state"
-                                .into(),
-                        ));
-                    }
-                }
-
-                let sampled_id = sample_token(
-                    &scratch.logits[..cfg.vocab_size],
-                    gen_cfg,
-                    &all_ids,
-                    &mut rng_state,
-                );
-
-                // One atomic per-step transition (ADR-080 C3, PR #787) -- see
-                // `DecodePolicy::transition`. Set
-                // stopped=true on a grammar stop so the caller sees a
-                // grammar-terminal stop as stopped=true, matching
-                // decode_loop's `return Ok(true)`. `policy.stop_mode` is
-                // always `Disabled` on this path (`gen_cfg.stop_strings` is
-                // empty); the adapter still threads text through to
-                // `on_token` and reports `Interrupted` when the caller's sink
-                // can no longer consume output.
-                let generated_len_before = generated_ids.len();
-                let outcome = policy.transition(
-                    &mut token_logprobs,
-                    sampled_id,
-                    &scratch.logits[..cfg.vocab_size],
-                    gen_cfg.temperature,
-                    generated_len_before,
-                    |next_id| {
-                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                            engine.advance(gs, next_id)
-                        } else {
-                            true
-                        }
-                    },
-                    |next_id| should_stop_token(cfg, gen_cfg, next_id),
-                    |next_id| {
-                        generated_ids.push(next_id);
-                        all_ids.push(next_id);
-                        // Raw-token event fired from the same `push` point
-                        // that increments `generated_ids` -- never reached on
-                        // a grammar-stop/EOS step that returns before `push`.
-                        on_raw_event(RawGenEvent::RawToken {
-                            index: generated_ids.len(),
-                        });
-                    },
-                    |next_id| detok.push(&self.tokenizer, next_id),
-                    &mut text,
-                    &mut throwaway_offsets,
-                    |s, _next_id| on_token(s),
-                );
-
-                let answer_budget_exhausted = match outcome {
-                    StepOutcome::GrammarStop => {
-                        stopped = true;
-                        stop_reason = StopReason::Grammar;
-                        break;
-                    }
-                    StepOutcome::Eos => {
-                        stopped = true;
-                        stop_reason = StopReason::Eos;
-                        break;
-                    }
-                    StepOutcome::Interrupted => {
-                        stopped_by_caller = true;
-                        stop_reason = StopReason::Interrupt;
-                        break;
-                    }
-                    StepOutcome::Stopped => {
-                        // Unreachable on this path (`policy.stop_mode` is
-                        // always `Disabled` here -- no `stop_strings`
-                        // configured -- and `Disabled`'s `stop_check` arm
-                        // never returns `StopCheckOutcome::Stopped`), handled
-                        // for exhaustiveness/defense-in-depth.
-                        stopped = true;
-                        stop_reason = StopReason::Eos;
-                        break;
-                    }
-                    StepOutcome::Emitted {
-                        answer_budget_exhausted,
-                        ..
-                    } => {
-                        if grammar_complete_without_continuation(gen_cfg, &grammar_state) {
-                            stopped = true;
-                            stop_reason = StopReason::Grammar;
-                            break;
-                        }
-                        answer_budget_exhausted
-                    }
-                };
-
-                // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if answer_budget_exhausted {
-                    break;
-                }
-            }
-
-            // Flush any trailing incomplete bytes (generation truncated mid-codepoint)
-            // so the streamed deltas concatenate to exactly the returned text. Skip
-            // when the caller asked to stop -- it is no longer consuming the stream.
-            if !stopped_by_caller {
-                let tail = detok.finish();
-                if !tail.is_empty() {
-                    text.push_str(&tail);
-                    on_token(&tail);
-                }
-            }
-
-            Ok(GenerateOutput {
-                text,
-                token_ids: generated_ids.clone(),
-                prompt_tokens: prompt_len,
-                generated_tokens: generated_ids.len(),
-                stopped,
-                stop_reason: Some(stop_reason),
-                token_logprobs,
-            })
-        } else {
-            // String-stop path: `policy.stop_mode` is `StopMode::Streaming`
-            // (constructed in `DecodePolicy::init` above from the same
-            // non-empty `gen_cfg.stop_strings`), holding back (max_stop - 1)
-            // bytes so a partial stop prefix is never emitted before it is
-            // confirmed not to be a match.
-            let mut text = String::new();
-            let mut throwaway_offsets: Vec<usize> = Vec::new();
-            let first_delta = detok.push(&self.tokenizer, next_id);
-            let initial_outcome = policy.check_initial_stop(
-                &mut token_logprobs,
-                &mut text,
-                &mut throwaway_offsets,
-                &first_delta,
-                |s| on_token(s),
-            );
-            if matches!(initial_outcome, StopCheckOutcome::Interrupted) {
-                return Ok(GenerateOutput {
-                    text,
-                    token_ids: generated_ids.clone(),
-                    prompt_tokens: prompt_len,
-                    generated_tokens: generated_ids.len(),
-                    stopped: false, // caller interrupted the stream, not a stop condition
-                    stop_reason: Some(StopReason::Interrupt),
-                    token_logprobs,
-                });
-            }
-            if matches!(initial_outcome, StopCheckOutcome::Stopped) {
-                // Stop matched in the very first token.
-                // token_ids already contain next_id; cannot un-generate it.
-                return Ok(GenerateOutput {
-                    text,
-                    token_ids: generated_ids.clone(),
-                    prompt_tokens: prompt_len,
-                    generated_tokens: generated_ids.len(),
-                    stopped: true,
-                    stop_reason: Some(StopReason::Eos),
-                    token_logprobs,
-                });
-            }
-            if grammar_complete {
-                let tail = detok.finish();
-                policy.finish_stop(&mut text, &tail, |s| on_token(s));
-                return Ok(grammar_output(
-                    text,
-                    &generated_ids,
-                    prompt_len,
-                    true,
-                    token_logprobs,
-                ));
-            }
-
-            let mut stopped = false;
-            let mut stopped_by_caller = false;
-            let mut confirmed_stop_string_match = false;
-            let mut stop_reason = StopReason::Length;
-            // Decode loop for the string-stop path.
-            // cap = rb + max_new_tokens + 1 when budgeting (the +1 is the forced
-            // </think> delimiter); max_new_tokens otherwise (parity-safe).
-            let cap = policy.cap();
-            for _ in 1..cap {
-                if should_cancel() {
-                    stopped_by_caller = true;
-                    stop_reason = StopReason::Interrupt;
-                    break;
-                }
-                let pos = kv_cache.seq_len;
-                let Some(&last_token) = all_ids.last() else {
-                    return Err(InferenceError::Inference("empty generation state".into()));
-                };
-
-                self.forward_step(
-                    last_token,
-                    pos,
-                    &mut gdn_states,
-                    &mut kv_cache,
-                    &mut scratch,
-                );
-                kv_cache.seq_len += 1;
-
-                // Grammar mask before sampling; fail closed on an all-blocked step.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
-                    if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
-                        if engine.is_complete_without_continuation(gs) {
-                            stopped = true;
-                            stop_reason = StopReason::Grammar;
-                            break;
-                        }
-                        return Err(InferenceError::GrammarConstraintBlocked(
-                            "grammar constraint blocked every token; \
-                             no legal continuation exists in the current grammar state"
-                                .into(),
-                        ));
-                    }
-                }
-
-                let sampled_id = sample_token(
-                    &scratch.logits[..cfg.vocab_size],
-                    gen_cfg,
-                    &all_ids,
-                    &mut rng_state,
-                );
-
-                // One atomic per-step transition (ADR-080 C3, PR #787) -- see
-                // `DecodePolicy::transition`.
-                // `policy.stop_mode` (fixed to `StopMode::Streaming` at
-                // construction) owns the incremental byte-holdback
-                // stop-string match itself now -- this call site supplies only
-                // `decode_delta` (this loop's own detokenizer) and the
-                // shared `text`/`throwaway_offsets` buffers, so it can no
-                // longer independently choose to skip the real stop check.
-                let generated_len_before = generated_ids.len();
-                let outcome = policy.transition(
-                    &mut token_logprobs,
-                    sampled_id,
-                    &scratch.logits[..cfg.vocab_size],
-                    gen_cfg.temperature,
-                    generated_len_before,
-                    |next_id| {
-                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                            engine.advance(gs, next_id)
-                        } else {
-                            true
-                        }
-                    },
-                    |next_id| should_stop_token(cfg, gen_cfg, next_id),
-                    |next_id| {
-                        generated_ids.push(next_id);
-                        all_ids.push(next_id);
-                        // Raw-token event fired from the same `push` point
-                        // that increments `generated_ids` -- never reached on
-                        // a grammar-stop/EOS step that returns before `push`.
-                        on_raw_event(RawGenEvent::RawToken {
-                            index: generated_ids.len(),
-                        });
-                    },
-                    |next_id| detok.push(&self.tokenizer, next_id),
-                    &mut text,
-                    &mut throwaway_offsets,
-                    |s, _next_id| on_token(s),
-                );
-
-                let answer_budget_exhausted = match outcome {
-                    StepOutcome::GrammarStop => {
-                        stopped = true;
-                        stop_reason = StopReason::Grammar;
-                        break;
-                    }
-                    StepOutcome::Eos => {
-                        stopped = true;
-                        stop_reason = StopReason::Eos;
-                        break;
-                    }
-                    StepOutcome::Interrupted => {
-                        stopped_by_caller = true;
-                        stop_reason = StopReason::Interrupt;
-                        break;
-                    }
-                    StepOutcome::Stopped => {
-                        stopped = true;
-                        confirmed_stop_string_match = true;
-                        stop_reason = StopReason::Eos;
-                        break;
-                    }
-                    StepOutcome::Emitted {
-                        answer_budget_exhausted,
-                        ..
-                    } => {
-                        if grammar_complete_without_continuation(gen_cfg, &grammar_state) {
-                            stopped = true;
-                            stop_reason = StopReason::Grammar;
-                            break;
-                        }
-                        answer_budget_exhausted
-                    }
-                };
-
-                // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if answer_budget_exhausted {
-                    break;
-                }
-            }
-
-            // Natural-end flush (no-op if a stop was already hit inside the loop).
-            // Skip when the caller asked to stop -- it is no longer consuming
-            // the stream, and `on_token`'s return value here would not change
-            // why generation actually stopped.
-            if !stopped_by_caller
-                && let Some(tail) = finish_detokenizer(&mut detok, confirmed_stop_string_match)
-            {
-                let tail_stopped = policy.finish_stop(&mut text, &tail, |s| on_token(s));
-                // finish_stop may itself complete a stop in the tail bytes.
-                if tail_stopped && !stopped {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                }
-            }
-
-            Ok(GenerateOutput {
-                text,
-                token_ids: generated_ids.clone(),
-                prompt_tokens: prompt_len,
-                generated_tokens: generated_ids.len(),
-                stopped,
-                stop_reason: Some(stop_reason),
-                token_logprobs,
-            })
-        }
     }
 }
 
@@ -1666,46 +619,6 @@ fn test_take_first_sample_saw_prefill_end() -> Option<bool> {
     TEST_FIRST_SAMPLE_SAW_PREFILL_END.with(std::cell::Cell::get)
 }
 
-/// Returns `true` when at least one logit is strictly greater than
-/// `f32::NEG_INFINITY` — i.e. the grammar mask leaves at least one legal token.
-///
-/// When a grammar engine blocks every token via `mask_logits`, every logit
-/// becomes `NEG_INFINITY`. Without this guard the sampler's non-finite-max
-/// short-circuit would silently emit token 0 (lowest id after sorting an
-/// all-NEG_INFINITY candidate set), violating the grammar contract. Callers
-/// check this before invoking the sampler and return a typed error instead.
-fn has_finite_logit(logits: &[f32]) -> bool {
-    logits.iter().any(|&l| l > f32::NEG_INFINITY)
-}
-
-fn grammar_complete_without_continuation(
-    gen_cfg: &GenerateConfig,
-    grammar_state: &Option<GrammarState>,
-) -> bool {
-    match (&gen_cfg.grammar, grammar_state) {
-        (Some(engine), Some(state)) => engine.is_complete_without_continuation(state),
-        _ => false,
-    }
-}
-
-fn grammar_output(
-    text: String,
-    generated_ids: &[u32],
-    prompt_tokens: usize,
-    stopped: bool,
-    token_logprobs: Vec<TokenLogprob>,
-) -> GenerateOutput {
-    GenerateOutput {
-        text,
-        token_ids: generated_ids.to_vec(),
-        prompt_tokens,
-        generated_tokens: generated_ids.len(),
-        stopped,
-        stop_reason: Some(StopReason::Grammar),
-        token_logprobs,
-    }
-}
-
 pub(crate) fn initial_rng_state(seed: Option<u64>) -> u64 {
     match seed {
         Some(s) => {
@@ -1747,294 +660,6 @@ pub(crate) fn prefill_tokens(
             kv_cache.seq_len += 1;
         }
     }
-}
-
-/// Fast-path decode loop (no string stops). Budget forcing mirrors
-/// `generate_streaming`'s inline fast-path loop exactly: when `reasoning_budget`
-/// is disabled, `think_close_id` is `None`, `thinking_closed_seed` is `false`,
-/// `decode_cap` equals `max_new_tokens`, and `force_close_think` returns `None`,
-/// so the body is byte-identical to its pre-feature form (e2e-parity pinned).
-#[allow(clippy::too_many_arguments)]
-fn decode_loop(
-    model: &Qwen35Model,
-    gen_cfg: &GenerateConfig,
-    all_ids: &mut Vec<u32>,
-    generated_ids: &mut Vec<u32>,
-    rng_state: &mut u64,
-    gdn_states: &mut [GatedDeltaNetState],
-    kv_cache: &mut KvCache,
-    scratch: &mut ForwardScratch,
-    grammar_state: &mut Option<GrammarState>,
-    policy: &mut DecodePolicy,
-    token_logprobs: &mut Vec<TokenLogprob>,
-) -> Result<(bool, StopReason), InferenceError> {
-    let cfg = &model.config;
-    let cap = policy.cap();
-    for _ in 1..cap {
-        let pos = kv_cache.seq_len;
-        let Some(&last_token) = all_ids.last() else {
-            return Err(InferenceError::Inference("empty generation state".into()));
-        };
-
-        model.forward_step(last_token, pos, gdn_states, kv_cache, scratch);
-        kv_cache.seq_len += 1;
-
-        // Grammar mask before sampling; fail closed when every token is blocked.
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
-            if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
-                if engine.is_complete_without_continuation(gs) {
-                    return Ok((true, StopReason::Grammar));
-                }
-                return Err(InferenceError::GrammarConstraintBlocked(
-                    "grammar constraint blocked every token; \
-                     no legal continuation exists in the current grammar state"
-                        .into(),
-                ));
-            }
-        }
-
-        let sampled_id = sample_token(
-            &scratch.logits[..cfg.vocab_size],
-            gen_cfg,
-            all_ids,
-            rng_state,
-        );
-
-        // One atomic per-step transition (ADR-080 C3, PR #787): budget
-        // override, grammar-advance callback, emitted
-        // bookkeeping, EOS callback, push callback, logprobs, reasoning-end
-        // capture, the stop-check adapter, and the answer-budget check, all
-        // in the fixed required order -- see `DecodePolicy::transition`. This
-        // function is only ever called when `gen_cfg.stop_strings` is empty
-        // (see `generate()`'s branch), so `policy.stop_mode` is always
-        // `StopMode::Disabled` here, and this function has no text/detok
-        // pipeline of its own at all (it returns raw token ids, decoded once
-        // at the very end by `decode_tokens`) -- `decode_delta`/`text`/
-        // `token_logprob_end_offsets`/`emit_confirmed` are therefore
-        // throwaway values the `Disabled` dispatch never populates
-        // meaningfully (this is honest, not an escape hatch -- the
-        // empty-stop_strings guarantee
-        // now lives in `policy.stop_mode`, derived from the real config at
-        // `DecodePolicy::init`, not in a caller-chosen closure).
-        let generated_len_before = generated_ids.len();
-        let mut throwaway_text = String::new();
-        let mut throwaway_offsets: Vec<usize> = Vec::new();
-        let outcome = policy.transition(
-            token_logprobs,
-            sampled_id,
-            &scratch.logits[..cfg.vocab_size],
-            gen_cfg.temperature,
-            generated_len_before,
-            |next_id| {
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
-                    engine.advance(gs, next_id)
-                } else {
-                    true
-                }
-            },
-            |next_id| should_stop_token(cfg, gen_cfg, next_id),
-            |next_id| {
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-            },
-            |_next_id| String::new(),
-            &mut throwaway_text,
-            &mut throwaway_offsets,
-            |_delta, _next_id| true,
-        );
-
-        match outcome {
-            StepOutcome::GrammarStop => return Ok((true, StopReason::Grammar)),
-            StepOutcome::Eos => return Ok((true, StopReason::Eos)),
-            StepOutcome::Stopped => return Ok((true, StopReason::Eos)),
-            StepOutcome::Interrupted => return Ok((false, StopReason::Interrupt)),
-            StepOutcome::Emitted {
-                answer_budget_exhausted,
-                ..
-            } => {
-                if grammar_complete_without_continuation(gen_cfg, grammar_state) {
-                    return Ok((true, StopReason::Grammar));
-                }
-                // Answer-budget break: stop once max_new_tokens answer tokens
-                // follow </think>.
-                if answer_budget_exhausted {
-                    break;
-                }
-            }
-        }
-    }
-    Ok((false, StopReason::Length))
-}
-
-/// String-stop variant of `decode_loop`. Called only when `gen_cfg.stop_strings` is non-empty.
-///
-/// Runs the autoregressive loop, appending each token's decoded text into `full`. After every
-/// token it checks for the earliest occurrence of any stop string; on a hit it truncates `full`
-/// and returns early. When no stop is hit the loop runs to `max_new_tokens - 1` (the first token
-/// was already pushed by the caller before branching here).
-///
-/// Note: `generated_ids` and `all_ids` contain all tokens up to and including the token that
-/// completed the stop match — we cannot un-generate a partial token after the fact.
-#[allow(clippy::too_many_arguments)]
-fn decode_loop_with_stops(
-    model: &Qwen35Model,
-    gen_cfg: &GenerateConfig,
-    all_ids: &mut Vec<u32>,
-    generated_ids: &mut Vec<u32>,
-    rng_state: &mut u64,
-    gdn_states: &mut [GatedDeltaNetState],
-    kv_cache: &mut KvCache,
-    scratch: &mut ForwardScratch,
-    detok: &mut IncrementalDetokenizer,
-    full: &mut String,
-    grammar_state: &mut Option<GrammarState>,
-    policy: &mut DecodePolicy,
-    token_logprobs: &mut Vec<TokenLogprob>,
-    token_logprob_end_offsets: &mut Vec<usize>,
-) -> Result<(bool, StopReason), InferenceError> {
-    let cfg = &model.config;
-    let mut stopped = false;
-    let mut confirmed_stop_string_match = false;
-    let mut stop_reason = StopReason::Length;
-    let cap = policy.cap();
-    for _ in 1..cap {
-        let pos = kv_cache.seq_len;
-        let Some(&last_token) = all_ids.last() else {
-            return Err(InferenceError::Inference("empty generation state".into()));
-        };
-
-        model.forward_step(last_token, pos, gdn_states, kv_cache, scratch);
-        kv_cache.seq_len += 1;
-
-        // Grammar mask before sampling; fail closed when every token is blocked.
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
-            if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
-                if engine.is_complete_without_continuation(gs) {
-                    stopped = true;
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-                return Err(InferenceError::GrammarConstraintBlocked(
-                    "grammar constraint blocked every token; \
-                     no legal continuation exists in the current grammar state"
-                        .into(),
-                ));
-            }
-        }
-
-        let sampled_id = sample_token(
-            &scratch.logits[..cfg.vocab_size],
-            gen_cfg,
-            all_ids,
-            rng_state,
-        );
-
-        // One atomic per-step transition (ADR-080 C3, PR #787) -- see
-        // `DecodePolicy::transition`. The stop-check
-        // adapter now owns
-        // the rescan/truncate work this loop used to run itself in a
-        // `stop_check` closure -- this call site supplies only `decode_delta`
-        // (this loop's own detokenizer) and the shared `full`/
-        // `token_logprob_end_offsets` buffers; `policy.stop_mode` (fixed to
-        // `StopMode::FullScan` at construction, since this function is only
-        // called when `gen_cfg.stop_strings` is non-empty) does the actual
-        // rescan/truncate, not caller-supplied closure logic.
-        let generated_len_before = generated_ids.len();
-        let outcome = policy.transition(
-            token_logprobs,
-            sampled_id,
-            &scratch.logits[..cfg.vocab_size],
-            gen_cfg.temperature,
-            generated_len_before,
-            |next_id| {
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
-                    engine.advance(gs, next_id)
-                } else {
-                    true
-                }
-            },
-            |next_id| should_stop_token(cfg, gen_cfg, next_id),
-            |next_id| {
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-            },
-            |next_id| detok.push(&model.tokenizer, next_id),
-            full,
-            token_logprob_end_offsets,
-            |_delta, _next_id| true,
-        );
-
-        let (_next_id, answer_budget_exhausted) = match outcome {
-            StepOutcome::GrammarStop => {
-                stopped = true;
-                stop_reason = StopReason::Grammar;
-                break;
-            }
-            StepOutcome::Eos => {
-                stopped = true;
-                stop_reason = StopReason::Eos;
-                break;
-            }
-            StepOutcome::Stopped => {
-                stopped = true;
-                confirmed_stop_string_match = true;
-                stop_reason = StopReason::Eos;
-                break;
-            }
-            StepOutcome::Interrupted => {
-                // Unreachable on this path (`policy.stop_mode` is
-                // `StopMode::FullScan` here, whose `stop_check` arm never
-                // returns `StopCheckOutcome::Interrupted` -- only
-                // `StopMode::Streaming`'s arm does, for the streaming call
-                // sites), handled for exhaustiveness/defense-in-depth.
-                stop_reason = StopReason::Interrupt;
-                break;
-            }
-            StepOutcome::Emitted {
-                token_id,
-                answer_budget_exhausted,
-            } => {
-                if grammar_complete_without_continuation(gen_cfg, grammar_state) {
-                    stopped = true;
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-                (token_id, answer_budget_exhausted)
-            }
-        };
-
-        // Answer-budget break: stop once max_new_tokens answer tokens follow
-        // </think>. Computed inside `transition` and carried out via the
-        // `Emitted` outcome above (`answer_budget_exhausted` is now private
-        // to this module -- only `transition` may call it).
-        if answer_budget_exhausted {
-            break;
-        }
-    }
-
-    if let Some(tail) = finish_detokenizer(detok, confirmed_stop_string_match)
-        && !tail.is_empty()
-    {
-        full.push_str(&tail);
-        // The tail itself might complete a stop string.
-        if let Some(hit) = earliest_stop_match(full, &gen_cfg.stop_strings) {
-            full.truncate(hit);
-            truncate_token_logprobs_to_retained_text(
-                token_logprobs,
-                token_logprob_end_offsets,
-                hit,
-            );
-            if !stopped {
-                return Ok((true, StopReason::Eos));
-            }
-        }
-    }
-    if !stopped {
-        return Ok((false, StopReason::Length));
-    }
-    Ok((stopped, stop_reason))
 }
 
 /// Returns true when `token_id` is EOS or is in the `stop_token_ids` list.
@@ -2367,6 +992,10 @@ pub(crate) fn check_context_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // row R03 deleted this module's own free `has_finite_logit` (folded into
+    // `QwenCpuSession::select`); these two tests still probe the guard directly, so
+    // they now import the crate-private copy the driver's session actually calls.
+    use crate::decoder::qwen_cpu::has_finite_logit;
 
     // -----------------------------------------------------------------------
     // ADR-090 row C: driver trace vs the pre-migration golden
@@ -2454,16 +1083,19 @@ mod tests {
                 case.name
             );
 
-            // The SAME case replayed with `logprobs` set, which is the routing
-            // predicate's other arm. This is not redundancy: before this row the
-            // golden pinned `decode_loop`, and after it the golden pins the driver,
-            // so `generate_inline` and the two loop helpers it still owns would ship
-            // with no token-level coverage at all -- reachable only through grammar
-            // or logprobs, neither of which the golden sets. Capturing log
-            // probabilities does not change which token greedy decode picks, so the
-            // ids must be the same ids, and a divergence here means the fallback
-            // drifted from the route that replaced it.
+            // The SAME case replayed with `logprobs` set. Row R03 deleted the
+            // `generate_inline`/`decode_loop`/`decode_loop_with_stops` fallback this
+            // comment used to describe: a logprobs request now runs through the SAME
+            // `generate_via_driver` path as the plain request above, so this is no
+            // longer a paired negative arm against a default trace -- it is the same
+            // positive assertion the un-suffixed case above makes, replayed with
+            // logprobs on to prove that turning logprobs on does not change routing
+            // or the sampled ids. Capturing log probabilities does not change which
+            // token greedy decode picks, so the ids must be the same ids, and the
+            // trace must show the same one-open-per-token / one-still-open-at-finish
+            // shape driver::run maintains regardless of the logprobs flag.
             let inline_cfg = GenerateConfig {
+                min_p: 0.0,
                 logprobs: Some(0),
                 ..cfg.clone()
             };
@@ -2472,14 +1104,27 @@ mod tests {
                 .unwrap_or_else(|e| panic!("case {}: inline generation failed: {e}", case.name));
             assert_eq!(
                 inline_output.token_ids, case.expected_generated_ids,
-                "case {}: the grammar/logprobs fallback diverged from the same golden",
+                "case {}: the logprobs-requesting route diverged from the same golden",
                 case.name
             );
             assert_eq!(
-                inline_trace,
-                driver::DriverTrace::default(),
-                "case {}: a logprobs request must NOT reach the driver -- a non-default \
-                 trace here means the routing predicate sent it to the wrong loop",
+                inline_trace.opened,
+                inline_output.token_ids.len(),
+                "case {}: logprobs must route through the driver too (row R03) -- one \
+                 select() per emitted token on a natural finish",
+                case.name
+            );
+            assert_eq!(
+                inline_trace.consumed + 1,
+                inline_trace.opened,
+                "case {}: logprobs must route through the driver too (row R03) -- \
+                 exactly one prediction stays open at finish",
+                case.name
+            );
+            assert_eq!(
+                inline_output.token_logprobs.len(),
+                inline_output.token_ids.len(),
+                "case {}: every emitted token must carry a recorded logprob",
                 case.name
             );
         }
@@ -2585,11 +1230,13 @@ mod tests {
                 case.name
             );
 
-            // Acceptance 3: the paired negative arm. The SAME request replayed with
-            // `logprobs` set must produce the same token ids and a default trace --
-            // without this pair, a default trace on its own cannot distinguish "the
-            // fallback correctly ran" from "the driver never ran at all".
+            // Acceptance 3: row R03 deleted `generate_streaming_inline` -- a logprobs
+            // streaming request now runs through the SAME `generate_streaming_via_driver`
+            // path as acceptance 1 above, so this replays the same request with
+            // `logprobs` set and asserts the same driver-routed shape rather than a
+            // default (never-reached-the-driver) trace.
             let inline_cfg = GenerateConfig {
+                min_p: 0.0,
                 logprobs: Some(0),
                 ..cfg.clone()
             };
@@ -2603,22 +1250,34 @@ mod tests {
                 )
                 .unwrap_or_else(|e| {
                     panic!(
-                        "case {}: streaming inline generation failed: {e}",
+                        "case {}: streaming logprobs generation failed: {e}",
                         case.name
                     )
                 });
             assert_eq!(
                 inline_output.token_ids, case.expected_generated_ids,
-                "case {}: the streaming grammar/logprobs fallback diverged from the same \
+                "case {}: the streaming logprobs-requesting route diverged from the same \
                  golden",
                 case.name
             );
             assert_eq!(
-                inline_trace,
-                driver::DriverTrace::default(),
-                "case {}: a logprobs streaming request must NOT reach the driver -- a \
-                 non-default trace here means the routing predicate sent it to the wrong \
-                 loop",
+                inline_trace.opened,
+                inline_output.token_ids.len(),
+                "case {}: streaming logprobs must route through the driver too (row \
+                 R03) -- one select() per emitted token on a natural finish",
+                case.name
+            );
+            assert_eq!(
+                inline_trace.consumed + 1,
+                inline_trace.opened,
+                "case {}: streaming logprobs must route through the driver too (row \
+                 R03) -- exactly one prediction stays open at finish",
+                case.name
+            );
+            assert_eq!(
+                inline_output.token_logprobs.len(),
+                inline_output.token_ids.len(),
+                "case {}: every emitted token must carry a recorded logprob",
                 case.name
             );
 
@@ -2737,9 +1396,9 @@ mod tests {
     // Grammar wiring — end-to-end production-seam test (#397)
     // -----------------------------------------------------------------------
 
-    /// Proves that `generate()` calls `mask_logits` at the post-prefill wiring
-    /// site — i.e., the production call is real, not just the primitive tested
-    /// by `grammar_masking_blocks_argmax_token`.
+    /// Proves that `generate()` reaches real grammar masking at its first
+    /// (step-0) `select` call — i.e., the production wiring is real, not just
+    /// the primitive tested by `grammar_masking_blocks_argmax_token`.
     ///
     /// Strategy: build a minimal synthetic model (4 layers, 64-dim hidden,
     /// 97-token vocab), then construct a grammar engine whose vocabulary table
@@ -2747,19 +1406,25 @@ mod tests {
     /// empty entries (they can never advance the PDA), so the precomputed bitmask
     /// for the initial state is all-zeros: `mask_logits` sets every one of the 97
     /// logit positions to `NEG_INFINITY`. `has_finite_logit` then fires the
-    /// fail-closed guard inside `generate()`, which returns `Err(InvalidInput)`.
+    /// fail-closed guard inside `QwenCpuSession::select` (`decoder::qwen_cpu`),
+    /// which reports `SelectOutcome::GrammarExhausted`; since no token was
+    /// ever sampled, `decoder::driver::run` resolves that as
+    /// `Err(InferenceError::GrammarConstraintBlocked)`, not a completed grammar.
     ///
-    /// Coverage: the post-prefill masking site in `generate()` (the
-    /// `engine.mask_logits` call just before the first `sample_token`). The
-    /// decode-loop wiring sites — inside `decode_loop` and the inline streaming
-    /// loops — are reached only for tokens 2+ and are not separately covered
-    /// here; they would require additional forward-step iterations that cannot be
-    /// isolated without a controllable-output model.
+    /// Coverage: `select`'s masking call for the step-0 candidate. Every later
+    /// decode-loop token reaches the exact same `QwenCpuSession::select` call
+    /// site — there is no longer a separate "post-prefill" vs "decode-loop"
+    /// masking site to distinguish, since one driver loop calls `select` for
+    /// every token, step 0 included — so those later calls are not separately
+    /// covered here; they would require additional forward-step iterations
+    /// that cannot be isolated without a controllable-output model.
     ///
-    /// Mutation sensitivity: removing `engine.mask_logits(gs, ...)` from the
-    /// post-prefill site leaves logits at their raw (finite) model values.
-    /// `has_finite_logit` then returns `true`, no error is returned, and this
-    /// test's `assert!(result.is_err())` fails — proving the call is load-bearing.
+    /// Mutation sensitivity: removing the `request.grammar_mask` call from
+    /// `QwenCpuSession::select` leaves logits at their raw (finite) model
+    /// values. `has_finite_logit` then returns `true`, `select` reports a real
+    /// candidate instead of `GrammarExhausted`, and this test's assertion
+    /// against `Err(InferenceError::GrammarConstraintBlocked(_))` fails —
+    /// proving the call is load-bearing.
     ///
     /// The model-building helpers below mirror `lora_serving::build_model` in
     /// tests.rs; they are duplicated here to keep generation.rs self-contained
@@ -3165,6 +1830,7 @@ mod tests {
     #[test]
     fn decode_policy_cap_ignores_reasoning_budget_when_thinking_disabled() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: false,
             max_new_tokens: 1,
@@ -3204,6 +1870,7 @@ mod tests {
     #[test]
     fn context_admission_ignores_reasoning_budget_when_thinking_disabled() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(3),
             enable_thinking: false,
             max_new_tokens: 2,
@@ -3388,6 +2055,93 @@ mod tests {
                 assert!(result.stopped);
                 assert_eq!(result.stop_reason, Some(StopReason::Grammar));
             }
+            assert_eq!(streaming.text, streamed_text);
+        }
+    }
+
+    /// ADR-090 row R03 equivalence pin, written and run against the
+    /// pre-migration `generate_inline`/`decode_loop`/`decode_loop_with_stops`
+    /// implementation BEFORE those functions are deleted and grammar +
+    /// logprobs are routed through `decoder::driver::run`: grammar-constrained
+    /// decoding AND per-token logprob capture, combined, covering both the
+    /// step-0 sample (`DecodePolicy::init`) and a mid-loop sample that
+    /// completes the grammar (`DecodePolicy::transition`), across both the
+    /// fast (no `stop_strings`) and stop-strings decode paths, and across
+    /// both `generate` and `generate_streaming`. This is the "same
+    /// seed/config, identical grammar-constrained tokens, identical
+    /// logprobs, identical streaming event sequence" equivalence check the
+    /// row's acceptance criteria ask for -- expressed as a pinned expected
+    /// value (this crate has no feature flag to run the same request through
+    /// two loops side by side post-cutover, so the legacy run's own output,
+    /// captured here before the routing change, IS the pin).
+    ///
+    /// Every recorded logprob is deterministically 0.0: `a_token_grammar`'s
+    /// `root ::= "aa"` grammar has exactly one legal byte sequence ("a",
+    /// vocab index 0) in its 97-entry vocab table, so `mask_logits` always
+    /// leaves exactly one finite logit -- softmax over a single candidate
+    /// assigns it probability 1.0, and `ln(1.0) == 0.0` -- making the exact
+    /// value reproducible on the zero-weight fixture without a real
+    /// checkpoint.
+    ///
+    /// Mutation sensitivity (recorded at review time per the row's
+    /// acceptance criteria, not committed): routing `record_metadata`
+    /// (through the session) / the grammar-advance step (through the
+    /// driver's own owned state) at the wrong point (e.g. scoring against
+    /// pre-mask logits, or skipping the mid-loop grammar-advance call)
+    /// changes either `token_logprobs` or `token_ids` here without
+    /// necessarily changing the existing grammar-only / logprobs-only tests
+    /// above, which is exactly the combined-path gap this test closes.
+    #[test]
+    fn grammar_and_logprobs_combined_equivalence_across_stop_strings_and_streaming() {
+        let model = build_a_first_zero_model();
+
+        for stop_strings in [vec![], vec!["never".to_string()]] {
+            let mut gen_cfg = grammar_config("root ::= \"aa\"\n");
+            gen_cfg.stop_strings = stop_strings.clone();
+            gen_cfg.logprobs = Some(1);
+
+            let nonstreaming = model
+                .generate("b", &gen_cfg)
+                .expect("combined grammar+logprobs non-streaming generate must succeed");
+            let mut streamed_text = String::new();
+            let streaming = model
+                .generate_streaming("b", &gen_cfg, |delta| streamed_text.push_str(delta))
+                .expect("combined grammar+logprobs streaming generate must succeed");
+
+            for (label, result) in [("non-streaming", &nonstreaming), ("streaming", &streaming)] {
+                assert_eq!(result.text, "aa", "{label}: stop_strings={stop_strings:?}");
+                assert_eq!(
+                    result.token_ids,
+                    vec![0, 0],
+                    "{label}: stop_strings={stop_strings:?}"
+                );
+                assert_eq!(result.generated_tokens, 2, "{label}");
+                assert!(result.stopped, "{label}");
+                assert_eq!(result.stop_reason, Some(StopReason::Grammar), "{label}");
+
+                assert_eq!(
+                    result.token_logprobs.len(),
+                    2,
+                    "{label}: one recorded logprob per emitted token -- the first from \
+                     DecodePolicy::init (step 0), the second from a mid-loop transition"
+                );
+                for (i, entry) in result.token_logprobs.iter().enumerate() {
+                    assert_eq!(entry.token_id, 0, "{label}: entry {i}");
+                    assert!(
+                        (entry.logprob - 0.0).abs() < 1e-6,
+                        "{label}: entry {i} logprob={} (grammar leaves exactly one legal \
+                         token at every step, so probability is exactly 1.0)",
+                        entry.logprob
+                    );
+                    assert_eq!(
+                        entry.top.len(),
+                        1,
+                        "{label}: entry {i} requested top_logprobs=Some(1) (top_n=1)"
+                    );
+                    assert_eq!(entry.top[0].token_id, 0, "{label}: entry {i}");
+                }
+            }
+
             assert_eq!(streaming.text, streamed_text);
         }
     }
@@ -4234,7 +2988,8 @@ mod tests {
     /// but the active grammar forbids that token, decoding must **fail closed** — stop
     /// with `StopReason::Grammar` and NOT emit the forbidden `</think>`.
     ///
-    /// This pins the load-bearing weave in `decode_loop`: grammar `advance` runs on the
+    /// This pins the load-bearing weave in `DecodePolicy::transition_inner` (driven,
+    /// in production, via `decoder::driver::run`): grammar `advance` runs on the
     /// budget-FORCED token (`next_id`), not the pre-force `sampled_id`. Setup: grammar
     /// `root ::= "aa"` with a 7-entry grammar vocab (ids 0..=6); the tokenizer carries
     /// `</think>` at id 7 (outside the grammar vocab). All-zero weights → greedy always
@@ -4315,8 +3070,9 @@ mod tests {
     // drive `Qwen35Model::generate` through more than one distinguishable
     // decode position. The tests below construct `DecodePolicy` directly
     // instead, mirroring the exact call shape every decode loop above uses
-    // (`transition`'s closures wired the same way `decode_loop` wires them),
-    // to isolate the finalization ordering itself from sampling.
+    // (`transition`'s closures wired the same way `decoder::driver::run` wires
+    // `transition_with_metadata`'s), to isolate the finalization ordering
+    // itself from sampling.
 
     /// A budget-forced `</think>` that clears the grammar-advance and EOS
     /// checks must be emitted and have its own logprob recorded under the
@@ -4328,6 +3084,7 @@ mod tests {
     #[test]
     fn forced_close_with_logprobs_records_the_post_override_token() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: true,
             logprobs: Some(0),
@@ -4398,6 +3155,7 @@ mod tests {
     #[test]
     fn transition_refuses_eos_on_the_stale_pre_override_sample() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: true,
             ..GenerateConfig::default()
@@ -4460,6 +3218,7 @@ mod tests {
     #[test]
     fn transition_refuses_to_force_close_a_second_time_once_already_closed() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: true,
             ..GenerateConfig::default()
@@ -4519,6 +3278,7 @@ mod tests {
     #[test]
     fn init_records_the_first_tokens_logprob_when_it_is_already_the_close_marker() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: true,
             logprobs: Some(0),
@@ -4563,6 +3323,7 @@ mod tests {
     #[test]
     fn answer_budget_exhausts_on_the_terminal_token_with_no_next_decode_expected() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1),
             enable_thinking: true,
             max_new_tokens: 1,
@@ -4620,6 +3381,7 @@ mod tests {
     #[test]
     fn transition_leaves_an_unspent_reasoning_budget_inert() {
         let gen_cfg = GenerateConfig {
+            min_p: 0.0,
             reasoning_budget: Some(1_000),
             enable_thinking: true,
             logprobs: Some(0),
@@ -5296,9 +4058,11 @@ mod tests {
     }
 
     /// PR #787: with `gen_cfg.logprobs`
-    /// left at its default (`None`), `DecodePolicy::record_logprob` (driven by
-    /// both `init` for the prefill token and `transition` for every token
-    /// after) must be a true no-op -- `token_logprobs` stays empty for the
+    /// left at its default (`None`), `DecodePolicy`'s logprobs gate (the
+    /// `if let Some(top_n) = self.logprobs` guard `init_with_metadata` and
+    /// `transition_inner` both apply in production, driven via
+    /// `decoder::driver::run`) must be a true no-op -- `token_logprobs` stays
+    /// empty for the
     /// whole generation, not just for the truncated-text case the test above
     /// covers. Replaces `sampling.rs`'s now-removed
     /// `test_record_logprob_noop_when_not_requested`: that free function no
@@ -5325,27 +4089,29 @@ mod tests {
         assert!(
             result.token_logprobs.is_empty(),
             "logprobs: None must record nothing across the whole generation \
-             (prefill token via init, decode tokens via transition); got {} entries",
+             (prefill token via init_with_metadata, decode tokens via \
+             transition_with_metadata); got {} entries",
             result.token_logprobs.len()
         );
     }
 
     /// PR #787: isolates
-    /// `DecodePolicy::init`'s first-step logprob ownership from
-    /// `transition`'s per-step logprob ownership, which
+    /// `DecodePolicy::init_with_metadata`'s first-step logprob ownership from
+    /// `transition_with_metadata`'s per-step logprob ownership, which
     /// `transition_records_one_logprob_per_generated_token` below already
     /// covers but does not itself distinguish. With `max_new_tokens: 1`,
-    /// `decode_loop`'s cap is 1, so its `for _ in 1..cap` loop body never
-    /// executes and `DecodePolicy::transition` is never called at all -- the
-    /// entire generation consists of the one prefill-derived token `init`
-    /// records. If that one `TokenLogprob` entry exists, it can only have
-    /// come from `init`.
+    /// `policy.cap()` is 1, so `decoder::driver::run`'s `for _ in 1..cap`
+    /// decode loop body never executes and `transition_with_metadata` is
+    /// never called at all -- the entire generation consists of the one
+    /// prefill-derived token `init_with_metadata` records. If that one
+    /// `TokenLogprob` entry exists, it can only have come from
+    /// `init_with_metadata`.
     ///
     /// Mutation sensitivity: removing the
-    /// `policy.record_logprob(token_logprobs, first_logits, ...)` call
-    /// inside `DecodePolicy::init` makes `token_logprobs` come back empty
-    /// while `token_ids` still has 1 entry -- this test fails with a length
-    /// mismatch (`0 != 1`) instead of passing.
+    /// `record_metadata(first_emitted_id, top_n)` call inside
+    /// `DecodePolicy::init_with_metadata` makes `token_logprobs` come back
+    /// empty while `token_ids` still has 1 entry -- this test fails with a
+    /// length mismatch (`0 != 1`) instead of passing.
     #[test]
     fn init_records_the_prefill_tokens_logprob_before_any_transition_call() {
         let model = build_tiny_zero_model();
@@ -5362,15 +4128,15 @@ mod tests {
         assert_eq!(
             result.generated_tokens, 1,
             "max_new_tokens: 1 must generate exactly the prefill-derived \
-             first token and never enter decode_loop; got {}",
+             first token and never run the decode loop; got {}",
             result.generated_tokens
         );
         assert_eq!(
             result.token_logprobs.len(),
             1,
             "the sole generated token's logprob must be recorded by \
-             DecodePolicy::init alone (transition is never called when \
-             max_new_tokens == 1); got {} entries",
+             DecodePolicy::init_with_metadata alone (transition_with_metadata \
+             is never called when max_new_tokens == 1); got {} entries",
             result.token_logprobs.len()
         );
         assert_eq!(

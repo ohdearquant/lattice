@@ -333,14 +333,22 @@ phase_load_file() {
 }
 
 phase_sampler_start() {
-  local arm="$1" outfile ready_file poll
+  local arm="$1" outfile ready_file poll self_pid
   mkdir -p "$PHASE_LOAD_ROOT"
   outfile="$(phase_load_file "$arm")"
   ready_file="${outfile}.ready"
   : > "$outfile"
   rm -f "$ready_file"
+  # Under --gpu-handoff the supervisor launches the admitted benchmark as a
+  # sibling of this script (bench_handoff.py), so a self tree rooted at "$$"
+  # never reaches it. The supervisor is this script's parent, so root there
+  # instead. Without handoff every measured process descends from "$$".
+  self_pid="$$"
+  if [ -n "$handoff_broker" ]; then
+    self_pid="$PPID"
+  fi
   "$PYTHON_BIN" "$REPO/scripts/lib/phase-load-sampler.py" \
-    --arm "$arm" --self-pid "$$" --out "$outfile" \
+    --arm "$arm" --self-pid "$self_pid" --out "$outfile" \
     --interval "$PHASE_SAMPLE_INTERVAL" &
   local sampler_pid=$!
   # shellcheck disable=SC2064 -- expand sampler_pid now, not at trap-fire time
@@ -464,6 +472,7 @@ GATE_SCRIPT="$REPO/scripts/perf-bench-gate.py"
 print_execution_provenance() {
   echo "  head arm: $HEAD_MODE"
   echo "  gate: scripts/perf-bench-gate.py from the invoking checkout"
+  echo "  python: $PYTHON_BIN"
 }
 
 require_commit_clean_head() {

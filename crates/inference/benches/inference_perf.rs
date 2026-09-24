@@ -166,6 +166,34 @@ fn bench_sampler_allocation(c: &mut Criterion) {
         );
     });
 
+    // Min-p on top of the default filters (#1394): exercises the min-p
+    // cutoff over the top-k survivors.
+    group.bench_function("default_topk50_topp0.9_minp0.05", |b| {
+        b.iter_batched(
+            || {
+                Sampler::new(SamplingConfig::default())
+                    .with_seed(0xDEAD_BEEF)
+                    .with_min_p(0.05)
+            },
+            |mut sampler| black_box(sampler.sample(black_box(&logits))),
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Min-p with top-k disabled (#1394): the cutoff runs over the full
+    // vocabulary, the case where rejecting the tail matters most.
+    group.bench_function("topk0_topp0.9_minp0.05_full_vocab", |b| {
+        b.iter_batched(
+            || {
+                let mut cfg = SamplingConfig::default();
+                cfg.top_k = 0;
+                Sampler::new(cfg).with_seed(0xDEAD_BEEF).with_min_p(0.05)
+            },
+            |mut sampler| black_box(sampler.sample(black_box(&logits))),
+            BatchSize::SmallInput,
+        );
+    });
+
     // Greedy baseline: argmax only, no allocations beyond logits clone.
     group.bench_function("greedy_argmax_baseline", |b| {
         b.iter_batched(

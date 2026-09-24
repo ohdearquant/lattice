@@ -5,15 +5,18 @@
 //! the type system enforces rather than a comment a future caller has to remember.
 //!
 //! ADR-090 row C (`driver`) adds the one autoregressive loop over `&mut dyn DecoderSession`,
-//! and `model::qwen35::generation`'s `generate()`/`generate_with_trace()` are its first
-//! production callers -- see `driver`'s own module doc comment for the row's scope
-//! (notably: grammar and `logprobs` are not routed through it yet).
+//! and `model::qwen35::generation`'s `generate()`/`generate_with_trace()` are its production
+//! callers. Row R03 routes grammar-constrained decoding and `logprobs` capture through it too
+//! (`select` returns [`SelectOutcome`] and `metadata` is a real per-step call now, not reserved
+//! surface). Grammar ownership lives in `driver`, not in this trait: `select` reads a borrowed
+//! mask through [`SelectionRequest::grammar_mask`] and the driver calls `advance` /
+//! `is_complete_without_continuation` on its own owned engine and state -- see `driver`'s own
+//! module doc comment for the full per-step ordering and the reasoning for that split.
 //!
 //! Everything in this module is `pub(crate)`.
 
 use crate::error::InferenceError;
 use crate::generation::{GenerateConfig, TopLogprob};
-use crate::grammar::GrammarEngine;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// First concrete [`DecoderSession`] implementation (ADR-090 row B): the CPU dense
@@ -109,11 +112,6 @@ impl PredictionLedger {
     /// Whether `id` is the ledger's current live prediction. This is the eligibility check
     /// a concrete session's `select`/`metadata` operations must consult: a cancelled,
     /// consumed, superseded, or reset-invalidated id is never live again.
-    // Row C's driver never routes logprobs (see `decoder::driver`'s module doc comment),
-    // so its `metadata()` call -- the only production caller of this check -- never
-    // fires. Reserved for the logprobs-routing row; exercised today by this module's own
-    // ledger-invariant tests and by `QwenCpuSession::metadata`.
-    #[allow(dead_code)]
     pub(crate) fn is_live(&self, id: PredictionId) -> bool {
         self.live == Some(id)
     }
@@ -210,6 +208,13 @@ pub(crate) struct SelectionCandidate {
     pub(crate) prediction: PredictionId,
 }
 
+/// Grammar mask closure carried by [`SelectionRequest::grammar_mask`]: applies grammar
+/// masking to a session's own logits in place, or fails with the same error
+/// `crate::grammar::GrammarEngine::mask_logits` returns. Named as its own alias (rather than
+/// spelled out inline) purely to keep `SelectionRequest`'s and `decoder::driver::run`'s type
+/// signatures readable -- clippy's `type_complexity` lint flags the unaliased form.
+pub(crate) type GrammarMaskFn<'a> = dyn Fn(&mut [f32]) -> Result<(), InferenceError> + 'a;
+
 /// What a concrete session's `select` operation borrows to sample the next candidate.
 ///
 /// RNG ownership stays in the driver/session, never in this request: randomness crosses
@@ -220,19 +225,38 @@ pub(crate) struct SelectionCandidate {
 /// legacy `TokenSampler::sample` draws its RNG internally rather than accepting
 /// already-drawn values; reconciling that draw schedule with this boundary is row B/C
 /// work and is not solved here.
+///
+/// `grammar_mask` is the one field that is not `Copy`-trivial to reason about but still lets
+/// this type stay `#[derive(Copy)]`: a shared reference to a `dyn Fn` is `Copy` regardless of
+/// what the closure behind it captures. The driver builds this closure once per `run()` call
+/// over its own owned `GrammarEngine`/`GrammarState` (interior mutability via `RefCell`, since
+/// masking needs `&mut GrammarState` but `select` only ever sees `&SelectionRequest`), and
+/// hands a borrow of it to every step's request. `None` when no grammar was set on
+/// `GenerateConfig` -- the ADR-090 D1 owner of grammar transitions is the driver, not any
+/// concrete session, so a session with no grammar support simply never receives `Some` here.
+/// See `decoder::driver`'s module doc comment for the full per-step ordering.
 #[derive(Clone, Copy)]
 pub(crate) struct SelectionRequest<'a> {
     pub(crate) config: &'a GenerateConfig,
     pub(crate) history: &'a [u32],
-    // The row C driver never sets this to anything but `None`, and row B's
-    // `QwenCpuSession::select` never reads it (see that function's doc comment): grammar
-    // masking needs a mutable grammar state reachable from inside `select`, which a shared
-    // `&SelectionRequest` cannot carry (see the driver module's doc comment for the full
-    // reasoning). The field stays on the struct because the request shape is meant to hold
-    // it once a future row wires grammar through a session; until then it is constructed
-    // but never consulted.
-    #[allow(dead_code)]
-    pub(crate) grammar: Option<&'a GrammarEngine>,
+    pub(crate) grammar_mask: Option<&'a GrammarMaskFn<'a>>,
+}
+
+/// Outcome of [`DecoderSession::select`]: either a real sampled candidate, or a signal that
+/// grammar masking blocked every token, i.e. no finite logit remained after applying
+/// [`SelectionRequest::grammar_mask`]. This variant does not by itself distinguish "the
+/// grammar reached a valid accepting state with no further legal continuation" (a completed
+/// grammar -- generation ends here with no new token sampled) from "no legal continuation
+/// exists and the grammar is not in an accepting state" (a hard error): resolving that
+/// requires the grammar engine and state, which the session no longer holds (ADR-090 D1: the
+/// driver owns grammar transitions). The driver makes that call itself right after `select`
+/// returns this variant, via its own owned `is_complete_without_continuation` check, and
+/// returns `InferenceError::GrammarConstraintBlocked` directly (never as a variant of this
+/// enum) for the not-complete case -- mirroring the pre-driver inline loops' identical
+/// distinction, just relocated to the caller that still has the state to make it.
+pub(crate) enum SelectOutcome {
+    Candidate(SelectionCandidate),
+    GrammarExhausted,
 }
 
 // ---------------------------------------------------------------------------
@@ -243,9 +267,6 @@ pub(crate) struct SelectionRequest<'a> {
 /// [`GenerateConfig::logprobs`] exactly: `None` disables metadata capture entirely; `Some(n)`
 /// requests the final token's log-probability plus its `n` highest-probability
 /// alternatives (`n == 0` is valid: report only the final token's log-probability).
-// Row C's driver never calls `DecoderSession::metadata` (see `decoder::driver`'s module
-// doc comment on why logprobs stay out of scope); reserved for the logprobs-routing row.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataRequest {
     pub(crate) top_logprobs: Option<usize>,
@@ -262,11 +283,16 @@ pub(crate) struct MetadataRequest {
 /// log-probability under the prediction's pre-advance scoring view, never the candidate's.
 /// Reuses [`crate::generation::TopLogprob`] rather than defining a second alternative-token
 /// type.
-// Same scope note as `MetadataRequest` above: the output type of a call row C never makes.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct TokenMetadata {
+    // `driver::run`'s `record_metadata` closure trusts the session's own bookkeeping and
+    // reads only `final_logprob`/`top`; these two identity fields exist for the
+    // consistency guarantee this doc comment describes and are exercised by this
+    // module's and `qwen_cpu`'s tests (e.g. `assert_eq!(metadata.prediction, ...)`),
+    // never by production code, so a CPU-only production build reports them unread.
+    #[allow(dead_code)]
     pub(crate) prediction: PredictionId,
+    #[allow(dead_code)]
     pub(crate) final_token_id: u32,
     pub(crate) final_logprob: f32,
     pub(crate) top: Vec<TopLogprob>,
@@ -400,15 +426,8 @@ pub(crate) trait DecoderSession {
         cancel: &dyn Cancellation,
     ) -> Result<StepStamp, InferenceError>;
 
-    fn select(
-        &mut self,
-        request: &SelectionRequest<'_>,
-    ) -> Result<SelectionCandidate, InferenceError>;
+    fn select(&mut self, request: &SelectionRequest<'_>) -> Result<SelectOutcome, InferenceError>;
 
-    // No caller in this crate reaches this yet: row C's driver stays out of logprobs
-    // routing (see `decoder::driver`'s module doc comment). Part of the trait's object-
-    // safety proof (this module's tests) regardless of whether a driver calls it.
-    #[allow(dead_code)]
     fn metadata(
         &mut self,
         prediction: PredictionId,
@@ -637,12 +656,12 @@ mod tests {
         fn select(
             &mut self,
             _request: &SelectionRequest<'_>,
-        ) -> Result<SelectionCandidate, InferenceError> {
+        ) -> Result<SelectOutcome, InferenceError> {
             let prediction = self.ledger.open();
-            Ok(SelectionCandidate {
+            Ok(SelectOutcome::Candidate(SelectionCandidate {
                 candidate_id: 11,
                 prediction,
-            })
+            }))
         }
 
         fn metadata(
@@ -701,11 +720,15 @@ mod tests {
         let request = SelectionRequest {
             config: &cfg,
             history: &history,
-            grammar: None,
+            grammar_mask: None,
         };
-        let candidate = session
+        let candidate = match session
             .select(&request)
-            .expect("dummy select always succeeds");
+            .expect("dummy select always succeeds")
+        {
+            SelectOutcome::Candidate(c) => c,
+            SelectOutcome::GrammarExhausted => panic!("dummy select never reports exhaustion"),
+        };
 
         // Policy finalization and requested metadata happen before decode (D2's
         // lifecycle order), against the prediction's pre-advance scoring view.

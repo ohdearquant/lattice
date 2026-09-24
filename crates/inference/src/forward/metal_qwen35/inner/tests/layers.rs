@@ -2,9 +2,15 @@ use super::*;
 
 #[test]
 fn metal_gdn_state_pairs_buffers_with_explicit_geometry() {
-    let device = metal::Device::system_default()
-        .expect("typed Metal GDN state gate requires a real Metal device");
     let _guard = gpu_test_lock();
+    let enforce = std::env::var("LATTICE_METAL_TEST_ENFORCE").is_ok();
+    let Some(device) = metal::Device::system_default() else {
+        assert!(
+            !enforce,
+            "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+        );
+        return;
+    };
     let (mut cfg, weights) = tiny_hybrid_fixture();
     cfg.layer_mask[1] = false;
     let allocated_layers = cfg.num_active_linear_attention_layers();
@@ -50,9 +56,15 @@ fn metal_gdn_state_pairs_buffers_with_explicit_geometry() {
 
 #[test]
 fn metal_gdn_state_layer_index_drives_each_real_recurrence_pair() {
-    metal::Device::system_default()
-        .expect("typed Metal GDN state recurrence gate requires a real Metal device");
     let _guard = gpu_test_lock();
+    let enforce = std::env::var("LATTICE_METAL_TEST_ENFORCE").is_ok();
+    let Some(_) = metal::Device::system_default() else {
+        assert!(
+            !enforce,
+            "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+        );
+        return;
+    };
     let (cfg, weights) = tiny_hybrid_fixture();
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 

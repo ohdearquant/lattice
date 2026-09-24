@@ -44,6 +44,24 @@ if [ "${1:-}" = "--run-rust-gates" ]; then
         echo "Clippy check failed. Fix warnings before committing."
         exit 1
     fi
+    # The DEFAULT-feature pass above cannot see code behind `f16`/`metal-gpu`,
+    # and `lattice_serve` does not even build as a target without them. CI runs
+    # this line separately (.github/workflows/ci.yml, "inference -- metal-gpu
+    # clippy"), so without it here the local gate reports success on a commit
+    # that reds CI -- which is what happened: a test inserted between a
+    # `#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]` attribute
+    # and the function it belonged to moved the gate onto the test, left the
+    # helper ungated, and passed this hook cleanly because the unresolved
+    # symbol only exists under those features.
+    #
+    # macOS only: `metal-gpu` does not build elsewhere, and a hook that fails
+    # on Linux for a platform reason is a hook people disable.
+    if [ "$(uname -s)" = "Darwin" ]; then
+        if ! cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings; then
+            echo "Clippy check failed under --features f16,metal-gpu. Fix warnings before committing."
+            exit 1
+        fi
+    fi
     exit 0
 fi
 

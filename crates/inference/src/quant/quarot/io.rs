@@ -40,7 +40,6 @@
 //! [ADR-044]: ../../../../../docs/adr/ADR-044-quarot-rotated-quantization.md
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -131,9 +130,8 @@ struct ParsedEntry {
 
 impl Shard {
     fn open(path: &Path) -> Result<Self, InferenceError> {
-        let file = File::open(path).map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", path.display()))
-        })?;
+        let file = crate::weights::mmap_trust::open_regular_file_no_hang(path)
+            .map_err(InferenceError::InvalidSafetensors)?;
         // This reader loads the same HuggingFace hub-cache checkpoints the
         // runtime baseline forward pass does (see `QuarotTensorReader::open`'s
         // doc comment), so `path` may resolve through a final-component
@@ -1241,6 +1239,46 @@ mod tests {
             .expect("chmod 0o600");
         QuarotTensorReader::open(dir.path())
             .expect("an owner-only checkpoint file must still be accepted");
+    }
+
+    // #1380: `Shard::open` (reached via `QuarotTensorReader::open`) is one
+    // of the three entry points the issue named. It used to call plain
+    // `File::open` before any file-type check ran, so a FIFO planted at the
+    // checkpoint path blocked the call indefinitely. Proves the fix the same
+    // way as the other loader entry points: the call must return (any
+    // return) inside a deadline, and the return must specifically reject the
+    // FIFO as non-regular. `mkfifo` (POSIX, not macOS-only) keeps this test
+    // portable to the Linux CI legs that run this suite.
+    #[test]
+    fn open_rejects_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must succeed to set up this test");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_dir = dir.path().to_path_buf();
+        // A pre-fix blocking `File::open` on this FIFO (no writer ever
+        // connects) would hang this thread forever; running the call on a
+        // detached thread and racing it against a deadline on
+        // `rx.recv_timeout` turns "hangs forever" into an observable test
+        // failure instead of an actually-hung test process.
+        std::thread::spawn(move || {
+            let result = QuarotTensorReader::open(&probe_dir);
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "QuarotTensorReader::open did not return within 5s -- it blocked on the \
+             planted FIFO, meaning the open-time regular-file guard regressed",
+        );
+        let err = result.expect_err("a FIFO checkpoint must be rejected, not opened");
+        assert!(
+            matches!(&err, InferenceError::InvalidSafetensors(msg) if msg.contains("not a regular file")),
+            "expected a not-a-regular-file refusal, got: {err:?}"
+        );
     }
 
     #[test]

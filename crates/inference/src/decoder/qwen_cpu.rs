@@ -45,19 +45,20 @@
 //! `DecodePolicy::init`/`transition`, which is what reaches `record_logprob` ->
 //! `compute_step_logprobs` -- the same value this session captures.
 //!
-//! **Left out, deliberately**: `select` does not apply grammar masking against
-//! `SelectionRequest::grammar`. Masking mutates a `GrammarState` the request does not carry
-//! (only a `&GrammarEngine`), and nothing else in this row owns or threads that state --
-//! `generate()`'s own masking happens at its call sites, outside `sample_token`, against a
-//! `grammar_state` the *driver* owns across steps. Wiring that through a session is row C
-//! work, once a driver exists to own the state between calls; inventing a per-call
-//! reinitialized `GrammarState` here would silently restart grammar progress every step,
-//! which is not "implementable now" so much as "wrong now."
+//! **Grammar state (row R03, re-owned by `decoder::driver` in this rework)**: this session
+//! holds no grammar engine or state of its own. ADR-090 D1 names the driver as the owner of
+//! grammar transitions, so a per-model session that carried its own copy would be exactly the
+//! duplication every future session (Gemma CPU, Metal Qwen, ...) would have to reimplement.
+//! Each `select` call instead receives a borrowed mask through
+//! [`SelectionRequest::grammar_mask`] (`None` when no grammar is set) and applies it to its
+//! own logits before sampling, via [`has_finite_logit`] to detect "every token blocked" --
+//! see `decoder::driver`'s module doc comment for who owns the engine/state and where
+//! `advance`/`is_complete_without_continuation` are called from.
 
 use super::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
-    MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectionCandidate,
-    SelectionRequest, StepStamp, TokenMetadata,
+    MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectOutcome,
+    SelectionCandidate, SelectionRequest, StepStamp, TokenMetadata,
 };
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
@@ -65,6 +66,18 @@ use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{ForwardScratch, KvCache, force_serial_prefill, initial_rng_state};
 use crate::model::qwen35::{prefill_tokens, sample_token};
 use crate::sampling::compute_step_logprobs;
+
+/// When a grammar engine blocks every token via `mask_logits`, every logit becomes
+/// `NEG_INFINITY`. Without this guard the sampler's non-finite-max short-circuit would
+/// silently emit token 0 (lowest id after sorting an all-NEG_INFINITY candidate set),
+/// violating the grammar contract. `select` checks this before invoking the sampler and
+/// returns [`SelectOutcome::GrammarExhausted`] or a typed error instead. Moved here from
+/// `model::qwen35::generation` (row R03): this is the one site that still masks logits
+/// before sampling; `model::qwen35::generation`'s own tests reach it via
+/// `crate::decoder::qwen_cpu::has_finite_logit`, not a private copy.
+pub(crate) fn has_finite_logit(logits: &[f32]) -> bool {
+    logits.iter().any(|&l| l > f32::NEG_INFINITY)
+}
 
 /// `ExecutionCapabilities` for the base CPU dense entry point. All four true: this is the
 /// same family `generate()`/`generate_streaming()` wire directly (see the doc comment on
@@ -88,12 +101,6 @@ pub(crate) struct QwenCpuSession<'model> {
     prompt_ids: Vec<u32>,
     prompt_len: usize,
     rng_state: u64,
-    // Read only by `metadata()`, which the row C driver never calls (logprobs stay out of
-    // scope; see `decoder::driver`'s module doc comment). Reserved for the logprobs-routing
-    // row rather than removed, so that row does not have to re-derive where the temperature
-    // for `compute_step_logprobs` comes from (see the module doc comment's "`metadata`
-    // temperature" section).
-    #[allow(dead_code)]
     temperature: f32,
     ledger: PredictionLedger,
 }
@@ -103,7 +110,8 @@ impl<'model> QwenCpuSession<'model> {
     /// `Qwen35Model::generate` itself allocates per call. `temperature` and `seed` are the
     /// two `GenerateConfig` fields this session must capture at construction (see the module
     /// doc comment on why `metadata` and the RNG draw need them independent of any later
-    /// `SelectionRequest`).
+    /// `SelectionRequest`). No `grammar` parameter: the driver owns the grammar engine and
+    /// state now (module doc comment) and hands this session a mask per step instead.
     pub(crate) fn new(
         model: &'model Qwen35Model,
         prompt_ids: Vec<u32>,
@@ -205,10 +213,10 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
 
     /// Consumes `accepted.prediction` (rejecting a stale/foreign/already-consumed id through
     /// `PredictionLedger::consume`, mapped via `From<PredictionError>`), then runs one
-    /// `forward_step` at the current cache position -- the same `forward_step` call
-    /// `decode_loop` makes -- advancing `kv_cache.seq_len` and leaving the new position's
-    /// logits in `scratch.logits` for the next `select`. Consumption happens before the
-    /// forward pass so a stale id never advances session state.
+    /// `forward_step` at the current cache position -- the same `forward_step` call the
+    /// pre-driver `decode_loop` used to make -- advancing `kv_cache.seq_len` and leaving
+    /// the new position's logits in `scratch.logits` for the next `select`. Consumption
+    /// happens before the forward pass so a stale id never advances session state.
     fn decode(
         &mut self,
         accepted: &AcceptedToken,
@@ -235,15 +243,29 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
         })
     }
 
-    /// Samples from the logits `prefill`/`decode` most recently left in `self.scratch`,
-    /// via the exact `sample_token` `generate()` calls, and opens a new ledger prediction
-    /// for the sampled candidate. See the module doc comment for why `request.grammar` is
-    /// not consulted here.
-    fn select(
-        &mut self,
-        request: &SelectionRequest<'_>,
-    ) -> Result<SelectionCandidate, InferenceError> {
+    /// Masks the logits `prefill`/`decode` most recently left in `self.scratch` through
+    /// `request.grammar_mask` (a no-op when `None` -- no grammar set), then samples via the
+    /// exact `sample_token` `generate()` calls, and opens a new ledger prediction for the
+    /// sampled candidate.
+    ///
+    /// Mirrors `generate_inline`'s / `decode_loop`'s mask-before-sample sequence, minus the
+    /// part that moved to the driver: this method masks in place and fails closed via
+    /// [`has_finite_logit`] when every token is blocked, but does not itself decide whether
+    /// that is a completed grammar or a real error -- it always reports
+    /// [`SelectOutcome::GrammarExhausted`] and leaves that call to whichever caller still
+    /// holds the grammar engine and state (see `SelectOutcome`'s and `decoder::driver`'s
+    /// doc comments). Grammar *advance* is likewise not this method's job any more: the
+    /// driver calls it directly on its own owned state after the sampled candidate is known.
+    fn select(&mut self, request: &SelectionRequest<'_>) -> Result<SelectOutcome, InferenceError> {
         let vocab_size = self.model.config.vocab_size;
+
+        if let Some(mask) = request.grammar_mask {
+            mask(&mut self.scratch.logits[..vocab_size])?;
+            if !has_finite_logit(&self.scratch.logits[..vocab_size]) {
+                return Ok(SelectOutcome::GrammarExhausted);
+            }
+        }
+
         let candidate_id = sample_token(
             &self.scratch.logits[..vocab_size],
             request.config,
@@ -252,10 +274,10 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
         );
         let prediction = self.ledger.open();
 
-        Ok(SelectionCandidate {
+        Ok(SelectOutcome::Candidate(SelectionCandidate {
             candidate_id,
             prediction,
-        })
+        }))
     }
 
     /// Scores `final_token` against the prediction's logits via
@@ -368,11 +390,15 @@ mod tests {
         let request = SelectionRequest {
             config: &gen_cfg,
             history: &history,
-            grammar: None,
+            grammar_mask: None,
         };
-        let candidate = session
+        let candidate = match session
             .select(&request)
-            .expect("select over freshly prefilled logits must succeed");
+            .expect("select over freshly prefilled logits must succeed")
+        {
+            SelectOutcome::Candidate(c) => c,
+            SelectOutcome::GrammarExhausted => panic!("no grammar set on this session"),
+        };
 
         // Ledger lifecycle, open half: live immediately after select.
         assert!(session.ledger.is_live(candidate.prediction));
@@ -528,9 +554,12 @@ mod tests {
         let request = SelectionRequest {
             config: &gen_cfg,
             history: &prompt_ids,
-            grammar: None,
+            grammar_mask: None,
         };
-        let candidate = session.select(&request).expect("select must succeed");
+        let candidate = match session.select(&request).expect("select must succeed") {
+            SelectOutcome::Candidate(c) => c,
+            SelectOutcome::GrammarExhausted => panic!("no grammar set on this session"),
+        };
         assert!(session.ledger.is_live(candidate.prediction)); // control: live before
 
         let accepted = AcceptedToken {
@@ -589,9 +618,12 @@ mod tests {
         let request = SelectionRequest {
             config: &gen_cfg,
             history: &prompt_ids,
-            grammar: None,
+            grammar_mask: None,
         };
-        let candidate = session.select(&request).expect("select must succeed");
+        let candidate = match session.select(&request).expect("select must succeed") {
+            SelectOutcome::Candidate(c) => c,
+            SelectOutcome::GrammarExhausted => panic!("no grammar set on this session"),
+        };
         assert!(session.ledger.is_live(candidate.prediction)); // open at select
 
         let meta_request = MetadataRequest {
