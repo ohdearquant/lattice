@@ -320,20 +320,11 @@ impl CandidateSet {
             top_p.clamp(0.0, 1.0)
         };
 
-        // #1394 item 2, round 2: a real A/B measurement showed the round-1
-        // shape below (sort everything, *then* reject the min-p tail before
-        // exponentiating) never touched the actual cost — `sort_by` over the
-        // full (up to vocab-sized, `top_k == 0`) candidate set runs
-        // unconditionally either way, and that sort is what a paired
-        // bench-compare attributed the measured time to; the `exp()` calls
-        // the original issue named are cheap by comparison. Rejecting the
-        // min-p tail *before* sorting, so the sort itself only ever runs
-        // over the (typically much smaller) survivor set, is the version
-        // that can actually avoid the cost. See `min_p_prefilter_and_sort`'s
-        // doc comment for how a single linear scan finds what the full sort
-        // would have put first (and detects any NaN) without materializing
-        // the sort, and for the superset-margin argument that keeps the
-        // final answer byte-identical to the un-pre-filtered algorithm below.
+        // With min-p on, the tail is rejected before the sort, so the sort
+        // runs over the survivors only. With `top_k == 0` the full sort is
+        // the dominant cost of this call, not the `exp` of the tail. See
+        // `min_p_prefilter_and_sort` for why the result is identical to
+        // sorting everything first.
         let max_logit = if min_p > 0.0 {
             match self.min_p_prefilter_and_sort(min_p) {
                 Ok(max_logit) => max_logit,
@@ -424,8 +415,8 @@ impl CandidateSet {
         self.candidates.last().map(|c| c.token_id).unwrap_or(0)
     }
 
-    /// #1394 item 2 (round 2): reject the min-p tail in logit space *before*
-    /// sorting, then sort only the survivors. Only called from
+    /// #1394 item 2: reject the min-p tail in logit space *before* sorting,
+    /// then sort only the survivors. Only called from
     /// [`CandidateSet::sample_min_p_top_p_with_scratch`] when `min_p > 0.0`
     /// (both call sites enforce this; the caller's `min_p == 0.0` path never
     /// reaches here at all).
@@ -2556,7 +2547,7 @@ mod tests {
         }
     }
 
-    /// #1394 item 2 (round 2): pins the order-equivalence claim
+    /// #1394 item 2: pins the order-equivalence claim
     /// `min_p_prefilter_and_sort` relies on directly, at the level of the
     /// candidate list itself rather than the final sampled output -- for
     /// randomized logits including exact ties and NaNs, either (a) the
