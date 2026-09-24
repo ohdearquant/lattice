@@ -107,6 +107,11 @@ pub enum Symbol {
 /// well-formed grammar on well-formed output.
 pub(crate) const MAX_PDA_DEPTH: usize = 8192;
 
+/// Maximum checkpoint restores per byte (see `try_backtrack`, #322). Nested
+/// nullable alternatives can multiply restores combinatorially; capped low
+/// enough to stay cheap, past which a byte falls back to outright rejection.
+pub(crate) const MAX_BACKTRACK_RESTORES: usize = 256;
+
 /// A compiled grammar rule: a name and a set of alternatives.
 #[derive(Debug, Clone)]
 pub struct Rule {
@@ -272,10 +277,18 @@ fn try_advance_byte(state: &mut GrammarState, grammar: &CompiledGrammar, b: u8) 
 
 /// Advance `stack` by byte `b`. Returns true on success.
 fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: u8) -> bool {
+    // Checkpoints of nullable, uncommitted choices popped without consuming a
+    // byte (#322). See `try_backtrack`. `restores_left` bounds total restores
+    // this call; nested nullable alternatives can multiply them.
+    let mut checkpoints: Vec<Vec<StackFrame>> = Vec::new();
+    let mut restores_left = MAX_BACKTRACK_RESTORES;
     loop {
         if stack.is_empty() {
-            // Stack empty and we still have a byte to consume → reject.
-            return false;
+            // Still have a byte pending: try a checkpointed choice first.
+            if !try_backtrack(stack, &mut checkpoints, &mut restores_left) {
+                return false;
+            }
+            continue;
         }
         if stack.len() > MAX_PDA_DEPTH {
             // Cyclic / left-recursive grammar pushing frames without progress
@@ -291,7 +304,9 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
 
         // Rule with no alternatives: dead end → reject via next-alt or backtrack.
         if rule.alts.is_empty() {
-            if !try_next_alt(stack, grammar, frame_idx) {
+            if !try_next_alt(stack, grammar, frame_idx)
+                && !try_backtrack(stack, &mut checkpoints, &mut restores_left)
+            {
                 return false;
             }
             continue;
@@ -302,7 +317,12 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
         };
 
         if frame.sym_pos >= alt.len() {
-            // Current alternative exhausted: pop frame, advance parent.
+            // Exhausted without consuming a byte, with an untried sibling
+            // alternative left: checkpoint before popping, else this choice
+            // is lost (#322). See `try_backtrack`.
+            if !frame.consumed && frame.alt_idx + 1 < rule.alts.len() {
+                checkpoints.push(stack.clone());
+            }
             stack.pop();
             if let Some(parent) = stack.last_mut() {
                 parent.sym_pos += 1;
@@ -336,7 +356,9 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
                     // the old `sym_pos == 0` heuristic and closes both halves of
                     // #353 (the trailing-comma over-acceptance and the
                     // nullable-prefix over-rejection).
-                    if !try_next_alt(stack, grammar, frame_idx) {
+                    if !try_next_alt(stack, grammar, frame_idx)
+                        && !try_backtrack(stack, &mut checkpoints, &mut restores_left)
+                    {
                         return false;
                     }
                     continue;
@@ -442,6 +464,33 @@ fn try_next_alt(
         stack.truncate(frame_idx);
         frame_idx -= 1;
     }
+}
+
+/// Restore the most recent checkpointed nullable choice (#322): a frame
+/// popped via nullability without consuming a byte, retried at its next
+/// alternative. Sound (never rewinds a consumed byte); bounded by `restores_left`.
+///
+/// Scoped to one `try_advance_stack` call, i.e. one byte: a choice already
+/// committed on an EARLIER byte cannot be reopened here.
+fn try_backtrack(
+    stack: &mut Vec<StackFrame>,
+    checkpoints: &mut Vec<Vec<StackFrame>>,
+    restores_left: &mut usize,
+) -> bool {
+    if *restores_left == 0 {
+        return false;
+    }
+    let Some(mut restored) = checkpoints.pop() else {
+        return false;
+    };
+    *restores_left -= 1;
+    if let Some(top) = restored.last_mut() {
+        top.alt_idx += 1;
+        top.sym_pos = 0;
+        top.consumed = false;
+    }
+    *stack = restored;
+    true
 }
 
 /// Mark every frame currently on the stack as having consumed a byte under its
@@ -1472,6 +1521,143 @@ mod tests {
         assert_eq!(state.stack, before.stack);
         assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
         assert_eq!(state.complete, before.complete);
+    }
+
+    /// `r ::= "" | "a"` (epsilon first), `root ::= r "b"`.
+    fn epsilon_first_alt_grammar() -> CompiledGrammar {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let r_id = b.reserve("r");
+        b.set_alts(r_id, vec![vec![], vec![Symbol::Terminal(b'a')]])
+            .unwrap();
+        b.set_alts(
+            root_id,
+            vec![vec![Symbol::NonTerminal(r_id), Symbol::Terminal(b'b')]],
+        )
+        .unwrap();
+        b.build()
+    }
+
+    /// Same shape, epsilon last: `r ::= "a" | ""`. Control proving the fix
+    /// does not depend on alternative order (this direction already worked).
+    fn epsilon_last_alt_grammar() -> CompiledGrammar {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let r_id = b.reserve("r");
+        b.set_alts(r_id, vec![vec![Symbol::Terminal(b'a')], vec![]])
+            .unwrap();
+        b.set_alts(
+            root_id,
+            vec![vec![Symbol::NonTerminal(r_id), Symbol::Terminal(b'b')]],
+        )
+        .unwrap();
+        b.build()
+    }
+
+    /// `r ::= "" | "a"`, `root ::= r "a" "c"`: accepting "aac" needs `r`'s
+    /// epsilon choice reopened after the SECOND byte fails, one byte past
+    /// where `try_backtrack` can still reach it (#322, remaining gap).
+    fn epsilon_first_multi_byte_grammar() -> CompiledGrammar {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let r_id = b.reserve("r");
+        b.set_alts(r_id, vec![vec![], vec![Symbol::Terminal(b'a')]])
+            .unwrap();
+        b.set_alts(
+            root_id,
+            vec![vec![
+                Symbol::NonTerminal(r_id),
+                Symbol::Terminal(b'a'),
+                Symbol::Terminal(b'c'),
+            ]],
+        )
+        .unwrap();
+        b.build()
+    }
+
+    /// Deeply nested `r_i ::= "" | (r_{i+1} "a") | (r_{i+1} "b")`, base case
+    /// `r_depth ::= "" | "a" | "b"`; each level doubles fresh re-exploration
+    /// of the next, so full search is ~2^depth restores.
+    fn nested_nullable_branch_grammar(depth: usize) -> CompiledGrammar {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let levels: Vec<usize> = (0..=depth).map(|i| b.reserve(&format!("r{i}"))).collect();
+        b.set_alts(
+            levels[depth],
+            vec![
+                vec![],
+                vec![Symbol::Terminal(b'a')],
+                vec![Symbol::Terminal(b'b')],
+            ],
+        )
+        .unwrap();
+        for i in (0..depth).rev() {
+            let next = levels[i + 1];
+            b.set_alts(
+                levels[i],
+                vec![
+                    vec![],
+                    vec![Symbol::NonTerminal(next), Symbol::Terminal(b'a')],
+                    vec![Symbol::NonTerminal(next), Symbol::Terminal(b'b')],
+                ],
+            )
+            .unwrap();
+        }
+        b.set_alts(
+            root_id,
+            vec![vec![Symbol::NonTerminal(levels[0]), Symbol::Terminal(b'z')]],
+        )
+        .unwrap();
+        b.build()
+    }
+
+    /// #322: an epsilon-first alternative must not permanently commit. `"ab"`
+    /// falls back to `r`'s `"a"` once `root`'s `"b"` mismatches; `"b"` keeps
+    /// working via the epsilon choice; `"c"` / `"aab"` still reject.
+    #[test]
+    fn epsilon_first_alternative_is_retried_on_later_mismatch() {
+        let g = epsilon_first_alt_grammar();
+        assert!(accepts_str(&g, b"ab"), "\"ab\" must accept via r ::= \"a\"");
+        assert!(accepts_str(&g, b"b"), "\"b\" must accept via r ::= \"\"");
+        assert!(!accepts_str(&g, b"c"), "\"c\" matches neither alternative");
+        assert!(
+            !accepts_str(&g, b"aab"),
+            "\"aab\" has one 'a' too many for r ::= \"\" | \"a\""
+        );
+    }
+
+    /// Epsilon *last* control: must keep accepting both forms, unaffected by
+    /// alternative order (this direction predates #322 and must not regress).
+    #[test]
+    fn epsilon_last_alternative_still_accepts_both_forms() {
+        let g = epsilon_last_alt_grammar();
+        assert!(accepts_str(&g, b"ab"), "\"ab\" must accept via r ::= \"a\"");
+        assert!(accepts_str(&g, b"b"), "\"b\" must accept via r ::= \"\"");
+        assert!(!accepts_str(&g, b"c"));
+        assert!(!accepts_str(&g, b"aab"));
+    }
+
+    /// Remaining #322 gap: the checkpoint trail lives inside one
+    /// `try_advance_stack` call (one byte). `r`'s epsilon choice for "aac"
+    /// is committed on byte 1 and cannot reopen on byte 2's mismatch.
+    #[test]
+    #[ignore = "requires multi-byte backtracking"]
+    fn epsilon_first_choice_across_a_later_byte_is_not_reopened() {
+        let g = epsilon_first_multi_byte_grammar();
+        assert!(
+            accepts_str(&g, b"aac"),
+            "\"aac\" must accept via r ::= \"a\""
+        );
+    }
+
+    /// Full search of `depth`-nested branches is ~2^depth restores,
+    /// intractable if unbounded; completing at all proves the budget capped
+    /// it. "x" matches no alternative anywhere, so rejection is correct
+    /// regardless of how much of the search the budget allowed.
+    #[test]
+    fn nested_nullable_alternatives_reject_within_restore_budget() {
+        let g = nested_nullable_branch_grammar(40);
+        assert!(!accepts_str(&g, b"x"));
     }
 
     #[test]
