@@ -336,6 +336,17 @@ fn run_shared_driver_gate(model_dir: &Path) {
     let model =
         Gemma4Model::from_safetensors(model_dir).expect("loading real gemma-4-e2b-it checkpoint");
 
+    // Issue #1597: the checkpoint's real end-of-turn id (106, from
+    // `generation_config.json`/top-level `config.json`, see
+    // `gemma4_config::resolve_stop_token_ids`) must be part of the loaded stop set --
+    // `text_config.eos_token_id` alone (1) never fires on this golden prompt within 3 tokens,
+    // which is exactly the gap this gate now exists to catch.
+    assert!(
+        model.stop_token_ids().contains(&106),
+        "the checkpoint's end-of-turn id (106) must be in the loaded stop set: {:?}",
+        model.stop_token_ids()
+    );
+
     // `stop_token_ids: vec![]` overrides `GenerateConfig::default()`'s
     // `QWEN_CHAT_IM_END_TOKEN_ID` (248_046): Gemma's vocab_size (262_144) is
     // large enough that this Qwen-specific id is a valid, unrelated Gemma
@@ -358,30 +369,41 @@ fn run_shared_driver_gate(model_dir: &Path) {
         .generate(&golden.input_ids, &gen_cfg)
         .expect("gemma4 shared-driver generate");
 
-    // Gate 3, replayed through the shared decoder driver's public entry
-    // point: identical assertion to `run_gate`'s own greedy-token check
-    // above, over the SAME golden and the SAME real checkpoint, but through
-    // `Gemma4Model::generate` (ADR-090 row R04) instead of the fixed-count
-    // `generate_greedy_with_probe` diagnostic. `output.stopped` is asserted
-    // `false` first: if the run stopped early (e.g. one of the golden's 3
-    // greedy tokens happens to equal this checkpoint's real
-    // `eos_token_id` -- a real, checkpoint-dependent possibility `generate`'s
-    // EOS-aware contract introduces that the diagnostic path above never had
-    // to consider), `token_ids` would be shorter than 3 and the length
-    // assertion below would fail with a confusing message; asserting
-    // `!stopped` first names the actual condition directly.
+    // Gate 3, replayed through the shared decoder driver's public entry point: identical
+    // assertion to `run_gate`'s own greedy-token check above, over the SAME golden and the SAME
+    // real checkpoint, but through `Gemma4Model::generate` (ADR-090 row R04) instead of the
+    // fixed-count `generate_greedy_with_probe` diagnostic.
+    //
+    // Unlike the fixed-count diagnostic path, `generate` is EOS-aware, and the golden's own
+    // third greedy token (106) IS this checkpoint's real end-of-turn id (asserted above): a
+    // correct run stops there and excludes it from `token_ids` (the crate-wide stop-token
+    // contract), so the shared-driver path must reproduce the golden's ids up to, but not
+    // including, that first stop id -- `[9079, 236761]`, not all 3.
+    let first_stop_idx = golden
+        .greedy_tokens
+        .iter()
+        .position(|id| model.stop_token_ids().contains(id));
+    let expected: Vec<u32> = match first_stop_idx {
+        Some(idx) => golden.greedy_tokens[..idx].to_vec(),
+        None => golden.greedy_tokens.clone(),
+    };
+    assert_eq!(
+        expected,
+        vec![9079, 236761],
+        "this golden's own greedy tokens or the loaded stop set changed -- re-derive the \
+         hardcoded expectation here rather than loosening it"
+    );
     assert!(
-        !output.stopped,
-        "the shared-driver path must not stop before 3 tokens for this golden prompt (stop \
-         reason: {:?}) -- if this fires, one of the golden's 3 greedy tokens likely equals \
-         this checkpoint's real eos_token_id, a real EOS-aware-vs-fixed-count behavioral \
-         difference from generate_greedy_with_probe that needs its own investigation, not a \
-         silently loosened assertion here",
+        output.stopped,
+        "the shared-driver path must stop on the golden's third token (106, this checkpoint's \
+         real end-of-turn id) -- stop reason: {:?}",
         output.stop_reason
     );
+    assert_eq!(output.stop_reason, Some(lattice_inference::StopReason::Eos));
     assert_eq!(
-        output.token_ids, golden.greedy_tokens,
-        "shared-driver greedy tokens must match the HF golden exactly"
+        output.token_ids, expected,
+        "shared-driver greedy tokens must match the HF golden's ids up to (excluding) its \
+         first real end-of-turn id"
     );
 }
 

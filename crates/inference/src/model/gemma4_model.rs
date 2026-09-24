@@ -19,7 +19,7 @@
 //! crate's Qwen3.5 GQA attention, so that kernel is not reused here.
 
 use super::gemma4_cache::Gemma4KvCache;
-use super::gemma4_config::Gemma4Config;
+use super::gemma4_config::{Gemma4Config, resolve_stop_token_ids};
 use super::gemma4_loading::load_weights;
 use super::gemma4_ops::{
     gemma4_apply_rope, gemma4_geglu_mlp, gemma4_gelu_tanh, gemma4_logit_softcap, gemma4_rms_norm,
@@ -156,6 +156,16 @@ pub struct Gemma4Model {
     /// past `partial_rotary_factor * global_head_dim / 2`), length
     /// `global_head_dim / 2`.
     global_inv_freq: Vec<f32>,
+    /// Full stop-token set for [`Self::generate`]/[`Self::generate_with_trace`]/
+    /// [`Self::generate_streaming_with_cancel`] (issue #1597): `config.eos_token_id`
+    /// (`text_config`'s single id) unioned with the checkpoint's `generation_config.json` or
+    /// top-level `config.json` `eos_token_id` -- see
+    /// [`super::gemma4_config::resolve_stop_token_ids`]. Deliberately NOT a field on
+    /// [`Gemma4Config`]: every field of that struct is `pub` and the struct carries no
+    /// `#[non_exhaustive]`, so it is constructible outside this crate, and a new field there
+    /// would be a semver-major break. `generate_greedy`/`generate_greedy_with_probe` do not read
+    /// this at all -- they remain the fixed-count diagnostic entry points that never check EOS.
+    stop_token_ids: Vec<u32>,
 }
 
 /// UTF-8-boundary-safe streaming detokenizer for [`Gemma4Model::generate_streaming_via_driver`].
@@ -249,6 +259,7 @@ impl Gemma4Model {
             config.rope_theta,
             Some(config.partial_rotary_factor),
         );
+        let stop_token_ids = resolve_stop_token_ids(path, config.eos_token_id);
 
         Ok(Self {
             config,
@@ -256,12 +267,21 @@ impl Gemma4Model {
             tokenizer,
             local_inv_freq,
             global_inv_freq,
+            stop_token_ids,
         })
     }
 
     /// **Unstable**: access Gemma 4 configuration.
     pub fn config(&self) -> &Gemma4Config {
         &self.config
+    }
+
+    /// **Unstable**: the full stop-token set [`Self::generate`]/[`Self::generate_with_trace`]/
+    /// [`Self::generate_streaming_with_cancel`] halt on -- `config().eos_token_id` unioned with
+    /// the checkpoint's `generation_config.json` or top-level `config.json` `eos_token_id` (issue
+    /// #1597). `generate_greedy`/`generate_greedy_with_probe` ignore this entirely.
+    pub fn stop_token_ids(&self) -> &[u32] {
+        &self.stop_token_ids
     }
 
     /// **Unstable**: access the Gemma BPE tokenizer.
@@ -733,11 +753,12 @@ impl Gemma4Model {
     /// tokenized with BOS included by the caller -- same convention as
     /// [`Self::generate_greedy`]/[`Self::generate_greedy_with_probe`], and
     /// unlike `Qwen35Model::generate`'s `prompt: &str`. EOS-aware: stops on
-    /// `self.config.eos_token_id` or any id in `gen_cfg.stop_token_ids`, and
-    /// excludes the terminating token from the returned `token_ids`/`text`
-    /// (the crate-wide stop-token contract, `GenerateOutput`'s own doc
-    /// comment). Runs no forward pass after the last requested output
-    /// (ADR-090 D2).
+    /// any id in [`Self::stop_token_ids`] (the checkpoint's full loaded stop
+    /// set, issue #1597 -- not only `self.config.eos_token_id`) or in
+    /// `gen_cfg.stop_token_ids`, and excludes the terminating token from the
+    /// returned `token_ids`/`text` (the crate-wide stop-token contract,
+    /// `GenerateOutput`'s own doc comment). Runs no forward pass after the
+    /// last requested output (ADR-090 D2).
     ///
     /// `generate_greedy`/`generate_greedy_with_probe` are UNCHANGED by this
     /// row and remain the fixed-count diagnostic entry points; this is a
@@ -868,9 +889,20 @@ impl Gemma4Model {
         let mut throwaway_text = String::new();
         let mut throwaway_offsets: Vec<usize> = Vec::new();
 
+        // `driver::run` only checks a single `eos_token_id: u32` plus `gen_cfg.stop_token_ids`
+        // (issue #1597): `cfg.eos_token_id` below is `text_config`'s own id, so the
+        // checkpoint's real end-of-turn set (`self.stop_token_ids`, which already includes
+        // `cfg.eos_token_id`) is folded into a CLONE of `gen_cfg` here rather than the caller's
+        // own config -- extending `gen_cfg.stop_token_ids` in place would mutate a value the
+        // caller still owns.
+        let mut extended_gen_cfg = gen_cfg.clone();
+        extended_gen_cfg
+            .stop_token_ids
+            .extend(self.stop_token_ids.iter().copied());
+
         let result = driver::run(
             &mut session,
-            gen_cfg,
+            &extended_gen_cfg,
             None,
             prompt_ids,
             cfg.eos_token_id,
@@ -1014,9 +1046,16 @@ impl Gemma4Model {
         let detok_cell =
             std::cell::RefCell::new(IncrementalByteFallbackDetokenizer::new(&self.tokenizer));
 
+        // See `generate_via_driver`'s identical clone-and-extend for why this is a clone of
+        // `gen_cfg` rather than an in-place mutation (issue #1597).
+        let mut extended_gen_cfg = gen_cfg.clone();
+        extended_gen_cfg
+            .stop_token_ids
+            .extend(self.stop_token_ids.iter().copied());
+
         let result = driver::run(
             &mut session,
-            gen_cfg,
+            &extended_gen_cfg,
             None,
             prompt_ids,
             cfg.eos_token_id,
@@ -1207,12 +1246,15 @@ pub(crate) fn tiny_zero_model() -> Gemma4Model {
         Some(config.partial_rotary_factor),
     );
 
+    let stop_token_ids = vec![config.eos_token_id];
+
     Gemma4Model {
         config,
         weights,
         tokenizer,
         local_inv_freq,
         global_inv_freq,
+        stop_token_ids,
     }
 }
 
@@ -1462,6 +1504,62 @@ mod tests {
         assert_eq!(output.stop_reason, Some(StopReason::Eos));
     }
 
+    /// Issue #1597: the model-level stop set (`Gemma4Model::stop_token_ids`, resolved at
+    /// load time from `generation_config.json`/top-level `config.json` -- see
+    /// `gemma4_config::resolve_stop_token_ids`) must end generation on its own, even when the
+    /// caller's own `gen_cfg.stop_token_ids` is empty. Distinct from
+    /// `generate_stops_on_configured_stop_token_id` above, which exercises `gen_cfg`'s own field;
+    /// this one never touches `gen_cfg.stop_token_ids` at all.
+    #[test]
+    fn generate_stops_on_model_level_stop_token_id() {
+        let mut model = tiny_zero_model();
+        // Greedy decode on the all-zero tiny model always samples token id 0 (see
+        // `tiny_zero_model`'s doc comment); configuring it here as a MODEL-level stop id
+        // (bypassing `resolve_stop_token_ids`, which this test does not exercise) isolates the
+        // extension `generate_via_driver`/`generate_streaming_via_driver` must apply.
+        model.stop_token_ids = vec![0];
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let output = model
+            .generate(&[2, 3], &gen_cfg)
+            .expect("generation over the tiny model must succeed");
+        assert!(
+            output.token_ids.is_empty(),
+            "the model-level stop id (0, sampled at step 0) must end generation even though \
+             gen_cfg.stop_token_ids never named it"
+        );
+        assert_eq!(output.generated_tokens, 0);
+        assert!(output.stopped);
+        assert_eq!(output.stop_reason, Some(StopReason::Eos));
+    }
+
+    #[test]
+    fn generate_streaming_stops_on_model_level_stop_token_id() {
+        // Streaming sibling of the test above, isolating generate_streaming_via_driver's
+        // own extension of the model-level stop ids into the driver call.
+        let mut model = tiny_zero_model();
+        model.stop_token_ids = vec![0];
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let output = model
+            .generate_streaming_with_cancel(&[2, 3], &gen_cfg, |_delta| true, || false)
+            .expect("generation over the tiny model must succeed");
+        assert!(output.token_ids.is_empty());
+        assert_eq!(output.generated_tokens, 0);
+        assert!(output.stopped);
+        assert_eq!(output.stop_reason, Some(StopReason::Eos));
+    }
+
     /// `prompt_len + effective decode cap > max_position_embeddings` must be refused before any
     /// KV-cache allocation or forward call. `max_new_tokens: usize::MAX` proves the ordering:
     /// skipping the check would abort the process on an oversized allocation, not return `Err`.
@@ -1632,27 +1730,38 @@ mod tests {
             .expect("gemma4 shared-driver generate_with_trace");
 
         assert!(
-            !output.stopped,
-            "must not stop before 3 tokens for this golden prompt (stop reason: {:?}) -- see \
-             tests/gemma4_e2e_forward_test.rs's stage5_shared_driver_greedy_matches_hf_golden \
-             for the full explanation of this risk",
+            model.stop_token_ids().contains(&106),
+            "the checkpoint's loaded stop set must include the end-of-turn id"
+        );
+        let first_stop_idx = golden
+            .greedy_tokens
+            .iter()
+            .position(|id| model.stop_token_ids().contains(id));
+        let expected: Vec<u32> = match first_stop_idx {
+            Some(idx) => golden.greedy_tokens[..idx].to_vec(),
+            None => golden.greedy_tokens.clone(),
+        };
+        assert_eq!(
+            expected,
+            vec![9079, 236761],
+            "golden ids before the first stop id must be exactly these two"
+        );
+        assert!(
+            output.stopped,
+            "must stop on the checkpoint's own end-of-turn id (stop reason: {:?})",
             output.stop_reason
         );
+        assert_eq!(output.stop_reason, Some(StopReason::Eos));
         assert_eq!(
-            output.token_ids, golden.greedy_tokens,
-            "driver-routed ids must match the HF golden exactly"
+            output.token_ids, expected,
+            "driver-routed ids must match the HF golden up to the first stop id"
         );
-        // The driver-trace bypass-detector invariant (`decoder::driver`'s own
-        // module doc comment): one `select()` per emitted token on a natural
-        // (non-EOS-at-step-0) finish, and exactly one prediction stays open
-        // at finish (`consumed == opened - 1`). A step routed around the
-        // driver would leave both counters short of what a real run
-        // produces, in a way the token-id comparison above cannot see by
-        // construction.
+        // On an EOS finish `decoder::driver::run` opens a prediction for the stop token
+        // and never emits it, so `opened` is one more than the emitted count.
         assert_eq!(
             trace.opened,
-            output.token_ids.len(),
-            "one select() per emitted token on a natural finish"
+            output.token_ids.len() + 1,
+            "opens the stop-token prediction it never emits"
         );
         assert_eq!(
             trace.consumed + 1,

@@ -20,6 +20,7 @@
 //! for an absent or partial `text_config`.
 
 use crate::error::InferenceError;
+use crate::model::config_file::read_config_json_bounded;
 use std::path::Path;
 
 /// Expected safetensors dtype for every Gemma 4 E2B language-model tensor
@@ -816,6 +817,65 @@ pub(crate) fn compute_layer_types(num_layers: usize, interval: usize) -> Vec<Gem
         .collect()
 }
 
+/// Resolves the full stop-token set `Gemma4Model::generate` and its siblings must halt on:
+/// `text_config_eos` (the `text_config.eos_token_id` this module already parses into
+/// [`Gemma4Config::eos_token_id`]) unioned with whichever of `generation_config.json`'s or the
+/// top-level `config.json`'s own `eos_token_id` is available at `model_dir`.
+///
+/// `generation_config.json` wins when it exists, parses as JSON, and carries a usable
+/// `eos_token_id`; the top-level `config.json` field is the fallback used only when it does not --
+/// mirroring `tokenizer::gemma_bpe::ernie_max_seq_len`'s optional-companion-file convention: a
+/// missing file, a parse failure, or an absent/wrong-shaped field are each "this source has
+/// nothing to add," never a hard error, since `text_config_eos` alone is always a valid stop id.
+///
+/// `eos_token_id` in either HF file may be a single integer or a list (observed on the pinned
+/// `google/gemma-4-E2B-it` checkpoint: `generation_config.json` ships `[1, 106, 50]`, the
+/// top-level `config.json` ships `[1, 106]`, `text_config.eos_token_id` is the single int `1`) --
+/// both shapes are accepted from either file.
+pub(crate) fn resolve_stop_token_ids(model_dir: &Path, text_config_eos: u32) -> Vec<u32> {
+    let mut ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    ids.insert(text_config_eos);
+
+    let extra = read_top_level_eos_ids(
+        &model_dir.join("generation_config.json"),
+        "generation_config",
+    )
+    .unwrap_or_else(|| {
+        read_top_level_eos_ids(&model_dir.join("config.json"), "config").unwrap_or_default()
+    });
+    ids.extend(extra);
+    ids.into_iter().collect()
+}
+
+/// Reads `path` as JSON and returns its top-level `eos_token_id` (single integer or list), or
+/// `None` if the file is missing, is not valid JSON, or has no usable `eos_token_id` field --
+/// every one of those is a silent "nothing to add" per [`resolve_stop_token_ids`]'s own doc
+/// comment, not an error.
+fn read_top_level_eos_ids(path: &Path, what: &str) -> Option<Vec<u32>> {
+    let text = read_config_json_bounded(path, what).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let ids = eos_ids_from_json_value(value.get("eos_token_id")?);
+    if ids.is_empty() { None } else { Some(ids) }
+}
+
+/// Accepts either a single JSON integer or an array of integers for an `eos_token_id` field;
+/// anything else (a string, an object, a float that does not fit `u32`) yields an empty `Vec`,
+/// which [`read_top_level_eos_ids`] treats as "field present but unusable."
+fn eos_ids_from_json_value(value: &serde_json::Value) -> Vec<u32> {
+    match value {
+        serde_json::Value::Number(_) => value
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .into_iter()
+            .collect(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_u64().and_then(|v| u32::try_from(v).ok()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,5 +1291,85 @@ mod tests {
             .expect("a directory with a valid config.json must load");
         assert_eq!(cfg.hidden_size, 1536);
         assert_eq!(cfg.num_hidden_layers, 35);
+    }
+
+    // --- resolve_stop_token_ids (issue #1597: generate()/generate_with_trace()/
+    // generate_streaming_with_cancel() must stop on the checkpoint's real end-of-turn id, not
+    // only text_config's single eos_token_id) ---
+
+    #[test]
+    fn stop_ids_use_generation_config_list_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"), pinned_config_json()).unwrap();
+        std::fs::write(
+            tmp.path().join("generation_config.json"),
+            serde_json::json!({"eos_token_id": [1, 106, 50]}).to_string(),
+        )
+        .unwrap();
+        let ids = resolve_stop_token_ids(tmp.path(), 1);
+        assert_eq!(ids, vec![1, 50, 106]);
+    }
+
+    #[test]
+    fn stop_ids_fall_back_to_top_level_config_json_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Only config.json (top-level eos_token_id: [1, 106], per the pinned fixture) --
+        // no generation_config.json in this directory at all.
+        std::fs::write(tmp.path().join("config.json"), pinned_config_json()).unwrap();
+        let ids = resolve_stop_token_ids(tmp.path(), 1);
+        assert_eq!(ids, vec![1, 106]);
+    }
+
+    #[test]
+    fn stop_ids_fall_back_to_text_config_alone_when_neither_file_has_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut json = pinned_config_value();
+        json.as_object_mut().unwrap().remove("eos_token_id");
+        std::fs::write(tmp.path().join("config.json"), json.to_string()).unwrap();
+        let ids = resolve_stop_token_ids(tmp.path(), 1);
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[test]
+    fn stop_ids_ignore_a_malformed_generation_config_and_fall_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"), pinned_config_json()).unwrap();
+        // Not valid JSON at all.
+        std::fs::write(tmp.path().join("generation_config.json"), "{not json").unwrap();
+        let ids = resolve_stop_token_ids(tmp.path(), 1);
+        assert_eq!(
+            ids,
+            vec![1, 106],
+            "a malformed generation_config.json must be treated as absent, falling back to \
+             config.json's top-level eos_token_id, not as a hard error"
+        );
+    }
+
+    #[test]
+    fn stop_ids_ignore_a_generation_config_with_no_eos_field_and_fall_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"), pinned_config_json()).unwrap();
+        std::fs::write(
+            tmp.path().join("generation_config.json"),
+            serde_json::json!({"max_length": 20}).to_string(),
+        )
+        .unwrap();
+        let ids = resolve_stop_token_ids(tmp.path(), 1);
+        assert_eq!(ids, vec![1, 106]);
+    }
+
+    #[test]
+    fn stop_ids_accept_a_single_integer_eos_token_id() {
+        // 50 is absent from the top-level config.json fallback ([1, 106]), so
+        // only the generation_config int path can produce it.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"), pinned_config_json()).unwrap();
+        std::fs::write(
+            tmp.path().join("generation_config.json"),
+            serde_json::json!({"eos_token_id": 50}).to_string(),
+        )
+        .unwrap();
+        let ids = resolve_stop_token_ids(tmp.path(), 1);
+        assert_eq!(ids, vec![1, 50]);
     }
 }

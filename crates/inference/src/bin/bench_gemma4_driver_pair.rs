@@ -1,49 +1,48 @@
 //! Issue #1597 measurement cell: "PAIR on comparable output semantics, setup/prefill/decode
 //! separately." Replays the stage-5 golden prompt through Gemma 4's fixed-count greedy path
 //! ([`Gemma4Model::generate_greedy`]) and its shared-driver path
-//! ([`Gemma4Model::generate_streaming_with_cancel`]), asserts the two produce identical token
-//! ids, and reports load/prefill/decode time for each. CPU-only: no Metal dispatch, so it does
-//! not take `/tmp/lion-metal-gpu-test.lock`.
+//! ([`Gemma4Model::generate_streaming_with_cancel`]) at the SAME token count and asserts the two
+//! produce identical token ids. CPU-only: no Metal dispatch, so it does not take
+//! `/tmp/lion-metal-gpu-test.lock`.
 //!
-//! **Both paths run in one process, interleaved ABBA per round** (mirrors
-//! `scripts/bench-compare.sh`'s own arm ordering), rather than behind a `--path` flag: the
-//! identical-token-id assertion this binary must make can only be done in-process, so there is
-//! no scenario where the two paths need separate invocations. ABBA alternates which path goes
-//! first each round so a linear drift across the run (thermal ramp, cache effects) lands on both
-//! paths rather than favoring one.
+//! **The driver stops itself at the model's end-of-turn id; the greedy path does not check EOS
+//! at all and always emits exactly the count it is given.** So the token count comparable output
+//! semantics can be judged over is prompt-determined, not a number this binary picks. For the
+//! stage-5 golden prompt ("The capital of France is"), the model's stop set unions
+//! `text_config.eos_token_id` with the checkpoint's `generation_config.json` (or, if that file is
+//! absent, top-level `config.json`) `eos_token_id` -- see
+//! `model::gemma4_config::resolve_stop_token_ids` -- so the driver stops after 2 tokens
+//! (`[9079, 236761]`), before the end-of-turn id 106.
 //!
-//! Timing boundaries -- neither path exposes a real prefill/decode split on the public API, so
-//! each is honestly approximated a different way:
-//!   - **greedy**: [`Gemma4Model::generate_greedy`] is one blocking call with no per-token hook.
-//!     `prefill` times a `max_new_tokens=0` call (prompt forward passes only, same cache size as
-//!     the timed run); `decode_total` is a separate `max_new_tokens=n` call's elapsed time minus
-//!     `prefill`. This runs the prompt forward pass twice per round and assumes it costs the same
-//!     both times (deterministic CPU greedy decode, no RNG). `decode_total / n` includes token 0.
-//!   - **driver**: `generate_streaming_with_cancel`'s `on_token` callback fires once per emitted
-//!     token, including the first (`decoder::driver::run`'s `check_initial_stop`/
-//!     `transition_with_metadata` path feeds the same confirmed-output sink for token 0 and every
-//!     later token). Time-to-first-callback is charged as `prefill`; it also includes token 0's
-//!     own selection, which has no separate boundary on this API. `decode_total` is the last
-//!     callback minus the first, so `decode_total / (n - 1)` excludes token 0.
+//! Each repeat therefore runs an UNTIMED driver call first (capped at `--tokens`, default 16) to
+//! learn that repeat's `N = driver.token_ids.len()`, then a greedy call with
+//! `max_new_tokens = N` at `max_seq_len = prompt_len + N` -- equal work, so the id comparison is
+//! exact rather than an artifact of one path stopping earlier than the other. This costs one
+//! extra, untimed generation per repeat.
 //!
-//! The two paths' per-token decode averages are therefore not directly comparable (greedy
-//! includes token 0, driver excludes it) -- both are reported plainly rather than forced to
-//! align.
+//! **Both paths run in one process; the TIMED calls alternate ABBA per repeat** (mirrors
+//! `scripts/bench-compare.sh`'s own arm ordering) so a linear drift across the run (thermal
+//! ramp, cache effects) lands on both paths rather than favoring one. The untimed N-discovery
+//! call always runs first and is not part of that alternation -- it has to, since neither timed
+//! call can start before `N` is known.
 //!
-//! **Semantic gap this binary is built to surface, not to paper over**: `generate_greedy` never
-//! checks EOS and always emits exactly `n` tokens; the driver path stops early on
-//! `config.eos_token_id`. If EOS falls within the requested `n` on the real checkpoint, the two
-//! token-id vectors legitimately differ in length and the identical-output assertion below fails
-//! -- that is the "comparable output semantics" question the issue asks.
+//! **Timing**: each path's number is the WHOLE call's wall time at that repeat's `N` --
+//! `generate_streaming_with_cancel` for the driver, `generate_greedy` for greedy. Neither path
+//! exposes a real prefill/decode split on the public API. `generate_greedy`'s own separate
+//! `max_new_tokens=0` call (prompt forward passes only, same cache size as the timed call) is
+//! reported alongside as an informational reference figure, not subtracted from anything. The
+//! driver's `on_token` callback count is also reported as information only: it does not fire
+//! once per emitted token (special tokens can decode to an empty text delta and the callback is
+//! not guaranteed to fire on every one), so it is not a decode-per-token instrument.
 //!
 //! Env:
 //!   LATTICE_GEMMA4_MODEL_DIR  checkpoint dir (default ~/.lattice/models/gemma-4-e2b-it)
 //! Args:
-//!   --tokens N     greedy tokens per path per round (default 16)
-//!   --repeats N    timed rounds, each round times both paths once (default 5)
+//!   --tokens N     cap for the untimed N-discovery driver call (default 16)
+//!   --repeats N    timed repeats, each fixing its own N and timing both paths once (default 5)
 //!
-//! Output: one `sample` line per (round, path) to stdout; a `setup` line once, before any
-//! sample; a `MISMATCH` line to stderr for any round whose two paths disagree.
+//! Output: one `sample` line per (repeat, path) to stdout; a `setup` line once, before any
+//! sample; a `MISMATCH` line to stderr for any repeat whose two paths disagree at equal N.
 //!
 //! Run it on a quiet machine with the checkpoint present:
 //!   scripts/bench-command.sh --label gemma4-driver-pair --durable -- \
@@ -92,39 +91,6 @@ fn repeats_arg() -> usize {
         .unwrap_or(5)
 }
 
-struct PathTiming {
-    prefill: Duration,
-    decode_total: Duration,
-    /// Tokens the `decode_total` average divides by -- `n` for greedy (includes token 0),
-    /// `n.saturating_sub(1)` for driver (excludes it; see module doc).
-    decode_token_count: usize,
-    token_ids: Vec<u32>,
-}
-
-/// Prefill timed by a separate `max_new_tokens=0` call at the SAME `max_seq_len` as the timed
-/// run, so both calls allocate an identically sized cache -- see module doc for the assumption
-/// this rests on.
-fn run_greedy(model: &Gemma4Model, prompt_ids: &[u32], n: usize, max_seq_len: usize) -> PathTiming {
-    let t0 = Instant::now();
-    model
-        .generate_greedy(prompt_ids, 0, max_seq_len)
-        .expect("prefill-only greedy call must succeed");
-    let prefill = t0.elapsed();
-
-    let t1 = Instant::now();
-    let token_ids = model
-        .generate_greedy(prompt_ids, n, max_seq_len)
-        .expect("greedy generation must succeed");
-    let total = t1.elapsed();
-
-    PathTiming {
-        prefill,
-        decode_total: total.saturating_sub(prefill),
-        decode_token_count: n,
-        token_ids,
-    }
-}
-
 fn driver_config(n: usize) -> GenerateConfig {
     let mut cfg = GenerateConfig::default();
     cfg.max_new_tokens = n;
@@ -134,51 +100,79 @@ fn driver_config(n: usize) -> GenerateConfig {
     cfg
 }
 
-fn run_driver(model: &Gemma4Model, prompt_ids: &[u32], n: usize) -> PathTiming {
-    let gen_cfg = driver_config(n);
-    let mut first: Option<Instant> = None;
-    let mut last: Option<Instant> = None;
-    let mut calls = 0usize;
+/// Runs the driver path once, untimed, capped at `token_cap`, and returns however many ids it
+/// actually produced -- the driver stops itself at the model's end-of-turn id, so this is
+/// usually well under `token_cap` (see module doc).
+fn discover_n(model: &Gemma4Model, prompt_ids: &[u32], token_cap: usize) -> usize {
+    let gen_cfg = driver_config(token_cap);
+    let output = model
+        .generate_streaming_with_cancel(prompt_ids, &gen_cfg, |_delta| true, || false)
+        .expect("driver generation must succeed");
+    output.token_ids.len()
+}
 
+struct GreedyTiming {
+    total: Duration,
+    token_ids: Vec<u32>,
+}
+
+fn time_greedy(
+    model: &Gemma4Model,
+    prompt_ids: &[u32],
+    n: usize,
+    max_seq_len: usize,
+) -> GreedyTiming {
+    let start = Instant::now();
+    let token_ids = model
+        .generate_greedy(prompt_ids, n, max_seq_len)
+        .expect("greedy generation must succeed");
+    GreedyTiming {
+        total: start.elapsed(),
+        token_ids,
+    }
+}
+
+/// Prompt-forward-passes-only timing at the same cache size as the timed call; informational,
+/// not subtracted from `time_greedy`'s total (see module doc).
+fn time_greedy_prefill_only(
+    model: &Gemma4Model,
+    prompt_ids: &[u32],
+    max_seq_len: usize,
+) -> Duration {
+    let start = Instant::now();
+    model
+        .generate_greedy(prompt_ids, 0, max_seq_len)
+        .expect("prefill-only greedy call must succeed");
+    start.elapsed()
+}
+
+struct DriverTiming {
+    total: Duration,
+    /// Informational only -- not a per-token decode instrument (see module doc).
+    on_token_calls: usize,
+    token_ids: Vec<u32>,
+}
+
+fn time_driver(model: &Gemma4Model, prompt_ids: &[u32], n: usize) -> DriverTiming {
+    let gen_cfg = driver_config(n);
+    let mut on_token_calls = 0usize;
     let start = Instant::now();
     let output = model
         .generate_streaming_with_cancel(
             prompt_ids,
             &gen_cfg,
             |_delta| {
-                let now = Instant::now();
-                first.get_or_insert(now);
-                last = Some(now);
-                calls += 1;
+                on_token_calls += 1;
                 true
             },
             || false,
         )
         .expect("driver generation must succeed");
-
-    let first = first.expect("max_new_tokens > 0 must emit at least one token");
-    let last = last.unwrap_or(first);
-    PathTiming {
-        prefill: first.duration_since(start),
-        decode_total: last.duration_since(first),
-        decode_token_count: calls.saturating_sub(1),
+    DriverTiming {
+        total: start.elapsed(),
+        on_token_calls,
         token_ids: output.token_ids,
     }
-}
-
-fn print_sample(round: usize, path: &str, timing: &PathTiming) {
-    let per_token = if timing.decode_token_count > 0 {
-        timing.decode_total.as_secs_f64() / timing.decode_token_count as f64
-    } else {
-        0.0
-    };
-    println!(
-        "sample round={round} path={path} prefill_secs={:.6} decode_total_secs={:.6} \
-         decode_per_token_secs={per_token:.6} decode_token_count={}",
-        timing.prefill.as_secs_f64(),
-        timing.decode_total.as_secs_f64(),
-        timing.decode_token_count
-    );
 }
 
 fn main() {
@@ -190,7 +184,7 @@ fn main() {
         );
         std::process::exit(2);
     }
-    let n = tokens_arg();
+    let token_cap = tokens_arg();
     let repeats = repeats_arg().max(1);
     let dir = model_dir();
 
@@ -202,43 +196,60 @@ fn main() {
 
     let golden: Golden = serde_json::from_str(GOLDEN_FIXTURE).expect("golden fixture parses");
     let prompt_ids = golden.input_ids;
-    let max_seq_len = prompt_ids.len() + n;
 
-    // Untimed warm-up, one call per path, discarded -- first-call allocation and page-in costs
-    // must not land in the timed samples below.
-    let _ = model.generate_greedy(&prompt_ids, n, max_seq_len);
-    let warm_cfg = driver_config(n);
+    // Untimed warm-up, one call per path at `token_cap`, discarded -- first-call allocation and
+    // page-in costs must not land in the timed samples below.
+    let warmup_max_seq_len = prompt_ids.len() + token_cap;
+    let _ = model.generate_greedy(&prompt_ids, token_cap, warmup_max_seq_len);
+    let warm_cfg = driver_config(token_cap);
     let _ = model.generate_streaming_with_cancel(&prompt_ids, &warm_cfg, |_| true, || false);
 
     let mut mismatches = 0usize;
-    for round in 0..repeats {
-        let (greedy, driver) = if round % 2 == 0 {
-            let g = run_greedy(&model, &prompt_ids, n, max_seq_len);
-            let d = run_driver(&model, &prompt_ids, n);
+    for repeat in 0..repeats {
+        // Untimed: fixes this repeat's N. Always first -- neither timed call below can start
+        // before N is known, so it cannot take part in the ABBA alternation.
+        let repeat_n = discover_n(&model, &prompt_ids, token_cap);
+        let repeat_max_seq_len = prompt_ids.len() + repeat_n;
+
+        let (greedy, driver) = if repeat % 2 == 0 {
+            let g = time_greedy(&model, &prompt_ids, repeat_n, repeat_max_seq_len);
+            let d = time_driver(&model, &prompt_ids, repeat_n);
             (g, d)
         } else {
-            let d = run_driver(&model, &prompt_ids, n);
-            let g = run_greedy(&model, &prompt_ids, n, max_seq_len);
+            let d = time_driver(&model, &prompt_ids, repeat_n);
+            let g = time_greedy(&model, &prompt_ids, repeat_n, repeat_max_seq_len);
             (g, d)
         };
 
         if greedy.token_ids != driver.token_ids {
             mismatches += 1;
             eprintln!(
-                "MISMATCH round={round} greedy={:?} driver={:?}",
+                "MISMATCH repeat={repeat} n={repeat_n} greedy={:?} driver={:?}",
                 greedy.token_ids, driver.token_ids
             );
         }
 
-        print_sample(round, "greedy", &greedy);
-        print_sample(round, "driver", &driver);
+        let prefill_only = time_greedy_prefill_only(&model, &prompt_ids, repeat_max_seq_len);
+
+        println!(
+            "sample repeat={repeat} path=greedy n={repeat_n} total_secs={:.6} \
+             prefill_only_informational_secs={:.6}",
+            greedy.total.as_secs_f64(),
+            prefill_only.as_secs_f64()
+        );
+        println!(
+            "sample repeat={repeat} path=driver n={repeat_n} total_secs={:.6} \
+             on_token_calls_informational={}",
+            driver.total.as_secs_f64(),
+            driver.on_token_calls
+        );
     }
 
     if mismatches > 0 {
         eprintln!(
-            "FAILED: {mismatches}/{repeats} round(s) produced different token ids between the \
-             greedy and driver paths (see module doc: generate_greedy ignores EOS, the driver \
-             path honors it)"
+            "FAILED: {mismatches}/{repeats} repeat(s) produced different token ids between the \
+             greedy and driver paths at equal N -- both ran the same token count, so this is a \
+             real decode divergence, not a stopping-condition mismatch"
         );
         std::process::exit(1);
     }
