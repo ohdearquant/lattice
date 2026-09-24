@@ -20,9 +20,13 @@ throughout the arm, not just at its edges.
 SELF VS FOREIGN. The bench itself is load: one core busy on a 2-core CI
 runner is 50% of `100 - idle`, so a raw idle floor applied mid-arm would
 refuse every honest run. Each sample therefore also walks the process tree
-rooted at the impl script's own PID (passed as --self-pid) and splits total
-CPU% between that tree (self) and everything else (foreign). Only foreign
-load is judged against the refusal ceiling; self is recorded for context.
+rooted at --self-pid and splits total CPU% between that tree (self) and
+everything else (foreign). Only foreign load is judged against the refusal
+ceiling; self is recorded for context. --self-pid is ordinarily the impl
+script's own PID, but under --gpu-handoff (lattice#1732) the admitted
+benchmark executable is launched by the cooperative supervisor as a SIBLING of
+the impl script, not a descendant of it, so bench-compare-impl.sh passes its
+own PARENT PID instead in that case -- the supervisor that launched both.
 
 PER-PROCESS CPU FIGURE. This samples `ps -Ao pid,ppid,pcpu,comm` (Darwin) /
 `ps -eo pid,ppid,pcpu,comm` (Linux) once per cadence tick. `ps`'s pcpu field
