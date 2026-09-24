@@ -738,7 +738,7 @@ impl QwenModel {
 
             // Try to create Metal GPU forward pass before transmuting weights.
             // MetalForwardPass copies weights into GPU buffers, so it only borrows temporarily.
-            let metal = if std::env::var("LATTICE_NO_GPU").is_ok() {
+            let metal = if crate::env_switch_enabled("LATTICE_NO_GPU") {
                 tracing::info!("Metal GPU disabled by LATTICE_NO_GPU env var");
                 None
             } else {
@@ -794,7 +794,7 @@ impl QwenModel {
 
             // Try Metal GPU. MetalForwardPass copies weights — it only borrows
             // weights_tmp briefly here, before we hand ownership to the model.
-            let metal = if std::env::var("LATTICE_NO_GPU").is_ok() {
+            let metal = if crate::env_switch_enabled("LATTICE_NO_GPU") {
                 tracing::info!("Metal GPU disabled by LATTICE_NO_GPU env var");
                 None
             } else {
