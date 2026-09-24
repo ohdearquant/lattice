@@ -18714,6 +18714,157 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
+        // Sibling of `synthetic_mtp_weights_for_test` with a NON-ZERO `fc` hidden
+        // half and NON-ZERO K/V projections (lattice#1396).
+        // `synthetic_mtp_weights_for_test`'s all-zero K/V
+        // projections -- and `constant_zero_draft_mtp_weights_for_test`'s
+        // additionally-zeroed `fc`, which collapses the fused hidden to zero
+        // regardless of input -- make every MTP cache row identically zero no
+        // matter which hidden state it is paired with, so neither existing
+        // fixture can tell a correct pairing from a wrong one. This variant
+        // keeps that same property for the OUTPUT logits (so the draft's own
+        // predicted next token stays deterministic), while making the raw
+        // cache row content depend on the paired hidden state.
+        //
+        // `fc` is identity on BOTH halves (`fc_out[i] = normed_embed[i] +
+        // normed_hidden[i]`, instead of `synthetic_mtp_weights_for_test`'s
+        // embedding-half-only identity), so the fused hidden actually carries
+        // the paired hidden state's contribution forward into K/V. `k_proj`/
+        // `v_proj` are identity on their first `full_kv_dim()` rows, scaled
+        // differently (`k=1x`, `v=2x`) so a K/V transposition would also be
+        // caught. `q_proj` and `o_proj` stay zero: a zero `o_proj` nullifies
+        // the attention branch's contribution to the OUTPUT hidden regardless
+        // of what `k_proj`/`v_proj` write into the cache (the attention
+        // residual becomes `residual + 0` either way), so this change is
+        // invisible to the draft's own argmax and the deterministic
+        // accept/reject construction other MTP tests in this module rely on
+        // still holds unchanged.
+        fn synthetic_mtp_weights_with_nonzero_kv_for_test(
+            device: &Device,
+            cfg: &Qwen35Config,
+        ) -> MetalMtpWeights {
+            let hidden = cfg.hidden_size;
+            let inter = cfg.intermediate_size;
+            let q_dim = cfg.full_q_dim();
+            let kv_dim = cfg.full_kv_dim();
+
+            // fc shape: [hidden, 2*hidden]. The embedding half is identity
+            // (`fc_out[i] = normed_embed[i]`). The hidden half is identity
+            // shifted by ONE output index (`fc_out[(j + 1) % hidden] +=
+            // normed_hidden[j]`) -- deliberately NOT same-index identity.
+            //
+            // `tiny_metal_qwen35_fixture`'s embeddings are
+            // one-hot at dim 0 for every token, and this fixture's target
+            // model has zero attn/FFN weights, so a pending token's own
+            // pre-final hidden (what the accept arm pairs the appended row
+            // with) is numerically the SAME one-hot vector as that token's
+            // own embedding. With same-index identity on both halves,
+            // `fc_out` became a positive scalar multiple of one shared
+            // direction (`normed_embed` alone for the wrong pairing vs
+            // `normed_embed + normed_hidden`, both pointing along `e_0`, for
+            // the correct one) -- and the `input_layernorm` RMSNorm this
+            // function's GPU phase dispatches immediately afterward
+            // (`dispatch_copy_and_rms_norm`) is invariant to a uniform
+            // positive rescale of its whole input. So the two pairings
+            // collapsed to an IDENTICAL normalized hidden, and every row
+            // derived from it (K via `k_proj`, V via `v_proj`) came out
+            // identical too: `correct_ref_k == wrong_ref_k`, failing the
+            // test's own fixture-sanity assert before it could discriminate
+            // anything. Landing the hidden half on a DIFFERENT output index
+            // makes the two pairings differ in DIRECTION, not merely
+            // magnitude, which RMSNorm cannot erase.
+            let mut fc = vec![0.0f32; hidden * 2 * hidden];
+            for i in 0..hidden {
+                fc[i * (2 * hidden) + i] = 1.0; // embedding half -> output i
+            }
+            for j in 0..hidden {
+                let out_idx = (j + 1) % hidden;
+                fc[out_idx * (2 * hidden) + hidden + j] = 1.0; // hidden half -> output (j+1) mod hidden
+            }
+
+            // k_proj/v_proj shape: [kv_dim, hidden]; identity (scaled
+            // differently for K vs V) on the first `kv_dim` input dims.
+            let mut k_proj = vec![0.0f32; kv_dim * hidden];
+            let mut v_proj = vec![0.0f32; kv_dim * hidden];
+            for i in 0..kv_dim {
+                k_proj[i * hidden + i] = 1.0;
+                v_proj[i * hidden + i] = 2.0;
+            }
+
+            MetalMtpWeights {
+                fc: make_buffer_f16(device, &fc, "test.mtp.fc.nonzero_kv"),
+                pre_fc_norm_embedding: make_buffer(
+                    device,
+                    &vec![1.0; hidden],
+                    "test.mtp.pre_fc_norm_embedding",
+                ),
+                pre_fc_norm_hidden: make_buffer(
+                    device,
+                    &vec![1.0; hidden],
+                    "test.mtp.pre_fc_norm_hidden",
+                ),
+                layers: vec![MetalMtpLayerWeights {
+                    input_layernorm: make_buffer(device, &vec![1.0; hidden], "test.mtp.input_ln"),
+                    post_attention_layernorm: make_buffer(
+                        device,
+                        &vec![1.0; hidden],
+                        "test.mtp.post_attn_ln",
+                    ),
+                    q_proj: make_buffer_f16(
+                        device,
+                        &vec![0.0; 2 * q_dim * hidden],
+                        "test.mtp.q_proj",
+                    ),
+                    k_proj: make_buffer_f16(device, &k_proj, "test.mtp.k_proj.nonzero"),
+                    v_proj: make_buffer_f16(device, &v_proj, "test.mtp.v_proj.nonzero"),
+                    o_proj: make_buffer_f16(device, &vec![0.0; hidden * q_dim], "test.mtp.o_proj"),
+                    q_norm: make_buffer(device, &vec![1.0; cfg.head_dim], "test.mtp.q_norm"),
+                    k_norm: make_buffer(device, &vec![1.0; cfg.head_dim], "test.mtp.k_norm"),
+                    mlp: MetalMtpDenseMlpWeights {
+                        gate_proj: make_buffer_f16(
+                            device,
+                            &vec![0.0; inter * hidden],
+                            "test.mtp.gate_proj",
+                        ),
+                        up_proj: make_buffer_f16(
+                            device,
+                            &vec![0.0; inter * hidden],
+                            "test.mtp.up_proj",
+                        ),
+                        down_proj: make_buffer_f16(
+                            device,
+                            &vec![0.0; hidden * inter],
+                            "test.mtp.down_proj",
+                        ),
+                    },
+                }],
+                norm: make_buffer(device, &vec![1.0; hidden], "test.mtp.norm"),
+            }
+        }
+
+        fn metal_state_with_nonzero_kv_mtp_for_test(
+            weights: &ModelWeights,
+            cfg: &Qwen35Config,
+        ) -> MetalQwen35State {
+            let mut engine = MetalQwen35Engine::new(weights, cfg)
+                .expect("tiny MetalQwen35Engine with nonzero-KV MTP fixture constructs");
+            engine.mtp_weights = Some(synthetic_mtp_weights_with_nonzero_kv_for_test(
+                &engine.device,
+                cfg,
+            ));
+            let session = engine.new_session(16).expect("tiny MTP session constructs");
+            MetalQwen35State {
+                engine,
+                session,
+                lora: None,
+                use_gdn_chunked: true,
+                use_kv_f16: false,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled: false,
+                path_proof: PathProofCounters::default(),
+            }
+        }
+
         #[test]
         fn rollback_speculative_state_to_preserves_mtp_cursor_after_k1_reject() {
             let _gpu_guard = gpu_test_lock();
@@ -18968,6 +19119,245 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  {mtp_seq_len}, meaning the accepted draft's own row was never \
                  appended and the next round's `mtp_forward_one` will land one \
                  physical slot behind its RoPE position"
+            );
+        }
+
+        // lattice#1396: `full_accept_appends_mtp_cache_row_for_accepted_draft_token`
+        // (#1731) proves only that the appended row EXISTS (the cursor reaches
+        // `c0 + 2`) -- its fixture has all-zero MTP K/V projection weights, so
+        // the appended row's raw content is zero regardless of which hidden
+        // state was paired with the accepted token, and a wrong pairing would
+        // be silently invisible to that test. This test uses
+        // `synthetic_mtp_weights_with_nonzero_kv_for_test`, whose non-zero `fc`
+        // hidden half and non-zero K/V projections make the cache row's raw
+        // content actually depend on the paired hidden state, and reads that
+        // content back to compare against two independently-built reference
+        // rows built through the SAME `mtp_prefill_append` primitive the
+        // accept arm calls:
+        //   - the INTENDED pairing: the accepted token with the target's own
+        //     pre-final hidden state that predicted it (`pending_token`'s own
+        //     pre-final hidden, i.e. `verify_out.first_pre_final_hidden`),
+        //     derived independently via a fresh `forward_step_inner` call
+        //     (the same technique
+        //     `generate_greedy_mtp_restores_correct_hidden_after_k1_reject`
+        //     uses for its reference hidden);
+        //   - a PLAUSIBLE WRONG pairing: the accepted token with
+        //     `self.session.last_pre_final_hidden`'s value as it actually
+        //     reads right after `verify_tokens_batched` returns -- this is
+        //     NOT a hardcoded/arbitrary value. `verify_tokens_batched`'s
+        //     per-token loop (this file, `fn verify_tokens_batched`) calls
+        //     `forward_step_inner(_, _, true, _)` once per verify token, and
+        //     that function (both branches, ~6664 and ~6862 in this file)
+        //     unconditionally writes `self.session.last_pre_final_hidden =
+        //     h.clone()` on every call -- so after the loop's *second*
+        //     iteration (the draft token), `last_pre_final_hidden` holds the
+        //     draft token's own pre-final hidden, overwriting the value the
+        //     first iteration (`pending_token`) produced. A wrong-pairing
+        //     change that substitutes `self.session.last_pre_final_hidden`
+        //     for `verify_out.first_pre_final_hidden` at the accept-arm's
+        //     `mtp_prefill_append` call therefore pairs the accepted token
+        //     with the draft token's *own* re-verified hidden state instead
+        //     of the pending token's.
+        //
+        //     An earlier version of this test forced `pending_token == 0`,
+        //     which (via this fixture's residue-class argmax construction,
+        //     see `full_accept_appends_mtp_cache_row_for_accepted_draft_token`)
+        //     makes the accepted draft token ALSO equal 0 -- the same token
+        //     id twice. Since this fixture's target attention/FFN are all
+        //     zero (`tiny_metal_qwen35_fixture`), a token's pre-final hidden
+        //     equals its own raw embedding independent of position, so
+        //     verifying token 0 at position 0 and token 0 again at position 1
+        //     produce BIT-IDENTICAL hidden states: `first_pre_final_hidden`
+        //     and the post-loop `last_pre_final_hidden` were provably equal
+        //     on that construction, making the wrong-pairing mutation an
+        //     unobservable no-op purely as an artifact of pending_token ==
+        //     draft.token_id, not because the bug class is unreal. Forcing
+        //     `pending_token = 1` instead breaks that coincidence: token 1
+        //     is in residue class 1 (`tiny_metal_qwen35_fixture`'s
+        //     `token % 3 == 1` branch), whose embedding is the all-zero
+        //     vector, so the target's tied-lm-head logits tie at zero across
+        //     the whole vocabulary and first-wins argmax resolves to token 0
+        //     -- the same token the MTP draft head resolves to via the
+        //     identical zero-input/first-wins mechanism (`fc`'s embedding
+        //     half is an identity copy per `synthetic_mtp_weights_for_test`'s
+        //     doc comment, and this fixture's own draft-side attention/FFN
+        //     are likewise all zero) -- still a deterministic K=1 full
+        //     accept, but now `pending_token` (1, embedding all-zero) and
+        //     `draft.token_id` (0, embedding one-hot at dim 0) are genuinely
+        //     different tokens with genuinely different embeddings, so their
+        //     pre-final hidden states differ and the wrong pairing is
+        //     observable.
+        #[test]
+        fn full_accept_mtp_cache_row_pairs_accepted_token_with_target_hidden() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            use crate::generation::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let kv_dim = cfg.full_kv_dim();
+
+            // Independently derive the target's real pre-final hidden after
+            // processing `pending_token` (1) alone -- the value
+            // `verify_out.first_pre_final_hidden` must equal per #1731's
+            // pairing contract -- independent of the production round below.
+            let mut h0_state = metal_state_with_nonzero_kv_mtp_for_test(&weights, &cfg);
+            let _ =
+                h0_state.forward_step_inner(1, 0, true, crate::forward::signpost::Scope::NotDecode);
+            let h0 = h0_state.session.last_pre_final_hidden.clone();
+            assert!(
+                !h0.is_empty(),
+                "reference forward_step_inner must capture a hidden state"
+            );
+
+            // Independently derive the SAME value
+            // `self.session.last_pre_final_hidden` actually holds right after
+            // `verify_tokens_batched` returns in the production round below:
+            // the accepted draft token's (0) own pre-final hidden, from
+            // `verify_tokens_batched`'s loop's second (and last) iteration --
+            // see the doc comment above for why this, not an arbitrary or
+            // hardcoded value, is the plausible wrong pairing a real mutation
+            // produces.
+            let mut wrong_state = metal_state_with_nonzero_kv_mtp_for_test(&weights, &cfg);
+            let _ = wrong_state.forward_step_inner(
+                0,
+                0,
+                true,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            let wrong_hidden = wrong_state.session.last_pre_final_hidden.clone();
+            assert_ne!(
+                h0, wrong_hidden,
+                "test setup requires the correct and wrong hidden states to \
+                 differ, otherwise this test cannot distinguish a correct \
+                 pairing from a wrong one"
+            );
+
+            fn read_row(buf: &Buffer, row: usize, row_len: usize) -> Vec<f32> {
+                // SAFETY: `MetalMtpCache`'s `k_buf`/`v_buf` are
+                // StorageModeShared f32 buffers (`make_zero_buffer`), written
+                // by command buffers that have already completed by the time
+                // the dispatching call (`mtp_prefill_append`/
+                // `generate_greedy_mtp`) returns.
+                unsafe {
+                    let ptr = (buf.contents() as *const f32).add(row * row_len);
+                    std::slice::from_raw_parts(ptr, row_len).to_vec()
+                }
+            }
+
+            // Reference row: append the INTENDED (accepted-token,
+            // correct-hidden) pair directly via the same primitive the accept
+            // arm calls, on a fresh state with identical weights. Position 1
+            // matches `pos + 1` for a round-1 accept (`pos == 0`); a fresh
+            // cache's first append lands at row index 0 regardless of the
+            // RoPE `position` argument (`mtp_prefill`'s own convention: the
+            // row index tracks the cache cursor, the `position` argument only
+            // feeds RoPE), which is why this reads row 0 here but row 1 from
+            // the production state below.
+            let mut correct_ref_state = metal_state_with_nonzero_kv_mtp_for_test(&weights, &cfg);
+            correct_ref_state.mtp_prefill_append(0, &h0, 1);
+            let correct_ref_k = read_row(
+                &correct_ref_state.session.mtp.as_ref().unwrap().cache.k_buf,
+                0,
+                kv_dim,
+            );
+            let correct_ref_v = read_row(
+                &correct_ref_state.session.mtp.as_ref().unwrap().cache.v_buf,
+                0,
+                kv_dim,
+            );
+
+            // Reference row: the same accepted token paired with the WRONG
+            // hidden.
+            let mut wrong_ref_state = metal_state_with_nonzero_kv_mtp_for_test(&weights, &cfg);
+            wrong_ref_state.mtp_prefill_append(0, &wrong_hidden, 1);
+            let wrong_ref_k = read_row(
+                &wrong_ref_state.session.mtp.as_ref().unwrap().cache.k_buf,
+                0,
+                kv_dim,
+            );
+            let wrong_ref_v = read_row(
+                &wrong_ref_state.session.mtp.as_ref().unwrap().cache.v_buf,
+                0,
+                kv_dim,
+            );
+            assert!(
+                correct_ref_k != wrong_ref_k || correct_ref_v != wrong_ref_v,
+                "test setup requires the two hidden states to actually produce \
+                 different cache content through this fixture's non-zero K/V \
+                 weights; got identical K={correct_ref_k:?} V={correct_ref_v:?} \
+                 for both pairings"
+            );
+
+            // Now drive the real production round.
+            let mut state = metal_state_with_nonzero_kv_mtp_for_test(&weights, &cfg);
+            let gen_cfg = GenerateConfig {
+                min_p: 0.0,
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(true),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+            let mut prefill_logits = vec![-1.0f32; cfg.vocab_size];
+            prefill_logits[1] = 100.0;
+
+            let out = state.generate_greedy_mtp(&prefill_logits, 0, &tokenizer, &gen_cfg);
+            assert!(
+                !out.stopped,
+                "test assumes round 1 does not hit EOS; got {out:?}"
+            );
+            assert_eq!(
+                state.session.kv_cache.seq_len, 2,
+                "test setup assumption violated: expected round 1 to accept the \
+                 MTP draft (token 0), matching the target's own prediction for \
+                 pending token 1 -- pending token 1's embedding is the \
+                 all-zero vector (residue class 1), so the target's tied-head \
+                 logits tie at zero across the whole vocabulary and \
+                 first-wins argmax resolves to token 0, the same token the \
+                 zero-input MTP draft head resolves to; got {}",
+                state.session.kv_cache.seq_len
+            );
+            let mtp_seq_len = state.session.mtp.as_ref().unwrap().cache.seq_len;
+            assert_eq!(
+                mtp_seq_len, 2,
+                "full accept must append a second MTP cache row; got {mtp_seq_len}"
+            );
+
+            let actual_k = read_row(&state.session.mtp.as_ref().unwrap().cache.k_buf, 1, kv_dim);
+            let actual_v = read_row(&state.session.mtp.as_ref().unwrap().cache.v_buf, 1, kv_dim);
+
+            assert_eq!(
+                actual_k, correct_ref_k,
+                "appended row's K content must match the intended \
+                 (accepted-token, preceding-target-hidden) pairing; a wrong \
+                 hidden state was paired instead"
+            );
+            assert_eq!(
+                actual_v, correct_ref_v,
+                "appended row's V content must match the intended \
+                 (accepted-token, preceding-target-hidden) pairing; a wrong \
+                 hidden state was paired instead"
+            );
+            assert_ne!(
+                actual_k, wrong_ref_k,
+                "appended row's K content coincidentally matches the plausible \
+                 WRONG pairing (accepted token 0 + its own re-verified hidden \
+                 state, the value `self.session.last_pre_final_hidden` holds \
+                 after `verify_tokens_batched`'s second loop iteration) -- \
+                 this pairing test cannot distinguish correct from wrong \
+                 content for this fixture"
             );
         }
 
