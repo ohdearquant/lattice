@@ -376,6 +376,21 @@ mod inner {
             hidden_input: &[f32],
             seq_len: usize,
         ) -> Result<Vec<f32>, String> {
+            objc::rc::autoreleasepool(|| self.forward_dispatch(hidden_input, seq_len))
+        }
+
+        // lattice#1630: same autorelease contract as the Qwen3.5 engine's dispatch paths
+        // (lattice#1584) — `new_command_buffer` returns a borrowed reference to an
+        // autoreleased, unretained object that survives until the calling thread's
+        // outermost pool drains. `forward` above pools the single command buffer this
+        // dispatch creates for the whole 28-layer pass; the readback below copies the
+        // result into an owned `Vec<f32>` before the pool closes, so nothing Metal-owned
+        // escapes it.
+        fn forward_dispatch(
+            &mut self,
+            hidden_input: &[f32],
+            seq_len: usize,
+        ) -> Result<Vec<f32>, String> {
             let hidden = self.config.hidden_size;
             if seq_len == 0 || seq_len > self.config.max_seq_len {
                 return Err(format!(
