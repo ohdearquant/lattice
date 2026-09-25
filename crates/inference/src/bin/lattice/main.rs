@@ -273,7 +273,7 @@ async fn main() {
                     match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(
                         model_path,
                     ) {
-                        Ok(m) => serve::ModelBackend::Cpu(Arc::new(m)),
+                        Ok(m) => cpu_serving_backend(m),
                         Err(e) => {
                             eprintln!("Error: failed to load model: {e}");
                             std::process::exit(1);
@@ -555,6 +555,53 @@ async fn main() {
                 std::process::exit(1);
             }
         },
+    }
+}
+
+fn cpu_serving_backend(
+    mut model: lattice_inference::model::qwen35::Qwen35Model,
+) -> serve::ModelBackend {
+    model.ensure_tokenizer_max_seq_len(model.max_context());
+    serve::ModelBackend::Cpu(std::sync::Arc::new(model))
+}
+
+#[cfg(test)]
+mod cpu_serve_prompt_tests {
+    #[cfg(feature = "test-utils")]
+    use super::*;
+    #[cfg(feature = "test-utils")]
+    use lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context;
+    #[cfg(feature = "test-utils")]
+    use lattice_inference::{GenerateConfig, Tokenizer};
+
+    #[test]
+    fn cpu_serve_load_keeps_tokenizer_initialization() {
+        // The server's non-returning main cannot be called by a unit test.
+        // Keep its load wired to the initialization exercised below.
+        let startup = include_str!("main.rs")
+            .split("fn cpu_serving_backend(")
+            .next()
+            .unwrap();
+        assert!(startup.contains("Ok(m) => cpu_serving_backend(m),"));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn serving_model_keeps_long_prompts_after_generation_tokenization() {
+        let model = tiny_zero_model_with_context(8192);
+        assert_eq!(model.tokenizer().max_seq_len(), 4096);
+        let backend = cpu_serving_backend(model);
+        let serve::ModelBackend::Cpu(model) = backend else {
+            panic!("expected CPU serving backend");
+        };
+        let mut cfg = GenerateConfig::default();
+        cfg.max_new_tokens = 0;
+        for n in [4097, model.max_context()] {
+            let prompt = "a".repeat(n);
+            assert_eq!(model.tokenizer().tokenize(&prompt).real_length, n);
+            let output = model.generate(&prompt, &cfg).unwrap();
+            assert_eq!(output.prompt_tokens, n);
+        }
     }
 }
 

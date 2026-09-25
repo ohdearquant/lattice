@@ -5,6 +5,29 @@ use super::*;
 use crate::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID;
 
 #[test]
+fn tokenizer_cap_preserves_long_prompts_and_only_grows() {
+    use crate::Tokenizer;
+
+    let mut model = super::test_support::tiny_zero_model_with_context(8192);
+    let prompt = "a".repeat(4097);
+    assert_eq!(model.tokenizer().max_seq_len(), 4096);
+    assert_eq!(model.tokenizer().tokenize(&prompt).real_length, 4096);
+
+    model.ensure_tokenizer_max_seq_len(model.max_context());
+    assert_eq!(model.tokenizer().tokenize(&prompt).real_length, 4097);
+    for requested in [8192, 4096, 0] {
+        model.ensure_tokenizer_max_seq_len(requested);
+        for n in [4097, model.max_context()] {
+            let prompt = "a".repeat(n);
+            let input = model.tokenizer().tokenize(&prompt);
+            assert_eq!(input.real_length, n);
+            assert_eq!(&input.input_ids[..input.real_length], vec![1; n]);
+        }
+        assert_eq!(model.tokenizer().max_seq_len(), 8192);
+    }
+}
+
+#[test]
 fn test_partial_rope_only_rotates_first_quarter() {
     // Build a RoPE table for rope_dim=64 (head_dim=256, partial_rotary_factor=0.25)
     let rope_dim = 64;
