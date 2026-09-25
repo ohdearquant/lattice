@@ -4,8 +4,9 @@
 //! Wraps the work `MetalQwen35State::generate` (the direct entry) and
 //! `MetalQwen35State::generate_streaming_with_cancel` (the streaming entry)
 //! each did in their own decode loop. The streaming entry runs its requests
-//! through this session and [`run_streaming`]; the direct entry still runs
-//! its own loop, so the direct profile is constructed only by tests.
+//! through this session and [`run_streaming`]; the direct entry runs its
+//! ordinary requests through it and [`run_direct`], and keeps its MTP and
+//! GDN-first self-speculative routes, which this session refuses.
 //!
 //! **Owned state.** The session borrows the caller's `MetalQwen35State`
 //! mutably for its whole life, so the GPU caches, scratch and the compact
@@ -55,10 +56,6 @@
 //! auto-trait implementation. A compile-time control in the test module pins
 //! that.
 
-// Only this module's tests construct the direct profile; the direct entry is
-// routed through the session separately.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::driver;
 use super::qwen_cpu::has_finite_logit;
 use super::{
@@ -73,13 +70,14 @@ use crate::forward::metal_qwen35::{
     sample_from_candidates, sample_token, self_spec_route_active,
 };
 use crate::generation::{GenerateConfig, GenerateOutput};
+use crate::model::qwen35::stop_strings::earliest_stop_match;
 use crate::model::qwen35::{
     GenerationPlan, check_logprobs_not_set, check_reasoning_budget_not_set,
 };
 use crate::sampling::compute_step_logprobs;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
-use crate::tokenizer::detokenize::IncrementalDetokenizer;
+use crate::tokenizer::detokenize::{IncrementalDetokenizer, decode_tokens};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 
@@ -257,7 +255,9 @@ impl<'state> QwenMetalSession<'state> {
         )
     }
 
-    fn with_route_environment(
+    /// [`Self::new`] with the route environment the caller already read, so a
+    /// caller that planned the route to choose this session plans the same one.
+    pub(crate) fn with_route_environment(
         state: &'state mut MetalQwen35State,
         plan: GenerationPlan,
         gen_cfg: &GenerateConfig,
@@ -320,6 +320,7 @@ impl<'state> QwenMetalSession<'state> {
     }
 
     /// The readback mode fixed at construction.
+    #[cfg(test)]
     pub(crate) fn mode(&self) -> ReadbackMode {
         self.mode
     }
@@ -526,8 +527,8 @@ impl DecoderSession for QwenMetalSession<'_> {
     }
 }
 
-/// The error the streaming entry returns when the grammar blocks every token
-/// before the first one is emitted.
+/// The error both entries return when the grammar blocks every token before
+/// the first one is emitted.
 const STEP_ZERO_GRAMMAR_BLOCKED: &str = "grammar constraint blocked every token at step 0; \
      no legal first token exists in the current grammar state";
 
@@ -644,6 +645,99 @@ pub(crate) fn run_streaming(
         token_ids: result.generated_ids,
         stopped,
         stop_reason: Some(stop_reason),
+        token_logprobs: result.token_logprobs,
+    })
+}
+
+/// Runs one `MetalQwen35State::generate` request through [`driver::run`] over
+/// `session` and returns that entry's output.
+///
+/// **Stop strings** use the driver's non-streaming full-scan mode, the mode the
+/// CPU direct entry runs them in: each decoded delta is appended to the text and
+/// scanned from the earliest byte a new match could start at, and a match
+/// truncates the text and stops the request with `StopReason::Eos`. That is the
+/// text the entry's own matcher accumulated. The natural-end flush then appends
+/// the bytes the detokenizer held back and scans the whole text once more, as
+/// the matcher's `finish` did: a stop string those bytes complete truncates the
+/// text and leaves the stop disposition as the loop reported it. With no stop
+/// strings the text is decoded from the generated ids in one pass.
+///
+/// Two parts of the entry's contract differ from what the driver reports, and
+/// this function keeps the entry's:
+///
+/// 1. A sampled token the grammar rejects ends the request with
+///    `stopped: false` and `StopReason::Grammar`; the driver reports
+///    `stopped: true`. A rejection is the one grammar stop that leaves the last
+///    opened prediction unpushed, so it is read from the trace.
+/// 2. A grammar that blocks every token before the first one is emitted keeps
+///    the entry's step-0 message.
+pub(crate) fn run_direct(
+    session: &mut dyn DecoderSession,
+    gen_cfg: &GenerateConfig,
+    prompt_ids: &[u32],
+    eos_token_id: u32,
+    tokenizer: &BpeTokenizer,
+) -> Result<GenerateOutput, InferenceError> {
+    let scan_stop_strings = !gen_cfg.stop_strings.is_empty();
+    let mut detok = IncrementalDetokenizer::new();
+    let pushed = Cell::new(0usize);
+    let mut text = String::new();
+    let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
+    let never_cancel = || false;
+
+    let result = driver::run(
+        session,
+        gen_cfg,
+        None,
+        prompt_ids,
+        eos_token_id,
+        false,
+        &never_cancel,
+        |generated_len| pushed.set(generated_len),
+        |next_id| {
+            if scan_stop_strings {
+                detok.push(tokenizer, next_id)
+            } else {
+                String::new()
+            }
+        },
+        &mut text,
+        &mut token_logprob_end_offsets,
+        |_, _| true,
+        || {},
+        String::new,
+    );
+    let result = match result {
+        Err(InferenceError::GrammarConstraintBlocked(_)) if pushed.get() == 0 => {
+            return Err(InferenceError::GrammarConstraintBlocked(
+                STEP_ZERO_GRAMMAR_BLOCKED.into(),
+            ));
+        }
+        other => other?,
+    };
+
+    let text = if scan_stop_strings {
+        if !result.confirmed_stop_string_match {
+            let tail = detok.finish();
+            text.push_str(&tail);
+            if let Some(hit) = earliest_stop_match(&text, &gen_cfg.stop_strings) {
+                text.truncate(hit);
+            }
+        }
+        text
+    } else {
+        decode_tokens(tokenizer, &result.generated_ids)
+    };
+
+    let grammar_rejection = result.stop_reason == StopReason::Grammar
+        && result.trace.opened == result.generated_ids.len() + 1;
+    Ok(GenerateOutput {
+        text,
+        prompt_tokens: prompt_ids.len(),
+        generated_tokens: result.generated_ids.len(),
+        token_ids: result.generated_ids,
+        stopped: result.stopped && !grammar_rejection,
+        stop_reason: Some(result.stop_reason),
         token_logprobs: result.token_logprobs,
     })
 }
@@ -1561,415 +1655,146 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Real-checkpoint parity: the session driven by `driver::run` against
-    // the direct entry's own loop, on the same state. The streaming entry
-    // itself runs through this session, so a streaming comparison here would
-    // compare the driver with itself; the Metal generation golden replay pins
-    // that entry instead. Runs only when the Metal generation golden
-    // checkpoint is configured; skips otherwise unless the golden enforce
-    // switch is on.
+    // `run_direct` over a scripted session (no Metal device): the direct
+    // entry's stop-string text and disposition, and the two places its
+    // contract differs from what the driver reports on its own.
     // -----------------------------------------------------------------
 
-    const MODEL_DIR_VAR: &str = "LATTICE_METAL_GENERATION_MODEL_DIR";
-    const ENFORCE_VAR: &str = "LATTICE_METAL_GENERATION_GOLDEN_ENFORCE";
-    const SKIP_MARKER: &str = "LATTICE_METAL_GENERATION_GOLDEN_SKIPPED";
-    const PARITY_CACHE_LEN: usize = 2048;
-    const PLAIN_PROMPT: &str = "The capital of France is";
-    const GRAMMAR_PROMPT: &str = "<|im_start|>user\nReply with a JSON object whose key \"answer\" holds the number 42.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
-    const GRAMMAR_SCHEMA: &str =
-        r#"{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"]}"#;
-
-    /// Environment switches that select a decode route, pinned for the whole
-    /// parity run so an ambient value cannot move a case onto another route.
-    const ROUTE_SWITCHES: &[(&str, &str)] = &[
-        ("LATTICE_METAL_PATH_PROOF", "1"),
-        ("LATTICE_COMPACT_TOPK", "0"),
-        ("LATTICE_COMPACT_TOPK_SELECT", "0"),
-        ("LATTICE_COMPACT_TOPP_APPROX", "0"),
-        ("LATTICE_SELF_SPEC", "0"),
-        ("LATTICE_MTP", "0"),
-    ];
-
-    static ROUTE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Pins [`ROUTE_SWITCHES`] and restores the prior values on drop. Writers
-    /// are serialized by `ROUTE_ENV_LOCK`, held for the guard's life.
-    struct RouteEnvironment {
-        prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl RouteEnvironment {
-        fn pin() -> Self {
-            let lock = ROUTE_ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let prior = ROUTE_SWITCHES
-                .iter()
-                .map(|(name, _)| (*name, std::env::var_os(name)))
-                .collect();
-            for (name, value) in ROUTE_SWITCHES {
-                // SAFETY: writers are serialized by ROUTE_ENV_LOCK, held by the guard.
-                unsafe { std::env::set_var(name, value) };
-            }
-            Self { prior, _lock: lock }
-        }
-
-        fn set_compact(&self, on: bool) {
-            // SAFETY: writers are serialized by ROUTE_ENV_LOCK, held by `self`.
-            unsafe { std::env::set_var("LATTICE_COMPACT_TOPK", if on { "1" } else { "0" }) };
-        }
-    }
-
-    impl Drop for RouteEnvironment {
-        fn drop(&mut self) {
-            for (name, value) in &self.prior {
-                // SAFETY: writers are serialized by ROUTE_ENV_LOCK, still held here.
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(name, value),
-                        None => std::env::remove_var(name),
-                    }
-                }
-            }
-        }
-    }
-
-    /// Returns the checkpoint directory, or `None` after printing the skip
-    /// marker. A missing checkpoint under the enforce switch, and a relative
-    /// path always, fail the test.
-    fn parity_checkpoint(test: &str) -> Option<std::path::PathBuf> {
-        let enforce = crate::env_switch_enabled(ENFORCE_VAR);
-        let skip = |reason: String| {
-            assert!(!enforce, "{reason}, and {ENFORCE_VAR} is enabled");
-            eprintln!("{SKIP_MARKER} test={test} reason={reason}");
-            None
+    /// Runs `script` through `run_direct` with the direct entry's capabilities.
+    fn direct_script(
+        script: Vec<u32>,
+        gen_cfg: &GenerateConfig,
+    ) -> Result<GenerateOutput, InferenceError> {
+        let mut session = ScriptedSession {
+            caps: DIRECT_CAPABILITIES,
+            ledger: PredictionLedger::new(),
+            script,
+            selects: 0,
         };
-        let Some(raw) = std::env::var_os(MODEL_DIR_VAR) else {
-            return skip(format!("{MODEL_DIR_VAR} is unset"));
-        };
-        let path = std::path::PathBuf::from(&raw);
-        assert!(
-            path.is_absolute(),
-            "{MODEL_DIR_VAR}={raw:?} is relative; cargo test runs test binaries with the crate \
-             directory as CWD. Pass an absolute path."
-        );
-        if !path.exists() {
-            return skip(format!("{MODEL_DIR_VAR}={raw:?} does not exist"));
-        }
-        if metal::Device::system_default().is_none() {
-            return skip("no Metal device".to_string());
-        }
-        Some(path)
+        run_direct(
+            &mut session,
+            gen_cfg,
+            &[0],
+            SCRIPTED_EOS,
+            &scripted_tokenizer(),
+        )
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum ExpectedMode {
-        Dense,
-        Compact,
-        GreedyArgmax,
-    }
-
-    struct ParityCase {
-        name: &'static str,
-        prompt: &'static str,
-        compact_env: bool,
-        /// `(temperature, top_k, top_p, seed)`.
-        sampler: (f32, usize, f32, u64),
-        max_new_tokens: usize,
-        stop_strings: &'static [&'static str],
-        grammar: bool,
-        mode: ExpectedMode,
-    }
-
-    const GREEDY: (f32, usize, f32, u64) = (0.0, 1, 1.0, 1);
-    const SAMPLED_DENSE: (f32, usize, f32, u64) = (0.8, 40, 0.9, 0x5EED_0001);
-    const SAMPLED_BLOCK_TOPK: (f32, usize, f32, u64) = (0.8, 40, 1.0, 0x5EED_0002);
-
-    const BASE_CASE: ParityCase = ParityCase {
-        name: "",
-        prompt: PLAIN_PROMPT,
-        compact_env: false,
-        sampler: GREEDY,
-        max_new_tokens: 16,
-        stop_strings: &[],
-        grammar: false,
-        mode: ExpectedMode::Dense,
-    };
-
-    const PARITY_CASES: &[ParityCase] = &[
-        ParityCase {
-            name: "direct_greedy_argmax",
-            mode: ExpectedMode::GreedyArgmax,
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "direct_greedy_compact",
-            compact_env: true,
-            mode: ExpectedMode::Compact,
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "direct_sampled_dense",
-            sampler: SAMPLED_DENSE,
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "direct_sampled_compact",
-            compact_env: true,
-            sampler: SAMPLED_BLOCK_TOPK,
-            mode: ExpectedMode::Compact,
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "direct_grammar",
-            prompt: GRAMMAR_PROMPT,
-            compact_env: true,
-            max_new_tokens: 48,
-            grammar: true,
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "direct_stop_string",
-            max_new_tokens: 48,
-            stop_strings: &[".\n"],
-            mode: ExpectedMode::GreedyArgmax,
-            ..BASE_CASE
-        },
-    ];
-
-    fn parity_config(
-        case: &ParityCase,
-        grammar: &std::sync::Arc<crate::grammar::GrammarEngine>,
-    ) -> GenerateConfig {
-        let (temperature, top_k, top_p, seed) = case.sampler;
+    fn with_stop_strings(max_new_tokens: usize, stop_strings: &[&str]) -> GenerateConfig {
         GenerateConfig {
-            max_new_tokens: case.max_new_tokens,
-            temperature,
-            top_k,
-            top_p,
-            seed: Some(seed),
-            min_p: 0.0,
-            repetition_penalty: 1.0,
-            enable_mtp: Some(false),
-            grammar: case.grammar.then(|| std::sync::Arc::clone(grammar)),
-            stop_strings: case.stop_strings.iter().map(|s| (*s).to_string()).collect(),
+            max_new_tokens,
+            stop_strings: stop_strings.iter().map(|s| (*s).to_string()).collect(),
             ..Default::default()
         }
     }
 
-    /// What both paths are compared on: the id stream, the stop disposition,
-    /// the logprob ids, and the readback counters the path proof recorded.
-    #[derive(Debug, PartialEq)]
-    struct ParityRecord {
-        token_ids: Vec<u32>,
-        stop_reason: StopReason,
-        stopped: bool,
-        logprob_ids: Vec<u32>,
-        top_logprob_ids: Vec<Vec<u32>>,
-        logit_readback: String,
-        hidden_readback: String,
-    }
-
-    fn parity_record(
-        state: &MetalQwen35State,
-        token_ids: Vec<u32>,
-        stop_reason: StopReason,
-        stopped: bool,
-        token_logprobs: &[crate::generation::TokenLogprob],
-    ) -> ParityRecord {
-        ParityRecord {
-            token_ids,
-            stop_reason,
-            stopped,
-            logprob_ids: token_logprobs.iter().map(|t| t.token_id).collect(),
-            top_logprob_ids: token_logprobs
-                .iter()
-                .map(|t| t.top.iter().map(|alt| alt.token_id).collect())
-                .collect(),
-            logit_readback: format!("{:?}", state.logit_readback_path_proof_snapshot()),
-            hidden_readback: format!("{:?}", state.hidden_readback_path_proof_snapshot()),
-        }
-    }
-
-    fn run_legacy(
-        state: &mut MetalQwen35State,
-        tokenizer: &crate::tokenizer::bpe::BpeTokenizer,
-        case: &ParityCase,
-        gen_cfg: &GenerateConfig,
-    ) -> ParityRecord {
-        state.reset_path_proof_counters();
-        let output = state
-            .generate(case.prompt, tokenizer, gen_cfg)
-            .unwrap_or_else(|error| panic!("{}: legacy entry failed: {error}", case.name));
-        let stop_reason = output
-            .stop_reason
-            .unwrap_or_else(|| panic!("{}: legacy entry reported no stop reason", case.name));
-        parity_record(
-            state,
-            output.token_ids,
-            stop_reason,
-            output.stopped,
-            &output.token_logprobs,
-        )
-    }
-
-    fn run_session(
-        state: &mut MetalQwen35State,
-        tokenizer: &crate::tokenizer::bpe::BpeTokenizer,
-        case: &ParityCase,
-        gen_cfg: &GenerateConfig,
-    ) -> ParityRecord {
-        use crate::model::qwen35::{
-            GenerationEntryContract, GenerationPreparation, prepare_generation,
-            resolve_reasoning_close_token,
-        };
-        use crate::tokenizer::detokenize::IncrementalDetokenizer;
-
-        state.reset_path_proof_counters();
-        let vocab_size = state.engine.config.vocab_size;
-        let eos_token_id = state.engine.config.eos_token_id;
-        let plan = match prepare_generation(
-            tokenizer,
-            case.prompt,
-            gen_cfg,
-            vocab_size,
-            state.max_context(),
-            GenerationEntryContract::MetalDirect,
-        )
-        .unwrap_or_else(|error| panic!("{}: preparation failed: {error}", case.name))
-        {
-            GenerationPreparation::Ready(plan) => plan,
-            GenerationPreparation::Complete(_) => {
-                panic!("{}: preparation completed without decoding", case.name)
-            }
-        };
-        let prompt_ids = plan.prompt_ids.clone();
-        let think_close_id = resolve_reasoning_close_token(
-            tokenizer,
-            gen_cfg.reasoning_budget,
-            gen_cfg.enable_thinking,
-            vocab_size,
-        )
-        .unwrap_or_else(|error| panic!("{}: reasoning close token: {error}", case.name));
-
-        let cancel = || false;
-        let detok = std::cell::RefCell::new(IncrementalDetokenizer::new());
-        let mut text = String::new();
-        let mut offsets = Vec::new();
-
-        let mut session = QwenMetalSession::new(state, plan, gen_cfg, MetalEntryProfile::Direct)
-            .unwrap_or_else(|error| panic!("{}: session construction failed: {error}", case.name));
-        let mode = session.mode();
-        let result = driver::run(
-            &mut session,
-            gen_cfg,
-            think_close_id,
-            &prompt_ids,
-            eos_token_id,
-            false,
-            &cancel,
-            |_| {},
-            |id| detok.borrow_mut().push(tokenizer, id),
-            &mut text,
-            &mut offsets,
-            |_, _| true,
-            || {},
-            || detok.borrow_mut().finish(),
-        )
-        .unwrap_or_else(|error| panic!("{}: driver failed: {error}", case.name));
-        drop(session);
-
-        let observed = match mode {
-            ReadbackMode::Dense => ExpectedMode::Dense,
-            ReadbackMode::Compact { .. } => ExpectedMode::Compact,
-            ReadbackMode::GreedyArgmax => ExpectedMode::GreedyArgmax,
-        };
-        assert_eq!(observed, case.mode, "{}: readback mode", case.name);
-        assert_eq!(
-            state.session.compact_topk, 0,
-            "{}: route torn down",
-            case.name
-        );
-        parity_record(
-            state,
-            result.generated_ids,
-            result.stop_reason,
-            result.stopped,
-            &result.token_logprobs,
-        )
-    }
-
+    /// "ax" is completed only by the second token of the pair, so the match
+    /// needs the text of both: the request stops on that token with
+    /// `StopReason::Eos`, keeps it in `token_ids`, and returns the text before
+    /// the match.
     #[test]
-    fn decoder_session_matches_the_legacy_metal_entries_on_a_real_checkpoint() {
-        use crate::model_format::{ModelFormat, detect_format};
+    fn direct_stop_string_spanning_two_tokens_stops_and_truncates() {
+        let output = direct_script(vec![2, 0, 2, 0], &with_stop_strings(8, &["ax"]))
+            .expect("a stop string is not an error");
+        assert_eq!(output.token_ids, vec![2, 0, 2]);
+        assert_eq!(output.text, "x");
+        assert!(output.stopped);
+        assert_eq!(output.stop_reason, Some(StopReason::Eos));
 
-        let test = "decoder_session_matches_the_legacy_metal_entries_on_a_real_checkpoint";
-        let Some(model_dir) = parity_checkpoint(test) else {
-            return;
+        // Control: without the stop string the same script runs to its cap.
+        let control = direct_script(vec![2, 0, 2, 0], &with_stop_strings(4, &[]))
+            .expect("an unconstrained script runs to its cap");
+        assert_eq!(control.text, "xaxa");
+        assert_eq!(control.stop_reason, Some(StopReason::Length));
+    }
+
+    /// The last token's lone 0xE4 byte is released only by the natural-end
+    /// flush, as U+FFFD. A stop string that byte completes truncates the text
+    /// but leaves the disposition the loop reported: `StopReason::Length` and
+    /// `stopped: false`, as the entry's own matcher left them.
+    #[test]
+    fn direct_stop_string_completed_by_the_final_flush_truncates_and_keeps_the_disposition() {
+        let output = direct_script(vec![0, 1], &with_stop_strings(2, &["\u{fffd}"]))
+            .expect("a stop string is not an error");
+        assert_eq!(output.token_ids, vec![0, 1]);
+        assert_eq!(output.text, "a");
+        assert!(!output.stopped);
+        assert_eq!(output.stop_reason, Some(StopReason::Length));
+
+        // Control: without the stop string the flushed byte stays in the text.
+        let control = direct_script(vec![0, 1], &with_stop_strings(2, &[]))
+            .expect("an unconstrained script runs to its cap");
+        assert_eq!(control.text, "a\u{fffd}");
+    }
+
+    /// A stop string that never occurs leaves the text, the ids and the
+    /// disposition exactly as a request without stop strings reports them.
+    #[test]
+    fn direct_stop_string_never_completed_changes_nothing() {
+        let output = direct_script(vec![0, 2, 1], &with_stop_strings(3, &["zz"]))
+            .expect("a stop string is not an error");
+        let control = direct_script(vec![0, 2, 1], &with_stop_strings(3, &[]))
+            .expect("an unconstrained script runs to its cap");
+        assert_eq!(output.text, "ax\u{fffd}");
+        assert_eq!(output.token_ids, control.token_ids);
+        assert_eq!(output.text, control.text);
+        assert_eq!(output.stopped, control.stopped);
+        assert_eq!(output.stop_reason, Some(StopReason::Length));
+        assert_eq!(output.stop_reason, control.stop_reason);
+    }
+
+    /// A token the grammar rejects ends the request with `StopReason::Grammar`
+    /// and `stopped: false`; a grammar the emitted tokens complete reports
+    /// `stopped: true` (control).
+    #[test]
+    fn direct_grammar_rejection_reports_not_stopped() {
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            grammar: Some(scripted_grammar("root ::= \"x\" \"x\"\n", b"b")),
+            ..Default::default()
         };
-        let _gpu = gpu_test_lock();
-        let env = RouteEnvironment::pin();
+        let rejected = direct_script(vec![2, 0], &gen_cfg).expect("a rejection is not an error");
+        assert_eq!(rejected.token_ids, vec![2]);
+        assert_eq!(rejected.text, "x");
+        assert_eq!(rejected.stop_reason, Some(StopReason::Grammar));
+        assert!(!rejected.stopped);
 
-        let tokenizer_path = model_dir.join("tokenizer.json");
-        let tokenizer = crate::tokenizer::bpe::BpeTokenizer::from_tokenizer_json(&tokenizer_path)
-            .expect("checkpoint tokenizer");
-        let (mut state, cfg) = match detect_format(&model_dir) {
-            ModelFormat::Q4 => {
-                let cfg = Qwen35Config::from_model_dir(&model_dir).expect("config.json");
-                let state = MetalQwen35State::from_q4_dir(
-                    &model_dir,
-                    &tokenizer_path,
-                    &cfg,
-                    PARITY_CACHE_LEN,
-                )
-                .expect("Q4 Metal state");
-                (state, cfg)
-            }
-            ModelFormat::Safetensors => {
-                let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
-                    .expect("safetensors model");
-                let cfg = model.config().clone();
-                let state = MetalQwen35State::new(model.weights(), &cfg, PARITY_CACHE_LEN)
-                    .expect("safetensors Metal state");
-                (state, cfg)
-            }
-            other => panic!(
-                "{} holds no Qwen3.5 checkpoint: {other:?}",
-                model_dir.display()
-            ),
+        let completed = direct_script(vec![2, 2], &gen_cfg).expect("a completed grammar");
+        assert_eq!(completed.token_ids, vec![2, 2]);
+        assert_eq!(completed.stop_reason, Some(StopReason::Grammar));
+        assert!(completed.stopped);
+    }
+
+    /// A grammar that blocks every id before the first token keeps the
+    /// entry's step-0 message; a dead end after the first token keeps the
+    /// decode-step message (control).
+    #[test]
+    fn direct_grammar_block_messages_distinguish_step_zero() {
+        let blocked_at_start = GenerateConfig {
+            max_new_tokens: 4,
+            grammar: Some(scripted_grammar("root ::= \"b\"\n", b"a")),
+            ..Default::default()
         };
+        match direct_script(vec![1], &blocked_at_start) {
+            Err(InferenceError::GrammarConstraintBlocked(message)) => {
+                assert_eq!(message, STEP_ZERO_GRAMMAR_BLOCKED);
+            }
+            other => panic!("expected the step-0 grammar block, got {other:?}"),
+        }
 
-        let spec =
-            crate::grammar::GrammarSpec::json_schema_str(GRAMMAR_SCHEMA).expect("grammar schema");
-        let vocab_bytes = tokenizer
-            .vocab_bytes(cfg.vocab_size)
-            .expect("vocabulary bytes");
-        let grammar = std::sync::Arc::new(
-            crate::grammar::GrammarEngine::new(&spec, vocab_bytes).expect("grammar engine"),
-        );
-
-        for case in PARITY_CASES {
-            env.set_compact(case.compact_env);
-            let gen_cfg = parity_config(case, &grammar);
-            let legacy = run_legacy(&mut state, &tokenizer, case, &gen_cfg);
-            let session = run_session(&mut state, &tokenizer, case, &gen_cfg);
-            assert_eq!(
-                session, legacy,
-                "{}: session differs from the legacy entry",
-                case.name
-            );
-            assert!(
-                !legacy.token_ids.is_empty(),
-                "{}: generated nothing",
-                case.name
-            );
-            eprintln!(
-                "decoder session parity {}: {} tokens, {:?}",
-                case.name,
-                legacy.token_ids.len(),
-                legacy.stop_reason
-            );
+        let dead_end = GenerateConfig {
+            max_new_tokens: 4,
+            grammar: Some(scripted_grammar("root ::= \"x\" \"c\"\n", b"b")),
+            ..Default::default()
+        };
+        match direct_script(vec![2], &dead_end) {
+            Err(InferenceError::GrammarConstraintBlocked(message)) => {
+                assert!(
+                    message.contains("no legal continuation"),
+                    "a decode-step dead end keeps its own message, got {message:?}"
+                );
+            }
+            other => panic!("expected the decode-step grammar block, got {other:?}"),
         }
     }
 }

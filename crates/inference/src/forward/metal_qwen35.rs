@@ -541,7 +541,6 @@ mod inner {
     use crate::model::qwen35_config::Qwen35Config;
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
-    use crate::tokenizer::common::Tokenizer;
     use crate::tokenizer::detokenize::IncrementalDetokenizer;
     use crate::vision::multimodal::Qwen35VisionRequest;
     use crate::weights::q4_weights::quantize_row_q4_0;
@@ -9767,79 +9766,18 @@ mod inner {
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
-            use crate::error::InferenceError;
-
             let plan = match self.prepare_direct_generation(prompt, tokenizer, gen_cfg)? {
                 GenerationPreparation::Complete(output) => return Ok(output),
                 GenerationPreparation::Ready(plan) => plan,
             };
-            let GenerationPlan {
-                mut rng_state,
-                prompt_ids,
-                prompt_len,
-                ..
-            } = plan;
 
-            let cfg = self.engine.config.clone();
-
-            // Reset state for new generation
-            self.reset_state();
-
-            let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
-            let mut all_ids = prompt_ids.clone();
-
-            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
-
-            // Initialise grammar state for grammar-constrained decoding (ADR-046).
-            let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
-
-            // Batch prefill: process all prompt tokens at once (GEMM). Through the
-            // fallible entry point, not the unwrapping wrapper: a multi-token prompt
-            // on an MoE model has no batched schedule, and this is a request-facing
-            // call, so it must come back as `UnsupportedModel` rather than aborting
-            // the process. `try_forward_prefill` rejects before any state mutation;
-            // the error arm disengages the compact route configured above, exactly
-            // as the cancellation paths do, so the session is left clean for a raw
-            // `forward_step` caller.
-            let mut prefill_logits = match self.try_forward_prefill(&prompt_ids) {
-                Ok(logits) => logits,
-                Err(error) => {
-                    if use_compact {
-                        self.disengage_compact_route();
-                    }
-                    return Err(error);
-                }
-            };
-
-            // Apply grammar masking to prefill logits before sampling.
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits)?;
-                // If the grammar blocked every token the sampler's non-finite-max
-                // short-circuit would silently return the first candidate's token
-                // id. An accepting state with no legal continuation is a completed
-                // generation, not a failure; otherwise fail closed, matching the
-                // CPU contract (#611, generation.rs step-0 sites).
-                if !super::has_finite_logit(&prefill_logits) {
-                    if engine.is_complete_without_continuation(gs) {
-                        return Ok(GenerateOutput {
-                            text: String::new(),
-                            token_ids: vec![],
-                            prompt_tokens: prompt_len,
-                            generated_tokens: 0,
-                            stopped: true,
-                            stop_reason: Some(StopReason::Grammar),
-                            token_logprobs: vec![],
-                        });
-                    }
-                    return Err(InferenceError::GrammarConstraintBlocked(
-                        "grammar constraint blocked every token at step 0; \
-                         no legal first token exists in the current grammar state"
-                            .into(),
-                    ));
-                }
-            }
-
-            // MTP greedy path: programmatic flag or env-gated, greedy (top_k<=1) only.
+            // The MTP and GDN-first self-speculative routes are chosen from the request,
+            // the checkpoint and the environment alone, before any state is touched. The
+            // one route plan made here also configures the decoder session, which refuses
+            // both speculative routes, so a request cannot reach the ordinary loop by a
+            // second reading of the environment.
+            let environment = SamplingRouteEnvironment::current();
+            let route = plan_sampling_route(gen_cfg, plan.prompt_ids.is_empty(), environment);
             let mtp_enabled = gen_cfg
                 .enable_mtp
                 .unwrap_or_else(|| crate::env_switch_enabled("LATTICE_MTP"));
@@ -9847,39 +9785,52 @@ mod inner {
                 self.session.mtp.is_some(),
                 mtp_enabled,
                 gen_cfg,
-                use_compact,
+                route.use_compact,
             );
-            if use_mtp {
-                // This request has committed to the MTP path (#1336 round 2) —
-                // downstream pre-final-hidden-capture gates key off this, not
-                // off `self.session.mtp.is_some()` (which only reports whether
-                // the checkpoint carries MTP weights, not whether this request
-                // uses them).
-                self.session.mtp_active = true;
-                if use_compact {
-                    self.disengage_compact_route();
-                }
-                // #1340: rebuild the MTP draft head's KV cache from the prompt
-                // before the first draft round, so it attends to the prompt prefix
-                // instead of the single row `reset_state` left it with.
-                self.mtp_prefill(&prompt_ids);
-                return Ok(self.generate_greedy_mtp(
-                    &prefill_logits,
-                    prompt_len,
-                    tokenizer,
+            let use_self_spec = !use_mtp
+                && super::self_spec_route_active(
+                    self.session.gdn_checkpoints.is_some(),
+                    crate::env_switch_enabled("LATTICE_SELF_SPEC"),
                     gen_cfg,
-                ));
-            }
-
-            // GDN-first self-speculative greedy path: env-gated, greedy only.
-            let use_self_spec = super::self_spec_route_active(
-                self.session.gdn_checkpoints.is_some(),
-                crate::env_switch_enabled("LATTICE_SELF_SPEC"),
-                gen_cfg,
-                use_compact,
-                cfg.num_active_linear_attention_layers(),
-            );
-            if use_self_spec {
+                    route.use_compact,
+                    self.engine.config.num_active_linear_attention_layers(),
+                );
+            if use_mtp || use_self_spec {
+                // Both routes require a greedy request without grammar, so the plan never
+                // engages a compact route here and prefill logits are always dense.
+                let GenerationPlan {
+                    prompt_ids,
+                    prompt_len,
+                    ..
+                } = plan;
+                self.reset_state();
+                apply_sampling_route_plan(
+                    route,
+                    &mut self.session.compact_route,
+                    &mut self.session.compact_topk,
+                    &mut self.session.compact_result,
+                );
+                // Through the fallible entry point: a multi-token prompt on an MoE model
+                // has no batched schedule and must come back as `UnsupportedModel`.
+                let prefill_logits = self.try_forward_prefill(&prompt_ids)?;
+                if use_mtp {
+                    // This request has committed to the MTP path (#1336 round 2) —
+                    // downstream pre-final-hidden-capture gates key off this, not
+                    // off `self.session.mtp.is_some()` (which only reports whether
+                    // the checkpoint carries MTP weights, not whether this request
+                    // uses them).
+                    self.session.mtp_active = true;
+                    // #1340: rebuild the MTP draft head's KV cache from the prompt
+                    // before the first draft round, so it attends to the prompt prefix
+                    // instead of the single row `reset_state` left it with.
+                    self.mtp_prefill(&prompt_ids);
+                    return Ok(self.generate_greedy_mtp(
+                        &prefill_logits,
+                        prompt_len,
+                        tokenizer,
+                        gen_cfg,
+                    ));
+                }
                 return Ok(self.generate_greedy_self_spec(
                     &prefill_logits,
                     prompt_len,
@@ -9888,226 +9839,31 @@ mod inner {
                 ));
             }
 
-            let next_id = if use_compact {
-                sample_from_candidates(
-                    &self.session.compact_result,
-                    gen_cfg,
-                    &all_ids,
-                    &mut rng_state,
-                )
-            } else {
-                sample_token(&prefill_logits, gen_cfg, &all_ids, &mut rng_state)
-            };
-
-            // Advance grammar state after sampling the prefill token.
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                && !engine.advance(gs, next_id)
-            {
-                let text = tokenizer.decode(&generated_ids).unwrap_or_default();
-                return Ok(GenerateOutput {
-                    text,
-                    token_ids: generated_ids.clone(),
-                    prompt_tokens: prompt_len,
-                    generated_tokens: generated_ids.len(),
-                    stopped: false,
-                    stop_reason: Some(StopReason::Grammar),
-                    token_logprobs: vec![],
-                });
-            }
-
-            let is_stop = |id: u32| -> bool {
-                id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id)
-            };
-
-            if is_stop(next_id) {
-                if use_compact {
-                    self.disengage_compact_route();
-                }
-                return Ok(GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
-                    prompt_tokens: prompt_len,
-                    generated_tokens: 0,
-                    stopped: true,
-                    stop_reason: Some(StopReason::Eos),
-                    token_logprobs: vec![],
-                });
-            }
-
-            generated_ids.push(next_id);
-            all_ids.push(next_id);
-
-            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
-            // `stop_text_state` is `None` for the (default) empty-`stop_strings` case,
-            // which keeps the original zero-overhead fast path untouched.
-            let mut stop_text_state = if gen_cfg.stop_strings.is_empty() {
-                None
-            } else {
-                Some((
-                    IncrementalDetokenizer::new(),
-                    StopStringMatcher::new(&gen_cfg.stop_strings),
-                ))
-            };
-
-            if let Some((detok, matcher)) = stop_text_state.as_mut() {
-                let delta = detok.push(tokenizer, next_id);
-                if matcher.push(&delta, &mut |_| {}) {
-                    if use_compact {
-                        self.disengage_compact_route();
-                    }
-                    let (_, matcher) = stop_text_state.take().expect("just matched Some(..)");
-                    return Ok(GenerateOutput {
-                        text: matcher.into_text(),
-                        token_ids: generated_ids.clone(),
-                        prompt_tokens: prompt_len,
-                        generated_tokens: generated_ids.len(),
-                        stopped: true,
-                        stop_reason: Some(StopReason::Eos),
-                        token_logprobs: vec![],
-                    });
-                }
-            }
-
-            // Greedy fast path: zero-copy argmax avoids 993KB alloc+copy per step.
-            let greedy_fast = gen_cfg.temperature <= 0.0
-                && gen_cfg.top_k <= 1
-                && gen_cfg.repetition_penalty == 1.0
-                && gen_cfg.grammar.is_none()
-                && !use_compact;
-
-            // Autoregressive decode
-            let mut stopped = false;
-            let mut stop_reason = StopReason::Length;
-            // A grammar completed by the prefill-derived first token with no
-            // legal continuation is a successful stop, mirroring the CPU
-            // `grammar_complete` early return. Recorded here — immediately
-            // after the initial advance — rather than probed at the loop top,
-            // so a zero-iteration decode loop (max_new_tokens == 1) cannot
-            // fall through to Length (#1064 follow-up).
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
-                && engine.is_complete_without_continuation(gs)
-            {
-                stopped = true;
-                stop_reason = StopReason::Grammar;
-            }
-            for _ in 1..gen_cfg.max_new_tokens {
-                // Initial-token grammar completion (recorded above) terminates
-                // decode before any per-step GPU work: past this point
-                // mask_logits would block every token and the all-blocked
-                // guard below would misreport the completed generation as
-                // GrammarConstraintBlocked (#1064).
-                if stopped {
-                    break;
-                }
-                if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
-                    stop_reason = StopReason::KvFull;
-                    break;
-                }
-                let pos = self.session.kv_cache.seq_len;
-                let last_token = *all_ids
-                    .last()
-                    .expect("invariant: prompt or previous sample populated all_ids");
-
-                let next_id = if greedy_fast {
-                    self.forward_step_greedy_argmax(last_token, pos)
-                } else {
-                    let mut step_logits = self.forward_step_decode(last_token, pos);
-
-                    // Apply grammar masking before sampling (ADR-046).
-                    if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                        let _signpost_grammar = crate::forward::signpost::interval(
-                            crate::forward::signpost::Label::DecodeGrammarMask,
-                        );
-                        engine.mask_logits(gs, &mut step_logits)?;
-                        // Fail closed if the grammar blocked every continuation,
-                        // matching the CPU contract (#611).
-                        if !super::has_finite_logit(&step_logits) {
-                            return Err(InferenceError::GrammarConstraintBlocked(
-                                "grammar constraint blocked every token; \
-                                 no legal continuation exists in the current grammar state"
-                                    .into(),
-                            ));
-                        }
-                    }
-
-                    sample_decode_traced(
-                        use_compact.then_some(self.session.compact_result.as_slice()),
-                        &step_logits,
-                        gen_cfg,
-                        &all_ids,
-                        &mut rng_state,
-                    )
-                };
-
-                // Advance grammar state after sampling.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                    && !engine.advance(gs, next_id)
-                {
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-
-                if is_stop(next_id) {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break;
-                }
-
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-
-                if let Some((detok, matcher)) = stop_text_state.as_mut() {
-                    let delta = detok.push(tokenizer, next_id);
-                    if matcher.push(&delta, &mut |_| {}) {
-                        stopped = true;
-                        stop_reason = StopReason::Eos;
-                        break;
-                    }
-                }
-
-                // Post-advance completion check, mirroring the CPU
-                // `grammar_complete_without_continuation` check after every
-                // emitted token: the final loop iteration has no following
-                // loop top, so a grammar completed by the last allowed token
-                // would otherwise misreport as Length (#1064 follow-up).
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
-                    && engine.is_complete_without_continuation(gs)
-                {
-                    stopped = true;
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-
-                if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
-                    stop_reason = StopReason::KvFull;
-                    break;
-                }
-            }
-
-            if use_compact {
-                self.disengage_compact_route();
-            }
-
-            // Detokenize: string-stop path uses the matcher's (possibly truncated)
-            // text; otherwise fall back to the original decode_tokens fast path.
-            let text = if let Some((mut detok, mut matcher)) = stop_text_state {
-                if !matcher.stopped() {
-                    matcher.finish(&detok.finish(), &mut |_| {});
-                }
-                matcher.into_text()
-            } else {
-                decode_tokens(tokenizer, &generated_ids)
-            };
-
-            Ok(GenerateOutput {
-                text,
-                token_ids: generated_ids.clone(),
-                prompt_tokens: prompt_len,
-                generated_tokens: generated_ids.len(),
-                stopped,
-                stop_reason: Some(stop_reason),
-                token_logprobs: vec![],
-            })
+            let eos_token_id = self.engine.config.eos_token_id;
+            let prompt_ids = plan.prompt_ids.clone();
+            // The session resets the state and engages the planned sampling route;
+            // dropping it tears the route down on every exit path below.
+            let mut session = crate::decoder::qwen_metal::QwenMetalSession::with_route_environment(
+                self,
+                plan,
+                gen_cfg,
+                crate::decoder::qwen_metal::MetalEntryProfile::Direct,
+                environment,
+            )?;
+            // KV capacity: `prepare_generation` admitted this request only if
+            // `prompt_len + max_new_tokens <= max_context()` (the direct entry refuses a
+            // reasoning budget, so the decode cap is `max_new_tokens`), and the driver
+            // runs at most `max_new_tokens - 1` decode steps after prefill, so the last
+            // step writes position `max_context() - 2` at most. No admitted request
+            // fills the cache: this entry never stops with `StopReason::KvFull`, and the
+            // session's full-cache refusal cannot fire.
+            crate::decoder::qwen_metal::run_direct(
+                &mut session,
+                gen_cfg,
+                &prompt_ids,
+                eos_token_id,
+                tokenizer,
+            )
         }
 
         /// **Unstable**: multimodal generation; visual token handling and position encoding
@@ -14937,6 +14693,7 @@ mod inner {
             CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, FullAttentionLayerWeights,
         };
         use crate::model::qwen35_config::LayerType;
+        use crate::tokenizer::common::Tokenizer;
 
         // Mutation-sensitive: five decode
         // loops used to copy-paste their own `decode.sample` interval +
@@ -14979,14 +14736,14 @@ mod inner {
                 .find("    mod tests {")
                 .expect("mod tests must exist in this file");
             let production_src = &src[..production_end];
-            // One definition + four call sites in this file. The fifth loop, the
-            // streaming entry's, decodes through the Metal decoder session, whose
-            // `select` samples every decode step (dense and compact readback) through
-            // the same function; it is counted in that file below.
+            // One definition + three call sites in this file. The other two loops, the
+            // direct and streaming entries', decode through the Metal decoder session,
+            // whose `select` samples every decode step (dense and compact readback)
+            // through the same function; it is counted in that file below.
             let count = production_src.matches("sample_decode_traced(").count();
             assert_eq!(
-                count, 5,
-                "expected sample_decode_traced's definition plus exactly 4 decode-loop \
+                count, 4,
+                "expected sample_decode_traced's definition plus exactly 3 decode-loop \
                  call sites; got {count} instead -- a decode loop likely reverted to \
                  calling sample_token/sample_from_candidates directly, the exact drift \
                  round 3's review caught in the two multimodal decode loops"
@@ -17582,11 +17339,32 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .0;
             // Streaming generation plans its route in the Metal decoder session's
             // constructor, from the same planner and applier the configurator wraps.
+            // Direct generation plans it once to choose between its speculative routes
+            // and that session, then applies that plan itself on a speculative route
+            // or hands its environment to the session; `generate` is checked below.
             assert_eq!(
                 production.matches("self.configure_sampling_route(").count(),
-                2,
-                "direct and prefix-cache generation must share the configurator"
+                1,
+                "prefix-cache generation must use the configurator"
             );
+            let generate = production
+                .split_once("        pub fn generate(\n")
+                .expect("direct generation must exist")
+                .1;
+            let generate = &generate[..generate
+                .find("\n        }\n")
+                .expect("direct generation must close")];
+            for shared in [
+                "plan_sampling_route(",
+                "apply_sampling_route_plan(",
+                "QwenMetalSession::with_route_environment(",
+            ] {
+                assert_eq!(
+                    generate.matches(shared).count(),
+                    1,
+                    "direct generation must plan, apply or hand over its route through {shared}"
+                );
+            }
             let session_src = include_str!("../decoder/qwen_metal.rs");
             let session_production = &session_src[..session_src
                 .find("\nmod tests {")
@@ -32224,6 +32002,120 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        /// The same KV capacity boundary for the direct entry, which decodes
+        /// through the same session and driver: a request whose prompt plus
+        /// `max_new_tokens` equals the cache length runs to its token cap with the
+        /// cache one slot short of full. Control: one more token of budget is
+        /// refused at admission.
+        #[test]
+        fn metal_generate_at_exact_kv_capacity_runs_to_the_token_cap() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::generation::GenerateConfig;
+
+            const CAPACITY: usize = 32;
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+            let mut state =
+                MetalQwen35State::new(&weights, &cfg, CAPACITY).expect("tiny hybrid fixture");
+            let gen_cfg = |max_new_tokens, temperature, top_k| GenerateConfig {
+                min_p: 0.0,
+                max_new_tokens,
+                temperature,
+                top_k,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            // Greedy (argmax readback) and sampled (dense readback) requests.
+            for (temperature, top_k) in [(0.0, 1), (0.8, 8)] {
+                let out = state
+                    .generate("a", &tokenizer, &gen_cfg(CAPACITY - 1, temperature, top_k))
+                    .expect("prompt plus max_new_tokens equal to the capacity is admitted");
+                assert_eq!(out.prompt_tokens, 1);
+                assert_eq!(out.stop_reason, Some(StopReason::Length));
+                assert!(!out.stopped);
+                assert_eq!(out.generated_tokens, CAPACITY - 1);
+                assert_eq!(
+                    state.session.position(),
+                    CAPACITY - 1,
+                    "the prompt and every emitted token but the last were forwarded"
+                );
+            }
+
+            let refused = state.generate("a", &tokenizer, &gen_cfg(CAPACITY, 0.0, 1));
+            assert!(
+                matches!(&refused, Err(crate::error::InferenceError::Inference(message))
+                    if message.contains("exceeds model context window")),
+                "one token over the capacity must be refused at admission, got {refused:?}"
+            );
+        }
+
+        /// A greedy direct request with no compact route reads back one argmax id
+        /// per decode step, never a vocabulary-sized row: the only full-vocabulary
+        /// readback is the one the prefill-derived token is sampled from. Control:
+        /// a repetition penalty needs the dense row, and reads one back per token.
+        #[test]
+        fn metal_generate_greedy_reads_back_one_argmax_id_per_decode_step() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::generation::GenerateConfig;
+
+            const MAX_NEW_TOKENS: usize = 9;
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            state.path_proof_enabled = true;
+            let gen_cfg = |repetition_penalty| GenerateConfig {
+                min_p: 0.0,
+                max_new_tokens: MAX_NEW_TOKENS,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let full_rows = |state: &mut MetalQwen35State, repetition_penalty| {
+                state.reset_path_proof_counters();
+                let out = with_compact_topk_env("0", || {
+                    state.generate("a", &tokenizer, &gen_cfg(repetition_penalty))
+                })
+                .expect("an ordinary greedy request generates");
+                assert_eq!(out.generated_tokens, MAX_NEW_TOKENS);
+                let readback = state.logit_readback_path_proof_snapshot();
+                assert_eq!(readback.decode_compact_candidate, 0);
+                assert_eq!(readback.prefill_compact_candidate, 0);
+                readback.decode_full_vocab + readback.prefill_full_vocab
+            };
+
+            assert_eq!(full_rows(&mut state, 1.0), 1);
+            assert_eq!(full_rows(&mut state, 1.3), MAX_NEW_TOKENS as u64);
+        }
+
         #[test]
         fn self_spec_pool_holds_one_slot_per_verify_token_plus_base() {
             let _gpu_guard = gpu_test_lock();
@@ -40080,9 +39972,12 @@ mod public_scheduling_entry_point_tests {
                 "check_raw_prefill_fresh_session",
             ),
             ("fn forward_prefill_from(", "reject_moe_batched"),
-            ("pub fn generate(", "disengage_compact_route"),
-            // The streaming entry decodes through the Metal decoder session, whose
-            // `Drop` and `finish` own the compact-route teardown on every exit path.
+            // The direct and streaming entries decode through the Metal decoder session,
+            // whose `Drop` and `finish` own the compact-route teardown on every exit path.
+            (
+                "pub fn generate(",
+                "QwenMetalSession::with_route_environment",
+            ),
             (
                 "pub fn generate_streaming_with_cancel<F, C>(",
                 "QwenMetalSession::new",
@@ -40114,14 +40009,46 @@ mod public_scheduling_entry_point_tests {
             );
         }
 
+        // Direct generation engages a compact route only inside the Metal decoder
+        // session, so its body carries no compact branch and no teardown of its own;
+        // the session's `Drop` and `finish` each call its one idempotent teardown.
         let generate = strip_comments_and_strings(item(real, "pub fn generate("));
         assert_eq!(
             generate
                 .lines()
                 .filter(|line| line.trim() == "if use_compact {")
                 .count(),
+            0,
+            "direct generation must leave the compact route to the decoder session"
+        );
+        assert_eq!(
             count_calls(&generate, "disengage_compact_route"),
-            "each compact generation branch must disengage its route"
+            0,
+            "direct generation must leave the compact-route teardown to the decoder session"
+        );
+        let session_source = include_str!("../decoder/qwen_metal.rs");
+        let session_production = strip_comments_and_strings(
+            session_source
+                .split_once("\nmod tests {")
+                .expect("the decoder session file must have a test module")
+                .0,
+        );
+        for declaration in ["fn drop(&mut self)", "fn finish(&mut self"] {
+            assert!(
+                contains_call(
+                    item(&session_production, declaration),
+                    "self.disengage_route"
+                ),
+                "the decoder session's {declaration} must tear down the compact route"
+            );
+        }
+        assert_eq!(
+            count_calls(
+                item(&session_production, "fn disengage_route(&mut self)"),
+                "disengage_compact_route"
+            ),
+            1,
+            "the decoder session must tear the route down through disengage_compact_route"
         );
     }
 }
