@@ -668,10 +668,20 @@ pub(crate) fn run(
         // supply ignores it for the tail case (it is not tied to one sampled token),
         // same as the pre-migration `finish_stop` call site, whose `on_token` sink
         // takes no id at all.
-        let tail_stopped = policy.finish_stop(text, &tail, |s| emit_confirmed(s, 0));
-        if tail_stopped && !stopped {
-            stopped = true;
-            stop_reason = StopReason::Eos;
+        //
+        // A caller rejecting the flushed text ends the request exactly like the loop's
+        // `StepOutcome::Interrupted` arm: `Interrupt`, `stopped: false`, and it wins over a
+        // stop match the same tail completed (`finish_stop` applies that precedence).
+        match policy.finish_stop(text, &tail, |s| emit_confirmed(s, 0)) {
+            StopCheckOutcome::Interrupted => {
+                stopped = false;
+                stop_reason = StopReason::Interrupt;
+            }
+            StopCheckOutcome::Stopped if !stopped => {
+                stopped = true;
+                stop_reason = StopReason::Eos;
+            }
+            StopCheckOutcome::Stopped | StopCheckOutcome::Continue => {}
         }
     }
 
@@ -1004,5 +1014,174 @@ mod tests {
             "on_push must fire for token n strictly before that token's metadata call, for \
              every one of the 3 generated tokens (the prefill-derived first token included)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // A caller rejecting the natural-end tail flush must end the request
+    // with `Interrupt`, exactly as a mid-decode rejection does.
+    // -----------------------------------------------------------------
+
+    const TEXT_TOKEN: u32 = 7;
+    const SCRIPTED_EOS: u32 = 999;
+
+    /// Returns `script[i]` from the i-th `select` call (the last entry repeats), driving
+    /// `PredictionLedger` correctly through select/decode.
+    struct ScriptedSession {
+        caps: ExecutionCapabilities,
+        ledger: PredictionLedger,
+        script: Vec<u32>,
+        selects: usize,
+    }
+
+    impl DecoderSession for ScriptedSession {
+        fn capabilities(&self) -> &ExecutionCapabilities {
+            &self.caps
+        }
+
+        fn prefill(&mut self, _cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
+            Ok(StepStamp {
+                evaluated_len: 1,
+                prediction: None,
+            })
+        }
+
+        fn decode(
+            &mut self,
+            accepted: &AcceptedToken,
+            _cancel: &dyn Cancellation,
+        ) -> Result<StepStamp, InferenceError> {
+            self.ledger.consume(accepted.prediction)?;
+            Ok(StepStamp {
+                evaluated_len: 2,
+                prediction: None,
+            })
+        }
+
+        fn select(
+            &mut self,
+            _request: &SelectionRequest<'_>,
+        ) -> Result<SelectOutcome, InferenceError> {
+            let index = self.selects.min(self.script.len() - 1);
+            self.selects += 1;
+            Ok(SelectOutcome::Candidate(SelectionCandidate {
+                candidate_id: self.script[index],
+                prediction: self.ledger.open(),
+            }))
+        }
+
+        fn metadata(
+            &mut self,
+            _prediction: PredictionId,
+            _final_token: u32,
+            _request: &MetadataRequest,
+        ) -> Result<TokenMetadata, InferenceError> {
+            unreachable!("gen_cfg.logprobs is None, so metadata is never requested")
+        }
+
+        fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
+            Ok(())
+        }
+    }
+
+    /// Streams `script` with `stop_strings = ["ZZ"]`, every token decoding to "a". The sink
+    /// returns false only on call number `reject_call` (1-based). Returns the result and
+    /// every string the sink was handed, in order.
+    fn run_streaming_script(
+        script: Vec<u32>,
+        max_new_tokens: usize,
+        reject_call: usize,
+    ) -> (DriverResult, Vec<String>) {
+        let mut session = ScriptedSession {
+            caps: ExecutionCapabilities {
+                stop_strings: true,
+                ..ExecutionCapabilities::default()
+            },
+            ledger: PredictionLedger::new(),
+            script,
+            selects: 0,
+        };
+        let gen_cfg = GenerateConfig {
+            max_new_tokens,
+            stop_strings: vec!["ZZ".to_string()],
+            ..Default::default()
+        };
+        let cancel = || false;
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        let mut emitted: Vec<String> = Vec::new();
+        let result = run(
+            &mut session,
+            &gen_cfg,
+            None,
+            &[0u32],
+            SCRIPTED_EOS,
+            true,
+            &cancel,
+            |_generated_len| {},
+            |_next_id| "a".to_string(),
+            &mut text,
+            &mut offsets,
+            |delta, _id| {
+                emitted.push(delta.to_string());
+                emitted.len() != reject_call
+            },
+            || {},
+            String::new,
+        )
+        .expect("a scripted non-grammar stream must not error");
+        (result, emitted)
+    }
+
+    /// "ZZ" holds back one byte, so the third "a" of a 3-token run reaches the caller only
+    /// through `finish_stop`: calls 1 and 2 are mid-decode, call 3 is the tail flush.
+    #[test]
+    fn rejected_tail_flush_after_length_cap_reports_interrupt() {
+        let (control, emitted) = run_streaming_script(vec![TEXT_TOKEN], 3, usize::MAX);
+        assert_eq!(
+            emitted,
+            vec!["a", "a", "a"],
+            "fixture shape: 2 loop emits + 1 flush"
+        );
+        assert_eq!(
+            control.stop_reason,
+            StopReason::Length,
+            "control: all accepted"
+        );
+        assert!(!control.stopped);
+
+        let (result, emitted) = run_streaming_script(vec![TEXT_TOKEN], 3, 3);
+        assert_eq!(emitted.len(), 3, "the rejected call must be the tail flush");
+        assert_eq!(
+            result.stop_reason,
+            StopReason::Interrupt,
+            "a sink rejecting the final flush must end the request as Interrupt, like a \
+             mid-decode rejection"
+        );
+        assert!(!result.stopped, "Interrupt always reports stopped: false");
+        assert!(!result.confirmed_stop_string_match);
+    }
+
+    /// Same, for a stream that ends on EOS (`stopped: true` before the flush): the rejected
+    /// flush must still report `Interrupt` and clear `stopped`.
+    #[test]
+    fn rejected_tail_flush_after_eos_reports_interrupt() {
+        let script = vec![TEXT_TOKEN, TEXT_TOKEN, SCRIPTED_EOS];
+        let (control, emitted) = run_streaming_script(script.clone(), 8, usize::MAX);
+        assert_eq!(
+            emitted,
+            vec!["a", "a"],
+            "fixture shape: 1 loop emit + 1 flush"
+        );
+        assert_eq!(
+            control.stop_reason,
+            StopReason::Eos,
+            "control: all accepted"
+        );
+        assert!(control.stopped);
+
+        let (result, emitted) = run_streaming_script(script, 8, 2);
+        assert_eq!(emitted.len(), 2, "the rejected call must be the tail flush");
+        assert_eq!(result.stop_reason, StopReason::Interrupt);
+        assert!(!result.stopped, "Interrupt always reports stopped: false");
     }
 }

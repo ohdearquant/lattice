@@ -12050,18 +12050,23 @@ mod inner {
             // so streamed deltas concatenate to exactly the returned text. Skip when
             // the caller asked to stop — it is no longer consuming the stream.
             if !stopped_by_caller {
-                // This flush emits the residual incomplete-UTF-8 bytes of the
-                // already-generated final token, not a new generation step —
-                // generation has already terminated for the stop_reason decided
-                // above. A late cancel here (return value intentionally unused)
-                // does not change why generation stopped, so treating it as
-                // Interrupt would misattribute the stop cause to this flush.
+                // This flush releases the detokenizer's residual bytes and the
+                // stop matcher's held-back text. A caller rejecting it never
+                // received that text, so it ends the request like the loop's
+                // `Interrupted` arm, winning over a stop match the same tail
+                // completed (`finish_stop` applies that precedence).
                 let tail = detok.finish();
-                let tail_stopped =
-                    policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id));
-                if tail_stopped && !stopped {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
+                match policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id)) {
+                    crate::generation::StopCheckOutcome::Interrupted => {
+                        stopped = false;
+                        stop_reason = StopReason::Interrupt;
+                    }
+                    crate::generation::StopCheckOutcome::Stopped if !stopped => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                    }
+                    crate::generation::StopCheckOutcome::Stopped
+                    | crate::generation::StopCheckOutcome::Continue => {}
                 }
             }
             Ok(GenerateOutput {
@@ -15129,22 +15134,36 @@ mod inner {
             // Tail flush runs before the cache-save decision: a stop string can
             // still complete in the final detokenizer tail, and that late match
             // must also suppress caching the truncated generation (see below).
+            let mut tail_rejected = false;
             if !stopped_by_caller {
                 let tail = detok.finish();
-                let tail_stopped =
-                    policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id));
-                if tail_stopped && !stopped {
-                    stopped = true;
-                    stopped_by_stop_string = true;
-                    stop_reason = StopReason::Eos;
+                match policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id)) {
+                    crate::generation::StopCheckOutcome::Interrupted => {
+                        stopped = false;
+                        tail_rejected = true;
+                        stop_reason = StopReason::Interrupt;
+                    }
+                    crate::generation::StopCheckOutcome::Stopped if !stopped => {
+                        stopped = true;
+                        stopped_by_stop_string = true;
+                        stop_reason = StopReason::Eos;
+                    }
+                    crate::generation::StopCheckOutcome::Stopped
+                    | crate::generation::StopCheckOutcome::Continue => {}
                 }
             }
 
-            if stopped_by_stop_string {
+            if stopped_by_stop_string || tail_rejected {
                 // CPU semantics can retain token ids whose text was truncated by
                 // the stop-string match; caching those hidden states would
                 // represent text the caller never received, so drop the cache
                 // entry for this slot entirely instead of saving a prefix.
+                //
+                // A rejected tail flush is the same hazard: the rejected text
+                // can belong to tokens already forwarded into KV (the last
+                // token after an EOS break, or earlier tokens whose bytes the
+                // stop matcher held back), and skipping the silent step below
+                // would not exclude those, so no prefix is saved.
                 self.cross_turn_prefix_cache.remove(slot_id);
             } else {
                 // Every exit above leaves the last *pushed* generated token
@@ -37268,6 +37287,100 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 followup.output.token_ids, parity_reference.token_ids,
                 "ExactAppend reuse must reproduce exactly what a full re-prefill of the \
                  follow-up prompt would produce"
+            );
+        }
+
+        /// A caller rejecting the natural-end tail flush must end the prefix-cache
+        /// path with `Interrupt`, like a mid-decode rejection, and must leave no
+        /// cross-turn entry: the rejected text belongs to generated tokens, so no
+        /// saved boundary may include them.
+        #[test]
+        fn cross_turn_cache_rejected_tail_flush_reports_interrupt_and_saves_no_entry() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let prompt = "ab".to_string();
+            let mut gen_cfg = cross_turn_test_gen_cfg(41, 3);
+            // 'Z' is outside single_char_vocab_tokenizer's alphabet, so this never
+            // matches; it only makes the stop matcher hold back one byte, which
+            // reaches the caller through the tail flush alone.
+            gen_cfg.stop_strings = vec!["ZZ".to_string()];
+
+            // Control: the same request with every emit accepted runs to the cap and
+            // saves an entry for the slot.
+            let mut control_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let mut control_emits: Vec<String> = Vec::new();
+            let control = control_state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |delta, _id| {
+                        control_emits.push(delta.to_string());
+                        true
+                    },
+                    || false,
+                )
+                .expect("control run must not error");
+            assert_eq!(control.output.stop_reason, Some(StopReason::Length));
+            assert_eq!(control.output.token_ids.len(), 3);
+            assert_eq!(
+                control_emits.len(),
+                3,
+                "fixture shape: two decode-loop emits plus one tail flush, got {control_emits:?}"
+            );
+            assert!(
+                control_state.cross_turn_prefix_cache.get(slot_id).is_some(),
+                "control: an accepted run must save a cross-turn entry, or the assertion \
+                 below proves nothing"
+            );
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let mut calls = 0usize;
+            let turn = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_delta, _id| {
+                        calls += 1;
+                        calls < control_emits.len()
+                    },
+                    || false,
+                )
+                .expect("a rejected tail flush must not surface as an engine error");
+            assert_eq!(
+                calls,
+                control_emits.len(),
+                "the only rejected call must be the final one, the tail flush"
+            );
+            assert_eq!(
+                turn.output.token_ids, control.output.token_ids,
+                "the rejection lands after decoding ends, so the same tokens were generated"
+            );
+            assert_eq!(
+                turn.output.stop_reason,
+                Some(StopReason::Interrupt),
+                "a rejected tail flush must stop with Interrupt"
+            );
+            assert!(
+                !turn.output.stopped,
+                "Interrupt always reports stopped: false"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.get(slot_id).is_none(),
+                "a rejected tail flush must not persist a boundary covering tokens whose \
+                 text the caller never received"
             );
         }
 

@@ -979,6 +979,18 @@ kernel void conv1d_depthwise_silu(
 // config rather than a contract between the backends.
 constant float GDN_QK_NORM_EPS = 1e-6f;
 
+// Decay-gate softplus without a hard zero in the negative tail. MSL has no log1p, and
+// `1 + exp(x)` loses the low bits of exp(x) to rounding (all of them below x ≈ -16.6 in f32).
+// Below -4, y = exp(x) < 0.0184 and the cubic log1p series y - y^2/2 + y^3/3 is accurate to
+// ~1.6e-6 relative, where log(1 + y) is no better than ~3e-6 at the cutoff and degrades as x
+// falls. Above 20, log(1 + exp(x)) equals x to f32 precision.
+static inline float gdn_softplus(float x) {
+    if (x > 20.0f) return x;
+    float y = exp(x);
+    if (x < -4.0f) return y * (1.0f - y * (0.5f - y / 3.0f));
+    return log(1.0f + y);
+}
+
 // One threadgroup per head, 128 threads (4 simdgroups).
 // S stored transposed: S^T[value_dim, key_dim] for contiguous row access.
 struct GdnRecurParams {
@@ -1088,7 +1100,7 @@ kernel void gdn_recurrence_fused(
 
     // Decay gate
     float a = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
-    float sp = log(1.0f + exp(alpha_val + dt_bias[h]));
+    float sp = gdn_softplus(alpha_val + dt_bias[h]);
     float g = exp(-a * sp);
 
     // k[:] @ q[:] — shared dot product, same for all value rows in this head
@@ -1239,7 +1251,7 @@ kernel void gdn_recurrence_fused_q36(
 
     // Decay gate
     float a = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
-    float sp = log(1.0f + exp(alpha_val + dt_bias[h]));
+    float sp = gdn_softplus(alpha_val + dt_bias[h]);
     float g = exp(-a * sp);
 
     // k dot q (scalar, same for all value rows in this head)
@@ -1384,7 +1396,7 @@ kernel void gdn_precompute_keys(
 
     // Decay gate — per VALUE head
     float a  = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
-    float sp = log(1.0f + exp(alpha_val + dt_bias[h]));
+    float sp = gdn_softplus(alpha_val + dt_bias[h]);
     float g  = exp(-a * sp);
 
     float kq_part = k_norm_val * q_norm_val;
@@ -2854,9 +2866,9 @@ kernel void gdn_chunk_materialize_c32(
                 float s = 0.0f;
                 for (uint si = 0u; si < 4u; si++) s += sg_buf[si];
                 float a  = exp(a_log[h]);
-                float sp = log(1.0f + exp(s + dt_bias[h]));
+                float sp = gdn_softplus(s + dt_bias[h]);
                 // Floor the per-token log-decay so the chunked cumulative-log scan stays
-                // closed under saturated decay.  An overflowing softplus drives -a*sp to
+                // closed under saturated decay.  An overflowing decay product drives -a*sp to
                 // -inf; the prefix-log differences in gdn_chunk_solve_c32 then form
                 // -inf - -inf = NaN and poison all downstream GDN state (gamma_logs, qk_l,
                 // k_right, S_all).  The serial recurrence maps the same input to
