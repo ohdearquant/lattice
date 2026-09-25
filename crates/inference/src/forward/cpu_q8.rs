@@ -1409,6 +1409,437 @@ mod tests {
         (cfg, weights, rope, tokenizer)
     }
 
+    // -----------------------------------------------------------------------
+    // generate_q8 output-stream goldens
+    // -----------------------------------------------------------------------
+    //
+    // Own fixture rather than reusing `make_nonzero_q8_cpu_test_model` above:
+    // that fixture's `eos_token_id: 127` sits inside its `vocab_size: 128`, so
+    // an LCG-driven argmax could land on it "by luck" during a multi-step
+    // decode and make a golden's stop behaviour depend on incidental EOS
+    // timing rather than the `GenerateConfig` under test. Same LCG recipe,
+    // same layer shapes, `eos_token_id` moved out of range instead.
+    //
+    // Regenerating the goldens: run
+    //   cargo test -p lattice-inference --lib \
+    //     forward::cpu_q8::tests::print_q8_generate_goldens -- --ignored --nocapture
+    // and copy the printed `token_ids`/`stop_reason`/`stopped`/`text` lines into
+    // the four `#[test]` functions below.
+    fn make_nonzero_q8_generate_fixture() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
+        use crate::model::qwen35_config::LayerType;
+        use crate::weights::q8_weights::quantize_matrix;
+
+        let hidden: usize = 64;
+        let vocab: usize = 128;
+        let inter: usize = 128;
+        let num_attn_heads: usize = 2;
+        let num_kv_heads: usize = 1;
+        let head_dim: usize = 32;
+        let q_dim = num_attn_heads * head_dim; // 64
+        let kv_dim = num_kv_heads * head_dim; // 32
+        let lin_key_heads: usize = 2;
+        let lin_val_heads: usize = 2;
+        let lin_key_dim: usize = 32;
+        let lin_val_dim: usize = 32;
+        let lin_qkv_dim = lin_key_heads * lin_key_dim * 2 + lin_val_heads * lin_val_dim; // 192
+        let lin_output_dim = lin_val_heads * lin_val_dim; // 64
+        let kernel_size: usize = 4;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 2,
+            vocab_size: vocab,
+            intermediate_size: inter,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: num_attn_heads,
+            num_key_value_heads: num_kv_heads,
+            head_dim,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: lin_key_heads,
+            linear_num_value_heads: Some(lin_val_heads),
+            linear_key_head_dim: lin_key_dim,
+            linear_value_head_dim: lin_val_dim,
+            linear_conv_kernel_dim: kernel_size,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            layer_mask: vec![true; 2],
+            eos_token_id: 999_999,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
+        };
+
+        let rope_dim = (head_dim as f32 * cfg.partial_rotary_factor) as usize; // 16
+        let rope = RopeTable::new(rope_dim, cfg.max_position_embeddings, cfg.rope_theta);
+
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        // Shared LCG step, reused by every draw below (weights, norm gains,
+        // conv taps, decay-gate biases) so the whole fixture stays one
+        // deterministic stream from a single seed.
+        fn lcg_step(seed: &mut u64) -> f32 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*seed >> 33) as f32 / u32::MAX as f32
+        }
+        fn next_small_vec(seed: &mut u64, n: usize, scale: f32) -> Vec<f32> {
+            (0..n)
+                .map(|_| lcg_step(seed) * scale - scale / 2.0)
+                .collect()
+        }
+        // Norm gains, decay-gate params and conv taps: distinct, non-uniform
+        // per-element draws (never a repeated literal) so these vectors carry
+        // real per-channel structure instead of acting as either a no-op
+        // (`1 + gamma` with every gamma identical) or a dead branch (`gamma`
+        // uniformly `0.0` feeding a direct, non-shifted `x * gamma` norm).
+        // Drawn BEFORE `next_weight` is even defined: that closure holds a
+        // unique borrow of `seed` for its whole life once created, so any
+        // `next_small_vec(&mut seed, ..)` call sitting inside that span
+        // (even textually before the closure's first call) conflicts.
+        let gdn_a_log = next_small_vec(&mut seed, lin_key_heads, 1.0);
+        let gdn_dt_bias = next_small_vec(&mut seed, lin_key_heads, 1.0);
+        let gdn_conv1d_weight = next_small_vec(&mut seed, lin_qkv_dim * kernel_size, 0.04);
+        // The gated-attention output norm (`scalar_gated_rms_norm`,
+        // attention/gdn_fused.rs) applies its weight directly
+        // (`x * inv_rms * gamma`), unlike the shifted `1 + gamma`
+        // convention `qwen35_rms_norm` uses everywhere else in this
+        // fixture. A uniform `0.0` here zeroed this layer's entire output
+        // for every input, which is what made the golden streams below
+        // identical across every prompt regardless of length or content.
+        // A non-uniform, non-zero draw keeps the layer's output both
+        // nonzero and content-shaped (a single shared constant would
+        // still be a pure, direction-preserving rescale).
+        let gdn_norm_weight: Vec<f32> = next_small_vec(&mut seed, lin_val_dim, 1.0)
+            .iter()
+            .map(|g| g + 1.0)
+            .collect();
+        // q_norm/k_norm gains at scale 8.0 (Qwen3.5's shifted `1 + gamma`
+        // convention, so this puts the per-channel Q/K rescale in roughly
+        // [-4, 4] instead of [0.5, 1.5]), tried together with the v_proj/
+        // o_proj scale below to make the softmax over `full_attention_step_q8`'s
+        // attended keys sensitive to the RoPE phase shift a decode position
+        // change produces. Measured: raw-logit deltas from a one-position
+        // shift stay ~4 orders of magnitude below this fixture's candidate-
+        // logit spacing at this scale, so the greedy argmax never moves
+        // (see the `pos+1` / prefill-`seq_len` control results on the
+        // `generate_q8_greedy_golden` test). `full_attention_step_q8` reads
+        // its attend-window size from `kv_cache.seq_len`, never from the
+        // `position` argument the caller passes in, so `position` only ever
+        // perturbs RoPE phase here; the fixture's own signal path (GDN's
+        // linear recurrence, not full attention) dominates the residual at
+        // this problem size regardless of this gain.
+        let full_q_norm = next_small_vec(&mut seed, head_dim, 8.0);
+        let full_k_norm = next_small_vec(&mut seed, head_dim, 8.0);
+
+        let mut next_weight =
+            |n: usize, k: usize, scale: f32| -> crate::weights::q8_weights::Q8Matrix {
+                let floats: Vec<f32> = (0..n * k)
+                    .map(|_| lcg_step(&mut seed) * scale - scale / 2.0)
+                    .collect();
+                quantize_matrix(&floats, n, k).unwrap()
+            };
+
+        let gdn_w = Q8GatedDeltaNetWeights {
+            in_proj_qkv: next_weight(lin_qkv_dim, hidden, 0.04),
+            in_proj_z: next_weight(lin_output_dim, hidden, 0.04),
+            in_proj_b: next_weight(lin_key_heads, hidden, 0.04),
+            in_proj_a: next_weight(lin_key_heads, hidden, 0.04),
+            a_log: gdn_a_log,
+            dt_bias: gdn_dt_bias,
+            conv1d_weight: gdn_conv1d_weight,
+            conv_dim: lin_qkv_dim,
+            kernel_size,
+            norm_weight: gdn_norm_weight,
+            out_proj: next_weight(hidden, lin_output_dim, 0.04),
+        };
+
+        // v_proj/o_proj at a distinctly larger scale (4.0 vs the 0.04 every
+        // other matrix uses), tried alongside the q_norm/k_norm gain above
+        // so the full-attention layer's residual contribution would compete
+        // with the FFN's attenuation. Measured insufficient at this scale
+        // (see the comment on `full_q_norm`/`full_k_norm` above) — kept at
+        // this larger value because it strictly widens the draw range used
+        // for the content-sensitivity property this fixture guards, without
+        // regressing it (all three wrappers still agree exactly on all four
+        // golden types at this scale), not because it reaches position
+        // sensitivity.
+        let full_w = Q8FullAttentionLayerWeights {
+            q_proj: next_weight(2 * q_dim, hidden, 0.04),
+            k_proj: next_weight(kv_dim, hidden, 0.04),
+            v_proj: next_weight(kv_dim, hidden, 4.0),
+            o_proj: next_weight(hidden, q_dim, 4.0),
+            q_norm: full_q_norm,
+            k_norm: full_k_norm,
+        };
+
+        let make_common = |seed: &mut u64| -> Q8CommonLayerWeights {
+            let input_layernorm = next_small_vec(seed, hidden, 1.0);
+            let post_attention_layernorm = next_small_vec(seed, hidden, 1.0);
+            let mut nw = |n: usize, k: usize| -> crate::weights::q8_weights::Q8Matrix {
+                let floats: Vec<f32> = (0..n * k).map(|_| lcg_step(seed) * 0.04 - 0.02).collect();
+                quantize_matrix(&floats, n, k).unwrap()
+            };
+            Q8CommonLayerWeights {
+                input_layernorm,
+                post_attention_layernorm,
+                gate_proj: nw(inter, hidden),
+                up_proj: nw(inter, hidden),
+                down_proj: nw(hidden, inter),
+            }
+        };
+
+        let layers = vec![
+            (Q8AttentionWeights::Linear(gdn_w), make_common(&mut seed)),
+            (Q8AttentionWeights::Full(full_w), make_common(&mut seed)),
+        ];
+
+        let embed_tokens: Vec<f32> = (0..vocab * hidden)
+            .map(|_| lcg_step(&mut seed) * 0.04 - 0.02)
+            .collect();
+
+        let weights = Q8ModelWeights {
+            embed_tokens,
+            final_norm: next_small_vec(&mut seed, hidden, 1.0),
+            layers,
+        };
+
+        (cfg, weights, rope)
+    }
+
+    /// Tokenizer covering every id in the nonzero fixture's `vocab_size` (128).
+    /// Ids 0..=7 keep the single-character tokens the other tests in this file
+    /// already rely on; the golden prompt `"world"` encodes to five of them. Ids 8..128 get
+    /// distinct two-character printable tokens so every id the decode loop can
+    /// produce has real text instead of falling through to an empty string.
+    fn nonzero_fixture_tokenizer_q8() -> BpeTokenizer {
+        use std::collections::HashMap;
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        for id in 8u32..128 {
+            let j = (id - 8) as usize;
+            let a = ALPHABET[j / ALPHABET.len()] as char;
+            let b = ALPHABET[j % ALPHABET.len()] as char;
+            vocab_map.insert(format!("{a}{b}"), id);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap()
+    }
+
+    /// Writer path for the four `generate_q8` goldens below. Not run by
+    /// default; see the module-level comment above.
+    #[test]
+    #[ignore = "golden writer: run explicitly to (re)print the pinned values"]
+    fn print_q8_generate_goldens() {
+        let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
+        let tokenizer = nonzero_fixture_tokenizer_q8();
+
+        let greedy_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let greedy = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &greedy_cfg)
+            .expect("greedy golden must succeed");
+        println!("GREEDY token_ids={:?}", greedy.token_ids);
+        println!(
+            "GREEDY stopped={} stop_reason={:?}",
+            greedy.stopped, greedy.stop_reason
+        );
+        println!("GREEDY text={:?}", greedy.text);
+
+        let seeded_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.8,
+            top_k: 5,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            seed: Some(1234),
+            ..Default::default()
+        };
+        let seeded = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &seeded_cfg)
+            .expect("seeded golden must succeed");
+        println!("SEEDED token_ids={:?}", seeded.token_ids);
+        println!(
+            "SEEDED stopped={} stop_reason={:?}",
+            seeded.stopped, seeded.stop_reason
+        );
+        println!("SEEDED text={:?}", seeded.text);
+
+        assert!(
+            greedy.token_ids.len() >= 2,
+            "need at least 2 greedy tokens to derive a mid-stream stop token"
+        );
+        let stop_tok = greedy.token_ids[1];
+        let stop_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            stop_token_ids: vec![stop_tok],
+            ..Default::default()
+        };
+        let stopped = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &stop_cfg)
+            .expect("stop-token golden must succeed");
+        println!("STOP stop_tok={stop_tok}");
+        println!("STOP token_ids={:?}", stopped.token_ids);
+        println!(
+            "STOP stopped={} stop_reason={:?}",
+            stopped.stopped, stopped.stop_reason
+        );
+        println!("STOP text={:?}", stopped.text);
+
+        let one_tok_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            temperature: 0.0,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let one_tok = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &one_tok_cfg)
+            .expect("max_new_tokens=1 golden must succeed");
+        println!("ONE token_ids={:?}", one_tok.token_ids);
+        println!(
+            "ONE stopped={} stop_reason={:?}",
+            one_tok.stopped, one_tok.stop_reason
+        );
+        println!("ONE text={:?}", one_tok.text);
+    }
+
+    /// `generate_q8` greedy decode (`temperature: 0.0`). Values captured from
+    /// `print_q8_generate_goldens`; identical to `generate_f16`'s greedy
+    /// golden for this fixture; `generate_q8_neon`'s diverges (see the note
+    /// on `generate_q8_neon_greedy_golden`).
+    ///
+    /// Mutation check: changing `max_new_tokens: 6` to `5` must turn
+    /// `token_ids` red (truncated sequence). `seed` is not the mutated field
+    /// here: at `temperature: 0.0` the sampler takes the degenerate-temperature
+    /// argmax short-circuit before the RNG is ever consulted, so a seed change
+    /// on a greedy golden cannot move the output.
+    #[test]
+    fn generate_q8_greedy_golden() {
+        let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
+        let tokenizer = nonzero_fixture_tokenizer_q8();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
+            .expect("greedy golden must succeed");
+        assert_eq!(
+            out.prompt_tokens, 5,
+            "the prompt must span several prefill positions"
+        );
+        assert_eq!(out.token_ids, vec![36, 80, 112, 62, 103, 86]);
+        assert!(!out.stopped);
+        assert_eq!(
+            out.stop_reason,
+            Some(crate::stop_reason::StopReason::Length)
+        );
+        assert_eq!(out.text, "aCbkbQa2bHbq");
+    }
+
+    /// `generate_q8` with temperature/top_k/top_p/repetition_penalty all set
+    /// (seeded sampling, not greedy).
+    ///
+    /// Mutation check: changing `top_k: 5` to `top_k: 1` must turn `token_ids`
+    /// red against this golden.
+    #[test]
+    fn generate_q8_seeded_sampling_golden() {
+        let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
+        let tokenizer = nonzero_fixture_tokenizer_q8();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.8,
+            top_k: 5,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            seed: Some(1234),
+            ..Default::default()
+        };
+        let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
+            .expect("seeded golden must succeed");
+        assert_eq!(out.token_ids, vec![36, 80, 103, 112, 87, 86]);
+        assert!(!out.stopped);
+        assert_eq!(
+            out.stop_reason,
+            Some(crate::stop_reason::StopReason::Length)
+        );
+        assert_eq!(out.text, "aCbkbHbQbrbq");
+    }
+
+    /// `generate_q8` stopping on a `stop_token_ids` match. `stop_tok = 80` is
+    /// the greedy golden's own second token (see `generate_q8_greedy_golden`),
+    /// so this proves an actual decode-loop stop.
+    ///
+    /// Mutation check: removing `stop_token_ids` must turn
+    /// `stopped`/`stop_reason`/`token_ids.len()` red against this golden.
+    #[test]
+    fn generate_q8_stop_token_golden() {
+        let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
+        let tokenizer = nonzero_fixture_tokenizer_q8();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            stop_token_ids: vec![80],
+            ..Default::default()
+        };
+        let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
+            .expect("stop-token golden must succeed");
+        assert_eq!(out.token_ids, vec![36]);
+        assert!(out.stopped);
+        assert_eq!(out.stop_reason, Some(crate::stop_reason::StopReason::Eos));
+        assert_eq!(out.text, "aC");
+    }
+
+    /// `generate_q8` with `max_new_tokens: 1`, the boundary case where the
+    /// decode loop must stop after exactly one token.
+    ///
+    /// Mutation check: changing `max_new_tokens` to `2` must turn
+    /// `token_ids.len()` red against this golden.
+    #[test]
+    fn generate_q8_max_new_tokens_one_golden() {
+        let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
+        let tokenizer = nonzero_fixture_tokenizer_q8();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            temperature: 0.0,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
+            .expect("max_new_tokens=1 golden must succeed");
+        assert_eq!(out.token_ids, vec![36]);
+        assert!(!out.stopped);
+        assert_eq!(
+            out.stop_reason,
+            Some(crate::stop_reason::StopReason::Length)
+        );
+        assert_eq!(out.text, "aC");
+    }
+
     /// `generate_q8` with `max_new_tokens == 0` must return zero generated tokens
     /// without running a forward pass or sampling anything.
     ///
@@ -1585,6 +2016,58 @@ mod tests {
         assert!(
             matches!(err, crate::error::InferenceError::InvalidInput(_)),
             "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    /// `generate_q8` must reject a `GenerateConfig` that sets `logprobs` with a
+    /// typed `InvalidInput` error before sampling any token (#585): this wrapper
+    /// has not wired per-step log-probability capture into its decode loop.
+    ///
+    /// Sibling of `generate_q8_rejects_grammar_config_before_sampling` /
+    /// `..._stop_strings_..` / `..._reasoning_budget_..`, which already cover the
+    /// other three `StandaloneCpu`-contract guards; this one was the gap.
+    /// Mutation sensitivity: removing the `check_logprobs_not_set`
+    /// call in `GenerationEntryContract::StandaloneCpu`'s `validate_capabilities`
+    /// arm makes the function proceed past the guard and attempt to forward with
+    /// empty weights, producing a panic or a non-`InvalidInput` error — this
+    /// assert fails either way.
+    #[test]
+    fn generate_q8_rejects_logprobs_config_before_sampling() {
+        use crate::error::InferenceError;
+        use std::collections::HashMap;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let weights = Q8ModelWeights {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            layers: vec![],
+        };
+
+        let gen_cfg = GenerateConfig {
+            logprobs: Some(0),
+            ..Default::default()
+        };
+
+        let result = generate_q8(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::InvalidInput(ref message))
+                    if message.contains("per-token logprobs are not yet supported")
+            ),
+            "generate_q8 must fail closed with the exact logprobs-unsupported \
+             InvalidInput (#585); got {result:?}"
         );
     }
 

@@ -268,6 +268,11 @@ fn bench_llm_f16() -> Vec<Metric> {
 
     if !dir.join("model.safetensors").exists() {
         eprintln!("[bench_suite] Qwen3.5-2B model not found, skipping f16 LLM bench");
+        // Machine-readable companion to the eprintln above: a paired run
+        // (scripts/bench-command.sh --durable base/head) checks this line on
+        // stdout so a checkpoint-absent invocation cannot silently read as a
+        // clean "no metrics changed" measurement.
+        println!("SKIP wrapper=f16 fn=generate_f16 reason=checkpoint_not_found path={model_dir}");
         return vec![];
     }
 
@@ -322,6 +327,12 @@ fn bench_llm_f16() -> Vec<Metric> {
         total_ms += elapsed_ms;
     }
 
+    // Printed only after `n_runs` successful `.expect()`-checked calls above
+    // (the warmup call's result is discarded and does not gate this line): a
+    // paired run greps for this to prove the wrapper it named actually ran,
+    // rather than trusting an unchanged metric to mean "no regression".
+    println!("ROUTE wrapper=f16 fn=generate_f16 calls={n_runs}");
+
     let tok_per_sec = total_tok as f64 / (total_ms / 1000.0);
     let avg_ms = total_ms / n_runs as f64;
 
@@ -355,6 +366,7 @@ fn bench_llm_q8() -> Vec<Metric> {
 
     if !dir.join("model.safetensors").exists() {
         eprintln!("[bench_suite] Qwen3.5-2B model not found, skipping Q8 LLM bench");
+        println!("SKIP wrapper=q8 fn=generate_q8 reason=checkpoint_not_found path={model_dir}");
         return vec![];
     }
 
@@ -404,6 +416,8 @@ fn bench_llm_q8() -> Vec<Metric> {
         total_ms += elapsed_ms;
     }
 
+    println!("ROUTE wrapper=q8 fn=generate_q8 calls={n_runs}");
+
     let tok_per_sec = total_tok as f64 / (total_ms / 1000.0);
     let avg_ms = total_ms / n_runs as f64;
 
@@ -437,6 +451,9 @@ fn bench_llm_q8_neon() -> Vec<Metric> {
 
     if !dir.join("model.safetensors").exists() {
         eprintln!("[bench_suite] Qwen3.5-2B model not found, skipping Q8 NEON bench");
+        println!(
+            "SKIP wrapper=q8_neon fn=generate_q8_neon reason=checkpoint_not_found path={model_dir}"
+        );
         return vec![];
     }
 
@@ -483,6 +500,8 @@ fn bench_llm_q8_neon() -> Vec<Metric> {
         total_tok += result.generated_tokens;
         total_ms += elapsed_ms;
     }
+
+    println!("ROUTE wrapper=q8_neon fn=generate_q8_neon calls={n_runs}");
 
     let tok_per_sec = total_tok as f64 / (total_ms / 1000.0);
     let avg_ms = total_ms / n_runs as f64;
@@ -834,6 +853,29 @@ fn main() {
     let run_gdn = run_all || args.iter().any(|a| a == "--gdn");
     let run_embed = run_all || args.iter().any(|a| a == "--embed");
 
+    // Select one LLM route per invocation, inside the `--llm` category: one of
+    // "base" (`Qwen35Model::generate`), "f16", "q8", "q8_neon", "metal". Absent
+    // (the default), every route in the category runs, unchanged from before
+    // this flag existed. Named, only that route runs -- so a paired
+    // base-vs-head measurement can isolate one standalone wrapper's `ROUTE`
+    // marker without the timing noise of running the other four.
+    const VALID_WRAPPERS: &[&str] = &["base", "f16", "q8", "q8_neon", "metal"];
+    let wrapper_filter: Option<&str> = match args.iter().position(|a| a == "--wrapper") {
+        None => None,
+        Some(i) => match args.get(i + 1).map(std::string::String::as_str) {
+            Some(v) if VALID_WRAPPERS.contains(&v) => Some(v),
+            Some(v) => {
+                eprintln!("[bench_suite] --wrapper {v:?} is not one of {VALID_WRAPPERS:?}");
+                std::process::exit(2);
+            }
+            None => {
+                eprintln!("[bench_suite] --wrapper requires a value, one of {VALID_WRAPPERS:?}");
+                std::process::exit(2);
+            }
+        },
+    };
+    let run_wrapper = |name: &str| wrapper_filter.is_none_or(|w| w == name);
+
     eprintln!("[bench_suite] Starting benchmark suite...");
     let t_total = Instant::now();
 
@@ -845,23 +887,29 @@ fn main() {
     }
 
     if run_llm {
-        eprintln!("[bench_suite] Running LLM benchmark (Qwen3.5-2B)...");
-        metrics.extend(bench_llm());
+        if run_wrapper("base") {
+            eprintln!("[bench_suite] Running LLM benchmark (Qwen3.5-2B)...");
+            metrics.extend(bench_llm());
+        }
 
         #[cfg(feature = "f16")]
-        {
+        if run_wrapper("f16") {
             eprintln!("[bench_suite] Running F16 LLM benchmark (Qwen3.5-2B)...");
             metrics.extend(bench_llm_f16());
         }
 
-        eprintln!("[bench_suite] Running Q8 LLM benchmark (Qwen3.5-2B)...");
-        metrics.extend(bench_llm_q8());
+        if run_wrapper("q8") {
+            eprintln!("[bench_suite] Running Q8 LLM benchmark (Qwen3.5-2B)...");
+            metrics.extend(bench_llm_q8());
+        }
 
-        eprintln!("[bench_suite] Running Q8 NEON LLM benchmark (Qwen3.5-2B)...");
-        metrics.extend(bench_llm_q8_neon());
+        if run_wrapper("q8_neon") {
+            eprintln!("[bench_suite] Running Q8 NEON LLM benchmark (Qwen3.5-2B)...");
+            metrics.extend(bench_llm_q8_neon());
+        }
 
         #[cfg(feature = "metal-gpu")]
-        {
+        if run_wrapper("metal") {
             eprintln!("[bench_suite] Running Metal GPU LLM benchmark (Qwen3.5-2B)...");
             metrics.extend(bench_llm_metal());
         }
