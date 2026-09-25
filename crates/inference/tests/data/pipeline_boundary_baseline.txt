@@ -47,7 +47,6 @@ src/bin/gramperf_profile.rs	crate::model::qwen35_config::Qwen35Config
 src/bin/lattice_serve.rs	crate::forward::metal_qwen35::ChatRole
 src/bin/lattice_serve.rs	crate::forward::metal_qwen35::MetalQwen35State
 src/bin/lattice_serve.rs	crate::model::bert::BertModel
-src/bin/lattice_serve.rs	crate::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID
 src/bin/lattice_serve.rs	crate::model::qwen35_config::Qwen35Config
 src/bin/lattice_serve.rs	crate::model::qwen35::model::Qwen35Model
 src/bin/lattice_serve.rs	crate::model::qwen35::test_support::tiny_zero_model
@@ -93,3 +92,5 @@ src/serve/metal_worker.rs	crate::model::qwen35_config::VisionModelConfig
 src/serve/mod.rs	crate::forward::metal_qwen35::ChatMessage
 src/serve/mod.rs	crate::forward::metal_qwen35::ChatRole
 src/serve/mod.rs	crate::forward::metal_qwen35::format_chat_template_parts
+src/serve/prepare.rs	crate::forward::metal_qwen35::ChatMessage
+src/serve/prepare.rs	crate::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID
