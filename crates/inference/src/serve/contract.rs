@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
 
-use super::prepare::QwenChatDefaults;
+use super::prompt_adapter::QwenChatDefaults;
 use super::{ApiError, REQUEST_BODY_LIMIT_BYTES};
 
 /// Maximum number of messages accepted in a single chat request, enforced

@@ -93,4 +93,7 @@ src/serve/mod.rs	crate::forward::metal_qwen35::ChatMessage
 src/serve/mod.rs	crate::forward::metal_qwen35::ChatRole
 src/serve/mod.rs	crate::forward::metal_qwen35::format_chat_template_parts
 src/serve/prepare.rs	crate::forward::metal_qwen35::ChatMessage
-src/serve/prepare.rs	crate::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID
+src/serve/prompt_adapter.rs	crate::model::config_file::read_config_json_bounded
+src/serve/prompt_adapter.rs	crate::model::gemma4_config::Gemma4Config
+src/serve/prompt_adapter.rs	crate::model::gemma4_config::resolve_stop_token_ids
+src/serve/prompt_adapter.rs	crate::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID

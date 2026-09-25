@@ -113,6 +113,8 @@ pub mod metal_worker;
 pub mod metrics;
 /// Chat-request preparation shared by the serving binaries.
 pub mod prepare;
+/// Per-family chat prompt adapters used by request preparation.
+mod prompt_adapter;
 /// Gate-free routing facade for the serving path (ADR-094 decision 2).
 pub mod routing;
 

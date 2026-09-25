@@ -22,6 +22,14 @@
 //!                  `lattice_serve` profile, `serve::prepare::build_cfg`, then
 //!                  `serve::into_engine_chat_messages`. No render or tokenize
 //!                  happens in this handler.
+//!   gemma-cpu      Gemma 4 E2B text on a safetensors checkpoint, CPU.
+//!                  Preparation: `serve::prepare::prepare_gemma_chat_request`
+//!                  (validate, the Gemma prompt adapter's defaults, render
+//!                  with the checkpoint's chat template, tokenize, context
+//!                  check) plus the prompt ids. First token:
+//!                  `Gemma4Model::generate_streaming_with_cancel`. No serving
+//!                  binary routes Gemma yet, so this route measures the
+//!                  preparation entry the servers will call.
 //!
 //! The two Metal routes share one preparation path after the handler: both
 //! submit to `MetalWorkerClient::submit_with_lora`, whose admission gate
@@ -33,13 +41,13 @@
 //!
 //! Timed regions, per measured run:
 //!   prepare_ms         request JSON -> validated request -> handler output
-//!                      (for `cpu`/`lattice-metal` this includes the render,
-//!                      tokenize and context-window check).
+//!                      (for `cpu`/`lattice-metal`/`gemma-cpu` this includes
+//!                      the render, tokenize and context-window check).
 //!   worker_prepare_ms  Metal routes: the worker's render, tokenize and
 //!                      window check, called here on the same functions.
 //!   admit_ms           Metal routes: `submit_with_lora`, the admission
 //!                      decision plus enqueue.
-//!   first_token_ms     `cpu`: the generate call up to its first streamed
+//!   first_token_ms     `cpu`/`gemma-cpu`: the generate call up to its first streamed
 //!                      delta. Metal routes: from submit to the first
 //!                      `WorkerEvent::Delta`, which also contains the worker's
 //!                      own render, tokenize and window check.
@@ -54,8 +62,10 @@
 //! refused with the contract's exact error and is not timed). Every positive
 //! request streams. Each run prefixes its first message with the run number so
 //! the Metal worker's cross-turn prefix cache cannot reuse the previous run's
-//! prompt. A Gemma chat case is out of scope: no Gemma prompt renderer exists
-//! in the serving path yet.
+//! prompt. `gemma-cpu` runs `control` and `multi_turn`; Gemma has no
+//! reasoning-budget mode, so its `reasoning` case, like `unsupported_role` and
+//! `unsupported_modality` (an image part on a text-only model), must be refused
+//! with the contract's error code and is not timed.
 //!
 //! Not covered: `lattice_serve`'s raw-body pre-checks (duplicate JSON members,
 //! content-part limits) and its structured-output admission are private to that
@@ -63,8 +73,9 @@
 //! `lattice serve` handler does.
 //!
 //! Env:
-//!   BENCH_ROUTE        cpu | lattice-metal | lattice-serve (required)
-//!   LATTICE_MODEL_DIR  checkpoint directory (default ~/.lattice/models/qwen3.5-0.8b)
+//!   BENCH_ROUTE        cpu | lattice-metal | lattice-serve | gemma-cpu (required)
+//!   LATTICE_MODEL_DIR  checkpoint directory (default ~/.lattice/models/qwen3.5-0.8b,
+//!                      or ~/.lattice/models/gemma-4-e2b-it for gemma-cpu)
 //!   BENCH_RUNS         measured runs per case, after one untimed warmup (default 5)
 //!
 //! Output:
@@ -73,6 +84,7 @@
 //!   RESULT route=<r> case=<c> run=<n> prompt_tokens=<n> prepare_ms=<f>
 //!     worker_prepare_ms=<f|na> admit_ms=<f|na> first_token_ms=<f>
 //!   RESULT route=<r> case=unsupported_role refused=1 code=<code>
+//!   RESULT route=gemma-cpu case=<reasoning|unsupported_modality> refused=1 code=<code>
 //!   SKIP route=<r> reason=<...>   (exit status 2: nothing was measured)
 //!
 //! The Metal routes need `--features f16,metal-gpu,serve,bench-internals` and
@@ -87,7 +99,8 @@ use lattice_inference::serve::contract::{
 };
 use lattice_inference::serve::into_engine_chat_messages;
 use lattice_inference::serve::prepare::{
-    PreparedChatRequest, build_cfg, lattice_gen_cfg, prepare_chat_request,
+    GemmaPromptAdapter, PreparedChatRequest, PreparedGemmaChatRequest, build_cfg, lattice_gen_cfg,
+    prepare_chat_request, prepare_gemma_chat_request,
 };
 use serde_json::json;
 
@@ -125,12 +138,14 @@ metal_only! {
 const LATTICE_SERVE_DEFAULT_MAX_TOKENS: usize = 512;
 const REFUSED_MESSAGE: &str = "role 'tool' is not supported by this server";
 const REFUSED_CODE: &str = "unsupported_feature";
+const VISION_REFUSED_CODE: &str = "vision_unsupported";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {
     Cpu,
     LatticeMetal,
     LatticeServe,
+    GemmaCpu,
 }
 
 impl Route {
@@ -139,8 +154,9 @@ impl Route {
             "cpu" => Ok(Self::Cpu),
             "lattice-metal" => Ok(Self::LatticeMetal),
             "lattice-serve" => Ok(Self::LatticeServe),
+            "gemma-cpu" => Ok(Self::GemmaCpu),
             other => Err(format!(
-                "BENCH_ROUTE={other:?} must be cpu, lattice-metal or lattice-serve"
+                "BENCH_ROUTE={other:?} must be cpu, lattice-metal, lattice-serve or gemma-cpu"
             )),
         }
     }
@@ -150,6 +166,7 @@ impl Route {
             Self::Cpu => "cpu",
             Self::LatticeMetal => "lattice-metal",
             Self::LatticeServe => "lattice-serve",
+            Self::GemmaCpu => "gemma-cpu",
         }
     }
 }
@@ -162,6 +179,7 @@ enum Case {
 }
 
 const POSITIVE_CASES: [Case; 3] = [Case::Control, Case::MultiTurn, Case::Reasoning];
+const GEMMA_POSITIVE_CASES: [Case; 2] = [Case::Control, Case::MultiTurn];
 
 impl Case {
     fn name(self) -> &'static str {
@@ -218,6 +236,21 @@ fn unsupported_role_body() -> Vec<u8> {
     .into_bytes()
 }
 
+fn unsupported_modality_body() -> Vec<u8> {
+    json!({
+        "model": MODEL_ID,
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe this image."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]}
+        ],
+    })
+    .to_string()
+    .into_bytes()
+}
+
 fn parse_body(body: &[u8]) -> Result<ChatRequest, String> {
     serde_json::from_slice::<ChatRequest>(body).map_err(|e| format!("request body: {e}"))
 }
@@ -257,6 +290,40 @@ metal_only! {
             let cfg = build_cfg(&validated);
             into_engine_chat_messages(validated.messages).map(|messages| (messages, cfg))
         }))
+    }
+}
+
+/// Gemma E2B text preparation, with the `lattice serve` defaults.
+fn gemma_prepare(
+    adapter: &GemmaPromptAdapter,
+    body: &[u8],
+    tokenize_len: impl FnOnce(&str) -> usize,
+    max_context: usize,
+) -> Result<Result<PreparedGemmaChatRequest, ApiError>, String> {
+    let req = parse_body(body)?;
+    Ok(prepare_gemma_chat_request(
+        adapter,
+        &req,
+        MODEL_ID,
+        LATTICE_DEFAULT_MAX_TOKENS,
+        LATTICE_MAX_TOKENS_CAP,
+        tokenize_len,
+        || max_context,
+    ))
+}
+
+/// Requires a refusal carrying `expected` as its code.
+fn check_refusal_code<T>(
+    case: &str,
+    outcome: Result<T, ApiError>,
+    expected: &'static str,
+) -> Result<&'static str, String> {
+    match outcome {
+        Ok(_) => Err(format!("{case}: the request was accepted")),
+        Err(ApiError::BadRequest { code, .. }) if code == expected => Ok(code),
+        Err(other) => Err(format!(
+            "{case}: expected BadRequest {expected:?}, got {other:?}"
+        )),
     }
 }
 
@@ -317,15 +384,41 @@ fn run(route: Route) -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => 5,
     };
     let home = std::env::var("HOME")?;
+    let default_model = match route {
+        Route::GemmaCpu => "gemma-4-e2b-it",
+        _ => "qwen3.5-0.8b",
+    };
     let model_dir = std::env::var("LATTICE_MODEL_DIR")
-        .unwrap_or_else(|_| format!("{home}/.lattice/models/qwen3.5-0.8b"));
+        .unwrap_or_else(|_| format!("{home}/.lattice/models/{default_model}"));
     let dir = std::path::PathBuf::from(&model_dir);
+    if route == Route::GemmaCpu {
+        let missing: Vec<&str> = [
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "model.safetensors",
+        ]
+        .into_iter()
+        .filter(|name| !dir.join(name).is_file())
+        .collect();
+        if !missing.is_empty() {
+            skip(
+                route,
+                &format!(
+                    "checkpoint_absent model_dir={model_dir} missing={}",
+                    missing.join(",")
+                ),
+            );
+        }
+        return run_gemma_cpu(&dir, runs);
+    }
     let tokenizer_path = dir.join("tokenizer.json");
     let format = detect_format(&dir);
     let format_ok = match route {
         Route::Cpu => matches!(format, ModelFormat::Safetensors),
         Route::LatticeMetal => matches!(format, ModelFormat::Q4),
         Route::LatticeServe => matches!(format, ModelFormat::Q4 | ModelFormat::Safetensors),
+        Route::GemmaCpu => false,
     };
     if !format_ok || !tokenizer_path.is_file() {
         skip(
@@ -336,7 +429,122 @@ fn run(route: Route) -> Result<(), Box<dyn std::error::Error>> {
     match route {
         Route::Cpu => run_cpu(&dir, runs),
         Route::LatticeMetal | Route::LatticeServe => run_metal(route, &dir, format, runs),
+        Route::GemmaCpu => Err("gemma-cpu is dispatched before format detection".into()),
     }
+}
+
+fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error::Error>> {
+    use lattice_inference::Tokenizer as _;
+    use lattice_inference::model::gemma4_config::Gemma4Config;
+    use lattice_inference::model::gemma4_model::Gemma4Model;
+    use lattice_inference::tokenizer::GemmaBpeTokenizer;
+    use std::time::Instant;
+
+    let route = Route::GemmaCpu;
+    println!("ROUTE route={} binary=lattice backend=cpu", route.name());
+    let max_context = Gemma4Config::from_model_dir(dir)?.max_position_embeddings;
+    // Truncation at the context window, never below it, so the context check
+    // sees the whole prompt. `tokenize_batch` pads to the longest input rather
+    // than to `max_seq_len`, so a one-prompt batch carries no padding.
+    let tokenizer = GemmaBpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json"))?
+        .with_max_seq_len(max_context);
+    let adapter = GemmaPromptAdapter::from_model_dir(dir, &tokenizer)?;
+    let load = Instant::now();
+    let model = Gemma4Model::from_safetensors(dir)?;
+    println!("LOAD route={} load_ms={:.3}", route.name(), ms(load));
+
+    for case in GEMMA_POSITIVE_CASES {
+        for run in 0..=runs {
+            let body = case.body(run);
+            let start = Instant::now();
+            let mut tokenized = None;
+            let prepared = gemma_prepare(
+                &adapter,
+                &body,
+                |p| {
+                    let batch = tokenizer.tokenize_batch(&[p]);
+                    let len = batch.first().map_or(0, |t| t.pre_truncation_len);
+                    tokenized = batch.into_iter().next();
+                    len
+                },
+                max_context,
+            )?
+            .map_err(|e| format!("{}: {e:?}", case.name()))?;
+            let tokenized =
+                tokenized.ok_or_else(|| format!("{}: prompt not tokenized", case.name()))?;
+            if tokenized.real_length != tokenized.pre_truncation_len {
+                return Err(format!("{}: prompt was truncated", case.name()).into());
+            }
+            let prompt_ids = &tokenized.input_ids[..tokenized.real_length];
+            let prepare_ms = ms(start);
+            let prompt_tokens = prompt_ids.len();
+
+            let start = Instant::now();
+            let mut first_token_ms = None;
+            model.generate_streaming_with_cancel(
+                prompt_ids,
+                &prepared.gen_cfg,
+                |_| {
+                    first_token_ms = Some(ms(start));
+                    false
+                },
+                || false,
+            )?;
+            let first_token_ms = first_token_ms
+                .ok_or_else(|| format!("{}: generation produced no token", case.name()))?;
+            if run == 0 {
+                continue;
+            }
+            println!(
+                "RESULT route={} case={} run={run} prompt_tokens={prompt_tokens} \
+                 prepare_ms={prepare_ms:.3} worker_prepare_ms=na admit_ms=na \
+                 first_token_ms={first_token_ms:.3}",
+                route.name(),
+                case.name(),
+            );
+        }
+    }
+    let token_len = |p: &str| {
+        tokenizer
+            .tokenize_batch(&[p])
+            .first()
+            .map_or(0, |t| t.pre_truncation_len)
+    };
+    let code = check_refusal(gemma_prepare(
+        &adapter,
+        &unsupported_role_body(),
+        token_len,
+        max_context,
+    )?)?;
+    println!(
+        "RESULT route={} case=unsupported_role refused=1 code={code}",
+        route.name()
+    );
+    let code = check_refusal_code(
+        Case::Reasoning.name(),
+        gemma_prepare(&adapter, &Case::Reasoning.body(1), token_len, max_context)?,
+        REFUSED_CODE,
+    )?;
+    println!(
+        "RESULT route={} case={} refused=1 code={code}",
+        route.name(),
+        Case::Reasoning.name()
+    );
+    let code = check_refusal_code(
+        "unsupported_modality",
+        gemma_prepare(
+            &adapter,
+            &unsupported_modality_body(),
+            token_len,
+            max_context,
+        )?,
+        VISION_REFUSED_CODE,
+    )?;
+    println!(
+        "RESULT route={} case=unsupported_modality refused=1 code={code}",
+        route.name()
+    );
+    Ok(())
 }
 
 fn run_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -603,7 +811,12 @@ mod tests {
 
     #[test]
     fn route_names_round_trip_and_unknown_routes_are_refused() {
-        for route in [Route::Cpu, Route::LatticeMetal, Route::LatticeServe] {
+        for route in [
+            Route::Cpu,
+            Route::LatticeMetal,
+            Route::LatticeServe,
+            Route::GemmaCpu,
+        ] {
             assert_eq!(Route::parse(route.name()), Ok(route));
         }
         assert!(Route::parse("metal").is_err());
@@ -654,6 +867,84 @@ mod tests {
         assert_eq!(
             check_refusal(lattice_serve_prepare(&body, TEST_CONTEXT).unwrap()),
             Ok(REFUSED_CODE)
+        );
+    }
+
+    /// The Gemma adapter over the committed E2B config and tokenizer fixtures,
+    /// with the checkpoint's recorded `generation_config.json`.
+    fn gemma_adapter() -> GemmaPromptAdapter {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gemma4");
+        let matrix: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(fixtures.join("chat_template_matrix.json")).unwrap(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            fixtures.join("e2b_config.json"),
+            dir.path().join("config.json"),
+        )
+        .unwrap();
+        std::fs::copy(
+            fixtures.join("tokenizer/tokenizer_config.json"),
+            dir.path().join("tokenizer_config.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            matrix["generation_config_json"].as_str().unwrap(),
+        )
+        .unwrap();
+        let tokenizer = lattice_inference::tokenizer::GemmaBpeTokenizer::from_tokenizer_json(
+            &fixtures.join("tokenizer/tokenizer.json"),
+        )
+        .unwrap();
+        GemmaPromptAdapter::from_model_dir(dir.path(), &tokenizer).unwrap()
+    }
+
+    #[test]
+    fn gemma_route_prepares_its_positive_cases_and_refuses_the_negatives() {
+        let adapter = gemma_adapter();
+        for case in GEMMA_POSITIVE_CASES {
+            let prepared = gemma_prepare(&adapter, &case.body(1), str::len, TEST_CONTEXT)
+                .unwrap()
+                .unwrap_or_else(|e| panic!("{}: {e:?}", case.name()));
+            assert!(prepared.stream, "{}", case.name());
+            assert!(
+                prepared.prompt.starts_with("<bos><|turn>"),
+                "{}",
+                case.name()
+            );
+            assert!(prepared.prompt.contains("Request 1."), "{}", case.name());
+            assert!(!prepared.gen_cfg.enable_thinking, "{}", case.name());
+        }
+        assert_eq!(
+            check_refusal(
+                gemma_prepare(&adapter, &unsupported_role_body(), str::len, TEST_CONTEXT).unwrap()
+            ),
+            Ok(REFUSED_CODE)
+        );
+        assert_eq!(
+            check_refusal_code(
+                "reasoning",
+                gemma_prepare(&adapter, &Case::Reasoning.body(1), str::len, TEST_CONTEXT).unwrap(),
+                REFUSED_CODE,
+            ),
+            Ok(REFUSED_CODE)
+        );
+        assert_eq!(
+            check_refusal_code(
+                "unsupported_modality",
+                gemma_prepare(
+                    &adapter,
+                    &unsupported_modality_body(),
+                    str::len,
+                    TEST_CONTEXT
+                )
+                .unwrap(),
+                VISION_REFUSED_CODE,
+            ),
+            Ok(VISION_REFUSED_CODE)
         );
     }
 

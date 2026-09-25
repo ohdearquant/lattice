@@ -3,7 +3,8 @@
 **Status**: Accepted (2026-09-15)\
 **Date**: 2026-09-15\
 **Amended**: 2026-09-25, RNG ownership (see "Amendment, 2026-09-25" under D1's roles);
-2026-09-25, requested chat options (see "Amendment, 2026-09-25" under D3)\
+2026-09-25, requested chat options (see "Amendment, 2026-09-25" under D3);
+2026-09-25, model prompt adapters (see "Amendment, 2026-09-25: model prompt adapters" under D3)\
 **Crate**: lattice-inference
 
 <!-- deno-fmt-ignore-start -->
@@ -295,6 +296,21 @@ chosen over a stable public one because the worker-local factory (R07) will move
 applied. `#[doc(hidden)]` is a convention, not a semver guarantee, and this type is not a
 semver-covered surface. R07 owes a disposition: promote it to a stable type through the separate
 API/semver review above, or fold it into the factory.
+
+#### Amendment, 2026-09-25: model prompt adapters
+
+Each model family's chat conventions live in one crate-private prompt adapter: rendering normalized
+messages to the prompt, the family's stop token ids, and the defaults step over
+`RequestedChatOptions`. The Qwen adapter wraps the Qwen defaults step above unchanged. The Gemma E2B
+text adapter renders exactly what the checkpoint's `chat_template.jinja` renders for string-content
+system, user and assistant turns, reads its stop ids and BOS spelling from the checkpoint, and applies
+no thinking default: the template's opt-in `enable_thinking` mode has no request switch, and the Gemma
+CPU session cannot enforce a reasoning budget, so a positive `reasoning_budget`, logprobs, `stop`
+strings, images and typed content parts are refused with the contract's existing codes. The Gemma
+preparation entry (`serve::prepare::prepare_gemma_chat_request`), its output type and the adapter
+type are `pub` and `#[doc(hidden)]` only because the measurement example calls them; they carry the
+same no-semver-guarantee status and the same R07 disposition as `RequestedChatOptions`. Routing Gemma
+through the serving binaries remains R08/R09.
 
 ### D4. Reconcile existing decisions without weakening their tests
 
