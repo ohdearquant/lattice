@@ -140,6 +140,17 @@ impl Qwen35Model {
         self.config.eos_token_id = eos_token_id;
     }
 
+    /// **Unstable**: raise the tokenizer's sequence cap to at least `max_seq_len`.
+    ///
+    /// Serving callers should pass [`Self::max_context`] before sharing the model
+    /// so tokenization preserves admitted prompts. Smaller values leave the cap
+    /// unchanged. This does not extend the model's context window.
+    pub fn ensure_tokenizer_max_seq_len(&mut self, max_seq_len: usize) {
+        if self.tokenizer.max_seq_len() < max_seq_len {
+            self.tokenizer = self.tokenizer.with_max_seq_len(max_seq_len);
+        }
+    }
+
     /// **Unstable**: access the BPE tokenizer.
     pub fn tokenizer(&self) -> &BpeTokenizer {
         &self.tokenizer

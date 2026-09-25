@@ -46,6 +46,18 @@ pub fn tiny_zero_model() -> Qwen35Model {
     tiny_zero_model_with_tokenizer(DEFAULT_TINY_TOK_JSON)
 }
 
+/// Same as [`tiny_zero_model`], with a caller-specified context window.
+pub fn tiny_zero_model_with_context(max_context: usize) -> Qwen35Model {
+    let mut model = tiny_zero_model();
+    model.config.max_position_embeddings = max_context;
+    model.rope = RopeTable::new(
+        model.config.rope_dim(),
+        max_context,
+        model.config.rope_theta,
+    );
+    model
+}
+
 /// Same as [`tiny_zero_model`], with a caller-supplied tokenizer JSON (e.g.
 /// to add a special token like `</think>` at a known id).
 pub fn tiny_zero_model_with_tokenizer(tok_json: &str) -> Qwen35Model {
