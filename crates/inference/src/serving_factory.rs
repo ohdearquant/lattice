@@ -1,7 +1,7 @@
 //! Select the serving family before building worker-local execution state.
 
-use super::serving_runtime::{QwenMetalRuntime, RuntimeFactory, ServingRuntime};
 use crate::forward::metal_qwen35::MetalQwen35State;
+use crate::model::serving_runtime::{QwenMetalRuntime, RuntimeFactory, ServingRuntime};
 use crate::serve::lora::{AdapterIndex, ResidencyLimits};
 use crate::serve::metal_worker::{VisionRuntime, WorkerMetadata, serving_tokenizer};
 use crate::serve::prepare::PreparationHandle;

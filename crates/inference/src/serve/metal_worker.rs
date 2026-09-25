@@ -59,9 +59,9 @@ use crate::forward::metal_qwen35::{
 };
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35_config::{Qwen35Config, VisionModelConfig};
-use crate::model::serving_factory::ServingFactory;
 use crate::serve::ApiError;
 use crate::serve::prepare::PreparationHandle;
+use crate::serving_factory::ServingFactory;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::vision::VisionError;

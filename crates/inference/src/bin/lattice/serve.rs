@@ -338,10 +338,10 @@ impl ModelBackend {
         residency_limits: lattice_inference::serve::lora::ResidencyLimits,
         preload_vision: bool,
     ) -> Result<(Self, usize), String> {
-        use lattice_inference::model::serving_factory::ServingFactory;
         use lattice_inference::serve::metal_worker::{
             ContextWindowPolicy, MetalWorker, StartupError, VisionRuntime, WorkerMetadata,
         };
+        use lattice_inference::serving_factory::ServingFactory;
 
         let tokenizer_path = tokenizer_dir
             .as_deref()

@@ -101,7 +101,6 @@ mod imp {
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::model::serving_factory::ServingFactory;
     use lattice_inference::model_format::{self, ModelFormat};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatReq, GenerationDefaults, ServeProfile, is_message_flood_error,
@@ -124,6 +123,7 @@ mod imp {
     };
     use lattice_inference::serve::metrics::ServeMetrics;
     use lattice_inference::serve::prepare::build_cfg;
+    use lattice_inference::serving_factory::ServingFactory;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::{BertModel, BertPooling};
     use serde_json::{Value, json};

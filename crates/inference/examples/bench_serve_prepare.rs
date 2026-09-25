@@ -649,13 +649,13 @@ fn run_metal(
     use lattice_inference::forward::metal_qwen35::{MetalQwen35State, format_chat_template};
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::model::serving_factory::ServingFactory;
     use lattice_inference::model_format::ModelFormat;
     use lattice_inference::serve::lora::ResidencyLimits;
     use lattice_inference::serve::metal_worker::bench_support::check_prompt_fits_window;
     use lattice_inference::serve::metal_worker::{
         ContextWindowPolicy, MetalWorker, VisionRuntime, WorkerEvent, WorkerMetadata,
     };
+    use lattice_inference::serving_factory::ServingFactory;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use std::time::Instant;
 
