@@ -735,6 +735,25 @@ fn check_prompt_fits_window(
     Ok(())
 }
 
+/// Measurement access to worker internals, for the `bench_serve_prepare`
+/// example only. Not a stable API.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_support {
+    use super::{ApiError, ContextWindowPolicy, GenerateConfig};
+
+    /// The worker's context-window admission check, exactly as the Metal
+    /// worker applies it to a rendered, tokenized prompt before generation.
+    pub fn check_prompt_fits_window(
+        policy: ContextWindowPolicy,
+        model_max_context: usize,
+        prompt_len: usize,
+        cfg: &GenerateConfig,
+    ) -> Result<(), ApiError> {
+        super::check_prompt_fits_window(policy, model_max_context, prompt_len, cfg)
+    }
+}
+
 /// Dequeue -> cancel-check -> generate -> reply, serialized on whatever
 /// thread calls this (the dedicated Metal worker thread in production; a
 /// plain `std::thread::spawn` in this module's own tests).

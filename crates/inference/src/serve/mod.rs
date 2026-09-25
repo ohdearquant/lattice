@@ -111,6 +111,8 @@ pub mod metal_worker;
 /// from its own request-completion hook (currently `lattice_serve.rs`'s
 /// `emit_serve_event`).
 pub mod metrics;
+/// Chat-request preparation shared by the serving binaries.
+pub mod prepare;
 /// Gate-free routing facade for the serving path (ADR-094 decision 2).
 pub mod routing;
 

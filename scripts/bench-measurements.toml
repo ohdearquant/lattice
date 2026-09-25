@@ -87,6 +87,7 @@ paths = [
     "crates/inference/examples/bench_q4_prefill.rs",
     "crates/inference/examples/bench_q8_prefill.rs",
     "crates/inference/examples/bench_quality.rs",
+    "crates/inference/examples/bench_serve_prepare.rs",
     "crates/inference/examples/bench_simdgroup.rs",
     "crates/inference/examples/bench_stability.rs",
     "crates/inference/examples/bench_suite.rs",

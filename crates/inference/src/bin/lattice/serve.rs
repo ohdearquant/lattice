@@ -16,19 +16,21 @@ use lattice_inference::Tokenizer;
 // The canonical ChatML renderer is CPU-available (#668): this binary's
 // CPU serve path renders normalized contract messages through the same
 // formatter core the Metal worker uses, with no bespoke template copy.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use lattice_inference::forward::metal_qwen35::ChatMessage;
 #[cfg(test)]
 use lattice_inference::forward::metal_qwen35::format_chat_template;
-use lattice_inference::serve::contract::{
-    ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
-    ValidatedChatRequest as ContractValidatedChatRequest,
-    normalize_request_with_context_and_budget, validate_context_window_with_budget,
-};
+use lattice_inference::serve::contract::ChatRequest as ChatCompletionRequest;
 #[cfg(test)]
 use lattice_inference::serve::contract::{
-    ContentPart, Message, MessageContent, ResponseFormat, normalize_request,
+    ContentPart, GenerationDefaults, Message, MessageContent, ResponseFormat, ServeProfile,
+    ValidatedChatRequest as ContractValidatedChatRequest, normalize_request,
 };
-use lattice_inference::serve::{format_normalized_chat_template, into_engine_chat_messages};
+#[cfg(test)]
+use lattice_inference::serve::into_engine_chat_messages;
+use lattice_inference::serve::prepare::{
+    PreparedChatRequest, lattice_gen_cfg, prepare_chat_request,
+};
 use lattice_inference::{GenerateOutput, TokenLogprob};
 use serde::Serialize;
 use serde_json::Value;
@@ -950,94 +952,6 @@ fn validate_chat_request(
     )
 }
 
-/// Output of the full pre-generation validation cascade, ready for
-/// `gen_cfg` construction.
-#[derive(Debug)]
-struct PreparedChatRequest {
-    messages: Vec<ChatMessage>,
-    max_tokens: usize,
-    temperature: f32,
-    top_p: f32,
-    logprobs: Option<usize>,
-    prompt: String,
-    stop_strings: Vec<String>,
-    reasoning_budget: Option<usize>,
-    seed: Option<u64>,
-    stream: bool,
-}
-
-/// Production entry point for the shared context-aware normalization
-/// cascade: supplies the prompt-aware context-window check (rendering the
-/// chat template, tokenizing it, then calling the shared
-/// `validate_context_window_with_budget`) as the context check, in the
-/// exact order the original inline `chat_completions` cascade used:
-/// `stop` is validated *last*, after both the served-model hard
-/// requirements and the context-window check that guards against a
-/// panic in the blocking generation path. A request that is both
-/// over-context and carries a malformed `stop` field must fail with
-/// `context_length_exceeded`, not a stop-parsing error — pinned by
-/// `cm_serve_context_window_checked_before_stop_parsing`.
-///
-/// `tokenize_len`/`max_context` are threaded through as thunks (rather
-/// than a `&ModelBackend`) so this whole cascade — including the
-/// ordering — is testable without constructing a real model: the
-/// rendered `prompt` that `tokenize_len` needs only exists once
-/// `validate_chat_request` has already run, so the thunk form lets a
-/// test control the token count `check_context_window` sees without
-/// having to fake a tokenizer.
-fn prepare_chat_request(
-    req: &ChatCompletionRequest,
-    model_id: &str,
-    default_max_tokens: usize,
-    max_tokens_cap: usize,
-    vision_supported: bool,
-    tokenize_len: impl FnOnce(&str) -> usize,
-    max_context: impl FnOnce() -> usize,
-) -> Result<PreparedChatRequest, ApiError> {
-    let (validated, prompt) = normalize_request_with_context_and_budget(
-        req,
-        GenerationDefaults::standard(default_max_tokens),
-        ServeProfile::lattice(model_id, max_tokens_cap).with_vision_support(vision_supported),
-        |messages, max_tokens, reasoning_budget| {
-            let prompt = format_normalized_chat_template(messages);
-            let prompt_token_count = tokenize_len(&prompt);
-            validate_context_window_with_budget(
-                prompt_token_count,
-                max_tokens,
-                reasoning_budget,
-                max_context(),
-            )?;
-            Ok(prompt)
-        },
-    )?;
-    let ContractValidatedChatRequest {
-        messages,
-        max_tokens,
-        temperature,
-        top_p,
-        logprobs,
-        stop_strings,
-        reasoning_budget,
-        seed,
-        stream,
-        ..
-    } = validated;
-    let messages = into_engine_chat_messages(messages)?;
-
-    Ok(PreparedChatRequest {
-        messages,
-        max_tokens,
-        temperature,
-        top_p,
-        logprobs,
-        prompt,
-        stop_strings,
-        reasoning_budget,
-        seed,
-        stream,
-    })
-}
-
 /// The `on_token`/`should_cancel` composition for CPU-style streaming
 /// generation, constructed in exactly ONE place and shared by the real
 /// `ModelBackend::Cpu` arm and the test-only `CpuFakeGenerate` arm below
@@ -1214,14 +1128,15 @@ async fn chat_completions_with_request(
         || state.model.max_context(),
     )?;
 
-    let mut gen_cfg = lattice_inference::GenerateConfig::default();
-    gen_cfg.max_new_tokens = max_tokens;
-    gen_cfg.temperature = temperature;
-    gen_cfg.top_p = top_p;
-    gen_cfg.seed = seed;
-    gen_cfg.stop_strings = stop_strings;
-    gen_cfg.reasoning_budget = reasoning_budget;
-    gen_cfg.logprobs = logprobs;
+    let gen_cfg = lattice_gen_cfg(
+        max_tokens,
+        temperature,
+        top_p,
+        seed,
+        stop_strings,
+        reasoning_budget,
+        logprobs,
+    );
 
     // Metal-only: reuse the exact messages normalized alongside the CPU
     // prompt, so role/content validation and allocation happen once.
