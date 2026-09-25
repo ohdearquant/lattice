@@ -1,0 +1,429 @@
+{
+  "description": "Gemma 4 E2B chat_template.jinja rendered with add_generation_prompt=True over a fixed message matrix; the expected prompt strings for the Gemma prompt adapter",
+  "generator": "scripts/gemma4_chat_template_matrix.py",
+  "command": "uv run --no-project --with jinja2==3.1.6 python scripts/gemma4_chat_template_matrix.py --model-dir <gemma-4-e2b-it>",
+  "environment": "jinja2.sandbox.ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols]); every case also renders identically under jinja2.Environment()",
+  "jinja2": "3.1.6",
+  "unicode_version": "15.0.0",
+  "source_repo": "google/gemma-4-E2B-it",
+  "revision": "9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf",
+  "files": {
+    "chat_template.jinja": {
+      "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"
+    },
+    "tokenizer_config.json": {
+      "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df"
+    },
+    "generation_config.json": {
+      "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+    },
+    "config.json": {
+      "sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330"
+    },
+    "tokenizer.json": {
+      "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+    }
+  },
+  "render_kwargs": {
+    "add_generation_prompt": true,
+    "tools": null,
+    "documents": null,
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "unk_token": "<unk>",
+    "pad_token": "<pad>",
+    "mask_token": "<mask>"
+  },
+  "thinking_mode": {
+    "template_variable": "enable_thinking",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the capital of France?"
+      }
+    ],
+    "rendered_with_enable_thinking": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n"
+  },
+  "generation_config_json": "{\n  \"bos_token_id\": 2,\n  \"do_sample\": true,\n  \"eos_token_id\": [\n    1,\n    106,\n    50\n  ],\n  \"pad_token_id\": 0,\n  \"temperature\": 1.0,\n  \"top_k\": 64,\n  \"top_p\": 0.95,\n  \"transformers_version\": \"5.5.0.dev0\"\n}\n",
+  "text_config_eos_token_id": 1,
+  "stop_token_ids": [
+    1,
+    50,
+    106
+  ],
+  "control_token_ids": {
+    "bos": 2,
+    "eos": 1,
+    "start_of_turn": 105,
+    "end_of_turn": 106,
+    "think": 98,
+    "start_of_tool_response": 50
+  },
+  "python_strip_whitespace": [
+    9,
+    10,
+    11,
+    12,
+    13,
+    28,
+    29,
+    30,
+    31,
+    32,
+    133,
+    160,
+    5760,
+    8192,
+    8193,
+    8194,
+    8195,
+    8196,
+    8197,
+    8198,
+    8199,
+    8200,
+    8201,
+    8202,
+    8232,
+    8233,
+    8239,
+    8287,
+    12288
+  ],
+  "cases": [
+    {
+      "name": "single_user",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France?"
+        }
+      ],
+      "rendered": "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "system_user",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a concise assistant."
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "rendered": "<bos><|turn>system\nYou are a concise assistant.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "multi_turn",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a concise assistant."
+        },
+        {
+          "role": "user",
+          "content": "Name a prime number between 10 and 20."
+        },
+        {
+          "role": "assistant",
+          "content": "13 is a prime number between 10 and 20."
+        },
+        {
+          "role": "user",
+          "content": "Name another one and explain why it is prime."
+        }
+      ],
+      "rendered": "<bos><|turn>system\nYou are a concise assistant.<turn|>\n<|turn>user\nName a prime number between 10 and 20.<turn|>\n<|turn>model\n13 is a prime number between 10 and 20.<turn|>\n<|turn>user\nName another one and explain why it is prime.<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "empty_system",
+      "messages": [
+        {
+          "role": "system",
+          "content": ""
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "rendered": "<bos><|turn>system\n<turn|>\n<|turn>user\nHello<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "empty_user",
+      "messages": [
+        {
+          "role": "user",
+          "content": ""
+        }
+      ],
+      "rendered": "<bos><|turn>user\n<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "unicode",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Réponds en français, s'il te plaît."
+        },
+        {
+          "role": "user",
+          "content": "Grüße, 世界! 🌍 — naïve café, ½ + ¼ ≠ 1"
+        }
+      ],
+      "rendered": "<bos><|turn>system\nRéponds en français, s'il te plaît.<turn|>\n<|turn>user\nGrüße, 世界! 🌍 — naïve café, ½ + ¼ ≠ 1<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "assistant_last",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France?"
+        },
+        {
+          "role": "assistant",
+          "content": "The capital of France is Paris."
+        }
+      ],
+      "rendered": "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\nThe capital of France is Paris.<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "consecutive_assistant",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Count to two."
+        },
+        {
+          "role": "assistant",
+          "content": "One."
+        },
+        {
+          "role": "assistant",
+          "content": "Two."
+        },
+        {
+          "role": "user",
+          "content": "Again."
+        }
+      ],
+      "rendered": "<bos><|turn>user\nCount to two.<turn|>\n<|turn>model\nOne.<turn|>\nTwo.<turn|>\n<|turn>user\nAgain.<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "assistant_after_system",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be brief."
+        },
+        {
+          "role": "assistant",
+          "content": "Ready."
+        },
+        {
+          "role": "user",
+          "content": "Go."
+        }
+      ],
+      "rendered": "<bos><|turn>system\nBe brief.<turn|>\n<|turn>model\nReady.<turn|>\n<|turn>user\nGo.<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "mid_conversation_system",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi"
+        },
+        {
+          "role": "assistant",
+          "content": "Hello."
+        },
+        {
+          "role": "system",
+          "content": "Answer in one word."
+        },
+        {
+          "role": "user",
+          "content": "Colour of the sky?"
+        }
+      ],
+      "rendered": "<bos><|turn>user\nHi<turn|>\n<|turn>model\nHello.<turn|>\n<|turn>system\nAnswer in one word.<turn|>\n<|turn>user\nColour of the sky?<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "system_only",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Only a system turn."
+        }
+      ],
+      "rendered": "<bos><|turn>system\nOnly a system turn.<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "whitespace_trimmed",
+      "messages": [
+        {
+          "role": "system",
+          "content": "  padded system \n"
+        },
+        {
+          "role": "user",
+          "content": "\t user with tabs\nand an inner newline \n\n"
+        },
+        {
+          "role": "assistant",
+          "content": "  spaced answer  \r\n"
+        },
+        {
+          "role": "user",
+          "content": " 　ideographic space "
+        }
+      ],
+      "rendered": "<bos><|turn>system\npadded system<turn|>\n<|turn>user\nuser with tabs\nand an inner newline<turn|>\n<|turn>model\nspaced answer<turn|>\n<|turn>user\nideographic space<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "python_only_whitespace",
+      "messages": [
+        {
+          "role": "user",
+          "content": "\u001c\u001dseparators\u001e\u001f"
+        },
+        {
+          "role": "assistant",
+          "content": "\u001f​zero width stays​\u001c"
+        },
+        {
+          "role": "user",
+          "content": "next line "
+        }
+      ],
+      "rendered": "<bos><|turn>user\nseparators<turn|>\n<|turn>model\n​zero width stays​<turn|>\n<|turn>user\nnext line<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "assistant_thought_stripped",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Is 7 prime?"
+        },
+        {
+          "role": "assistant",
+          "content": "<|channel>thought\nCheck divisors.<channel|>Yes, 7 is prime."
+        },
+        {
+          "role": "user",
+          "content": "And 9?"
+        }
+      ],
+      "rendered": "<bos><|turn>user\nIs 7 prime?<turn|>\n<|turn>model\nYes, 7 is prime.<turn|>\n<|turn>user\nAnd 9?<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "assistant_unclosed_thought",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q"
+        },
+        {
+          "role": "assistant",
+          "content": " A <|channel>left open"
+        },
+        {
+          "role": "user",
+          "content": "Q2"
+        }
+      ],
+      "rendered": "<bos><|turn>user\nQ<turn|>\n<|turn>model\nA<turn|>\n<|turn>user\nQ2<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "markup_is_not_escaped",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<b>&amp; {{ not a template }} {% raw %} \"quoted\" 'single'"
+        }
+      ],
+      "rendered": "<bos><|turn>user\n<b>&amp; {{ not a template }} {% raw %} \"quoted\" 'single'<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "tool_role",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What was the result?"
+        },
+        {
+          "role": "tool",
+          "content": "{\"result\": 42}"
+        },
+        {
+          "role": "user",
+          "content": "Tell me."
+        }
+      ],
+      "expect_refusal": "unsupported_feature",
+      "template_rendered": "<bos><|turn>user\nWhat was the result?<turn|>\n<|turn>user\nTell me.<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "developer_role",
+      "messages": [
+        {
+          "role": "developer",
+          "content": "Be terse."
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "expect_refusal": "unsupported_feature",
+      "template_rendered": "<bos><|turn>system\nBe terse.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "unknown_role",
+      "messages": [
+        {
+          "role": "function",
+          "content": "x"
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "expect_refusal": "invalid_role",
+      "template_rendered": "<bos><|turn>function\nx<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n"
+    },
+    {
+      "name": "text_content_parts",
+      "messages": [
+        {
+          "role": "system",
+          "content": [
+            {
+              "type": "text",
+              "text": " Be brief. "
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": " first "
+            },
+            {
+              "type": "text",
+              "text": " second "
+            }
+          ]
+        }
+      ],
+      "expect_refusal": "unsupported_feature",
+      "template_rendered": "<bos><|turn>system\nBe brief. <turn|>\n<|turn>user\nfirstsecond<turn|>\n<|turn>model\n"
+    }
+  ]
+}

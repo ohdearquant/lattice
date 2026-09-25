@@ -8,21 +8,25 @@
 //! the same code. They are `#[doc(hidden)]`: they mirror each binary's
 //! current handler behaviour and are not a stable API.
 //!
-//! `QwenChatDefaults` is the one place Qwen's chat defaults are applied:
-//! the server's sampling defaults for options a request omitted, the
-//! thinking switch and the `<|im_end|>` stop token.
+//! Family chat conventions (rendering, stop tokens, defaults) come from the
+//! model's prompt adapter in `serve::prompt_adapter`; nothing here supplies a
+//! family default. [`prepare_gemma_chat_request`] is the Gemma E2B text
+//! preparation entry, used by tests and the measurement example until the
+//! serving binaries route Gemma.
 
 use crate::forward::metal_qwen35::ChatMessage;
 use crate::generation::GenerateConfig;
-use crate::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID;
 use crate::serve::ApiError;
 use crate::serve::contract::{
-    ChatRequest as ChatCompletionRequest, GenerationDefaults, MaxTokensPolicy,
-    RequestedChatOptions, ServeProfile, ValidatedChatRequest as ContractValidatedChatRequest,
-    apply_max_tokens_policy, normalize_request_with_context_and_budget,
-    validate_context_window_with_budget, validate_temperature, validate_top_p,
+    ChatRequest as ChatCompletionRequest, GenerationDefaults, MessageContent, ServeProfile,
+    ValidatedChatRequest as ContractValidatedChatRequest,
+    normalize_request_with_context_and_budget, normalize_requested_options,
+    validate_context_window_with_budget,
 };
-use crate::serve::{format_normalized_chat_template, into_engine_chat_messages};
+use crate::serve::into_engine_chat_messages;
+use crate::serve::prompt_adapter::{PromptAdapter as _, QwenPromptAdapter};
+
+pub use crate::serve::prompt_adapter::GemmaPromptAdapter;
 
 /// The `lattice_serve` handler's name for the validated request type.
 type ValidatedChatRequest = ContractValidatedChatRequest;
@@ -78,7 +82,7 @@ pub fn prepare_chat_request(
         GenerationDefaults::standard(default_max_tokens),
         ServeProfile::lattice(model_id, max_tokens_cap).with_vision_support(vision_supported),
         |messages, max_tokens, reasoning_budget| {
-            let prompt = format_normalized_chat_template(messages);
+            let prompt = QwenPromptAdapter.render(messages);
             let prompt_token_count = tokenize_len(&prompt);
             validate_context_window_with_budget(
                 prompt_token_count,
@@ -129,7 +133,7 @@ pub fn lattice_gen_cfg(
     reasoning_budget: Option<usize>,
     logprobs: Option<usize>,
 ) -> GenerateConfig {
-    QwenChatDefaults::lattice_generate_config(
+    QwenPromptAdapter.lattice_generate_config(
         max_tokens,
         temperature,
         top_p,
@@ -142,151 +146,65 @@ pub fn lattice_gen_cfg(
 
 #[doc(hidden)]
 pub fn build_cfg(req: &ValidatedChatRequest) -> GenerateConfig {
-    QwenChatDefaults::generate_config(req)
+    QwenPromptAdapter.generate_config(req)
 }
 
-/// Qwen's chat defaults step: turns [`RequestedChatOptions`] plus the
-/// server's [`GenerationDefaults`] into the effective request values, and
-/// the effective values into a Qwen `GenerateConfig`.
+/// Output of [`prepare_gemma_chat_request`]: the rendered prompt and the
+/// `GenerateConfig` the Gemma adapter builds for it.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PreparedGemmaChatRequest {
+    pub prompt: String,
+    pub gen_cfg: GenerateConfig,
+    pub stream: bool,
+}
+
+/// Gemma E2B text chat preparation under the `lattice serve` request
+/// profile (text only): validate the request, refuse typed content parts
+/// and every control the Gemma adapter cannot serve, apply the server's
+/// sampling defaults through the adapter, render with the checkpoint's chat
+/// template, then check the context window on the rendered prompt's token
+/// count.
 ///
-/// This is the only place a Qwen default is applied. Request validation
-/// calls [`Self::max_tokens`], [`Self::temperature`], [`Self::top_p`] and
-/// [`Self::reasoning_budget`] at the position each option has always been
-/// resolved, so a refusal caused by a default keeps its precedence.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct QwenChatDefaults {
-    generation: GenerationDefaults,
-}
-
-impl QwenChatDefaults {
-    pub(crate) const fn new(generation: GenerationDefaults) -> Self {
-        Self { generation }
+/// Typed content parts are refused rather than flattened: the template
+/// trims each text part separately, which the flattened message text cannot
+/// reproduce. Not a stable API; see [`GemmaPromptAdapter`].
+#[doc(hidden)]
+pub fn prepare_gemma_chat_request(
+    adapter: &GemmaPromptAdapter,
+    req: &ChatCompletionRequest,
+    model_id: &str,
+    default_max_tokens: usize,
+    max_tokens_cap: usize,
+    tokenize_len: impl FnOnce(&str) -> usize,
+    max_context: impl FnOnce() -> usize,
+) -> Result<PreparedGemmaChatRequest, ApiError> {
+    let options =
+        normalize_requested_options(req, ServeProfile::lattice(model_id, max_tokens_cap))?;
+    if req
+        .messages
+        .iter()
+        .any(|message| matches!(message.content, MessageContent::Parts(_)))
+    {
+        return Err(ApiError::BadRequest {
+            message: "typed content parts are not supported for this model; send message \
+                      content as a string"
+                .to_string(),
+            code: "unsupported_feature",
+        });
     }
-
-    /// Effective generation-token budget under the profile's policy.
-    pub(crate) fn max_tokens(
-        &self,
-        requested: Option<usize>,
-        policy: MaxTokensPolicy,
-    ) -> Result<usize, ApiError> {
-        apply_max_tokens_policy(requested.unwrap_or(self.generation.max_tokens), policy)
-    }
-
-    pub(crate) fn temperature(&self, requested: Option<f32>) -> Result<f32, ApiError> {
-        validate_temperature(requested.unwrap_or(self.generation.temperature))
-    }
-
-    pub(crate) fn top_p(&self, requested: Option<f32>) -> Result<f32, ApiError> {
-        validate_top_p(requested.unwrap_or(self.generation.top_p))
-    }
-
-    /// Effective reasoning budget: a requested `0` means "use the default",
-    /// and a context-clamped profile leaves room for the generation budget
-    /// and the closing token.
-    pub(crate) fn reasoning_budget(
-        &self,
-        requested: Option<usize>,
-        supported: bool,
-        policy: MaxTokensPolicy,
-        max_tokens: usize,
-    ) -> Option<usize> {
-        let mut reasoning_budget = if supported {
-            requested
-                .filter(|&value| value > 0)
-                .or(self.generation.reasoning_budget)
-        } else {
-            None
-        };
-        if let MaxTokensPolicy::ClampToContext { context } = policy {
-            let reasoning_room = context.saturating_sub(max_tokens).saturating_sub(1);
-            reasoning_budget = reasoning_budget
-                .map(|value| value.min(reasoning_room))
-                .filter(|&value| value > 0);
-        }
-        reasoning_budget
-    }
-
-    /// Effective request values for validated options.
-    pub(crate) fn apply(
-        &self,
-        options: RequestedChatOptions,
-    ) -> Result<ValidatedChatRequest, ApiError> {
-        let max_tokens = self.max_tokens(options.max_tokens, options.max_tokens_policy)?;
-        let reasoning_budget = self.reasoning_budget(
-            options.reasoning_budget,
-            options.reasoning_budget_supported,
-            options.max_tokens_policy,
-            max_tokens,
-        );
-        let logprobs = if options.logprobs.unwrap_or(false) {
-            Some(options.top_logprobs.unwrap_or(0))
-        } else {
-            None
-        };
-        Ok(ValidatedChatRequest {
-            messages: options.messages,
-            max_tokens,
-            temperature: self.temperature(options.temperature)?,
-            top_k: options.top_k.unwrap_or(self.generation.top_k),
-            top_p: self.top_p(options.top_p)?,
-            repetition_penalty: options
-                .repetition_penalty
-                .unwrap_or(self.generation.repetition_penalty),
-            seed: options.seed,
-            stream: options.stream.unwrap_or(false),
-            stop_strings: options.stop_strings,
-            reasoning_budget,
-            logprobs,
-        })
-    }
-
-    /// The `lattice_serve` handler's `GenerateConfig` for a validated request.
-    #[allow(clippy::field_reassign_with_default)]
-    fn generate_config(req: &ValidatedChatRequest) -> GenerateConfig {
-        let mut cfg = Self::generate_config_base();
-        cfg.max_new_tokens = req.max_tokens;
-        cfg.temperature = req.temperature;
-        cfg.top_k = req.top_k;
-        cfg.top_p = req.top_p;
-        cfg.repetition_penalty = req.repetition_penalty;
-        cfg.seed = req.seed;
-        cfg.enable_mtp = None;
-        cfg.grammar = None;
-        cfg.stop_strings = req.stop_strings.clone();
-        cfg.reasoning_budget = req.reasoning_budget;
-        cfg.logprobs = req.logprobs;
-        cfg
-    }
-
-    /// The `lattice serve` handler's `GenerateConfig` for prepared sampling
-    /// fields.
-    #[allow(clippy::field_reassign_with_default)]
-    fn lattice_generate_config(
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        seed: Option<u64>,
-        stop_strings: Vec<String>,
-        reasoning_budget: Option<usize>,
-        logprobs: Option<usize>,
-    ) -> GenerateConfig {
-        let mut cfg = Self::generate_config_base();
-        cfg.max_new_tokens = max_tokens;
-        cfg.temperature = temperature;
-        cfg.top_p = top_p;
-        cfg.seed = seed;
-        cfg.stop_strings = stop_strings;
-        cfg.reasoning_budget = reasoning_budget;
-        cfg.logprobs = logprobs;
-        cfg
-    }
-
-    /// Qwen chat generation: thinking on, stopping at `<|im_end|>`.
-    #[allow(clippy::field_reassign_with_default)]
-    fn generate_config_base() -> GenerateConfig {
-        let mut cfg = GenerateConfig::default();
-        cfg.stop_token_ids = vec![QWEN_CHAT_IM_END_TOKEN_ID];
-        cfg.enable_thinking = true;
-        cfg
-    }
+    let validated =
+        adapter.apply_defaults(GenerationDefaults::standard(default_max_tokens), options)?;
+    let prompt = adapter.render(&validated.messages);
+    validate_context_window_with_budget(
+        tokenize_len(&prompt),
+        validated.max_tokens,
+        validated.reasoning_budget,
+        max_context(),
+    )?;
+    Ok(PreparedGemmaChatRequest {
+        gen_cfg: adapter.generate_config(&validated),
+        stream: validated.stream,
+        prompt,
+    })
 }
