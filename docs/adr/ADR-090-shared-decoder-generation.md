@@ -2,7 +2,8 @@
 
 **Status**: Accepted (2026-09-15)\
 **Date**: 2026-09-15\
-**Amended**: 2026-09-25, RNG ownership (see "Amendment, 2026-09-25" under D1's roles)\
+**Amended**: 2026-09-25, RNG ownership (see "Amendment, 2026-09-25" under D1's roles);
+2026-09-25, requested chat options (see "Amendment, 2026-09-25" under D3)\
 **Crate**: lattice-inference
 
 <!-- deno-fmt-ignore-start -->
@@ -280,6 +281,20 @@ from the family label or give every layer independent writable KV. Future non-ca
 would require a layer- and phase-specific mask and complete-span input; the present milestone
 rejects them. Upstream cross-family variation motivates this extensible boundary but does not
 establish support for additional Lattice variants.
+
+#### Amendment, 2026-09-25: requested chat options are a hidden, unstable type
+
+The missing-versus-explicit distinction for HTTP options is carried by
+`serve::contract::RequestedChatOptions`, a `pub` `#[doc(hidden)]` type produced by
+`normalize_requested_options`. It holds each option as the request sent it and `None` for an omitted
+one; request validation still makes every refusal that cannot depend on a default. Qwen's defaults
+(the server's sampling defaults, the thinking switch and the `<|im_end|>` stop token) are applied in
+one Qwen defaults step, which the existing normalization functions and both handlers' `GenerateConfig`
+construction route through, so their observable behavior is unchanged. A hidden, unstable type was
+chosen over a stable public one because the worker-local factory (R07) will move where defaults are
+applied. `#[doc(hidden)]` is a convention, not a semver guarantee, and this type is not a
+semver-covered surface. R07 owes a disposition: promote it to a stable type through the separate
+API/semver review above, or fold it into the factory.
 
 ### D4. Reconcile existing decisions without weakening their tests
 
