@@ -67,7 +67,7 @@ mod mtp_weights;
 /// MTP to the plain loop, which either captures logprobs or rejects the
 /// config via `check_logprobs_not_set`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-fn mtp_route_active(
+pub(crate) fn mtp_route_active(
     mtp_present: bool,
     mtp_enabled: bool,
     gen_cfg: &crate::generation::GenerateConfig,
@@ -95,7 +95,7 @@ fn mtp_route_active(
 /// as [`mtp_route_active`]: `generate_greedy_self_spec` also unconditionally
 /// returns `token_logprobs: vec![]`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-fn self_spec_route_active(
+pub(crate) fn self_spec_route_active(
     gdn_checkpoints_present: bool,
     self_spec_env_set: bool,
     gen_cfg: &crate::generation::GenerateConfig,
@@ -1421,14 +1421,14 @@ mod inner {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct SamplingRouteEnvironment {
-        compact: bool,
-        selection: bool,
-        approximate_top_p: bool,
+    pub(crate) struct SamplingRouteEnvironment {
+        pub(crate) compact: bool,
+        pub(crate) selection: bool,
+        pub(crate) approximate_top_p: bool,
     }
 
     impl SamplingRouteEnvironment {
-        fn current() -> Self {
+        pub(crate) fn current() -> Self {
             Self {
                 compact: crate::env_switch_enabled("LATTICE_COMPACT_TOPK"),
                 selection: crate::env_switch_enabled("LATTICE_COMPACT_TOPK_SELECT"),
@@ -1438,13 +1438,13 @@ mod inner {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct SamplingRoutePlan {
-        use_compact: bool,
-        compact_route: GpuTopkRoute,
-        compact_topk: usize,
+    pub(crate) struct SamplingRoutePlan {
+        pub(crate) use_compact: bool,
+        pub(crate) compact_route: GpuTopkRoute,
+        pub(crate) compact_topk: usize,
     }
 
-    fn plan_sampling_route(
+    pub(crate) fn plan_sampling_route(
         gen_cfg: &GenerateConfig,
         history_is_empty: bool,
         environment: SamplingRouteEnvironment,
@@ -1495,7 +1495,7 @@ mod inner {
         }
     }
 
-    fn apply_sampling_route_plan(
+    pub(crate) fn apply_sampling_route_plan(
         plan: SamplingRoutePlan,
         compact_route: &mut GpuTopkRoute,
         compact_topk: &mut usize,
@@ -7385,12 +7385,13 @@ mod inner {
 
         /// Same contract as [`Self::forward_step`], for the production
         /// autoregressive decode loops (`generate`, `generate_streaming*`,
-        /// `generate_streaming_with_prefix_cache*`) only — marks the
+        /// `generate_streaming_with_prefix_cache*`, and
+        /// `crate::decoder::qwen_metal::QwenMetalSession`) only — marks the
         /// `decode.*` signpost interval `Scope::Decode` so it is not silent.
         /// Not `pub`: external consumers get the general-purpose
         /// `forward_step`, which stays `Scope::NotDecode` since it cannot
         /// know whether the caller is decoding or prefilling.
-        fn forward_step_decode(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+        pub(crate) fn forward_step_decode(&mut self, token_id: u32, position: usize) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
             self.forward_step_inner(
                 token_id,
@@ -7403,7 +7404,7 @@ mod inner {
 
         /// Zero-copy greedy argmax: run forward pass then scan GPU shared buffer
         /// directly for the argmax token ID, avoiding 993KB allocation+copy.
-        fn forward_step_greedy_argmax(&mut self, token_id: u32, position: usize) -> u32 {
+        pub(crate) fn forward_step_greedy_argmax(&mut self, token_id: u32, position: usize) -> u32 {
             let cfg = self.engine.config.clone();
             // Binding (not discarding) the returned guard keeps `decode.step`
             // alive through the host-read/argmax scan below, matching its
@@ -9739,7 +9740,7 @@ mod inner {
         /// The teardown for a compact sampling route engaged by
         /// [`Self::configure_sampling_route`], whether generation completed, was
         /// cancelled, or failed at prefill.
-        fn disengage_compact_route(&mut self) {
+        pub(crate) fn disengage_compact_route(&mut self) {
             self.session.compact_topk = 0;
             self.session.compact_route = GpuTopkRoute::CpuFallback;
         }
@@ -11335,7 +11336,7 @@ mod inner {
     /// scan needed).  Repetition penalty is applied CPU-side to the compact
     /// set as a round-0 approximation (accurate when recently-repeated tokens
     /// are not ranked far below the top-k boundary).
-    fn sample_from_candidates(
+    pub(crate) fn sample_from_candidates(
         candidates: &[crate::sampling::Candidate],
         cfg: &GenerateConfig,
         previous_ids: &[u32],
@@ -11449,7 +11450,7 @@ mod inner {
     /// only ever runs over the surviving k candidates), and thread-local scratch
     /// buffers reused across decode steps instead of a fresh vocab-sized
     /// `CandidateSet` per token.
-    fn sample_token(
+    pub(crate) fn sample_token(
         logits: &[f32],
         cfg: &GenerateConfig,
         previous_ids: &[u32],
@@ -11474,7 +11475,7 @@ mod inner {
     /// callers with no compact route, which is the multimodal decode loops'
     /// only case -- they gain `decode.sample` instrumentation as a side
     /// effect of routing through here instead of `sample_token` directly.
-    fn sample_decode_traced(
+    pub(crate) fn sample_decode_traced(
         compact: Option<&[crate::sampling::Candidate]>,
         step_logits: &[f32],
         cfg: &GenerateConfig,
@@ -41447,6 +41448,15 @@ pub use inner::{
     LogitReadbackPathProofSnapshot, LoraLayerData, MetalQwen35State, MoeRoutingTraceRecord,
     PathProofSnapshot, arm_moe_routing_trace, blend_lora_layer_data, dump_moe_routing_trace_jsonl,
     take_moe_routing_trace,
+};
+
+/// The ordinary-generation route planner and samplers, shared with
+/// `crate::decoder::qwen_metal` so the decoder session selects exactly as
+/// `generate` and `generate_streaming_with_cancel` do.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use inner::{
+    GpuTopkRoute, SamplingRouteEnvironment, SamplingRoutePlan, apply_sampling_route_plan,
+    plan_sampling_route, sample_decode_traced, sample_from_candidates, sample_token,
 };
 
 #[cfg(all(
