@@ -19,17 +19,107 @@ use crate::generation::GenerateConfig;
 use crate::serve::ApiError;
 use crate::serve::contract::{
     ChatRequest as ChatCompletionRequest, GenerationDefaults, MessageContent, ServeProfile,
-    ValidatedChatRequest as ContractValidatedChatRequest,
+    ValidatedChatRequest as ContractValidatedChatRequest, normalize_request,
     normalize_request_with_context_and_budget, normalize_requested_options,
     validate_context_window_with_budget,
 };
 use crate::serve::into_engine_chat_messages;
 use crate::serve::prompt_adapter::{PromptAdapter as _, QwenPromptAdapter};
+use crate::tokenizer::Tokenizer as _;
+use crate::tokenizer::bpe::BpeTokenizer;
+use std::sync::Arc;
 
 pub use crate::serve::prompt_adapter::GemmaPromptAdapter;
 
 /// The `lattice_serve` handler's name for the validated request type.
 type ValidatedChatRequest = ContractValidatedChatRequest;
+
+/// Opaque, model-bound preparation for the serving binaries.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct PreparationHandle {
+    tokenizer: Arc<BpeTokenizer>,
+    model_max_context: usize,
+}
+
+impl PreparationHandle {
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+    pub(crate) fn qwen(tokenizer: Arc<BpeTokenizer>, model_max_context: usize) -> Self {
+        Self {
+            tokenizer,
+            model_max_context,
+        }
+    }
+
+    /// Tokenize with the same tokenizer used by worker execution.
+    pub fn tokenize_len(&self, prompt: &str) -> usize {
+        self.tokenizer.tokenize(prompt).pre_truncation_len
+    }
+
+    /// Run the CLI's render, tokenize and context check before stop parsing.
+    pub fn prepare_lattice(
+        &self,
+        req: &ChatCompletionRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+        vision_supported: bool,
+    ) -> Result<PreparedChatRequest, ApiError> {
+        prepare_chat_request(
+            req,
+            model_id,
+            default_max_tokens,
+            max_tokens_cap,
+            vision_supported,
+            |prompt| self.tokenize_len(prompt),
+            || self.model_max_context,
+        )
+    }
+
+    /// Apply the standalone server's existing normalization profile.
+    pub fn normalize_standalone(
+        &self,
+        req: &ChatCompletionRequest,
+        defaults: GenerationDefaults,
+        model_id: &str,
+        vision_supported: bool,
+    ) -> Result<ValidatedChatRequest, ApiError> {
+        normalize_request(
+            req,
+            defaults,
+            ServeProfile::lattice_serve(model_id, self.model_max_context)
+                .with_vision_support(vision_supported),
+        )
+    }
+
+    /// Map validated standalone options through the model's prompt adapter.
+    pub fn standalone_generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig {
+        QwenPromptAdapter.generate_config(req)
+    }
+
+    /// Map prepared CLI sampling options through the model's prompt adapter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lattice_generate_config(
+        &self,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        seed: Option<u64>,
+        stop_strings: Vec<String>,
+        reasoning_budget: Option<usize>,
+        logprobs: Option<usize>,
+    ) -> GenerateConfig {
+        lattice_gen_cfg(
+            max_tokens,
+            temperature,
+            top_p,
+            seed,
+            stop_strings,
+            reasoning_budget,
+            logprobs,
+        )
+    }
+}
 
 /// Output of the full pre-generation validation cascade, ready for
 /// `gen_cfg` construction.
@@ -207,4 +297,65 @@ pub fn prepare_gemma_chat_request(
         stream: validated.stream,
         prompt,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChatCompletionRequest, PreparationHandle};
+    use crate::serve::ApiError;
+    use crate::tokenizer::bpe::BpeTokenizer;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn handle(model_max_context: usize) -> PreparationHandle {
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(
+            HashMap::from([("a".to_string(), 0), ("b".to_string(), 1)]),
+            Vec::new(),
+        )
+        .expect("tiny tokenizer must construct");
+        PreparationHandle::qwen(Arc::new(tokenizer), model_max_context)
+    }
+
+    fn request(stop: serde_json::Value) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "served-model",
+            "messages": [{"role": "user", "content": "a".repeat(64)}],
+            "max_tokens": 1,
+            "stop": stop,
+        }))
+        .expect("chat request body")
+    }
+
+    #[test]
+    fn prepare_lattice_checks_context_with_its_tokenizer_before_stop() {
+        let err = handle(8)
+            .prepare_lattice(
+                &request(serde_json::json!([])),
+                "served-model",
+                1,
+                4096,
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "context_length_exceeded",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        handle(4096)
+            .prepare_lattice(
+                &request(serde_json::Value::Null),
+                "served-model",
+                1,
+                4096,
+                false,
+            )
+            .expect("a prompt inside the window is admitted");
+    }
 }

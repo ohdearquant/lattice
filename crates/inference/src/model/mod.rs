@@ -15,6 +15,11 @@ pub mod paddleocr_vl;
 pub mod qwen;
 pub mod qwen35;
 pub mod qwen35_config;
+#[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+#[doc(hidden)]
+pub mod serving_factory;
+#[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+pub(crate) mod serving_runtime;
 
 // Re-export everything from bert (was top-level `model` module)
 pub use self::bert::*;

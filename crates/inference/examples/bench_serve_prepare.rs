@@ -649,6 +649,7 @@ fn run_metal(
     use lattice_inference::forward::metal_qwen35::{MetalQwen35State, format_chat_template};
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::Qwen35Config;
+    use lattice_inference::model::serving_factory::ServingFactory;
     use lattice_inference::model_format::ModelFormat;
     use lattice_inference::serve::lora::ResidencyLimits;
     use lattice_inference::serve::metal_worker::bench_support::check_prompt_fits_window;
@@ -674,46 +675,48 @@ fn run_metal(
     };
 
     let load = Instant::now();
-    let (owner, client, meta) = MetalWorker::spawn_with_vision(
-        move || {
-            let tokenizer_path = loader_dir.join("tokenizer.json");
-            // `lattice serve` allocates its fixed 4096-token context;
-            // `lattice_serve` requests the checkpoint's configured window.
-            let state = match (route, format) {
-                (Route::LatticeServe, ModelFormat::Safetensors) => {
-                    let model = Qwen35Model::from_safetensors(&loader_dir)
-                        .map_err(|e| format!("safetensors load failed: {e}"))?;
-                    let cfg = model.config().clone();
-                    let context = cfg.max_position_embeddings;
-                    MetalQwen35State::new(model.weights(), &cfg, context)
-                        .map_err(|e| format!("Metal init failed: {e}"))?
-                }
-                _ => {
-                    let cfg = Qwen35Config::from_model_dir(&loader_dir)
-                        .map_err(|e| format!("config.json load failed: {e}"))?;
-                    let context = match route {
-                        Route::LatticeServe => cfg.max_position_embeddings,
-                        _ => LATTICE_METAL_MAX_CONTEXT,
-                    };
-                    MetalQwen35State::from_q4_dir(&loader_dir, &tokenizer_path, &cfg, context)
-                        .map_err(|e| format!("Q4 model load failed: {e}"))?
-                }
-            };
-            let model_max_context = match route {
-                Route::LatticeServe => state.max_context(),
-                _ => LATTICE_METAL_MAX_CONTEXT,
-            };
-            Ok((
-                state,
-                worker_tokenizer,
-                WorkerMetadata {
-                    format: format!("{format:?}"),
-                    model_max_context,
-                    context_window_policy: policy,
-                },
-            ))
-        },
-        VisionRuntime::unsupported(),
+    let (owner, client, meta, preparation) = MetalWorker::spawn_with_vision(
+        ServingFactory::qwen_metal(
+            move || {
+                let tokenizer_path = loader_dir.join("tokenizer.json");
+                // `lattice serve` allocates its fixed 4096-token context;
+                // `lattice_serve` requests the checkpoint's configured window.
+                let state = match (route, format) {
+                    (Route::LatticeServe, ModelFormat::Safetensors) => {
+                        let model = Qwen35Model::from_safetensors(&loader_dir)
+                            .map_err(|e| format!("safetensors load failed: {e}"))?;
+                        let cfg = model.config().clone();
+                        let context = cfg.max_position_embeddings;
+                        MetalQwen35State::new(model.weights(), &cfg, context)
+                            .map_err(|e| format!("Metal init failed: {e}"))?
+                    }
+                    _ => {
+                        let cfg = Qwen35Config::from_model_dir(&loader_dir)
+                            .map_err(|e| format!("config.json load failed: {e}"))?;
+                        let context = match route {
+                            Route::LatticeServe => cfg.max_position_embeddings,
+                            _ => LATTICE_METAL_MAX_CONTEXT,
+                        };
+                        MetalQwen35State::from_q4_dir(&loader_dir, &tokenizer_path, &cfg, context)
+                            .map_err(|e| format!("Q4 model load failed: {e}"))?
+                    }
+                };
+                let model_max_context = match route {
+                    Route::LatticeServe => state.max_context(),
+                    _ => LATTICE_METAL_MAX_CONTEXT,
+                };
+                Ok((
+                    state,
+                    worker_tokenizer,
+                    WorkerMetadata {
+                        format: format!("{format:?}"),
+                        model_max_context,
+                        context_window_policy: policy,
+                    },
+                ))
+            },
+            VisionRuntime::unsupported(),
+        ),
         1,
         ResidencyLimits::default(),
     )
@@ -723,25 +726,39 @@ fn run_metal(
     println!("LOAD route={} load_ms={:.3}", route.name(), ms(load));
 
     let prepare = |body: &[u8]| -> Result<Result<EngineRequest, ApiError>, String> {
+        let req = parse_body(body)?;
         match route {
-            Route::LatticeServe => lattice_serve_prepare(body, model_max_context),
-            _ => Ok(lattice_prepare(
-                body,
-                |p| tokenizer.tokenize(p).real_length,
-                LATTICE_METAL_MAX_CONTEXT,
-            )?
-            .map(|prepared| {
-                let cfg = lattice_gen_cfg(
-                    prepared.max_tokens,
-                    prepared.temperature,
-                    prepared.top_p,
-                    prepared.seed,
-                    prepared.stop_strings.clone(),
-                    prepared.reasoning_budget,
-                    prepared.logprobs,
-                );
-                (prepared.messages, cfg)
-            })),
+            Route::LatticeServe => Ok(preparation
+                .normalize_standalone(
+                    &req,
+                    GenerationDefaults::standard(LATTICE_SERVE_DEFAULT_MAX_TOKENS),
+                    MODEL_ID,
+                    false,
+                )
+                .and_then(|validated| {
+                    let cfg = preparation.standalone_generate_config(&validated);
+                    into_engine_chat_messages(validated.messages).map(|messages| (messages, cfg))
+                })),
+            _ => Ok(preparation
+                .prepare_lattice(
+                    &req,
+                    MODEL_ID,
+                    LATTICE_DEFAULT_MAX_TOKENS,
+                    LATTICE_MAX_TOKENS_CAP,
+                    false,
+                )
+                .map(|prepared| {
+                    let cfg = preparation.lattice_generate_config(
+                        prepared.max_tokens,
+                        prepared.temperature,
+                        prepared.top_p,
+                        prepared.seed,
+                        prepared.stop_strings.clone(),
+                        prepared.reasoning_budget,
+                        prepared.logprobs,
+                    );
+                    (prepared.messages, cfg)
+                })),
         }
     };
 

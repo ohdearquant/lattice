@@ -11,7 +11,7 @@
 //! dedicated OS thread (the Metal state can never cross a thread boundary),
 //! serve `Job`s FIFO from an unbounded channel, check a per-job
 //! disconnect-cancellation signal before paying for any prefill work, reuse
-//! the single process-wide [`CrossTurnSlotId::DEFAULT`] cache slot, and
+//! the single process-wide [`crate::kv_cache::CrossTurnSlotId::DEFAULT`] cache slot, and
 //! stream token deltas back to the HTTP handler. Only comments -- not
 //! shared code -- kept the two copies in sync, and they had already drifted:
 //! on dequeue-time cancellation, `lattice.rs`'s worker sent an empty
@@ -36,10 +36,10 @@
 //!
 //! [`run_worker_loop`] -- the FIFO/cancellation/terminal-event state
 //! machine -- is generic over an injected `generate` closure, exactly like
-//! `lattice_serve.rs`'s pre-existing `run_worker_loop` was. [`MetalWorker::spawn`]
-//! wires a REAL closure (calling `MetalQwen35State::generate_streaming_with_prefix_cache_and_cancel`)
-//! into it for production; this module's own tests inject a fake generator
-//! instead, so the state machine is fully covered without a Metal device.
+//! `lattice_serve.rs`'s pre-existing `run_worker_loop` was. Production
+//! supplies callbacks from a model-owned runtime; this module's own tests
+//! inject a fake generator instead, so the state machine is covered without
+//! a Metal device.
 //! `MetalWorker::spawn`'s `loader` failure path is also GPU-free: a loader
 //! that returns `Err` before ever constructing a `MetalQwen35State`
 //! typechecks and runs with no device involved. The real `spawn` -> real
@@ -52,15 +52,16 @@
 use super::lora::{
     AdapterControlError, AdapterControlResult, AdapterIndex, LoraSelection, ResidencyLimits,
 };
-use super::lora_registry::ResidencyRegistry;
+use crate::forward::metal_qwen35::format_chat_template;
 use crate::forward::metal_qwen35::{
-    ChatMessage, LoraLayerData, MetalQwen35State, format_chat_template, push_chat_generation_open,
-    push_chat_turn_close, push_chat_turn_open,
+    ChatMessage, LoraLayerData, MetalQwen35State, push_chat_generation_open, push_chat_turn_close,
+    push_chat_turn_open,
 };
 use crate::generation::{GenerateConfig, GenerateOutput};
-use crate::kv_cache::CrossTurnSlotId;
 use crate::model::qwen35_config::{Qwen35Config, VisionModelConfig};
+use crate::model::serving_factory::ServingFactory;
 use crate::serve::ApiError;
+use crate::serve::prepare::PreparationHandle;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::vision::VisionError;
@@ -75,7 +76,6 @@ use crate::vision::qwen35_vit_metal::qwen35_vit_forward_metal_with_cancel;
 use std::cell::RefCell;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
@@ -171,7 +171,7 @@ pub enum WorkerEvent {
 /// instead of `lattice_serve.rs`'s prior string-prefix-sniffing convention
 /// (`PROMPT_EXCEEDS_WINDOW_PREFIX`).
 #[derive(Debug)]
-enum WorkerFailure {
+pub(crate) enum WorkerFailure {
     Rejected(ApiError),
     Failed(String),
     /// Mirrors [`WorkerEvent::ConstraintBlocked`] -- see that variant's doc
@@ -488,6 +488,7 @@ pub struct MetalWorkerClient {
     control: Arc<Semaphore>,
     adapters: Arc<RwLock<AdapterIndex>>,
     vision_supported: Arc<AtomicBool>,
+    preparation: Option<PreparationHandle>,
     /// Keeps the worker join owner alive for exactly as long as the queue
     /// can accept jobs. Test-only clients without a worker carry an owner
     /// whose join slot is already empty.
@@ -507,6 +508,7 @@ impl MetalWorkerClient {
             control: Arc::new(Semaphore::new(1)),
             adapters: Arc::new(RwLock::new(AdapterIndex::default())),
             vision_supported,
+            preparation: None,
             _owner: owner,
         }
     }
@@ -667,6 +669,12 @@ impl MetalWorkerClient {
     pub fn supports_vision(&self) -> bool {
         self.vision_supported.load(Ordering::Acquire)
     }
+
+    /// Model-bound preparation, present on a successfully loaded worker.
+    #[doc(hidden)]
+    pub fn preparation(&self) -> Option<&PreparationHandle> {
+        self.preparation.as_ref()
+    }
 }
 
 impl Drop for MetalWorkerClient {
@@ -685,7 +693,7 @@ impl Drop for MetalWorkerClient {
 /// reasoning tokens and one delimiter slot. `lattice.rs` keeps its
 /// pre-existing HTTP formula, which accepts
 /// `prompt_tokens + max_tokens == max_context`.
-fn check_prompt_fits_window(
+pub(crate) fn check_prompt_fits_window(
     policy: ContextWindowPolicy,
     model_max_context: usize,
     prompt_len: usize,
@@ -742,7 +750,7 @@ fn check_prompt_fits_window(
 /// prompt with this same tokenizer, so a lower cap would silently drop the
 /// prompt's tail (including the open assistant turn) for any prompt that
 /// fits the window but exceeds the cap. Only ever raises the cap.
-fn serving_tokenizer(tokenizer: BpeTokenizer, model_max_context: usize) -> BpeTokenizer {
+pub(crate) fn serving_tokenizer(tokenizer: BpeTokenizer, model_max_context: usize) -> BpeTokenizer {
     if tokenizer.max_seq_len() < model_max_context {
         tokenizer.with_max_seq_len(model_max_context)
     } else {
@@ -755,7 +763,7 @@ fn serving_tokenizer(tokenizer: BpeTokenizer, model_max_context: usize) -> BpeTo
 /// Admission uses the pre-truncation token count: a truncated count can never
 /// exceed the tokenizer's cap, so an over-window prompt would pass the check
 /// and then be generated from a shortened prefix.
-fn render_text_prompt_within_window(
+pub(crate) fn render_text_prompt_within_window(
     tokenizer: &BpeTokenizer,
     messages: &[ChatMessage],
     policy: ContextWindowPolicy,
@@ -1047,7 +1055,7 @@ impl VisionRuntime {
         self.vision_supported.load(Ordering::Acquire)
     }
 
-    fn shared_capability(&self) -> Arc<AtomicBool> {
+    pub(crate) fn shared_capability(&self) -> Arc<AtomicBool> {
         self.vision_supported.clone()
     }
 
@@ -1195,7 +1203,7 @@ fn build_vision_prompt_ids(
 }
 
 #[derive(Debug)]
-enum VisionRequestBuild {
+pub(crate) enum VisionRequestBuild {
     Ready {
         request: Qwen35VisionRequest,
         metal_dispatches: usize,
@@ -1204,7 +1212,7 @@ enum VisionRequestBuild {
     Cancelled,
 }
 
-fn build_vision_request(
+pub(crate) fn build_vision_request(
     runtime: &mut VisionRuntime,
     config: &Qwen35Config,
     tokenizer: &BpeTokenizer,
@@ -1348,7 +1356,7 @@ fn build_vision_request(
     })
 }
 
-fn cancelled_output() -> GenerateOutput {
+pub(crate) fn cancelled_output() -> GenerateOutput {
     GenerateOutput {
         text: String::new(),
         token_ids: Vec::new(),
@@ -1361,12 +1369,12 @@ fn cancelled_output() -> GenerateOutput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobRoute {
+pub(crate) enum JobRoute {
     Text,
     Vision { message_index: usize },
 }
 
-fn classify_job(messages: &[ChatMessage]) -> Result<JobRoute, WorkerFailure> {
+pub(crate) fn classify_job(messages: &[ChatMessage]) -> Result<JobRoute, WorkerFailure> {
     let mut image_positions = messages
         .iter()
         .enumerate()
@@ -1428,33 +1436,34 @@ impl MetalWorker {
         max_pending: usize,
         residency_limits: ResidencyLimits,
     ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
-        Self::spawn_with_vision(
-            loader,
-            VisionRuntime::unsupported(),
+        let (owner, client, metadata, _preparation) = Self::spawn_with_vision(
+            ServingFactory::legacy_qwen(loader),
             max_pending,
             residency_limits,
-        )
+        )?;
+        Ok((owner, client, metadata))
     }
 
-    /// Vision-capable sibling of [`Self::spawn`].
-    ///
-    /// `vision_runtime` is derived from the same concrete checkpoint config
-    /// as `loader`. It remains worker-local and loads vision tensors only
-    /// when the first image-bearing job is actually dispatched.
+    /// Spawn from a one-shot model factory. Its Metal state is built on the
+    /// dedicated worker thread after the spawn.
     pub fn spawn_with_vision(
-        loader: impl FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
-        + Send
-        + 'static,
-        mut vision_runtime: VisionRuntime,
+        factory: ServingFactory,
         max_pending: usize,
         residency_limits: ResidencyLimits,
-    ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
+    ) -> Result<
+        (
+            MetalWorkerOwner,
+            MetalWorkerClient,
+            WorkerMetadata,
+            PreparationHandle,
+        ),
+        StartupError,
+    > {
         if residency_limits.max_adapters == 0 || residency_limits.max_bytes == 0 {
             return Err(StartupError::InvalidResidencyLimits {
                 limits: residency_limits,
             });
         }
-        let vision_supported = vision_runtime.shared_capability();
         // #939: validate BEFORE `Semaphore::new`, which panics outright for
         // `max_pending > Semaphore::MAX_PERMITS` and would otherwise let
         // `max_pending == 0` silently build a worker that admits nothing.
@@ -1463,189 +1472,43 @@ impl MetalWorker {
         }
         let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let admission = Arc::new(Semaphore::new(max_pending));
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WorkerMetadata, String>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<
+            Result<(WorkerMetadata, PreparationHandle, Arc<AtomicBool>), String>,
+        >();
 
         let adapters = Arc::new(RwLock::new(AdapterIndex::default()));
         let worker_index = Arc::clone(&adapters);
-        let join_handle = std::thread::spawn(move || match loader() {
-            Ok((state, tokenizer, meta)) => {
-                let tokenizer = serving_tokenizer(tokenizer, meta.model_max_context);
-                let _ = ready_tx.send(Ok(meta.clone()));
-                // `Rc`/`RefCell`, not `Arc`/`Mutex`: both handles are created
-                // here, inside the spawned thread and after `loader()` has run
-                // on it, and neither ever leaves. `!Send` is the correct
-                // property for a handle to `!Send` state -- it is the compiler
-                // checking the confinement this whole module exists to
-                // maintain, not a cost being paid to work around it.
-                //
-                // The two borrows below can never overlap: the loop holds
-                // exactly one message at a time and calls exactly one of the
-                // two closures per message, so `borrow_mut` is uncontended by
-                // construction rather than by convention.
-                let state_rc = Rc::new(RefCell::new(state));
-                let state_for_control = Rc::clone(&state_rc);
-                let registry = Rc::new(RefCell::new(ResidencyRegistry::new(
-                    worker_index,
-                    residency_limits,
-                )));
-                let control_registry = Rc::clone(&registry);
-                run_worker_loop_with_lora(
-                    job_rx,
-                    move |messages, cfg, lora, on_token, should_cancel| {
-                        let mut guard = state_rc.borrow_mut();
-                        let state = &mut *guard;
-                        if let JobRoute::Vision {
-                            message_index: image_message_index,
-                        } = classify_job(messages)?
-                        {
-                            if should_cancel() {
-                                return Ok(cancelled_output());
-                            }
-                            let config = state.engine.config.clone();
-                            let (request, metal_dispatches, gemm_calls) =
-                                match build_vision_request(
-                                    &mut vision_runtime,
-                                    &config,
-                                    &tokenizer,
-                                    messages,
-                                    image_message_index,
-                                    should_cancel,
-                                    |prompt_len| {
-                                        check_prompt_fits_window(
-                                            meta.context_window_policy,
-                                            meta.model_max_context,
-                                            prompt_len,
-                                            cfg,
-                                        )
-                                    },
-                                )? {
-                                    VisionRequestBuild::Ready {
-                                        request,
-                                        metal_dispatches,
-                                        gemm_calls,
-                                    } => (request, metal_dispatches, gemm_calls),
-                                    VisionRequestBuild::Cancelled => return Ok(cancelled_output()),
-                                };
-                            if should_cancel() {
-                                return Ok(cancelled_output());
-                            }
-                            eprintln!(
-                                "[metal-worker] route=vision dispatch=multimodal \
-                             metal_gemm_dispatches={metal_dispatches} \
-                             metal_gemm_calls={gemm_calls}"
-                            );
-                            registry
-                                .borrow_mut()
-                                .apply(lora, state)
-                                .map_err(WorkerFailure::Rejected)?;
-                            let output = state
-                                .generate_multimodal_vision_with_cancel(
-                                    &request,
-                                    &tokenizer,
-                                    cfg,
-                                    should_cancel,
-                                )
-                                .map_err(WorkerFailure::from)?;
-                            if !output.text.is_empty() {
-                                let _ = on_token(&output.text, 0);
-                            }
-                            return Ok(output);
-                        }
-
-                        // Render the ChatML prompt exactly once (#828/#832: the
-                        // prior `lattice_serve.rs` path rendered it a second
-                        // time inside its own window preflight); reused for
-                        // both the window check and the generation call below.
-                        let (prompt, _prompt_len) = render_text_prompt_within_window(
-                            &tokenizer,
-                            messages,
-                            meta.context_window_policy,
-                            meta.model_max_context,
-                            cfg,
-                        )
-                        .map_err(WorkerFailure::Rejected)?;
-
-                        // Cache-aware + cancellation-aware call (#462/#744):
-                        // reuses the previous turn's shared token prefix
-                        // instead of a full re-prefill on every request, and
-                        // observes client disconnect before prefill,
-                        // immediately after prefill, and at the top of every
-                        // decode iteration. This worker thread owns one
-                        // `MetalQwen35State` for the whole process lifetime, so
-                        // `CrossTurnSlotId::DEFAULT` is the only slot that
-                        // exists; the planner re-verifies the retained prefix
-                        // against this request's prompt on every call and
-                        // falls back to `PrefixReuseMode::FullRefill` whenever
-                        // they diverge, so correctness never depends on
-                        // distinguishing clients.
-                        //
-                        // DEPLOYMENT ASSUMPTION, stated because it is currently
-                        // true only by the accident that no multi-tenant consumer
-                        // exists: this path assumes a single tenant, or clients
-                        // that mutually trust one another. Reuse-versus-refill is
-                        // externally visible as latency, so while no request can
-                        // read another's content, a client CAN observe that some
-                        // other request recently shared a prefix with its own.
-                        // A shared inference endpoint serving mutually distrusting
-                        // clients must key the slot per tenant via
-                        // `CrossTurnSlotId::new`, not inherit `DEFAULT`.
-                        if should_cancel() {
-                            return Ok(cancelled_output());
-                        }
-                        registry
-                            .borrow_mut()
-                            .apply(lora, state)
-                            .map_err(WorkerFailure::Rejected)?;
-                        let cached = state.generate_streaming_with_prefix_cache_and_cancel(
-                            CrossTurnSlotId::DEFAULT,
-                            &prompt,
-                            &tokenizer,
-                            cfg,
-                            on_token,
-                            should_cancel,
-                        );
-                        if let Ok(c) = &cached {
-                            eprintln!(
-                                "[metal-worker] cross-turn cache: mode={:?} reused={} \
-                             prefetched={} prompt={}",
-                                c.cache.mode,
-                                c.cache.reused_tokens,
-                                c.cache.prefetched_tokens,
-                                c.cache.prompt_tokens,
-                            );
-                        }
-                        cached.map(|c| c.output).map_err(WorkerFailure::from)
-                    },
-                    move |command| {
-                        let mut guard = state_for_control.borrow_mut();
-                        let state = &mut *guard;
-                        match command {
-                            AdapterCommand::Load {
-                                name,
-                                path,
-                                layers,
-                                descriptor,
-                            } => {
-                                let mut registry = control_registry.borrow_mut();
-                                let id = registry.load(name, path, layers, *descriptor)?;
-                                registry.metadata(id).map(AdapterControlResult::Loaded)
-                            }
-                            AdapterCommand::Unload { id } => control_registry
-                                .borrow_mut()
-                                .unload(id, state)
-                                .map(AdapterControlResult::Unloaded),
-                        }
-                    },
-                );
-            }
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
+        let join_handle = std::thread::spawn(move || {
+            match factory.build(worker_index, residency_limits) {
+                Ok((runtime, metadata, preparation)) => {
+                    let vision_supported = runtime.vision_supported();
+                    let _ = ready_tx.send(Ok((metadata, preparation, vision_supported)));
+                    // The non-Send runtime was built after the spawn and never
+                    // crosses back. The loop lends it to one callback at a
+                    // time, so these mutable borrows cannot overlap.
+                    let runtime = RefCell::new(runtime);
+                    run_worker_loop_with_lora(
+                        job_rx,
+                        |messages, cfg, lora, on_token, should_cancel| {
+                            runtime.borrow_mut().generate(
+                                messages,
+                                cfg,
+                                lora,
+                                on_token,
+                                should_cancel,
+                            )
+                        },
+                        |command| runtime.borrow_mut().control(command),
+                    );
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                }
             }
         });
-
         let owner = MetalWorkerOwner::from_handle(join_handle);
         match ready_rx.recv() {
-            Ok(Ok(meta)) => {
+            Ok(Ok((meta, preparation, vision_supported))) => {
                 let mut client = MetalWorkerClient::with_owner(
                     job_tx,
                     admission,
@@ -1653,7 +1516,8 @@ impl MetalWorker {
                     owner.clone(),
                 );
                 client.adapters = adapters;
-                Ok((owner, client, meta))
+                client.preparation = Some(preparation.clone());
+                Ok((owner, client, meta, preparation))
             }
             Ok(Err(e)) => Err(StartupError::Load(e)),
             Err(_) => Err(StartupError::ThreadExited),

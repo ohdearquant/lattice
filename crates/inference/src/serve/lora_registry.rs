@@ -10,7 +10,7 @@ use lattice_fann::lora::LoraDescriptor;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-pub(super) trait AdapterSlot {
+pub(crate) trait AdapterSlot {
     fn load(&mut self, layers: Vec<LoraLayerData>) -> Result<(), String>;
     fn unload(&mut self);
 }
@@ -33,7 +33,7 @@ struct ResidentAdapter {
     payload_bytes: usize,
 }
 
-pub(super) struct ResidencyRegistry {
+pub(crate) struct ResidencyRegistry {
     residents: HashMap<u32, ResidentAdapter>,
     identities: HashMap<(String, String), u32>,
     resident_bytes: usize,
@@ -59,7 +59,7 @@ pub(super) struct ResidencyRegistry {
 }
 
 impl ResidencyRegistry {
-    pub(super) fn new(index: Arc<RwLock<AdapterIndex>>, limits: ResidencyLimits) -> Self {
+    pub(crate) fn new(index: Arc<RwLock<AdapterIndex>>, limits: ResidencyLimits) -> Self {
         Self {
             residents: HashMap::new(),
             identities: HashMap::new(),
@@ -118,7 +118,7 @@ impl ResidencyRegistry {
         }
     }
 
-    pub(super) fn load(
+    pub(crate) fn load(
         &mut self,
         name: String,
         path: String,
@@ -205,7 +205,7 @@ impl ResidencyRegistry {
         Ok(id)
     }
 
-    pub(super) fn unload(
+    pub(crate) fn unload(
         &mut self,
         id: u32,
         slot: &mut impl AdapterSlot,
@@ -228,14 +228,14 @@ impl ResidencyRegistry {
         Ok(id)
     }
 
-    pub(super) fn metadata(&self, id: u32) -> Result<AdapterMetadata, AdapterControlError> {
+    pub(crate) fn metadata(&self, id: u32) -> Result<AdapterMetadata, AdapterControlError> {
         self.residents
             .get(&id)
             .map(|adapter| adapter.metadata.clone())
             .ok_or(AdapterControlError::NotFound(id))
     }
 
-    pub(super) fn apply(
+    pub(crate) fn apply(
         &mut self,
         selection: &[LoraSelection],
         slot: &mut impl AdapterSlot,
