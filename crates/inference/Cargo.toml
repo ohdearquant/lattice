@@ -255,6 +255,10 @@ name = "bench_metal"
 required-features = ["f16", "metal-gpu"]
 
 [[example]]
+name = "bench_decode_streaming"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
 name = "bench_gpu"
 required-features = ["f16", "wgpu-gpu"]
 

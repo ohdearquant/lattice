@@ -68,6 +68,7 @@ tracking_issue = "#1273"
 reason = "Rust examples whose basenames match bench*.rs are outside this local script supervisor."
 paths = [
     "crates/inference/examples/bench_concurrent.rs",
+    "crates/inference/examples/bench_decode_streaming.rs",
     "crates/inference/examples/bench_dispatch.rs",
     "crates/inference/examples/bench_dispatch2.rs",
     "crates/inference/examples/bench_embed_quality.rs",
