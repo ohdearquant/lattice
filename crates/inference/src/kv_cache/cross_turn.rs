@@ -116,12 +116,17 @@ pub fn longest_common_token_prefix(a: &[u32], b: &[u32]) -> usize {
 /// (`ReplayFromCheckpoint`). Everything else falls back to `FullRefill` —
 /// decline-beats-fabricate for the token-identity invariant.
 ///
-/// `ExactAppend` additionally requires a non-empty suffix
-/// (`new_prompt_ids.len() > shared`): an
-/// exact-equal retry of the represented prompt has no divergent suffix to
-/// prefill, and the Metal integration's `forward_prefill_from` treats an
-/// empty suffix as an internal invariant violation, not a valid no-op. That
-/// case falls back to `FullRefill` here rather than surfacing as an error.
+/// Both reuse modes additionally require a non-empty suffix. `ExactAppend`
+/// requires `new_prompt_ids.len() > shared`: an exact-equal retry of the
+/// represented prompt has no divergent suffix to prefill.
+/// `ReplayFromCheckpoint` only considers checkpoints with
+/// `checkpoint_len < new_prompt_ids.len()`: a new prompt that ends exactly
+/// on a checkpoint boundary would otherwise replay an empty suffix, so the
+/// deepest checkpoint strictly inside the new prompt wins instead. The Metal
+/// integration's `forward_prefill_from` treats an empty suffix as an
+/// internal invariant violation, not a valid no-op, so when no reuse mode
+/// leaves a non-empty suffix the plan falls back to `FullRefill` here rather
+/// than surfacing as an error.
 pub fn plan_prefix_reuse(
     entry: Option<&CrossTurnPrefixEntry>,
     metadata: &CrossTurnPrefixMetadata,
@@ -165,10 +170,11 @@ pub fn plan_prefix_reuse(
     }
 
     // Mid-history reuse: only valid at an exact, already-owned checkpoint
-    // boundary at or below the shared prefix length.
+    // boundary at or below the shared prefix length, and strictly inside the
+    // new prompt so the replayed suffix is non-empty.
     if let Some(&checkpoint_len) = sparse_checkpoint_lens
         .iter()
-        .filter(|&&len| len > 0 && len <= shared)
+        .filter(|&&len| len > 0 && len <= shared && len < new_prompt_ids.len())
         .max()
     {
         return PrefixRestorePlan {
@@ -397,6 +403,42 @@ mod tests {
             plan.mode,
             PrefixReuseMode::ReplayFromCheckpoint { checkpoint_len: 3 }
         );
+    }
+
+    // A new prompt that ends exactly on the only retained checkpoint shares
+    // its whole length with that checkpoint, so replaying from it would
+    // leave an empty suffix, which `forward_prefill_from` rejects. The
+    // planner must skip that checkpoint and fall back to `FullRefill`.
+    //
+    // Mutation sensitivity: dropping the `len < new_prompt_ids.len()`
+    // conjunct makes this test fail, because the plan would again be
+    // `ReplayFromCheckpoint { checkpoint_len: 2 }` with `suffix_len == 0`.
+    #[test]
+    fn plan_checkpoint_at_new_prompt_end_is_full_refill() {
+        let e = entry(vec![1, 2, 3, 4], 4, 4);
+        let plan = plan_prefix_reuse(Some(&e), &metadata(), &[1, 2], &[2]);
+        assert_eq!(plan.mode, PrefixReuseMode::FullRefill);
+        assert_eq!(plan.shared_token_prefix_len, 2);
+        assert_eq!(plan.reusable_len, 0);
+        assert_eq!(plan.suffix_start, 0);
+        assert_eq!(plan.suffix_len, 2);
+    }
+
+    // With a shallower checkpoint also retained, the one at the new prompt's
+    // end is skipped and the deepest checkpoint strictly inside the prompt
+    // wins, leaving a non-empty suffix.
+    #[test]
+    fn plan_checkpoint_at_new_prompt_end_uses_shallower_checkpoint() {
+        let e = entry(vec![1, 2, 3, 4], 4, 4);
+        let plan = plan_prefix_reuse(Some(&e), &metadata(), &[1, 2], &[1, 2]);
+        assert_eq!(
+            plan.mode,
+            PrefixReuseMode::ReplayFromCheckpoint { checkpoint_len: 1 }
+        );
+        assert_eq!(plan.shared_token_prefix_len, 2);
+        assert_eq!(plan.reusable_len, 1);
+        assert_eq!(plan.suffix_start, 1);
+        assert_eq!(plan.suffix_len, 1);
     }
 
     // #590: the survival predicate is the single source of truth for which
