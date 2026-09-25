@@ -1,0 +1,938 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "lattice-metal-ordinary-generation-golden",
+  "checkpoint": {
+    "model_format": "q4",
+    "vocab_size": 248320,
+    "eos_token_id": 248044,
+    "im_end_token_id": 248046,
+    "think_close_token_id": 248069,
+    "kv_f16": false
+  },
+  "cases": [
+    {
+      "name": "direct_greedy_argmax",
+      "entry": "direct",
+      "config": "CaseSpec { name: \"direct_greedy_argmax\", entry: Direct, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Greedy, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: Length, readback: Argmax }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369,
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369
+          ],
+          "text": " Paris.\nThe capital of France is Paris.\nThe capital of France is",
+          "stop_reason": "Some(Length)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 16,
+          "callback_ids": [],
+          "callback_text": "",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 0,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 0,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "direct_greedy_compact",
+      "entry": "direct",
+      "config": "CaseSpec { name: \"direct_greedy_compact\", entry: Direct, prompt: Plain(\"The capital of France is\"), compact_env: true, sampler: Greedy, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: Length, readback: Compact }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369,
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369
+          ],
+          "text": " Paris.\nThe capital of France is Paris.\nThe capital of France is",
+          "stop_reason": "Some(Length)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 16,
+          "callback_ids": [],
+          "callback_text": "",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 0,
+            "decode_compact_candidate": 15,
+            "prefill_full_vocab": 0,
+            "prefill_compact_candidate": 1,
+            "decode_full_vocab_bytes": 0,
+            "decode_compact_candidate_bytes": 120,
+            "prefill_full_vocab_bytes": 0,
+            "prefill_compact_candidate_bytes": 8
+          }
+        }
+      }
+    },
+    {
+      "name": "direct_sampled_dense",
+      "entry": "direct",
+      "config": "CaseSpec { name: \"direct_sampled_dense\", entry: Direct, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Seeded { temperature: 0.8, top_k: 40, top_p: 0.9, seed: 1592590337 }, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: Length, readback: Dense }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            11,
+            279,
+            7526,
+            3177,
+            303,
+            279,
+            3046,
+            13,
+            11751,
+            682,
+            264,
+            6823,
+            314,
+            888,
+            220
+          ],
+          "text": " Paris, the largest city in the country. Paris has a population of over ",
+          "stop_reason": "Some(Length)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 16,
+          "callback_ids": [],
+          "callback_text": "",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 15,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 14899200,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "direct_sampled_block_topk",
+      "entry": "direct",
+      "config": "CaseSpec { name: \"direct_sampled_block_topk\", entry: Direct, prompt: Plain(\"The capital of France is\"), compact_env: true, sampler: Seeded { temperature: 0.8, top_k: 40, top_p: 1.0, seed: 1592590338 }, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: Length, readback: Compact }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            694,
+            279,
+            6511,
+            314,
+            9338,
+            369,
+            524,
+            7172,
+            303,
+            11751,
+            13,
+            3437,
+            369,
+            279,
+            6511
+          ],
+          "text": " Paris but the capital of France is not located in Paris. What is the capital",
+          "stop_reason": "Some(Length)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 16,
+          "callback_ids": [],
+          "callback_text": "",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 0,
+            "decode_compact_candidate": 15,
+            "prefill_full_vocab": 0,
+            "prefill_compact_candidate": 1,
+            "decode_full_vocab_bytes": 0,
+            "decode_compact_candidate_bytes": 4800,
+            "prefill_full_vocab_bytes": 0,
+            "prefill_compact_candidate_bytes": 320
+          }
+        }
+      }
+    },
+    {
+      "name": "direct_grammar_json",
+      "entry": "direct",
+      "config": "CaseSpec { name: \"direct_grammar_json\", entry: Direct, prompt: ChatNoThink(\"Reply with a JSON object whose key \\\"answer\\\" holds the number 42.\"), compact_env: true, sampler: Greedy, max_new_tokens: 48, stop_strings: [], stop_on_im_end: false, grammar: true, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: GrammarJson, readback: Dense }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            90,
+            198,
+            220,
+            328,
+            8944,
+            763,
+            220,
+            19,
+            17,
+            198,
+            92
+          ],
+          "text": "{\n  \"answer\": 42\n}",
+          "stop_reason": "Some(Grammar)",
+          "stopped": true,
+          "prompt_tokens": 29,
+          "generated_tokens": 11,
+          "callback_ids": [],
+          "callback_text": "",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 10,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 9932800,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "direct_stop_string",
+      "entry": "direct",
+      "config": "CaseSpec { name: \"direct_stop_string\", entry: Direct, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Greedy, max_new_tokens: 48, stop_strings: [\".\\n\"], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: StopString, readback: Argmax }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            13,
+            198
+          ],
+          "text": " Paris",
+          "stop_reason": "Some(Eos)",
+          "stopped": true,
+          "prompt_tokens": 5,
+          "generated_tokens": 3,
+          "callback_ids": [],
+          "callback_text": "",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 0,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 0,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "direct_stop_token",
+      "entry": "direct",
+      "config": "CaseSpec { name: \"direct_stop_token\", entry: Direct, prompt: ChatNoThink(\"Reply with exactly these words: yes, of course\"), compact_env: false, sampler: Greedy, max_new_tokens: 48, stop_strings: [], stop_on_im_end: true, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: StopToken, readback: Argmax }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            9405,
+            11,
+            314,
+            3199
+          ],
+          "text": "yes, of course",
+          "stop_reason": "Some(Eos)",
+          "stopped": true,
+          "prompt_tokens": 22,
+          "generated_tokens": 4,
+          "callback_ids": [],
+          "callback_text": "",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 0,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 0,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "direct_logprobs_refused",
+      "entry": "direct",
+      "config": "CaseSpec { name: \"direct_logprobs_refused\", entry: Direct, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Greedy, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: Some(2), enable_thinking: false, reasoning_budget: None, cancel: Never, expect: Refused, readback: NoDecode }",
+      "outcome": {
+        "refused": {
+          "error": "Invalid input: per-token logprobs are not yet supported on this generation path; use the Qwen3.5 CPU generate() / generate_streaming() or the Metal generate_streaming(), which implement logprobs capture",
+          "readback": {
+            "decode_full_vocab": 0,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 0,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 0,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 0,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "direct_reasoning_budget_refused",
+      "entry": "direct",
+      "config": "CaseSpec { name: \"direct_reasoning_budget_refused\", entry: Direct, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Greedy, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: true, reasoning_budget: Some(4), cancel: Never, expect: Refused, readback: NoDecode }",
+      "outcome": {
+        "refused": {
+          "error": "Invalid input: reasoning_budget is not yet supported on this generation path; use the Qwen3.5 CPU generate() / generate_streaming() or the Metal generate_streaming(), which implement reasoning-budget forcing",
+          "readback": {
+            "decode_full_vocab": 0,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 0,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 0,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 0,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_greedy_dense",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_greedy_dense\", entry: Streaming, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Greedy, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: Length, readback: Dense }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369,
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369
+          ],
+          "text": " Paris.\nThe capital of France is Paris.\nThe capital of France is",
+          "stop_reason": "Some(Length)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 16,
+          "callback_ids": [
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369,
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369
+          ],
+          "callback_text": " Paris.\nThe capital of France is Paris.\nThe capital of France is",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 15,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 14899200,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_greedy_compact",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_greedy_compact\", entry: Streaming, prompt: Plain(\"The capital of France is\"), compact_env: true, sampler: Greedy, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: Length, readback: Compact }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369,
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369
+          ],
+          "text": " Paris.\nThe capital of France is Paris.\nThe capital of France is",
+          "stop_reason": "Some(Length)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 16,
+          "callback_ids": [
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369,
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369
+          ],
+          "callback_text": " Paris.\nThe capital of France is Paris.\nThe capital of France is",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 0,
+            "decode_compact_candidate": 15,
+            "prefill_full_vocab": 0,
+            "prefill_compact_candidate": 1,
+            "decode_full_vocab_bytes": 0,
+            "decode_compact_candidate_bytes": 120,
+            "prefill_full_vocab_bytes": 0,
+            "prefill_compact_candidate_bytes": 8
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_sampled_dense",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_sampled_dense\", entry: Streaming, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Seeded { temperature: 0.8, top_k: 40, top_p: 0.9, seed: 1592590337 }, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: Length, readback: Dense }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            11,
+            279,
+            7526,
+            3177,
+            303,
+            279,
+            3046,
+            13,
+            11751,
+            682,
+            264,
+            6823,
+            314,
+            888,
+            220
+          ],
+          "text": " Paris, the largest city in the country. Paris has a population of over ",
+          "stop_reason": "Some(Length)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 16,
+          "callback_ids": [
+            11751,
+            11,
+            279,
+            7526,
+            3177,
+            303,
+            279,
+            3046,
+            13,
+            11751,
+            682,
+            264,
+            6823,
+            314,
+            888,
+            220
+          ],
+          "callback_text": " Paris, the largest city in the country. Paris has a population of over ",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 15,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 14899200,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_sampled_block_topk",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_sampled_block_topk\", entry: Streaming, prompt: Plain(\"The capital of France is\"), compact_env: true, sampler: Seeded { temperature: 0.8, top_k: 40, top_p: 1.0, seed: 1592590338 }, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: Length, readback: Compact }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            694,
+            279,
+            6511,
+            314,
+            9338,
+            369,
+            524,
+            7172,
+            303,
+            11751,
+            13,
+            3437,
+            369,
+            279,
+            6511
+          ],
+          "text": " Paris but the capital of France is not located in Paris. What is the capital",
+          "stop_reason": "Some(Length)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 16,
+          "callback_ids": [
+            11751,
+            694,
+            279,
+            6511,
+            314,
+            9338,
+            369,
+            524,
+            7172,
+            303,
+            11751,
+            13,
+            3437,
+            369,
+            279,
+            6511
+          ],
+          "callback_text": " Paris but the capital of France is not located in Paris. What is the capital",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 0,
+            "decode_compact_candidate": 15,
+            "prefill_full_vocab": 0,
+            "prefill_compact_candidate": 1,
+            "decode_full_vocab_bytes": 0,
+            "decode_compact_candidate_bytes": 4800,
+            "prefill_full_vocab_bytes": 0,
+            "prefill_compact_candidate_bytes": 320
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_grammar_json",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_grammar_json\", entry: Streaming, prompt: ChatNoThink(\"Reply with a JSON object whose key \\\"answer\\\" holds the number 42.\"), compact_env: true, sampler: Greedy, max_new_tokens: 48, stop_strings: [], stop_on_im_end: false, grammar: true, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: GrammarJson, readback: Dense }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            90,
+            198,
+            220,
+            328,
+            8944,
+            763,
+            220,
+            19,
+            17,
+            198,
+            92
+          ],
+          "text": "{\n  \"answer\": 42\n}",
+          "stop_reason": "Some(Grammar)",
+          "stopped": true,
+          "prompt_tokens": 29,
+          "generated_tokens": 11,
+          "callback_ids": [
+            90,
+            198,
+            220,
+            328,
+            8944,
+            763,
+            220,
+            19,
+            17,
+            198,
+            92
+          ],
+          "callback_text": "{\n  \"answer\": 42\n}",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 10,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 9932800,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_stop_string",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_stop_string\", entry: Streaming, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Greedy, max_new_tokens: 48, stop_strings: [\".\\n\"], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: StopString, readback: Dense }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            13,
+            198
+          ],
+          "text": " Paris",
+          "stop_reason": "Some(Eos)",
+          "stopped": true,
+          "prompt_tokens": 5,
+          "generated_tokens": 3,
+          "callback_ids": [
+            11751,
+            13
+          ],
+          "callback_text": " Paris",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 2,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 1986560,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_stop_token",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_stop_token\", entry: Streaming, prompt: ChatNoThink(\"Reply with exactly these words: yes, of course\"), compact_env: false, sampler: Greedy, max_new_tokens: 48, stop_strings: [], stop_on_im_end: true, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: Never, expect: StopToken, readback: Dense }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            9405,
+            11,
+            314,
+            3199
+          ],
+          "text": "yes, of course",
+          "stop_reason": "Some(Eos)",
+          "stopped": true,
+          "prompt_tokens": 22,
+          "generated_tokens": 4,
+          "callback_ids": [
+            9405,
+            11,
+            314,
+            3199
+          ],
+          "callback_text": "yes, of course",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 4,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 3973120,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_logprobs",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_logprobs\", entry: Streaming, prompt: Plain(\"The capital of France is\"), compact_env: true, sampler: Greedy, max_new_tokens: 8, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: Some(2), enable_thinking: false, reasoning_budget: None, cancel: Never, expect: LogprobsCaptured, readback: Dense }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369
+          ],
+          "text": " Paris.\nThe capital of France is",
+          "stop_reason": "Some(Length)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 8,
+          "callback_ids": [
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369
+          ],
+          "callback_text": " Paris.\nThe capital of France is",
+          "logprob_token_ids": [
+            11751,
+            13,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369
+          ],
+          "top_logprob_ids": [
+            [
+              11751,
+              279
+            ],
+            [
+              13,
+              11
+            ],
+            [
+              198,
+              561
+            ],
+            [
+              760,
+              57590
+            ],
+            [
+              6511,
+              803
+            ],
+            [
+              314,
+              369
+            ],
+            [
+              9338,
+              279
+            ],
+            [
+              369,
+              557
+            ]
+          ],
+          "readback": {
+            "decode_full_vocab": 7,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 6952960,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_reasoning_budget",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_reasoning_budget\", entry: Streaming, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Greedy, max_new_tokens: 8, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: true, reasoning_budget: Some(4), cancel: Never, expect: ReasoningBudgetForcesClose, readback: Dense }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            13,
+            198,
+            760,
+            248069,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369,
+            11751,
+            13
+          ],
+          "text": " Paris.\nThe</think>\nThe capital of France is Paris.",
+          "stop_reason": "Some(Length)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 13,
+          "callback_ids": [
+            11751,
+            13,
+            198,
+            760,
+            248069,
+            198,
+            760,
+            6511,
+            314,
+            9338,
+            369,
+            11751,
+            13
+          ],
+          "callback_text": " Paris.\nThe</think>\nThe capital of France is Paris.",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 12,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 11919360,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_cancel_by_callback",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_cancel_by_callback\", entry: Streaming, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Greedy, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: OnTokenCall(3), expect: CancelledByCallback, readback: Dense }",
+      "outcome": {
+        "generated": {
+          "token_ids": [
+            11751,
+            13,
+            198
+          ],
+          "text": " Paris.\n",
+          "stop_reason": "Some(Interrupt)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 3,
+          "callback_ids": [
+            11751,
+            13,
+            198
+          ],
+          "callback_text": " Paris.\n",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 2,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 1986560,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming_cancel_after_prefill",
+      "entry": "streaming",
+      "config": "CaseSpec { name: \"streaming_cancel_after_prefill\", entry: Streaming, prompt: Plain(\"The capital of France is\"), compact_env: false, sampler: Greedy, max_new_tokens: 16, stop_strings: [], stop_on_im_end: false, grammar: false, logprobs: None, enable_thinking: false, reasoning_budget: None, cancel: AfterPrefill, expect: CancelledAfterPrefill, readback: NoDecode }",
+      "outcome": {
+        "generated": {
+          "token_ids": [],
+          "text": "",
+          "stop_reason": "Some(Interrupt)",
+          "stopped": false,
+          "prompt_tokens": 5,
+          "generated_tokens": 0,
+          "callback_ids": [],
+          "callback_text": "",
+          "logprob_token_ids": [],
+          "top_logprob_ids": [],
+          "readback": {
+            "decode_full_vocab": 0,
+            "decode_compact_candidate": 0,
+            "prefill_full_vocab": 1,
+            "prefill_compact_candidate": 0,
+            "decode_full_vocab_bytes": 0,
+            "decode_compact_candidate_bytes": 0,
+            "prefill_full_vocab_bytes": 993280,
+            "prefill_compact_candidate_bytes": 0
+          }
+        }
+      }
+    }
+  ]
+}
