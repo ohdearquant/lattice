@@ -215,6 +215,72 @@ pub enum ModelBackend {
 }
 
 impl ModelBackend {
+    #[allow(clippy::too_many_arguments)]
+    fn generation_config(
+        &self,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        seed: Option<u64>,
+        stop_strings: Vec<String>,
+        reasoning_budget: Option<usize>,
+        logprobs: Option<usize>,
+    ) -> lattice_inference::GenerateConfig {
+        #[cfg(feature = "metal-gpu")]
+        if let ModelBackend::Metal { handle, .. } = self
+            && let Some(preparation) = handle.client.preparation()
+        {
+            return preparation.lattice_generate_config(
+                max_tokens,
+                temperature,
+                top_p,
+                seed,
+                stop_strings,
+                reasoning_budget,
+                logprobs,
+            );
+        }
+        lattice_gen_cfg(
+            max_tokens,
+            temperature,
+            top_p,
+            seed,
+            stop_strings,
+            reasoning_budget,
+            logprobs,
+        )
+    }
+
+    fn prepare_chat_request(
+        &self,
+        req: &ChatCompletionRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+    ) -> Result<PreparedChatRequest, ApiError> {
+        #[cfg(feature = "metal-gpu")]
+        if let ModelBackend::Metal { handle, .. } = self
+            && let Some(preparation) = handle.client.preparation()
+        {
+            return preparation.prepare_lattice(
+                req,
+                model_id,
+                default_max_tokens,
+                max_tokens_cap,
+                self.supports_vision(),
+            );
+        }
+        prepare_chat_request(
+            req,
+            model_id,
+            default_max_tokens,
+            max_tokens_cap,
+            self.supports_vision(),
+            |prompt| self.tokenize_len(prompt),
+            || self.max_context(),
+        )
+    }
+
     pub fn tokenize_len(&self, text: &str) -> usize {
         match self {
             ModelBackend::Cpu(m) => m.tokenizer().tokenize(text).pre_truncation_len,
@@ -275,6 +341,7 @@ impl ModelBackend {
         use lattice_inference::serve::metal_worker::{
             ContextWindowPolicy, MetalWorker, StartupError, VisionRuntime, WorkerMetadata,
         };
+        use lattice_inference::serving_factory::ServingFactory;
 
         let tokenizer_path = tokenizer_dir
             .as_deref()
@@ -318,28 +385,30 @@ impl ModelBackend {
         }
         let model_dir_for_loader = model_dir.clone();
         let tokenizer_path_for_loader = tokenizer_path.clone();
-        let (owner, client, _meta) = MetalWorker::spawn_with_vision(
-            move || {
-                let cfg = crate::chat::load_q4_config(&model_dir_for_loader)?;
-                let state =
-                    lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir(
-                        &model_dir_for_loader,
-                        &tokenizer_path_for_loader,
-                        &cfg,
-                        max_context,
-                    )
-                    .map_err(|e| format!("Q4 model load failed: {e}"))?;
-                Ok((
-                    state,
-                    tokenizer_for_worker,
-                    WorkerMetadata {
-                        format: "q4".to_string(),
-                        model_max_context: max_context,
-                        context_window_policy: ContextWindowPolicy::PromptAndMaxTokens,
-                    },
-                ))
-            },
-            vision_runtime,
+        let (owner, client, _meta, _preparation) = MetalWorker::spawn_with_vision(
+            ServingFactory::qwen_metal(
+                move || {
+                    let cfg = crate::chat::load_q4_config(&model_dir_for_loader)?;
+                    let state =
+                        lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir(
+                            &model_dir_for_loader,
+                            &tokenizer_path_for_loader,
+                            &cfg,
+                            max_context,
+                        )
+                        .map_err(|e| format!("Q4 model load failed: {e}"))?;
+                    Ok((
+                        state,
+                        tokenizer_for_worker,
+                        WorkerMetadata {
+                            format: "q4".to_string(),
+                            model_max_context: max_context,
+                            context_window_policy: ContextWindowPolicy::PromptAndMaxTokens,
+                        },
+                    ))
+                },
+                vision_runtime,
+            ),
             max_pending,
             residency_limits,
         )
@@ -1118,17 +1187,14 @@ async fn chat_completions_with_request(
         reasoning_budget,
         seed,
         stream,
-    } = prepare_chat_request(
+    } = state.model.prepare_chat_request(
         &req,
         &state.model_id,
         state.default_max_tokens,
         state.max_tokens_cap,
-        state.model.supports_vision(),
-        |p| state.model.tokenize_len(p),
-        || state.model.max_context(),
     )?;
 
-    let gen_cfg = lattice_gen_cfg(
+    let gen_cfg = state.model.generation_config(
         max_tokens,
         temperature,
         top_p,

@@ -123,6 +123,7 @@ mod imp {
     };
     use lattice_inference::serve::metrics::ServeMetrics;
     use lattice_inference::serve::prepare::build_cfg;
+    use lattice_inference::serving_factory::ServingFactory;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::{BertModel, BertPooling};
     use serde_json::{Value, json};
@@ -1809,10 +1810,9 @@ mod imp {
     // all now live in `lattice_inference::serve::metal_worker` (issue #832),
     // replacing this binary's previous private `spawn_worker`/
     // `run_worker_loop`/`check_prompt_fits_window`/`enforce_prompt_window`.
-    // `load_model`/`LoadedModel` below are unchanged: `run()` wraps
-    // `load_model` in a loader closure passed to `MetalWorker::spawn`, which
-    // runs it ON the worker thread it creates (the `!Send` `MetalQwen35State`
-    // this function returns never crosses a thread boundary).
+    // `load_model`/`LoadedModel` below are unchanged: `run()` gives the
+    // factory a loader closure, which it invokes on the worker thread
+    // (the `!Send` `MetalQwen35State` never crosses a thread boundary).
 
     /// Everything the worker thread needs after a successful model load,
     /// including the actual KV context (#551) so request clamping never
@@ -2106,12 +2106,21 @@ mod imp {
             );
             return err.into_response();
         }
-        let validated = match normalize_request(
-            &req,
-            s.defaults,
-            ServeProfile::lattice_serve(s.model_id.as_ref(), s.model_max_context)
-                .with_vision_support(s.jobs.supports_vision()),
-        ) {
+        let normalized = match s.jobs.preparation() {
+            Some(preparation) => preparation.normalize_standalone(
+                &req,
+                s.defaults,
+                s.model_id.as_ref(),
+                s.jobs.supports_vision(),
+            ),
+            None => normalize_request(
+                &req,
+                s.defaults,
+                ServeProfile::lattice_serve(s.model_id.as_ref(), s.model_max_context)
+                    .with_vision_support(s.jobs.supports_vision()),
+            ),
+        };
+        let validated = match normalized {
             Ok(validated) => validated,
             Err(err) => {
                 emit_serve_event(
@@ -2155,7 +2164,10 @@ mod imp {
                 return err_response(err.status(), err.message(), err.code());
             }
         };
-        let mut cfg = build_cfg(&validated);
+        let mut cfg = match s.jobs.preparation() {
+            Some(preparation) => preparation.standalone_generate_config(&validated),
+            None => build_cfg(&validated),
+        };
         // Wire the compiled grammar into the worker config (design note
         // §"End-to-end execution", step 4) and force `enable_thinking` off
         // for strict requests regardless of server defaults:
@@ -3608,25 +3620,29 @@ mod imp {
                 model_max_context,
                 ..
             },
+            _preparation,
         ) = match MetalWorker::spawn_with_vision(
-            move || {
-                let LoadedModel {
-                    metal,
-                    tokenizer,
-                    format,
-                    model_max_context,
-                } = load_model(&model_dir_for_loader, &tokenizer_path, format)?;
-                Ok((
-                    metal,
-                    tokenizer,
-                    WorkerMetadata {
+            ServingFactory::qwen_metal(
+                move || {
+                    let LoadedModel {
+                        metal,
+                        tokenizer,
                         format,
                         model_max_context,
-                        context_window_policy: ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-                    },
-                ))
-            },
-            vision_runtime,
+                    } = load_model(&model_dir_for_loader, &tokenizer_path, format)?;
+                    Ok((
+                        metal,
+                        tokenizer,
+                        WorkerMetadata {
+                            format,
+                            model_max_context,
+                            context_window_policy:
+                                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                        },
+                    ))
+                },
+                vision_runtime,
+            ),
             max_pending,
             residency_limits,
         ) {
