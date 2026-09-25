@@ -258,6 +258,12 @@ required-features = ["f16", "metal-gpu"]
 name = "bench_decode_streaming"
 required-features = ["f16", "metal-gpu"]
 
+# The Metal routes additionally need f16, metal-gpu and bench-internals;
+# without them those routes print SKIP and exit non-zero.
+[[example]]
+name = "bench_serve_prepare"
+required-features = ["serve"]
+
 [[example]]
 name = "bench_gpu"
 required-features = ["f16", "wgpu-gpu"]

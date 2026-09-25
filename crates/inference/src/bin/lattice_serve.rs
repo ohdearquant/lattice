@@ -96,18 +96,20 @@ mod imp {
         },
         routing::{get, post},
     };
+    use lattice_inference::GenerateOutput;
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::{QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::model_format::{self, ModelFormat};
     use lattice_inference::serve::contract::{
-        ChatRequest as ChatReq, GenerationDefaults, ServeProfile, ValidatedChatRequest,
-        is_message_flood_error, message_flood_text, normalize_request,
+        ChatRequest as ChatReq, GenerationDefaults, ServeProfile, is_message_flood_error,
+        message_flood_text, normalize_request,
     };
     #[cfg(test)]
     use lattice_inference::serve::contract::{
-        ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, normalize_messages,
+        ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, ValidatedChatRequest,
+        normalize_messages,
     };
     use lattice_inference::serve::embeddings::{
         TextEmbeddingsRequest, build_embeddings_response, check_embeddings_item_fits_window,
@@ -120,9 +122,9 @@ mod imp {
         WorkerEvent, WorkerMetadata,
     };
     use lattice_inference::serve::metrics::ServeMetrics;
+    use lattice_inference::serve::prepare::build_cfg;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::{BertModel, BertPooling};
-    use lattice_inference::{GenerateConfig, GenerateOutput};
     use serde_json::{Value, json};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Condvar, Mutex};
@@ -1798,24 +1800,6 @@ mod imp {
         cfg.map(|cfg| cfg.max_position_embeddings)
             .filter(|&n| n > 0)
             .unwrap_or(FALLBACK_MODEL_MAX_CONTEXT)
-    }
-
-    fn build_cfg(req: &ValidatedChatRequest) -> GenerateConfig {
-        let mut cfg = GenerateConfig::default();
-        cfg.max_new_tokens = req.max_tokens;
-        cfg.temperature = req.temperature;
-        cfg.top_k = req.top_k;
-        cfg.top_p = req.top_p;
-        cfg.repetition_penalty = req.repetition_penalty;
-        cfg.seed = req.seed;
-        cfg.stop_token_ids = vec![QWEN_CHAT_IM_END_TOKEN_ID];
-        cfg.enable_thinking = true;
-        cfg.enable_mtp = None;
-        cfg.grammar = None;
-        cfg.stop_strings = req.stop_strings.clone();
-        cfg.reasoning_budget = req.reasoning_budget;
-        cfg.logprobs = req.logprobs;
-        cfg
     }
 
     // ─── GPU worker thread ───────────────────────────────────────────────────
