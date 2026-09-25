@@ -2357,6 +2357,473 @@ mod tests {
         (cfg, weights, rope, tokenizer)
     }
 
+    // -----------------------------------------------------------------------
+    // generate_f16 output-stream goldens
+    // -----------------------------------------------------------------------
+    //
+    // A small (2-layer) synthetic Qwen3.5-shaped model with deterministic
+    // non-zero weights (an LCG, matching `cpu_q8::tests::make_nonzero_q8_cpu_test_model`
+    // and `neon_forward::tests::make_nonzero_q8_neon_test_model`), covering both
+    // hybrid layer kinds so the golden run actually exercises GatedDeltaNet
+    // (linear attention) and GQA (full attention) rather than a degenerate
+    // zero-layer stub. Unlike the zero-layer fixture above (used for preflight/
+    // guard tests, where the *only* interesting behaviour is what happens before
+    // any weight is touched), this fixture exists so the pinned token streams
+    // below characterize the actual decode loop.
+    //
+    // Regenerating the goldens: run
+    //   cargo test -p lattice-inference --features f16 --lib \
+    //     forward::cpu_f16::tests::print_f16_generate_goldens -- --ignored --nocapture
+    // and copy the printed `token_ids`/`stop_reason`/`stopped`/`text` lines into
+    // the four `#[test]` functions below. Re-run whenever the fixture, the
+    // shared sampler, or `forward_step_f16` changes on purpose.
+    fn make_nonzero_f16_cpu_test_model() -> (Qwen35Config, F16ModelWeights, RopeTable) {
+        use crate::model::qwen35_config::LayerType;
+        use crate::weights::f16_weights::f32_to_f16_slice;
+
+        let hidden: usize = 64;
+        let vocab: usize = 128;
+        let inter: usize = 128;
+        let num_attn_heads: usize = 2;
+        let num_kv_heads: usize = 1;
+        let head_dim: usize = 32;
+        let q_dim = num_attn_heads * head_dim; // 64
+        let kv_dim = num_kv_heads * head_dim; // 32
+        let lin_key_heads: usize = 2;
+        let lin_val_heads: usize = 2;
+        let lin_key_dim: usize = 32;
+        let lin_val_dim: usize = 32;
+        let lin_qkv_dim = lin_key_heads * lin_key_dim * 2 + lin_val_heads * lin_val_dim; // 192
+        let lin_output_dim = lin_val_heads * lin_val_dim; // 64
+        let kernel_size: usize = 4;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 2,
+            vocab_size: vocab,
+            intermediate_size: inter,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: num_attn_heads,
+            num_key_value_heads: num_kv_heads,
+            head_dim,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: lin_key_heads,
+            linear_num_value_heads: Some(lin_val_heads),
+            linear_key_head_dim: lin_key_dim,
+            linear_value_head_dim: lin_val_dim,
+            linear_conv_kernel_dim: kernel_size,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            layer_mask: vec![true; 2],
+            // Out of the fixture's vocabulary range: EOS never fires "by luck" on
+            // this LCG-generated model, so every golden case's stop behaviour
+            // (or lack of it) is controlled entirely by `GenerateConfig`.
+            eos_token_id: 999_999,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
+        };
+
+        let rope_dim = (head_dim as f32 * cfg.partial_rotary_factor) as usize; // 16
+        let rope = RopeTable::new(rope_dim, cfg.max_position_embeddings, cfg.rope_theta);
+
+        // Deterministic weight generator: LCG producing small non-zero floats,
+        // packed to f16. Same constants as the Q8/NEON nonzero fixtures so all
+        // three wrappers' goldens are built by the same recipe.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        // Shared LCG step, reused by every draw below (weights, norm gains,
+        // conv taps, decay-gate biases) so the whole fixture stays one
+        // deterministic stream from a single seed.
+        fn lcg_step(seed: &mut u64) -> f32 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*seed >> 33) as f32 / u32::MAX as f32
+        }
+        fn next_small_vec(seed: &mut u64, n: usize, scale: f32) -> Vec<f32> {
+            (0..n)
+                .map(|_| lcg_step(seed) * scale - scale / 2.0)
+                .collect()
+        }
+        // Norm gains, decay-gate params and conv taps: distinct, non-uniform
+        // per-element draws (never a repeated literal) so these vectors carry
+        // real per-channel structure instead of acting as either a no-op
+        // (`1 + gamma` with every gamma identical) or a dead branch (`gamma`
+        // uniformly `0.0` feeding a direct, non-shifted `x * gamma` norm).
+        // Drawn BEFORE `next_weight` is even defined: that closure holds a
+        // unique borrow of `seed` for its whole life once created, so any
+        // `next_small_vec(&mut seed, ..)` call sitting inside that span
+        // (even textually before the closure's first call) conflicts.
+        let gdn_a_log = next_small_vec(&mut seed, lin_key_heads, 1.0);
+        let gdn_dt_bias = next_small_vec(&mut seed, lin_key_heads, 1.0);
+        let gdn_conv1d_weight = next_small_vec(&mut seed, lin_qkv_dim * kernel_size, 0.04);
+        // The gated-attention output norm (`scalar_gated_rms_norm`,
+        // attention/gdn_fused.rs) applies its weight directly
+        // (`x * inv_rms * gamma`), unlike the shifted `1 + gamma`
+        // convention `qwen35_rms_norm` uses everywhere else in this
+        // fixture. A uniform `0.0` here zeroed this layer's entire output
+        // for every input, which is what made the golden streams below
+        // identical across every prompt regardless of length or content.
+        // A non-uniform, non-zero draw keeps the layer's output both
+        // nonzero and content-shaped (a single shared constant would
+        // still be a pure, direction-preserving rescale).
+        let gdn_norm_weight: Vec<f32> = next_small_vec(&mut seed, lin_val_dim, 1.0)
+            .iter()
+            .map(|g| g + 1.0)
+            .collect();
+        // q_norm/k_norm gains at scale 8.0 (Qwen3.5's shifted `1 + gamma`
+        // convention, so this puts the per-channel Q/K rescale in roughly
+        // [-4, 4] instead of [0.5, 1.5]), tried together with the v_proj/
+        // o_proj scale below to make the softmax over `full_attention_step_f16`'s
+        // attended keys sensitive to the RoPE phase shift a decode position
+        // change produces. Measured (round 3, all-full-attention, this
+        // fixture's own history in `crates/inference/src/forward/cpu_q8.rs`):
+        // raw-logit deltas from a one-position shift stay ~4 orders of
+        // magnitude below this fixture's candidate-logit spacing at this
+        // scale, so the greedy argmax never moves. `full_attention_step_f16`
+        // reads its attend-window size from `kv_cache.seq_len`, never from
+        // the `position` argument the caller passes in, so `position` only
+        // ever perturbs RoPE phase here; the fixture's own signal path
+        // (GDN's linear recurrence, not full attention) dominates the
+        // residual at this problem size regardless of this gain.
+        let full_q_norm = next_small_vec(&mut seed, head_dim, 8.0);
+        let full_k_norm = next_small_vec(&mut seed, head_dim, 8.0);
+
+        let mut next_weight = |n: usize, k: usize, scale: f32| -> Vec<u16> {
+            let floats: Vec<f32> = (0..n * k)
+                .map(|_| lcg_step(&mut seed) * scale - scale / 2.0)
+                .collect();
+            let mut packed = vec![0u16; n * k];
+            f32_to_f16_slice(&floats, &mut packed);
+            packed
+        };
+
+        let gdn_w = F16GatedDeltaNetWeights {
+            in_proj_qkv: next_weight(lin_qkv_dim, hidden, 0.04),
+            in_proj_qkv_rows: lin_qkv_dim,
+            in_proj_qkv_cols: hidden,
+            in_proj_z: next_weight(lin_output_dim, hidden, 0.04),
+            in_proj_z_rows: lin_output_dim,
+            in_proj_z_cols: hidden,
+            in_proj_b: next_weight(lin_key_heads, hidden, 0.04),
+            in_proj_b_rows: lin_key_heads,
+            in_proj_b_cols: hidden,
+            in_proj_a: next_weight(lin_key_heads, hidden, 0.04),
+            in_proj_a_rows: lin_key_heads,
+            in_proj_a_cols: hidden,
+            a_log: gdn_a_log,
+            dt_bias: gdn_dt_bias,
+            conv1d_weight: gdn_conv1d_weight,
+            conv_dim: lin_qkv_dim,
+            kernel_size,
+            norm_weight: gdn_norm_weight,
+            out_proj: next_weight(hidden, lin_output_dim, 0.04),
+            out_proj_rows: hidden,
+            out_proj_cols: lin_output_dim,
+        };
+
+        // v_proj/o_proj at a distinctly larger scale (4.0 vs the 0.04 every
+        // other matrix uses), tried alongside the q_norm/k_norm gain above
+        // so the full-attention layer's residual contribution would compete
+        // with the FFN's attenuation. Measured insufficient at this scale
+        // (see the comment on `full_q_norm`/`full_k_norm` above) — kept at
+        // this larger value because it strictly widens the draw range used
+        // for the content-sensitivity property this fixture guards, without
+        // regressing it, not because it reaches position sensitivity.
+        let full_w = F16FullAttentionLayerWeights {
+            q_proj: next_weight(2 * q_dim, hidden, 0.04),
+            k_proj: next_weight(kv_dim, hidden, 0.04),
+            v_proj: next_weight(kv_dim, hidden, 4.0),
+            o_proj: next_weight(hidden, q_dim, 4.0),
+            q_norm: full_q_norm,
+            k_norm: full_k_norm,
+        };
+
+        let make_common = |seed: &mut u64| -> F16CommonLayerWeights {
+            let input_layernorm = next_small_vec(seed, hidden, 1.0);
+            let post_attention_layernorm = next_small_vec(seed, hidden, 1.0);
+            let mut nw = |n: usize, k: usize| -> Vec<u16> {
+                let floats: Vec<f32> = (0..n * k).map(|_| lcg_step(seed) * 0.04 - 0.02).collect();
+                let mut packed = vec![0u16; n * k];
+                f32_to_f16_slice(&floats, &mut packed);
+                packed
+            };
+            F16CommonLayerWeights {
+                input_layernorm,
+                post_attention_layernorm,
+                ffn: F16FeedForwardWeights::Dense {
+                    gate_proj: nw(inter, hidden),
+                    up_proj: nw(inter, hidden),
+                    down_proj: nw(hidden, inter),
+                },
+            }
+        };
+
+        let layers = vec![
+            (F16AttentionWeights::Linear(gdn_w), make_common(&mut seed)),
+            (F16AttentionWeights::Full(full_w), make_common(&mut seed)),
+        ];
+
+        let embed_floats: Vec<f32> = (0..vocab * hidden)
+            .map(|_| lcg_step(&mut seed) * 0.04 - 0.02)
+            .collect();
+        let mut embed_tokens = vec![0u16; vocab * hidden];
+        f32_to_f16_slice(&embed_floats, &mut embed_tokens);
+
+        let weights = F16ModelWeights {
+            embed_tokens,
+            final_norm: next_small_vec(&mut seed, hidden, 1.0),
+            layers,
+        };
+
+        (cfg, weights, rope)
+    }
+
+    /// Tokenizer covering every id in the nonzero fixture's `vocab_size` (128).
+    /// Ids 0..=7 keep the single-character tokens the other tests in this file
+    /// already rely on; the golden prompt `"world"` encodes to five of them. Ids 8..128 get
+    /// distinct two-character printable tokens so every id the decode loop can
+    /// produce has real text instead of falling through to an empty string.
+    fn nonzero_fixture_tokenizer() -> BpeTokenizer {
+        use std::collections::HashMap;
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        for id in 8u32..128 {
+            let j = (id - 8) as usize;
+            let a = ALPHABET[j / ALPHABET.len()] as char;
+            let b = ALPHABET[j % ALPHABET.len()] as char;
+            vocab_map.insert(format!("{a}{b}"), id);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap()
+    }
+
+    /// Writer path for the four `generate_f16` goldens below: prints the exact
+    /// fields the `#[test]`s pin. Not run by default (`#[ignore]`); run
+    /// explicitly (see the module-level comment above) and copy its output into
+    /// the assertions when the fixture or the production decode path changes on
+    /// purpose.
+    #[test]
+    #[ignore = "golden writer: run explicitly to (re)print the pinned values"]
+    fn print_f16_generate_goldens() {
+        let (cfg, weights, rope) = make_nonzero_f16_cpu_test_model();
+        let tokenizer = nonzero_fixture_tokenizer();
+
+        let greedy_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let greedy = generate_f16(&weights, &cfg, &tokenizer, &rope, "world", &greedy_cfg)
+            .expect("greedy golden must succeed");
+        println!("GREEDY token_ids={:?}", greedy.token_ids);
+        println!(
+            "GREEDY stopped={} stop_reason={:?}",
+            greedy.stopped, greedy.stop_reason
+        );
+        println!("GREEDY text={:?}", greedy.text);
+
+        let seeded_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.8,
+            top_k: 5,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            seed: Some(1234),
+            ..Default::default()
+        };
+        let seeded = generate_f16(&weights, &cfg, &tokenizer, &rope, "world", &seeded_cfg)
+            .expect("seeded golden must succeed");
+        println!("SEEDED token_ids={:?}", seeded.token_ids);
+        println!(
+            "SEEDED stopped={} stop_reason={:?}",
+            seeded.stopped, seeded.stop_reason
+        );
+        println!("SEEDED text={:?}", seeded.text);
+
+        // Stop-token case: derive a real mid-stream token from the greedy run
+        // above and make it a stop token, so the golden proves an ACTUAL
+        // decode-loop stop (not a fixture that vacuously never generates).
+        assert!(
+            greedy.token_ids.len() >= 2,
+            "need at least 2 greedy tokens to derive a mid-stream stop token"
+        );
+        let stop_tok = greedy.token_ids[1];
+        let stop_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            stop_token_ids: vec![stop_tok],
+            ..Default::default()
+        };
+        let stopped = generate_f16(&weights, &cfg, &tokenizer, &rope, "world", &stop_cfg)
+            .expect("stop-token golden must succeed");
+        println!("STOP stop_tok={stop_tok}");
+        println!("STOP token_ids={:?}", stopped.token_ids);
+        println!(
+            "STOP stopped={} stop_reason={:?}",
+            stopped.stopped, stopped.stop_reason
+        );
+        println!("STOP text={:?}", stopped.text);
+
+        let one_tok_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            temperature: 0.0,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let one_tok = generate_f16(&weights, &cfg, &tokenizer, &rope, "world", &one_tok_cfg)
+            .expect("max_new_tokens=1 golden must succeed");
+        println!("ONE token_ids={:?}", one_tok.token_ids);
+        println!(
+            "ONE stopped={} stop_reason={:?}",
+            one_tok.stopped, one_tok.stop_reason
+        );
+        println!("ONE text={:?}", one_tok.text);
+    }
+
+    /// `generate_f16` greedy decode (`temperature: 0.0`). Values captured from
+    /// `print_f16_generate_goldens` (see that test's doc comment for the exact
+    /// regeneration command); identical to `generate_q8`'s and
+    /// `generate_q8_neon`'s greedy goldens for this fixture (small,
+    /// well-separated logits at this problem size are not moved by f16/int8
+    /// quantization noise here).
+    ///
+    /// Mutation check: changing `max_new_tokens: 6` to `5` must turn
+    /// `token_ids` red (truncated sequence). `seed` is not the mutated field
+    /// here: at `temperature: 0.0` the sampler takes the degenerate-temperature
+    /// argmax short-circuit before the RNG is ever consulted, so a seed change
+    /// on a greedy golden cannot move the output.
+    #[test]
+    fn generate_f16_greedy_golden() {
+        let (cfg, weights, rope) = make_nonzero_f16_cpu_test_model();
+        let tokenizer = nonzero_fixture_tokenizer();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let out = generate_f16(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
+            .expect("greedy golden must succeed");
+        assert_eq!(
+            out.prompt_tokens, 5,
+            "the prompt must span several prefill positions"
+        );
+        assert_eq!(out.token_ids, vec![36, 80, 112, 62, 103, 86]);
+        assert!(!out.stopped);
+        assert_eq!(
+            out.stop_reason,
+            Some(crate::stop_reason::StopReason::Length)
+        );
+        assert_eq!(out.text, "aCbkbQa2bHbq");
+    }
+
+    /// `generate_f16` with temperature/top_k/top_p/repetition_penalty all set
+    /// (seeded sampling, not greedy).
+    ///
+    /// Mutation check: changing `top_k: 5` to `top_k: 1` (equivalent to greedy
+    /// given the other settings) must turn `token_ids` red against this golden.
+    #[test]
+    fn generate_f16_seeded_sampling_golden() {
+        let (cfg, weights, rope) = make_nonzero_f16_cpu_test_model();
+        let tokenizer = nonzero_fixture_tokenizer();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.8,
+            top_k: 5,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            seed: Some(1234),
+            ..Default::default()
+        };
+        let out = generate_f16(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
+            .expect("seeded golden must succeed");
+        assert_eq!(out.token_ids, vec![36, 80, 103, 112, 87, 86]);
+        assert!(!out.stopped);
+        assert_eq!(
+            out.stop_reason,
+            Some(crate::stop_reason::StopReason::Length)
+        );
+        assert_eq!(out.text, "aCbkbHbQbrbq");
+    }
+
+    /// `generate_f16` stopping on a `stop_token_ids` match. `stop_tok = 80` is
+    /// the greedy golden's own second token (see `generate_f16_greedy_golden`),
+    /// so this proves an actual decode-loop stop, not a fixture that vacuously
+    /// never generates that token.
+    ///
+    /// Mutation check: removing `stop_token_ids` (or pointing it at a token the
+    /// greedy prefix never produces) must turn `stopped`/`stop_reason`/
+    /// `token_ids.len()` red against this golden.
+    #[test]
+    fn generate_f16_stop_token_golden() {
+        let (cfg, weights, rope) = make_nonzero_f16_cpu_test_model();
+        let tokenizer = nonzero_fixture_tokenizer();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 6,
+            temperature: 0.0,
+            seed: Some(7),
+            stop_token_ids: vec![80],
+            ..Default::default()
+        };
+        let out = generate_f16(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
+            .expect("stop-token golden must succeed");
+        assert_eq!(out.token_ids, vec![36]);
+        assert!(out.stopped);
+        assert_eq!(out.stop_reason, Some(crate::stop_reason::StopReason::Eos));
+        assert_eq!(out.text, "aC");
+    }
+
+    /// `generate_f16` with `max_new_tokens: 1`, the boundary case where the
+    /// decode loop must stop after exactly one token.
+    ///
+    /// Mutation check: changing `max_new_tokens` to `2` must turn
+    /// `token_ids.len()` red against this golden (it would produce 2 tokens,
+    /// matching the greedy golden's first two: `[36, 80]`).
+    #[test]
+    fn generate_f16_max_new_tokens_one_golden() {
+        let (cfg, weights, rope) = make_nonzero_f16_cpu_test_model();
+        let tokenizer = nonzero_fixture_tokenizer();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            temperature: 0.0,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let out = generate_f16(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
+            .expect("max_new_tokens=1 golden must succeed");
+        assert_eq!(out.token_ids, vec![36]);
+        assert!(!out.stopped);
+        assert_eq!(
+            out.stop_reason,
+            Some(crate::stop_reason::StopReason::Length)
+        );
+        assert_eq!(out.text, "aC");
+    }
+
     /// `generate_f16` must reject a request whose prompt + max_new_tokens exceeds
     /// the RoPE table capacity with a clean error, not an out-of-bounds RoPE index
     /// (in a real model) or a runaway allocation. The preflight returns before any
@@ -2642,6 +3109,60 @@ mod tests {
             matches!(result, Err(InferenceError::InvalidInput(_))),
             "generate_f16 must fail closed with InvalidInput when grammar is set (#397/#398); \
              got {result:?}"
+        );
+    }
+
+    /// `generate_f16` must reject a `GenerateConfig` that sets `logprobs` with a
+    /// typed `InvalidInput` error before sampling any token (#585): this wrapper
+    /// has not wired per-step log-probability capture into its decode loop, so a
+    /// request asking for it must fail closed rather than silently return an
+    /// empty `token_logprobs`.
+    ///
+    /// Sibling of `generate_f16_rejects_grammar_config_before_sampling` /
+    /// `..._stop_strings_..` / `..._reasoning_budget_..`, which already cover the
+    /// other three `StandaloneCpu`-contract guards; this one was the gap.
+    /// Mutation sensitivity: removing the `check_logprobs_not_set`
+    /// call in `GenerationEntryContract::StandaloneCpu`'s `validate_capabilities`
+    /// arm makes the function proceed past the guard and attempt to forward with
+    /// empty weights, producing a panic or a non-`InvalidInput` error — this
+    /// assert fails either way.
+    #[test]
+    fn generate_f16_rejects_logprobs_config_before_sampling() {
+        use crate::error::InferenceError;
+        use std::collections::HashMap;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let weights = F16ModelWeights {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            layers: vec![],
+        };
+
+        let gen_cfg = GenerateConfig {
+            logprobs: Some(0),
+            ..Default::default()
+        };
+
+        let result = generate_f16(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::InvalidInput(ref message))
+                    if message.contains("per-token logprobs are not yet supported")
+            ),
+            "generate_f16 must fail closed with the exact logprobs-unsupported \
+             InvalidInput (#585); got {result:?}"
         );
     }
 

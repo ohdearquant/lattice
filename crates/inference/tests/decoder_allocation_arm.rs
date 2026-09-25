@@ -70,6 +70,13 @@
 //! two independent thread-local counters, which is correct, but they would
 //! contend for the same CPU and the byte totals would interleave in the printed
 //! record in an order the reader cannot reconstruct.
+//!
+//! The same invocation also runs `measure_generate_f16_allocations`,
+//! `measure_generate_q8_allocations` and `measure_generate_q8_neon_allocations`:
+//! one `record` line each for `generate_f16` / `generate_q8` / `generate_q8_neon`
+//! against the same checkpoint and the same golden cases. None of the three
+//! wrappers has a `_streaming` sibling, so unlike `measure_generate_allocations`
+//! above these print no `record_streaming` line.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -243,19 +250,12 @@ mod controls {
     }
 }
 
-/// The measurement. Prints two machine-readable records per case -- a `record`
-/// line for `generate` and a `record_streaming` line for `generate_streaming`
-/// with a no-op callback, in the same column layout -- and asserts only what is
-/// true at any ref; the base-vs-head comparison is the caller's.
-///
-/// Every `generate` measurement runs, and every `record` line is printed, before
-/// the first `generate_streaming` call, so the `record` lines stay comparable with
-/// runs that predate the streaming records.
-#[test]
-fn measure_generate_allocations() {
-    use lattice_inference::GenerateConfig;
-    use lattice_inference::model::qwen35::Qwen35Model;
-
+/// Checkpoint directory shared by every measurement in this file: either env
+/// var, checked in the order the pre-existing `measure_generate_allocations`
+/// already used. Factored out so the three wrapper-specific measurements added
+/// below resolve the same directory the same way, rather than each re-deciding
+/// which env var wins.
+fn checkpoint_dir() -> std::path::PathBuf {
     let model_dir = std::env::var("LATTICE_CPU_GREEDY_MODEL_DIR")
         .or_else(|_| std::env::var("LATTICE_MODEL_DIR"))
         .unwrap_or_else(|_| {
@@ -271,13 +271,54 @@ fn measure_generate_allocations() {
         model_dir.is_dir(),
         "checkpoint {model_dir:?} is not a directory"
     );
+    model_dir
+}
 
-    // The prompts come from the greedy golden's own fixture so the measured path
-    // is the one the correctness gate pins, rather than a second set of prompts
-    // that could exercise a different branch.
+/// The greedy golden's own fixture, parsed once per caller. Shared by every
+/// measurement in this file so the measured prompts and generation settings are
+/// the ones the correctness gate already pins, rather than a second set that
+/// could exercise a different branch.
+fn greedy_golden() -> serde_json::Value {
     let fixture =
         include_str!("fixtures/cpu_pre_migration_greedy_v1/qwen35_0_8b_cpu_greedy_tokens.json");
-    let golden: serde_json::Value = serde_json::from_str(fixture).expect("golden fixture parses");
+    serde_json::from_str(fixture).expect("golden fixture parses")
+}
+
+fn config_for(
+    golden: &serde_json::Value,
+    case: &serde_json::Value,
+) -> lattice_inference::GenerateConfig {
+    let mut cfg = lattice_inference::GenerateConfig::default();
+    cfg.max_new_tokens = golden["max_new_tokens"].as_u64().expect("max_new_tokens") as usize;
+    cfg.temperature = golden["generation"]["temperature"]
+        .as_f64()
+        .expect("temperature") as f32;
+    cfg.repetition_penalty = golden["generation"]["repetition_penalty"]
+        .as_f64()
+        .expect("repetition_penalty") as f32;
+    cfg.seed = golden["generation"]["seed"].as_u64();
+    cfg.enable_thinking = golden["generation"]["enable_thinking"]
+        .as_bool()
+        .expect("enable_thinking");
+    cfg.reasoning_budget = case["reasoning_budget"].as_u64().map(|v| v as usize);
+    cfg
+}
+
+/// The measurement. Prints two machine-readable records per case -- a `record`
+/// line for `generate` and a `record_streaming` line for `generate_streaming`
+/// with a no-op callback, in the same column layout -- and asserts only what is
+/// true at any ref; the base-vs-head comparison is the caller's.
+///
+/// Every `generate` measurement runs, and every `record` line is printed, before
+/// the first `generate_streaming` call, so the `record` lines stay comparable with
+/// runs that predate the streaming records.
+#[test]
+fn measure_generate_allocations() {
+    use lattice_inference::model::qwen35::Qwen35Model;
+
+    let model_dir = checkpoint_dir();
+
+    let golden = greedy_golden();
     let cases = golden["cases"]
         .as_array()
         .expect("golden fixture declares cases");
@@ -288,28 +329,11 @@ fn measure_generate_allocations() {
     println!("# decoder_allocation_arm records; large threshold {LARGE_ALLOC_BYTES} bytes");
     println!("# case\tcalls\tbytes\tlarge_calls\tmax_bytes");
 
-    let config_for = |case: &serde_json::Value| {
-        let mut cfg = GenerateConfig::default();
-        cfg.max_new_tokens = golden["max_new_tokens"].as_u64().expect("max_new_tokens") as usize;
-        cfg.temperature = golden["generation"]["temperature"]
-            .as_f64()
-            .expect("temperature") as f32;
-        cfg.repetition_penalty = golden["generation"]["repetition_penalty"]
-            .as_f64()
-            .expect("repetition_penalty") as f32;
-        cfg.seed = golden["generation"]["seed"].as_u64();
-        cfg.enable_thinking = golden["generation"]["enable_thinking"]
-            .as_bool()
-            .expect("enable_thinking");
-        cfg.reasoning_budget = case["reasoning_budget"].as_u64().map(|v| v as usize);
-        cfg
-    };
-
     let mut any = 0usize;
     for case in cases {
         let name = case["name"].as_str().expect("case has a name");
         let prompt = case["prompt"].as_str().expect("case has a prompt");
-        let cfg = config_for(case);
+        let cfg = config_for(&golden, case);
 
         // Warm once OUTSIDE the measured window. The first generation pulls in
         // lazily-initialized state that belongs to neither arm, and attributing
@@ -342,7 +366,7 @@ fn measure_generate_allocations() {
     for case in cases {
         let name = case["name"].as_str().expect("case has a name");
         let prompt = case["prompt"].as_str().expect("case has a prompt");
-        let cfg = config_for(case);
+        let cfg = config_for(&golden, case);
 
         // Warmed separately: the streaming entry is a different call path from
         // `generate`, so the `generate` warm-up above does not stand in for it.
@@ -374,6 +398,215 @@ fn measure_generate_allocations() {
     assert_eq!(
         any_streaming, any,
         "generate_streaming measured a different number of cases than generate"
+    );
+    println!("# measured {any} case(s)");
+}
+
+/// The same allocation instrument, extended to the three standalone-CPU
+/// wrappers (`generate_f16`, `generate_q8`, `generate_q8_neon`). None of the
+/// three has a `_streaming` sibling, so each measurement below prints one
+/// `record` line per case and no `record_streaming` line, unlike
+/// `measure_generate_allocations` above.
+///
+/// Model/weight loading mirrors `examples/bench_suite.rs`'s `bench_llm_f16` /
+/// `bench_llm_q8` / `bench_llm_q8_neon` exactly (same load functions, same
+/// order), because that is the repo's one existing precedent for constructing
+/// each wrapper's weight type outside its own module tests. `Qwen35Config` comes
+/// from `Qwen35Config::from_model_dir`, not a hardcoded preset: the checkpoint
+/// named by `LATTICE_CPU_GREEDY_MODEL_DIR` is a Qwen3.5-0.8B directory (see the
+/// golden fixture path above), not the 2B preset `bench_suite.rs` hardcodes.
+#[test]
+fn measure_generate_f16_allocations() {
+    use lattice_inference::forward::cpu_f16::generate_f16;
+    use lattice_inference::model::qwen35_config::Qwen35Config;
+    use lattice_inference::rope::RopeTable;
+    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    use lattice_inference::weights::SafetensorsFile;
+    use lattice_inference::weights::f16_weights::load_f16_weights;
+
+    let model_dir = checkpoint_dir();
+    let golden = greedy_golden();
+    let cases = golden["cases"]
+        .as_array()
+        .expect("golden fixture declares cases");
+
+    let cfg = Qwen35Config::from_model_dir(&model_dir)
+        .unwrap_or_else(|e| panic!("reading config.json in {model_dir:?} failed: {e}"));
+    let tokenizer = BpeTokenizer::from_tokenizer_json(&model_dir.join("tokenizer.json"))
+        .expect("failed to load tokenizer");
+    let rope_dim = cfg.rope_dim();
+    let rope_max = cfg.max_position_embeddings.min(8192);
+    let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
+    let sf = SafetensorsFile::open(&model_dir.join("model.safetensors"))
+        .expect("failed to open safetensors");
+    let weights = load_f16_weights(&sf, &cfg).expect("failed to load f16 weights");
+
+    println!(
+        "# decoder_allocation_arm records (generate_f16); large threshold {LARGE_ALLOC_BYTES} bytes"
+    );
+    println!("# case\tcalls\tbytes\tlarge_calls\tmax_bytes");
+
+    let mut any = 0usize;
+    for case in cases {
+        let name = case["name"].as_str().expect("case has a name");
+        let prompt = case["prompt"].as_str().expect("case has a prompt");
+        let cfg_gen = config_for(&golden, case);
+
+        // Warm once OUTSIDE the measured window; see measure_generate_allocations.
+        let _ = generate_f16(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen);
+
+        reset();
+        let output = generate_f16(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen)
+            .unwrap_or_else(|e| panic!("case {name}: generate_f16 failed: {e}"));
+        let rec = snapshot();
+        std::hint::black_box(&output);
+
+        assert!(
+            rec.calls > 0,
+            "case {name}: generate_f16() recorded zero allocations, which is not a \
+             result but a dead counter"
+        );
+        println!(
+            "record\t{name}\t{}\t{}\t{}\t{}",
+            rec.calls, rec.bytes, rec.large_calls, rec.max_bytes
+        );
+        any += 1;
+    }
+
+    assert!(
+        any > 0,
+        "the golden fixture declared no cases, so nothing was measured"
+    );
+    println!("# measured {any} case(s)");
+}
+
+#[test]
+fn measure_generate_q8_allocations() {
+    use lattice_inference::forward::cpu_q8::{generate_q8, quantize_from_model};
+    use lattice_inference::model::qwen35::Qwen35Model;
+    use lattice_inference::model::qwen35_config::Qwen35Config;
+    use lattice_inference::rope::RopeTable;
+    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+
+    let model_dir = checkpoint_dir();
+    let golden = greedy_golden();
+    let cases = golden["cases"]
+        .as_array()
+        .expect("golden fixture declares cases");
+
+    // Load f32 model first, then quantize -- same order as bench_suite.rs's
+    // bench_llm_q8, and the f32 model is dropped once quantization is done so
+    // the measured window below never has two copies of the weights live.
+    let model = Qwen35Model::from_safetensors(&model_dir)
+        .unwrap_or_else(|e| panic!("loading {model_dir:?} failed: {e}"));
+    let cfg = Qwen35Config::from_model_dir(&model_dir)
+        .unwrap_or_else(|e| panic!("reading config.json in {model_dir:?} failed: {e}"));
+    let tokenizer = BpeTokenizer::from_tokenizer_json(&model_dir.join("tokenizer.json"))
+        .expect("failed to load tokenizer");
+    let rope_dim = cfg.rope_dim();
+    let rope_max = cfg.max_position_embeddings.min(8192);
+    let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
+    let weights = quantize_from_model(&model).expect("Q8 quantization failed");
+    drop(model);
+
+    println!(
+        "# decoder_allocation_arm records (generate_q8); large threshold {LARGE_ALLOC_BYTES} bytes"
+    );
+    println!("# case\tcalls\tbytes\tlarge_calls\tmax_bytes");
+
+    let mut any = 0usize;
+    for case in cases {
+        let name = case["name"].as_str().expect("case has a name");
+        let prompt = case["prompt"].as_str().expect("case has a prompt");
+        let cfg_gen = config_for(&golden, case);
+
+        let _ = generate_q8(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen);
+
+        reset();
+        let output = generate_q8(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen)
+            .unwrap_or_else(|e| panic!("case {name}: generate_q8 failed: {e}"));
+        let rec = snapshot();
+        std::hint::black_box(&output);
+
+        assert!(
+            rec.calls > 0,
+            "case {name}: generate_q8() recorded zero allocations, which is not a \
+             result but a dead counter"
+        );
+        println!(
+            "record\t{name}\t{}\t{}\t{}\t{}",
+            rec.calls, rec.bytes, rec.large_calls, rec.max_bytes
+        );
+        any += 1;
+    }
+
+    assert!(
+        any > 0,
+        "the golden fixture declared no cases, so nothing was measured"
+    );
+    println!("# measured {any} case(s)");
+}
+
+#[test]
+fn measure_generate_q8_neon_allocations() {
+    use lattice_inference::forward::neon_forward::{generate_q8_neon, quantize_model};
+    use lattice_inference::model::qwen35::Qwen35Model;
+    use lattice_inference::model::qwen35_config::Qwen35Config;
+    use lattice_inference::rope::RopeTable;
+    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+
+    let model_dir = checkpoint_dir();
+    let golden = greedy_golden();
+    let cases = golden["cases"]
+        .as_array()
+        .expect("golden fixture declares cases");
+
+    let model = Qwen35Model::from_safetensors(&model_dir)
+        .unwrap_or_else(|e| panic!("loading {model_dir:?} failed: {e}"));
+    let cfg = Qwen35Config::from_model_dir(&model_dir)
+        .unwrap_or_else(|e| panic!("reading config.json in {model_dir:?} failed: {e}"));
+    let tokenizer = BpeTokenizer::from_tokenizer_json(&model_dir.join("tokenizer.json"))
+        .expect("failed to load tokenizer");
+    let rope_dim = cfg.rope_dim();
+    let rope_max = cfg.max_position_embeddings.min(8192);
+    let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
+    let weights = quantize_model(model.weights(), &cfg).expect("quantize_model failed");
+    drop(model);
+
+    println!(
+        "# decoder_allocation_arm records (generate_q8_neon); large threshold {LARGE_ALLOC_BYTES} bytes"
+    );
+    println!("# case\tcalls\tbytes\tlarge_calls\tmax_bytes");
+
+    let mut any = 0usize;
+    for case in cases {
+        let name = case["name"].as_str().expect("case has a name");
+        let prompt = case["prompt"].as_str().expect("case has a prompt");
+        let cfg_gen = config_for(&golden, case);
+
+        let _ = generate_q8_neon(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen);
+
+        reset();
+        let output = generate_q8_neon(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen)
+            .unwrap_or_else(|e| panic!("case {name}: generate_q8_neon failed: {e}"));
+        let rec = snapshot();
+        std::hint::black_box(&output);
+
+        assert!(
+            rec.calls > 0,
+            "case {name}: generate_q8_neon() recorded zero allocations, which is not \
+             a result but a dead counter"
+        );
+        println!(
+            "record\t{name}\t{}\t{}\t{}\t{}",
+            rec.calls, rec.bytes, rec.large_calls, rec.max_bytes
+        );
+        any += 1;
+    }
+
+    assert!(
+        any > 0,
+        "the golden fixture declared no cases, so nothing was measured"
     );
     println!("# measured {any} case(s)");
 }
