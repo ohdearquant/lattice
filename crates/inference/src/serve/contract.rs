@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
 
+use super::prepare::QwenChatDefaults;
 use super::{ApiError, REQUEST_BODY_LIMIT_BYTES};
 
 /// Maximum number of messages accepted in a single chat request, enforced
@@ -354,7 +355,7 @@ enum ModelNamePolicy<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum MaxTokensPolicy {
+pub(crate) enum MaxTokensPolicy {
     RejectAbove { limit: usize },
     ClampToContext { context: usize },
 }
@@ -375,7 +376,7 @@ pub struct ServeProfile<'a> {
     /// rejected ahead of the served-model check (matching each binary's
     /// pre-shared-contract precedence for this one check): `true` on the
     /// daemon profile, `false` on the `lattice` profile, where it is
-    /// checked after the model check instead (see [`normalize_max_tokens`]).
+    /// checked after the model check instead (see [`requested_max_tokens`]).
     max_tokens_conflict_checked_early: bool,
 }
 
@@ -453,6 +454,72 @@ pub struct ValidatedChatRequest {
     pub logprobs: Option<usize>,
 }
 
+/// Validated chat options exactly as the request specified them, before any
+/// model's defaults are applied.
+///
+/// Every option a request may omit is `None` when it was omitted (or sent as
+/// JSON `null`), so an omitted option stays distinguishable from one sent
+/// with the same value a default would have supplied. Values are kept as
+/// sent: `max_tokens` is not yet clamped by the profile, and a
+/// `reasoning_budget` of `0` is kept as `Some(0)`. Options a profile accepts
+/// but ignores (`top_k` and `repetition_penalty` on the `lattice` profile)
+/// are `None`. The request has no field for the thinking switch or the
+/// model's stop tokens, so neither appears here; the model's defaults step
+/// supplies them.
+///
+/// Not a stable API. `#[doc(hidden)]` is a convention, not a semver
+/// guarantee: this type may be reshaped, or folded into the worker-local
+/// model factory, when that factory lands (rollout row R07 in
+/// `docs/adr/R00-ROLLOUT.md`).
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct RequestedChatOptions {
+    /// Validated backend-independent chat messages.
+    pub messages: Vec<NormalizedChatMessage>,
+    /// `max_tokens`, or `max_completion_tokens` when only that is sent.
+    pub max_tokens: Option<usize>,
+    /// Temperature, validated in `[0.0, 2.0]`.
+    pub temperature: Option<f32>,
+    /// Top-k limit, when the profile applies it.
+    pub top_k: Option<usize>,
+    /// Top-p mass, validated in `(0.0, 1.0]`.
+    pub top_p: Option<f32>,
+    /// Repetition penalty, when the profile applies it.
+    pub repetition_penalty: Option<f32>,
+    /// Deterministic sampling seed.
+    pub seed: Option<u64>,
+    /// Whether to stream the response.
+    pub stream: Option<bool>,
+    /// Parsed string-level stop conditions.
+    pub stop_strings: Vec<String>,
+    /// Reasoning-token budget, when the profile applies it.
+    pub reasoning_budget: Option<usize>,
+    /// Whether log probabilities were requested.
+    pub logprobs: Option<bool>,
+    /// Number of alternative log probabilities, validated at most 20.
+    pub top_logprobs: Option<usize>,
+    pub(crate) max_tokens_policy: MaxTokensPolicy,
+    pub(crate) reasoning_budget_supported: bool,
+}
+
+/// Validate a request according to a named server profile without applying
+/// any model defaults.
+///
+/// Runs the same validation as [`normalize_request`] in the same order and
+/// makes every refusal that cannot depend on a default. Refusals that can
+/// (an omitted option whose default is out of range, a reasoning budget on
+/// an image request, the context window) belong to the model's defaults
+/// step. Not a stable API; see [`RequestedChatOptions`].
+#[doc(hidden)]
+pub fn normalize_requested_options(
+    req: &ChatRequest,
+    profile: ServeProfile<'_>,
+) -> Result<RequestedChatOptions, ApiError> {
+    type NoContextCheck =
+        fn(&[NormalizedChatMessage], usize, Option<usize>) -> Result<(), ApiError>;
+    requested_options_inner::<(), NoContextCheck>(req, profile, None).map(|(options, _)| options)
+}
+
 /// Normalize one shared wire request according to a named server profile.
 pub fn normalize_request(
     req: &ChatRequest,
@@ -510,6 +577,30 @@ fn normalize_request_inner<C>(
     profile: ServeProfile<'_>,
     check_context: impl FnOnce(&[NormalizedChatMessage], usize, Option<usize>) -> Result<C, ApiError>,
 ) -> Result<(ValidatedChatRequest, C), ApiError> {
+    let step = QwenChatDefaults::new(defaults);
+    let (options, context) = requested_options_inner(req, profile, Some((&step, check_context)))?;
+    let validated = step.apply(options)?;
+    match context {
+        Some(context) => Ok((validated, context)),
+        None => Err(ApiError::Internal {
+            message: "chat request preparation skipped its context check".to_string(),
+        }),
+    }
+}
+
+/// The shared validation cascade. With a defaults step, the step resolves
+/// each defaulted option at the position the cascade has always resolved
+/// it, so a refusal caused by a default keeps its precedence, and the
+/// context check runs on the effective values; without one, only refusals
+/// that cannot depend on a default are made.
+fn requested_options_inner<C, F>(
+    req: &ChatRequest,
+    profile: ServeProfile<'_>,
+    step: Option<(&QwenChatDefaults, F)>,
+) -> Result<(RequestedChatOptions, Option<C>), ApiError>
+where
+    F: FnOnce(&[NormalizedChatMessage], usize, Option<usize>) -> Result<C, ApiError>,
+{
     reject_unsupported(req, profile)?;
     validate_model_name(req.model.as_deref(), profile.model_name)?;
 
@@ -529,18 +620,26 @@ fn normalize_request_inner<C>(
         });
     }
 
-    let max_tokens = normalize_max_tokens(
-        req,
-        defaults.max_tokens,
-        profile.max_tokens,
-        profile.max_tokens_conflict_checked_early,
-    )?;
-    let temperature = validate_temperature(req.temperature.unwrap_or(defaults.temperature))?;
-    let top_p = validate_top_p(req.top_p.unwrap_or(defaults.top_p))?;
-    let logprobs = normalize_logprobs(req)?;
+    let max_tokens = requested_max_tokens(req, profile.max_tokens_conflict_checked_early)?;
+    if let Some(requested) = max_tokens {
+        apply_max_tokens_policy(requested, profile.max_tokens)?;
+    }
+    let effective_max_tokens = match &step {
+        Some((defaults, _)) => Some(defaults.max_tokens(max_tokens, profile.max_tokens)?),
+        None => None,
+    };
+    let temperature = req.temperature.map(validate_temperature).transpose()?;
+    if let Some((defaults, _)) = &step {
+        defaults.temperature(temperature)?;
+    }
+    let top_p = req.top_p.map(validate_top_p).transpose()?;
+    if let Some((defaults, _)) = &step {
+        defaults.top_p(top_p)?;
+    }
+    let logprobs_enabled = normalize_logprobs(req)?.is_some();
     let messages = normalize_messages_with_vision(&req.messages, profile.vision_supported)?;
     let has_image = messages.iter().any(|message| message.image.is_some());
-    if has_image && logprobs.is_some() {
+    if has_image && logprobs_enabled {
         unsupported("logprobs are not supported for image requests")?;
     }
     if has_image && req.stream.unwrap_or(false) {
@@ -556,29 +655,38 @@ fn normalize_request_inner<C>(
             "json_schema response format is not supported for image requests",
         )?;
     }
-    // Resolved ahead of `check_context` (rather than in its pre-refactor spot
-    // after `check_context`/`stop`) so the shared full-window formula
+    // Parsed ahead of the context check (rather than in its pre-refactor spot
+    // after the context check and `stop`) so the shared full-window formula
     // (`prompt + max_new_tokens + reasoning_budget + 1 <= max_context`, #831)
     // has the effective reasoning budget in hand when it runs -- the window
     // cannot be validated against a value that has not been parsed yet.
-    let mut reasoning_budget = if profile.reasoning_budget_supported {
+    let reasoning_budget = if profile.reasoning_budget_supported {
         parse_ignorable_field::<usize>(&req.reasoning_budget, "reasoning_budget")?
-            .filter(|&value| value > 0)
-            .or(defaults.reasoning_budget)
     } else {
         None
     };
-    if let MaxTokensPolicy::ClampToContext { context } = profile.max_tokens {
-        let reasoning_room = context.saturating_sub(max_tokens).saturating_sub(1);
-        reasoning_budget = reasoning_budget
-            .map(|value| value.min(reasoning_room))
-            .filter(|&value| value > 0);
-    }
-    if has_image && reasoning_budget.is_some() {
-        image_unsupported_combination("reasoning_budget is not supported for image requests")?;
-    }
 
-    let context = check_context(&messages, max_tokens, reasoning_budget)?;
+    let context = match (step, effective_max_tokens) {
+        (Some((defaults, check_context)), Some(effective_max_tokens)) => {
+            let effective_reasoning_budget = defaults.reasoning_budget(
+                reasoning_budget,
+                profile.reasoning_budget_supported,
+                profile.max_tokens,
+                effective_max_tokens,
+            );
+            if has_image && effective_reasoning_budget.is_some() {
+                image_unsupported_combination(
+                    "reasoning_budget is not supported for image requests",
+                )?;
+            }
+            Some(check_context(
+                &messages,
+                effective_max_tokens,
+                effective_reasoning_budget,
+            )?)
+        }
+        _ => None,
+    };
     let stop_strings = if profile.stop_supported {
         parse_stop_strings(&req.stop)?
     } else {
@@ -586,19 +694,18 @@ fn normalize_request_inner<C>(
     };
 
     let top_k = if profile.sampling_extensions_supported {
-        parse_ignorable_field::<usize>(&req.top_k, "top_k")?.unwrap_or(defaults.top_k)
+        parse_ignorable_field::<usize>(&req.top_k, "top_k")?
     } else {
-        defaults.top_k
+        None
     };
     let repetition_penalty = if profile.sampling_extensions_supported {
         parse_ignorable_field::<f32>(&req.repetition_penalty, "repetition_penalty")?
-            .unwrap_or(defaults.repetition_penalty)
     } else {
-        defaults.repetition_penalty
+        None
     };
 
     Ok((
-        ValidatedChatRequest {
+        RequestedChatOptions {
             messages,
             max_tokens,
             temperature,
@@ -606,10 +713,13 @@ fn normalize_request_inner<C>(
             top_p,
             repetition_penalty,
             seed: req.seed,
-            stream: req.stream.unwrap_or(false),
+            stream: req.stream,
             stop_strings,
             reasoning_budget,
-            logprobs,
+            logprobs: req.logprobs,
+            top_logprobs: req.top_logprobs,
+            max_tokens_policy: profile.max_tokens,
+            reasoning_budget_supported: profile.reasoning_budget_supported,
         },
         context,
     ))
@@ -633,7 +743,7 @@ fn normalize_request_inner<C>(
 /// instead of unconditionally grouped here: the daemon profile checked it
 /// ahead of the model-id match pre-refactor, but the `lattice` profile
 /// checked it after (inside its `validate_max_tokens`), so it runs from
-/// [`normalize_max_tokens`] on that profile instead.
+/// [`requested_max_tokens`] on that profile instead.
 fn reject_unsupported(req: &ChatRequest, profile: ServeProfile<'_>) -> Result<(), ApiError> {
     if req.tools.is_some() || req.tool_choice.is_some() {
         return unsupported("tools and tool_choice are not supported by this server");
@@ -673,7 +783,7 @@ fn reject_unsupported(req: &ChatRequest, profile: ServeProfile<'_>) -> Result<()
 
 /// Rejects a present-but-disagreeing `max_tokens`/`max_completion_tokens`
 /// pair. Called from [`reject_unsupported`] (ahead of the model check) or
-/// [`normalize_max_tokens`] (after it), depending on
+/// [`requested_max_tokens`] (after it), depending on
 /// `ServeProfile::max_tokens_conflict_checked_early`.
 fn reject_conflicting_max_tokens(req: &ChatRequest) -> Result<(), ApiError> {
     if let (Some(max_tokens), Some(max_completion_tokens)) =
@@ -890,7 +1000,7 @@ fn validate_model_name(
     })
 }
 
-/// Resolves the effective `max_tokens` request. When
+/// Reads the requested `max_tokens`, `None` when omitted. When
 /// `conflict_checked_early` is `true`, `reject_unsupported` has already
 /// rejected a conflicting `max_tokens`/`max_completion_tokens` pair (B3:
 /// restores the daemon profile's original first-error precedence over the
@@ -898,20 +1008,27 @@ fn validate_model_name(
 /// equal. When it is `false` (the `lattice` profile), that check has not
 /// run yet -- it runs here instead, after the model check, matching that
 /// profile's original `validate_max_tokens` position.
-fn normalize_max_tokens(
+fn requested_max_tokens(
     req: &ChatRequest,
-    default_max_tokens: usize,
-    policy: MaxTokensPolicy,
     conflict_checked_early: bool,
-) -> Result<usize, ApiError> {
+) -> Result<Option<usize>, ApiError> {
     if !conflict_checked_early {
         reject_conflicting_max_tokens(req)?;
     }
-    let requested = match (req.max_tokens, req.max_completion_tokens) {
-        (None, None) => default_max_tokens,
-        (Some(value), None) | (None, Some(value)) => value,
-        (Some(left), Some(_right)) => left,
-    };
+    Ok(match (req.max_tokens, req.max_completion_tokens) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(left), Some(_right)) => Some(left),
+    })
+}
+
+/// Apply the profile's generation-token policy to a requested or defaulted
+/// budget: zero is refused, then the budget is refused above the server
+/// limit or clamped to the context.
+pub(crate) fn apply_max_tokens_policy(
+    requested: usize,
+    policy: MaxTokensPolicy,
+) -> Result<usize, ApiError> {
     super::reject_zero_max_tokens(requested)?;
     match policy {
         MaxTokensPolicy::RejectAbove { limit } if requested > limit => Err(ApiError::BadRequest {
@@ -2266,5 +2383,144 @@ mod tests {
         let normalized = normalize_messages(&messages).unwrap();
         assert_eq!(normalized[0].content, "");
         assert_eq!(normalized[1].content, "   ");
+    }
+
+    fn requested(body: &str, profile: ServeProfile<'_>) -> RequestedChatOptions {
+        normalize_requested_options(&request(body), profile).unwrap()
+    }
+
+    fn effective(body: &str, defaults: GenerationDefaults) -> ValidatedChatRequest {
+        normalize_request(
+            &request(body),
+            defaults,
+            ServeProfile::lattice_serve("model", 4096),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn requested_options_distinguish_absent_from_explicit_default() {
+        let defaults = GenerationDefaults::standard(512);
+        let profile = ServeProfile::lattice_serve("model", 4096);
+        let absent = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let absent_options = requested(absent, profile);
+        assert_eq!(absent_options.max_tokens, None);
+        assert_eq!(absent_options.temperature, None);
+        assert_eq!(absent_options.top_k, None);
+        assert_eq!(absent_options.top_p, None);
+        assert_eq!(absent_options.repetition_penalty, None);
+        assert_eq!(absent_options.seed, None);
+        assert_eq!(absent_options.stream, None);
+        assert_eq!(absent_options.reasoning_budget, None);
+        assert_eq!(absent_options.logprobs, None);
+        assert_eq!(absent_options.top_logprobs, None);
+
+        // Each option sent with the value its default would have supplied:
+        // the requested options keep it, and the defaults step resolves the
+        // explicit and the omitted form to the same effective request.
+        type IsExplicit = fn(&RequestedChatOptions) -> bool;
+        let cases: [(&str, IsExplicit); 9] = [
+            (r#""max_tokens":512"#, |o| o.max_tokens == Some(512)),
+            (r#""max_completion_tokens":512"#, |o| {
+                o.max_tokens == Some(512)
+            }),
+            (r#""temperature":0.7"#, |o| o.temperature == Some(0.7)),
+            (r#""top_k":50"#, |o| o.top_k == Some(50)),
+            (r#""top_p":0.9"#, |o| o.top_p == Some(0.9)),
+            (r#""repetition_penalty":1.1"#, |o| {
+                o.repetition_penalty == Some(1.1)
+            }),
+            (r#""stream":false"#, |o| o.stream == Some(false)),
+            (r#""reasoning_budget":0"#, |o| o.reasoning_budget == Some(0)),
+            (r#""logprobs":false"#, |o| o.logprobs == Some(false)),
+        ];
+        let absent_effective = effective(absent, defaults);
+        for (field, is_explicit) in cases {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],{field}}}"#);
+            let options = requested(&body, profile);
+            assert!(is_explicit(&options), "{field} must be kept as sent");
+            let explicit_effective = effective(&body, defaults);
+            assert_eq!(
+                format!("{explicit_effective:?}"),
+                format!("{absent_effective:?}"),
+                "{field} must resolve to the default's effective value"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_options_distinguish_absent_from_explicit_default_top_logprobs() {
+        let profile = ServeProfile::lattice("model", 4096);
+        let absent = requested(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"logprobs":true}"#,
+            profile,
+        );
+        let explicit = requested(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"logprobs":true,"top_logprobs":0}"#,
+            profile,
+        );
+        assert_eq!(absent.top_logprobs, None);
+        assert_eq!(explicit.top_logprobs, Some(0));
+        let defaults = QwenChatDefaults::new(GenerationDefaults::standard(16));
+        assert_eq!(defaults.apply(absent).unwrap().logprobs, Some(0));
+        assert_eq!(defaults.apply(explicit).unwrap().logprobs, Some(0));
+    }
+
+    #[test]
+    fn requested_options_keep_values_the_defaults_step_rewrites() {
+        // A context-clamped max_tokens and a reasoning budget are kept as sent;
+        // the defaults step applies the clamp.
+        let profile = ServeProfile::lattice_serve("model", 64);
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":500,"reasoning_budget":40}"#;
+        let options = requested(body, profile);
+        assert_eq!(options.max_tokens, Some(500));
+        assert_eq!(options.reasoning_budget, Some(40));
+        let validated = QwenChatDefaults::new(GenerationDefaults::standard(16))
+            .apply(options)
+            .unwrap();
+        assert_eq!(validated.max_tokens, 63);
+        assert_eq!(validated.reasoning_budget, None);
+
+        // Options a profile ignores are not reported as requested.
+        let ignored = requested(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"top_k":7,"repetition_penalty":1.5}"#,
+            ServeProfile::lattice("model", 4096),
+        );
+        assert_eq!(ignored.top_k, None);
+        assert_eq!(ignored.repetition_penalty, None);
+    }
+
+    #[test]
+    fn requested_options_leave_default_dependent_refusals_to_the_defaults_step() {
+        // An out-of-range default refuses only once the defaults step runs.
+        let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let profile = ServeProfile::lattice_serve("model", 4096);
+        let options = requested(body, profile);
+        assert_eq!(options.temperature, None);
+        let invalid = GenerationDefaults {
+            temperature: 3.0,
+            ..GenerationDefaults::standard(16)
+        };
+        let err = QwenChatDefaults::new(invalid).apply(options).unwrap_err();
+        assert!(matches!(
+            err,
+            ApiError::BadRequest {
+                code: "invalid_temperature",
+                ..
+            }
+        ));
+        // An explicit out-of-range value is refused without any defaults.
+        let err = normalize_requested_options(
+            &request(r#"{"messages":[{"role":"user","content":"hi"}],"temperature":3.0}"#),
+            profile,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ApiError::BadRequest {
+                code: "invalid_temperature",
+                ..
+            }
+        ));
     }
 }

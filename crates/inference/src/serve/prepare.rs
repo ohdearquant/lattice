@@ -7,15 +7,20 @@
 //! so that the handlers and the `bench_serve_prepare` measurement example call
 //! the same code. They are `#[doc(hidden)]`: they mirror each binary's
 //! current handler behaviour and are not a stable API.
+//!
+//! `QwenChatDefaults` is the one place Qwen's chat defaults are applied:
+//! the server's sampling defaults for options a request omitted, the
+//! thinking switch and the `<|im_end|>` stop token.
 
 use crate::forward::metal_qwen35::ChatMessage;
 use crate::generation::GenerateConfig;
 use crate::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID;
 use crate::serve::ApiError;
 use crate::serve::contract::{
-    ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
-    ValidatedChatRequest as ContractValidatedChatRequest,
-    normalize_request_with_context_and_budget, validate_context_window_with_budget,
+    ChatRequest as ChatCompletionRequest, GenerationDefaults, MaxTokensPolicy,
+    RequestedChatOptions, ServeProfile, ValidatedChatRequest as ContractValidatedChatRequest,
+    apply_max_tokens_policy, normalize_request_with_context_and_budget,
+    validate_context_window_with_budget, validate_temperature, validate_top_p,
 };
 use crate::serve::{format_normalized_chat_template, into_engine_chat_messages};
 
@@ -115,7 +120,6 @@ pub fn prepare_chat_request(
 /// The `lattice serve` chat handler's mapping from a prepared request's
 /// sampling fields to its `GenerateConfig`.
 #[doc(hidden)]
-#[allow(clippy::field_reassign_with_default)]
 pub fn lattice_gen_cfg(
     max_tokens: usize,
     temperature: f32,
@@ -125,33 +129,164 @@ pub fn lattice_gen_cfg(
     reasoning_budget: Option<usize>,
     logprobs: Option<usize>,
 ) -> GenerateConfig {
-    let mut gen_cfg = GenerateConfig::default();
-    gen_cfg.max_new_tokens = max_tokens;
-    gen_cfg.temperature = temperature;
-    gen_cfg.top_p = top_p;
-    gen_cfg.seed = seed;
-    gen_cfg.stop_strings = stop_strings;
-    gen_cfg.reasoning_budget = reasoning_budget;
-    gen_cfg.logprobs = logprobs;
-    gen_cfg
+    QwenChatDefaults::lattice_generate_config(
+        max_tokens,
+        temperature,
+        top_p,
+        seed,
+        stop_strings,
+        reasoning_budget,
+        logprobs,
+    )
 }
 
 #[doc(hidden)]
-#[allow(clippy::field_reassign_with_default)]
 pub fn build_cfg(req: &ValidatedChatRequest) -> GenerateConfig {
-    let mut cfg = GenerateConfig::default();
-    cfg.max_new_tokens = req.max_tokens;
-    cfg.temperature = req.temperature;
-    cfg.top_k = req.top_k;
-    cfg.top_p = req.top_p;
-    cfg.repetition_penalty = req.repetition_penalty;
-    cfg.seed = req.seed;
-    cfg.stop_token_ids = vec![QWEN_CHAT_IM_END_TOKEN_ID];
-    cfg.enable_thinking = true;
-    cfg.enable_mtp = None;
-    cfg.grammar = None;
-    cfg.stop_strings = req.stop_strings.clone();
-    cfg.reasoning_budget = req.reasoning_budget;
-    cfg.logprobs = req.logprobs;
-    cfg
+    QwenChatDefaults::generate_config(req)
+}
+
+/// Qwen's chat defaults step: turns [`RequestedChatOptions`] plus the
+/// server's [`GenerationDefaults`] into the effective request values, and
+/// the effective values into a Qwen `GenerateConfig`.
+///
+/// This is the only place a Qwen default is applied. Request validation
+/// calls [`Self::max_tokens`], [`Self::temperature`], [`Self::top_p`] and
+/// [`Self::reasoning_budget`] at the position each option has always been
+/// resolved, so a refusal caused by a default keeps its precedence.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QwenChatDefaults {
+    generation: GenerationDefaults,
+}
+
+impl QwenChatDefaults {
+    pub(crate) const fn new(generation: GenerationDefaults) -> Self {
+        Self { generation }
+    }
+
+    /// Effective generation-token budget under the profile's policy.
+    pub(crate) fn max_tokens(
+        &self,
+        requested: Option<usize>,
+        policy: MaxTokensPolicy,
+    ) -> Result<usize, ApiError> {
+        apply_max_tokens_policy(requested.unwrap_or(self.generation.max_tokens), policy)
+    }
+
+    pub(crate) fn temperature(&self, requested: Option<f32>) -> Result<f32, ApiError> {
+        validate_temperature(requested.unwrap_or(self.generation.temperature))
+    }
+
+    pub(crate) fn top_p(&self, requested: Option<f32>) -> Result<f32, ApiError> {
+        validate_top_p(requested.unwrap_or(self.generation.top_p))
+    }
+
+    /// Effective reasoning budget: a requested `0` means "use the default",
+    /// and a context-clamped profile leaves room for the generation budget
+    /// and the closing token.
+    pub(crate) fn reasoning_budget(
+        &self,
+        requested: Option<usize>,
+        supported: bool,
+        policy: MaxTokensPolicy,
+        max_tokens: usize,
+    ) -> Option<usize> {
+        let mut reasoning_budget = if supported {
+            requested
+                .filter(|&value| value > 0)
+                .or(self.generation.reasoning_budget)
+        } else {
+            None
+        };
+        if let MaxTokensPolicy::ClampToContext { context } = policy {
+            let reasoning_room = context.saturating_sub(max_tokens).saturating_sub(1);
+            reasoning_budget = reasoning_budget
+                .map(|value| value.min(reasoning_room))
+                .filter(|&value| value > 0);
+        }
+        reasoning_budget
+    }
+
+    /// Effective request values for validated options.
+    pub(crate) fn apply(
+        &self,
+        options: RequestedChatOptions,
+    ) -> Result<ValidatedChatRequest, ApiError> {
+        let max_tokens = self.max_tokens(options.max_tokens, options.max_tokens_policy)?;
+        let reasoning_budget = self.reasoning_budget(
+            options.reasoning_budget,
+            options.reasoning_budget_supported,
+            options.max_tokens_policy,
+            max_tokens,
+        );
+        let logprobs = if options.logprobs.unwrap_or(false) {
+            Some(options.top_logprobs.unwrap_or(0))
+        } else {
+            None
+        };
+        Ok(ValidatedChatRequest {
+            messages: options.messages,
+            max_tokens,
+            temperature: self.temperature(options.temperature)?,
+            top_k: options.top_k.unwrap_or(self.generation.top_k),
+            top_p: self.top_p(options.top_p)?,
+            repetition_penalty: options
+                .repetition_penalty
+                .unwrap_or(self.generation.repetition_penalty),
+            seed: options.seed,
+            stream: options.stream.unwrap_or(false),
+            stop_strings: options.stop_strings,
+            reasoning_budget,
+            logprobs,
+        })
+    }
+
+    /// The `lattice_serve` handler's `GenerateConfig` for a validated request.
+    #[allow(clippy::field_reassign_with_default)]
+    fn generate_config(req: &ValidatedChatRequest) -> GenerateConfig {
+        let mut cfg = Self::generate_config_base();
+        cfg.max_new_tokens = req.max_tokens;
+        cfg.temperature = req.temperature;
+        cfg.top_k = req.top_k;
+        cfg.top_p = req.top_p;
+        cfg.repetition_penalty = req.repetition_penalty;
+        cfg.seed = req.seed;
+        cfg.enable_mtp = None;
+        cfg.grammar = None;
+        cfg.stop_strings = req.stop_strings.clone();
+        cfg.reasoning_budget = req.reasoning_budget;
+        cfg.logprobs = req.logprobs;
+        cfg
+    }
+
+    /// The `lattice serve` handler's `GenerateConfig` for prepared sampling
+    /// fields.
+    #[allow(clippy::field_reassign_with_default)]
+    fn lattice_generate_config(
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        seed: Option<u64>,
+        stop_strings: Vec<String>,
+        reasoning_budget: Option<usize>,
+        logprobs: Option<usize>,
+    ) -> GenerateConfig {
+        let mut cfg = Self::generate_config_base();
+        cfg.max_new_tokens = max_tokens;
+        cfg.temperature = temperature;
+        cfg.top_p = top_p;
+        cfg.seed = seed;
+        cfg.stop_strings = stop_strings;
+        cfg.reasoning_budget = reasoning_budget;
+        cfg.logprobs = logprobs;
+        cfg
+    }
+
+    /// Qwen chat generation: thinking on, stopping at `<|im_end|>`.
+    #[allow(clippy::field_reassign_with_default)]
+    fn generate_config_base() -> GenerateConfig {
+        let mut cfg = GenerateConfig::default();
+        cfg.stop_token_ids = vec![QWEN_CHAT_IM_END_TOKEN_ID];
+        cfg.enable_thinking = true;
+        cfg
+    }
 }
