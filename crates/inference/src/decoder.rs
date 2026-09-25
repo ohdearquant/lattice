@@ -27,6 +27,11 @@ pub(crate) mod qwen_cpu;
 /// text CPU entry point wrapped over this module's typed vocabulary.
 pub(crate) mod gemma_cpu;
 
+/// The ordinary Qwen3.5 Metal generation path as a concrete [`DecoderSession`] (ADR-090
+/// row R06).
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod qwen_metal;
+
 /// The autoregressive driver (ADR-090 row C): one loop over `&mut dyn DecoderSession`
 /// that drives [`DecodePolicy`](crate::generation::DecodePolicy) unchanged.
 pub(crate) mod driver;
