@@ -735,6 +735,39 @@ fn check_prompt_fits_window(
     Ok(())
 }
 
+/// Raises the worker tokenizer's truncation cap to the model's context window.
+///
+/// A tokenizer loaded from `tokenizer.json` caps sequences at a fixed default
+/// that can sit below the served context. Generation tokenizes the rendered
+/// prompt with this same tokenizer, so a lower cap would silently drop the
+/// prompt's tail (including the open assistant turn) for any prompt that
+/// fits the window but exceeds the cap. Only ever raises the cap.
+fn serving_tokenizer(tokenizer: BpeTokenizer, model_max_context: usize) -> BpeTokenizer {
+    if tokenizer.max_seq_len() < model_max_context {
+        tokenizer.with_max_seq_len(model_max_context)
+    } else {
+        tokenizer
+    }
+}
+
+/// Renders a text-only job's prompt and admits it against the context window.
+///
+/// Admission uses the pre-truncation token count: a truncated count can never
+/// exceed the tokenizer's cap, so an over-window prompt would pass the check
+/// and then be generated from a shortened prefix.
+fn render_text_prompt_within_window(
+    tokenizer: &BpeTokenizer,
+    messages: &[ChatMessage],
+    policy: ContextWindowPolicy,
+    model_max_context: usize,
+    cfg: &GenerateConfig,
+) -> Result<(String, usize), ApiError> {
+    let prompt = format_chat_template(messages);
+    let prompt_len = tokenizer.tokenize(&prompt).pre_truncation_len;
+    check_prompt_fits_window(policy, model_max_context, prompt_len, cfg)?;
+    Ok((prompt, prompt_len))
+}
+
 /// Measurement access to worker internals, for the `bench_serve_prepare`
 /// example only. Not a stable API.
 #[cfg(feature = "bench-internals")]
@@ -1436,6 +1469,7 @@ impl MetalWorker {
         let worker_index = Arc::clone(&adapters);
         let join_handle = std::thread::spawn(move || match loader() {
             Ok((state, tokenizer, meta)) => {
+                let tokenizer = serving_tokenizer(tokenizer, meta.model_max_context);
                 let _ = ready_tx.send(Ok(meta.clone()));
                 // `Rc`/`RefCell`, not `Arc`/`Mutex`: both handles are created
                 // here, inside the spawned thread and after `loader()` has run
@@ -1522,12 +1556,11 @@ impl MetalWorker {
                         // prior `lattice_serve.rs` path rendered it a second
                         // time inside its own window preflight); reused for
                         // both the window check and the generation call below.
-                        let prompt = format_chat_template(messages);
-                        let prompt_len = tokenizer.tokenize(&prompt).real_length;
-                        check_prompt_fits_window(
+                        let (prompt, _prompt_len) = render_text_prompt_within_window(
+                            &tokenizer,
+                            messages,
                             meta.context_window_policy,
                             meta.model_max_context,
-                            prompt_len,
                             cfg,
                         )
                         .map_err(WorkerFailure::Rejected)?;
@@ -1841,12 +1874,22 @@ fn spawn_fake_with_capability(
     + 'static,
 ) -> MetalWorkerClient {
     let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
+    let tokenizer = serving_tokenizer(tokenizer, model_max_context);
     let join_handle = std::thread::spawn(move || {
         run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
-            let prompt = format_chat_template(messages);
+            let (prompt, _prompt_len) = render_text_prompt_within_window(
+                &tokenizer,
+                messages,
+                context_window_policy,
+                model_max_context,
+                cfg,
+            )
+            .map_err(WorkerFailure::Rejected)?;
+            // The production worker hands generation the rendered prompt and
+            // the worker's tokenizer, which re-tokenizes it; report the length
+            // that tokenization keeps, so a tokenizer cap below the window is
+            // visible here as it is on the real path.
             let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
-            check_prompt_fits_window(context_window_policy, model_max_context, prompt_tokens, cfg)
-                .map_err(WorkerFailure::Rejected)?;
             generate(messages, cfg, prompt_tokens, on_token, should_cancel)
                 .map_err(WorkerFailure::Failed)
         });
@@ -4029,5 +4072,157 @@ mod tests {
         drop(rx1);
         drop(client);
         handle.join().expect("worker thread must not panic");
+    }
+
+    fn long_text_prompt(chars: usize) -> Vec<ChatMessage> {
+        vec![ChatMessage::user("ab".repeat(chars / 2))]
+    }
+
+    fn untruncated_prompt_len(messages: &[ChatMessage]) -> usize {
+        tiny_tokenizer()
+            .tokenize(&format_chat_template(messages))
+            .pre_truncation_len
+    }
+
+    /// Submits one text job to a fake worker built from `tokenizer` and
+    /// returns its terminal event plus the prompt length handed to generation
+    /// (`None` when generation was never reached).
+    fn run_text_job(
+        policy: ContextWindowPolicy,
+        model_max_context: usize,
+        tokenizer: BpeTokenizer,
+        messages: Vec<ChatMessage>,
+        cfg: GenerateConfig,
+    ) -> (WorkerEvent, Option<usize>) {
+        let seen = Arc::new(Mutex::new(None));
+        let seen_by_generate = Arc::clone(&seen);
+        let client = spawn_fake(
+            policy,
+            model_max_context,
+            tokenizer,
+            move |_messages, _cfg, prompt_tokens, _on_token, _should_cancel| {
+                *seen_by_generate.lock().expect("prompt length slot") = Some(prompt_tokens);
+                Ok(GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens,
+                    generated_tokens: 0,
+                    stopped: true,
+                    stop_reason: None,
+                    token_logprobs: vec![],
+                })
+            },
+        );
+        let (_guard, cancel) = crate::serve::cancel_pair();
+        let mut rx = client
+            .submit(messages, cfg, cancel)
+            .expect("the fake worker admits every job");
+        let terminal = rx
+            .blocking_recv()
+            .expect("the job must produce a terminal event");
+        let generated_with = *seen.lock().expect("prompt length slot");
+        (terminal, generated_with)
+    }
+
+    #[test]
+    fn text_prompt_above_the_default_tokenizer_cap_reaches_generation_in_full() {
+        let messages = long_text_prompt(10_000);
+        let full_len = untruncated_prompt_len(&messages);
+        let default_cap = crate::tokenizer::bpe::DEFAULT_BPE_MAX_SEQ_LEN;
+        let window = 16_384;
+        assert_eq!(tiny_tokenizer().max_seq_len(), default_cap);
+        assert!(
+            full_len > default_cap && full_len < window,
+            "fixture must exceed the default cap ({default_cap}) and fit the window ({window}), \
+             got {full_len}"
+        );
+        let cfg = GenerateConfig {
+            max_new_tokens: 16,
+            ..GenerateConfig::default()
+        };
+
+        let (terminal, generated_with) = run_text_job(
+            ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+            window,
+            tiny_tokenizer(),
+            messages,
+            cfg,
+        );
+        assert!(
+            matches!(terminal, WorkerEvent::Complete(_)),
+            "a prompt inside the window must be generated, got {terminal:?}"
+        );
+        assert_eq!(generated_with, Some(full_len));
+
+        let prompt = format_chat_template(&long_text_prompt(10_000));
+        let generation_input = serving_tokenizer(tiny_tokenizer(), window).tokenize(&prompt);
+        assert_eq!(
+            generation_input.real_length, full_len,
+            "the worker's tokenizer must hand generation every prompt token"
+        );
+    }
+
+    #[test]
+    fn text_prompt_beyond_the_window_is_refused_with_its_full_token_count() {
+        let window = 64;
+        let messages = long_text_prompt(400);
+        let full_len = untruncated_prompt_len(&messages);
+        let tokenizer = tiny_tokenizer().with_max_seq_len(window / 2);
+        assert!(
+            full_len > window,
+            "fixture must exceed the window, got {full_len}"
+        );
+
+        let cfg = GenerateConfig {
+            max_new_tokens: 16,
+            ..GenerateConfig::default()
+        };
+        let (terminal, generated_with) = run_text_job(
+            ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+            window,
+            tokenizer.clone(),
+            messages.clone(),
+            cfg,
+        );
+        assert_eq!(
+            generated_with, None,
+            "an over-window prompt must not be generated"
+        );
+        match terminal {
+            WorkerEvent::Rejected(ApiError::BadRequest { message, code }) => {
+                assert_eq!(code, "context_length_exceeded");
+                assert!(
+                    message.contains(&format!("prompt has {full_len} tokens")),
+                    "the refusal must report the untruncated prompt length {full_len}: {message}"
+                );
+            }
+            other => panic!("expected a context-window refusal, got {other:?}"),
+        }
+
+        let zero_budget = GenerateConfig {
+            max_new_tokens: 0,
+            ..GenerateConfig::default()
+        };
+        let (terminal, generated_with) = run_text_job(
+            ContextWindowPolicy::PromptAndMaxTokens,
+            window,
+            tokenizer,
+            messages,
+            zero_budget,
+        );
+        assert_eq!(
+            generated_with, None,
+            "a prompt longer than the window must be refused even with no decode budget"
+        );
+        assert!(
+            matches!(
+                terminal,
+                WorkerEvent::Rejected(ApiError::BadRequest {
+                    code: "context_length_exceeded",
+                    ..
+                })
+            ),
+            "expected a context-window refusal, got {terminal:?}"
+        );
     }
 }
