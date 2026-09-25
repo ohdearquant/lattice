@@ -2,6 +2,7 @@
 
 **Status**: Accepted (2026-09-15)\
 **Date**: 2026-09-15\
+**Amended**: 2026-09-25, RNG ownership (see "Amendment, 2026-09-25" under D1's roles)\
 **Crate**: lattice-inference
 
 <!-- deno-fmt-ignore-start -->
@@ -133,6 +134,39 @@ to cross this interface. Prediction eligibility survives candidate selection and
 metadata reads, and ends at consumption, cancellation, failure or finish. Another prefill/reset also
 invalidates it. Data borrowed for an operation cannot escape a subsequent invalidating state
 mutation; `PredictionId` identifies state, not a public borrow or a cache-position override.
+
+#### Amendment, 2026-09-25: the session owns and draws the RNG
+
+Role 1 above says "RNG ownership stays in the driver", and the driver paragraph earlier in this
+section lists "sampler/RNG progression" among what the driver owns. Both are replaced by the rule
+below. The rest of role 1 is unchanged: `select` still returns a sampled candidate, sampling still
+authorizes neither publication nor consumption, and the sampling step and its exact RNG consumption
+are still preserved when a reasoning-budget rule later overrides the candidate.
+
+**Rule.** The concrete session owns the RNG state and performs every draw inside `select`. The
+state is seeded once, when the session is constructed, through the same seed-to-state transform
+the pre-migration entry uses. Draws follow that entry's legacy schedule for the selection mode in
+use, including the modes that draw nothing: a degenerate temperature (non-finite, not positive, or
+so small that `1/t` overflows) selects the argmax and consumes no draw. `SelectionRequest` carries
+no RNG handle and no pre-drawn values, and the driver never draws.
+
+**Why.** The number of draws per step is a property of the selection mode, and on Metal the mode is
+fixed per request by the readback route: a dense row, a compact candidate set, or a fused argmax.
+Randomness supplied by the driver would have to predict each session's per-mode schedule, which
+moves model-specific sampling knowledge into the shared layer. The CPU sessions delivered under R03
+and R04 already keep the state in the session (`decoder.rs`, the `SelectionRequest` documentation;
+`decoder/qwen_cpu.rs`, the module's RNG-state note). Keeping the driver-owned wording would mean
+reopening those sessions to move the state with no change in output. Their goldens are greedy, so
+they draw nothing and cannot detect a change in draw schedule; the seeded-reproducibility
+obligation below is what a sampled golden has to check.
+
+**What the driver still owns.** Output budget, grammar transitions, reasoning policy, stop-string
+holdback, cancellation and observer ordering, as stated above. Seeded reproducibility is a
+per-session obligation: for a given seed and configuration, a session must produce the token
+stream the pre-migration entry produced.
+
+[ADR-092](ADR-092-model-owned-decoder-execution.md) states "The driver owns policy and RNG
+progression" in its execution-trait section. This amendment governs that sentence too.
 
 Published token IDs, stop-held text bytes, the accepted final token pending consumption and the
 evaluated prefix remain distinct. Neither sampling nor recording an output token implies that its
