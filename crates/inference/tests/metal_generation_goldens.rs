@@ -253,7 +253,7 @@ const CASES: &[CaseSpec] = &[
     },
     CaseSpec {
         name: "direct_stop_token",
-        prompt: Prompt::ChatNoThink("Reply with the single word: yes"),
+        prompt: Prompt::ChatNoThink("Reply with exactly these words: yes, of course"),
         max_new_tokens: 48,
         stop_on_im_end: true,
         expect: Expect::StopToken,
@@ -324,7 +324,7 @@ const CASES: &[CaseSpec] = &[
     CaseSpec {
         name: "streaming_stop_token",
         entry: Entry::Streaming,
-        prompt: Prompt::ChatNoThink("Reply with the single word: yes"),
+        prompt: Prompt::ChatNoThink("Reply with exactly these words: yes, of course"),
         max_new_tokens: 48,
         stop_on_im_end: true,
         expect: Expect::StopToken,
