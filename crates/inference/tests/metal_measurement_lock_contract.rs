@@ -343,6 +343,7 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "benches/mtp_decode.rs",
     "benches/topk_readback.rs",
     "examples/bench_concurrent.rs",
+    "examples/bench_decode_streaming.rs",
     "examples/bench_dispatch.rs",
     "examples/bench_dispatch2.rs",
     "examples/bench_embed_quality.rs",
