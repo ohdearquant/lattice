@@ -431,7 +431,7 @@ pub fn l2_normalize_vec(x: &mut [f32]) {
 #[inline]
 fn compute_decay_gate(a_log: f32, alpha: f32, dt_bias: f32) -> f32 {
     // `a_log.exp()` overflows f32 to +inf for a_log > ~88. Paired with a very negative
-    // `alpha + dt_bias` (softplus hard-returns 0.0), the product is `inf * 0.0` = NaN and
+    // `alpha + dt_bias` (softplus underflows to 0.0), the product is `inf * 0.0` = NaN and
     // `exp(NaN)` = NaN — which then propagates through the recurrent state S and poisons
     // every subsequent token. Clamp the decay rate to finite so the product stays finite:
     // `huge * 0 = 0` → g = 1 (the dt≈0 "no decay" limit), `huge * positive` → -inf → g = 0
@@ -448,10 +448,10 @@ fn compute_decay_gate(a_log: f32, alpha: f32, dt_bias: f32) -> f32 {
 pub fn softplus(x: f32) -> f32 {
     if x > 20.0 {
         x // For large x, ln(1+exp(x)) ≈ x
-    } else if x < -20.0 {
-        0.0 // For very negative x, ln(1+exp(x)) ≈ 0
     } else {
-        (1.0 + x.exp()).ln()
+        // `(1.0 + x.exp()).ln()` rounds to 0 below x ≈ -16.6 in f32, where the true value is
+        // ≈ exp(x); `ln_1p` keeps that tail, so the decay gate still decays there.
+        x.exp().ln_1p()
     }
 }
 
@@ -641,6 +641,20 @@ mod tests {
     }
 
     #[test]
+    fn test_softplus_keeps_negative_tail() {
+        let at_minus_20 = softplus(-20.0);
+        let exp_minus_20 = (-20f32).exp();
+        assert!(at_minus_20 > 0.0, "softplus(-20) must be positive");
+        assert!(
+            ((at_minus_20 - exp_minus_20) / exp_minus_20).abs() < 1e-3,
+            "softplus(-20) = {at_minus_20}, expected ≈ exp(-20) = {exp_minus_20}"
+        );
+        assert!(softplus(-30.0) > 0.0, "softplus(-30) must be positive");
+        assert!((softplus(0.0) - 2.0_f32.ln()).abs() < 1e-6);
+        assert_eq!(softplus(25.0), 25.0);
+    }
+
+    #[test]
     fn test_sigmoid() {
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
         assert!(sigmoid(10.0) > 0.999);
@@ -669,7 +683,7 @@ mod tests {
     #[test]
     fn test_decay_gate_finite_on_exp_overflow() {
         // a_log large enough that exp(a_log) overflows f32 to +inf, paired with a very
-        // negative (alpha + dt_bias) where softplus hard-returns 0.0. Pre-guard this was
+        // negative (alpha + dt_bias) where softplus underflows to 0.0. Pre-guard this was
         // `inf * 0.0` = NaN → `exp(NaN)` = NaN, which then poisons the entire recurrent
         // state S and every subsequent token.
         let g = compute_decay_gate(100.0, -200.0, 0.0);

@@ -13,7 +13,7 @@
 
 use crate::attention::flash::{TiledAttentionBuffers, TiledAttentionConfig};
 use crate::attention::gdn::{
-    GatedDeltaNetState, GatedDeltaNetWeights, gated_rms_norm, l2_normalize_vec, sigmoid,
+    GatedDeltaNetState, GatedDeltaNetWeights, gated_rms_norm, l2_normalize_vec, sigmoid, softplus,
 };
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
@@ -1001,13 +1001,7 @@ fn compute_decay_gate_prefill(a_log: f32, alpha: f32, dt_bias: f32) -> f32 {
 /// Numerically stable softplus used by `compute_decay_gate_prefill()`.
 #[inline]
 fn softplus_prefill(x: f32) -> f32 {
-    if x > 20.0 {
-        x
-    } else if x < -20.0 {
-        0.0
-    } else {
-        (1.0 + x.exp()).ln()
-    }
+    softplus(x)
 }
 
 #[cfg(test)]
@@ -1021,6 +1015,18 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
+
+    #[test]
+    fn test_softplus_prefill_matches_gdn_softplus() {
+        for i in 0..=3200 {
+            let x = -40.0 + i as f32 * 0.025;
+            assert_eq!(
+                softplus_prefill(x).to_bits(),
+                softplus(x).to_bits(),
+                "softplus_prefill({x}) diverges from gdn::softplus"
+            );
+        }
+    }
 
     /// Verify that batched prompt prefill matches the legacy token-by-token path.
     #[test]
