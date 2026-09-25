@@ -217,12 +217,12 @@ pub enum ModelBackend {
 impl ModelBackend {
     pub fn tokenize_len(&self, text: &str) -> usize {
         match self {
-            ModelBackend::Cpu(m) => m.tokenizer().tokenize(text).real_length,
+            ModelBackend::Cpu(m) => m.tokenizer().tokenize(text).pre_truncation_len,
             #[cfg(feature = "metal-gpu")]
-            ModelBackend::Metal { tokenizer, .. } => tokenizer.tokenize(text).real_length,
+            ModelBackend::Metal { tokenizer, .. } => tokenizer.tokenize(text).pre_truncation_len,
             #[cfg(all(feature = "test-utils", test))]
             ModelBackend::CpuFakeGenerate { model, .. } => {
-                model.tokenizer().tokenize(text).real_length
+                model.tokenizer().tokenize(text).pre_truncation_len
             }
         }
     }
@@ -5085,6 +5085,53 @@ mod tests {
             let value: serde_json::Value =
                 serde_json::from_slice(&bytes).expect("error response must be JSON");
             assert_eq!(value["error"]["code"], "context_length_exceeded");
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    mod prompt_above_tokenizer_cap {
+        use super::*;
+        use tower::ServiceExt as _;
+
+        #[tokio::test]
+        async fn over_window_prompt_is_refused_with_its_untruncated_token_count() {
+            let cap = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .max_seq_len();
+            let content = "ab".repeat(cap);
+            let body = format!(
+                r#"{{"model":"test-model","messages":[{{"role":"user","content":"{content}"}}],"max_tokens":16}}"#
+            );
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .expect("fixture request must build");
+            let response = router(tiny_state(16))
+                .oneshot(request)
+                .await
+                .expect("router must produce a response, not a transport error");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("error response must be JSON");
+            assert_eq!(value["error"]["code"], "context_length_exceeded");
+            let message = value["error"]["message"]
+                .as_str()
+                .expect("error message must be a string");
+            let prompt_tokens: usize = message
+                .strip_prefix("prompt (")
+                .and_then(|rest| rest.split_once(" tokens)"))
+                .and_then(|(count, _)| count.parse().ok())
+                .unwrap_or_else(|| panic!("unexpected refusal message: {message}"));
+            assert!(
+                prompt_tokens >= 2 * cap,
+                "admission must count every prompt token, not the tokenizer's {cap}-token \
+                 truncation: {message}"
+            );
         }
     }
 
