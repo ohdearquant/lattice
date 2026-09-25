@@ -3,8 +3,9 @@
 //!
 //! Wraps the work `MetalQwen35State::generate` (the direct entry) and
 //! `MetalQwen35State::generate_streaming_with_cancel` (the streaming entry)
-//! each do in their own decode loop. Nothing in production constructs this
-//! session yet; tests drive it directly and through `decoder::driver::run`.
+//! each did in their own decode loop. The streaming entry runs its requests
+//! through this session and [`run_streaming`]; the direct entry still runs
+//! its own loop, so the direct profile is constructed only by tests.
 //!
 //! **Owned state.** The session borrows the caller's `MetalQwen35State`
 //! mutably for its whole life, so the GPU caches, scratch and the compact
@@ -54,10 +55,11 @@
 //! auto-trait implementation. A compile-time control in the test module pins
 //! that.
 
-// Nothing outside this module's tests constructs the session yet; the entry
-// points are routed through it separately.
+// Only this module's tests construct the direct profile; the direct entry is
+// routed through the session separately.
 #![cfg_attr(not(test), allow(dead_code))]
 
+use super::driver;
 use super::qwen_cpu::has_finite_logit;
 use super::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
@@ -70,11 +72,15 @@ use crate::forward::metal_qwen35::{
     apply_sampling_route_plan, mtp_route_active, plan_sampling_route, sample_decode_traced,
     sample_from_candidates, sample_token, self_spec_route_active,
 };
-use crate::generation::GenerateConfig;
+use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::{
     GenerationPlan, check_logprobs_not_set, check_reasoning_budget_not_set,
 };
 use crate::sampling::compute_step_logprobs;
+use crate::stop_reason::StopReason;
+use crate::tokenizer::bpe::BpeTokenizer;
+use crate::tokenizer::detokenize::IncrementalDetokenizer;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 
 /// Which ordinary Metal entry point the session reproduces. The two entries
@@ -417,6 +423,13 @@ impl DecoderSession for QwenMetalSession<'_> {
             }
             Readback::Dense(logits) => {
                 if let Some(mask) = request.grammar_mask {
+                    // Decode-step masking is timed and the prefill-derived step is not,
+                    // as in every other Metal decode loop.
+                    let _signpost_grammar = (!prefill_token).then(|| {
+                        crate::forward::signpost::interval(
+                            crate::forward::signpost::Label::DecodeGrammarMask,
+                        )
+                    });
                     mask(logits)?;
                     if !has_finite_logit(logits) {
                         return Ok(SelectOutcome::GrammarExhausted);
@@ -511,6 +524,128 @@ impl DecoderSession for QwenMetalSession<'_> {
         self.readback = Readback::Empty;
         Ok(())
     }
+}
+
+/// The error the streaming entry returns when the grammar blocks every token
+/// before the first one is emitted.
+const STEP_ZERO_GRAMMAR_BLOCKED: &str = "grammar constraint blocked every token at step 0; \
+     no legal first token exists in the current grammar state";
+
+/// Adapts the streaming entry's `FnMut` cancellation poll to [`Cancellation`],
+/// whose blanket impl covers only `Fn` closures. `driver::run` polls it
+/// sequentially from one thread, so the borrow never conflicts.
+struct FnMutCancellation<'a, F: FnMut() -> bool>(&'a RefCell<F>);
+
+impl<F: FnMut() -> bool> Cancellation for FnMutCancellation<'_, F> {
+    fn is_cancelled(&self) -> bool {
+        (*self.0.borrow_mut())()
+    }
+}
+
+/// Runs one `MetalQwen35State::generate_streaming_with_cancel` request through
+/// [`driver::run`] over `session` and returns that entry's output.
+///
+/// `should_cancel` is polled at the driver's three checkpoints: before
+/// prefill, right after it, and at the top of every decode iteration. Text
+/// reaches `on_token` through an incremental detokenizer and the policy's
+/// stop-string matcher, as it did in the entry's own loop.
+///
+/// Three parts of the entry's contract differ from what the driver reports,
+/// and this function keeps the entry's:
+///
+/// 1. The text released by the natural-end flush reaches `on_token` with the
+///    id of the last emitted token; the driver hands the flush the id 0.
+/// 2. A sampled or budget-forced token the grammar rejects ends the request
+///    with `stopped: false` and `StopReason::Grammar`, unless the flush then
+///    completes a stop string, which reports `stopped: true` and
+///    `StopReason::Eos`. The driver reports `stopped: true` for the
+///    rejection and keeps `Grammar` through the flush. A rejection is the one
+///    grammar stop that leaves the last opened prediction unpushed, so it is
+///    read from the trace; the flush completed a stop string exactly when the
+///    matcher withheld decoded text from `text`.
+/// 3. A grammar that blocks every token before the first one is emitted keeps
+///    the entry's step-0 message.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_streaming(
+    session: &mut dyn DecoderSession,
+    gen_cfg: &GenerateConfig,
+    think_close_id: Option<u32>,
+    prompt_ids: &[u32],
+    eos_token_id: u32,
+    tokenizer: &BpeTokenizer,
+    mut on_token: impl FnMut(&str, u32) -> bool,
+    should_cancel: impl FnMut() -> bool,
+) -> Result<GenerateOutput, InferenceError> {
+    let should_cancel = RefCell::new(should_cancel);
+    let cancel = FnMutCancellation(&should_cancel);
+    let detok = RefCell::new(IncrementalDetokenizer::new());
+    let last_pushed: Cell<Option<u32>> = Cell::new(None);
+    let decoded_len = Cell::new(0usize);
+    let flushing_tail = Cell::new(false);
+    let mut text = String::new();
+    let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
+
+    let result = driver::run(
+        session,
+        gen_cfg,
+        think_close_id,
+        prompt_ids,
+        eos_token_id,
+        true,
+        &cancel,
+        |_generated_len| {},
+        |next_id| {
+            last_pushed.set(Some(next_id));
+            let delta = detok.borrow_mut().push(tokenizer, next_id);
+            decoded_len.set(decoded_len.get() + delta.len());
+            delta
+        },
+        &mut text,
+        &mut token_logprob_end_offsets,
+        |delta, next_id| {
+            let id = if flushing_tail.get() {
+                last_pushed.get().unwrap_or(next_id)
+            } else {
+                next_id
+            };
+            on_token(delta, id)
+        },
+        || {},
+        || {
+            flushing_tail.set(true);
+            let tail = detok.borrow_mut().finish();
+            decoded_len.set(decoded_len.get() + tail.len());
+            tail
+        },
+    );
+    let result = match result {
+        Err(InferenceError::GrammarConstraintBlocked(_)) if last_pushed.get().is_none() => {
+            return Err(InferenceError::GrammarConstraintBlocked(
+                STEP_ZERO_GRAMMAR_BLOCKED.into(),
+            ));
+        }
+        other => other?,
+    };
+
+    let mut stopped = result.stopped;
+    let mut stop_reason = result.stop_reason;
+    if stop_reason == StopReason::Grammar && result.trace.opened == result.generated_ids.len() + 1 {
+        let flush_completed_stop_string = text.len() < decoded_len.get();
+        stopped = flush_completed_stop_string;
+        if flush_completed_stop_string {
+            stop_reason = StopReason::Eos;
+        }
+    }
+
+    Ok(GenerateOutput {
+        text,
+        prompt_tokens: prompt_ids.len(),
+        generated_tokens: result.generated_ids.len(),
+        token_ids: result.generated_ids,
+        stopped,
+        stop_reason: Some(stop_reason),
+        token_logprobs: result.token_logprobs,
+    })
 }
 
 #[cfg(test)]
@@ -1183,10 +1318,256 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // `run_streaming` over a scripted session (no Metal device): the three
+    // places the streaming entry's contract differs from what the driver
+    // reports on its own.
+    // -----------------------------------------------------------------
+
+    /// Tokenizer ids: 0 decodes to "a"; 1 decodes to the lone byte 0xE4, an
+    /// incomplete UTF-8 sequence the detokenizer holds until its final flush,
+    /// which renders it as U+FFFD; 2 decodes to "x".
+    fn scripted_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
+        let vocab = [("a", 0u32), ("\u{e4}", 1), ("x", 2)]
+            .into_iter()
+            .map(|(token, id)| (token.to_string(), id))
+            .collect();
+        crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+            .expect("scripted tokenizer")
+    }
+
+    /// A grammar over the scripted ids, where the grammar reads id 0 as "a",
+    /// id 1 as `second` and id 2 as "x".
+    fn scripted_grammar(
+        gbnf: &str,
+        second: &[u8],
+    ) -> std::sync::Arc<crate::grammar::GrammarEngine> {
+        std::sync::Arc::new(
+            crate::grammar::GrammarEngine::new(
+                &crate::grammar::GrammarSpec::Gbnf(gbnf.into()),
+                vec![b"a".to_vec(), second.to_vec(), b"x".to_vec()],
+            )
+            .expect("scripted grammar compiles"),
+        )
+    }
+
+    const SCRIPTED_EOS: u32 = 99;
+    const SCRIPTED_THINK_CLOSE: u32 = 2;
+
+    /// Offers `script[i]` from the i-th `select` (the last entry repeats).
+    /// A grammar mask is applied to a zero row over the three ids first, so a
+    /// mask that blocks every id is reported as `GrammarExhausted`, as the
+    /// real session reports it.
+    struct ScriptedSession {
+        caps: ExecutionCapabilities,
+        ledger: PredictionLedger,
+        script: Vec<u32>,
+        selects: usize,
+    }
+
+    impl DecoderSession for ScriptedSession {
+        fn capabilities(&self) -> &ExecutionCapabilities {
+            &self.caps
+        }
+
+        fn prefill(&mut self, _cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
+            Ok(StepStamp {
+                evaluated_len: 1,
+                prediction: None,
+            })
+        }
+
+        fn decode(
+            &mut self,
+            accepted: &AcceptedToken,
+            _cancel: &dyn Cancellation,
+        ) -> Result<StepStamp, InferenceError> {
+            self.ledger.consume(accepted.prediction)?;
+            Ok(StepStamp {
+                evaluated_len: 2,
+                prediction: None,
+            })
+        }
+
+        fn select(
+            &mut self,
+            request: &SelectionRequest<'_>,
+        ) -> Result<SelectOutcome, InferenceError> {
+            let candidate_id = self.script[self.selects.min(self.script.len() - 1)];
+            self.selects += 1;
+            if let Some(mask) = request.grammar_mask {
+                let mut row = vec![0.0f32; 3];
+                mask(&mut row)?;
+                if !has_finite_logit(&row) {
+                    return Ok(SelectOutcome::GrammarExhausted);
+                }
+            }
+            Ok(SelectOutcome::Candidate(SelectionCandidate {
+                candidate_id,
+                prediction: self.ledger.open(),
+            }))
+        }
+
+        fn metadata(
+            &mut self,
+            _prediction: PredictionId,
+            _final_token: u32,
+            _request: &MetadataRequest,
+        ) -> Result<TokenMetadata, InferenceError> {
+            unreachable!("no scripted request sets logprobs")
+        }
+
+        fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
+            Ok(())
+        }
+    }
+
+    /// Streams `script` and returns the output and every `(text, id)` pair
+    /// `on_token` received.
+    fn stream_script(
+        script: Vec<u32>,
+        gen_cfg: &GenerateConfig,
+    ) -> (Result<GenerateOutput, InferenceError>, Vec<(String, u32)>) {
+        let mut session = ScriptedSession {
+            caps: STREAMING_CAPABILITIES,
+            ledger: PredictionLedger::new(),
+            script,
+            selects: 0,
+        };
+        let tokenizer = scripted_tokenizer();
+        let mut calls = Vec::new();
+        let output = run_streaming(
+            &mut session,
+            gen_cfg,
+            Some(SCRIPTED_THINK_CLOSE),
+            &[0],
+            SCRIPTED_EOS,
+            &tokenizer,
+            |text, id| {
+                calls.push((text.to_string(), id));
+                true
+            },
+            || false,
+        );
+        (output, calls)
+    }
+
+    /// The natural-end flush releases the held 0xE4 byte as U+FFFD. It must
+    /// reach `on_token` with the id of the last emitted token (1), not the
+    /// placeholder id the driver hands the flush.
+    #[test]
+    fn streaming_tail_flush_reports_the_last_emitted_token_id() {
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 2,
+            ..Default::default()
+        };
+        let (output, calls) = stream_script(vec![0, 1], &gen_cfg);
+        let output = output.expect("an unconstrained scripted stream runs to its cap");
+        assert_eq!(output.token_ids, vec![0, 1]);
+        assert_eq!(output.stop_reason, Some(StopReason::Length));
+        assert!(!output.stopped);
+        assert_eq!(
+            calls,
+            vec![("a".to_string(), 0), ("\u{fffd}".to_string(), 1)],
+            "fixture shape: one decode-step delta, then the flushed tail"
+        );
+        assert_eq!(output.text, "a\u{fffd}");
+    }
+
+    /// Budget forcing replaces the second token with the close id, which the
+    /// grammar (`"b" "b"`, id 1 read as "b") rejects: the request ends with
+    /// `StopReason::Grammar` and `stopped: false`. The flushed tail still
+    /// reaches `on_token`, and completes no stop string.
+    #[test]
+    fn streaming_grammar_rejection_reports_not_stopped() {
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            enable_thinking: true,
+            reasoning_budget: Some(1),
+            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
+            ..Default::default()
+        };
+        let (output, calls) = stream_script(vec![1], &gen_cfg);
+        let output = output.expect("a grammar rejection is not an error");
+        assert_eq!(
+            output.token_ids,
+            vec![1],
+            "the forced close id is rejected before it is pushed"
+        );
+        assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        assert!(
+            !output.stopped,
+            "a grammar rejection is not a stop condition"
+        );
+        assert_eq!(calls, vec![("\u{fffd}".to_string(), 1)]);
+    }
+
+    /// The same rejection, with a stop string the flushed tail completes: the
+    /// request reports the stop string (`StopReason::Eos`, `stopped: true`),
+    /// and the matched text never reaches `on_token`.
+    #[test]
+    fn streaming_grammar_rejection_then_flushed_stop_string_reports_eos() {
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            enable_thinking: true,
+            reasoning_budget: Some(1),
+            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
+            stop_strings: vec!["\u{fffd}".to_string()],
+            ..Default::default()
+        };
+        let (output, calls) = stream_script(vec![1], &gen_cfg);
+        let output = output.expect("a grammar rejection is not an error");
+        assert_eq!(output.token_ids, vec![1]);
+        assert_eq!(output.stop_reason, Some(StopReason::Eos));
+        assert!(output.stopped);
+        assert!(calls.is_empty(), "the stop string is withheld: {calls:?}");
+        assert_eq!(output.text, "");
+    }
+
+    /// A grammar that blocks every id before the first token keeps the
+    /// entry's step-0 message; a dead end after the first token keeps the
+    /// decode-step message (control: the step-0 message is not applied to it).
+    #[test]
+    fn streaming_grammar_block_messages_distinguish_step_zero() {
+        let blocked_at_start = GenerateConfig {
+            max_new_tokens: 4,
+            grammar: Some(scripted_grammar("root ::= \"b\"\n", b"a")),
+            ..Default::default()
+        };
+        let (output, calls) = stream_script(vec![1], &blocked_at_start);
+        match output {
+            Err(InferenceError::GrammarConstraintBlocked(message)) => {
+                assert_eq!(message, STEP_ZERO_GRAMMAR_BLOCKED);
+            }
+            other => panic!("expected the step-0 grammar block, got {other:?}"),
+        }
+        assert!(calls.is_empty());
+
+        let dead_end = GenerateConfig {
+            max_new_tokens: 4,
+            grammar: Some(scripted_grammar("root ::= \"b\" \"c\"\n", b"b")),
+            ..Default::default()
+        };
+        let (output, calls) = stream_script(vec![1], &dead_end);
+        match output {
+            Err(InferenceError::GrammarConstraintBlocked(message)) => {
+                assert!(
+                    message.contains("no legal continuation"),
+                    "a decode-step dead end keeps its own message, got {message:?}"
+                );
+            }
+            other => panic!("expected the decode-step grammar block, got {other:?}"),
+        }
+        assert!(calls.is_empty(), "the held 0xE4 byte is never flushed");
+    }
+
+    // -----------------------------------------------------------------
     // Real-checkpoint parity: the session driven by `driver::run` against
-    // the legacy entry it reproduces, on the same state. Runs only when the
-    // Metal generation golden checkpoint is configured; skips otherwise
-    // unless the golden enforce switch is on.
+    // the direct entry's own loop, on the same state. The streaming entry
+    // itself runs through this session, so a streaming comparison here would
+    // compare the driver with itself; the Metal generation golden replay pins
+    // that entry instead. Runs only when the Metal generation golden
+    // checkpoint is configured; skips otherwise unless the golden enforce
+    // switch is on.
     // -----------------------------------------------------------------
 
     const MODEL_DIR_VAR: &str = "LATTICE_METAL_GENERATION_MODEL_DIR";
@@ -1291,7 +1672,6 @@ mod tests {
 
     struct ParityCase {
         name: &'static str,
-        profile: MetalEntryProfile,
         prompt: &'static str,
         compact_env: bool,
         /// `(temperature, top_k, top_p, seed)`.
@@ -1299,8 +1679,6 @@ mod tests {
         max_new_tokens: usize,
         stop_strings: &'static [&'static str],
         grammar: bool,
-        logprobs: Option<usize>,
-        cancel_after_prefill: bool,
         mode: ExpectedMode,
     }
 
@@ -1310,15 +1688,12 @@ mod tests {
 
     const BASE_CASE: ParityCase = ParityCase {
         name: "",
-        profile: MetalEntryProfile::Direct,
         prompt: PLAIN_PROMPT,
         compact_env: false,
         sampler: GREEDY,
         max_new_tokens: 16,
         stop_strings: &[],
         grammar: false,
-        logprobs: None,
-        cancel_after_prefill: false,
         mode: ExpectedMode::Dense,
     };
 
@@ -1361,62 +1736,6 @@ mod tests {
             mode: ExpectedMode::GreedyArgmax,
             ..BASE_CASE
         },
-        ParityCase {
-            name: "streaming_greedy_dense",
-            profile: MetalEntryProfile::Streaming,
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "streaming_greedy_compact",
-            profile: MetalEntryProfile::Streaming,
-            compact_env: true,
-            mode: ExpectedMode::Compact,
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "streaming_sampled_dense",
-            profile: MetalEntryProfile::Streaming,
-            sampler: SAMPLED_DENSE,
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "streaming_sampled_compact",
-            profile: MetalEntryProfile::Streaming,
-            compact_env: true,
-            sampler: SAMPLED_BLOCK_TOPK,
-            mode: ExpectedMode::Compact,
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "streaming_grammar",
-            profile: MetalEntryProfile::Streaming,
-            prompt: GRAMMAR_PROMPT,
-            compact_env: true,
-            max_new_tokens: 48,
-            grammar: true,
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "streaming_stop_string",
-            profile: MetalEntryProfile::Streaming,
-            max_new_tokens: 48,
-            stop_strings: &[".\n"],
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "streaming_logprobs",
-            profile: MetalEntryProfile::Streaming,
-            compact_env: true,
-            max_new_tokens: 8,
-            logprobs: Some(2),
-            ..BASE_CASE
-        },
-        ParityCase {
-            name: "streaming_cancel_after_prefill",
-            profile: MetalEntryProfile::Streaming,
-            cancel_after_prefill: true,
-            ..BASE_CASE
-        },
     ];
 
     fn parity_config(
@@ -1435,7 +1754,6 @@ mod tests {
             enable_mtp: Some(false),
             grammar: case.grammar.then(|| std::sync::Arc::clone(grammar)),
             stop_strings: case.stop_strings.iter().map(|s| (*s).to_string()).collect(),
-            logprobs: case.logprobs,
             ..Default::default()
         }
     }
@@ -1481,23 +1799,9 @@ mod tests {
         gen_cfg: &GenerateConfig,
     ) -> ParityRecord {
         state.reset_path_proof_counters();
-        let output = match case.profile {
-            MetalEntryProfile::Direct => state.generate(case.prompt, tokenizer, gen_cfg),
-            MetalEntryProfile::Streaming => {
-                let mut polls = 0usize;
-                state.generate_streaming_with_cancel(
-                    case.prompt,
-                    tokenizer,
-                    gen_cfg,
-                    |_, _| true,
-                    || {
-                        polls += 1;
-                        case.cancel_after_prefill && polls >= 2
-                    },
-                )
-            }
-        }
-        .unwrap_or_else(|error| panic!("{}: legacy entry failed: {error}", case.name));
+        let output = state
+            .generate(case.prompt, tokenizer, gen_cfg)
+            .unwrap_or_else(|error| panic!("{}: legacy entry failed: {error}", case.name));
         let stop_reason = output
             .stop_reason
             .unwrap_or_else(|| panic!("{}: legacy entry reported no stop reason", case.name));
@@ -1523,10 +1827,6 @@ mod tests {
         use crate::tokenizer::detokenize::IncrementalDetokenizer;
 
         state.reset_path_proof_counters();
-        let contract = match case.profile {
-            MetalEntryProfile::Direct => GenerationEntryContract::MetalDirect,
-            MetalEntryProfile::Streaming => GenerationEntryContract::MetalStreaming,
-        };
         let vocab_size = state.engine.config.vocab_size;
         let eos_token_id = state.engine.config.eos_token_id;
         let plan = match prepare_generation(
@@ -1535,7 +1835,7 @@ mod tests {
             gen_cfg,
             vocab_size,
             state.max_context(),
-            contract,
+            GenerationEntryContract::MetalDirect,
         )
         .unwrap_or_else(|error| panic!("{}: preparation failed: {error}", case.name))
         {
@@ -1553,16 +1853,12 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("{}: reasoning close token: {error}", case.name));
 
-        let polls = std::cell::Cell::new(0usize);
-        let cancel = || {
-            polls.set(polls.get() + 1);
-            case.cancel_after_prefill && polls.get() >= 2
-        };
+        let cancel = || false;
         let detok = std::cell::RefCell::new(IncrementalDetokenizer::new());
         let mut text = String::new();
         let mut offsets = Vec::new();
 
-        let mut session = QwenMetalSession::new(state, plan, gen_cfg, case.profile)
+        let mut session = QwenMetalSession::new(state, plan, gen_cfg, MetalEntryProfile::Direct)
             .unwrap_or_else(|error| panic!("{}: session construction failed: {error}", case.name));
         let mode = session.mode();
         let result = driver::run(
@@ -1571,7 +1867,7 @@ mod tests {
             think_close_id,
             &prompt_ids,
             eos_token_id,
-            case.profile == MetalEntryProfile::Streaming,
+            false,
             &cancel,
             |_| {},
             |id| detok.borrow_mut().push(tokenizer, id),
@@ -1663,23 +1959,11 @@ mod tests {
                 "{}: session differs from the legacy entry",
                 case.name
             );
-            if case.cancel_after_prefill {
-                assert_eq!(legacy.stop_reason, StopReason::Interrupt, "{}", case.name);
-                assert!(legacy.token_ids.is_empty(), "{}", case.name);
-            } else {
-                assert!(
-                    !legacy.token_ids.is_empty(),
-                    "{}: generated nothing",
-                    case.name
-                );
-            }
-            if case.logprobs.is_some() {
-                assert_eq!(
-                    legacy.logprob_ids, legacy.token_ids,
-                    "{}: logprobs were not captured",
-                    case.name
-                );
-            }
+            assert!(
+                !legacy.token_ids.is_empty(),
+                "{}: generated nothing",
+                case.name
+            );
             eprintln!(
                 "decoder session parity {}: {} tokens, {:?}",
                 case.name,
