@@ -1031,6 +1031,22 @@ struct HfQwenConfigFile {
     vision_end_token_id: Option<u32>,
 }
 
+// Whether text_config spells the flat RoPE fields at all. Qwen35Config is #[serde(default)], so
+// its parsed values cannot tell an absent field from the preset default.
+#[derive(Debug, Default, serde::Deserialize)]
+struct HfFlatRopePresence {
+    #[serde(default)]
+    rope_theta: Option<f64>,
+    #[serde(default)]
+    partial_rotary_factor: Option<f32>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct HfFlatRopePresenceFile {
+    #[serde(default)]
+    text_config: Option<HfFlatRopePresence>,
+}
+
 impl Default for Qwen35Config {
     fn default() -> Self {
         Self::qwen36_35b_a3b()
@@ -1375,13 +1391,36 @@ impl Qwen35Config {
         cfg.vision_start_token_id = parsed.vision_start_token_id;
         cfg.vision_end_token_id = parsed.vision_end_token_id;
         // Many models nest rope_theta and partial_rotary_factor under rope_parameters
-        // instead of at the text_config level — extract when the flat fields are unset.
+        // instead of at the text_config level — use the nested value when the flat field is
+        // absent from the JSON (or, for rope_theta, 0.0), and refuse when both disagree.
         if let Some(rp) = &cfg.rope_parameters {
-            if cfg.rope_theta == 0.0 && rp.rope_theta > 0.0 {
-                cfg.rope_theta = rp.rope_theta;
+            let flat = serde_json::from_str::<HfFlatRopePresenceFile>(json)
+                .map_err(|e| InferenceError::Inference(format!("invalid Qwen config.json: {e}")))?
+                .text_config
+                .unwrap_or_default();
+            if rp.rope_theta > 0.0 {
+                match flat.rope_theta.filter(|&t| t != 0.0) {
+                    Some(t) if t != rp.rope_theta => {
+                        return Err(InferenceError::Inference(format!(
+                            "invalid Qwen config.json: text_config.rope_theta ({t}) conflicts \
+                             with text_config.rope_parameters.rope_theta ({})",
+                            rp.rope_theta
+                        )));
+                    }
+                    _ => cfg.rope_theta = rp.rope_theta,
+                }
             }
             if let Some(prf) = rp.partial_rotary_factor {
-                cfg.partial_rotary_factor = prf;
+                match flat.partial_rotary_factor {
+                    Some(f) if f != prf => {
+                        return Err(InferenceError::Inference(format!(
+                            "invalid Qwen config.json: text_config.partial_rotary_factor ({f}) \
+                             conflicts with text_config.rope_parameters.partial_rotary_factor \
+                             ({prf})"
+                        )));
+                    }
+                    _ => cfg.partial_rotary_factor = prf,
+                }
             }
         }
         cfg.validate()
@@ -3434,6 +3473,74 @@ mod tests {
             Qwen35Config::from_config_json_str(json).is_ok(),
             "partial_rotary_factor == 1.0 (full rotary) must be accepted"
         );
+    }
+
+    #[test]
+    fn nested_rope_theta_applies_when_flat_is_absent() {
+        // The defaulted flat field reads 1e7 here, so presence has to come from the raw JSON.
+        let json = r#"{"text_config": {"rope_parameters": {"rope_theta": 500000.0}}}"#;
+        let cfg = Qwen35Config::from_config_json_str(json).expect("nested rope_theta parses");
+        assert_eq!(cfg.rope_theta, 500_000.0);
+    }
+
+    #[test]
+    fn equal_flat_and_nested_rope_theta_accepted() {
+        let json = r#"{"text_config": {"rope_theta": 500000.0,
+            "rope_parameters": {"rope_theta": 500000.0}}}"#;
+        let cfg = Qwen35Config::from_config_json_str(json).expect("equal values agree");
+        assert_eq!(cfg.rope_theta, 500_000.0);
+    }
+
+    #[test]
+    fn conflicting_flat_and_nested_rope_theta_errors() {
+        let json = r#"{"text_config": {"rope_theta": 500000.0,
+            "rope_parameters": {"rope_theta": 1000000.0}}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("disagreeing rope_theta values must not pick one")
+            .to_string();
+        assert!(
+            err.contains("(500000)") && err.contains("(1000000)"),
+            "error must name both values: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_partial_rotary_factor_applies_when_flat_is_absent() {
+        let json = r#"{"text_config": {"rope_parameters": {"partial_rotary_factor": 0.5}}}"#;
+        let cfg = Qwen35Config::from_config_json_str(json).expect("nested factor parses");
+        assert_eq!(cfg.partial_rotary_factor, 0.5);
+    }
+
+    #[test]
+    fn conflicting_flat_and_nested_partial_rotary_factor_errors() {
+        let json = r#"{"text_config": {"partial_rotary_factor": 0.25,
+            "rope_parameters": {"partial_rotary_factor": 0.5}}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("disagreeing partial_rotary_factor values must not pick one")
+            .to_string();
+        assert!(
+            err.contains("(0.25)") && err.contains("(0.5)"),
+            "error must name both values: {err}"
+        );
+    }
+
+    #[test]
+    fn equal_flat_and_nested_partial_rotary_factor_accepted() {
+        let json = r#"{"text_config": {"partial_rotary_factor": 0.25,
+            "rope_parameters": {"partial_rotary_factor": 0.25}}}"#;
+        let cfg = Qwen35Config::from_config_json_str(json).expect("equal values agree");
+        assert_eq!(cfg.partial_rotary_factor, 0.25);
+    }
+
+    #[test]
+    fn qwen35_0_8b_fixture_keeps_nested_rope_values() {
+        let json = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/qwen35_0_8b_config.json"
+        ));
+        let cfg = Qwen35Config::from_config_json_str(json).expect("fixture parses");
+        assert_eq!(cfg.rope_theta, 10_000_000.0);
+        assert_eq!(cfg.partial_rotary_factor, 0.25);
     }
 
     // ──────────────────────────────────────────────────────────────────────
