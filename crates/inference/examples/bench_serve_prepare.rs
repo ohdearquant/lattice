@@ -15,13 +15,15 @@
 //!                  `Qwen35Model::generate_streaming_with_cancel`. This route
 //!                  has no admission gate.
 //!   lattice-metal  `lattice serve` on a Q4 checkpoint (Metal worker).
-//!                  Handler: the same `prepare_chat_request` and mapping as
-//!                  `cpu`, with the 4096-token context the binary uses.
+//!                  Handler: the worker factory's `PreparationHandle`
+//!                  (`prepare_lattice`, the same `prepare_chat_request` bound
+//!                  to the worker's tokenizer and 4096-token context), then
+//!                  `lattice_generate_config`.
 //!   lattice-serve  `lattice_serve` (Metal worker, Q4 or safetensors).
-//!                  Handler: `serve::contract::normalize_request` with the
-//!                  `lattice_serve` profile, `serve::prepare::build_cfg`, then
-//!                  `serve::into_engine_chat_messages`. No render or tokenize
-//!                  happens in this handler.
+//!                  Handler: the handle's `normalize_standalone` with the
+//!                  `lattice_serve` defaults, `standalone_generate_config`,
+//!                  then `serve::into_engine_chat_messages`. No render or
+//!                  tokenize happens in this handler.
 //!   gemma-cpu      Gemma 4 E2B text on a safetensors checkpoint, CPU.
 //!                  Preparation: `serve::prepare::prepare_gemma_chat_request`
 //!                  (validate, the Gemma prompt adapter's defaults, render
@@ -273,24 +275,24 @@ fn lattice_prepare(
     ))
 }
 
-metal_only! {
-    /// The `lattice_serve` handler's preparation: normalize, `build_cfg`, engine
-    /// messages.
-    fn lattice_serve_prepare(
-        body: &[u8],
-        model_max_context: usize,
-    ) -> Result<Result<EngineRequest, ApiError>, String> {
-        let req = parse_body(body)?;
-        Ok(normalize_request(
-            &req,
-            GenerationDefaults::standard(LATTICE_SERVE_DEFAULT_MAX_TOKENS),
-            ServeProfile::lattice_serve(MODEL_ID, model_max_context).with_vision_support(false),
-        )
-        .and_then(|validated| {
-            let cfg = build_cfg(&validated);
-            into_engine_chat_messages(validated.messages).map(|messages| (messages, cfg))
-        }))
-    }
+/// The `lattice_serve` handler's preparation before the worker factory:
+/// normalize, `build_cfg`, engine messages. Kept for the preparation tests
+/// below; the Metal route now prepares through the worker's handle.
+#[cfg_attr(not(test), allow(dead_code))]
+fn lattice_serve_prepare(
+    body: &[u8],
+    model_max_context: usize,
+) -> Result<Result<EngineRequest, ApiError>, String> {
+    let req = parse_body(body)?;
+    Ok(normalize_request(
+        &req,
+        GenerationDefaults::standard(LATTICE_SERVE_DEFAULT_MAX_TOKENS),
+        ServeProfile::lattice_serve(MODEL_ID, model_max_context).with_vision_support(false),
+    )
+    .and_then(|validated| {
+        let cfg = build_cfg(&validated);
+        into_engine_chat_messages(validated.messages).map(|messages| (messages, cfg))
+    }))
 }
 
 /// Gemma E2B text preparation, with the `lattice serve` defaults.
