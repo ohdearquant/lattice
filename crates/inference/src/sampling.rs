@@ -244,19 +244,25 @@ impl CandidateSet {
             }
             return;
         }
-        // Center on the largest finite logit before scaling. Scaling first overflows
-        // any logit above `temperature * f32::MAX` to +inf, and two overflowed logits
-        // then tie and break on token id instead of on value. Centered logits are
-        // <= 0, so the scaled maximum is exactly 0.0; anything that overflows to -inf
-        // instead had no probability mass to lose.
-        let center = self
-            .candidates
-            .iter()
-            .map(|c| c.logit)
-            .filter(|logit| logit.is_finite())
-            .fold(f32::NEG_INFINITY, f32::max);
-        let center = if center.is_finite() { center } else { 0.0 };
+        // Center only when `inv > 1.0` (see `select_top_k`'s doc comment for the
+        // full reasoning): scaling first overflows any logit above
+        // `temperature * f32::MAX` to +inf only when `inv > 1`, and two overflowed
+        // logits would then tie and break on token id instead of on value.
+        // Centering unconditionally trades that failure for the opposite one: with
+        // `inv <= 1` a huge negative logit can center-and-overflow to -inf even
+        // though plain scaling would have kept it finite.
         let inv = 1.0 / temperature;
+        let center = if inv > 1.0 {
+            let raw = self
+                .candidates
+                .iter()
+                .map(|c| c.logit)
+                .filter(|logit| logit.is_finite())
+                .fold(f32::NEG_INFINITY, f32::max);
+            if raw.is_finite() { raw } else { 0.0 }
+        } else {
+            0.0
+        };
         for c in &mut self.candidates {
             c.logit = (c.logit - center) * inv;
         }
@@ -714,13 +720,15 @@ impl Sampler {
             return token;
         }
 
-        // Scaling is centered on the finite `max_logit` so no logit overflows to
-        // +inf (see `select_top_k`).
-        let (inv_temp, center) = if self.config.temperature != 1.0 {
-            (1.0 / self.config.temperature, max_logit)
+        // Centering is applied only when `inv_temp > 1.0` (see `select_top_k`'s
+        // doc comment for the full reasoning), so no logit overflows to +inf in
+        // that regime, without introducing a new downward overflow when it isn't.
+        let inv_temp = if self.config.temperature != 1.0 {
+            1.0 / self.config.temperature
         } else {
-            (1.0, 0.0)
+            1.0
         };
+        let center = if inv_temp > 1.0 { max_logit } else { 0.0 };
 
         // Streaming min-heap top-k with fused temperature scaling.
         // ~95% of vocab elements are skipped by the NEON threshold gate.
@@ -903,18 +911,18 @@ pub(crate) fn sample_full_logits(
         // above `temperature * f32::MAX`. The fused top-k therefore subtracts
         // the finite `max_logit` found here before multiplying by the positive
         // finite `inv_temp` (guaranteed by the `temperature_degenerate` check
-        // above). That preserves NaN-ness and maps the maximum to exactly 0.0,
+        // above) -- but only when `inv_temp > 1.0` (see `select_top_k`'s doc
+        // comment for the full reasoning): that is the only regime where scaling
+        // first can overflow upward, and centering when `inv_temp <= 1.0` would
+        // trade that away for a downward overflow instead. That preserves
+        // NaN-ness and, when centering applies, maps the maximum to exactly 0.0,
         // so the scaled maximum stays finite and scanning before the fused
         // top-k scale is equivalent to scanning after it.
         let (has_nan, max_logit) = scan_nan_or_nonfinite_max(logit_scratch);
         if has_nan || !max_logit.is_finite() {
             return argmax_f32(logit_scratch);
         }
-        let center = if cfg.temperature != 1.0 {
-            max_logit
-        } else {
-            0.0
-        };
+        let center = if inv_temp > 1.0 { max_logit } else { 0.0 };
 
         // Streaming min-heap top-k with fused temperature scaling — the softmax
         // draw below runs only over these k survivors, never the full vocabulary.
@@ -1363,9 +1371,17 @@ fn heap_build(heap: &mut [Candidate]) {
 
 /// Runtime-dispatch top-k: NEON on aarch64 when detected, scalar otherwise.
 /// Temperature is fused into the scan — candidates store `(logit - center) * inv_temp`.
-/// Callers that scale pass the finite max logit as `center`: scaling first would
-/// overflow any logit above `f32::MAX / inv_temp` to +inf and tie it with every
-/// other overflowed logit. `center = 0.0` leaves each logit exactly `logit * inv_temp`.
+///
+/// Callers pass `center = max_logit` when `inv_temp > 1.0`, and `center = 0.0`
+/// otherwise. When `inv_temp <= 1`, `|logit * inv_temp| <= |logit|`, so scaling the
+/// raw logit can never overflow, and centering is skipped so the result is exactly
+/// `logit * inv_temp` (bit-identical to no centering at all). When `inv_temp > 1`,
+/// scaling the raw logit first can overflow to +inf above `f32::MAX / inv_temp`,
+/// tying every overflowed logit together on token id instead of on value; centering
+/// first avoids that because every centered value is `<= 0`, so scaling can only
+/// overflow *downward*, and a value that reaches `-inf` there already had a true
+/// scaled value below `-f32::MAX`, whose probability rounds to zero either way. So
+/// centering only when `inv_temp > 1` loses no probability mass in either regime.
 fn select_top_k(logits: &[f32], k: usize, inv_temp: f32, center: f32, out: &mut Vec<Candidate>) {
     #[cfg(target_arch = "aarch64")]
     {
@@ -3213,6 +3229,140 @@ mod tests {
             sample_full_logits(&HUGE_FINITE_LOGITS, &cfg, &[], &mut rng_state, 0.0, 0.0),
             1
         );
+    }
+
+    // Opposite-direction overflow: `f32::MAX` passes `temperature_degenerate`
+    // (its reciprocal is tiny but finite), and `inv_temp <= 1.0` so centering
+    // must be skipped (see `select_top_k`'s doc comment). Centering
+    // unconditionally sends the negative logit to `-inf` even though plain
+    // scaling keeps both finite at about `[1.0, -1.0]`.
+    const HUGE_LOGITS_BOTH_SIGNS: [f32; 2] = [f32::MAX, -f32::MAX];
+
+    #[test]
+    fn apply_temperature_scales_without_centering_when_inv_le_one() {
+        let mut cs = CandidateSet::from_full_logits(&HUGE_LOGITS_BOTH_SIGNS);
+        cs.apply_temperature(f32::MAX);
+        assert!(
+            cs.candidates[0].logit.is_finite(),
+            "positive logit must stay finite"
+        );
+        assert!(
+            cs.candidates[1].logit.is_finite(),
+            "negative logit must stay finite, not center-and-overflow to -inf"
+        );
+        let diff = (cs.candidates[0].logit - cs.candidates[1].logit).abs();
+        assert!(
+            (diff - 2.0).abs() < 1e-3,
+            "logit difference must be ~2.0, got {diff}"
+        );
+    }
+
+    #[test]
+    fn select_top_k_scales_without_centering_when_inv_le_one() {
+        // Mirrors `select_top_k_centers_huge_finite_logits_before_scaling`: the
+        // padded row places both extreme logits inside the NEON 4-wide phase.
+        // The filler is `NEG_INFINITY`, not `0.0`: with `k == 2` the function
+        // keeps only the two largest values, and `0.0` filler would itself
+        // outrank `-f32::MAX`, evicting it from the returned set and defeating
+        // the point of the test (`-f32::MAX` is the most negative *finite*
+        // value, so only `-inf` filler ranks below it).
+        let padded = [
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            -f32::MAX,
+        ];
+        let inv_temp = 1.0 / f32::MAX;
+        for logits in [&HUGE_LOGITS_BOTH_SIGNS[..], &padded[..]] {
+            let mut scalar_out = Vec::new();
+            select_top_k_scalar(logits, 2, inv_temp, 0.0, &mut scalar_out);
+            let mut dispatch_out = Vec::new();
+            select_top_k(logits, 2, inv_temp, 0.0, &mut dispatch_out);
+            for out in [&scalar_out, &dispatch_out] {
+                assert_eq!(out.len(), 2);
+                for c in out.iter() {
+                    assert!(
+                        c.logit.is_finite(),
+                        "logit for token {} must be finite",
+                        c.token_id
+                    );
+                }
+                let diff = (out[0].logit - out[1].logit).abs();
+                assert!(
+                    (diff - 2.0).abs() < 1e-3,
+                    "logit difference must be ~2.0, got {diff}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sampler_sample_scales_without_centering_when_inv_le_one() {
+        // `Sampler::sample` exposes only a sampled token id through its public
+        // signature; verified through the private `candidate_scratch` it
+        // restores after sampling (this test module is nested inside the same
+        // module, so the field is visible here).
+        let config = SamplingConfig {
+            min_p: 0.0,
+            temperature: f32::MAX,
+            top_k: 2,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(7);
+        sampler.sample(&HUGE_LOGITS_BOTH_SIGNS);
+        assert_eq!(sampler.candidate_scratch.len(), 2);
+        for c in &sampler.candidate_scratch {
+            assert!(
+                c.logit.is_finite(),
+                "logit for token {} must be finite",
+                c.token_id
+            );
+        }
+        let diff = (sampler.candidate_scratch[0].logit - sampler.candidate_scratch[1].logit).abs();
+        assert!(
+            (diff - 2.0).abs() < 1e-3,
+            "logit difference must be ~2.0, got {diff}"
+        );
+    }
+
+    #[test]
+    fn sample_full_logits_scales_without_centering_when_inv_le_one() {
+        // `sample_full_logits` also exposes only a sampled token id; verified
+        // through the thread-local candidate scratch it restores before
+        // returning.
+        let cfg = GenerateConfig {
+            temperature: f32::MAX,
+            top_k: 2,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut rng_state = 7;
+        sample_full_logits(&HUGE_LOGITS_BOTH_SIGNS, &cfg, &[], &mut rng_state, 0.0, 0.0);
+        FULL_LOGIT_SCRATCH.with(|cell| {
+            let scratch = cell.borrow();
+            assert_eq!(scratch.candidate_scratch.len(), 2);
+            for c in &scratch.candidate_scratch {
+                assert!(
+                    c.logit.is_finite(),
+                    "logit for token {} must be finite",
+                    c.token_id
+                );
+            }
+            let diff =
+                (scratch.candidate_scratch[0].logit - scratch.candidate_scratch[1].logit).abs();
+            assert!(
+                (diff - 2.0).abs() < 1e-3,
+                "logit difference must be ~2.0, got {diff}"
+            );
+        });
     }
 
     #[test]
