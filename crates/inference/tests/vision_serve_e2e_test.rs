@@ -235,6 +235,11 @@ fn serve_chat_completions_reaches_vision_forward_path() {
             health_wait_started.elapsed()
         );
     }
+    eprintln!(
+        "lattice_serve healthy after {:?} (budget {:?})",
+        health_wait_started.elapsed(),
+        health_timeout
+    );
 
     let image_response = post_chat_completion(
         port,
