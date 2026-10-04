@@ -71,46 +71,10 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
         accelerate_matmul_bt(a, b, c, m, n, k);
     }
 
-    // x86_64 fallback: hand-written SIMD with tiling for large matrices.
+    // x86_64 fallback: hand-written SIMD with tiling for large matrices, rows split across
+    // the rayon pool for prefill-sized problems.
     #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
-    {
-        // Use cache-blocked (tiled) path for large matrices where blocking pays off.
-        // Two conditions must be met:
-        //   1. Total work m*n*k >= 1024*1024 (below this, overhead dominates).
-        //   2. K >= 128 (the shared dimension must be large enough that B-rows don't fit
-        //      in L1 cache naturally). When K is small (e.g. 32), each B-row is only
-        //      128 bytes and fits in L1 without tiling. Tiling would only change the
-        //      accumulation order and introduce unnecessary numerical differences.
-        // The tiled AVX2 kernel computes a full TILE_I x TILE_J tile with SIMD only when
-        // its K-tile has at least 16 elements; every other tile, including every partial
-        // TILE_I row tile, runs a scalar loop (the whole tiled call is scalar when
-        // AVX2+FMA is not detected). So the tiled path takes only the largest
-        // multiple of TILE_I rows, and the remaining rows (all of them when m < TILE_I,
-        // as in every decode step) go through the direct kernels below: AVX-512F, then
-        // AVX2, then the scalar reference when no SIMD feature is detected. Partial
-        // TILE_J column tiles and short K tiles inside the tiled part are still scalar.
-        // The tiled call gets exactly c[..full * n] because it zeroes the whole slice it
-        // is given.
-        let total_work = (m as u64) * (n as u64) * (k as u64);
-        let full = if total_work >= 1024 * 1024 && k >= super::tiled::TILE_K {
-            m - m % super::tiled::TILE_I
-        } else {
-            0
-        };
-        if full > 0 {
-            matmul_bt_tiled(&a[..full * k], b, &mut c[..full * n], full, k, n);
-        }
-        if full < m {
-            matmul_bt_direct(
-                &a[full * k..m * k],
-                b,
-                &mut c[full * n..m * n],
-                m - full,
-                k,
-                n,
-            );
-        }
-    }
+    matmul_bt_x86(a, b, c, m, k, n, ROW_THREAD_MIN_WORK);
 
     // Other non-macOS targets: hand-written SIMD with tiling for large matrices.
     #[cfg(all(not(target_os = "macos"), not(target_arch = "x86_64")))]
@@ -145,6 +109,126 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
         }
 
         matmul_bt_scalar(a, b, c, m, k, n);
+    }
+}
+
+/// Multiply-add count (m*n*k) at and above which `matmul_bt` splits its rows across the
+/// rayon pool on x86_64: twice the smallest shape measured to gain from the split
+/// (16 x 1024 x 3584). Only rows are split, and only on x86_64; other targets are unmeasured.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+const ROW_THREAD_MIN_WORK: u64 = 117_440_512;
+
+/// Smallest row chunk worth handing to another thread; shorter chunks lose to the split's cost.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+const ROW_THREAD_MIN_CHUNK: usize = 16;
+
+/// Rows per chunk when `matmul_bt` should split across `threads`, else `None`.
+///
+/// `None` for fewer than two threads, fewer than 32 rows, an empty shared or output
+/// dimension, work (m*n*k) below `min_work`, or when the chunk would cover every row. A chunk
+/// is a multiple of TILE_I rows, so every row stays on the kernel the unsplit call picks
+/// for it (the tiled kernel takes whole TILE_I row tiles, the direct kernel the remainder).
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+fn row_chunk_len(m: usize, k: usize, n: usize, threads: usize, min_work: u64) -> Option<usize> {
+    if threads < 2 || m < 32 || k == 0 || n == 0 {
+        return None;
+    }
+    let work = (m as u64).saturating_mul(n as u64).saturating_mul(k as u64);
+    if work < min_work {
+        return None;
+    }
+    let tile = super::tiled::TILE_I;
+    let chunk = (m.div_ceil(threads).div_ceil(tile) * tile).max(ROW_THREAD_MIN_CHUNK);
+    (chunk < m).then_some(chunk)
+}
+
+/// Whether the tiled kernel takes the leading rows of an m x k x n product.
+///
+/// Decided once for the whole product: a row chunk that recomputed this from its own,
+/// smaller, m would send rows to the direct kernel that the unsplit call gives to the tiled one.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+fn tiled_applies(m: usize, k: usize, n: usize) -> bool {
+    // Use cache-blocked (tiled) path for large matrices where blocking pays off.
+    // Two conditions must be met:
+    //   1. Total work m*n*k >= 1024*1024 (below this, overhead dominates).
+    //   2. K >= 128 (the shared dimension must be large enough that B-rows don't fit
+    //      in L1 cache naturally). When K is small (e.g. 32), each B-row is only
+    //      128 bytes and fits in L1 without tiling. Tiling would only change the
+    //      accumulation order and introduce unnecessary numerical differences.
+    let total_work = (m as u64) * (n as u64) * (k as u64);
+    total_work >= 1024 * 1024 && k >= super::tiled::TILE_K
+}
+
+/// x86_64 `matmul_bt`: the serial kernels over the whole product, or over row chunks run in
+/// parallel when `row_chunk_len` says the product is large enough. Each output row is computed
+/// from its own A row and B alone, and chunks start on TILE_I boundaries, so the split result
+/// is bit-identical to the serial one. Returns the chunk length used, `None` when it ran serially.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+fn matmul_bt_x86(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    min_work: u64,
+) -> Option<usize> {
+    use rayon::prelude::*;
+
+    let tiled = tiled_applies(m, k, n);
+    let chunk = row_chunk_len(m, k, n, rayon::current_num_threads(), min_work);
+    match chunk {
+        Some(rows) => {
+            c[..m * n]
+                .par_chunks_mut(rows * n)
+                .zip(a[..m * k].par_chunks(rows * k))
+                .for_each(|(c_chunk, a_chunk)| {
+                    matmul_bt_x86_rows(a_chunk, b, c_chunk, c_chunk.len() / n, k, n, tiled);
+                });
+        }
+        None => matmul_bt_x86_rows(a, b, c, m, k, n, tiled),
+    }
+    chunk
+}
+
+/// Serial x86_64 `matmul_bt` over `m` rows; `tiled` is `tiled_applies` for the whole product.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+fn matmul_bt_x86_rows(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    tiled: bool,
+) {
+    // The tiled AVX2 kernel computes a full TILE_I x TILE_J tile with SIMD only when
+    // its K-tile has at least 16 elements; every other tile, including every partial
+    // TILE_I row tile, runs a scalar loop (the whole tiled call is scalar when
+    // AVX2+FMA is not detected). So the tiled path takes only the largest
+    // multiple of TILE_I rows, and the remaining rows (all of them when m < TILE_I,
+    // as in every decode step) go through the direct kernels below: AVX-512F, then
+    // AVX2, then the scalar reference when no SIMD feature is detected. Partial
+    // TILE_J column tiles and short K tiles inside the tiled part are still scalar.
+    // The tiled call gets exactly c[..full * n] because it zeroes the whole slice it
+    // is given.
+    let full = if tiled {
+        m - m % super::tiled::TILE_I
+    } else {
+        0
+    };
+    if full > 0 {
+        matmul_bt_tiled(&a[..full * k], b, &mut c[..full * n], full, k, n);
+    }
+    if full < m {
+        matmul_bt_direct(
+            &a[full * k..m * k],
+            b,
+            &mut c[full * n..m * n],
+            m - full,
+            k,
+            n,
+        );
     }
 }
 
@@ -460,6 +544,185 @@ mod tests {
                     c[..m * n].iter().all(|x| x.is_finite()),
                     "m={m}: result region was not fully written"
                 );
+            }
+        }
+    }
+
+    // --- x86_64: row-split dispatch ---
+
+    #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+    mod row_threads {
+        use super::*;
+
+        fn bits(v: &[f32]) -> Vec<u32> {
+            v.iter().map(|x| x.to_bits()).collect()
+        }
+
+        fn serial(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+            let mut c = vec![0.0f32; m * n];
+            matmul_bt_x86_rows(a, b, &mut c, m, k, n, tiled_applies(m, k, n));
+            c
+        }
+
+        fn in_pool<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("rayon pool")
+                .install(f)
+        }
+
+        /// The split result and the chunk length the dispatcher reports having used.
+        fn threaded(
+            a: &[f32],
+            b: &[f32],
+            m: usize,
+            k: usize,
+            n: usize,
+            min_work: u64,
+        ) -> (Vec<f32>, Option<usize>) {
+            in_pool(4, || {
+                let mut c = vec![0.0f32; m * n];
+                let used = matmul_bt_x86(a, b, &mut c, m, k, n, min_work);
+                (c, used)
+            })
+        }
+
+        fn assert_bit_identical(m: usize, k: usize, n: usize) {
+            let a = lcg_vec(m * k, 0x2A11 + m as u32);
+            let b = lcg_vec(n * k, 0x2B22 + n as u32);
+            let (got, used) = threaded(&a, &b, m, k, n, 0);
+            assert!(used.is_some(), "m={m} k={k} n={n}: the split must engage");
+            assert_eq!(used, row_chunk_len(m, k, n, 4, 0), "m={m} k={k} n={n}");
+            assert_eq!(
+                bits(&got),
+                bits(&serial(&a, &b, m, k, n)),
+                "m={m} k={k} n={n}"
+            );
+        }
+
+        #[test]
+        fn row_chunk_len_decides_the_split() {
+            let min = ROW_THREAD_MIN_WORK;
+            assert_eq!(min, 2 * 16 * 1024 * 3584);
+            // No threads, one thread, too few rows, too little work.
+            assert_eq!(row_chunk_len(64, 1024, 3584, 0, min), None);
+            assert_eq!(row_chunk_len(64, 1024, 3584, 1, min), None);
+            assert_eq!(row_chunk_len(31, 1024, 3584, 8, 0), None);
+            assert_eq!(row_chunk_len(16, 1024, 3584, 8, min), None);
+            assert_eq!(row_chunk_len(64, 1024, 1024, 8, min), None);
+            // Empty shared or output dimension cannot be chunked.
+            assert_eq!(row_chunk_len(64, 0, 64, 8, 0), None);
+            assert_eq!(row_chunk_len(64, 64, 0, 8, 0), None);
+            // The work threshold is inclusive: 32 x 1024 x 3584 is exactly min_work.
+            assert_eq!(row_chunk_len(32, 1024, 3584, 8, min), Some(16));
+            assert_eq!(row_chunk_len(32, 1024, 3583, 8, min), None);
+            // Prefill shape: ceil(64 / 8) = 8 is raised to the 16-row floor.
+            assert_eq!(row_chunk_len(64, 1024, 3584, 8, min), Some(16));
+            // ceil(m / threads) that is not a multiple of TILE_I is rounded up.
+            assert_eq!(row_chunk_len(100, 64, 8, 3, 0), Some(36));
+            assert_eq!(row_chunk_len(200, 64, 8, 4, 0), Some(52));
+            assert_eq!(row_chunk_len(512, 1024, 3584, 8, min), Some(64));
+        }
+
+        #[test]
+        fn row_chunk_len_is_tile_aligned_and_leaves_several_chunks() {
+            for m in 32..400usize {
+                for threads in 2..=16usize {
+                    if let Some(rows) = row_chunk_len(m, 64, 8, threads, 0) {
+                        assert_eq!(rows % crate::forward::cpu::tiled::TILE_I, 0);
+                        assert!(rows >= 16, "m={m} threads={threads}: rows={rows}");
+                        assert!(rows < m, "m={m} threads={threads}: rows={rows}");
+                        assert!(
+                            m.div_ceil(rows) <= threads,
+                            "m={m} threads={threads}: rows={rows}"
+                        );
+                    } else {
+                        panic!("m={m} threads={threads}: expected a split");
+                    }
+                }
+            }
+        }
+
+        /// k below and at/above TILE_K, with m values that leave 0..3 remainder rows and
+        /// a short last chunk.
+        #[test]
+        fn threaded_matches_serial_bit_for_bit() {
+            for m in [32usize, 33, 37, 64, 130] {
+                for k in [64usize, 256] {
+                    for n in [8usize, 37] {
+                        assert_bit_identical(m, k, n);
+                    }
+                }
+            }
+        }
+
+        /// Shapes at which the tiled kernel is selected for the whole product, so the
+        /// chunks really run it.
+        #[test]
+        fn threaded_matches_serial_bit_for_bit_when_tiled_kernel_applies() {
+            for (m, k, n) in [
+                (33usize, 512usize, 64usize),
+                (36, 256, 128),
+                (37, 256, 128),
+                (64, 256, 64),
+                (130, 256, 37),
+            ] {
+                assert!(tiled_applies(m, k, n), "m={m} k={k} n={n}");
+                assert_bit_identical(m, k, n);
+            }
+        }
+
+        /// The last chunk is 4 rows, below the tiled work gate on its own while the whole
+        /// product is above it: those 4 rows must still take the tiled kernel.
+        #[test]
+        fn short_last_chunk_keeps_the_whole_products_kernel_choice() {
+            let (m, k, n) = (36usize, 256usize, 128usize);
+            let rows = row_chunk_len(m, k, n, 4, 0).expect("split");
+            let last = m - (m.div_ceil(rows) - 1) * rows;
+            assert_eq!((rows, last), (16, 4));
+            assert!(tiled_applies(m, k, n));
+            assert!(!tiled_applies(last, k, n));
+            assert_bit_identical(m, k, n);
+        }
+
+        /// The dispatcher itself, not just the predicate, stays serial below the work
+        /// threshold and on a single-thread pool.
+        #[test]
+        fn dispatcher_runs_serially_unless_the_split_applies() {
+            let (m, k, n) = (64usize, 256usize, 64usize);
+            let a = lcg_vec(m * k, 0x2E55);
+            let b = lcg_vec(n * k, 0x2F66);
+            let want = serial(&a, &b, m, k, n);
+
+            let (got, used) = threaded(&a, &b, m, k, n, ROW_THREAD_MIN_WORK);
+            assert_eq!(used, None, "below the work threshold");
+            assert_eq!(bits(&got), bits(&want));
+
+            let (got, used) = threaded(&a, &b, m, k, n, 0);
+            assert_eq!(used, Some(16), "split forced by min_work 0");
+            assert_eq!(bits(&got), bits(&want));
+
+            let (got, used) = in_pool(1, || {
+                let mut c = vec![0.0f32; m * n];
+                let used = matmul_bt_x86(&a, &b, &mut c, m, k, n, 0);
+                (c, used)
+            });
+            assert_eq!(used, None, "one thread");
+            assert_eq!(bits(&got), bits(&want));
+        }
+
+        #[test]
+        fn threaded_matches_scalar_reference() {
+            let (m, k, n) = (130usize, 256usize, 37usize);
+            let a = lcg_vec(m * k, 0x2C33);
+            let b = lcg_vec(n * k, 0x2D44);
+            let (got, used) = threaded(&a, &b, m, k, n, 0);
+            assert!(used.is_some());
+            let mut want = vec![0.0f32; m * n];
+            matmul_bt_scalar(&a, &b, &mut want, m, k, n);
+            for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!((g - w).abs() < 1e-4, "idx={idx}: got {g}, want {w}");
             }
         }
     }
