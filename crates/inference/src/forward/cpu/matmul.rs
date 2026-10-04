@@ -59,8 +59,10 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
     // Release-active, overflow-first, oversized-scratch-allowed contract (#368, ADR-080 C4).
     // Note: B is stored transposed, so its footprint is n*k, not k*n. Some callers pass
     // reused scratch buffers longer than the exact footprint; that is sound (the check is
-    // `>=`). The output suffix beyond m*n is NOT part of the result and is unspecified
-    // by contract; the non-macOS dispatch below writes only c[..m*n].
+    // `>=`). The output suffix beyond m*n is NOT part of the result and is unspecified by
+    // contract: on x86_64 the dispatch below writes only c[..m*n], while on the other
+    // non-macOS targets matmul_bt_tiled zeroes the full c slice it is given, so callers
+    // needing suffix preservation there must pass &mut c[..m*n].
     validate_gemm_bt(a.len(), b.len(), c.len(), m, k, n, "matmul_bt");
 
     // CPU path only — Accelerate AMX on macOS, SIMD/scalar elsewhere.
@@ -69,8 +71,8 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
         accelerate_matmul_bt(a, b, c, m, n, k);
     }
 
-    // Non-macOS fallback: hand-written SIMD with tiling for large matrices.
-    #[cfg(not(target_os = "macos"))]
+    // x86_64 fallback: hand-written SIMD with tiling for large matrices.
+    #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
     {
         // Use cache-blocked (tiled) path for large matrices where blocking pays off.
         // Two conditions must be met:
@@ -79,11 +81,16 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
         //      in L1 cache naturally). When K is small (e.g. 32), each B-row is only
         //      128 bytes and fits in L1 without tiling. Tiling would only change the
         //      accumulation order and introduce unnecessary numerical differences.
-        // The tiled kernels run SIMD only on full TILE_I-row tiles and handle every
-        // other row with a scalar loop, so the tiled path takes only the largest
-        // multiple of TILE_I rows. The remaining rows (all of them when m < TILE_I, as
-        // in every decode step) go through the direct SIMD kernels below. The tiled
-        // call gets exactly c[..full * n] because it zeroes the whole slice it is given.
+        // The tiled AVX2 kernel computes a full TILE_I x TILE_J tile with SIMD only when
+        // its K-tile has at least 16 elements; every other tile, including every partial
+        // TILE_I row tile, runs a scalar loop (the whole tiled call is scalar when
+        // AVX2+FMA is not detected). So the tiled path takes only the largest
+        // multiple of TILE_I rows, and the remaining rows (all of them when m < TILE_I,
+        // as in every decode step) go through the direct kernels below: AVX-512F, then
+        // AVX2, then the scalar reference when no SIMD feature is detected. Partial
+        // TILE_J column tiles and short K tiles inside the tiled part are still scalar.
+        // The tiled call gets exactly c[..full * n] because it zeroes the whole slice it
+        // is given.
         let total_work = (m as u64) * (n as u64) * (k as u64);
         let full = if total_work >= 1024 * 1024 && k >= super::tiled::TILE_K {
             m - m % super::tiled::TILE_I
@@ -104,40 +111,62 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
             );
         }
     }
+
+    // Other non-macOS targets: hand-written SIMD with tiling for large matrices.
+    #[cfg(all(not(target_os = "macos"), not(target_arch = "x86_64")))]
+    {
+        // Use cache-blocked (tiled) path for large matrices where blocking pays off.
+        // Two conditions must be met:
+        //   1. Total work > 1M elements (below this, overhead dominates).
+        //   2. K >= 128 (the shared dimension must be large enough that B-rows don't fit
+        //      in L1 cache naturally). When K is small (e.g. 32), each B-row is only
+        //      128 bytes and fits in L1 without tiling. Tiling would only change the
+        //      accumulation order and introduce unnecessary numerical differences.
+        // All m rows go to the tiled kernel without a row split: on aarch64 its NEON edge
+        // branch vectorises partial TILE_I row tiles along K, so small m is not forced
+        // scalar there.
+        let total_work = (m as u64) * (n as u64) * (k as u64);
+        if total_work >= 1024 * 1024 && k >= super::tiled::TILE_K {
+            matmul_bt_tiled(a, b, c, m, k, n);
+            return;
+        }
+
+        let config = simd_config();
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if config.neon_enabled {
+                // SAFETY: NEON is available on aarch64 and the runtime gate ensures this path.
+                unsafe {
+                    matmul_neon(a, b, c, m, k, n);
+                    return;
+                }
+            }
+        }
+
+        matmul_bt_scalar(a, b, c, m, k, n);
+    }
 }
 
-/// Direct (untiled) transposed-B matmul: the widest SIMD kernel the CPU supports,
-/// else the scalar reference. Each output element depends only on its own A row and B row.
-#[cfg(not(target_os = "macos"))]
+/// Direct (untiled) transposed-B matmul on x86_64: the widest SIMD kernel the CPU
+/// supports, else the scalar reference. Each output element depends only on its own
+/// A row and B row.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
 fn matmul_bt_direct(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     let config = simd_config();
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        if config.avx512f_enabled && config.fma_enabled {
-            // SAFETY: The runtime feature checks above guarantee AVX-512F+FMA support.
-            unsafe {
-                matmul_avx512(a, b, c, m, k, n);
-                return;
-            }
-        }
-        if config.avx2_enabled && config.fma_enabled {
-            // SAFETY: The runtime feature checks above guarantee AVX2+FMA support.
-            unsafe {
-                matmul_avx2(a, b, c, m, k, n);
-                return;
-            }
+    if config.avx512f_enabled && config.fma_enabled {
+        // SAFETY: The runtime feature checks above guarantee AVX-512F+FMA support.
+        unsafe {
+            matmul_avx512(a, b, c, m, k, n);
+            return;
         }
     }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if config.neon_enabled {
-            // SAFETY: NEON is available on aarch64 and the runtime gate ensures this path.
-            unsafe {
-                matmul_neon(a, b, c, m, k, n);
-                return;
-            }
+    if config.avx2_enabled && config.fma_enabled {
+        // SAFETY: The runtime feature checks above guarantee AVX2+FMA support.
+        unsafe {
+            matmul_avx2(a, b, c, m, k, n);
+            return;
         }
     }
 
@@ -281,9 +310,9 @@ mod tests {
         // correct values in c[0..m*n]. This test proves the >= bound is correct.
     }
 
-    // --- small-m rows must not run through the tiled kernel's scalar edge loop ---
+    // --- x86_64: small-m rows must not run through the tiled kernel's scalar edge loop ---
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
     mod small_m_dispatch {
         use super::*;
 
