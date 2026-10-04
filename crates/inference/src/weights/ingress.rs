@@ -220,6 +220,11 @@ impl<'a> DecodedTensorValidator<'a> {
         self.reject_non_finite(value as f64)
     }
 
+    pub(crate) fn reject_bf16_bits_at(&self, index: usize, bits: u16) -> InferenceError {
+        let value = crate::weights::half_bits::bf16_bits_to_f32(bits);
+        self.reject_non_finite_at(index, value as f64)
+    }
+
     #[inline(always)]
     pub(crate) fn observe_finite(&mut self) {
         self.seen += 1;

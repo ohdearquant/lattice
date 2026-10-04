@@ -340,6 +340,55 @@ impl SafetensorsFile {
         self.tensors.get(name).map(|m| m.dtype.name())
     }
 
+    fn payload_bytes(&self, meta: &TensorMeta) -> Result<&[u8], InferenceError> {
+        let start = self
+            .data_offset
+            .checked_add(meta.start)
+            .ok_or_else(|| InferenceError::InvalidSafetensors("tensor start overflow".into()))?;
+        let end = self
+            .data_offset
+            .checked_add(meta.end)
+            .ok_or_else(|| InferenceError::InvalidSafetensors("tensor end overflow".into()))?;
+        Ok(&self.data.as_slice()[start..end])
+    }
+
+    /// Raw little-endian payload of a BF16 tensor, read in place from the backing storage.
+    ///
+    /// Nothing is widened or copied, so a table too large to hold as f32 can stay in the
+    /// mapping. A non-finite value is refused with the same error `get_f32_tensor` raises for
+    /// the tensor, and the result is cached like that path's.
+    pub(crate) fn bf16_payload(&self, name: &str) -> Result<&[u8], InferenceError> {
+        let meta = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?;
+        if meta.dtype != DType::BF16 {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "{}: tensor {name} has dtype {}, expected BF16",
+                self.source,
+                meta.dtype.name()
+            )));
+        }
+        let bytes = self.payload_bytes(meta)?;
+        let validation = meta.validated.get_or_init(|| {
+            validate_bf16_payload(self.source.as_str(), name, meta.shape.as_slice(), bytes)
+                .map_err(|e| e.to_string())
+        });
+        match validation {
+            Ok(()) => Ok(bytes),
+            Err(msg) => Err(InferenceError::InvalidSafetensors(msg.clone())),
+        }
+    }
+
+    /// Number of tensors currently holding a cached f32 conversion.
+    #[cfg(test)]
+    pub(crate) fn cached_f32_tensor_count(&self) -> usize {
+        self.tensors
+            .values()
+            .filter(|meta| meta.converted_f32.get().is_some())
+            .count()
+    }
+
     /// **Unstable**: load a named tensor as f32 slice; dtype conversion strategy may change.
     ///
     /// Get a tensor by name as f32 slice.
@@ -349,15 +398,7 @@ impl SafetensorsFile {
             .get(name)
             .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?;
 
-        let start = self
-            .data_offset
-            .checked_add(meta.start)
-            .ok_or_else(|| InferenceError::InvalidSafetensors("tensor start overflow".into()))?;
-        let end = self
-            .data_offset
-            .checked_add(meta.end)
-            .ok_or_else(|| InferenceError::InvalidSafetensors("tensor end overflow".into()))?;
-        let bytes = &self.data.as_slice()[start..end];
+        let bytes = self.payload_bytes(meta)?;
         let source = self.source.as_str();
         let shape = meta.shape.as_slice();
         let dtype_name = meta.dtype.name();
@@ -1034,6 +1075,35 @@ fn copy_bytes_to_f32_owned(bytes: &[u8]) -> Vec<f32> {
     out
 }
 
+fn validate_bf16_payload(
+    source: &str,
+    name: &str,
+    shape: &[usize],
+    bytes: &[u8],
+) -> Result<(), InferenceError> {
+    let validator = crate::weights::ingress::DecodedTensorValidator::safetensors(
+        source,
+        name,
+        shape,
+        DType::BF16.name(),
+        bytes.len() / 2,
+    )?;
+    let bits_at = |chunk: &[u8]| u16::from_le_bytes([chunk[0], chunk[1]]);
+    let has_non_finite = bytes.chunks_exact(2).fold(false, |seen, chunk| {
+        seen | (bits_at(chunk) & 0x7f80 == 0x7f80)
+    });
+    if has_non_finite
+        && let Some((index, bits)) = bytes
+            .chunks_exact(2)
+            .map(bits_at)
+            .enumerate()
+            .find(|(_, bits)| bits & 0x7f80 == 0x7f80)
+    {
+        return Err(validator.reject_bf16_bits_at(index, bits));
+    }
+    Ok(())
+}
+
 fn convert_f16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     debug_assert_eq!(bytes.len() % 2, 0);
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -1284,8 +1354,19 @@ impl TensorSource for SafetensorsFile {
         &mut self,
         name: &str,
     ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
-        let (data, shape) = self.get_f32_tensor(name)?;
-        Ok((data.to_vec(), shape.to_vec()))
+        let shape = self.get_f32_tensor(name)?.1.to_vec();
+        let meta = self
+            .tensors
+            .get_mut(name)
+            .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?;
+        // Handing the cached conversion over instead of cloning it keeps one f32 copy
+        // of the tensor alive during a load, not two. Only the zero-copy aligned F32
+        // view has nothing cached; that case still needs the copy.
+        if let Some(converted) = meta.converted_f32.take() {
+            return Ok((converted.into_vec(), shape));
+        }
+        let (data, _) = self.get_f32_tensor(name)?;
+        Ok((data.to_vec(), shape))
     }
 }
 
@@ -1546,13 +1627,13 @@ impl ShardedSafetensors {
             .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
     }
 
-    fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
+    fn open_shard(&mut self, shard_file: &str) -> Result<&mut SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
             let (file, real_path) = open_manifest_entry_once(&self.root, shard_file)?;
             let shard = SafetensorsFile::from_open_file(file, &real_path)?;
             self.shards.insert(shard_file.to_string(), shard);
         }
-        self.shards.get(shard_file).ok_or_else(|| {
+        self.shards.get_mut(shard_file).ok_or_else(|| {
             InferenceError::InvalidSafetensors(format!("failed to cache shard {shard_file}"))
         })
     }
@@ -1565,7 +1646,8 @@ impl TensorSource for ShardedSafetensors {
 
     fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
         let shard_file = self.shard_file_for(name)?;
-        let shard = self.open_shard(&shard_file)?;
+        // Shared reborrow: a `&mut` receiver would resolve `tensor_shape` to this trait's method.
+        let shard: &SafetensorsFile = self.open_shard(&shard_file)?;
         Ok(shard.tensor_shape(name).map(<[usize]>::to_vec))
     }
 
@@ -1575,8 +1657,7 @@ impl TensorSource for ShardedSafetensors {
     ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
         let shard_file = self.shard_file_for(name)?;
         let shard = self.open_shard(&shard_file)?;
-        let (data, shape) = shard.get_f32_tensor(name)?;
-        Ok((data.to_vec(), shape.to_vec()))
+        shard.get_f32_tensor_owned(name)
     }
 }
 
@@ -3283,6 +3364,380 @@ mod tests {
         // Second access must not panic or error — it should skip re-scanning.
         sf.get_f32_tensor("t")
             .expect("second access reuses cached validation");
+    }
+
+    fn half_bits_fixture(len: usize, seed: u32, exponent_mask: u16) -> Vec<u16> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let mut bits = (state >> 16) as u16;
+                if bits & exponent_mask == exponent_mask {
+                    bits ^= exponent_mask & exponent_mask.wrapping_neg();
+                }
+                bits
+            })
+            .collect()
+    }
+
+    fn f32_fixture(len: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let mut bits = state;
+                if bits & 0x7F80_0000 == 0x7F80_0000 {
+                    bits ^= 0x0080_0000;
+                }
+                f32::from_bits(bits)
+            })
+            .collect()
+    }
+
+    fn le_bytes_of_u16(bits: &[u16]) -> Vec<u8> {
+        bits.iter().flat_map(|b| b.to_le_bytes()).collect()
+    }
+
+    fn bit_patterns(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Writes a one-tensor file whose payload starts `payload_phase` bytes past a
+    /// 4-byte boundary of the file start. The space-padded header is what moves the
+    /// payload, so the same fixture can build both the aligned and the misaligned
+    /// F32 arm on a page-aligned mapping.
+    fn write_tensor_with_payload_phase(
+        path: &std::path::Path,
+        dtype: &str,
+        len: usize,
+        raw: &[u8],
+        payload_phase: usize,
+    ) {
+        let base = format!(
+            r#"{{"t":{{"dtype":"{dtype}","shape":[{len}],"data_offsets":[0,{}]}}}}"#,
+            raw.len()
+        );
+        let pad = (payload_phase + 4 - (8 + base.len()) % 4) % 4;
+        let header = format!("{base}{}", " ".repeat(pad));
+        write_raw_safetensors(path, &header, raw);
+    }
+
+    fn converted_is_cached(file: &SafetensorsFile, name: &str) -> bool {
+        file.tensors
+            .get(name)
+            .expect("tensor tracked")
+            .converted_f32
+            .get()
+            .is_some()
+    }
+
+    /// `(label, dtype, element count, payload bytes, payload phase)`.
+    fn owned_read_cases() -> Vec<(&'static str, &'static str, usize, Vec<u8>, usize)> {
+        let bf16 = half_bits_fixture(96, 11, 0x7F80);
+        let f16 = half_bits_fixture(96, 23, 0x7C00);
+        let f32_values = f32_fixture(96, 37);
+        let f32_bytes: Vec<u8> = f32_values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        vec![
+            ("bf16", "BF16", bf16.len(), le_bytes_of_u16(&bf16), 0),
+            ("f16", "F16", f16.len(), le_bytes_of_u16(&f16), 0),
+            ("f32_aligned", "F32", f32_values.len(), f32_bytes.clone(), 0),
+            ("f32_misaligned", "F32", f32_values.len(), f32_bytes, 2),
+        ]
+    }
+
+    #[test]
+    fn owned_read_hands_over_the_cached_conversion_instead_of_cloning_it() {
+        let path = temp_path("lattice_weights_owned_take_bf16");
+        let bits = half_bits_fixture(64, 7, 0x7F80);
+        write_tensor_with_payload_phase(&path, "BF16", bits.len(), &le_bytes_of_u16(&bits), 0);
+        let expected: Vec<f32> = bits
+            .iter()
+            .map(|&b| crate::weights::half_bits::bf16_bits_to_f32(b))
+            .collect();
+
+        let mut owned_only = SafetensorsFile::open(&path).expect("open: valid file");
+        let (values, shape) = owned_only
+            .get_f32_tensor_owned("t")
+            .expect("owned read of a finite BF16 tensor");
+        assert_eq!(shape, vec![bits.len()]);
+        assert_eq!(bit_patterns(&values), bit_patterns(&expected));
+        assert!(
+            !converted_is_cached(&owned_only, "t"),
+            "an owned read must not leave a second f32 copy alive in the source"
+        );
+
+        let mut after_borrow = SafetensorsFile::open(&path).expect("open: valid file");
+        let cached_ptr = after_borrow
+            .get_f32_tensor("t")
+            .expect("borrowed read populates the cache")
+            .0
+            .as_ptr();
+        assert!(converted_is_cached(&after_borrow, "t"));
+        let (values, _) = after_borrow
+            .get_f32_tensor_owned("t")
+            .expect("owned read after a borrowed read");
+        assert_eq!(
+            values.as_ptr(),
+            cached_ptr,
+            "the owned vector must be the cached allocation, not a clone of it"
+        );
+        assert!(!converted_is_cached(&after_borrow, "t"));
+    }
+
+    #[test]
+    fn owned_read_matches_borrowed_read_bit_for_bit() {
+        for (label, dtype, len, raw, phase) in owned_read_cases() {
+            let path = temp_path(&format!("lattice_weights_owned_vs_borrowed_{label}"));
+            write_tensor_with_payload_phase(&path, dtype, len, &raw, phase);
+
+            let borrowed_file = SafetensorsFile::open(&path).expect("open: valid file");
+            let (borrowed, borrowed_shape) = borrowed_file
+                .get_f32_tensor("t")
+                .expect("borrowed read of a finite tensor");
+
+            let mut owned_file = SafetensorsFile::open(&path).expect("open: valid file");
+            let payload = &owned_file.data.as_slice()[owned_file.data_offset..];
+            let payload_is_aligned =
+                payload.as_ptr().align_offset(std::mem::align_of::<f32>()) == 0;
+            assert_eq!(
+                payload_is_aligned,
+                phase == 0,
+                "{label}: the fixture must produce the payload alignment it names"
+            );
+            let zero_copy_view =
+                cfg!(target_endian = "little") && dtype == "F32" && payload_is_aligned;
+            assert_eq!(
+                converted_is_cached(&borrowed_file, "t"),
+                !zero_copy_view,
+                "{label}: only the aligned F32 view is served without a cached conversion"
+            );
+
+            let (owned, owned_shape) = owned_file
+                .get_f32_tensor_owned("t")
+                .expect("owned read of a finite tensor");
+            assert_eq!(owned.len(), len, "{label}");
+            assert_eq!(owned_shape.as_slice(), borrowed_shape, "{label}");
+            assert_eq!(
+                bit_patterns(&owned),
+                bit_patterns(borrowed),
+                "{label}: owned and borrowed values must agree bit for bit"
+            );
+            assert!(
+                !converted_is_cached(&owned_file, "t"),
+                "{label}: no cached conversion may outlive an owned read"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_read_of_non_finite_bf16_is_refused_like_the_borrowed_read() {
+        let cases = [("nan", 0x7FC0u16), ("pos_inf", 0x7F80), ("neg_inf", 0xFF80)];
+        for (label, bad_bits) in cases {
+            let path = temp_path(&format!("lattice_weights_owned_non_finite_{label}"));
+            let raw = le_bytes_of_u16(&[0x3F80, bad_bits]);
+            write_raw_tensor(&path, "t", "BF16", &[2], &raw);
+
+            let borrowed_file = SafetensorsFile::open(&path).expect("open: valid file");
+            let borrowed_err = borrowed_file
+                .get_f32_tensor("t")
+                .expect_err("non-finite BF16 must be refused on the borrowed path");
+
+            let mut owned_file = SafetensorsFile::open(&path).expect("open: valid file");
+            let owned_err = owned_file
+                .get_f32_tensor_owned("t")
+                .expect_err("non-finite BF16 must be refused on the owned path");
+            assert!(
+                matches!(owned_err, InferenceError::InvalidSafetensors(_)),
+                "{label}: unexpected error class: {owned_err:?}"
+            );
+            assert!(matches!(
+                borrowed_err,
+                InferenceError::InvalidSafetensors(_)
+            ));
+            assert_eq!(owned_err.to_string(), borrowed_err.to_string(), "{label}");
+            assert!(
+                owned_err.to_string().contains("non-finite")
+                    && owned_err.to_string().contains("element index 1"),
+                "{label}: unexpected error: {owned_err}"
+            );
+
+            let retry_err = owned_file
+                .get_f32_tensor_owned("t")
+                .expect_err("a refused tensor stays refused on a second owned read");
+            assert_eq!(retry_err.to_string(), borrowed_err.to_string(), "{label}");
+            let borrowed_retry = owned_file
+                .get_f32_tensor("t")
+                .expect_err("a refused tensor stays refused on a later borrowed read");
+            assert_eq!(
+                borrowed_retry.to_string(),
+                borrowed_err.to_string(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_read_after_owned_read_returns_the_same_values_and_keeps_validation() {
+        for (label, dtype, len, raw, phase) in owned_read_cases() {
+            let path = temp_path(&format!("lattice_weights_borrowed_after_owned_{label}"));
+            write_tensor_with_payload_phase(&path, dtype, len, &raw, phase);
+
+            let mut file = SafetensorsFile::open(&path).expect("open: valid file");
+            let (owned, owned_shape) = file
+                .get_f32_tensor_owned("t")
+                .expect("owned read of a finite tensor");
+            assert!(
+                file.tensors
+                    .get("t")
+                    .expect("tensor tracked")
+                    .validated
+                    .get()
+                    .is_some_and(Result::is_ok),
+                "{label}: the owned read must leave a passing validation result behind"
+            );
+
+            let (borrowed, borrowed_shape) = file
+                .get_f32_tensor("t")
+                .expect("borrowed read after an owned read");
+            assert_eq!(borrowed_shape, owned_shape.as_slice(), "{label}");
+            assert_eq!(
+                bit_patterns(borrowed),
+                bit_patterns(&owned),
+                "{label}: a borrowed read after an owned read must see the same values"
+            );
+        }
+    }
+
+    #[test]
+    fn sharded_owned_read_hands_over_the_shard_cache_and_keeps_the_refusal() {
+        let dir = temp_dir("lattice_sharded_owned_take_test");
+        let good_bits = half_bits_fixture(32, 5, 0x7F80);
+        write_raw_tensor(
+            &dir.join("good.safetensors"),
+            "tensor.good",
+            "BF16",
+            &[good_bits.len()],
+            &le_bytes_of_u16(&good_bits),
+        );
+        write_raw_tensor(
+            &dir.join("bad.safetensors"),
+            "tensor.bad",
+            "BF16",
+            &[2],
+            &le_bytes_of_u16(&[0x3F80, 0x7FC0]),
+        );
+        let index_path = dir.join("model.safetensors.index.json");
+        fs::write(
+            &index_path,
+            r#"{"weight_map": {"tensor.good": "good.safetensors", "tensor.bad": "bad.safetensors"}}"#,
+        )
+        .expect("test setup: write index");
+
+        let mut st = ShardedSafetensors::open_index(&index_path).expect("index parses");
+        let (values, shape) = st
+            .get_f32_tensor_owned("tensor.good")
+            .expect("owned read through the sharded source");
+        assert_eq!(shape, vec![good_bits.len()]);
+        let expected: Vec<f32> = good_bits
+            .iter()
+            .map(|&b| crate::weights::half_bits::bf16_bits_to_f32(b))
+            .collect();
+        assert_eq!(bit_patterns(&values), bit_patterns(&expected));
+        let shard = st.shards.get("good.safetensors").expect("shard is open");
+        assert!(
+            !converted_is_cached(shard, "tensor.good"),
+            "the shard must not keep a second f32 copy after an owned read"
+        );
+
+        let err = st
+            .get_f32_tensor_owned("tensor.bad")
+            .expect_err("non-finite BF16 must be refused through the sharded source");
+        assert!(
+            matches!(err, InferenceError::InvalidSafetensors(_))
+                && err.to_string().contains("non-finite"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bf16_payload_reads_bytes_in_place_without_widening() {
+        let path = temp_path("lattice_weights_bf16_payload_bytes");
+        let bits = half_bits_fixture(33, 3, 0x7F80);
+        let raw = le_bytes_of_u16(&bits);
+        write_tensor_with_payload_phase(&path, "BF16", bits.len(), &raw, 2);
+
+        let sf = SafetensorsFile::open(&path).expect("open: valid file");
+        assert_eq!(
+            sf.bf16_payload("t").expect("finite BF16 payload"),
+            raw.as_slice()
+        );
+        assert_eq!(
+            sf.cached_f32_tensor_count(),
+            0,
+            "reading the payload in place must not materialize an f32 copy"
+        );
+        assert!(matches!(
+            sf.bf16_payload("absent"),
+            Err(InferenceError::MissingTensor(_))
+        ));
+    }
+
+    #[test]
+    fn bf16_payload_refuses_non_finite_values_like_the_widening_path() {
+        let cases = [
+            ("nan_first", 0usize, 0x7FC0u16),
+            ("pos_inf_tail", 32, 0x7F80),
+            ("neg_inf_middle", 17, 0xFF80),
+        ];
+        for (label, index, bad_bits) in cases {
+            let path = temp_path(&format!("lattice_weights_bf16_payload_{label}"));
+            let mut bits = half_bits_fixture(33, 9, 0x7F80);
+            bits[index] = bad_bits;
+            write_raw_tensor(&path, "t", "BF16", &[bits.len()], &le_bytes_of_u16(&bits));
+
+            let payload_err = SafetensorsFile::open(&path)
+                .expect("open: valid file")
+                .bf16_payload("t")
+                .expect_err("a non-finite BF16 payload must be refused");
+            let widening_err = SafetensorsFile::open(&path)
+                .expect("open: valid file")
+                .get_f32_tensor("t")
+                .expect_err("the widening path refuses the same tensor");
+            assert!(
+                matches!(payload_err, InferenceError::InvalidSafetensors(_)),
+                "{label}: unexpected error class: {payload_err:?}"
+            );
+            assert!(
+                payload_err
+                    .to_string()
+                    .contains(&format!("element index {index}")),
+                "{label}: unexpected error: {payload_err}"
+            );
+            assert_eq!(payload_err.to_string(), widening_err.to_string(), "{label}");
+
+            let sf = SafetensorsFile::open(&path).expect("open: valid file");
+            let first = sf.bf16_payload("t").expect_err("refused on first read");
+            let again = sf
+                .bf16_payload("t")
+                .expect_err("a cached result keeps refusing");
+            assert_eq!(first.to_string(), again.to_string(), "{label}");
+        }
+    }
+
+    #[test]
+    fn bf16_payload_refuses_a_tensor_of_another_dtype() {
+        let path = temp_path("lattice_weights_bf16_payload_dtype");
+        write_single_f32_tensor(&path, "t", &[1.0, 2.0]);
+        let sf = SafetensorsFile::open(&path).expect("open: valid file");
+        let err = sf
+            .bf16_payload("t")
+            .expect_err("an F32 tensor is not a BF16 payload");
+        assert!(
+            matches!(err, InferenceError::InvalidSafetensors(_))
+                && err.to_string().contains("F32")
+                && err.to_string().contains("expected BF16"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

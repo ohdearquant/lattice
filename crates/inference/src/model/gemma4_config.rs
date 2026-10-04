@@ -265,7 +265,7 @@ struct HfGemma4TextConfig {
     expert_intermediate_size: Option<serde_json::Value>,
     /// Per-layer-embedding vocabulary size (ADR-090 Gemma admission, issue
     /// #1598 R04a): row count of the checkpoint's
-    /// `embed_tokens_per_layer` table. `gemma4_loading::load_weights`
+    /// `embed_tokens_per_layer` table. `gemma4_loading::load_per_layer_embeddings`
     /// derives that tensor's expected shape as `[vocab_size,
     /// num_hidden_layers * hidden_size_per_layer_input]` -- it assumes
     /// this field equals `vocab_size` and never reads it at all. The

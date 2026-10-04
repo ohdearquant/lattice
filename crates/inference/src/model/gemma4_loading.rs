@@ -12,9 +12,9 @@
 //! `qwen35::loading::load_weights`.
 
 use super::gemma4_config::{GEMMA4_EXPECTED_DTYPE, Gemma4Config};
-use super::gemma4_weights::{Gemma4LayerWeights, Gemma4Weights};
+use super::gemma4_weights::{Gemma4LayerWeights, Gemma4Weights, PerLayerEmbeddings};
 use crate::error::InferenceError;
-use crate::weights::TensorSource;
+use crate::weights::{SafetensorsFile, TensorSource};
 
 const LM_PREFIX: &str = "model.language_model.";
 
@@ -77,6 +77,9 @@ fn load_scalar<T: TensorSource + ?Sized>(
     Ok(data[0])
 }
 
+/// Copies to f32 the tensors the model reads, except `embed_tokens_per_layer`, which stays in
+/// the checkpoint mapping ([`load_per_layer_embeddings`]). KV-shared layers load no K/V
+/// projections or K norm.
 pub(super) fn load_weights<T: TensorSource + ?Sized>(
     source: &mut T,
     cfg: &Gemma4Config,
@@ -89,11 +92,6 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
         source,
         &format!("{LM_PREFIX}embed_tokens.weight"),
         &[cfg.vocab_size, hidden],
-    )?;
-    let embed_tokens_per_layer = load_tensor(
-        source,
-        &format!("{LM_PREFIX}embed_tokens_per_layer.weight"),
-        &[cfg.vocab_size, ple_packed_dim],
     )?;
     let norm = load_tensor(source, &format!("{LM_PREFIX}norm.weight"), &[hidden])?;
     let per_layer_model_projection = load_tensor(
@@ -229,7 +227,6 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
 
     Ok(Gemma4Weights {
         embed_tokens,
-        embed_tokens_per_layer,
         norm,
         per_layer_model_projection,
         per_layer_projection_norm,
@@ -237,9 +234,29 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
     })
 }
 
+/// Loads `embed_tokens_per_layer` as a view into the checkpoint file instead of an f32 copy.
+///
+/// Call after [`load_weights`] on the same file: `source` is consumed so the returned table
+/// can keep its mapping alive, and the dtype and shape contracts are the ones
+/// [`load_tensor`] enforces on every other tensor.
+pub(super) fn load_per_layer_embeddings(
+    mut source: SafetensorsFile,
+    cfg: &Gemma4Config,
+) -> Result<PerLayerEmbeddings, InferenceError> {
+    let name = format!("{LM_PREFIX}embed_tokens_per_layer.weight");
+    check_dtype(&mut source, &name)?;
+    PerLayerEmbeddings::new(
+        source,
+        name,
+        cfg.vocab_size,
+        cfg.num_hidden_layers * cfg.hidden_size_per_layer_input,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::gemma4_config::Gemma4LayerType;
+    use super::super::gemma4_weights::synthetic_safetensors_bytes;
     use super::*;
     use std::collections::HashMap;
 
@@ -511,6 +528,256 @@ mod tests {
         assert!(
             msg.contains(GEMMA4_EXPECTED_DTYPE),
             "error must name the expected dtype: {msg}"
+        );
+    }
+
+    fn per_layer_table_name() -> String {
+        format!("{LM_PREFIX}embed_tokens_per_layer.weight")
+    }
+
+    fn bf16_bytes(bits: &[u16]) -> Vec<u8> {
+        bits.iter().flat_map(|b| b.to_le_bytes()).collect()
+    }
+
+    fn finite_bf16_bits(len: usize, seed: u32) -> Vec<u16> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let bits = (state >> 16) as u16;
+                if bits & 0x7f80 == 0x7f80 {
+                    bits ^ 0x0080
+                } else {
+                    bits
+                }
+            })
+            .collect()
+    }
+
+    fn per_layer_table_file(dtype: &str, shape: &[usize], payload: &[u8]) -> SafetensorsFile {
+        let name = per_layer_table_name();
+        SafetensorsFile::from_bytes(synthetic_safetensors_bytes(&[(
+            name.as_str(),
+            dtype,
+            shape,
+            payload,
+        )]))
+        .expect("synthetic per-layer table is a valid safetensors buffer")
+    }
+
+    fn packed_dim(cfg: &Gemma4Config) -> usize {
+        cfg.num_hidden_layers * cfg.hidden_size_per_layer_input
+    }
+
+    #[test]
+    fn per_layer_table_is_read_in_place_from_the_checkpoint_file() {
+        let cfg = tiny_config();
+        let packed = packed_dim(&cfg);
+        let bits = finite_bf16_bits(cfg.vocab_size * packed, 17);
+        let file = per_layer_table_file("BF16", &[cfg.vocab_size, packed], &bf16_bytes(&bits));
+
+        let Ok(table) = load_per_layer_embeddings(file, &cfg) else {
+            panic!("a well-formed BF16 table must load");
+        };
+        assert_eq!(
+            table.cached_f32_tensor_count(),
+            0,
+            "loading the table must not widen it to f32"
+        );
+        for row in 0..cfg.vocab_size {
+            let got = table.scaled_row(row, 1.0).expect("row is in range");
+            let want: Vec<f32> = bits[row * packed..(row + 1) * packed]
+                .iter()
+                .map(|&b| crate::weights::half_bits::bf16_bits_to_f32(b))
+                .collect();
+            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            let want_bits: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got_bits, want_bits, "row {row}");
+        }
+        assert!(
+            table.scaled_row(cfg.vocab_size, 1.0).is_err(),
+            "a row past the vocabulary must be refused, not read out of bounds"
+        );
+        assert_eq!(
+            table.cached_f32_tensor_count(),
+            0,
+            "reading rows must widen only those rows, never cache the whole table as f32"
+        );
+    }
+
+    #[test]
+    fn full_checkpoint_load_leaves_no_f32_copy_in_the_file_the_model_keeps() {
+        let cfg = tiny_config();
+        let packed = packed_dim(&cfg);
+        let table_bits = finite_bf16_bits(cfg.vocab_size * packed, 29);
+        let table_name = per_layer_table_name();
+        let bodies: Vec<(String, Vec<usize>, Vec<u8>)> = full_tensor_set(&cfg)
+            .into_iter()
+            .map(|(name, (data, shape, _))| {
+                let bytes = if name == table_name {
+                    bf16_bytes(&table_bits)
+                } else {
+                    bf16_bytes(&vec![0u16; data.len()])
+                };
+                (name, shape, bytes)
+            })
+            .collect();
+        let entries: Vec<(&str, &str, &[usize], &[u8])> = bodies
+            .iter()
+            .map(|(name, shape, bytes)| {
+                (
+                    name.as_str(),
+                    GEMMA4_EXPECTED_DTYPE,
+                    shape.as_slice(),
+                    bytes.as_slice(),
+                )
+            })
+            .collect();
+        let mut file = SafetensorsFile::from_bytes(synthetic_safetensors_bytes(&entries))
+            .expect("synthetic checkpoint is a valid safetensors buffer");
+
+        load_weights(&mut file, &cfg).expect("an all-BF16 checkpoint must load");
+        assert_eq!(
+            file.cached_f32_tensor_count(),
+            0,
+            "the loader must take each converted tensor, leaving no second f32 copy in the file"
+        );
+
+        let Ok(table) = load_per_layer_embeddings(file, &cfg) else {
+            panic!("the table must load from the same file");
+        };
+        let row = cfg.vocab_size - 1;
+        let got = table.scaled_row(row, 2.0).expect("row is in range");
+        let want: Vec<f32> = table_bits[row * packed..(row + 1) * packed]
+            .iter()
+            .map(|&b| crate::weights::half_bits::bf16_bits_to_f32(b) * 2.0)
+            .collect();
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn per_layer_table_with_a_non_finite_value_is_refused_at_load() {
+        let cfg = tiny_config();
+        let packed = packed_dim(&cfg);
+        let len = cfg.vocab_size * packed;
+        let shape = [cfg.vocab_size, packed];
+
+        let control = finite_bf16_bits(len, 5);
+        assert!(
+            load_per_layer_embeddings(
+                per_layer_table_file("BF16", &shape, &bf16_bytes(&control)),
+                &cfg
+            )
+            .is_ok(),
+            "control: the same table without a non-finite value must load"
+        );
+
+        let cases = [
+            ("nan_first", 0usize, 0x7FC0u16),
+            ("pos_inf_last", len - 1, 0x7F80),
+            ("neg_inf_middle", len / 2, 0xFF80),
+        ];
+        for (label, index, bad_bits) in cases {
+            let mut bits = control.clone();
+            bits[index] = bad_bits;
+            let file = per_layer_table_file("BF16", &shape, &bf16_bytes(&bits));
+            let Err(err) = load_per_layer_embeddings(file, &cfg) else {
+                panic!("{label}: a non-finite per-layer table must be refused at load");
+            };
+            let msg = err.to_string();
+            assert!(
+                matches!(err, InferenceError::InvalidSafetensors(_)),
+                "{label}: unexpected error class: {err:?}"
+            );
+            assert!(
+                msg.contains("non-finite")
+                    && msg.contains(&format!("element index {index} "))
+                    && msg.contains(&per_layer_table_name()),
+                "{label}: unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_layer_table_with_the_wrong_shape_is_refused_at_load() {
+        let cfg = tiny_config();
+        let packed = packed_dim(&cfg);
+        let vocab = cfg.vocab_size;
+
+        let control = finite_bf16_bits(vocab * packed, 7);
+        assert!(
+            load_per_layer_embeddings(
+                per_layer_table_file("BF16", &[vocab, packed], &bf16_bytes(&control)),
+                &cfg
+            )
+            .is_ok(),
+            "control: the declared shape must load"
+        );
+
+        // The transposed table has the same byte length as the right one, so only the
+        // shape comparison can refuse it.
+        let cases: [(&str, [usize; 2]); 3] = [
+            ("one_row_short", [vocab - 1, packed]),
+            ("one_column_wide", [vocab, packed + 1]),
+            ("transposed", [packed, vocab]),
+        ];
+        for (label, shape) in cases {
+            let bits = finite_bf16_bits(shape[0] * shape[1], 11);
+            let file = per_layer_table_file("BF16", &shape, &bf16_bytes(&bits));
+            let Err(err) = load_per_layer_embeddings(file, &cfg) else {
+                panic!("{label}: a wrong-shaped per-layer table must be refused at load");
+            };
+            match err {
+                InferenceError::ShapeMismatch {
+                    name,
+                    expected,
+                    actual,
+                } => {
+                    assert_eq!(name, per_layer_table_name(), "{label}");
+                    assert_eq!(expected, vec![vocab, packed], "{label}");
+                    assert_eq!(actual, shape.to_vec(), "{label}");
+                }
+                other => panic!("{label}: expected ShapeMismatch, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn per_layer_table_of_another_dtype_or_missing_is_refused_at_load() {
+        let cfg = tiny_config();
+        let packed = packed_dim(&cfg);
+        let vocab = cfg.vocab_size;
+
+        let f32_payload: Vec<u8> = vec![0u8; vocab * packed * 4];
+        let file = per_layer_table_file("F32", &[vocab, packed], &f32_payload);
+        let Err(err) = load_per_layer_embeddings(file, &cfg) else {
+            panic!("an F32 per-layer table must be refused");
+        };
+        let msg = err.to_string();
+        assert!(
+            matches!(err, InferenceError::Inference(_))
+                && msg.contains(&per_layer_table_name())
+                && msg.contains("F32")
+                && msg.contains(GEMMA4_EXPECTED_DTYPE),
+            "unexpected error: {msg}"
+        );
+
+        let other = SafetensorsFile::from_bytes(synthetic_safetensors_bytes(&[(
+            "unrelated.weight",
+            "BF16",
+            &[1usize][..],
+            &[0u8, 0][..],
+        )]))
+        .expect("synthetic buffer");
+        let Err(err) = load_per_layer_embeddings(other, &cfg) else {
+            panic!("an absent per-layer table must be refused");
+        };
+        assert!(
+            matches!(err, InferenceError::MissingTensor(ref name) if *name == per_layer_table_name()),
+            "unexpected error: {err:?}"
         );
     }
 }
