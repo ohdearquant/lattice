@@ -225,12 +225,13 @@ pub(crate) fn run(
     };
 
     // Advances the driver-owned grammar state on the actually-emitted token, replacing the
-    // removed `DecoderSession::advance_grammar`. `true` (accept, nothing to advance) when no
-    // grammar is set -- the same default that trait method used to return.
-    let grammar_advance = |next_id: u32| -> bool {
+    // removed `DecoderSession::advance_grammar`. `Ok(true)` (accept, nothing to advance) when no
+    // grammar is set -- the same default that trait method used to return. A matcher stack
+    // limit comes back as `Err`, never as a rejection.
+    let grammar_advance = |next_id: u32| -> Result<bool, InferenceError> {
         match (grammar_engine, &grammar_state) {
-            (Some(engine), Some(state)) => engine.advance(&mut state.borrow_mut(), next_id),
-            _ => true,
+            (Some(engine), Some(state)) => Ok(engine.advance(&mut state.borrow_mut(), next_id)?),
+            _ => Ok(true),
         }
     };
 
@@ -360,7 +361,7 @@ pub(crate) fn run(
     // `stopped` argument (see `model::qwen35::generation::grammar_output`), which this
     // mirrors: a rejected candidate at step 0 is `stopped: false` (no completed grammar,
     // nothing to answer with) -- distinct from the exhaustion-before-sampling case above.
-    if !grammar_advance(candidate0.candidate_id) {
+    if !grammar_advance(candidate0.candidate_id)? {
         session.borrow_mut().finish(FinishDisposition::Reusable)?;
         return Ok(DriverResult {
             generated_ids: Vec::new(),

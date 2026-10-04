@@ -14186,7 +14186,7 @@ mod inner {
             };
 
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                && !engine.advance(gs, next_id)
+                && !engine.advance(gs, next_id)?
             {
                 let text = decode_tokens(tokenizer, &generated_ids);
                 self.save_cross_turn_prefix_or_clear(
@@ -14432,9 +14432,9 @@ mod inner {
                     generated_len_before,
                     |next_id| {
                         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                            engine.advance(gs, next_id)
+                            Ok(engine.advance(gs, next_id)?)
                         } else {
-                            true
+                            Ok(true)
                         }
                     },
                     &is_stop,
@@ -14446,7 +14446,7 @@ mod inner {
                     &mut text,
                     &mut throwaway_offsets,
                     |s, next_id| on_token(s, next_id),
-                );
+                )?;
 
                 let (next_id, answer_budget_exhausted) = match outcome {
                     crate::model::qwen35::StepOutcome::GrammarStop => {

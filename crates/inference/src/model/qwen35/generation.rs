@@ -1995,18 +1995,19 @@ mod tests {
     }
 
     #[test]
-    fn shared_prefix_complete_state_stops_when_pda_has_no_continuation() {
+    fn shared_prefix_accepting_state_continues_while_a_longer_alternative_is_live() {
         let model = build_a_first_zero_model();
-        // The current no-rewind PDA commits to the first shared-prefix
-        // alternative after consuming "a", so "aa" is no longer viable from
-        // this accepting state. This pins a no-continuation stop, not a general
+        // After "a" the grammar is complete, but the alternative `"aa"` is
+        // still live, so the accepting state has a continuation and generation
+        // goes on. After "aa" nothing can follow, which is where it stops. This
+        // pins a no-continuation stop, not a general
         // stop-at-first-accepting-state policy.
         let result = model
             .generate("b", &grammar_config("root ::= \"a\" | \"aa\"\n"))
             .expect("the accepting state must terminate without an all-masked error");
 
-        assert_eq!(result.text, "a");
-        assert_eq!(result.token_ids, vec![0]);
+        assert_eq!(result.text, "aa");
+        assert_eq!(result.token_ids, vec![0, 0]);
         assert!(result.stopped);
         assert_eq!(result.stop_reason, Some(StopReason::Grammar));
     }
@@ -3108,20 +3109,22 @@ mod tests {
 
         let mut text = String::new();
         let mut offsets = Vec::new();
-        let outcome = policy.transition(
-            &mut token_logprobs,
-            stale_sample,
-            &logits,
-            0.0,
-            /* generated_len_before */ 1,
-            |_next_id| true,
-            |_next_id| false,
-            |_next_id| {},
-            |_next_id| String::new(),
-            &mut text,
-            &mut offsets,
-            |_delta, _next_id| true,
-        );
+        let outcome = policy
+            .transition(
+                &mut token_logprobs,
+                stale_sample,
+                &logits,
+                0.0,
+                /* generated_len_before */ 1,
+                |_next_id| Ok(true),
+                |_next_id| false,
+                |_next_id| {},
+                |_next_id| String::new(),
+                &mut text,
+                &mut offsets,
+                |_delta, _next_id| true,
+            )
+            .expect("these callbacks cannot fail");
 
         match outcome {
             StepOutcome::Emitted { token_id, .. } => assert_eq!(
@@ -3177,21 +3180,23 @@ mod tests {
 
         let mut text = String::new();
         let mut offsets = Vec::new();
-        let outcome = policy.transition(
-            &mut token_logprobs,
-            stale_sample,
-            &[],
-            0.0,
-            /* generated_len_before */ 1,
-            |_next_id| true,
-            // Only the stale, pre-override sample would trigger EOS here.
-            |next_id| next_id == stale_sample,
-            |_next_id| {},
-            |_next_id| String::new(),
-            &mut text,
-            &mut offsets,
-            |_delta, _next_id| true,
-        );
+        let outcome = policy
+            .transition(
+                &mut token_logprobs,
+                stale_sample,
+                &[],
+                0.0,
+                /* generated_len_before */ 1,
+                |_next_id| Ok(true),
+                // Only the stale, pre-override sample would trigger EOS here.
+                |next_id| next_id == stale_sample,
+                |_next_id| {},
+                |_next_id| String::new(),
+                &mut text,
+                &mut offsets,
+                |_delta, _next_id| true,
+            )
+            .expect("these callbacks cannot fail");
 
         match outcome {
             StepOutcome::Emitted { token_id, .. } => assert_eq!(
@@ -3244,20 +3249,22 @@ mod tests {
         let mut offsets = Vec::new();
         // generated_len_before is far past the budget (1), so the raw
         // budget condition is still trivially satisfied on its own.
-        let outcome = policy.transition(
-            &mut token_logprobs,
-            sampled_id,
-            &[],
-            0.0,
-            /* generated_len_before */ 5,
-            |_next_id| true,
-            |_next_id| false,
-            |_next_id| {},
-            |_next_id| String::new(),
-            &mut text,
-            &mut offsets,
-            |_delta, _next_id| true,
-        );
+        let outcome = policy
+            .transition(
+                &mut token_logprobs,
+                sampled_id,
+                &[],
+                0.0,
+                /* generated_len_before */ 5,
+                |_next_id| Ok(true),
+                |_next_id| false,
+                |_next_id| {},
+                |_next_id| String::new(),
+                &mut text,
+                &mut offsets,
+                |_delta, _next_id| true,
+            )
+            .expect("these callbacks cannot fail");
 
         match outcome {
             StepOutcome::Emitted { token_id, .. } => assert_eq!(
@@ -3346,20 +3353,22 @@ mod tests {
 
         let mut text = String::new();
         let mut offsets = Vec::new();
-        let outcome = policy.transition(
-            &mut token_logprobs,
-            sampled_id,
-            &[],
-            0.0,
-            /* generated_len_before */ 1,
-            |_next_id| true,
-            |_next_id| false,
-            |_next_id| {},
-            |_next_id| String::new(),
-            &mut text,
-            &mut offsets,
-            |_delta, _next_id| true,
-        );
+        let outcome = policy
+            .transition(
+                &mut token_logprobs,
+                sampled_id,
+                &[],
+                0.0,
+                /* generated_len_before */ 1,
+                |_next_id| Ok(true),
+                |_next_id| false,
+                |_next_id| {},
+                |_next_id| String::new(),
+                &mut text,
+                &mut offsets,
+                |_delta, _next_id| true,
+            )
+            .expect("these callbacks cannot fail");
 
         match outcome {
             StepOutcome::Emitted {
@@ -3405,20 +3414,22 @@ mod tests {
 
         let mut text = String::new();
         let mut offsets = Vec::new();
-        let outcome = policy.transition(
-            &mut token_logprobs,
-            sampled_id,
-            &logits,
-            0.0,
-            /* generated_len_before */ 1,
-            |_next_id| true,
-            |_next_id| false,
-            |_next_id| {},
-            |_next_id| String::new(),
-            &mut text,
-            &mut offsets,
-            |_delta, _next_id| true,
-        );
+        let outcome = policy
+            .transition(
+                &mut token_logprobs,
+                sampled_id,
+                &logits,
+                0.0,
+                /* generated_len_before */ 1,
+                |_next_id| Ok(true),
+                |_next_id| false,
+                |_next_id| {},
+                |_next_id| String::new(),
+                &mut text,
+                &mut offsets,
+                |_delta, _next_id| true,
+            )
+            .expect("these callbacks cannot fail");
 
         match outcome {
             StepOutcome::Emitted { token_id, .. } => assert_eq!(

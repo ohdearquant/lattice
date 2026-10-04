@@ -297,7 +297,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
              and its own categorical flags.",
         ];
         let m = multi_prompts.len();
-        let mut cross_request_visits: HashMap<(Vec<StackFrame>, bool), u32> = HashMap::new();
+        let mut cross_request_visits: HashMap<(Vec<Vec<StackFrame>>, bool), u32> = HashMap::new();
         let mut total_steps = 0u64;
         let mut cross_request_hits = 0u64;
 
@@ -326,7 +326,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut state = engine.initial_state();
             let mut new_states_this_run = 0u64;
             for &token_id in &output.token_ids {
-                let key: (Vec<StackFrame>, bool) = (state.stack.clone(), state.complete);
+                let key: (Vec<Vec<StackFrame>>, bool) = (state.stacks.clone(), state.complete);
                 if cross_request_visits.contains_key(&key) {
                     cross_request_hits += 1;
                 } else {
@@ -334,7 +334,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 *cross_request_visits.entry(key).or_insert(0) += 1;
                 total_steps += 1;
-                if !engine.advance(&mut state, token_id) {
+                if !engine.advance(&mut state, token_id)? {
                     break;
                 }
             }
@@ -365,7 +365,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // above with density-counting overhead.
     {
         let mut state = engine.initial_state();
-        let mut visits: HashMap<(Vec<StackFrame>, bool), u32> = HashMap::new();
+        let mut visits: HashMap<(Vec<Vec<StackFrame>>, bool), u32> = HashMap::new();
         let mut steps = 0u64;
         let mut cache_hits = 0u64;
         let mut density_sum = 0f64;
@@ -375,7 +375,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut dummy_logits = vec![0.0f32; vocab_size];
 
         for &token_id in &grammar_token_ids {
-            let key: (Vec<StackFrame>, bool) = (state.stack.clone(), state.complete);
+            let key: (Vec<Vec<StackFrame>>, bool) = (state.stacks.clone(), state.complete);
             let seen_before = visits.contains_key(&key);
             *visits.entry(key).or_insert(0) += 1;
             if seen_before {
@@ -396,7 +396,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             density_max = density_max.max(density);
             steps += 1;
 
-            if !engine.advance(&mut state, token_id) {
+            if !engine.advance(&mut state, token_id)? {
                 break;
             }
         }

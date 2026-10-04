@@ -4369,46 +4369,56 @@ mod tests {
         );
     }
 
-    /// DOCUMENTED LIMITATION (issue #473, Tier 2): a nested `oneOf` is NOT
-    /// flattened, unlike a nested `anyOf`. `oneOf` is exclusive, and a
-    /// no-rewind PDA cannot enforce "exactly one branch matches", so merging
-    /// its branches into the parent's OR-hoist would over-accept any overlap
-    /// (see `anyof_nested_oneof_overlap_no_over_accept`). The conservative,
-    /// provably-safe choice leaves every nested `oneOf` unflattened, so its
-    /// broad string stays shadowed here even in this single-branch,
-    /// non-overlapping case. Matches `origin/main`; over-rejection is safe.
+    /// A nested `oneOf` is NOT flattened into the parent's OR-hoist, unlike a
+    /// nested `anyOf` (`oneOf` is exclusive and exclusivity is not enforced
+    /// at runtime). Its string branch stays reachable anyway: the matcher
+    /// keeps every live alternative, so the hoisted `"abc"` trie and the
+    /// nested string branch both consume the opening quote and `"zzz"`
+    /// follows the string branch. A matcher that committed to the hoisted
+    /// trie at the quote used to reject it.
     ///
-    /// Mutation guard: restoring `oneOf` to `as_pure_nested_union` flips this
-    /// to accept "zzz" and breaks the over-accept guard test below.
+    /// Mutation guard: keeping only the first matching alternative after a
+    /// byte (see `alternatives_sharing_a_first_byte_both_stay_alive` in
+    /// `pda.rs`) rejects "zzz" again.
     #[test]
-    fn anyof_nested_oneof_not_flattened_known_limitation() {
+    fn anyof_nested_oneof_string_branch_stays_reachable() {
         let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"oneOf":[{"type":"string"}]}]}"#);
         assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
         assert!(
-            rejects(&g, b"\"zzz\""),
-            "KNOWN LIMITATION #473: a nested oneOf is deliberately not flattened (XOR unenforceable)"
+            accepts(&g, b"\"zzz\""),
+            "a nested oneOf's string branch must stay reachable next to a sibling const trie"
         );
     }
 
-    /// OVER-ACCEPT GUARD (issue #473) — the reason a nested `oneOf` must not be
-    /// flattened. The inner `oneOf` has TWO overlapping branches: the broad
-    /// `type:string` and `const:"zzz"` both match "zzz", so under JSON Schema
-    /// `oneOf` (exactly one) the inner union FAILS for "zzz" and the parent
-    /// `anyOf` rejects it. Flattening the `oneOf` into the parent's string
-    /// hoist would let the broad string swallow "zzz" and wrongly accept it.
-    /// `origin/main` rejects "zzz"; this must too.
+    /// A nested `oneOf` with TWO overlapping branches follows `anyOf`
+    /// (union) semantics at runtime, exactly as a top-level `oneOf` does:
+    /// `oneOf` is lowered like `anyOf` and only literal overlaps that are
+    /// decidable at compile time are refused (see `check_one_of_exclusivity`).
+    /// The broad `type:string` and `const:"zzz"` both match "zzz", so exactly-one
+    /// semantics would refuse that shared value, but the grammar accepts it.
     ///
-    /// Mutation guard: restoring `oneOf` to `as_pure_nested_union` makes this
-    /// accept "zzz" (a genuine over-acceptance), failing this test.
+    /// Before the matcher kept sibling alternatives alive, "zzz" was rejected
+    /// only as a side effect of the hoisted `"abc"` trie shadowing the whole
+    /// nested branch. That shadowing also rejected "qqq", which matches exactly
+    /// one inner branch and is valid under any reading of `oneOf`. The
+    /// assertions below pin the values the grammar can and cannot reach now.
     #[test]
-    fn anyof_nested_oneof_overlap_no_over_accept() {
+    fn anyof_nested_oneof_overlap_follows_union_semantics() {
         let g = compile_ok(
             r#"{"anyOf":[{"const":"abc"},{"oneOf":[{"type":"string"},{"const":"zzz"}]}]}"#,
         );
         assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
         assert!(
-            rejects(&g, b"\"zzz\""),
-            "issue #473: overlapping nested oneOf must not over-accept the shared value \"zzz\""
+            accepts(&g, b"\"qqq\""),
+            "a string matching exactly one inner branch is valid and must be reachable"
+        );
+        assert!(
+            accepts(&g, b"\"zzz\""),
+            "the shared value follows union semantics: oneOf exclusivity is not enforced at runtime"
+        );
+        assert!(
+            rejects(&g, b"1"),
+            "a number matches no branch and must still be rejected"
         );
     }
 
@@ -4612,19 +4622,18 @@ mod tests {
     /// A nested union with an EXTRA sibling key (`"description"`) is NOT a
     /// PURE nested union, so `flatten_any_of_branches` deliberately leaves it
     /// unflattened (`as_pure_nested_union` only recognizes an object whose
-    /// ONLY key is `anyOf` / `oneOf`). This remains a narrower, documented
-    /// limitation: the nested broad string stays shadowed. Not flattening is
-    /// always safe (it falls through to the pre-existing `other_subs` path),
-    /// so this pins a deliberate scope boundary rather than a bug.
+    /// ONLY key is `anyOf` / `oneOf`). It falls through to the `other_subs`
+    /// path, and the matcher keeps that branch alive next to the hoisted
+    /// const trie, so its broad string is reachable without flattening.
     #[test]
-    fn anyof_nested_anyof_with_sibling_key_stays_unflattened() {
+    fn anyof_nested_anyof_with_sibling_key_stays_reachable_unflattened() {
         let g = compile_ok(
             r#"{"anyOf":[{"const":"abc"},{"anyOf":[{"type":"string"}],"description":"nested"}]}"#,
         );
         assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
         assert!(
-            rejects(&g, b"\"zzz\""),
-            "a nested union with a sibling key is deliberately not flattened"
+            accepts(&g, b"\"zzz\""),
+            "an unflattened nested union's broad string must stay reachable"
         );
     }
 
@@ -4672,33 +4681,29 @@ mod tests {
         );
     }
 
-    /// DOCUMENTED LIMITATION (issue #473, Tier 2 — out of scope for this
-    /// fix): an untyped `{}` sibling accepts any JSON value, but its string
-    /// inputs are shadowed by the hoisted const trie. Matches `origin/main`;
-    /// pins current behavior pending a parallel-stack matcher.
+    /// An untyped `{}` sibling accepts any JSON value, including strings that
+    /// start the same way as the hoisted const trie: the matcher keeps both
+    /// alternatives alive after the opening quote.
     #[test]
-    fn anyof_untyped_sibling_shadowed_known_limitation() {
+    fn anyof_untyped_sibling_accepts_any_string() {
         let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{}]}"#);
         assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
         assert!(
-            rejects(&g, b"\"zzz\""),
-            "KNOWN LIMITATION #473: untyped empty-schema string inputs shadowed by the const trie"
+            accepts(&g, b"\"zzz\""),
+            "untyped empty-schema string inputs must stay reachable next to the const trie"
         );
     }
 
-    /// DOCUMENTED LIMITATION (issue #473, Tier 2 — out of scope for this
-    /// fix): a `{"type":["string","number"]}` sibling accepts both strings
-    /// and numbers, but this compiler does not special-case a `type` ARRAY —
+    /// A `{"type":["string","number"]}` sibling accepts both strings and
+    /// numbers. This compiler does not special-case a `type` ARRAY:
     /// `compile_schema_inner` dispatches on `Value::as_str`, which is `None`
     /// for a JSON array (same as an absent `type`), so it falls to the
-    /// untyped `any_value_alts` path, identically to `{}` — and its STRING
-    /// inputs are shadowed by the hoisted const trie exactly like the
-    /// untyped `{}` case above. There is no fixed literal set to fold here
-    /// (the branch's string language is unbounded), so fixing this needs
-    /// parallel-stack / NFA matching, not a compile-time fold. Pins current
-    /// behavior so a future engine change flips it intentionally.
+    /// untyped `any_value_alts` path, identically to `{}`. There is no fixed
+    /// literal set to fold (the branch's string language is unbounded); the
+    /// string inputs are reachable because the matcher keeps this branch alive
+    /// next to the hoisted const trie.
     #[test]
-    fn anyof_mixed_type_array_sibling_shadowed_known_limitation() {
+    fn anyof_mixed_type_array_sibling_accepts_strings() {
         let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"type":["string","number"]}]}"#);
         assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
         assert!(
@@ -4706,8 +4711,8 @@ mod tests {
             "a non-string alternative from the mixed-type branch stays reachable"
         );
         assert!(
-            rejects(&g, b"\"zzz\""),
-            "KNOWN LIMITATION #473: mixed-type-array sibling's string inputs shadowed by the const trie"
+            accepts(&g, b"\"zzz\""),
+            "the mixed-type-array sibling's string inputs must stay reachable next to the const trie"
         );
     }
 
@@ -5465,30 +5470,26 @@ mod tests {
         assert!(rejects(&g, b"{}"), "empty object must be rejected");
         assert!(rejects(&g, b"{\"o1\":2}"), "missing r must be rejected");
 
-        // r + o2 only (skip o1): this is the INTERLEAVED optional case.
-        // The CFG is correct, but the runtime PDA commits to the emit-o1
-        // alternative when it sees "," and cannot backtrack past the o1 key
-        // mismatch.  Assert the actual current behaviour so the test is
-        // mutation-sensitive and clearly documents the #353 boundary.
-        // #353: interleaved optional — PDA over-rejects; CFG is correct.
+        // r + o2 only (skip o1): the INTERLEAVED optional case. After the ","
+        // the emit-o1 and skip-o1 alternatives are both live; the o2 key
+        // matches only the skip branch, so the matcher follows it.
         assert!(
-            rejects(&g, b"{\"r\":1,\"o2\":3}"),
-            "#353: PDA over-rejects r+o2 (interleaved optional, skip o1)"
+            accepts(&g, b"{\"r\":1,\"o2\":3}"),
+            "r + o2 (interleaved optional, skip o1) must be accepted"
         );
         // Trailing comma boundary (see object_three_props_trailing_comma_boundary
         // for the full explanation):
-        // - r only with trailing comma: correctly rejects (inline-key fix).
-        // - r+o1 with trailing comma: correctly rejects. The per-frame
-        //   byte-consumption guard refuses to fall back to the o2 skip
-        //   alternative once the "," has been consumed.
-        // - r+o1+o2 with trailing comma: correctly rejects (no optional remaining).
+        // - r only with trailing comma: rejects (no optional key follows).
+        // - r+o1 with trailing comma: rejects. After the "," every live
+        //   alternative needs a key byte, so "}" has no continuation.
+        // - r+o1+o2 with trailing comma: rejects (no optional remaining).
         assert!(
             rejects(&g, b"{\"r\":1,}"),
             "trailing comma after r-only must reject"
         );
         assert!(
             rejects(&g, b"{\"r\":1,\"o1\":2,}"),
-            "trailing comma after r+o1 must reject (no fallback to o2 skip alt)"
+            "trailing comma after r+o1 must reject (every live alternative needs a key)"
         );
         assert!(
             rejects(&g, b"{\"r\":1,\"o1\":2,\"o2\":3,}"),
@@ -5605,19 +5606,16 @@ mod tests {
         assert!(rejects(&g, b"{}"), "empty must be rejected");
     }
 
-    /// Two fully-optional properties — PDA boundary for trailing-comma and
-    /// skip-first behaviours.
+    /// Two fully-optional properties — trailing-comma and skip-first
+    /// behaviours.
     ///
-    /// Trailing comma after the first optional (`{"a":1,}`) now correctly
-    /// rejects: the per-frame byte-consumption guard refuses to fall back to the
-    /// second optional's skip alternative once the "," has been consumed.
-    /// Skip-first (`{"b":2}` without `a`) is over-rejected: the no-rewind
-    /// single-stack matcher cannot reach the second optional's emit branch after
-    /// committing to skip the first.  That is the safe direction for constrained
-    /// decoding, where a valid member is unreachable but no invalid output is
-    /// ever emitted.
+    /// Trailing comma after the first optional (`{"a":1,}`) rejects: after the
+    /// "," every live alternative needs the second key, so "}" has no
+    /// continuation. Skip-first (`{"b":2}` without `a`) is accepted: the
+    /// emit-a and skip-a alternatives are both live at the opening brace and
+    /// the `b` key matches only the skip branch.
     #[test]
-    fn object_two_optional_only_pda_boundary() {
+    fn object_two_optional_only_skip_first_and_trailing_comma() {
         let g = compile_ok(
             r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}}}"#,
         );
@@ -5633,17 +5631,16 @@ mod tests {
             accepts(&g, b"{\"a\":1,\"b\":2}"),
             "both present must be accepted"
         );
-        // Skip-first ({"b":2} without a) is over-rejected (the safe direction).
+        // Skip-first ({"b":2} without a) is a valid object and must be reachable.
         assert!(
-            rejects(&g, b"{\"b\":2}"),
-            "PDA over-rejects skip-first optional (safe direction)"
+            accepts(&g, b"{\"b\":2}"),
+            "skip-first optional must be accepted"
         );
-        // Trailing comma {"a":1,} correctly rejects: the byte-consumption guard
-        // refuses to fall back to the second optional's skip alt once the ","
-        // has been consumed.
+        // Trailing comma {"a":1,} rejects: after the "," the second key is
+        // required, so "}" has no continuation.
         assert!(
             rejects(&g, b"{\"a\":1,}"),
-            "trailing comma after first optional must reject (no fallback to skip alt)"
+            "trailing comma after first optional must reject (the second key must follow)"
         );
         // When both properties are present the trailing comma correctly rejects
         // (no further optional to provide an escape route).
@@ -5656,13 +5653,11 @@ mod tests {
     /// Three-property schema (1 required + 2 trailing optionals) — documents
     /// trailing-comma boundary for the intermediate optional case.
     ///
-    /// `{"r":1,"o1":2,}` correctly rejects: the per-frame byte-consumption guard
-    /// refuses to fall back to the o2 skip alternative once the "," has been
-    /// consumed (the same guard exercised by
-    /// `object_two_optional_only_pda_boundary` above).  `{"r":1,}` rejects
-    /// because the inline key terminal makes the o1 mismatch fire at
-    /// sym_pos >= 2, which propagates to the required chain (no alt) and rejects.
-    /// `{"r":1,"o1":2,"o2":3,}` rejects because no optional remains.
+    /// `{"r":1,"o1":2,}` rejects: after the "," every live alternative needs
+    /// the o2 key, so "}" has no continuation (the same boundary exercised by
+    /// `object_two_optional_only_skip_first_and_trailing_comma` above).
+    /// `{"r":1,}` rejects for the same reason with o1. `{"r":1,"o1":2,"o2":3,}`
+    /// rejects because no optional remains.
     #[test]
     fn object_three_props_trailing_comma_boundary() {
         let g = compile_ok(
@@ -5691,7 +5686,7 @@ mod tests {
         // Trailing comma after intermediate optional correctly rejects.
         assert!(
             rejects(&g, b"{\"r\":1,\"o1\":2,}"),
-            "trailing comma after r+o1 must reject (no fallback to o2 skip alt)"
+            "trailing comma after r+o1 must reject (every live alternative needs a key)"
         );
         // Trailing comma after last property correctly rejects.
         assert!(

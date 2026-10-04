@@ -1,12 +1,12 @@
 //! Regression harness for GitHub issue #310 (grammar-constrained decoding, ADR-046).
 //!
 //! Status per finding:
-//!   f1 (object optional-member separators)     — pins PDA consumed-frame guard
+//!   f1 (object optional-member separators)     — trailing comma stays rejected
 //!   f2 (array cardinality minItems/maxItems)   — FIXED by #321
 //!   f3 (prefixItems tuple arrays)              — FIXED by #321
 //!   f4 (string enum rule-name collision)       — FIXED by #311
 //!   f5 (JSON-Schema string-enum common prefix) — FIXED by #471
-//!   f5 (arbitrary PDA common-prefix)            — needs architectural redesign, marked #[ignore]
+//!   f5 (arbitrary PDA common-prefix)            — FIXED: the matcher tracks every live stack
 //!   f6 (leading-zero integer rejection)        — FIXED by #311
 //!   f7 (enum/const string escaping)            — FIXED by #321
 
@@ -18,7 +18,7 @@ use lattice_inference::grammar::pda::{
 fn full_accept(g: &CompiledGrammar, s: &[u8]) -> bool {
     let mut st = GrammarState::initial();
     for &b in s {
-        if advance_byte(&mut st, g, b) == StepResult::Rejected {
+        if advance_byte(&mut st, g, b) != StepResult::Accepted {
             return false;
         }
     }
@@ -26,7 +26,6 @@ fn full_accept(g: &CompiledGrammar, s: &[u8]) -> bool {
 }
 
 #[test]
-#[ignore = "issue #310 finding #5 (single-stack PDA cannot backtrack common prefixes) — needs architectural redesign"]
 fn f5_common_prefix_raw() {
     let mut b = GrammarBuilder::new();
     b.add_rule(

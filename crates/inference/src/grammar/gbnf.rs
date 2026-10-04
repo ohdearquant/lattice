@@ -665,7 +665,7 @@ mod tests {
         assert!(accepts(&g, b"x"));
         // epsilon: initial state should be complete (? makes root = x | ε)
         let state = GrammarState::initial();
-        assert!(state.is_complete() || !state.stack.is_empty());
+        assert!(state.is_complete() || !state.stacks.is_empty());
     }
 
     #[test]

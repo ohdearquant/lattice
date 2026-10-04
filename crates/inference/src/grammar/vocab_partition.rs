@@ -65,6 +65,10 @@ pub struct VocabPartition {
     /// `None` uses the conservative global union because storing that state's
     /// local set would exceed the aggregate memory budget.
     context_dependent_by_state: Vec<Option<Vec<usize>>>,
+    /// Set when classifying some (state, token) pair exceeded the matcher's
+    /// stack limits. Such a pair is neither allowed nor rejected by the
+    /// grammar, so the engine refuses to build on a partition that has one.
+    stack_limit_exceeded: bool,
 }
 
 impl VocabPartition {
@@ -136,11 +140,12 @@ impl VocabPartition {
         let context_entry_budget =
             masks.len().saturating_mul(std::mem::size_of::<u64>()) / std::mem::size_of::<usize>();
         let mut context_entries_stored = 0usize;
+        let mut stack_limit_exceeded = false;
 
         for (state_id, grammar_state) in grammar_states[..effective_states].iter().enumerate() {
             let state_mask = &mut masks[state_id * mask_stride..(state_id + 1) * mask_stride];
             let mut state_context_dependent = Vec::new();
-            trie.classify(
+            stack_limit_exceeded |= trie.classify(
                 grammar_state,
                 grammar,
                 state_mask,
@@ -180,7 +185,20 @@ impl VocabPartition {
             states: grammar_states,
             context_dependent,
             context_dependent_by_state,
+            stack_limit_exceeded,
         }
+    }
+
+    /// Returns true when some (state, token) pair could not be classified
+    /// because the matcher exceeded its stack limits during the build.
+    ///
+    /// A set flag means the mask is not a grammar verdict: an unclassified
+    /// token has its bit unset in `apply_mask`, which blocks it exactly like a
+    /// token the grammar rejects. `GrammarEngine::new` refuses to build on a
+    /// partition with this flag set; a caller that uses the partition directly
+    /// must check it before trusting a mask.
+    pub fn stack_limit_exceeded(&self) -> bool {
+        self.stack_limit_exceeded
     }
 
     /// Apply the precomputed bitmask for `state_id` to `logits` in-place.
@@ -324,6 +342,35 @@ mod tests {
         let vocab = ab_vocab();
         let partition = VocabPartition::build(&grammar, states, &vocab);
         assert_eq!(partition.num_states(), 1);
+        assert!(!partition.stack_limit_exceeded());
+    }
+
+    /// A token the matcher cannot classify because the step needs more live
+    /// stacks than it allows is recorded instead of being masked as rejected:
+    /// the public flag is set, the token's bit stays unset, and it is not
+    /// listed as context-dependent.
+    #[test]
+    fn build_records_a_token_that_exceeds_the_stack_limit() {
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![
+                    vec![Symbol::Terminal(b'a'), Symbol::Terminal(b'b')];
+                    crate::grammar::pda::MAX_LIVE_STACKS + 1
+                ],
+            }],
+        };
+        let partition = VocabPartition::build(&grammar, vec![GrammarState::initial()], &ab_vocab());
+        assert!(partition.stack_limit_exceeded());
+        assert_eq!(
+            partition.masks[0] & 0b11,
+            0,
+            "neither the unclassifiable token 'a' nor the rejected token 'b' may have a bit"
+        );
+        assert!(
+            partition.context_dependent_ids().is_empty(),
+            "an unclassifiable token is not context-dependent"
+        );
     }
 
     #[test]
@@ -510,6 +557,11 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Equivalence with the per-token simulation the trie walk replaced
+    //
+    // These are equivalence tests: the oracle and the trie walk both run the
+    // same `advance_byte` matcher, so they pin the walk to `simulate_token`'s
+    // verdicts, not the matcher's language. The language itself is pinned by
+    // the matcher tests in `pda.rs` and `tests/grammar_shared_first_byte_alternatives.rs`.
     // -----------------------------------------------------------------------
 
     /// The pre-trie construction, kept as the oracle: simulates every
@@ -529,6 +581,7 @@ mod tests {
         let context_entry_budget =
             masks.len().saturating_mul(std::mem::size_of::<u64>()) / std::mem::size_of::<usize>();
         let mut context_entries_stored = 0usize;
+        let mut stack_limit_exceeded = false;
 
         for (state_id, grammar_state) in grammar_states[..effective_states].iter().enumerate() {
             let mut state_context_dependent = Vec::new();
@@ -549,6 +602,7 @@ mod tests {
                         masks[state_id * mask_stride + token_id / 64] |= 1u64 << (token_id % 64);
                     }
                     SimResult::Reject => {}
+                    SimResult::StackLimitExceeded => stack_limit_exceeded = true,
                 }
             }
             let stored_len = state_context_dependent.len();
@@ -571,6 +625,7 @@ mod tests {
             states: grammar_states,
             context_dependent,
             context_dependent_by_state,
+            stack_limit_exceeded,
         }
     }
 
@@ -591,10 +646,10 @@ mod tests {
             head += 1;
             for token in vocab.iter().filter(|t| !t.is_empty()) {
                 let (result, next) = simulate_token(&state, grammar, token);
-                if result != SimResult::Reject
+                if matches!(result, SimResult::Accept | SimResult::ContextDependent)
                     && !visited
                         .iter()
-                        .any(|s| s.stack == next.stack && s.complete == next.complete)
+                        .any(|s| s.stacks == next.stacks && s.complete == next.complete)
                 {
                     visited.push(next.clone());
                     if visited.len() < max_states {
@@ -611,7 +666,7 @@ mod tests {
         assert_eq!(got.mask_stride, want.mask_stride, "{label}: mask_stride");
         assert_eq!(got.states.len(), want.states.len(), "{label}: state count");
         for (i, (g, w)) in got.states.iter().zip(&want.states).enumerate() {
-            assert_eq!(g.stack, w.stack, "{label}: state {i} stack");
+            assert_eq!(g.stacks, w.stacks, "{label}: state {i} stacks");
             assert_eq!(g.complete, w.complete, "{label}: state {i} complete");
             assert_eq!(
                 g.partial_token_bytes, w.partial_token_bytes,
@@ -627,11 +682,16 @@ mod tests {
             got.context_dependent_by_state, want.context_dependent_by_state,
             "{label}: context_dependent_by_state"
         );
+        assert_eq!(
+            got.stack_limit_exceeded, want.stack_limit_exceeded,
+            "{label}: stack_limit_exceeded"
+        );
     }
 
-    /// Builds with both constructions (and through a prebuilt trie) and
-    /// requires every field to match, including each stored state's stack,
-    /// completion flag and partial bytes.
+    /// Equivalence check: builds with both constructions (and through a
+    /// prebuilt trie) and requires every field to match, including each stored
+    /// state's stack, completion flag and partial bytes, and the stack-limit
+    /// flag.
     fn assert_trie_build_matches_oracle(
         grammar: &CompiledGrammar,
         states: Vec<GrammarState>,
@@ -861,6 +921,75 @@ mod tests {
             partition.context_dependent_by_state.len(),
             MAX_GRAMMAR_STATES
         );
+    }
+
+    /// A grammar in which one branch needs more live stacks than the matcher
+    /// allows and the others do not: `root ::= "c" big | "xyz"` where `big`
+    /// has `MAX_LIVE_STACKS + 1` alternatives that all start with "d".
+    fn partly_over_the_stack_limit_grammar() -> CompiledGrammar {
+        let big = vec![
+            vec![Symbol::Terminal(b'd'), Symbol::Terminal(b'e')];
+            crate::grammar::pda::MAX_LIVE_STACKS + 1
+        ];
+        CompiledGrammar {
+            rules: vec![
+                Rule {
+                    name: "root".to_string(),
+                    alts: vec![
+                        vec![Symbol::Terminal(b'c'), Symbol::NonTerminal(1)],
+                        b"xyz".iter().copied().map(Symbol::Terminal).collect(),
+                    ],
+                },
+                Rule {
+                    name: "big".to_string(),
+                    alts: big,
+                },
+            ],
+        }
+    }
+
+    /// Equivalence test: tokens whose walk hits the stack limit on a later
+    /// byte ("cd", "cde", "cdx") are neither allowed nor context-dependent, the
+    /// flag is set, and tokens beside them keep their ordinary classification
+    /// ("c" and "x" accepted, "cx" and "xz" context-dependent, "q" rejected).
+    #[test]
+    fn trie_build_matches_oracle_when_only_some_tokens_exceed_the_stack_limit() {
+        let grammar = partly_over_the_stack_limit_grammar();
+        let vocab: Vec<Vec<u8>> = [
+            "c", "cx", "cd", "cde", "cdx", "x", "xy", "xyz", "xz", "q", "z", "", "cd", "x",
+        ]
+        .iter()
+        .map(|t| t.as_bytes().to_vec())
+        .collect();
+        let states = reachable_states(&grammar, &vocab, MAX_GRAMMAR_STATES);
+        assert!(states.len() > 1, "fixture must reach states past the root");
+        let partition =
+            assert_trie_build_matches_oracle(&grammar, states, &vocab, "partial stack limit");
+        assert!(partition.stack_limit_exceeded());
+
+        let id = |text: &str| vocab.iter().position(|t| t == text.as_bytes()).unwrap();
+        let allowed = |token: usize| partition.masks[token / 64] & (1u64 << (token % 64)) != 0;
+        for token in ["c", "x", "xy", "xyz"] {
+            assert!(allowed(id(token)), "{token} is accepted from the root");
+        }
+        for token in ["cd", "cde", "cdx"] {
+            assert!(!allowed(id(token)), "{token} hits the stack limit");
+            assert!(
+                !partition.context_dependent_ids().contains(&id(token)),
+                "{token} must not be context-dependent"
+            );
+        }
+        assert!(
+            partition
+                .context_dependent_ids_for_state(0)
+                .contains(&id("cx"))
+        );
+        assert!(
+            partition
+                .context_dependent_ids_for_state(0)
+                .contains(&id("xz"))
+        );
+        assert!(!allowed(id("q")));
     }
 
     /// Empty tokens are always blocked, as in the previous per-token builder
