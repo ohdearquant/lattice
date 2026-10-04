@@ -115,9 +115,22 @@ pub(crate) fn self_spec_route_active(
         && num_active_linear_attention_layers > 0
 }
 
+/// Whether the MTP verify phase should use the batch-GEMM verifier instead of
+/// the per-token verifier. The batch-GEMM verifier is opt-in through
+/// `LATTICE_MTP_BATCH` (`batch_switch_on`), but its dispatch issues base
+/// projections only and never applies a loaded LoRA adapter, while the
+/// per-token verifier steps through the layer encoders that do. With an
+/// adapter loaded (`adapter_loaded`) the switch is therefore ignored, so the
+/// verified tokens and the state the verifier writes stay adapter-consistent
+/// with plain decode.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn use_batch_gemm_verifier(batch_switch_on: bool, adapter_loaded: bool) -> bool {
+    batch_switch_on && !adapter_loaded
+}
+
 #[cfg(test)]
 mod route_predicate_tests {
-    use super::{mtp_route_active, self_spec_route_active};
+    use super::{mtp_route_active, self_spec_route_active, use_batch_gemm_verifier};
     use crate::generation::GenerateConfig;
 
     fn greedy_gen_cfg(stop_strings: Vec<String>) -> GenerateConfig {
@@ -360,6 +373,34 @@ mod route_predicate_tests {
             "self-spec must not activate when logprobs is set -- same \
              unconditional empty-token_logprobs output path as MTP"
         );
+    }
+
+    /// Baseline: with the batch switch on and no adapter loaded, the
+    /// batch-GEMM verifier is selected. Establishes the contrast the next
+    /// test depends on, so an always-false predicate cannot pass it.
+    #[test]
+    fn batch_gemm_verifier_selected_when_switch_on_and_no_adapter() {
+        assert!(use_batch_gemm_verifier(true, false));
+    }
+
+    /// A loaded adapter must keep the per-token verifier even with the batch
+    /// switch on: the batch-GEMM dispatch applies base projections only.
+    ///
+    /// Mutation sensitivity: making the predicate ignore `adapter_loaded`
+    /// makes this assertion fail.
+    #[test]
+    fn batch_gemm_verifier_not_selected_when_adapter_loaded() {
+        assert!(
+            !use_batch_gemm_verifier(true, true),
+            "the batch-GEMM verifier applies no LoRA adapter, so it must not \
+             be selected while one is loaded"
+        );
+    }
+
+    #[test]
+    fn batch_gemm_verifier_not_selected_when_switch_off() {
+        assert!(!use_batch_gemm_verifier(false, false));
+        assert!(!use_batch_gemm_verifier(false, true));
     }
 }
 
@@ -9101,8 +9142,12 @@ mod inner {
                 // Short-circuiting before verify caused concern #2 of #237: a wrong
                 // draft-EOS would silently truncate generation early.
 
-                // --- Verify phase (LATTICE_MTP_BATCH=1 selects batch-GEMM verifier) ---
-                let use_batch = crate::env_switch_enabled("LATTICE_MTP_BATCH");
+                // --- Verify phase (LATTICE_MTP_BATCH=1 selects batch-GEMM verifier,
+                // unless an adapter is loaded: that verifier applies none) ---
+                let use_batch = super::use_batch_gemm_verifier(
+                    crate::env_switch_enabled("LATTICE_MTP_BATCH"),
+                    self.lora.is_some(),
+                );
                 let t_verify = std::time::Instant::now();
                 let verify_result = if use_batch {
                     self.verify_tokens_batch_gemm(&[pending_token, draft.token_id], pos)
@@ -14752,6 +14797,30 @@ mod inner {
                 "sample_decode_traced must open the decode.sample interval -- it is the \
                  single call site all five decode loops now share; silently dropping this \
                  line removes decode.sample instrumentation from every decode loop at once"
+            );
+        }
+
+        #[test]
+        fn mtp_verify_phase_selector_goes_through_adapter_guard() {
+            let src = include_str!("metal_qwen35.rs");
+            let production_end = src
+                .find("    mod tests {")
+                .expect("mod tests must exist in this file");
+            let production_src = &src[..production_end];
+            let switch_read = "env_switch_enabled(\"LATTICE_MTP_BATCH\")";
+            assert_eq!(
+                production_src.matches(switch_read).count(),
+                1,
+                "LATTICE_MTP_BATCH must have exactly one reader, the verify-phase selector"
+            );
+            let read_at = production_src.find(switch_read).expect("counted above");
+            let guard_at = production_src[..read_at]
+                .rfind("use_batch_gemm_verifier(")
+                .expect("the verify-phase selector must call use_batch_gemm_verifier");
+            assert!(
+                read_at - guard_at < 120,
+                "the LATTICE_MTP_BATCH read must be an argument of use_batch_gemm_verifier: \
+                 the batch-GEMM verifier applies no LoRA adapter"
             );
         }
 
