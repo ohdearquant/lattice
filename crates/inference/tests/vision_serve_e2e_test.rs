@@ -18,6 +18,7 @@
 
 use base64::Engine as _;
 use lattice_inference::measurement::gpu_test_lock;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -30,13 +31,13 @@ fn enforce() -> bool {
     std::env::var("LATTICE_VISION_S3_GATE_ENFORCE").as_deref() == Ok("1")
 }
 
-fn expand_home(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
+fn expand_home(path: &OsStr) -> PathBuf {
+    if let Some(rest) = path.to_str().and_then(|text| text.strip_prefix("~/"))
+        && let Some(home) = std::env::var_os("HOME")
     {
-        return format!("{home}/{rest}");
+        return PathBuf::from(home).join(rest);
     }
-    path.to_string()
+    PathBuf::from(path)
 }
 
 fn default_model_dir() -> Option<PathBuf> {
@@ -59,7 +60,8 @@ enum ModelDirResolution {
 
 /// The explicit variable is authoritative: when it is set and does not exist the
 /// test skips (or panics under enforcement) instead of using the default checkpoint.
-/// The default directory is consulted only when the variable is unset.
+/// A set value counts as set whatever its encoding. The default directory is
+/// looked up and consulted only when the variable is unset.
 fn resolve_model_dir(
     var: Option<PathBuf>,
     var_exists: bool,
@@ -103,12 +105,15 @@ fn resolve_model_dir(
 }
 
 fn require_model_dir() -> Option<PathBuf> {
-    let var = std::env::var(MODEL_DIR_ENV)
-        .ok()
-        .map(|value| PathBuf::from(expand_home(&value)));
+    let var = std::env::var_os(MODEL_DIR_ENV).map(|value| expand_home(&value));
     let var_exists = var.as_ref().is_some_and(|path| path.exists());
-    let default = default_model_dir();
-    let default_exists = default.as_ref().is_some_and(|path| path.exists());
+    let (default, default_exists) = if var.is_none() {
+        let default = default_model_dir();
+        let default_exists = default.as_ref().is_some_and(|path| path.exists());
+        (default, default_exists)
+    } else {
+        (None, false)
+    };
     match resolve_model_dir(var, var_exists, default, default_exists, enforce()) {
         ModelDirResolution::Use(path) => Some(path),
         ModelDirResolution::Skip(line) => {
@@ -197,6 +202,50 @@ fn model_dir_resolution_unset_with_default_missing_panics_under_enforce() {
         false,
         true,
     );
+}
+
+#[test]
+fn model_dir_resolution_set_present_with_default_missing_uses_that_path() {
+    let resolved = resolve_model_dir(
+        Some(PathBuf::from("/data/ckpt")),
+        true,
+        Some(PathBuf::from("/default/models/qwen3.5-0.8b")),
+        false,
+        false,
+    );
+    assert_eq!(
+        resolved,
+        ModelDirResolution::Use(PathBuf::from("/data/ckpt"))
+    );
+}
+
+#[test]
+fn model_dir_resolution_unset_with_default_present_uses_default_under_enforce() {
+    let default = PathBuf::from("/default/models/qwen3.5-0.8b");
+    let resolved = resolve_model_dir(None, false, Some(default.clone()), true, true);
+    assert_eq!(resolved, ModelDirResolution::Use(default));
+}
+
+#[test]
+fn model_dir_resolution_set_missing_with_default_missing_names_the_variable_path() {
+    let resolved = resolve_model_dir(
+        Some(PathBuf::from("/nonexistent/ckpt")),
+        false,
+        Some(PathBuf::from("/default/models/qwen3.5-0.8b")),
+        false,
+        false,
+    );
+    match resolved {
+        ModelDirResolution::Skip(line) => {
+            assert!(line.contains("LATTICE_VISION_S6_SERVE_SKIPPED"), "{line}");
+            assert!(
+                line.contains("LATTICE_VISION_S3_MODEL_DIR=/nonexistent/ckpt"),
+                "{line}"
+            );
+            assert!(!line.contains("~/.lattice/models"), "{line}");
+        }
+        other => panic!("a set-but-missing variable must skip, got {other:?}"),
+    }
 }
 
 struct ChildGuard(Child);
