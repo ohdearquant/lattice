@@ -27,8 +27,11 @@
 //! event after `[DONE]`. A response body, including the body of a non-2xx
 //! reply, is read to its end, so a body that keeps arriving past the request
 //! deadline (a server that leaves a stream open after `[DONE]`, or trickles
-//! bytes) is refused at that deadline. A read already blocked when the deadline
-//! passes ends at the HTTP client's own timeout, up to 2 s later. Streaming
+//! bytes) is refused at the first read that returns after that deadline: the
+//! deadline is checked between reads. A read already blocked when the deadline
+//! passes is bounded by the HTTP client's own whole-request timeout, which
+//! `ureq` 2 applies to body reads as well as to the headers, and which is set
+//! 2 s after this deadline, so that read fails about 2 s later. Streaming
 //! chunks carry no `usage` object, so a stream is certified by its content
 //! deltas and reports `completion_tokens=na`.
 //!
@@ -48,10 +51,11 @@
 //!   BENCH_REQUEST_TIMEOUT_SECS total wall clock per request, from the start of
 //!                              the request to the end of the response body
 //!                              (default 900); a body that keeps arriving is
-//!                              refused at this deadline, a read already blocked
-//!                              then ends at the client timeout, up to 2 s
-//!                              later; the connect itself is capped at 10 s or
-//!                              this value, whichever is smaller
+//!                              refused at the first read that returns after
+//!                              this deadline, a read already blocked then ends
+//!                              at the client timeout, about 2 s later; the
+//!                              connect itself is capped at 10 s or this
+//!                              value, whichever is smaller
 //!   BENCH_STDERR_MARKER        substring to count in the server's stderr
 //!
 //! Output:
