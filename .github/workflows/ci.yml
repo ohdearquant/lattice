@@ -635,6 +635,31 @@ jobs:
             echo "expected at least 14 passing bench_suite tests, parsed '${passed:-<none>}'" >&2
             exit 1
           fi
+      # The tests above call the gate directly; they do not run `main`, so a
+      # `main` that stopped applying the gate would leave them green. Run the
+      # built example itself with a named wrapper and no checkpoint to read. `--llm
+      # --wrapper base` selects only the base LLM wrapper, and with HOME pointing at
+      # an empty directory it cannot find a model, so it measures nothing and must
+      # exit 2 with the refusal text. Cargo is run first with the real HOME; only
+      # the example runs with the empty one. Output goes to a file and the status is
+      # read on its own, so a pipe cannot hide it.
+      - name: inference — bench_suite refuses a named wrapper that measured nothing
+        run: |
+          set -euo pipefail
+          cargo build -p lattice-inference --features f16 --example bench_suite
+          empty_home=$(mktemp -d)
+          log=$(mktemp)
+          status=0
+          env HOME="$empty_home" "${CARGO_TARGET_DIR:-target}/debug/examples/bench_suite" --llm --wrapper base >"$log" 2>&1 || status=$?
+          cat "$log"
+          if [ "$status" -ne 2 ]; then
+            echo "expected bench_suite to exit 2 for a named wrapper with no checkpoint, got $status" >&2
+            exit 1
+          fi
+          if ! grep -F -q "refusing to certify this run: the named wrapper did not run or returned no metrics" "$log"; then
+            echo "bench_suite exited 2 but did not print the certification refusal" >&2
+            exit 1
+          fi
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
       - name: inference — metal-gpu (macOS only)
         if: runner.os == 'macOS'
