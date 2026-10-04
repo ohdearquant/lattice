@@ -3194,6 +3194,123 @@ mod tests {
     }
 
     #[test]
+    fn running_job_whose_event_receiver_closes_during_prefill_like_phase_never_calls_on_token() {
+        // Distinct from the dequeue-time receiver test (the receiver is open
+        // when job 1 is dequeued) and from the flag-driven prefill test (job
+        // 1's cancel guard is kept alive for the whole test, so the cancel
+        // flag never flips). The only thing that can stop job 1 inside its
+        // prefill-like phase is `should_cancel` observing the closed receiver.
+        //
+        // The receiver is dropped only after `generate` has been entered, and
+        // the generator holds its first predicate poll until that drop has
+        // happened, so the first poll is causally after the close and no
+        // sleep orders anything. Every wait below is bounded.
+        const WAIT: Duration = Duration::from_secs(10);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let entered_decode = Arc::new(AtomicBool::new(false));
+        let on_token_calls = Arc::new(AtomicUsize::new(0));
+        let job1_polls = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let ran_tokens = Arc::new(AtomicUsize::new(0));
+
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
+        let (job1, rx1, _guard1) = make_job();
+        let (job2, mut rx2, _guard2) = make_job();
+        job_tx.send(job1).unwrap();
+        job_tx.send(job2).unwrap();
+        drop(job_tx);
+
+        let handle = std::thread::spawn({
+            let entered_decode = entered_decode.clone();
+            let on_token_calls = on_token_calls.clone();
+            let job1_polls = job1_polls.clone();
+            let ran_tokens = ran_tokens.clone();
+            move || {
+                let mut prefill_gap = fake_generate_with_prefill_gap(50, 50, entered_decode);
+                let mut follow_up = fake_generate(50, Arc::new(AtomicUsize::new(0)), ran_tokens);
+                let mut calls = 0usize;
+                run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
+                    calls += 1;
+                    if calls > 1 {
+                        return follow_up(messages, cfg, on_token, should_cancel);
+                    }
+                    let _ = entered_tx.try_send(());
+                    if closed_rx.recv_timeout(WAIT).is_err() {
+                        return Err(WorkerFailure::Failed(
+                            "the test never closed job 1's event receiver".to_string(),
+                        ));
+                    }
+                    let mut counted_on_token = |delta: &str, token_id: u32| {
+                        on_token_calls.fetch_add(1, Ordering::SeqCst);
+                        on_token(delta, token_id)
+                    };
+                    let mut recorded_should_cancel = || {
+                        let cancelled = should_cancel();
+                        lock_unpoisoned(&job1_polls).push(cancelled);
+                        cancelled
+                    };
+                    prefill_gap(
+                        messages,
+                        cfg,
+                        &mut counted_on_token,
+                        &mut recorded_should_cancel,
+                    )
+                });
+                let _ = done_tx.send(());
+            }
+        });
+
+        entered_rx
+            .recv_timeout(WAIT)
+            .expect("generate must be entered for job 1 before its event receiver is closed");
+        drop(rx1);
+        closed_tx
+            .send(())
+            .expect("the generator must still be waiting for job 1's receiver to close");
+        done_rx
+            .recv_timeout(WAIT)
+            .expect("the worker must finish both jobs once job 1's receiver is closed");
+        handle.join().expect("worker thread must not panic");
+
+        assert_eq!(
+            *lock_unpoisoned(&job1_polls),
+            vec![true],
+            "the first predicate poll after the event receiver closed must report \
+             cancellation, and the generator must stop at that poll"
+        );
+        assert_eq!(
+            on_token_calls.load(Ordering::SeqCst),
+            0,
+            "on_token must never be called for a job whose receiver closed during the \
+             prefill-like phase"
+        );
+        assert!(
+            !entered_decode.load(Ordering::SeqCst),
+            "a closed event receiver alone must stop job 1 before the decode phase is reached"
+        );
+
+        let mut job2_tokens = None;
+        while let Some(event) = rx2.blocking_recv() {
+            if let WorkerEvent::Complete(output) = event {
+                job2_tokens = Some(output.generated_tokens);
+            }
+        }
+        assert_eq!(
+            job2_tokens,
+            Some(50),
+            "worker must survive job 1 stopping on a closed receiver and serve job 2 to \
+             completion"
+        );
+        assert_eq!(
+            ran_tokens.load(Ordering::SeqCst),
+            50,
+            "job 2 must run its 50 tokens; job 1 contributes none"
+        );
+    }
+
+    #[test]
     fn generation_failure_is_reported_as_failed_not_complete() {
         let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
 
