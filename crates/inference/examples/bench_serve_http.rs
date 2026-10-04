@@ -19,8 +19,11 @@
 //! listens (whatever its status), when the address it announces is not the
 //! port this run selected, when a request fails, when a non-streaming response
 //! reports zero `usage.completion_tokens`, an empty `choices[0].message.content`
-//! or an empty `finish_reason`, and when a stream carries an error event, no
-//! content delta, no (or an empty) finish reason, no `[DONE]` terminator, or any
+//! or an empty `finish_reason`, when `usage.completion_tokens` exceeds the
+//! request's `max_tokens`, when a `finish_reason` is not one `lattice serve`
+//! emits (`stop`, `length`), and when a stream carries an error event, an event
+//! whose data is empty or not JSON, no content delta, more content deltas than
+//! `max_tokens`, no (or an empty) finish reason, no `[DONE]` terminator, or any
 //! event after `[DONE]`. A stream is read to the end of the response body, so a
 //! server that leaves the response open after `[DONE]` is refused at the
 //! request deadline. Streaming chunks carry no `usage` object, so a stream is
@@ -39,9 +42,11 @@
 //!                              (default 100); `prompt_tokens` reports what
 //!                              that came to
 //!   BENCH_STARTUP_TIMEOUT_SECS wait for `Listening on` (default 900)
-//!   BENCH_REQUEST_TIMEOUT_SECS total wall clock per request, from connect to
-//!                              the end of the response body (default 900);
-//!                              the connect itself is capped at 10 s
+//!   BENCH_REQUEST_TIMEOUT_SECS total wall clock per request, from the start of
+//!                              the request to the end of the response body
+//!                              (default 900), enforced here as one absolute
+//!                              deadline; the connect itself is capped at 10 s
+//!                              or this value, whichever is smaller
 //!   BENCH_STDERR_MARKER        substring to count in the server's stderr
 //!
 //! Output:
@@ -83,6 +88,15 @@ const LISTENING_PREFIX: &str = "Listening on ";
 const SERVER_MAX_TOKENS_CAP: usize = 4096;
 const STDERR_TAIL_LINES: usize = 20;
 const POLL: Duration = Duration::from_millis(25);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// The HTTP client's own whole-request deadline, set this much after the one this
+// example enforces. It only bounds a read that is already blocked when the
+// example's deadline passes (waiting for response headers, or a silent stall),
+// where no application code is running to notice.
+const TRANSPORT_GRACE: Duration = Duration::from_secs(2);
+// The finish reasons `lattice serve` emits: it maps the engine's `stopped` flag
+// to `stop` or `length` and nothing else (`serve::finish_reason`).
+const SERVER_FINISH_REASONS: [&str; 2] = ["stop", "length"];
 const SHORT_PROMPT: &str = "Name three primary colors and say which one you like best.";
 const LONG_PARAGRAPH: &str = "The quick brown fox jumps over the lazy dog while the river keeps running past the old stone bridge.";
 const LONG_QUESTION: &str = "Summarize the passage above in one sentence.";
@@ -118,6 +132,11 @@ enum Refusal {
     ZeroCompletionTokens,
     EmptyContent,
     EmptyFinishReason,
+    UnknownFinishReason(String),
+    TokensOverBudget {
+        reported: u64,
+        max_tokens: u64,
+    },
     StreamError(String),
     NoContentDelta,
     StreamUnfinished,
@@ -178,6 +197,16 @@ impl std::fmt::Display for Refusal {
             Self::ZeroCompletionTokens => write!(f, "zero_completion_tokens"),
             Self::EmptyContent => write!(f, "empty_message_content"),
             Self::EmptyFinishReason => write!(f, "empty_finish_reason"),
+            Self::UnknownFinishReason(reason) => {
+                write!(f, "unknown_finish_reason {reason:?}")
+            }
+            Self::TokensOverBudget {
+                reported,
+                max_tokens,
+            } => write!(
+                f,
+                "tokens_over_budget reported={reported} max_tokens={max_tokens}"
+            ),
             Self::StreamError(error) => write!(f, "stream_error {error}"),
             Self::NoContentDelta => write!(f, "stream_without_content_delta"),
             Self::StreamUnfinished => write!(f, "stream_without_finish_reason_or_done"),
@@ -387,6 +416,9 @@ fn start_server(
     loop {
         match listening_rx.recv_timeout(POLL) {
             Ok((at, announced)) => {
+                // Exact match on purpose: a different spelling of the address
+                // (`localhost:PORT`) is refused rather than resolved, since a
+                // refusal costs a rerun and a wrong accept measures another server.
                 if announced != expected_addr {
                     return Err(Refusal::AnnouncedAddress {
                         expected: expected_addr.to_string(),
@@ -457,7 +489,17 @@ struct NonStreamStats {
     finish_reason: String,
 }
 
-fn certify_nonstream(body: &str) -> Result<NonStreamStats, Refusal> {
+fn check_finish_reason(reason: &str) -> Result<(), Refusal> {
+    if reason.is_empty() {
+        return Err(Refusal::EmptyFinishReason);
+    }
+    if !SERVER_FINISH_REASONS.contains(&reason) {
+        return Err(Refusal::UnknownFinishReason(reason.to_string()));
+    }
+    Ok(())
+}
+
+fn certify_nonstream(body: &str, max_tokens: u64) -> Result<NonStreamStats, Refusal> {
     let value: Value =
         serde_json::from_str(body).map_err(|e| Refusal::MalformedBody(e.to_string()))?;
     if let Some(error) = value.get("error") {
@@ -476,13 +518,17 @@ fn certify_nonstream(body: &str) -> Result<NonStreamStats, Refusal> {
     if completion_tokens == 0 {
         return Err(Refusal::ZeroCompletionTokens);
     }
+    if completion_tokens > max_tokens {
+        return Err(Refusal::TokensOverBudget {
+            reported: completion_tokens,
+            max_tokens,
+        });
+    }
     let finish_reason = value["choices"][0]["finish_reason"]
         .as_str()
         .ok_or_else(|| Refusal::MalformedBody("choices[0].finish_reason is missing".to_string()))?
         .to_string();
-    if finish_reason.is_empty() {
-        return Err(Refusal::EmptyFinishReason);
-    }
+    check_finish_reason(&finish_reason)?;
     let content = value["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| {
@@ -514,13 +560,18 @@ struct SseEventBuffer {
 
 impl SseEventBuffer {
     /// Takes one line of the body. Returns the event's data when this line is the
-    /// blank line that completes an event that carried some.
+    /// blank line that completes an event that carried a `data:` field, even when
+    /// that data is empty: an empty payload is the caller's to refuse, not ours to
+    /// drop.
     fn push_line(&mut self, line: &str) -> Option<String> {
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
+            if self.data.is_empty() {
+                return None;
+            }
             let event = self.data.join("\n");
             self.data.clear();
-            return (!event.is_empty()).then_some(event);
+            return Some(event);
         }
         if let Some(data) = sse_data(line) {
             self.data.push(data.to_string());
@@ -554,6 +605,11 @@ impl StreamTally {
             self.saw_done = true;
             return Ok(());
         }
+        if data.is_empty() {
+            return Err(Refusal::MalformedBody(
+                "stream event with an empty data payload".to_string(),
+            ));
+        }
         let value: Value =
             serde_json::from_str(data).map_err(|e| Refusal::MalformedBody(e.to_string()))?;
         if let Some(error) = value.get("error") {
@@ -583,7 +639,9 @@ struct StreamStats {
     finish_reason: String,
 }
 
-fn certify_stream(tally: &StreamTally) -> Result<StreamStats, Refusal> {
+// A delta is sent for at most one generated token, so more content deltas than
+// `max_tokens` cannot come from a server that honoured the request.
+fn certify_stream(tally: &StreamTally, max_tokens: u64) -> Result<StreamStats, Refusal> {
     if tally.after_done {
         return Err(Refusal::DataAfterDone);
     }
@@ -594,12 +652,16 @@ fn certify_stream(tally: &StreamTally) -> Result<StreamStats, Refusal> {
     else {
         return Err(Refusal::NoContentDelta);
     };
+    if tally.content_deltas as u64 > max_tokens {
+        return Err(Refusal::TokensOverBudget {
+            reported: tally.content_deltas as u64,
+            max_tokens,
+        });
+    }
     let Some(finish_reason) = tally.finish_reason.clone() else {
         return Err(Refusal::StreamUnfinished);
     };
-    if finish_reason.is_empty() {
-        return Err(Refusal::EmptyFinishReason);
-    }
+    check_finish_reason(&finish_reason)?;
     if !tally.saw_done {
         return Err(Refusal::StreamUnfinished);
     }
@@ -621,8 +683,8 @@ impl Client {
     fn new(base: String, request_timeout: Duration) -> Self {
         Self {
             agent: ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(10))
-                .timeout(request_timeout)
+                .timeout_connect(CONNECT_TIMEOUT.min(request_timeout))
+                .timeout(request_timeout.saturating_add(TRANSPORT_GRACE))
                 .build(),
             base,
             request_timeout,
@@ -678,22 +740,59 @@ impl Client {
         }
     }
 
+    fn deadline_from(&self, start: Instant) -> Result<Instant, Refusal> {
+        start.checked_add(self.request_timeout).ok_or_else(|| {
+            Refusal::BadConfig("BENCH_REQUEST_TIMEOUT_SECS overflows the clock".to_string())
+        })
+    }
+
+    fn check_deadline(&self, deadline: Instant) -> Result<(), Refusal> {
+        if Instant::now() >= deadline {
+            return Err(Refusal::Timeout {
+                waited_secs: self.request_timeout.as_secs(),
+            });
+        }
+        Ok(())
+    }
+
+    fn read_body(&self, mut reader: impl Read, deadline: Instant) -> Result<String, Refusal> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            self.check_deadline(deadline)?;
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.io_refusal(&e)),
+            }
+        }
+        self.check_deadline(deadline)?;
+        String::from_utf8(bytes)
+            .map_err(|e| Refusal::MalformedBody(format!("response body is not UTF-8: {e}")))
+    }
+
     fn run_nonstream(&self, body: &Value) -> Result<(NonStreamStats, f64), Refusal> {
         let start = Instant::now();
+        let deadline = self.deadline_from(start)?;
+        let max_tokens = requested_max_tokens(body)?;
         let response = self.post_chat(body)?;
-        let text = response.into_string().map_err(|e| self.io_refusal(&e))?;
+        let text = self.read_body(response.into_reader(), deadline)?;
         let total_ms = ms(start);
-        Ok((certify_nonstream(&text)?, total_ms))
+        Ok((certify_nonstream(&text, max_tokens)?, total_ms))
     }
 
     fn run_stream(&self, body: &Value) -> Result<(StreamStats, f64), Refusal> {
         let start = Instant::now();
+        let deadline = self.deadline_from(start)?;
+        let max_tokens = requested_max_tokens(body)?;
         let response = self.post_chat(body)?;
         let mut reader = BufReader::new(response.into_reader());
         let mut tally = StreamTally::default();
         let mut events = SseEventBuffer::default();
         let mut line = String::new();
         loop {
+            self.check_deadline(deadline)?;
             line.clear();
             let read = reader
                 .read_line(&mut line)
@@ -705,12 +804,19 @@ impl Client {
                 tally.feed_data(&data, ms(start))?;
             }
         }
+        self.check_deadline(deadline)?;
         let total_ms = ms(start);
         if events.is_pending() {
             return Err(Refusal::UnterminatedEvent);
         }
-        Ok((certify_stream(&tally)?, total_ms))
+        Ok((certify_stream(&tally, max_tokens)?, total_ms))
     }
+}
+
+fn requested_max_tokens(body: &Value) -> Result<u64, Refusal> {
+    body["max_tokens"].as_u64().ok_or_else(|| {
+        Refusal::BadConfig("the request body carries no integer max_tokens".to_string())
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -860,6 +966,8 @@ mod tests {
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
 
+    const MAX_TOKENS: u64 = 4;
+
     fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let owned: Vec<(String, String)> = pairs
             .iter()
@@ -878,7 +986,7 @@ mod tests {
             bin,
             model_dir,
             runs: 1,
-            max_tokens: 4,
+            max_tokens: MAX_TOKENS as usize,
             long_repeats: 2,
             startup_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
@@ -1042,7 +1150,7 @@ mod tests {
         })
         .to_string();
         assert!(matches!(
-            certify_nonstream(&body),
+            certify_nonstream(&body, MAX_TOKENS),
             Err(Refusal::ZeroCompletionTokens)
         ));
     }
@@ -1054,7 +1162,7 @@ mod tests {
             "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
         })
         .to_string();
-        let stats = certify_nonstream(&body).unwrap();
+        let stats = certify_nonstream(&body, MAX_TOKENS).unwrap();
         assert_eq!(stats.prompt_tokens, 7);
         assert_eq!(stats.completion_tokens, 3);
         assert_eq!(stats.finish_reason, "length");
@@ -1070,13 +1178,13 @@ mod tests {
 
     #[test]
     fn nonstream_response_without_generated_text_is_refused() {
-        assert!(certify_nonstream(&nonstream_body(json!("hello"), "length")).is_ok());
+        assert!(certify_nonstream(&nonstream_body(json!("hello"), "length"), MAX_TOKENS).is_ok());
         assert!(matches!(
-            certify_nonstream(&nonstream_body(json!(""), "length")),
+            certify_nonstream(&nonstream_body(json!(""), "length"), MAX_TOKENS),
             Err(Refusal::EmptyContent)
         ));
         assert!(matches!(
-            certify_nonstream(&nonstream_body(Value::Null, "length")),
+            certify_nonstream(&nonstream_body(Value::Null, "length"), MAX_TOKENS),
             Err(Refusal::MalformedBody(_))
         ));
         let no_message = json!({
@@ -1085,7 +1193,7 @@ mod tests {
         })
         .to_string();
         assert!(matches!(
-            certify_nonstream(&no_message),
+            certify_nonstream(&no_message, MAX_TOKENS),
             Err(Refusal::MalformedBody(_))
         ));
     }
@@ -1093,7 +1201,7 @@ mod tests {
     #[test]
     fn empty_finish_reason_is_refused_in_both_modes() {
         assert!(matches!(
-            certify_nonstream(&nonstream_body(json!("hello"), "")),
+            certify_nonstream(&nonstream_body(json!("hello"), ""), MAX_TOKENS),
             Err(Refusal::EmptyFinishReason)
         ));
         let events = vec![
@@ -1103,25 +1211,82 @@ mod tests {
             "[DONE]".to_string(),
         ];
         assert!(matches!(
-            certify_stream(&feed(&events).unwrap()),
+            certify_stream(&feed(&events).unwrap(), MAX_TOKENS),
             Err(Refusal::EmptyFinishReason)
         ));
+    }
+
+    #[test]
+    fn unknown_finish_reason_is_refused_in_both_modes() {
+        for reason in SERVER_FINISH_REASONS {
+            assert!(certify_nonstream(&nonstream_body(json!("hello"), reason), MAX_TOKENS).is_ok());
+        }
+        assert!(matches!(
+            certify_nonstream(&nonstream_body(json!("hello"), "not-a-finish-reason"), MAX_TOKENS),
+            Err(Refusal::UnknownFinishReason(reason)) if reason == "not-a-finish-reason"
+        ));
+        let events = vec![
+            role_chunk(),
+            data_chunk("Hel", None),
+            data_chunk("", Some("not-a-finish-reason")),
+            "[DONE]".to_string(),
+        ];
+        assert!(matches!(
+            certify_stream(&feed(&events).unwrap(), MAX_TOKENS),
+            Err(Refusal::UnknownFinishReason(reason)) if reason == "not-a-finish-reason"
+        ));
+    }
+
+    #[test]
+    fn completion_tokens_above_the_requested_max_tokens_are_refused() {
+        let over = json!({
+            "choices": [{"message": {"role": "assistant", "content": "hello"}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": MAX_TOKENS + 1, "total_tokens": 7},
+        })
+        .to_string();
+        assert!(matches!(
+            certify_nonstream(&over, MAX_TOKENS),
+            Err(Refusal::TokensOverBudget { reported, max_tokens })
+                if reported == MAX_TOKENS + 1 && max_tokens == MAX_TOKENS
+        ));
+        let at_the_limit = over.replace(&(MAX_TOKENS + 1).to_string(), &MAX_TOKENS.to_string());
+        assert!(certify_nonstream(&at_the_limit, MAX_TOKENS).is_ok());
+    }
+
+    #[test]
+    fn stream_with_more_content_deltas_than_max_tokens_is_refused() {
+        let tally = feed(&complete_events()).unwrap();
+        assert_eq!(tally.content_deltas, 2);
+        assert!(certify_stream(&tally, 2).is_ok());
+        assert!(matches!(
+            certify_stream(&tally, 1),
+            Err(Refusal::TokensOverBudget {
+                reported: 2,
+                max_tokens: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn stream_event_with_an_empty_data_payload_is_refused() {
+        let events = vec![role_chunk(), data_chunk("Hel", None), String::new()];
+        assert!(matches!(feed(&events), Err(Refusal::MalformedBody(_))));
     }
 
     #[test]
     fn nonstream_body_without_usage_or_with_an_error_is_refused() {
         let no_usage = json!({"choices": [{"finish_reason": "stop"}]}).to_string();
         assert!(matches!(
-            certify_nonstream(&no_usage),
+            certify_nonstream(&no_usage, MAX_TOKENS),
             Err(Refusal::MalformedBody(_))
         ));
         let error = json!({"error": {"message": "inference failed"}}).to_string();
         assert!(matches!(
-            certify_nonstream(&error),
+            certify_nonstream(&error, MAX_TOKENS),
             Err(Refusal::ServerError(_))
         ));
         assert!(matches!(
-            certify_nonstream("not json"),
+            certify_nonstream("not json", MAX_TOKENS),
             Err(Refusal::MalformedBody(_))
         ));
     }
@@ -1145,7 +1310,7 @@ mod tests {
             data_chunk("", Some("length")),
         ];
         events.push("[DONE]".to_string());
-        let stats = certify_stream(&feed(&events).unwrap()).unwrap();
+        let stats = certify_stream(&feed(&events).unwrap(), MAX_TOKENS).unwrap();
         assert_eq!(stats.deltas, 2);
         assert_eq!(stats.first_event_ms, 0.0);
         assert_eq!(stats.first_delta_ms, 1.0);
@@ -1160,7 +1325,7 @@ mod tests {
             "[DONE]".to_string(),
         ];
         assert!(matches!(
-            certify_stream(&feed(&events).unwrap()),
+            certify_stream(&feed(&events).unwrap(), MAX_TOKENS),
             Err(Refusal::NoContentDelta)
         ));
     }
@@ -1174,7 +1339,7 @@ mod tests {
             "[DONE]".to_string(),
         ];
         assert!(matches!(
-            certify_stream(&feed(&events).unwrap()),
+            certify_stream(&feed(&events).unwrap(), MAX_TOKENS),
             Err(Refusal::StreamError(_))
         ));
     }
@@ -1187,12 +1352,12 @@ mod tests {
             data_chunk("", Some("length")),
         ];
         assert!(matches!(
-            certify_stream(&feed(&no_done).unwrap()),
+            certify_stream(&feed(&no_done).unwrap(), MAX_TOKENS),
             Err(Refusal::StreamUnfinished)
         ));
         let no_finish = vec![role_chunk(), data_chunk("Hel", None), "[DONE]".to_string()];
         assert!(matches!(
-            certify_stream(&feed(&no_finish).unwrap()),
+            certify_stream(&feed(&no_finish).unwrap(), MAX_TOKENS),
             Err(Refusal::StreamUnfinished)
         ));
     }
@@ -1209,7 +1374,7 @@ mod tests {
 
     #[test]
     fn any_event_after_done_is_refused() {
-        assert!(certify_stream(&feed(&complete_events()).unwrap()).is_ok());
+        assert!(certify_stream(&feed(&complete_events()).unwrap(), MAX_TOKENS).is_ok());
         for late in [
             data_chunk("late", None),
             json!({"error": {"message": "late failure"}}).to_string(),
@@ -1220,7 +1385,7 @@ mod tests {
             events.push(late.clone());
             assert!(
                 matches!(
-                    certify_stream(&feed(&events).unwrap()),
+                    certify_stream(&feed(&events).unwrap(), MAX_TOKENS),
                     Err(Refusal::DataAfterDone)
                 ),
                 "{late}"
@@ -1247,11 +1412,20 @@ mod tests {
                 dispatched.push(event);
             }
         }
-        assert_eq!(dispatched, vec!["{\"a\":\n1}".to_string()]);
+        assert_eq!(
+            dispatched,
+            vec!["{\"a\":\n1}".to_string(), String::new()],
+            "an event whose data is empty is dispatched so it can be refused"
+        );
         assert!(serde_json::from_str::<Value>(&dispatched[0]).is_ok());
         assert!(events.is_pending(), "[DONE] has no blank line yet");
         assert_eq!(events.push_line("\n"), Some("[DONE]".to_string()));
         assert!(!events.is_pending());
+        assert_eq!(
+            events.push_line("\n"),
+            None,
+            "a blank line with no data field is not an event"
+        );
     }
 
     #[test]
@@ -1295,6 +1469,7 @@ mod tests {
     enum Fake {
         Healthy,
         ZeroTokens,
+        OverBudget,
         NoDeltas,
     }
 
@@ -1357,7 +1532,11 @@ mod tests {
             stream.write_all(b"0\r\n\r\n").ok()?;
             return Some(());
         }
-        let completion = if mode == Fake::ZeroTokens { 0 } else { 3 };
+        let completion = match mode {
+            Fake::ZeroTokens => 0,
+            Fake::OverBudget => MAX_TOKENS + 1,
+            _ => 3,
+        };
         let payload = json!({
             "choices": [{"message": {"role": "assistant", "content": "hello"}, "finish_reason": "length"}],
             "usage": {"prompt_tokens": 7, "completion_tokens": completion, "total_tokens": 7 + completion},
@@ -1446,7 +1625,7 @@ mod tests {
     }
 
     fn probe_body() -> Value {
-        json!({"stream": true})
+        json!({"stream": true, "max_tokens": MAX_TOKENS})
     }
 
     #[test]
@@ -1458,6 +1637,22 @@ mod tests {
         let outcome = client_for(port, Duration::from_secs(10)).run_stream(&probe_body());
         assert!(
             matches!(outcome, Err(Refusal::DataAfterDone)),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn http_stream_with_an_empty_data_event_is_refused() {
+        let mut frames = sse_frames(&[role_chunk(), data_chunk("Hel", None)]);
+        frames.push("data:\n\n".to_string());
+        frames.extend(sse_frames(&[
+            data_chunk("", Some("length")),
+            "[DONE]".to_string(),
+        ]));
+        let port = spawn_scripted_server(move |stream| serve_stream(stream, &frames, end_body));
+        let outcome = client_for(port, Duration::from_secs(10)).run_stream(&probe_body());
+        assert!(
+            matches!(outcome, Err(Refusal::MalformedBody(_))),
             "{outcome:?}"
         );
     }
@@ -1479,7 +1674,7 @@ mod tests {
         let frames = sse_frames(&complete_events());
         let port = spawn_scripted_server(move |stream| {
             serve_stream(stream, &frames, |_| {
-                std::thread::sleep(Duration::from_millis(1500));
+                std::thread::sleep(Duration::from_secs(4));
                 Some(())
             })
         });
@@ -1540,7 +1735,7 @@ mod tests {
     fn http_stream_that_trickles_past_the_request_deadline_is_refused() {
         let port = spawn_scripted_server(|stream| {
             serve_stream(stream, &sse_frames(&[role_chunk()]), |stream| {
-                for _ in 0..40 {
+                for _ in 0..30 {
                     write_chunk(stream, ": ping\n\n")?;
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -1559,10 +1754,10 @@ mod tests {
         let port = spawn_scripted_server(|stream| {
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\nconnection: close\r\n\r\n"
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 30\r\nconnection: close\r\n\r\n"
             )
             .ok()?;
-            for _ in 0..40 {
+            for _ in 0..30 {
                 stream.write_all(b" ").ok()?;
                 stream.flush().ok()?;
                 std::thread::sleep(Duration::from_millis(50));
@@ -1579,7 +1774,7 @@ mod tests {
     #[test]
     fn http_server_that_never_answers_is_refused_as_a_timeout() {
         let port = spawn_scripted_server(|_| {
-            std::thread::sleep(Duration::from_millis(1500));
+            std::thread::sleep(Duration::from_secs(4));
             Some(())
         });
         let outcome = client_for(port, Duration::from_millis(400)).run_nonstream(&probe_body());
@@ -1605,6 +1800,15 @@ mod tests {
         let (outcome, _) = measure_against(Fake::ZeroTokens);
         assert!(
             matches!(outcome, Err(Refusal::ZeroCompletionTokens)),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn http_response_reporting_more_tokens_than_requested_is_refused() {
+        let (outcome, _) = measure_against(Fake::OverBudget);
+        assert!(
+            matches!(outcome, Err(Refusal::TokensOverBudget { .. })),
             "{outcome:?}"
         );
     }

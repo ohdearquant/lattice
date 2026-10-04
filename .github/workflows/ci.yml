@@ -630,8 +630,9 @@ jobs:
       # but only while `serve` and `download` stay default features: cargo skips
       # a target whose required features are off and does not fail. Naming the
       # target turns that case into an error, and the count catches a module
-      # that was emptied. The step requires exactly one `test result:` line, so
-      # the count it reads is the example's own and not another target's.
+      # that was emptied. The step requires exactly one `test result:` line and
+      # exactly one cargo `Running unittests examples/bench_serve_http.rs` line,
+      # so the count it reads is the example's own and not another target's.
       - name: inference — bench_serve_http harness tests (example target)
         run: |
           set -euo pipefail
@@ -641,6 +642,11 @@ jobs:
             exit "$status"
           }
           printf '%s\n' "$out"
+          runs=$(printf '%s\n' "$out" | grep -c '^ *Running unittests examples/bench_serve_http\.rs (' || true)
+          if [ "$runs" -ne 1 ]; then
+            echo "expected exactly one 'Running unittests examples/bench_serve_http.rs' line, found $runs" >&2
+            exit 1
+          fi
           summaries=$(printf '%s\n' "$out" | grep -c '^test result: ' || true)
           if [ "$summaries" -ne 1 ]; then
             echo "expected exactly one 'test result:' line from the bench_serve_http target, found $summaries" >&2
@@ -651,6 +657,29 @@ jobs:
             echo "expected at least 32 passing bench_serve_http tests, parsed '${passed:-<none>}'" >&2
             exit 1
           fi
+      # The unit tests classify a missing checkpoint as a skip with exit code 2,
+      # but only `main` turns that classification into the process status. Run the
+      # example itself with the model directory pointing at an empty directory and
+      # require that status and its message, so a run that measured nothing cannot
+      # exit 0.
+      - name: inference — bench_serve_http exits 2 when no checkpoint is present (example target)
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d "${RUNNER_TEMP:-/tmp}/bench-serve-http.XXXXXX")
+          mkdir "$scratch/no-checkpoint"
+          rc=0
+          LATTICE_MODEL_DIR="$scratch/no-checkpoint" \
+            cargo run -p lattice-inference --example bench_serve_http \
+            >"$scratch/stdout" 2>"$scratch/stderr" || rc=$?
+          if [ "$rc" -ne 2 ] || ! grep -q '^SKIP reason=checkpoint_absent ' "$scratch/stdout"; then
+            echo "expected exit status 2 and a 'SKIP reason=checkpoint_absent' line, got status $rc" >&2
+            echo "--- stdout" >&2
+            cat "$scratch/stdout" >&2
+            echo "--- stderr" >&2
+            cat "$scratch/stderr" >&2
+            exit 1
+          fi
+          cat "$scratch/stdout"
       # The two metal-gpu legs above build the lattice-inference and lattice-embed
       # libraries (the embed leg pulls in lattice-inference/metal-gpu transitively),
       # so a stale-field constructor in either library is already caught there. What
