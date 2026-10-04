@@ -600,8 +600,8 @@ jobs:
           }
           printf '%s\n' "$out"
           passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
-          if [ -z "$passed" ] || [ "$passed" -lt 2 ]; then
-            echo "expected at least 2 passing allocation-arm controls, parsed '${passed:-<none>}'" >&2
+          if [ -z "$passed" ] || [ "$passed" -lt 4 ]; then
+            echo "expected at least 4 passing allocation-arm controls, parsed '${passed:-<none>}'" >&2
             exit 1
           fi
       # `cargo test --workspace`'s default target set is lib, bins, tests,
@@ -615,6 +615,26 @@ jobs:
       # the example target explicitly so they cannot silently rot.
       - name: transport — drift_compare example regressions (unreached by cargo test --workspace)
         run: cargo test -p lattice-transport --example drift_compare
+      # bench_suite decides whether a standalone-wrapper run may be certified: a
+      # named wrapper that printed SKIP or no ROUTE line must not be, and the
+      # refusal arm must match every control. Those tests live in the example's
+      # own test module, and the example requires `f16`, so neither
+      # `cargo test --workspace` nor a default-feature `--all-targets` run builds
+      # them. Run the target explicitly and read the count it reports.
+      - name: inference — bench_suite certification tests (example target, needs f16)
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p lattice-inference --features f16 --example bench_suite 2>&1) || {
+            status=$?
+            printf '%s\n' "$out"
+            exit "$status"
+          }
+          printf '%s\n' "$out"
+          passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
+          if [ -z "$passed" ] || [ "$passed" -lt 7 ]; then
+            echo "expected at least 7 passing bench_suite tests, parsed '${passed:-<none>}'" >&2
+            exit 1
+          fi
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
       - name: inference — metal-gpu (macOS only)
         if: runner.os == 'macOS'

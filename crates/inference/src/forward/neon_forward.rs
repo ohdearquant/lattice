@@ -1485,6 +1485,23 @@ mod tests {
         pack_weights_q8(&vec![0.0f32; n * k], n, k).unwrap()
     }
 
+    /// `generate_q8_neon` is `pub` in a published crate, so its signature is
+    /// part of the surface a later change to its body must not move. The
+    /// matching pins for `generate_f16` and `generate_q8` live in `cpu_f16` and
+    /// `cpu_q8`.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn generate_q8_neon_signature_is_pinned() {
+        let _generate: fn(
+            &Q8NeonModel,
+            &Qwen35Config,
+            &BpeTokenizer,
+            &RopeTable,
+            &str,
+            &GenerateConfig,
+        ) -> Result<GenerateOutput, InferenceError> = generate_q8_neon;
+    }
+
     #[test]
     fn test_quantize_model_produces_valid_packed_sizes() {
         let cfg = Qwen35Config::qwen35_2b();
