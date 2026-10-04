@@ -1,5 +1,6 @@
-//! Trie-accelerated vocabulary masking for grammar states outside the
-//! precomputed `VocabPartition` (issue #734).
+//! Trie-accelerated vocabulary walks for grammar constraints: the mask for
+//! states outside the precomputed `VocabPartition` (issue #734) and the
+//! per-state classification that builds the partition itself.
 //!
 //! # Motivation
 //!
@@ -23,11 +24,27 @@
 //! walk that fails to reach a token's terminal trie node covers both cases
 //! without needing to distinguish them.
 //!
+//! # Partition classification
+//!
+//! [`ByteTrie::classify`] walks the same trie from one grammar state and
+//! reproduces `simulate_token`'s three-way result for every token at once:
+//!
+//! - a byte rejected at the trie root rejects every token in that child's
+//!   subtree (`SimResult::Reject`, first-byte rejection);
+//! - a byte rejected below the root makes every token in that child's
+//!   subtree `SimResult::ContextDependent`;
+//! - a terminal reached through accepted edges only is `SimResult::Accept`.
+//!
+//! `VocabPartition` calls it once per precomputed state, so building the
+//! partition costs one shared-prefix walk per state instead of one
+//! `simulate_token` call per (state, token) pair.
+//!
 //! # DFS state handling
 //!
 //! Trie construction is independent of any grammar (it depends only on
-//! `vocab_bytes`), so the same trie is reused across every over-cap
-//! `mask_logits` call for a given engine. Masking DFS-walks the trie
+//! `vocab_bytes`). `GrammarEngine::new` builds it once, uses it to build the
+//! `VocabPartition`, and keeps it for every over-cap `mask_logits` call on
+//! that engine. Masking DFS-walks the trie
 //! carrying a live `GrammarState`, calling `advance_byte` once per trie
 //! edge:
 //!
@@ -158,6 +175,32 @@ impl ByteTrie {
             apply_allowed_mask(&allowed, vocab_size, logits);
         });
     }
+
+    /// Classify every vocabulary token against `state` in one walk, matching
+    /// `simulate_token` per token: `SimResult::Accept` tokens get their bit
+    /// set in `accepted`, `SimResult::ContextDependent` token ids are appended
+    /// to `context_dependent`, and `SimResult::Reject` tokens are left
+    /// untouched. Empty tokens are not in the trie and so are never reported.
+    ///
+    /// `accepted` must hold `vocab_size.div_ceil(64)` words; bits are only
+    /// ever OR-ed in. `context_dependent` ids arrive in trie-walk order, not
+    /// token-id order, so a caller that needs them sorted sorts them.
+    pub(crate) fn classify(
+        &self,
+        state: &GrammarState,
+        grammar: &CompiledGrammar,
+        accepted: &mut [u64],
+        context_dependent: &mut Vec<usize>,
+    ) {
+        classify_node(
+            &self.nodes,
+            0,
+            walk_root_state(state),
+            grammar,
+            accepted,
+            context_dependent,
+        );
+    }
 }
 
 /// Build the DFS walk's root state from the live decode-step `state`.
@@ -218,6 +261,74 @@ fn mark_allowed(
     let mut last_state = state;
     if advance_byte(&mut last_state, grammar, byte) == StepResult::Accepted {
         mark_allowed(nodes, child_idx, last_state, grammar, allowed);
+    }
+}
+
+/// DFS from `node_idx` carrying an owned live `state`, classifying tokens the
+/// way `simulate_token` does. Terminals at a node reached through accepted
+/// edges are `Accept`. A rejected child edge drops its whole subtree: at the
+/// root that is `Reject` (nothing to record), below the root every token in
+/// it is `ContextDependent`.
+fn classify_node(
+    nodes: &[TrieNode],
+    node_idx: u32,
+    state: GrammarState,
+    grammar: &CompiledGrammar,
+    accepted: &mut [u64],
+    context_dependent: &mut Vec<usize>,
+) {
+    let node = &nodes[node_idx as usize];
+    for &token_id in &node.terminals {
+        let idx = token_id as usize;
+        accepted[idx / 64] |= 1u64 << (idx % 64);
+    }
+
+    let children = &node.children;
+    let Some((&last, rest)) = children.split_last() else {
+        return;
+    };
+    let below_root = node_idx != 0;
+
+    // Same clone-avoidance as `mark_allowed`: only non-last children clone.
+    for &(byte, child_idx) in rest {
+        let mut child_state = state.clone();
+        if advance_byte(&mut child_state, grammar, byte) == StepResult::Accepted {
+            classify_node(
+                nodes,
+                child_idx,
+                child_state,
+                grammar,
+                accepted,
+                context_dependent,
+            );
+        } else if below_root {
+            collect_subtree_terminals(nodes, child_idx, context_dependent);
+        }
+    }
+
+    let (byte, child_idx) = last;
+    let mut last_state = state;
+    if advance_byte(&mut last_state, grammar, byte) == StepResult::Accepted {
+        classify_node(
+            nodes,
+            child_idx,
+            last_state,
+            grammar,
+            accepted,
+            context_dependent,
+        );
+    } else if below_root {
+        collect_subtree_terminals(nodes, child_idx, context_dependent);
+    }
+}
+
+/// Append every terminal token id in the subtree rooted at `node_idx`
+/// (including the node's own terminals). Needs no PDA work.
+fn collect_subtree_terminals(nodes: &[TrieNode], node_idx: u32, out: &mut Vec<usize>) {
+    let node = &nodes[node_idx as usize];
+    out.extend(node.terminals.iter().map(|&t| t as usize));
+    for &(_, child_idx) in &node.children {
+        collect_subtree_terminals(nodes, child_idx, out);
     }
 }
 

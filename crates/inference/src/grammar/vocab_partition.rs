@@ -26,7 +26,11 @@
 //! # Usage
 //!
 //! 1. `VocabPartition::build(grammar, grammar_states, vocab_bytes)` — called once
-//!    at `GrammarEngine::new` time.
+//!    at `GrammarEngine::new` time (which uses `build_from_trie` with the trie
+//!    it keeps for the runtime fallback). It builds a byte trie over the
+//!    vocabulary and walks it once per grammar state, so a rejected byte
+//!    prunes every token sharing that prefix instead of simulating each
+//!    (state, token) pair separately.
 //! 2. `VocabPartition::apply_mask(state_id, logits)` — called per decode step.
 //! 3. `VocabPartition::context_dependent_ids_for_state(state_id)` — returns
 //!    the token ids that need runtime PDA inspection in the current state,
@@ -34,7 +38,8 @@
 //!    under the aggregate capacity budget falls back to the global union
 //!    across every state.
 
-use crate::grammar::pda::{CompiledGrammar, GrammarState, SimResult, simulate_token};
+use crate::grammar::pda::{CompiledGrammar, GrammarState};
+use crate::grammar::trie::ByteTrie;
 
 /// Maximum number of grammar states for v0.
 /// A grammar with more states triggers a warning at build time.
@@ -63,19 +68,42 @@ pub struct VocabPartition {
 }
 
 impl VocabPartition {
-    /// Build the vocabulary partition by simulating every (state, token) pair.
+    /// Build the vocabulary partition by walking a byte trie over the
+    /// vocabulary once per grammar state.
     ///
     /// `grammar_states` are the grammar states to precompute masks for.
     /// `vocab_bytes[i]` is the byte sequence for token `i`.
     ///
-    /// This runs in O(|states| × |vocab| × |token_length|) time and is
-    /// called once at `GrammarEngine::new` time.
+    /// Builds a [`ByteTrie`] over `vocab_bytes` and delegates to
+    /// [`Self::build_from_trie`]. Callers that already hold a trie for this
+    /// vocabulary (`GrammarEngine::new`) use that entry point directly so the
+    /// trie is built once.
     pub fn build(
         grammar: &CompiledGrammar,
         grammar_states: Vec<GrammarState>,
         vocab_bytes: &[Vec<u8>],
     ) -> Self {
-        let vocab_size = vocab_bytes.len();
+        let trie = ByteTrie::build(vocab_bytes);
+        Self::build_from_trie(grammar, grammar_states, vocab_bytes.len(), &trie)
+    }
+
+    /// Build the vocabulary partition from a prebuilt `trie` over a
+    /// vocabulary of `vocab_size` tokens.
+    ///
+    /// For each precomputed state, one [`ByteTrie::classify`] walk visits the
+    /// vocabulary's shared byte prefixes and classifies every token the way
+    /// `simulate_token` would: a rejected first byte rejects the token, a
+    /// rejection after the first byte makes it context-dependent, and a fully
+    /// accepted token is allowed. Cost is O(|states| × trie nodes) PDA steps
+    /// plus the size of each state's context-dependent set; a rejected byte
+    /// prunes every token sharing that prefix at once. `trie` must have been
+    /// built from the same vocabulary of `vocab_size` tokens.
+    pub(crate) fn build_from_trie(
+        grammar: &CompiledGrammar,
+        grammar_states: Vec<GrammarState>,
+        vocab_size: usize,
+        trie: &ByteTrie,
+    ) -> Self {
         let mask_stride = vocab_size.div_ceil(64);
         let num_states = grammar_states.len();
 
@@ -90,7 +118,9 @@ impl VocabPartition {
 
         let effective_states = num_states.min(MAX_GRAMMAR_STATES);
         let mut masks = vec![0u64; effective_states * mask_stride];
-        let mut ctx_dep_set = std::collections::HashSet::new();
+        // Bitset over token ids: the union of every state's context-dependent
+        // ids, read back in increasing id order.
+        let mut ctx_dep_bits = vec![0u64; mask_stride];
         let mut context_dependent_by_state = Vec::with_capacity(effective_states);
         // Keep the aggregate payload capacity of the new state-local lists no
         // larger than the existing mask table. A dense adversarial grammar can
@@ -102,34 +132,21 @@ impl VocabPartition {
         let mut context_entries_stored = 0usize;
 
         for (state_id, grammar_state) in grammar_states[..effective_states].iter().enumerate() {
+            let state_mask = &mut masks[state_id * mask_stride..(state_id + 1) * mask_stride];
             let mut state_context_dependent = Vec::new();
-            for (token_id, token_bytes) in vocab_bytes.iter().enumerate() {
-                // Skip empty tokens.
-                if token_bytes.is_empty() {
-                    continue;
-                }
-
-                let (sim_result, _) = simulate_token(grammar_state, grammar, token_bytes);
-                match sim_result {
-                    SimResult::Accept => {
-                        // Set bit for this token in state's mask.
-                        let word = token_id / 64;
-                        let bit = token_id % 64;
-                        masks[state_id * mask_stride + word] |= 1u64 << bit;
-                    }
-                    SimResult::ContextDependent => {
-                        // Mark as context-dependent.
-                        ctx_dep_set.insert(token_id);
-                        state_context_dependent.push(token_id);
-                        // Also set the bit optimistically (runtime check will verify).
-                        let word = token_id / 64;
-                        let bit = token_id % 64;
-                        masks[state_id * mask_stride + word] |= 1u64 << bit;
-                    }
-                    SimResult::Reject => {
-                        // Bit remains 0 (token disallowed).
-                    }
-                }
+            trie.classify(
+                grammar_state,
+                grammar,
+                state_mask,
+                &mut state_context_dependent,
+            );
+            // The walk emits ids in trie order; the stored list is in
+            // increasing token id order.
+            state_context_dependent.sort_unstable();
+            for &token_id in &state_context_dependent {
+                // Also set the bit optimistically (runtime check will verify).
+                state_mask[token_id / 64] |= 1u64 << (token_id % 64);
+                ctx_dep_bits[token_id / 64] |= 1u64 << (token_id % 64);
             }
             state_context_dependent.shrink_to_fit();
             let stored_capacity = state_context_dependent.capacity();
@@ -141,8 +158,14 @@ impl VocabPartition {
             }
         }
 
-        let mut context_dependent: Vec<usize> = ctx_dep_set.into_iter().collect();
-        context_dependent.sort_unstable();
+        let mut context_dependent = Vec::new();
+        for (word_idx, &word) in ctx_dep_bits.iter().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                context_dependent.push(word_idx * 64 + word.trailing_zeros() as usize);
+                word &= word - 1;
+            }
+        }
 
         Self {
             masks,
@@ -261,8 +284,11 @@ impl VocabPartition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grammar::gbnf::parse_gbnf;
+    use crate::grammar::json_schema::compile;
     use crate::grammar::pda::{
-        CompiledGrammar, GrammarBuilder, GrammarState, Rule, StepResult, Symbol, advance_byte,
+        CompiledGrammar, GrammarBuilder, GrammarState, Rule, SimResult, StepResult, Symbol,
+        advance_byte, initial_grammar_state, simulate_token,
     };
 
     /// Grammar: root = 'a' | 'b'
@@ -473,6 +499,363 @@ mod tests {
                 partition.context_dependent_ids_for_state(state_id),
                 partition.context_dependent_ids()
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Equivalence with the per-token simulation the trie walk replaced
+    // -----------------------------------------------------------------------
+
+    /// The pre-trie construction, kept as the oracle: simulates every
+    /// (state, token) pair independently with `simulate_token`.
+    fn build_by_simulation(
+        grammar: &CompiledGrammar,
+        grammar_states: Vec<GrammarState>,
+        vocab_bytes: &[Vec<u8>],
+    ) -> VocabPartition {
+        let vocab_size = vocab_bytes.len();
+        let mask_stride = vocab_size.div_ceil(64);
+        let num_states = grammar_states.len();
+        let effective_states = num_states.min(MAX_GRAMMAR_STATES);
+        let mut masks = vec![0u64; effective_states * mask_stride];
+        let mut ctx_dep_set = std::collections::HashSet::new();
+        let mut context_dependent_by_state = Vec::with_capacity(effective_states);
+        let context_entry_budget =
+            masks.len().saturating_mul(std::mem::size_of::<u64>()) / std::mem::size_of::<usize>();
+        let mut context_entries_stored = 0usize;
+
+        for (state_id, grammar_state) in grammar_states[..effective_states].iter().enumerate() {
+            let mut state_context_dependent = Vec::new();
+            for (token_id, token_bytes) in vocab_bytes.iter().enumerate() {
+                if token_bytes.is_empty() {
+                    continue;
+                }
+                let (sim_result, _) = simulate_token(grammar_state, grammar, token_bytes);
+                match sim_result {
+                    SimResult::Accept => {
+                        masks[state_id * mask_stride + token_id / 64] |= 1u64 << (token_id % 64);
+                    }
+                    SimResult::ContextDependent => {
+                        ctx_dep_set.insert(token_id);
+                        state_context_dependent.push(token_id);
+                        masks[state_id * mask_stride + token_id / 64] |= 1u64 << (token_id % 64);
+                    }
+                    SimResult::Reject => {}
+                }
+            }
+            state_context_dependent.shrink_to_fit();
+            let stored_capacity = state_context_dependent.capacity();
+            if context_entries_stored.saturating_add(stored_capacity) <= context_entry_budget {
+                context_entries_stored += stored_capacity;
+                context_dependent_by_state.push(Some(state_context_dependent));
+            } else {
+                context_dependent_by_state.push(None);
+            }
+        }
+
+        let mut context_dependent: Vec<usize> = ctx_dep_set.into_iter().collect();
+        context_dependent.sort_unstable();
+
+        VocabPartition {
+            masks,
+            mask_stride,
+            vocab_size,
+            states: grammar_states,
+            context_dependent,
+            context_dependent_by_state,
+        }
+    }
+
+    /// Breadth-first reachable states, expanded by simulating every token
+    /// (same rule as the engine's enumeration): the states keep the byte
+    /// history `simulate_token` leaves behind, as they do in production.
+    fn reachable_states(
+        grammar: &CompiledGrammar,
+        vocab: &[Vec<u8>],
+        max_states: usize,
+    ) -> Vec<GrammarState> {
+        let initial = initial_grammar_state(grammar);
+        let mut queue = vec![initial.clone()];
+        let mut visited = vec![initial];
+        let mut head = 0;
+        while head < queue.len() && visited.len() < max_states {
+            let state = queue[head].clone();
+            head += 1;
+            for token in vocab.iter().filter(|t| !t.is_empty()) {
+                let (result, next) = simulate_token(&state, grammar, token);
+                if result != SimResult::Reject
+                    && !visited
+                        .iter()
+                        .any(|s| s.stack == next.stack && s.complete == next.complete)
+                {
+                    visited.push(next.clone());
+                    if visited.len() < max_states {
+                        queue.push(next);
+                    }
+                }
+            }
+        }
+        visited
+    }
+
+    fn assert_partitions_equal(got: &VocabPartition, want: &VocabPartition, label: &str) {
+        assert_eq!(got.vocab_size, want.vocab_size, "{label}: vocab_size");
+        assert_eq!(got.mask_stride, want.mask_stride, "{label}: mask_stride");
+        assert_eq!(got.states.len(), want.states.len(), "{label}: state count");
+        assert_eq!(got.masks, want.masks, "{label}: masks");
+        assert_eq!(
+            got.context_dependent, want.context_dependent,
+            "{label}: global context_dependent"
+        );
+        assert_eq!(
+            got.context_dependent_by_state, want.context_dependent_by_state,
+            "{label}: context_dependent_by_state"
+        );
+    }
+
+    /// Builds with both constructions (and through a prebuilt trie) and
+    /// requires every field to match.
+    fn assert_trie_build_matches_oracle(
+        grammar: &CompiledGrammar,
+        states: Vec<GrammarState>,
+        vocab: &[Vec<u8>],
+        label: &str,
+    ) -> VocabPartition {
+        let want = build_by_simulation(grammar, states.clone(), vocab);
+        let got = VocabPartition::build(grammar, states.clone(), vocab);
+        assert_partitions_equal(&got, &want, label);
+        let trie = ByteTrie::build(vocab);
+        let from_trie = VocabPartition::build_from_trie(grammar, states, vocab.len(), &trie);
+        assert_partitions_equal(&from_trie, &want, label);
+        got
+    }
+
+    /// All 256 single bytes, JSON-shaped multi-byte tokens sharing prefixes,
+    /// two ids on one byte sequence, and an empty token.
+    fn equivalence_vocab() -> Vec<Vec<u8>> {
+        let mut vocab: Vec<Vec<u8>> = (0u16..256).map(|b| vec![b as u8]).collect();
+        for frag in [
+            "\"name\"",
+            "\"nam",
+            "\"na",
+            "\"age\"",
+            "\"a",
+            "\":",
+            "\": ",
+            "\":1",
+            ",\"",
+            ",\"n",
+            "{\"",
+            "{\"name\":",
+            "}",
+            "},",
+            "[]",
+            "[1,2]",
+            "[\"",
+            "true",
+            "tru",
+            "false",
+            "null",
+            "12",
+            "123",
+            "-1",
+            "1.5",
+            "ab",
+            "ac",
+            "ad",
+            "abc",
+            "abd",
+            "abcd",
+            "ax",
+            "abx",
+            "red",
+            "re",
+            "green",
+            "\"red\"",
+            "\"green\"",
+        ] {
+            vocab.push(frag.as_bytes().to_vec());
+        }
+        vocab.push(Vec::new());
+        // Duplicate byte sequences under distinct ids.
+        vocab.push(b"\"name\"".to_vec());
+        vocab.push(b"a".to_vec());
+        vocab.push(Vec::new());
+        vocab
+    }
+
+    fn optional_properties_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+                "email": {"type": "string"},
+                "active": {"type": "boolean"},
+                "score": {"type": "number"},
+                "title": {"type": "string"},
+                "city": {"type": "string"},
+                "zip": {"type": "string"},
+                "phone": {"type": "string"},
+                "note": {"type": "string"}
+            }
+        })
+    }
+
+    fn enum_and_array_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "color": {"type": "string", "enum": ["red", "green", "blue"]},
+                "ids": {"type": "array", "items": {"type": "integer"}},
+                "tags": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["color", "ids"]
+        })
+    }
+
+    #[test]
+    fn trie_build_matches_oracle_for_optional_properties_schema() {
+        let grammar = compile(&optional_properties_schema()).unwrap();
+        let vocab = equivalence_vocab();
+        let states = reachable_states(&grammar, &vocab, MAX_GRAMMAR_STATES);
+        assert!(
+            states.len() > 10,
+            "schema must reach many states, got {}",
+            states.len()
+        );
+        let partition =
+            assert_trie_build_matches_oracle(&grammar, states, &vocab, "optional properties");
+        assert!(
+            !partition.context_dependent_ids().is_empty(),
+            "fixture must exercise context-dependent tokens"
+        );
+    }
+
+    #[test]
+    fn trie_build_matches_oracle_for_enum_and_array_schema() {
+        let grammar = compile(&enum_and_array_schema()).unwrap();
+        let vocab = equivalence_vocab();
+        let states = reachable_states(&grammar, &vocab, MAX_GRAMMAR_STATES);
+        assert_trie_build_matches_oracle(&grammar, states, &vocab, "enum and array");
+    }
+
+    #[test]
+    fn trie_build_matches_oracle_for_gbnf_alternatives_sharing_a_first_byte() {
+        let grammar = parse_gbnf("root ::= \"ab\" | \"ac\" | \"abcd\" | \"ad\" \"x\"\n").unwrap();
+        let vocab = equivalence_vocab();
+        let states = reachable_states(&grammar, &vocab, MAX_GRAMMAR_STATES);
+        assert!(states.len() > 1);
+        assert_trie_build_matches_oracle(&grammar, states, &vocab, "gbnf shared first byte");
+    }
+
+    #[test]
+    fn trie_build_matches_oracle_when_tokens_straddle_a_boundary() {
+        // "ax" and "abx" get past their first byte and are then rejected, so
+        // they are context-dependent where "x" alone is rejected outright.
+        let mut builder = GrammarBuilder::new();
+        builder.add_rule(
+            "root",
+            vec![b"abcd".iter().copied().map(Symbol::Terminal).collect()],
+        );
+        let grammar = builder.build();
+        let vocab = equivalence_vocab();
+        let states = reachable_states(&grammar, &vocab, MAX_GRAMMAR_STATES);
+        let partition = assert_trie_build_matches_oracle(&grammar, states, &vocab, "straddle");
+        let ax = vocab.iter().position(|t| t == b"ax").unwrap();
+        let abx = vocab.iter().position(|t| t == b"abx").unwrap();
+        assert!(partition.context_dependent_ids().contains(&ax));
+        assert!(partition.context_dependent_ids().contains(&abx));
+        assert!(partition.context_dependent_ids_for_state(0).contains(&ax));
+    }
+
+    #[test]
+    fn trie_build_matches_oracle_when_the_context_entry_budget_is_exceeded() {
+        let mut builder = GrammarBuilder::new();
+        builder.add_rule(
+            "root",
+            vec![b"aaaa".iter().copied().map(Symbol::Terminal).collect()],
+        );
+        let grammar = builder.build();
+        let state0 = GrammarState::initial();
+        let mut state1 = state0.clone();
+        assert_eq!(
+            advance_byte(&mut state1, &grammar, b'a'),
+            StepResult::Accepted
+        );
+        let mut state2 = state1.clone();
+        assert_eq!(
+            advance_byte(&mut state2, &grammar, b'a'),
+            StepResult::Accepted
+        );
+        let states = vec![state0, state1, state2];
+
+        // 3 states x 2 mask words = a 6-entry budget. Four context-dependent
+        // ids per state fit once and then overflow, so one `Some` precedes
+        // the `None`s.
+        let mut vocab = vec![b"ax".to_vec(); 4];
+        vocab.extend(std::iter::repeat_n(b"c".to_vec(), 66));
+        let mixed = assert_trie_build_matches_oracle(&grammar, states.clone(), &vocab, "mixed");
+        assert!(mixed.context_dependent_by_state[0].is_some());
+        assert!(mixed.context_dependent_by_state[1].is_none());
+
+        // Every state's list alone is over budget.
+        let dense = vec![b"ax".to_vec(); 128];
+        let all_none = assert_trie_build_matches_oracle(&grammar, states, &dense, "dense");
+        assert!(
+            all_none
+                .context_dependent_by_state
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn trie_build_matches_oracle_past_the_state_cap() {
+        let mut chain = Vec::new();
+        chain.extend(std::iter::repeat_n(Symbol::Terminal(b'a'), 300));
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![chain],
+            }],
+        };
+        let mut states = vec![GrammarState::initial()];
+        while states.len() < MAX_GRAMMAR_STATES + 14 {
+            let mut next = states.last().unwrap().clone();
+            assert_eq!(
+                advance_byte(&mut next, &grammar, b'a'),
+                StepResult::Accepted
+            );
+            states.push(next);
+        }
+        assert!(states.len() > MAX_GRAMMAR_STATES);
+        let vocab = vec![
+            b"a".to_vec(),
+            b"aa".to_vec(),
+            b"ab".to_vec(),
+            b"b".to_vec(),
+            Vec::new(),
+            b"a".to_vec(),
+        ];
+        let partition = assert_trie_build_matches_oracle(&grammar, states, &vocab, "state cap");
+        assert_eq!(partition.num_states(), MAX_GRAMMAR_STATES);
+        assert_eq!(
+            partition.context_dependent_by_state.len(),
+            MAX_GRAMMAR_STATES
+        );
+    }
+
+    #[test]
+    fn trie_build_with_only_empty_tokens_sets_no_bits() {
+        let grammar = or_grammar();
+        let states = vec![GrammarState::initial()];
+        for vocab in [vec![Vec::new(); 97], Vec::new()] {
+            let partition =
+                assert_trie_build_matches_oracle(&grammar, states.clone(), &vocab, "empty vocab");
+            assert!(partition.masks.iter().all(|&w| w == 0));
+            assert!(partition.context_dependent_ids().is_empty());
+            assert_eq!(partition.context_dependent_by_state, vec![Some(Vec::new())]);
         }
     }
 }

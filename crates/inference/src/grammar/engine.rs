@@ -34,13 +34,14 @@
 //!   global union across all states when it was withheld under the
 //!   partition's aggregate capacity budget.
 //! - `advance`: O(stack_depth) PDA step; typical depth 2–8.
-//! - `new`: O(|states| × vocab_size × max_token_len) — called once. `|states|`
-//!   is capped at `MAX_GRAMMAR_STATES` (256) and is the dominant, schema-
-//!   dependent factor; see [`GrammarEngine::new`] for measured figures at
-//!   both ends of that range.
-//! - First `mask_logits` call on a state past the cap: builds a byte trie
-//!   over the vocabulary, `O(vocab_size × max_token_len)` with no `|states|`
-//!   term. See [`GrammarEngine::trie_build_ns`] for a measured figure.
+//! - `new`: builds a byte trie over the vocabulary once
+//!   (`O(vocab_size × max_token_len)`, no `|states|` term; see
+//!   [`GrammarEngine::trie_build_ns`]), then walks it once per precomputed
+//!   state to build the partition. `|states|` is capped at
+//!   `MAX_GRAMMAR_STATES` (256) and is the schema-dependent factor in the
+//!   walk phase; see [`GrammarEngine::new`].
+//! - `mask_logits` on a state past the cap: reuses the trie built in `new`,
+//!   with no build cost on the first such call.
 
 use crate::grammar::gbnf::parse_gbnf;
 use crate::grammar::json_schema::compile;
@@ -53,7 +54,6 @@ use crate::grammar::trie::ByteTrie;
 use crate::grammar::vocab_partition::VocabPartition;
 use std::fmt;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Profiling instrumentation (issue #734 diagnostics)
@@ -339,15 +339,13 @@ pub struct GrammarEngine {
     /// no precomputed mask and fall back to `mask_by_trie`. See
     /// `exceeds_state_budget`.
     state_limit_exceeded: bool,
-    /// Byte trie over `vocab_bytes`, used by `mask_by_trie` for states with
-    /// no precomputed mask. Built lazily on first use (`OnceLock`) so
-    /// grammars that never exceed `MAX_GRAMMAR_STATES` — the common case —
-    /// never pay the build cost.
+    /// Byte trie over `vocab_bytes`. Built once in `new`, used there to build
+    /// `partition`, and kept for `mask_by_trie` on states with no
+    /// precomputed mask. Always populated after `new`; the `OnceLock` only
+    /// lets `mask_by_trie` borrow it without a panicking accessor.
     trie: OnceLock<ByteTrie>,
-    /// Nanoseconds spent building `trie`, captured the one time
-    /// `trie.get_or_init` actually runs the builder. Zero until the trie
-    /// has been built at least once.
-    trie_build_ns: AtomicU64,
+    /// Nanoseconds `new` spent building `trie`.
+    trie_build_ns: u64,
 }
 
 impl GrammarEngine {
@@ -356,12 +354,21 @@ impl GrammarEngine {
     /// `vocab_bytes[i]` is the UTF-8 / byte-level representation of token `i`.
     /// For BPE tokenizers, obtain this via `BpeTokenizer::vocab_bytes(model_vocab_size)`.
     ///
-    /// This runs in O(|states| × vocab_size × max_token_len) time, where
+    /// Construction builds a byte trie over the vocabulary
+    /// (`O(vocab_size × max_token_len)`, see [`Self::trie_build_ns`]) and
+    /// then walks it once per precomputed state to build the partition. The
+    /// walk phase scales with `|states| × trie nodes` PDA steps, where
     /// `|states|` is capped at `MAX_GRAMMAR_STATES` (256, see
-    /// `vocab_partition::MAX_GRAMMAR_STATES`) and is schema-dependent — a
-    /// timing figure is only meaningful alongside the `|states|` it was
-    /// measured at. Two reference points against the real Qwen3 tokenizer
-    /// (248,320 tokens):
+    /// `vocab_partition::MAX_GRAMMAR_STATES`) and is schema-dependent. State
+    /// enumeration (`enumerate_grammar_states`) still simulates every token
+    /// from each state it expands and is timed separately as
+    /// `BuildProfile::bfs_ns`.
+    ///
+    /// The figures below were measured before the partition was built from
+    /// the trie, when construction simulated every (state, token) pair
+    /// (`O(|states| × vocab_size × max_token_len)`); they bound the old cost
+    /// and are not re-measured for the trie walk. Two reference points
+    /// against the real Qwen3 tokenizer (248,320 tokens):
     ///
     /// | schema                                             | \|states\| | measured |
     /// |------------------------------------------------------|-----------|----------|
@@ -380,13 +387,12 @@ impl GrammarEngine {
     /// enum's flat single-rule matching — so `|states|` alone does not fully
     /// determine build time either, only bounds its order of magnitude.
     ///
-    /// This cost is **construction only**. A schema whose state count hits
-    /// the cap pays a second, separate cost the first time `mask_logits` is
-    /// called on a state outside the precomputed set: see
-    /// [`Self::trie_build_ns`]. Caching the `GrammarEngine` across requests
-    /// with the same schema amortizes both — the constructor cost shown
-    /// here, and that first-mask trie build — over every subsequent request
-    /// against the same schema.
+    /// This cost is **construction only**: the trie that serves
+    /// `mask_logits` on states outside the precomputed set is the one built
+    /// here, so a schema whose state count hits the cap pays no further
+    /// build cost on its first over-cap mask. Caching the `GrammarEngine`
+    /// across requests with the same schema amortizes the constructor cost
+    /// over every subsequent request against the same schema.
     pub fn new(spec: &GrammarSpec, vocab_bytes: Vec<Vec<u8>>) -> Result<Self, GrammarError> {
         let vocab_size = vocab_bytes.len();
 
@@ -416,9 +422,15 @@ impl GrammarEngine {
         }
         let reachable_states = states.len();
 
-        // Build the vocabulary partition.
+        // Build the byte trie once: the partition walks it per state, and
+        // `mask_by_trie` reuses it for states past the cap.
+        let trie_t0 = std::time::Instant::now();
+        let trie = ByteTrie::build(&vocab_bytes);
+        let trie_build_ns = trie_t0.elapsed().as_nanos() as u64;
+
+        // Build the vocabulary partition (excludes the trie build above).
         let partition_t0 = std::time::Instant::now();
-        let partition = VocabPartition::build(&grammar, states, &vocab_bytes);
+        let partition = VocabPartition::build_from_trie(&grammar, states, vocab_size, &trie);
         let partition_build_ns = partition_t0.elapsed().as_nanos() as u64;
 
         BUILD_PROFILE.with(|p| {
@@ -436,28 +448,24 @@ impl GrammarEngine {
             vocab_size,
             vocab_bytes,
             state_limit_exceeded,
-            trie: OnceLock::new(),
-            trie_build_ns: AtomicU64::new(0),
+            trie: OnceLock::from(trie),
+            trie_build_ns,
         })
     }
 
-    /// Nanoseconds spent building the byte trie used by `mask_by_trie`, or 0
-    /// if the trie has not been built yet (grammar never hit an over-cap
-    /// state, or none has been masked yet). Diagnostic accessor for
-    /// self-measurement harnesses.
+    /// Nanoseconds [`Self::new`] spent building the byte trie over the
+    /// vocabulary. Diagnostic accessor for self-measurement harnesses.
     ///
-    /// This cost is separate from — and not included in — [`Self::new`]'s
-    /// build time: `ByteTrie::build` depends only on `vocab_bytes`, not on
-    /// the grammar or its state count, and runs lazily on whichever request
-    /// is the *first* to call `mask_logits` from a state outside the
-    /// precomputed partition (i.e. only for schemas where `new` hit
-    /// `MAX_GRAMMAR_STATES`; see [`Self::exceeds_state_budget`]). Measured
-    /// directly against the real Qwen3 vocabulary (248,320 tokens, same
-    /// methodology as [`Self::new`]'s doc): ~85–150 ms typical, up to
-    /// ~310 ms under heavy concurrent machine load — see
-    /// `crates/inference/src/bin/gramtime_profile.rs`.
+    /// The trie is built once in `new`, before the partition, and then serves
+    /// both the partition build and `mask_by_trie`. `ByteTrie::build` depends
+    /// only on `vocab_bytes`, not on the grammar or its state count. This
+    /// time is included in `new`'s wall time but not in
+    /// `BuildProfile::partition_build_ns`. Measured directly against the real
+    /// Qwen3 vocabulary (248,320 tokens, same methodology as [`Self::new`]'s
+    /// doc): ~85–150 ms typical, up to ~310 ms under heavy concurrent machine
+    /// load — see `crates/inference/src/bin/gramtime_profile.rs`.
     pub fn trie_build_ns(&self) -> u64 {
-        self.trie_build_ns.load(Ordering::Relaxed)
+        self.trie_build_ns
     }
 
     /// True when state enumeration hit `MAX_GRAMMAR_STATES` (256) before
@@ -589,13 +597,10 @@ impl GrammarEngine {
                 // `mask_by_simulation` stays available as the oracle for the
                 // differential tests below and as a manual fallback.
                 //
-                // `mask_by_trie` builds the trie on the *first* call that
-                // reaches this branch for this engine (OnceLock) — a
-                // separate, one-time cost from `GrammarEngine::new`'s own
-                // build, measured at ~85-150ms for the real Qwen3
-                // vocabulary; see `Self::trie_build_ns`'s doc for figures
-                // and methodology. It lands on whichever request happens to
-                // be first, not on construction.
+                // `mask_by_trie` reuses the trie `GrammarEngine::new` built
+                // (its ~85-150ms for the real Qwen3 vocabulary is part of
+                // construction; see `Self::trie_build_ns`), so the first call
+                // here pays no build cost.
                 let t0 = profiling.then(std::time::Instant::now);
                 self.mask_by_trie(state, logits);
                 if let Some(t0) = t0 {
@@ -663,16 +668,10 @@ impl GrammarEngine {
     ///
     /// Same contract as `mask_by_simulation` (see [`crate::grammar::trie`]),
     /// used as the over-cap fallback in `mask_logits` in place of the
-    /// full-vocab independent simulation. Builds the trie on first use and
-    /// reuses it for every subsequent call against this engine.
+    /// full-vocab independent simulation. Uses the trie `new` built; the
+    /// initializer below only runs if that cell were ever left empty.
     fn mask_by_trie(&self, state: &GrammarState, logits: &mut [f32]) {
-        let trie = self.trie.get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let built = ByteTrie::build(&self.vocab_bytes);
-            self.trie_build_ns
-                .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            built
-        });
+        let trie = self.trie.get_or_init(|| ByteTrie::build(&self.vocab_bytes));
         trie.mask(state, &self.grammar, self.vocab_size, logits);
     }
 

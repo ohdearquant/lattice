@@ -7,16 +7,15 @@
 //! tokenizer when available at `GRAMTIME_TOKENIZER_JSON`, else a synthetic
 //! stand-in — see `real_or_synthetic` in the printed output):
 //!
-//!   1. `GrammarEngine::new`'s `VocabPartition::build` phase
-//!      (`partition_build_ns`, `BuildProfile`) — the O(|states| x vocab_size
-//!      x max_token_len) cost the doc comment describes.
-//!   2. `ByteTrie::build` (trie.rs:99) — the deferred over-cap masking
-//!      structure, O(vocab_size x max_token_len) with **no** `|states|`
-//!      factor. It is called directly here (not via `GrammarEngine`'s
-//!      `OnceLock`) because `ByteTrie::build` takes only `vocab_bytes` — no
+//!   1. `GrammarEngine::new`'s partition phase (`partition_build_ns`,
+//!      `BuildProfile`) — the per-state trie walk, which scales with
+//!      |states| and excludes the trie build itself.
+//!   2. `ByteTrie::build` — the structure `new` builds once and shares
+//!      between the partition walk and the over-cap masking path,
+//!      O(vocab_size x max_token_len) with **no** `|states|` factor. It is
+//!      called directly here because it takes only `vocab_bytes` — no
 //!      grammar or state — so timing it directly measures exactly the cost
-//!      `GrammarEngine::mask_by_trie` (engine.rs:610) pays on first use,
-//!      without needing to drive a live decode into an over-cap state.
+//!      `GrammarEngine::new` pays for it (`GrammarEngine::trie_build_ns`).
 //!
 //! `deep_schema` is the issue #734 profiling repro (also used by
 //! `gramperf_profile.rs`): 4 levels of nested objects, 3 arrays, 6
@@ -360,10 +359,9 @@ fn main() {
     measure_schema("simple", simple_schema(), &vocab, reps, probe_cap);
     measure_schema("deep", deep_schema(), &vocab, reps, probe_cap);
 
-    // ByteTrie::build depends only on vocab_bytes (trie.rs:99) — no grammar,
-    // no state — so timing it directly, independent of any schema, measures
-    // exactly what GrammarEngine::mask_by_trie's OnceLock builds on first
-    // use for any over-cap engine.
+    // ByteTrie::build depends only on vocab_bytes — no grammar, no state — so
+    // timing it directly, independent of any schema, measures exactly what
+    // GrammarEngine::new builds once for any engine.
     let mut trie_ns = Vec::with_capacity(reps);
     for rep in 0..reps {
         let t0 = Instant::now();
