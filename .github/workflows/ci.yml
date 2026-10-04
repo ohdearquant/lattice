@@ -908,9 +908,11 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
-      # What the prefix-cache slot holds after each way a streaming request can end. The
+      # What the prefix-cache slot holds after each streaming exit the group covers. The
       # group is selected by its module path, so the count pins the population: a test
       # renamed out of the module, or skipped on a runner with no Metal device, fails here.
+      # The count is read from the last `test result:` line of the output, matched whole,
+      # so text a test prints cannot stand in for the harness summary.
       - name: inference — Metal prefix-cache disposition per exit path (macOS only)
         if: runner.os == 'macOS'
         env:
@@ -927,7 +929,9 @@ jobs:
             cat "$log"
             exit "$test_status"
           fi
-          grep -Eq '^test result: ok\. 16 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          summary=$(grep -E '^test result: ' "$log" | tail -n 1)
+          printf '%s\n' "$summary"
+          printf '%s\n' "$summary" | grep -Eq '^test result: ok\. 19 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$'
       # #1583 / PR #1652: the Metal GDN Q/K L2 normalisation had no epsilon while the
       # CPU reference computes 1/sqrt(sum_sq + 1e-6). These two tests are the regression
       # guard, and neither runs under any other step here: `--lib forward::metal::` does

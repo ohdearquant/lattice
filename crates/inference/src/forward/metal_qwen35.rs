@@ -14292,12 +14292,12 @@ mod inner {
                 if use_compact {
                     self.disengage_compact_route();
                 }
-                // The caller cut the stream after exactly one forwarded
-                // token (the prefill sample) — state represents prompt +
-                // that one token already (forward happens on the *next*
-                // iteration in the loop below, which never runs here).
-                // Nothing further was forwarded, so do not save a cache
-                // entry claiming more than live state represents.
+                // The caller cut the stream on the prefill-derived first token.
+                // That token is pushed but not forwarded: its forward step is
+                // the first thing the decode loop below does, and the loop
+                // never runs here. Live state therefore holds only the prompt.
+                // The consumed entry was already taken, so returning without a
+                // save leaves the slot empty.
                 return Ok(CachedGenerateOutput {
                     output: GenerateOutput {
                         text,
@@ -14369,10 +14369,14 @@ mod inner {
                 // this iteration's delta ends up non-empty — mirrors
                 // `generate_streaming_with_cancel`'s decode-loop check and
                 // closes the same UTF-8-boundary gap `on_token`-only
-                // cancellation has. Every generated token up to this point
-                // was already forwarded (`forward_step` ran on the previous
-                // iteration), so this is exactly the on_token-returns-false
-                // case below: state is fully consistent, safe to save below.
+                // cancellation has. At a loop top every pushed token except the
+                // most recent one has been forwarded; the most recent one is
+                // forwarded by this iteration's `forward_step_decode`, which a
+                // cancel here skips. At the first loop top that means nothing
+                // has been forwarded past the prompt. The exit sets
+                // `stopped_by_caller`, the same flag an on_token rejection
+                // sets, so the silent step below is skipped and the boundary
+                // saved is the forwarded prefix.
                 if should_cancel() {
                     stopped_by_caller = true;
                     stop_reason = StopReason::Interrupt;
@@ -14542,14 +14546,16 @@ mod inner {
                 // "Better v1"). This must not sample or emit anything.
                 //
                 // `stopped_by_caller` is excluded from this silent step
-                // deliberately: it means `on_token` returned false for
-                // `last_pushed_id` itself (the caller rejected delivery of, or
-                // disconnected on, exactly that token), and that token has not
-                // been forwarded into KV yet at this point (forwarding happens
-                // on the loop iteration that never ran). Running the silent
-                // step here would forward and then persist a boundary that
-                // includes a token the caller never received. Leaving
-                // `kv_cache.seq_len` where it is instead naturally excludes
+                // deliberately. Two exits set it: `on_token` returning false
+                // for `last_pushed_id` itself (the caller rejected delivery of,
+                // or disconnected on, exactly that token), and `should_cancel()`
+                // at a decode-loop top, where `last_pushed_id` was already
+                // delivered. On both, `last_pushed_id` has not been forwarded
+                // into KV yet (forwarding happens on the loop iteration that
+                // never ran). Running the silent step here would forward it and
+                // persist a boundary that includes it, which for a rejected
+                // token is text the caller never received. Leaving
+                // `kv_cache.seq_len` where it is instead excludes
                 // `last_pushed_id` from `represented_len` below.
                 if !generated_ids.is_empty()
                     && !stopped
