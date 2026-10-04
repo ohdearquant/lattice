@@ -633,7 +633,12 @@ jobs:
       # that was emptied. The step requires exactly one `test result:` line and
       # exactly one cargo `Running unittests examples/bench_serve_http.rs` line,
       # so the count it reads is the example's own and not another target's.
+      # The workflow sets CARGO_TERM_COLOR=always, which puts escape codes in
+      # front of cargo's `Running` line; the step turns colour off and also
+      # strips escapes before counting, so the anchored patterns see plain text.
       - name: inference — bench_serve_http harness tests (example target)
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           set -euo pipefail
           out=$(cargo test -p lattice-inference --example bench_serve_http 2>&1) || {
@@ -641,6 +646,7 @@ jobs:
             printf '%s\n' "$out"
             exit "$status"
           }
+          out=$(printf '%s\n' "$out" | sed "s/$(printf '\033')\\[[0-9;]*m//g")
           printf '%s\n' "$out"
           runs=$(printf '%s\n' "$out" | grep -c '^ *Running unittests examples/bench_serve_http\.rs (' || true)
           if [ "$runs" -ne 1 ]; then
