@@ -16,13 +16,15 @@
 //! # Mask contract
 //!
 //! [`ByteTrie::mask`] reproduces `mask_by_simulation`'s contract bit for bit:
-//! a token is allowed iff `simulate_token(state, grammar, token_bytes)`
-//! would return `SimResult::Accept` — i.e. every byte of the token is
-//! accepted by the PDA in order, with no rejection at any position. Both
-//! `SimResult::Reject` (first-byte rejection) and `SimResult::ContextDependent`
-//! (rejection after a partial prefix) block the token identically: a DFS
-//! walk that fails to reach a token's terminal trie node covers both cases
-//! without needing to distinguish them.
+//! a non-empty token is allowed iff `simulate_token(state, grammar,
+//! token_bytes)` would return `SimResult::Accept` — i.e. every byte of the
+//! token is accepted by the PDA in order, with no rejection at any position.
+//! Both `SimResult::Reject` (first-byte rejection) and
+//! `SimResult::ContextDependent` (rejection after a partial prefix) block the
+//! token identically: a DFS walk that fails to reach a token's terminal trie
+//! node covers both cases without needing to distinguish them. Empty tokens
+//! are not in the trie and are always blocked (see "Partition classification"
+//! below).
 //!
 //! # Partition classification
 //!
