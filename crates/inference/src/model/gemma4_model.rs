@@ -20,12 +20,12 @@
 
 use super::gemma4_cache::Gemma4KvCache;
 use super::gemma4_config::{Gemma4Config, resolve_stop_token_ids};
-use super::gemma4_loading::load_weights;
+use super::gemma4_loading::{load_per_layer_embeddings, load_weights};
 use super::gemma4_ops::{
     gemma4_apply_rope, gemma4_geglu_mlp, gemma4_gelu_tanh, gemma4_logit_softcap, gemma4_rms_norm,
     gemma4_rope_cos_sin, gemma4_rope_inv_freq, gemma4_scaled_embedding,
 };
-use super::gemma4_weights::Gemma4Weights;
+use super::gemma4_weights::{Gemma4Weights, PerLayerEmbeddings};
 use crate::decoder::Cancellation;
 use crate::decoder::driver;
 use crate::decoder::gemma_cpu::GemmaCpuSession;
@@ -149,6 +149,7 @@ impl Gemma4Scratch {
 pub struct Gemma4Model {
     pub(crate) config: Gemma4Config,
     pub(crate) weights: Gemma4Weights,
+    per_layer_embeddings: PerLayerEmbeddings,
     pub(crate) tokenizer: GemmaBpeTokenizer,
     /// Sliding-layer RoPE inverse-frequency table, length `head_dim / 2`.
     local_inv_freq: Vec<f32>,
@@ -248,6 +249,7 @@ impl Gemma4Model {
         }
         let mut source = SafetensorsFile::open(&model_path)?;
         let weights = load_weights(&mut source, &config)?;
+        let per_layer_embeddings = load_per_layer_embeddings(source, &config)?;
 
         let tokenizer_path = path.join("tokenizer.json");
         let tokenizer = GemmaBpeTokenizer::from_tokenizer_json(&tokenizer_path)?;
@@ -264,6 +266,7 @@ impl Gemma4Model {
         Ok(Self {
             config,
             weights,
+            per_layer_embeddings,
             tokenizer,
             local_inv_freq,
             global_inv_freq,
@@ -348,7 +351,7 @@ impl Gemma4Model {
             token_id,
             per_layer_dim,
             ple_packed_dim,
-        );
+        )?;
 
         // -- Dual RoPE cos/sin, computed once per token (position-only). --
         let (cos_local, sin_local) = gemma4_rope_cos_sin(&self.local_inv_freq, &[position as u32]);
@@ -617,17 +620,14 @@ impl Gemma4Model {
         token_id: u32,
         per_layer_dim: usize,
         ple_packed_dim: usize,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferenceError> {
         let cfg = &self.config;
         let hidden_size = cfg.hidden_size;
 
         let id_scale = (per_layer_dim as f32).sqrt();
-        let row_start = token_id as usize * ple_packed_dim;
-        let mut identity: Vec<f32> = self.weights.embed_tokens_per_layer
-            [row_start..row_start + ple_packed_dim]
-            .iter()
-            .map(|&v| v * id_scale)
-            .collect();
+        let mut identity = self
+            .per_layer_embeddings
+            .scaled_row(token_id as usize, id_scale)?;
 
         let mut ctx = vec![0f32; ple_packed_dim];
         matmul_bt(
@@ -656,7 +656,7 @@ impl Gemma4Model {
         for i in 0..ple_packed_dim {
             identity[i] = (ctx[i] + identity[i]) * combine_scale;
         }
-        identity
+        Ok(identity)
     }
 
     /// **Unstable**: greedy-decode `max_new_tokens` continuation tokens for
@@ -1166,7 +1166,7 @@ fn argmax(logits: &[f32]) -> u32 {
 #[cfg(test)]
 pub(crate) fn tiny_zero_model() -> Gemma4Model {
     use super::gemma4_config::Gemma4LayerType;
-    use super::gemma4_weights::Gemma4LayerWeights;
+    use super::gemma4_weights::{Gemma4LayerWeights, per_layer_embeddings_from_bits};
 
     let hidden_size = 8;
     let head_w = 8;
@@ -1223,7 +1223,6 @@ pub(crate) fn tiny_zero_model() -> Gemma4Model {
 
     let weights = Gemma4Weights {
         embed_tokens: vec![0.0; vocab_size * hidden_size],
-        embed_tokens_per_layer: vec![0.0; vocab_size * per_layer_dim],
         norm: vec![0.0; hidden_size],
         per_layer_model_projection: vec![0.0; per_layer_dim * hidden_size],
         per_layer_projection_norm: vec![0.0; per_layer_dim],
@@ -1247,10 +1246,16 @@ pub(crate) fn tiny_zero_model() -> Gemma4Model {
     );
 
     let stop_token_ids = vec![config.eos_token_id];
+    let per_layer_embeddings = per_layer_embeddings_from_bits(
+        vocab_size,
+        per_layer_dim,
+        &vec![0u16; vocab_size * per_layer_dim],
+    );
 
     Gemma4Model {
         config,
         weights,
+        per_layer_embeddings,
         tokenizer,
         local_inv_freq,
         global_inv_freq,
@@ -1263,6 +1268,121 @@ mod tests {
     use super::*;
     use crate::decoder::ExecutionCapabilities;
     use crate::grammar::{GrammarEngine, GrammarSpec};
+    use crate::model::gemma4_weights::per_layer_embeddings_from_bits;
+
+    fn lcg_stream(len: usize, seed: u32) -> Vec<u32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                state
+            })
+            .collect()
+    }
+
+    /// The per-layer inputs with the table materialized as f32: the formula
+    /// `compute_per_layer_inputs` evaluated before the table stayed in the checkpoint mapping.
+    fn per_layer_inputs_from_f32_table(
+        model: &Gemma4Model,
+        table: &[f32],
+        scaled_embed: &[f32],
+        token_id: u32,
+    ) -> Vec<f32> {
+        let cfg = &model.config;
+        let per_layer_dim = cfg.hidden_size_per_layer_input;
+        let ple_packed_dim = cfg.num_hidden_layers * per_layer_dim;
+        let id_scale = (per_layer_dim as f32).sqrt();
+        let row_start = token_id as usize * ple_packed_dim;
+        let mut identity: Vec<f32> = table[row_start..row_start + ple_packed_dim]
+            .iter()
+            .map(|&v| v * id_scale)
+            .collect();
+        let mut ctx = vec![0f32; ple_packed_dim];
+        matmul_bt(
+            scaled_embed,
+            &model.weights.per_layer_model_projection,
+            &mut ctx,
+            1,
+            cfg.hidden_size,
+            ple_packed_dim,
+        );
+        let ctx_scale = 1.0 / (cfg.hidden_size as f32).sqrt();
+        for v in ctx.iter_mut() {
+            *v *= ctx_scale;
+        }
+        for layer in 0..cfg.num_hidden_layers {
+            let start = layer * per_layer_dim;
+            gemma4_rms_norm(
+                &mut ctx[start..start + per_layer_dim],
+                &model.weights.per_layer_projection_norm,
+                per_layer_dim,
+                cfg.rms_norm_eps,
+            );
+        }
+        for i in 0..ple_packed_dim {
+            identity[i] = (ctx[i] + identity[i]) * std::f32::consts::FRAC_1_SQRT_2;
+        }
+        identity
+    }
+
+    #[test]
+    fn per_layer_inputs_match_the_f32_materialized_table_bit_for_bit() {
+        let mut model = tiny_zero_model();
+        model.config.num_hidden_layers = 3;
+        let per_layer_dim = model.config.hidden_size_per_layer_input;
+        let ple_packed_dim = model.config.num_hidden_layers * per_layer_dim;
+        let vocab = model.config.vocab_size;
+        let hidden = model.config.hidden_size;
+
+        let table_bits: Vec<u16> = lcg_stream(vocab * ple_packed_dim, 41)
+            .into_iter()
+            .map(|word| {
+                let bits = (word >> 16) as u16;
+                let exponent = 112 + ((bits >> 7) & 0x1f);
+                (bits & 0x807f) | (exponent << 7)
+            })
+            .collect();
+        let table_f32: Vec<f32> = table_bits
+            .iter()
+            .map(|&bits| f32::from_bits(u32::from(bits) << 16))
+            .collect();
+        let unit = |word: u32| (word >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0;
+        model.per_layer_embeddings =
+            per_layer_embeddings_from_bits(vocab, ple_packed_dim, &table_bits);
+        model.weights.per_layer_model_projection = lcg_stream(ple_packed_dim * hidden, 43)
+            .into_iter()
+            .map(unit)
+            .collect();
+        model.weights.per_layer_projection_norm = lcg_stream(per_layer_dim, 47)
+            .into_iter()
+            .map(unit)
+            .collect();
+        let scaled_embed: Vec<f32> = lcg_stream(hidden, 53).into_iter().map(unit).collect();
+
+        let bit_patterns = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for token_id in 0..vocab as u32 {
+            let got = model
+                .compute_per_layer_inputs(&scaled_embed, token_id, per_layer_dim, ple_packed_dim)
+                .expect("token is inside the vocabulary");
+            let want = per_layer_inputs_from_f32_table(&model, &table_f32, &scaled_embed, token_id);
+            assert_eq!(
+                bit_patterns(&got),
+                bit_patterns(&want),
+                "token {token_id}: per-layer inputs must match the f32-materialized table"
+            );
+        }
+        assert!(
+            model
+                .compute_per_layer_inputs(
+                    &scaled_embed,
+                    vocab as u32,
+                    per_layer_dim,
+                    ple_packed_dim
+                )
+                .is_err(),
+            "a token past the vocabulary must be refused, not read out of bounds"
+        );
+    }
 
     // These four byte-fallback ids -- 478, 382, 378, 366 (`<0xF0><0x90><0x8C><0x80>`), verified
     // against the committed tokenizer fixture -- are the 4-byte UTF-8 encoding of U+10300; no
