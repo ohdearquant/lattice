@@ -14680,6 +14680,7 @@ mod inner {
     mod tests {
         mod dispatch;
         mod path_proof_bytes;
+        mod prefix_cache_disposition;
 
         use super::super::{
             LM_HEAD_TOPK_TIE_EPSILON, LM_HEAD_TOPK_TIE_EPSILON_Q4, TopkSetAgreement,
