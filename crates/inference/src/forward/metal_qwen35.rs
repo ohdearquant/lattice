@@ -14546,17 +14546,30 @@ mod inner {
                 // "Better v1"). This must not sample or emit anything.
                 //
                 // `stopped_by_caller` is excluded from this silent step
-                // deliberately. Two exits set it: `on_token` returning false
-                // for `last_pushed_id` itself (the caller rejected delivery of,
-                // or disconnected on, exactly that token), and `should_cancel()`
-                // at a decode-loop top, where `last_pushed_id` was already
-                // delivered. On both, `last_pushed_id` has not been forwarded
-                // into KV yet (forwarding happens on the loop iteration that
-                // never ran). Running the silent step here would forward it and
-                // persist a boundary that includes it, which for a rejected
-                // token is text the caller never received. Leaving
-                // `kv_cache.seq_len` where it is instead excludes
-                // `last_pushed_id` from `represented_len` below.
+                // deliberately. Two exits set it, and they leave
+                // `last_pushed_id` in different states:
+                //
+                // - `should_cancel()` at a decode-loop top: `last_pushed_id`
+                //   is the latest delivered token and has not been forwarded
+                //   yet, because forwarding it is the step this iteration
+                //   never reached. The silent step would forward it and
+                //   persist a boundary past the point the cancelled turn
+                //   reached; skipping it saves the forwarded prefix and the
+                //   next turn replays that token as part of its suffix.
+                // - `on_token` returning false inside the step (the caller
+                //   rejected delivery of, or disconnected on, the new token):
+                //   this iteration already forwarded the prior token, and the
+                //   exit comes before `last_pushed_id = next_id`, so
+                //   `last_pushed_id` still names that already-forwarded
+                //   token. The silent step would forward it a second time,
+                //   advancing `kv_cache.seq_len` by a position that holds no
+                //   new generated token. The rejected token itself sits in
+                //   `generated_ids` unforwarded and must stay out of the
+                //   saved boundary, since it is text the caller never
+                //   received.
+                //
+                // Leaving `kv_cache.seq_len` where it is keeps both cases
+                // consistent with `represented_len` below.
                 if !generated_ids.is_empty()
                     && !stopped
                     && !stopped_by_caller
