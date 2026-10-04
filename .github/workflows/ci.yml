@@ -630,7 +630,8 @@ jobs:
       # but only while `serve` and `download` stay default features: cargo skips
       # a target whose required features are off and does not fail. Naming the
       # target turns that case into an error, and the count catches a module
-      # that was emptied.
+      # that was emptied. The step requires exactly one `test result:` line, so
+      # the count it reads is the example's own and not another target's.
       - name: inference — bench_serve_http harness tests (example target)
         run: |
           set -euo pipefail
@@ -640,9 +641,14 @@ jobs:
             exit "$status"
           }
           printf '%s\n' "$out"
-          passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
-          if [ -z "$passed" ] || [ "$passed" -lt 19 ]; then
-            echo "expected at least 19 passing bench_serve_http tests, parsed '${passed:-<none>}'" >&2
+          summaries=$(printf '%s\n' "$out" | grep -c '^test result: ' || true)
+          if [ "$summaries" -ne 1 ]; then
+            echo "expected exactly one 'test result:' line from the bench_serve_http target, found $summaries" >&2
+            exit 1
+          fi
+          passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p')
+          if [ -z "$passed" ] || [ "$passed" -lt 32 ]; then
+            echo "expected at least 32 passing bench_serve_http tests, parsed '${passed:-<none>}'" >&2
             exit 1
           fi
       # The two metal-gpu legs above build the lattice-inference and lattice-embed
