@@ -3224,6 +3224,45 @@ mod tests {
     }
 
     #[test]
+    fn standalone_session_select_refuses_config_controls() {
+        let f = SessionFixture::new();
+        parity::assert_select_refuses_config_controls(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::seeded_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_finish_invalidates_the_live_prediction() {
+        let f = SessionFixture::new();
+        parity::assert_finish_invalidates_the_live_prediction(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_refuses_a_second_prefill() {
+        let f = SessionFixture::new();
+        parity::assert_second_prefill_is_refused(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
+    }
+
+    #[test]
     fn test_all_projection_dims_are_multiples_of_32() {
         // Q8_0 requires K to be a multiple of 32. Verify all our dims qualify.
         let cfg = Qwen35Config::qwen35_2b();

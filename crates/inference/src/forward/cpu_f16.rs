@@ -2971,6 +2971,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn standalone_session_select_refuses_config_controls() {
+        let f = SessionFixture::new();
+        parity::assert_select_refuses_config_controls(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::seeded_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_finish_invalidates_the_live_prediction() {
+        let f = SessionFixture::new();
+        parity::assert_finish_invalidates_the_live_prediction(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_refuses_a_second_prefill() {
+        let f = SessionFixture::new();
+        parity::assert_second_prefill_is_refused(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
+    }
+
     /// `generate_f16` must reject a request whose prompt + max_new_tokens exceeds
     /// the RoPE table capacity with a clean error, not an out-of-bounds RoPE index
     /// (in a real model) or a runaway allocation. The preflight returns before any

@@ -1986,6 +1986,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn standalone_session_select_refuses_config_controls() {
+        let f = SessionFixture::new();
+        parity::assert_select_refuses_config_controls(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::seeded_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_finish_invalidates_the_live_prediction() {
+        let f = SessionFixture::new();
+        parity::assert_finish_invalidates_the_live_prediction(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_refuses_a_second_prefill() {
+        let f = SessionFixture::new();
+        parity::assert_second_prefill_is_refused(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
+    }
+
     /// `generate_q8` with `max_new_tokens == 0` must return zero generated tokens
     /// without running a forward pass or sampling anything.
     ///

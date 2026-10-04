@@ -1,9 +1,9 @@
 //! `StandaloneCpuSession`: one [`super::DecoderSession`] for the three standalone CPU
 //! generation wrappers (`generate_f16`, `generate_q8`, `generate_q8_neon`).
 //!
-//! The wrappers differ only in the weight format and the single-token forward step they call,
-//! so the session holds one [`StandaloneWeights`] value and dispatches on it. Everything else
-//! the wrappers do is shared and lives here once: serial per-token prefill, the position and
+//! The wrappers share the decode sequence and differ in weight format, forward step, and
+//! KV/scratch allocation, so the session holds one [`StandaloneWeights`] value and dispatches
+//! on it. The shared part lives here once: serial per-token prefill, the position and
 //! `seq_len` bookkeeping, the prediction ledger, and sampling through `sample_token`.
 //!
 //! The session carries the wrappers' narrower contract. [`ExecutionCapabilities`] is all
@@ -11,6 +11,10 @@
 //! before it calls the session, and `select` and `metadata` refuse the same controls if a
 //! caller reaches them directly. `prepare_generation` with
 //! `GenerationEntryContract::StandaloneCpu` still runs first and keeps its refusal text.
+//!
+//! A session runs one generation. `prefill` is refused the second time it is called, because
+//! the recurrent state and KV cache it would write over belong to the first run; build a new
+//! session for another generation.
 //!
 //! Prefill is serial on purpose: each prompt token goes through the single-token forward step
 //! at its own position, with `kv_cache.seq_len` advanced after every token but the last and
@@ -79,6 +83,7 @@ pub(crate) struct StandaloneCpuSession<'w> {
     prompt_len: usize,
     rng_state: u64,
     ledger: PredictionLedger,
+    prefilled: bool,
 }
 
 impl<'w> StandaloneCpuSession<'w> {
@@ -119,6 +124,7 @@ impl<'w> StandaloneCpuSession<'w> {
             prompt_len,
             rng_state,
             ledger: PredictionLedger::new(),
+            prefilled: false,
         }
     }
 
@@ -174,10 +180,20 @@ impl DecoderSession for StandaloneCpuSession<'_> {
     /// Runs every prompt token through the single-token forward step at its own position and
     /// leaves the last token's logits in `scratch.logits` for the first `select`. Opens no
     /// prediction, so the returned stamp carries none.
+    ///
+    /// The session runs one generation: a second call returns `InvalidInput` before it touches
+    /// any state. A call refused for cancellation has not started, so it does not use up the
+    /// session's one prefill.
     fn prefill(&mut self, cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
+        if self.prefilled {
+            return Err(InferenceError::InvalidInput(
+                "this session runs one generation; build a new session".into(),
+            ));
+        }
         if cancel.is_cancelled() {
             return Err(InferenceError::Inference("cancelled before prefill".into()));
         }
+        self.prefilled = true;
 
         for pos in 0..self.prompt_len {
             let token_id = self.prompt_ids[pos];
@@ -223,6 +239,26 @@ impl DecoderSession for StandaloneCpuSession<'_> {
                 "session does not declare grammar support but a grammar mask was supplied".into(),
             ));
         }
+        if request.config.logprobs.is_some() {
+            return Err(InferenceError::InvalidInput(
+                "session does not declare logprobs support but the selection config sets logprobs"
+                    .into(),
+            ));
+        }
+        if !request.config.stop_strings.is_empty() {
+            return Err(InferenceError::InvalidInput(
+                "session does not declare stop_strings support but the selection config sets \
+                 stop_strings"
+                    .into(),
+            ));
+        }
+        if request.config.reasoning_budget.is_some() {
+            return Err(InferenceError::InvalidInput(
+                "session does not declare reasoning_budget support but the selection config sets \
+                 reasoning_budget"
+                    .into(),
+            ));
+        }
 
         let candidate_id = sample_token(
             &self.scratch.logits[..self.cfg.vocab_size],
@@ -249,10 +285,10 @@ impl DecoderSession for StandaloneCpuSession<'_> {
         ))
     }
 
-    fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError> {
-        if disposition == FinishDisposition::Poisoned {
-            self.ledger.invalidate();
-        }
+    /// Ends the live prediction whatever the disposition, so a decode of the last selected
+    /// token after `finish` is refused as stale. The session holds no other state to tear down.
+    fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
+        self.ledger.invalidate();
         Ok(())
     }
 }
@@ -472,8 +508,9 @@ pub(crate) mod parity {
     }
 
     /// Replays the session step by step against a hand-driven copy of the wrapper's own forward
-    /// step and requires bit-identical logits at every position. Token outputs do not depend on
-    /// the position and window the session feeds the forward step, the logits do.
+    /// step and requires bit-identical logits for the final prefill position and for each decode
+    /// step's output. Token outputs do not depend on the position and window the session feeds
+    /// the forward step, the logits do.
     pub(crate) fn assert_logits_replay(
         weights: StandaloneWeights<'_>,
         cfg: &Qwen35Config,
@@ -755,6 +792,224 @@ pub(crate) mod parity {
             },
         );
         assert!(matches!(metadata, Err(InferenceError::InvalidInput(_))));
+    }
+
+    /// `select` refuses logprobs, stop strings and a reasoning budget in the request's config
+    /// with `InvalidInput`, each with its own message, and a refusal changes nothing: the RNG
+    /// state is untouched, no prediction is opened, and the next ordinary `select` returns the
+    /// candidate an untouched twin session returns.
+    pub(crate) fn assert_select_refuses_config_controls(
+        weights: StandaloneWeights<'_>,
+        cfg: &Qwen35Config,
+        tokenizer: &BpeTokenizer,
+        rope: &RopeTable,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+    ) {
+        let never = || false;
+        let mut session = StandaloneCpuSession::new(
+            weights,
+            cfg,
+            rope,
+            plan_for(cfg, tokenizer, rope, prompt, gen_cfg),
+        );
+        let plan = plan_for(cfg, tokenizer, rope, prompt, gen_cfg);
+        let prompt_ids = plan.prompt_ids.clone();
+        let mut twin = StandaloneCpuSession::new(weights, cfg, rope, plan);
+        session.prefill(&never).expect("session prefill");
+        twin.prefill(&never).expect("twin prefill");
+        assert!(
+            gen_cfg.temperature > 0.0,
+            "a greedy config never draws from the RNG, so a refusal that drew would go unseen"
+        );
+
+        let controls: Vec<(&str, GenerateConfig, &str)> = vec![
+            (
+                "logprobs",
+                GenerateConfig {
+                    logprobs: Some(0),
+                    ..gen_cfg.clone()
+                },
+                "session does not declare logprobs support but the selection config sets logprobs",
+            ),
+            (
+                "stop_strings",
+                GenerateConfig {
+                    stop_strings: vec!["</s>".to_string()],
+                    ..gen_cfg.clone()
+                },
+                "session does not declare stop_strings support but the selection config sets \
+                 stop_strings",
+            ),
+            (
+                "reasoning_budget",
+                GenerateConfig {
+                    reasoning_budget: Some(16),
+                    ..gen_cfg.clone()
+                },
+                "session does not declare reasoning_budget support but the selection config sets \
+                 reasoning_budget",
+            ),
+        ];
+        let rng_before = session.rng_state;
+        for (control, refused_cfg, message) in &controls {
+            let request = SelectionRequest {
+                config: refused_cfg,
+                history: &prompt_ids,
+                grammar_mask: None,
+            };
+            match session.select(&request) {
+                Err(InferenceError::InvalidInput(actual)) => {
+                    assert_eq!(&actual, message, "{control}: refusal text")
+                }
+                Err(other) => panic!("{control}: wrong error {other:?}"),
+                Ok(_) => panic!("{control}: select accepted the control"),
+            }
+            assert_eq!(
+                session.rng_state, rng_before,
+                "{control}: the refused select drew from the RNG"
+            );
+            assert_eq!(
+                session.ledger.next_seq, 0,
+                "{control}: the refused select opened a prediction"
+            );
+            assert!(
+                session.ledger.live.is_none(),
+                "{control}: the refused select left a live prediction"
+            );
+        }
+
+        let plain = SelectionRequest {
+            config: gen_cfg,
+            history: &prompt_ids,
+            grammar_mask: None,
+        };
+        let candidate = match session.select(&plain).expect("select after the refusals") {
+            SelectOutcome::Candidate(candidate) => candidate,
+            SelectOutcome::GrammarExhausted => panic!("no grammar is set, so none can exhaust"),
+        };
+        let twin_candidate = match twin.select(&plain).expect("twin select") {
+            SelectOutcome::Candidate(candidate) => candidate,
+            SelectOutcome::GrammarExhausted => panic!("no grammar is set, so none can exhaust"),
+        };
+        assert_eq!(
+            candidate.candidate_id, twin_candidate.candidate_id,
+            "the refusals moved the sampling state"
+        );
+        assert_eq!(session.rng_state, twin.rng_state, "RNG state after select");
+        assert_eq!(session.ledger.next_seq, 1, "exactly one prediction opened");
+    }
+
+    /// `finish` ends the live prediction whatever the disposition: after
+    /// `finish(Reusable)` the last selected prediction cannot be decoded, and the refused
+    /// decode leaves the cache position and logits alone.
+    pub(crate) fn assert_finish_invalidates_the_live_prediction(
+        weights: StandaloneWeights<'_>,
+        cfg: &Qwen35Config,
+        tokenizer: &BpeTokenizer,
+        rope: &RopeTable,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+    ) {
+        let plan = plan_for(cfg, tokenizer, rope, prompt, gen_cfg);
+        let prompt_ids = plan.prompt_ids.clone();
+        let vocab = cfg.vocab_size;
+        let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan);
+
+        let never = || false;
+        session.prefill(&never).expect("session prefill");
+        let request = SelectionRequest {
+            config: gen_cfg,
+            history: &prompt_ids,
+            grammar_mask: None,
+        };
+        let candidate = match session.select(&request).expect("session select") {
+            SelectOutcome::Candidate(candidate) => candidate,
+            SelectOutcome::GrammarExhausted => panic!("no grammar is set, so none can exhaust"),
+        };
+        let accepted = AcceptedToken {
+            final_id: candidate.candidate_id,
+            prediction: candidate.prediction,
+        };
+        assert!(
+            session.ledger.is_live(accepted.prediction),
+            "the selected prediction must be live before finish"
+        );
+
+        session
+            .finish(FinishDisposition::Reusable)
+            .expect("finish(Reusable)");
+        assert!(
+            !session.ledger.is_live(accepted.prediction),
+            "finish(Reusable) left the prediction live"
+        );
+
+        let seq_len = session.kv_cache.seq_len;
+        let logits: Vec<u32> = session.scratch.logits[..vocab]
+            .iter()
+            .map(|logit| logit.to_bits())
+            .collect();
+        match session.decode(&accepted, &never) {
+            Err(InferenceError::Inference(message)) => assert!(
+                message.contains("stale prediction id"),
+                "unexpected refusal text: {message}"
+            ),
+            Err(other) => {
+                panic!("a finished prediction was refused with the wrong error: {other:?}")
+            }
+            Ok(_) => panic!("a prediction decoded after finish(Reusable)"),
+        }
+        assert_eq!(
+            session.kv_cache.seq_len, seq_len,
+            "the refused decode advanced the cache"
+        );
+        let after: Vec<u32> = session.scratch.logits[..vocab]
+            .iter()
+            .map(|logit| logit.to_bits())
+            .collect();
+        assert_eq!(after, logits, "the refused decode ran a forward pass");
+    }
+
+    /// The session runs one generation: a second `prefill` is refused with `InvalidInput`
+    /// and leaves the cache position and the logits as the first prefill left them.
+    pub(crate) fn assert_second_prefill_is_refused(
+        weights: StandaloneWeights<'_>,
+        cfg: &Qwen35Config,
+        tokenizer: &BpeTokenizer,
+        rope: &RopeTable,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+    ) {
+        let plan = plan_for(cfg, tokenizer, rope, prompt, gen_cfg);
+        let prompt_len = plan.prompt_len;
+        let vocab = cfg.vocab_size;
+        let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan);
+
+        let never = || false;
+        session.prefill(&never).expect("first prefill");
+        assert_eq!(session.kv_cache.seq_len, prompt_len, "first prefill length");
+        let logits: Vec<u32> = session.scratch.logits[..vocab]
+            .iter()
+            .map(|logit| logit.to_bits())
+            .collect();
+
+        match session.prefill(&never) {
+            Err(InferenceError::InvalidInput(message)) => assert_eq!(
+                message, "this session runs one generation; build a new session",
+                "refusal text"
+            ),
+            Err(other) => panic!("a second prefill was refused with the wrong error: {other:?}"),
+            Ok(_) => panic!("a second prefill was accepted"),
+        }
+        assert_eq!(
+            session.kv_cache.seq_len, prompt_len,
+            "the refused prefill moved the cache"
+        );
+        let after: Vec<u32> = session.scratch.logits[..vocab]
+            .iter()
+            .map(|logit| logit.to_bits())
+            .collect();
+        assert_eq!(after, logits, "the refused prefill ran a forward pass");
     }
 }
 
