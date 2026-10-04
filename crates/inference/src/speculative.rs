@@ -1808,8 +1808,9 @@ fn softmax_into(logits: &[f32], out: &mut [f32]) {
 /// `scratch` and `out` must have the same length as `logits`; `scratch` is
 /// overwritten with the temperature-scaled logits. `temperature == 1.0` skips
 /// the scaling pass entirely. `temperature` must already be validated finite
-/// and `> 0` by the caller — a non-positive divisor would sign-flip or NaN the
-/// scaled logits.
+/// and `> 0` by the caller, and `1.0 / temperature` must be finite. A
+/// non-positive divisor would sign-flip or NaN the scaled logits, and an
+/// infinite reciprocal turns the centered maximum into `0.0 * inf = NaN`.
 fn softmax_into_temperature(
     logits: &[f32],
     temperature: f32,
@@ -1821,8 +1822,21 @@ fn softmax_into_temperature(
         return;
     }
     let inv = 1.0 / temperature;
+    // Center only when `inv > 1.0`: that is the one regime where scaling a huge
+    // finite logit can overflow to +inf and poison the row. Output for
+    // `temperature >= 1.0` stays bit-identical to the uncentered formula.
+    let center = if inv > 1.0 {
+        let raw = logits
+            .iter()
+            .copied()
+            .filter(|l| l.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
+        if raw.is_finite() { raw } else { 0.0 }
+    } else {
+        0.0
+    };
     for (s, &l) in scratch.iter_mut().zip(logits.iter()) {
-        *s = l * inv;
+        *s = (l - center) * inv;
     }
     softmax_into(scratch, out);
 }
@@ -2013,7 +2027,8 @@ fn sample_adjusted(p: &[f32], q: &[f32], r: f32) -> usize {
 ///   `&[]` (the argument is unused).
 /// - `initial_target_logits` is empty or has a vocabulary size that disagrees
 ///   with `target_logits` / `draft_logits` rows.
-/// - `temperature` is non-finite or `<= 0.0` — checked only when `greedy == false`.
+/// - `temperature` is non-finite or `<= 0.0`, or `1.0 / temperature` is not
+///   finite (checked only when `greedy == false`).
 pub fn rejection_sample_draft(
     draft_tokens: &[u32],
     draft_logits: &[Vec<f32>],
@@ -2094,6 +2109,14 @@ pub fn rejection_sample_draft(
         if !temperature.is_finite() || temperature <= 0.0 {
             return Err(InferenceError::InvalidInput(format!(
                 "probabilistic rejection sampling requires a finite temperature > 0, got {temperature}"
+            )));
+        }
+        // A tiny positive temperature whose reciprocal overflows to +inf would
+        // turn the centered maximum into `0.0 * inf = NaN` in the softmax, so
+        // refuse it too rather than produce a non-distribution.
+        if !(1.0 / temperature).is_finite() {
+            return Err(InferenceError::InvalidInput(format!(
+                "probabilistic rejection sampling requires a temperature whose reciprocal is finite, got {temperature:e}"
             )));
         }
     }
@@ -3719,6 +3742,32 @@ mod tests {
         let initial = uniform_logits(10);
         let err = rejection_sample_draft(&[3], &logits, &initial, &[], false, 1.0, Some(1));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn rejection_probabilistic_rejects_temperature_with_overflowing_reciprocal() {
+        // 1e-40 is a positive finite subnormal whose reciprocal is +inf, which
+        // would turn the centered maximum into `0.0 * inf = NaN` in the softmax.
+        const VOCAB: usize = 4;
+        let draft = vec![peaked_logits(VOCAB, 1, 3.0)];
+        let target = vec![peaked_logits(VOCAB, 2, 5.0)];
+        let initial = peaked_logits(VOCAB, 1, 4.0);
+
+        let err = rejection_sample_draft(&[1u32], &draft, &initial, &target, false, 1e-40, Some(7))
+            .expect_err("temperature with a non-finite reciprocal must be refused");
+        match err {
+            crate::error::InferenceError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("1e-40"),
+                    "message must name the temperature: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        // Control: a tiny temperature whose reciprocal is still finite is accepted.
+        let ok = rejection_sample_draft(&[1u32], &draft, &initial, &target, false, 1e-30, Some(7));
+        assert!(ok.is_ok(), "finite reciprocal must be accepted, got {ok:?}");
     }
 
     #[test]
@@ -5427,5 +5476,71 @@ mod tests {
             "sibling query head's context must be a real (non-degenerate) \
              normalized result, not incidentally all-zero, got {clean_head:?}"
         );
+    }
+
+    /// The pre-centering formula: scale first, then softmax.
+    fn softmax_scaled_uncentered(logits: &[f32], temperature: f32) -> Vec<f32> {
+        let inv = 1.0 / temperature;
+        let scaled: Vec<f32> = logits.iter().map(|&l| l * inv).collect();
+        let mut out = vec![0.0f32; logits.len()];
+        softmax_into(&scaled, &mut out);
+        out
+    }
+
+    #[test]
+    fn softmax_into_temperature_huge_finite_logit_below_one_stays_finite() {
+        let logits = [3.0e38f32, 0.0];
+        let mut scratch = [0.0f32; 2];
+        let mut out = [0.0f32; 2];
+        softmax_into_temperature(&logits, 0.5, &mut scratch, &mut out);
+        assert!(
+            out.iter().all(|p| p.is_finite()),
+            "scaling a huge finite logit by 1/T must not poison the row, got {out:?}"
+        );
+        let sum: f32 = out.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "distribution must normalize, sum {sum}"
+        );
+        assert!(
+            (out[0] - 1.0).abs() < 1e-6,
+            "all mass on index 0, got {out:?}"
+        );
+        assert_eq!(out[1], 0.0);
+    }
+
+    #[test]
+    fn softmax_into_temperature_at_or_above_one_matches_uncentered_formula_bitwise() {
+        let logits = [1.5f32, -2.25, 0.0, 7.0, 3.125, -0.5];
+        for &t in &[1.0f32, 1.5, 2.0, 10.0] {
+            let mut scratch = [0.0f32; 6];
+            let mut out = [0.0f32; 6];
+            softmax_into_temperature(&logits, t, &mut scratch, &mut out);
+            let expected = if t == 1.0 {
+                let mut e = vec![0.0f32; logits.len()];
+                softmax_into(&logits, &mut e);
+                e
+            } else {
+                softmax_scaled_uncentered(&logits, t)
+            };
+            for (i, (a, b)) in out.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "T={t} index {i}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn softmax_into_temperature_neg_inf_entry_keeps_zero_probability_below_one() {
+        let logits = [2.0f32, f32::NEG_INFINITY, 1.0];
+        let mut scratch = [0.0f32; 3];
+        let mut out = [0.0f32; 3];
+        softmax_into_temperature(&logits, 0.5, &mut scratch, &mut out);
+        assert_eq!(
+            out[1], 0.0,
+            "-inf entry must keep probability 0, got {out:?}"
+        );
+        let sum: f32 = out.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "sum {sum}");
+        assert!(out[0] > out[2]);
     }
 }

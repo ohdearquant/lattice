@@ -1100,9 +1100,24 @@ pub(crate) fn compute_step_logprobs(
         1.0 / temperature
     };
 
+    // Center only when `scale > 1.0` (see `CandidateSet::apply_temperature`):
+    // scaling a huge finite logit first would overflow to +inf and send the
+    // whole row to the sentinel. Rows with no finite logit keep a zero center,
+    // so their non-finite max still short-circuits below.
+    let center = if scale > 1.0 {
+        let raw = logits
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
+        if raw.is_finite() { raw } else { 0.0 }
+    } else {
+        0.0
+    };
+
     let mut max_scaled = f32::NEG_INFINITY;
     for &v in logits {
-        let scaled = v * scale;
+        let scaled = (v - center) * scale;
         if scaled > max_scaled {
             max_scaled = scaled;
         }
@@ -1119,17 +1134,19 @@ pub(crate) fn compute_step_logprobs(
         return (LOGPROB_NEG_SENTINEL, top);
     }
 
-    // sum >= 1.0 always: the max term alone contributes exp(0) = 1.0, so
-    // log_sum is finite and non-negative (bounded above by ln(vocab_size)) --
-    // it cannot overflow or introduce a fresh non-finite value here.
+    // For a row without NaN, sum >= 1.0: the max term alone contributes
+    // exp(0) = 1.0, so log_sum is finite and non-negative (bounded above by
+    // ln(vocab_size)) and cannot overflow or introduce a fresh non-finite
+    // value here. A NaN entry makes sum (and log_sum) NaN; the per-token
+    // finite check in `logprob_of` then maps every result to the sentinel.
     let mut sum = 0.0f32;
     for &v in logits {
-        sum += (v * scale - max_scaled).exp();
+        sum += ((v - center) * scale - max_scaled).exp();
     }
     let log_sum = sum.ln();
 
     let logprob_of = |idx: usize| -> f32 {
-        let lp = (logits[idx] * scale - max_scaled) - log_sum;
+        let lp = ((logits[idx] - center) * scale - max_scaled) - log_sum;
         if lp.is_finite() {
             lp
         } else {
@@ -1150,10 +1167,22 @@ pub(crate) fn compute_step_logprobs(
         // Reuse the same descending-logit, NaN-last, lowest-token-id-wins
         // total order as the Metal-parity top-k path (`candidate_order`)
         // rather than inventing a second comparator.
+        //
+        // The ordering key is the raw logit when `scale > 1.0`: scaling by a
+        // positive factor preserves order, and the raw value cannot overflow.
+        // The centered value `logits[i] - center` can: on a row spanning more
+        // than `f32::MAX`, distinct finite tail logits all overflow to `-inf`
+        // and would then be ordered by token id instead of by logit. When
+        // `scale <= 1.0` the center is zero and the key is the scaled logit,
+        // exactly as before.
         let mut candidates: Vec<Candidate> = (0..vocab_size)
             .map(|i| Candidate {
                 token_id: i as u32,
-                logit: logits[i] * scale,
+                logit: if scale > 1.0 {
+                    logits[i]
+                } else {
+                    (logits[i] - center) * scale
+                },
             })
             .collect();
         candidates.select_nth_unstable_by(k - 1, candidate_order);
@@ -3754,6 +3783,101 @@ mod tests {
             "the requested token_id must still be reported (as the sentinel), \
              not dropped or replaced by an arbitrary index"
         );
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_huge_finite_logit_below_one_temperature_is_not_sentinel() {
+        let logits = [3.0e38f32, 0.0];
+        let (logprob, top) = compute_step_logprobs(&logits, 0, 0.5, 1);
+        assert!(
+            logprob.abs() < 1e-6,
+            "argmax of [3e38, 0] at T=0.5 has logprob 0.0, got {logprob}"
+        );
+        assert_ne!(logprob, LOGPROB_NEG_SENTINEL);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].token_id, 0);
+        assert!(
+            top[0].logprob.abs() < 1e-6,
+            "top-1 logprob {}",
+            top[0].logprob
+        );
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_at_or_above_one_temperature_matches_uncentered_formula_bitwise() {
+        let logits = [1.5f32, -2.25, 0.0, 7.0, 3.125, -0.5];
+        for &t in &[1.0f32, 1.5, 2.0, 10.0] {
+            let scale = 1.0 / t;
+            let max_scaled = logits
+                .iter()
+                .map(|&v| v * scale)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = logits.iter().map(|&v| (v * scale - max_scaled).exp()).sum();
+            let log_sum = sum.ln();
+            for (idx, &v) in logits.iter().enumerate() {
+                let expected = (v * scale - max_scaled) - log_sum;
+                let (lp, _) = compute_step_logprobs(&logits, idx as u32, t, 0);
+                assert_eq!(lp.to_bits(), expected.to_bits(), "T={t} token {idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_neg_inf_entry_below_one_temperature_reports_sentinel() {
+        let logits = [2.0f32, f32::NEG_INFINITY, 1.0];
+        let (lp_neg, _) = compute_step_logprobs(&logits, 1, 0.5, 0);
+        assert_eq!(lp_neg, LOGPROB_NEG_SENTINEL);
+        let (lp_best, top) = compute_step_logprobs(&logits, 0, 0.5, 3);
+        assert!(lp_best.is_finite() && lp_best < 0.0 && lp_best != LOGPROB_NEG_SENTINEL);
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0].token_id, 0);
+        assert_eq!(top[2].token_id, 1);
+        assert_eq!(top[2].logprob, LOGPROB_NEG_SENTINEL);
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_top_n_orders_by_logit_when_centering_overflows_tail() {
+        // The row spans more than f32::MAX, so centering at the maximum sends
+        // both finite tail logits to -inf. The top-N order must still follow
+        // the raw logits (0.6M, -0.4M, -0.5M, -inf), not token id.
+        let m = f32::MAX;
+        let logits = [0.6 * m, f32::NEG_INFINITY, -0.5 * m, -0.4 * m];
+        let (_, top) = compute_step_logprobs(&logits, 0, 0.9, 4);
+        let ids: Vec<u32> = top.iter().map(|t| t.token_id).collect();
+        assert_eq!(ids, vec![0, 3, 2, 1]);
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_top_n_at_or_above_one_temperature_matches_uncentered_formula_bitwise()
+     {
+        let logits = [1.5f32, -2.25, 0.0, 7.0, 3.125, -0.5, 4.75];
+        for &t in &[1.0f32, 1.5, 3.0] {
+            let scale = 1.0 / t;
+            let max_scaled = logits
+                .iter()
+                .map(|&v| v * scale)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = logits.iter().map(|&v| (v * scale - max_scaled).exp()).sum();
+            let log_sum = sum.ln();
+            let mut order: Vec<usize> = (0..logits.len()).collect();
+            order.sort_by(|&a, &b| {
+                (logits[b] * scale)
+                    .partial_cmp(&(logits[a] * scale))
+                    .unwrap()
+                    .then(a.cmp(&b))
+            });
+            let (_, top) = compute_step_logprobs(&logits, 0, t, logits.len());
+            assert_eq!(top.len(), logits.len(), "T={t}");
+            for (rank, (entry, &idx)) in top.iter().zip(order.iter()).enumerate() {
+                let expected = (logits[idx] * scale - max_scaled) - log_sum;
+                assert_eq!(entry.token_id, idx as u32, "T={t} rank {rank}");
+                assert_eq!(
+                    entry.logprob.to_bits(),
+                    expected.to_bits(),
+                    "T={t} rank {rank}"
+                );
+            }
+        }
     }
 
     #[test]
