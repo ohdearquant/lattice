@@ -76,7 +76,9 @@
 //! one `record` line each for `generate_f16` / `generate_q8` / `generate_q8_neon`
 //! against the same checkpoint and the same golden cases. None of the three
 //! wrappers has a `_streaming` sibling, so unlike `measure_generate_allocations`
-//! above these print no `record_streaming` line.
+//! above these print no `record_streaming` line. The wrappers refuse a
+//! `reasoning_budget`, so a fixture case that carries one prints a `refusal` line
+//! after the arm asserts the exact refusal message, in place of a `record` line.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -248,6 +250,123 @@ mod controls {
             VOCAB_ISH * 4
         );
     }
+
+    /// The classification must send exactly the budgeted fixture cases to the
+    /// refusal branch.
+    ///
+    /// The expectation is spelled out by case name instead of being derived from
+    /// `reasoning_budget` a second time, so a classifier that misreads the field
+    /// cannot agree with a check that reads it the same way.
+    #[test]
+    fn budgeted_cases_expect_exact_refusal_not_generation() {
+        let golden = super::greedy_golden();
+        let cases = golden["cases"]
+            .as_array()
+            .expect("golden fixture declares cases");
+
+        let mut refusals = Vec::new();
+        let mut generations = Vec::new();
+        for case in cases {
+            let name = case["name"].as_str().expect("case has a name");
+            match super::expected_for(case) {
+                super::Expected::BudgetRefusal => refusals.push(name),
+                super::Expected::Generation => generations.push(name),
+            }
+        }
+
+        assert_eq!(
+            refusals,
+            [
+                "short_factual_reasoning_budget_4",
+                "long_prose_reasoning_budget_4"
+            ],
+            "budgeted cases must be expected refusals"
+        );
+        assert_eq!(
+            generations,
+            ["short_factual", "long_prose"],
+            "unbudgeted cases must be expected generations"
+        );
+    }
+
+    /// The refusal text the arm expects must be the text the three wrappers
+    /// return. The refusal fires before any weight is read, so empty weights are
+    /// enough and no checkpoint is needed.
+    #[test]
+    fn budget_refusal_message_is_what_the_wrappers_emit() {
+        use lattice_inference::forward::cpu_f16::generate_f16;
+        use lattice_inference::forward::cpu_q8::generate_q8;
+        use lattice_inference::forward::neon_forward::{Q8NeonModel, generate_q8_neon};
+        use lattice_inference::model::qwen35_config::Qwen35Config;
+        use lattice_inference::rope::RopeTable;
+        use lattice_inference::tokenizer::bpe::BpeTokenizer;
+        use lattice_inference::weights::f16_weights::F16ModelWeights;
+        use lattice_inference::weights::q8_weights::Q8ModelWeights;
+        use std::collections::HashMap;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer =
+            BpeTokenizer::from_vocab_and_merges(vocab, merges).expect("test tokenizer builds");
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+
+        let golden = super::greedy_golden();
+        let budgeted = golden["cases"]
+            .as_array()
+            .expect("golden fixture declares cases")
+            .iter()
+            .find(|case| super::expected_for(case) == super::Expected::BudgetRefusal)
+            .expect("the golden fixture carries a budgeted case");
+        let gen_cfg = super::config_for(&golden, budgeted);
+        assert!(
+            gen_cfg.reasoning_budget.is_some(),
+            "control failed: the budgeted case produced a config without a budget, so the \
+             wrappers would not refuse it"
+        );
+
+        let f16_weights = F16ModelWeights {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            layers: vec![],
+        };
+        super::assert_exact_budget_refusal(
+            "budgeted",
+            "generate_f16",
+            generate_f16(&f16_weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg),
+        );
+
+        let q8_weights = Q8ModelWeights {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            layers: vec![],
+        };
+        super::assert_exact_budget_refusal(
+            "budgeted",
+            "generate_q8",
+            generate_q8(&q8_weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg),
+        );
+
+        let neon_model = Q8NeonModel {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            lm_head_packed: vec![],
+            lm_head_rows: 0,
+            lm_head_cols: 0,
+            layers: vec![],
+        };
+        super::assert_exact_budget_refusal(
+            "budgeted",
+            "generate_q8_neon",
+            generate_q8_neon(&neon_model, &cfg, &tokenizer, &rope, "hello", &gen_cfg),
+        );
+    }
 }
 
 /// Checkpoint directory shared by every measurement in this file: either env
@@ -302,6 +421,55 @@ fn config_for(
         .expect("enable_thinking");
     cfg.reasoning_budget = case["reasoning_budget"].as_u64().map(|v| v as usize);
     cfg
+}
+
+/// What a standalone CPU wrapper must do with one fixture case.
+///
+/// The wrappers refuse any `reasoning_budget`, and `config_for` copies the case's
+/// budget into the config, so a budgeted case has no generation to measure: the
+/// only correct outcome is the refusal. Treating it as a generation makes the
+/// measurement panic on the first budgeted case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expected {
+    Generation,
+    BudgetRefusal,
+}
+
+fn expected_for(case: &serde_json::Value) -> Expected {
+    if case["reasoning_budget"].as_u64().is_some() {
+        Expected::BudgetRefusal
+    } else {
+        Expected::Generation
+    }
+}
+
+/// The exact `InvalidInput` text the standalone wrappers return for a set
+/// `reasoning_budget`. `controls::budget_refusal_message_is_what_the_wrappers_emit`
+/// compares it against the wrappers themselves, so a reworded library message
+/// fails a checkpoint-free control instead of the next measurement run.
+const BUDGET_REFUSAL_MESSAGE: &str = "reasoning_budget is not yet supported on this generation path; \
+     use the Qwen3.5 CPU generate() / generate_streaming() or the Metal \
+     generate_streaming(), which implement reasoning-budget forcing";
+
+fn assert_exact_budget_refusal<T>(
+    name: &str,
+    wrapper: &str,
+    result: Result<T, lattice_inference::error::InferenceError>,
+) {
+    use lattice_inference::error::InferenceError;
+    match result {
+        Err(InferenceError::InvalidInput(message)) => assert_eq!(
+            message, BUDGET_REFUSAL_MESSAGE,
+            "case {name}: {wrapper} refused a budgeted case with a different message"
+        ),
+        Err(other) => {
+            panic!("case {name}: {wrapper} refused a budgeted case with the wrong error: {other:?}")
+        }
+        Ok(_) => panic!(
+            "case {name}: {wrapper} generated for a budgeted case it must refuse, so the \
+             standalone contract no longer holds"
+        ),
+    }
 }
 
 /// The measurement. Prints two machine-readable records per case -- a `record`
@@ -447,10 +615,22 @@ fn measure_generate_f16_allocations() {
     println!("# case\tcalls\tbytes\tlarge_calls\tmax_bytes");
 
     let mut any = 0usize;
+    let mut refused = 0usize;
     for case in cases {
         let name = case["name"].as_str().expect("case has a name");
         let prompt = case["prompt"].as_str().expect("case has a prompt");
         let cfg_gen = config_for(&golden, case);
+
+        if expected_for(case) == Expected::BudgetRefusal {
+            assert_exact_budget_refusal(
+                name,
+                "generate_f16",
+                generate_f16(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen),
+            );
+            println!("refusal\t{name}\texact");
+            refused += 1;
+            continue;
+        }
 
         // Warm once OUTSIDE the measured window; see measure_generate_allocations.
         let _ = generate_f16(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen);
@@ -478,6 +658,7 @@ fn measure_generate_f16_allocations() {
         "the golden fixture declared no cases, so nothing was measured"
     );
     println!("# measured {any} case(s)");
+    println!("# refused {refused} budgeted case(s)");
 }
 
 #[test]
@@ -515,10 +696,22 @@ fn measure_generate_q8_allocations() {
     println!("# case\tcalls\tbytes\tlarge_calls\tmax_bytes");
 
     let mut any = 0usize;
+    let mut refused = 0usize;
     for case in cases {
         let name = case["name"].as_str().expect("case has a name");
         let prompt = case["prompt"].as_str().expect("case has a prompt");
         let cfg_gen = config_for(&golden, case);
+
+        if expected_for(case) == Expected::BudgetRefusal {
+            assert_exact_budget_refusal(
+                name,
+                "generate_q8",
+                generate_q8(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen),
+            );
+            println!("refusal\t{name}\texact");
+            refused += 1;
+            continue;
+        }
 
         let _ = generate_q8(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen);
 
@@ -545,6 +738,7 @@ fn measure_generate_q8_allocations() {
         "the golden fixture declared no cases, so nothing was measured"
     );
     println!("# measured {any} case(s)");
+    println!("# refused {refused} budgeted case(s)");
 }
 
 #[test]
@@ -579,10 +773,22 @@ fn measure_generate_q8_neon_allocations() {
     println!("# case\tcalls\tbytes\tlarge_calls\tmax_bytes");
 
     let mut any = 0usize;
+    let mut refused = 0usize;
     for case in cases {
         let name = case["name"].as_str().expect("case has a name");
         let prompt = case["prompt"].as_str().expect("case has a prompt");
         let cfg_gen = config_for(&golden, case);
+
+        if expected_for(case) == Expected::BudgetRefusal {
+            assert_exact_budget_refusal(
+                name,
+                "generate_q8_neon",
+                generate_q8_neon(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen),
+            );
+            println!("refusal\t{name}\texact");
+            refused += 1;
+            continue;
+        }
 
         let _ = generate_q8_neon(&weights, &cfg, &tokenizer, &rope, prompt, &cfg_gen);
 
@@ -609,4 +815,5 @@ fn measure_generate_q8_neon_allocations() {
         "the golden fixture declared no cases, so nothing was measured"
     );
     println!("# measured {any} case(s)");
+    println!("# refused {refused} budgeted case(s)");
 }
