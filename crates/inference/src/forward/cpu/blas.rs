@@ -98,6 +98,25 @@ pub(super) fn accelerate_matmul_bt(
         "accelerate_matmul_bt",
     );
 
+    // The i32 ABI limit applies to an empty GEMM too (see `cblas_dim`), so the conversions
+    // precede the early returns below.
+    let (m_i, n_i, k_i) = (
+        cblas_dim(m, "m", "accelerate_matmul_bt"),
+        cblas_dim(n, "n", "accelerate_matmul_bt"),
+        cblas_dim(k, "k", "accelerate_matmul_bt"),
+    );
+
+    // cblas_sgemm rejects a zero leading dimension (lda = ldb = k, ldc = n) and aborts the
+    // process, so an empty GEMM never reaches it. m == 0 or n == 0 leaves nothing to write;
+    // k == 0 is an empty inner product, so every output element is zero.
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        output[..m * n].fill(0.0);
+        return;
+    }
+
     // Note: cblas_sgemv was benchmarked for M=1 and was SLOWER than sgemm
     // (4.98 vs 5.57 tok/s). Accelerate's sgemm appears to use multi-threaded
     // AMX tiling even for M=1, while sgemv dispatches single-threaded.
@@ -112,17 +131,17 @@ pub(super) fn accelerate_matmul_bt(
             accelerate::CBLAS_ROW_MAJOR,
             accelerate::CBLAS_NO_TRANS,
             accelerate::CBLAS_TRANS,
-            cblas_dim(m, "m", "accelerate_matmul_bt"),
-            cblas_dim(n, "n", "accelerate_matmul_bt"),
-            cblas_dim(k, "k", "accelerate_matmul_bt"),
+            m_i,
+            n_i,
+            k_i,
             1.0,
             a.as_ptr(),
-            cblas_dim(k, "lda", "accelerate_matmul_bt"),
+            k_i,
             b.as_ptr(),
-            cblas_dim(k, "ldb", "accelerate_matmul_bt"),
+            k_i,
             0.0,
             output.as_mut_ptr(),
-            cblas_dim(n, "ldc", "accelerate_matmul_bt"),
+            n_i,
         );
     }
 }
