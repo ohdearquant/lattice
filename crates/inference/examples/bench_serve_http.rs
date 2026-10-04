@@ -24,10 +24,13 @@
 //! emits (`stop`, `length`), and when a stream carries an error event, an event
 //! whose data is empty or not JSON, no content delta, more content deltas than
 //! `max_tokens`, no (or an empty) finish reason, no `[DONE]` terminator, or any
-//! event after `[DONE]`. A stream is read to the end of the response body, so a
-//! server that leaves the response open after `[DONE]` is refused at the
-//! request deadline. Streaming chunks carry no `usage` object, so a stream is
-//! certified by its content deltas and reports `completion_tokens=na`.
+//! event after `[DONE]`. A response body, including the body of a non-2xx
+//! reply, is read to its end, so a body that keeps arriving past the request
+//! deadline (a server that leaves a stream open after `[DONE]`, or trickles
+//! bytes) is refused at that deadline. A read already blocked when the deadline
+//! passes ends at the HTTP client's own timeout, up to 2 s later. Streaming
+//! chunks carry no `usage` object, so a stream is certified by its content
+//! deltas and reports `completion_tokens=na`.
 //!
 //! Env:
 //!   LATTICE_MODEL_DIR          checkpoint directory (default
@@ -44,9 +47,11 @@
 //!   BENCH_STARTUP_TIMEOUT_SECS wait for `Listening on` (default 900)
 //!   BENCH_REQUEST_TIMEOUT_SECS total wall clock per request, from the start of
 //!                              the request to the end of the response body
-//!                              (default 900), enforced here as one absolute
-//!                              deadline; the connect itself is capped at 10 s
-//!                              or this value, whichever is smaller
+//!                              (default 900); a body that keeps arriving is
+//!                              refused at this deadline, a read already blocked
+//!                              then ends at the client timeout, up to 2 s
+//!                              later; the connect itself is capped at 10 s or
+//!                              this value, whichever is smaller
 //!   BENCH_STDERR_MARKER        substring to count in the server's stderr
 //!
 //! Output:
@@ -723,7 +728,7 @@ impl Client {
         }
     }
 
-    fn post_chat(&self, body: &Value) -> Result<ureq::Response, Refusal> {
+    fn post_chat(&self, body: &Value, deadline: Instant) -> Result<ureq::Response, Refusal> {
         let bytes = serde_json::to_vec(body).map_err(|e| Refusal::MalformedBody(e.to_string()))?;
         match self
             .agent
@@ -732,10 +737,16 @@ impl Client {
             .send_bytes(&bytes)
         {
             Ok(response) => Ok(response),
-            Err(ureq::Error::Status(status, response)) => Err(Refusal::HttpStatus {
-                status,
-                body: response.into_string().unwrap_or_default(),
-            }),
+            Err(ureq::Error::Status(status, response)) => {
+                match self.read_body(response.into_reader(), deadline) {
+                    Err(timeout @ Refusal::Timeout { .. }) => Err(timeout),
+                    Err(_) => Err(Refusal::HttpStatus {
+                        status,
+                        body: String::new(),
+                    }),
+                    Ok(body) => Err(Refusal::HttpStatus { status, body }),
+                }
+            }
             Err(e) => Err(self.transport_refusal(&e)),
         }
     }
@@ -776,7 +787,7 @@ impl Client {
         let start = Instant::now();
         let deadline = self.deadline_from(start)?;
         let max_tokens = requested_max_tokens(body)?;
-        let response = self.post_chat(body)?;
+        let response = self.post_chat(body, deadline)?;
         let text = self.read_body(response.into_reader(), deadline)?;
         let total_ms = ms(start);
         Ok((certify_nonstream(&text, max_tokens)?, total_ms))
@@ -786,7 +797,7 @@ impl Client {
         let start = Instant::now();
         let deadline = self.deadline_from(start)?;
         let max_tokens = requested_max_tokens(body)?;
-        let response = self.post_chat(body)?;
+        let response = self.post_chat(body, deadline)?;
         let mut reader = BufReader::new(response.into_reader());
         let mut tally = StreamTally::default();
         let mut events = SseEventBuffer::default();
@@ -1670,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn http_stream_left_open_after_done_is_refused_at_the_request_deadline() {
+    fn http_stream_left_open_after_done_is_refused_as_a_timeout() {
         let frames = sse_frames(&complete_events());
         let port = spawn_scripted_server(move |stream| {
             serve_stream(stream, &frames, |_| {
@@ -1767,6 +1778,50 @@ mod tests {
         let outcome = client_for(port, Duration::from_millis(400)).run_nonstream(&probe_body());
         assert!(
             matches!(outcome, Err(Refusal::Timeout { .. })),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn http_error_body_that_trickles_past_the_request_deadline_is_refused() {
+        let port = spawn_scripted_server(|stream| {
+            write!(
+                stream,
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: 30\r\nconnection: close\r\n\r\n"
+            )
+            .ok()?;
+            for _ in 0..30 {
+                stream.write_all(b"x").ok()?;
+                stream.flush().ok()?;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Some(())
+        });
+        let started = Instant::now();
+        let outcome = client_for(port, Duration::from_millis(400)).run_nonstream(&probe_body());
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, Err(Refusal::Timeout { .. })),
+            "{outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1400),
+            "the refusal came at the request deadline, not after the 1.5 s body: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn http_error_status_with_a_prompt_body_is_reported_with_that_body() {
+        let port = spawn_scripted_server(|stream| {
+            write!(
+                stream,
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: 4\r\nconnection: close\r\n\r\nboom"
+            )
+            .ok()
+        });
+        let outcome = client_for(port, Duration::from_secs(10)).run_nonstream(&probe_body());
+        assert!(
+            matches!(&outcome, Err(Refusal::HttpStatus { status: 500, body }) if body == "boom"),
             "{outcome:?}"
         );
     }
