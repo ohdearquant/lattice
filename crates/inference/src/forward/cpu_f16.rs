@@ -1705,6 +1705,7 @@ pub fn embed_text_vlm_f16(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decoder::standalone_cpu::{StandaloneWeights, parity};
 
     #[test]
     #[allow(clippy::type_complexity)]
@@ -2822,6 +2823,191 @@ mod tests {
             Some(crate::stop_reason::StopReason::Length)
         );
         assert_eq!(out.text, "aC");
+    }
+
+    /// The fixture the goldens above use, bundled for the shared standalone-session checks.
+    struct SessionFixture {
+        cfg: Qwen35Config,
+        weights: F16ModelWeights,
+        rope: RopeTable,
+        tokenizer: BpeTokenizer,
+    }
+
+    impl SessionFixture {
+        fn new() -> Self {
+            let (cfg, weights, rope) = make_nonzero_f16_cpu_test_model();
+            Self {
+                cfg,
+                weights,
+                rope,
+                tokenizer: nonzero_fixture_tokenizer(),
+            }
+        }
+
+        fn standalone(&self) -> StandaloneWeights<'_> {
+            StandaloneWeights::F16(&self.weights)
+        }
+
+        fn legacy(
+            &self,
+            gen_cfg: &GenerateConfig,
+        ) -> Result<GenerateOutput, crate::error::InferenceError> {
+            generate_f16(
+                &self.weights,
+                &self.cfg,
+                &self.tokenizer,
+                &self.rope,
+                "world",
+                gen_cfg,
+            )
+        }
+
+        fn forward(
+            &self,
+            token_id: u32,
+            position: usize,
+            gdn_states: &mut [GatedDeltaNetState],
+            kv_cache: &mut KvCache,
+            scratch: &mut ForwardScratch,
+        ) -> Result<(), crate::error::InferenceError> {
+            forward_step_f16(
+                &self.weights,
+                &self.cfg,
+                &self.rope,
+                token_id,
+                position,
+                gdn_states,
+                kv_cache,
+                scratch,
+                None,
+                None,
+            )
+        }
+    }
+
+    #[test]
+    fn standalone_session_matches_legacy_loop_deterministic_cases() {
+        let f = SessionFixture::new();
+        for (name, gen_cfg) in parity::deterministic_cases() {
+            parity::assert_matches_legacy(
+                &|c| f.legacy(c),
+                f.standalone(),
+                &f.cfg,
+                &f.tokenizer,
+                &f.rope,
+                "world",
+                name,
+                &gen_cfg,
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_session_matches_legacy_loop_seeded() {
+        let f = SessionFixture::new();
+        parity::assert_matches_legacy(
+            &|c| f.legacy(c),
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            "seeded",
+            &parity::seeded_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_logits_match_reference_replay() {
+        let f = SessionFixture::new();
+        parity::assert_logits_replay(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+            4,
+            &|t, p, g, k, s| f.forward(t, p, g, k, s),
+        );
+    }
+
+    #[test]
+    fn standalone_session_rejects_a_stale_prediction() {
+        let f = SessionFixture::new();
+        parity::assert_rejects_stale_prediction(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_cancellation_precedes_state_change() {
+        let f = SessionFixture::new();
+        parity::assert_cancellation_precedes_state_change(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_refuses_undeclared_controls() {
+        let f = SessionFixture::new();
+        parity::assert_refuses_undeclared_controls(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_select_refuses_config_controls() {
+        let f = SessionFixture::new();
+        parity::assert_select_refuses_config_controls(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::seeded_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_finish_invalidates_the_live_prediction() {
+        let f = SessionFixture::new();
+        parity::assert_finish_invalidates_the_live_prediction(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
+    }
+
+    #[test]
+    fn standalone_session_refuses_a_second_prefill() {
+        let f = SessionFixture::new();
+        parity::assert_second_prefill_is_refused(
+            f.standalone(),
+            &f.cfg,
+            &f.tokenizer,
+            &f.rope,
+            "world",
+            &parity::greedy_case(),
+        );
     }
 
     /// `generate_f16` must reject a request whose prompt + max_new_tokens exceeds
