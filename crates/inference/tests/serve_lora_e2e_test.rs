@@ -12,7 +12,7 @@
 //!
 //! ```bash
 //! LATTICE_SERVE_LORA_GATE_ENFORCE=1 cargo test --release \
-//!   -p lattice-inference --features f16,metal-gpu \
+//!   -p lattice-inference --features download,f16,metal-gpu,serve \
 //!   --test serve_lora_e2e_test -- --nocapture
 //! ```
 //!
@@ -20,14 +20,19 @@
 //! `finish_reason` and token counts; it does not return token ids or logprobs
 //! (`logprobs` is rejected on this server). Comparisons below are therefore on
 //! the full assistant message, the finish reason and the completion token count,
-//! all deterministic under greedy decoding (`temperature: 0`).
+//! requested with greedy decoding (`temperature: 0`). Greedy decoding is not taken
+//! to be deterministic on the backend: repeatability is observed for the exact
+//! request sequence below, and each comparison is preceded by a repeat of the same
+//! request.
 //!
 //! Resident adapters are never applied implicitly: this server has no router, so
 //! a request that omits `lora` selects the base model whether or not an adapter
 //! is resident. The unload step therefore cannot be observed through base-request
-//! output alone, because every later base request re-applies the empty selection
-//! on its own; it is asserted through the published residency snapshot
-//! (`GET /v1/lora`) and through the refusal of a request that names the removed id.
+//! output alone: a base request clears an applied adapter by itself whenever the
+//! applied selection differs from the empty one (the registry does nothing when the
+//! requested selection already equals the applied one). The unload is asserted
+//! through the published residency snapshot (`GET /v1/lora`) and through the
+//! refusal of a request that names the removed id.
 
 #![cfg(all(target_os = "macos", feature = "metal-gpu"))]
 
@@ -36,6 +41,8 @@ use lattice_inference::lora_hook::qwen35_projection_shape;
 use lattice_inference::measurement::gpu_test_lock;
 use lattice_inference::model::qwen35_config::Qwen35Config;
 use serde_json::{Value, json};
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -66,23 +73,31 @@ const ADAPTER_MODULES: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 /// enough to push an f16 activation toward overflow).
 const ADAPTER_B_MAGNITUDE: f32 = 0.5;
 const ADAPTER_SEED: u64 = 0x1790_0A11_CE5E_ED01;
+/// A second adapter with the same shapes and a different weight stream, loaded after
+/// the first is unloaded so that reusing the first adapter's weights is observable.
+const RELOAD_ADAPTER_SEED: u64 = 0x1790_0B22_DF6F_FE02;
 const ADAPTER_NAME: &str = "synthetic-mlp-adapter";
 
 fn enforce() -> bool {
     std::env::var(ENFORCE_ENV).as_deref() == Ok("1")
 }
 
-fn expand_home(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
+/// A leading `~/` is expanded when `home` is given. The prefix is recognised on the raw
+/// bytes, so a non-UTF-8 suffix is still expanded; any other value is used as given.
+fn expand_home(value: &OsStr, home: Option<&OsStr>) -> PathBuf {
+    if let Some(rest) = value.as_bytes().strip_prefix(b"~/")
+        && let Some(home) = home
     {
-        return format!("{home}/{rest}");
+        let mut expanded = home.to_os_string();
+        expanded.push("/");
+        expanded.push(OsStr::from_bytes(rest));
+        return PathBuf::from(expanded);
     }
-    path.to_string()
+    PathBuf::from(value)
 }
 
 fn default_model_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
+    let home = std::env::var_os("HOME")?;
     Some(
         PathBuf::from(home)
             .join(".lattice")
@@ -95,8 +110,8 @@ fn default_model_dir() -> Option<PathBuf> {
 /// test skips (or fails under enforcement) instead of silently using the default
 /// checkpoint, so pointing it at a missing path is a reliable way to disable the run.
 fn require_model_dir() -> Option<PathBuf> {
-    if let Ok(value) = std::env::var(MODEL_DIR_ENV) {
-        let path = PathBuf::from(expand_home(&value));
+    if let Some(value) = std::env::var_os(MODEL_DIR_ENV) {
+        let path = expand_home(&value, std::env::var_os("HOME").as_deref());
         if path.exists() {
             return Some(path);
         }
@@ -274,7 +289,7 @@ fn health_wait_timeout() -> Duration {
 impl Server {
     fn spawn(model_dir: &Path) -> Self {
         let port = free_loopback_port();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_lattice_serve"))
+        let child = Command::new(env!("CARGO_BIN_EXE_lattice_serve"))
             .arg("--model")
             .arg(model_dir)
             .arg("--port")
@@ -285,11 +300,21 @@ impl Server {
             .stderr(Stdio::piped())
             .spawn()
             .expect("lattice_serve must spawn");
-        let stderr_pipe = child.stderr.take().expect("child stderr must be captured");
-        let stderr = Arc::new(Mutex::new(String::new()));
+        // The child belongs to `Server` from the moment it exists, so a panic anywhere
+        // below (stderr capture, the drainer thread, the health wait) kills and waits it.
+        let mut server = Self {
+            child,
+            port,
+            stderr: Arc::new(Mutex::new(String::new())),
+        };
+        let stderr_pipe = server
+            .child
+            .stderr
+            .take()
+            .expect("child stderr must be captured");
         {
             // Draining stderr is also what keeps the child from blocking on a full pipe.
-            let stderr = Arc::clone(&stderr);
+            let stderr = Arc::clone(&server.stderr);
             std::thread::spawn(move || {
                 use std::io::BufRead as _;
                 let mut reader = std::io::BufReader::new(stderr_pipe);
@@ -306,11 +331,6 @@ impl Server {
                 }
             });
         }
-        let server = Self {
-            child,
-            port,
-            stderr,
-        };
         let budget = health_wait_timeout();
         let started = Instant::now();
         let url = format!("http://127.0.0.1:{port}/health");
@@ -404,20 +424,21 @@ impl Server {
         body
     }
 
-    /// Greedy chat completion, optionally naming one resident adapter at scale 1.0.
-    fn chat_raw(&self, adapter: Option<u32>) -> (u16, String) {
+    /// Greedy chat completion, optionally naming one resident adapter and the request
+    /// scale applied on top of the adapter's own `alpha / rank` scale.
+    fn chat_raw(&self, adapter: Option<(u32, f32)>) -> (u16, String) {
         let mut body = json!({
             "messages": [{"role": "user", "content": PROMPT}],
             "max_tokens": MAX_TOKENS,
             "temperature": 0.0
         });
-        if let Some(id) = adapter {
-            body["lora"] = json!([{"id": id, "scale": 1.0}]);
+        if let Some((id, scale)) = adapter {
+            body["lora"] = json!([{"id": id, "scale": scale}]);
         }
         self.request("POST", "/v1/chat/completions", Some(&body))
     }
 
-    fn chat(&self, adapter: Option<u32>) -> Output {
+    fn chat(&self, adapter: Option<(u32, f32)>) -> Output {
         let (status, text) = self.chat_raw(adapter);
         assert_eq!(
             status,
@@ -521,6 +542,42 @@ fn synthesized_adapter_is_deterministic_and_accepted_by_the_load_parser() {
 }
 
 #[test]
+fn expand_home_joins_home_with_a_tilde_prefixed_value() {
+    let home = OsStr::new("/fixture/h");
+    assert_eq!(
+        expand_home(OsStr::new("~/models/x"), Some(home)),
+        PathBuf::from("/fixture/h/models/x")
+    );
+}
+
+#[test]
+fn expand_home_keeps_a_non_utf8_suffix() {
+    let home = OsStr::new("/fixture/h");
+    let value = OsStr::from_bytes(b"~/m\xff");
+    let expected = OsStr::from_bytes(b"/fixture/h/m\xff");
+    assert_eq!(expand_home(value, Some(home)), PathBuf::from(expected));
+}
+
+#[test]
+fn expand_home_leaves_a_tilde_value_unchanged_without_home() {
+    assert_eq!(
+        expand_home(OsStr::new("~/models/x"), None),
+        PathBuf::from("~/models/x")
+    );
+}
+
+#[test]
+fn expand_home_leaves_a_value_without_the_prefix_unchanged() {
+    let home = OsStr::new("/fixture/h");
+    for value in ["models/x", "/fixture/abs", "~x/y", "~"] {
+        assert_eq!(
+            expand_home(OsStr::new(value), Some(home)),
+            PathBuf::from(value)
+        );
+    }
+}
+
+#[test]
 fn serve_applies_and_removes_a_lora_adapter_on_the_metal_worker() {
     let Some(model_dir) = require_model_dir() else {
         return;
@@ -538,8 +595,11 @@ fn serve_applies_and_removes_a_lora_adapter_on_the_metal_worker() {
     // Nothing resident, nothing applied.
     assert_residency(&server, &[], &[], "fresh server");
 
-    // 1. Base output, and a control that the base is reproducible, so a later
-    //    difference cannot be nondeterminism.
+    // 1. Base output, and a repeat of it. The repeat shows the base trajectory is
+    //    stable across identical requests here; it does not by itself show that a
+    //    later difference comes from the adapter. The scale-0 / scale-1 pair below
+    //    adds that: the same adapter stays resident and selected, only the requested
+    //    scale moves, and the output moves from equal-to-base to different-from-base.
     let base = server.chat(None);
     assert!(
         base.message.contains("\"content\":\"") && base.completion_tokens > 0,
@@ -548,7 +608,7 @@ fn serve_applies_and_removes_a_lora_adapter_on_the_metal_worker() {
     assert_eq!(
         server.chat(None),
         base,
-        "greedy base decoding must be reproducible"
+        "base decoding must repeat for identical requests"
     );
 
     // 2. Load. Residency changes; nothing is applied by loading alone.
@@ -565,23 +625,36 @@ fn serve_applies_and_removes_a_lora_adapter_on_the_metal_worker() {
         "a resident but unnamed adapter must not change base output"
     );
 
-    // 4. Naming the adapter must change the output. This is the assertion that fails
-    //    when `QwenMetalRuntime::generate` stops applying the selection.
-    let adapted = server.chat(Some(id));
+    // 3b. The request scale multiplies the adapter's own alpha / rank scale. Naming the
+    //     adapter at request scale 0 selects it (it is published as applied) with an
+    //     effective scale of 0, so the output must be exactly the base output.
+    assert_eq!(
+        server.chat(Some((id, 0.0))),
+        base,
+        "naming the adapter at request scale 0 must reproduce base output"
+    );
+    assert_residency(&server, &[id], &[id], "after a scale-0 request");
+
+    // 4. The same adapter at request scale 1 (effective scale alpha / rank = 2) must
+    //    change the output. This is the assertion that fails when
+    //    `QwenMetalRuntime::generate` stops applying the selection, and, paired with
+    //    3b, when the registry ignores the requested scale.
+    let adapted = server.chat(Some((id, 1.0)));
     assert_ne!(
         adapted, base,
-        "naming the adapter left the output identical to base; the adapter was not \
-         applied (or the synthetic magnitude is too small for this checkpoint)"
+        "naming the adapter at scale 1 left the output identical to base; the adapter was \
+         not applied (or the synthetic magnitude is too small for this checkpoint)"
     );
-    assert_residency(&server, &[id], &[id], "after a named request");
+    assert_residency(&server, &[id], &[id], "after a scale-1 request");
     assert_eq!(
-        server.chat(Some(id)),
+        server.chat(Some((id, 1.0))),
         adapted,
-        "greedy decoding with the adapter must be reproducible"
+        "decoding with the adapter must repeat for identical requests"
     );
 
-    // 3b. The same request without naming the adapter returns to base: apply() is
-    //     run with the empty selection on every request.
+    // 3c. The same request without naming the adapter returns to base: the runtime
+    //     applies the empty selection, which unloads the slot because an adapter was
+    //     applied.
     assert_eq!(
         server.chat(None),
         base,
@@ -591,7 +664,7 @@ fn serve_applies_and_removes_a_lora_adapter_on_the_metal_worker() {
 
     // Re-applying after the revert reproduces the first adapted output exactly.
     assert_eq!(
-        server.chat(Some(id)),
+        server.chat(Some((id, 1.0))),
         adapted,
         "re-applying the adapter must reproduce the first adapted output"
     );
@@ -601,7 +674,7 @@ fn serve_applies_and_removes_a_lora_adapter_on_the_metal_worker() {
     //    nothing applied immediately, before any later request could mask a stale slot.
     server.unload_adapter(id);
     assert_residency(&server, &[], &[], "after unloading the applied adapter");
-    let (status, body) = server.chat_raw(Some(id));
+    let (status, body) = server.chat_raw(Some((id, 1.0)));
     assert_eq!(
         status, 400,
         "a request naming an unloaded adapter must be refused: {body}"
@@ -625,15 +698,37 @@ fn serve_applies_and_removes_a_lora_adapter_on_the_metal_worker() {
         "refusal must carry lora_adapter_not_found: {body}"
     );
 
-    // 6. A second load of the same file yields a fresh id and the same adapted output,
-    //    then unloads cleanly; the lifecycle repeats rather than working once.
-    let (second_id, _) = server.load_adapter(&adapter_path);
+    // 6. Load a different adapter (same shapes, different weights) after the unload. It
+    //    gets a fresh id and its own output: different from base and from the first
+    //    adapter's output, so reusing the first adapter's blend for the new id cannot
+    //    pass, and it repeats exactly. Then it unloads cleanly.
+    let second_path = adapter_dir
+        .path()
+        .join("synthetic_mlp_adapter_reload.safetensors");
+    write_adapter(&second_path, &cfg, RELOAD_ADAPTER_SEED);
+    let (second_id, _) = server.load_adapter(&second_path);
     assert_ne!(second_id, id, "an unloaded id must never be reused");
     assert_residency(&server, &[second_id], &[], "after the second load");
+    let reloaded = server.chat(Some((second_id, 1.0)));
+    assert_ne!(
+        reloaded, base,
+        "the second adapter left the output identical to base"
+    );
+    assert_ne!(
+        reloaded, adapted,
+        "the second adapter reproduced the first adapter's output; the new id was served \
+         with the previous adapter's weights"
+    );
+    assert_residency(
+        &server,
+        &[second_id],
+        &[second_id],
+        "after the second adapter",
+    );
     assert_eq!(
-        server.chat(Some(second_id)),
-        adapted,
-        "the reloaded adapter must produce the same adapted output"
+        server.chat(Some((second_id, 1.0))),
+        reloaded,
+        "decoding with the second adapter must repeat for identical requests"
     );
     server.unload_adapter(second_id);
     assert_residency(&server, &[], &[], "after the second unload");
