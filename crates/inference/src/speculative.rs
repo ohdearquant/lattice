@@ -1808,8 +1808,9 @@ fn softmax_into(logits: &[f32], out: &mut [f32]) {
 /// `scratch` and `out` must have the same length as `logits`; `scratch` is
 /// overwritten with the temperature-scaled logits. `temperature == 1.0` skips
 /// the scaling pass entirely. `temperature` must already be validated finite
-/// and `> 0` by the caller — a non-positive divisor would sign-flip or NaN the
-/// scaled logits.
+/// and `> 0` by the caller, and `1.0 / temperature` must be finite. A
+/// non-positive divisor would sign-flip or NaN the scaled logits, and an
+/// infinite reciprocal turns the centered maximum into `0.0 * inf = NaN`.
 fn softmax_into_temperature(
     logits: &[f32],
     temperature: f32,
@@ -2026,7 +2027,8 @@ fn sample_adjusted(p: &[f32], q: &[f32], r: f32) -> usize {
 ///   `&[]` (the argument is unused).
 /// - `initial_target_logits` is empty or has a vocabulary size that disagrees
 ///   with `target_logits` / `draft_logits` rows.
-/// - `temperature` is non-finite or `<= 0.0` — checked only when `greedy == false`.
+/// - `temperature` is non-finite or `<= 0.0`, or `1.0 / temperature` is not
+///   finite (checked only when `greedy == false`).
 pub fn rejection_sample_draft(
     draft_tokens: &[u32],
     draft_logits: &[Vec<f32>],
@@ -2107,6 +2109,14 @@ pub fn rejection_sample_draft(
         if !temperature.is_finite() || temperature <= 0.0 {
             return Err(InferenceError::InvalidInput(format!(
                 "probabilistic rejection sampling requires a finite temperature > 0, got {temperature}"
+            )));
+        }
+        // A tiny positive temperature whose reciprocal overflows to +inf would
+        // turn the centered maximum into `0.0 * inf = NaN` in the softmax, so
+        // refuse it too rather than produce a non-distribution.
+        if !(1.0 / temperature).is_finite() {
+            return Err(InferenceError::InvalidInput(format!(
+                "probabilistic rejection sampling requires a temperature whose reciprocal is finite, got {temperature:e}"
             )));
         }
     }
@@ -3732,6 +3742,32 @@ mod tests {
         let initial = uniform_logits(10);
         let err = rejection_sample_draft(&[3], &logits, &initial, &[], false, 1.0, Some(1));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn rejection_probabilistic_rejects_temperature_with_overflowing_reciprocal() {
+        // 1e-40 is a positive finite subnormal whose reciprocal is +inf, which
+        // would turn the centered maximum into `0.0 * inf = NaN` in the softmax.
+        const VOCAB: usize = 4;
+        let draft = vec![peaked_logits(VOCAB, 1, 3.0)];
+        let target = vec![peaked_logits(VOCAB, 2, 5.0)];
+        let initial = peaked_logits(VOCAB, 1, 4.0);
+
+        let err = rejection_sample_draft(&[1u32], &draft, &initial, &target, false, 1e-40, Some(7))
+            .expect_err("temperature with a non-finite reciprocal must be refused");
+        match err {
+            crate::error::InferenceError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("1e-40"),
+                    "message must name the temperature: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        // Control: a tiny temperature whose reciprocal is still finite is accepted.
+        let ok = rejection_sample_draft(&[1u32], &draft, &initial, &target, false, 1e-30, Some(7));
+        assert!(ok.is_ok(), "finite reciprocal must be accepted, got {ok:?}");
     }
 
     #[test]
