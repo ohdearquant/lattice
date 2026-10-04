@@ -19,6 +19,7 @@
 use base64::Engine as _;
 use lattice_inference::measurement::gpu_test_lock;
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -31,11 +32,11 @@ fn enforce() -> bool {
     std::env::var("LATTICE_VISION_S3_GATE_ENFORCE").as_deref() == Ok("1")
 }
 
-fn expand_home(path: &OsStr) -> PathBuf {
-    if let Some(rest) = path.to_str().and_then(|text| text.strip_prefix("~/"))
-        && let Some(home) = std::env::var_os("HOME")
+fn expand_home(path: &OsStr, home: Option<&OsStr>) -> PathBuf {
+    if let Some(rest) = path.as_bytes().strip_prefix(b"~/")
+        && let Some(home) = home
     {
-        return PathBuf::from(home).join(rest);
+        return PathBuf::from(home).join(OsStr::from_bytes(rest));
     }
     PathBuf::from(path)
 }
@@ -105,7 +106,8 @@ fn resolve_model_dir(
 }
 
 fn require_model_dir() -> Option<PathBuf> {
-    let var = std::env::var_os(MODEL_DIR_ENV).map(|value| expand_home(&value));
+    let home = std::env::var_os("HOME");
+    let var = std::env::var_os(MODEL_DIR_ENV).map(|value| expand_home(&value, home.as_deref()));
     let var_exists = var.as_ref().is_some_and(|path| path.exists());
     let (default, default_exists) = if var.is_none() {
         let default = default_model_dir();
@@ -245,6 +247,91 @@ fn model_dir_resolution_set_missing_with_default_missing_names_the_variable_path
             assert!(!line.contains("~/.lattice/models"), "{line}");
         }
         other => panic!("a set-but-missing variable must skip, got {other:?}"),
+    }
+}
+
+#[test]
+fn model_dir_resolution_set_present_uses_that_path_under_enforce() {
+    let resolved = resolve_model_dir(Some(PathBuf::from("/data/ckpt")), true, None, false, true);
+    assert_eq!(
+        resolved,
+        ModelDirResolution::Use(PathBuf::from("/data/ckpt"))
+    );
+}
+
+#[test]
+fn model_dir_resolution_empty_value_counts_as_set_and_skips() {
+    let resolved = resolve_model_dir(
+        Some(PathBuf::from("")),
+        false,
+        Some(PathBuf::from("/default/models/qwen3.5-0.8b")),
+        true,
+        false,
+    );
+    match resolved {
+        ModelDirResolution::Skip(line) => {
+            assert!(line.contains("LATTICE_VISION_S6_SERVE_SKIPPED"), "{line}");
+            assert!(
+                line.contains("tried=LATTICE_VISION_S3_MODEL_DIR="),
+                "{line}"
+            );
+            assert!(!line.contains("~/.lattice/models"), "{line}");
+        }
+        other => panic!("an empty-string variable is set and must skip, got {other:?}"),
+    }
+}
+
+#[test]
+#[should_panic(expected = "does not exist while LATTICE_VISION_S3_GATE_ENFORCE=1")]
+fn model_dir_resolution_empty_value_panics_under_enforce() {
+    let _ = resolve_model_dir(
+        Some(PathBuf::from("")),
+        false,
+        Some(PathBuf::from("/default/models/qwen3.5-0.8b")),
+        true,
+        true,
+    );
+}
+
+#[test]
+fn model_dir_resolution_unset_without_a_default_skips() {
+    let resolved = resolve_model_dir(None, false, None, false, false);
+    match resolved {
+        ModelDirResolution::Skip(line) => {
+            assert!(line.contains("LATTICE_VISION_S6_SERVE_SKIPPED"), "{line}");
+            assert!(line.contains("~/.lattice/models/qwen3.5-0.8b"), "{line}");
+        }
+        other => panic!("an unset variable with no default must skip, got {other:?}"),
+    }
+}
+
+#[test]
+fn expand_home_replaces_a_leading_tilde_with_home() {
+    let expanded = expand_home(OsStr::new("~/ckpt"), Some(OsStr::new("/fixture-home")));
+    assert_eq!(expanded, PathBuf::from("/fixture-home/ckpt"));
+}
+
+#[test]
+fn expand_home_keeps_a_non_utf8_suffix_after_the_tilde() {
+    let value = OsStr::from_bytes(b"~/ckpt-\xff");
+    let expanded = expand_home(value, Some(OsStr::new("/fixture-home")));
+    assert_eq!(
+        expanded,
+        PathBuf::from("/fixture-home").join(OsStr::from_bytes(b"ckpt-\xff"))
+    );
+}
+
+#[test]
+fn expand_home_leaves_the_value_unchanged_without_home() {
+    let expanded = expand_home(OsStr::new("~/ckpt"), None);
+    assert_eq!(expanded, PathBuf::from("~/ckpt"));
+}
+
+#[test]
+fn expand_home_leaves_a_value_without_a_leading_tilde_slash_unchanged() {
+    for value in ["/data/ckpt", "ckpt", "~ckpt", "a/~/b"] {
+        let expanded = expand_home(OsStr::new(value), Some(OsStr::new("/fixture-home")));
+        assert_eq!(expanded, PathBuf::from(value), "{value}");
     }
 }
 
