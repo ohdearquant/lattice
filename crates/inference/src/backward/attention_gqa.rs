@@ -374,6 +374,14 @@ pub fn gqa_forward_with_cache(
     sin_table: &[f32],
     eps: f32,
 ) -> (Vec<f32>, AttnCache) {
+    assert!(
+        num_kv_heads > 0,
+        "gqa_forward_with_cache: num_kv_heads must be > 0"
+    );
+    assert!(
+        num_q_heads.is_multiple_of(num_kv_heads),
+        "gqa_forward_with_cache: num_q_heads ({num_q_heads}) must be a multiple of num_kv_heads ({num_kv_heads})"
+    );
     let q_dim = num_q_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
     let groups = num_q_heads / num_kv_heads;
@@ -1221,8 +1229,8 @@ mod tests {
         assert_projection_parity(false, true);
     }
 
-    // A rank-0 adapter adds exactly nothing and must never reach the GEMM: `k = 0` is an
-    // invalid BLAS argument and aborts the process under Accelerate.
+    // A rank-0 adapter adds exactly nothing: `add_lora_delta` returns early instead of
+    // running two empty GEMMs, so the output and caches match the no-adapter run.
     #[test]
     fn gqa_forward_with_cache_rank_zero_lora_matches_no_lora() {
         let seq_len = 3;
@@ -1327,5 +1335,44 @@ mod tests {
         assert_eq!(out, vec![0.0f32; seq_len * hidden]);
         assert!(cache.q_raw.is_empty());
         assert_eq!(cache.v.len(), seq_len * kv_dim);
+    }
+
+    fn call_with_head_counts(num_q_heads: usize, num_kv_heads: usize) {
+        let _ = gqa_forward_with_cache(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            0,
+            1.0,
+            0,
+            0,
+            num_q_heads,
+            num_kv_heads,
+            4,
+            2,
+            &[],
+            &[],
+            1e-6,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "num_kv_heads must be > 0")]
+    fn gqa_forward_with_cache_zero_kv_heads_is_rejected() {
+        call_with_head_counts(2, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a multiple of num_kv_heads")]
+    fn gqa_forward_with_cache_indivisible_head_counts_are_rejected() {
+        call_with_head_counts(3, 2);
     }
 }

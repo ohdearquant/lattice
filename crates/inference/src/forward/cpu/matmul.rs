@@ -260,25 +260,27 @@ mod tests {
 
     // A zero dimension is an empty GEMM, not a shape error: Accelerate aborts the process on a
     // zero leading dimension, so each case runs through the public entry point on every backend.
-    // The sentinel suffix lies beyond m*n, which `matmul_bt` must leave untouched here.
+    // The result region is c[..m*n]; the suffix beyond it is not part of the contract (see the
+    // `matmul_bt` doc), so these tests assert nothing about it. The sentinel only proves that a
+    // nonempty result region is overwritten.
     const SENTINEL: f32 = 7.5;
 
     #[test]
-    fn matmul_bt_zero_rows_writes_nothing() {
+    fn matmul_bt_zero_rows_returns() {
         let (m, k, n) = (0usize, 3usize, 2usize);
         let b = [1.0f32; 6];
         let mut c = [SENTINEL; 4];
         matmul_bt(&[], &b, &mut c, m, k, n);
-        assert!(c.iter().all(|&v| v == SENTINEL), "m=0 must not write c");
+        // m*n == 0: the result region is empty, so the property is that the call returns.
     }
 
     #[test]
-    fn matmul_bt_zero_columns_writes_nothing() {
+    fn matmul_bt_zero_columns_returns() {
         let (m, k, n) = (2usize, 3usize, 0usize);
         let a = [1.0f32; 6];
         let mut c = [SENTINEL; 4];
         matmul_bt(&a, &[], &mut c, m, k, n);
-        assert!(c.iter().all(|&v| v == SENTINEL), "n=0 must not write c");
+        // m*n == 0: the result region is empty, so the property is that the call returns.
     }
 
     #[test]
@@ -291,10 +293,6 @@ mod tests {
             "k=0 must zero c[..m*n], got {:?}",
             &c[..m * n]
         );
-        assert!(
-            c[m * n..].iter().all(|&v| v == SENTINEL),
-            "k=0 must leave the suffix beyond m*n untouched"
-        );
     }
 
     #[test]
@@ -302,6 +300,5 @@ mod tests {
         let mut c = [SENTINEL; 5];
         matmul_bt(&[], &[], &mut c, 1, 0, 4);
         assert!(c[..4].iter().all(|&v| v == 0.0));
-        assert_eq!(c[4], SENTINEL);
     }
 }

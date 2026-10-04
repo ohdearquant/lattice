@@ -2229,19 +2229,27 @@ mod ffn_seq_forward_tests {
     // training uses. Both layers carry a LoRA slot. Layer 0 is non-terminal, so its FFN block
     // covers every position (rows start at position 0); layer 1 is terminal, so its FFN block
     // covers only the completion positions (rows start at position `COMPLETION_START - 1`).
-    // A wrong flat-row to position mapping in either block changes the loss the forward
-    // computes without changing what the backward reads, so the analytic gradient and the
-    // finite difference of the loss disagree.
+    // A wrong position offset when the FFN output is added back changes the loss the forward
+    // computes. A wrong `rows_by_position` mapping leaves that loss alone (it only places the
+    // stored gate/up rows the backward reads) and misaligns the backward instead. Either way
+    // the analytic gradient and the finite difference of the loss disagree.
     #[test]
     fn forward_full_lora_gradients_match_finite_differences() {
         // Central differences on an f32 forward: the loss itself carries roughly 1e-6 of f32
         // rounding noise, so eps = 1e-2 keeps that noise near 5e-5 in the quotient while the
         // O(eps^2) truncation term stays below 1e-4 for parameters of magnitude 0.2.
         const EPS: f32 = 1e-2;
-        // Relative to the larger of the two gradients, plus an absolute floor at the noise
-        // level for entries whose true gradient is near zero.
-        const REL_TOL: f64 = 5e-2;
-        const ABS_TOL: f64 = 2e-4;
+        // Relative to the larger of the two gradients, plus a small absolute floor. Measured on
+        // this fixture: worst relative error 2.25e-3 and worst absolute error 8.7e-6 over the
+        // 32 sampled entries, so 2e-2 leaves about 9x of margin and 2e-5 about 2.3x. A gradient
+        // wrong by 10% (a scale error of 0.9) is outside the relative bound for every entry.
+        const REL_TOL: f64 = 2e-2;
+        const ABS_TOL: f64 = 2e-5;
+        // An entry is significant when its gradient is large enough that the relative bound,
+        // not the absolute floor, decides it. Every (layer, tensor) group must hold at least
+        // `MIN_SIGNIFICANT_PER_GROUP` of them, so no group can pass on near-zero samples.
+        const SIGNIFICANT: f64 = 2e-3;
+        const MIN_SIGNIFICANT_PER_GROUP: usize = 2;
 
         let cfg = tiny_cfg();
         let dims = tiny_dims(&cfg);
@@ -2305,12 +2313,12 @@ mod ffn_seq_forward_tests {
             ("b_v", |l| &mut l.b_v),
         ];
         let mut checked = 0usize;
-        let mut significant = 0usize;
         let mut worst_rel = 0.0f64;
         for slot in 0..2 {
             for (name, select) in tensors {
                 let g = select(&mut grads[slot]).clone();
                 let len = g.len();
+                let mut significant = 0usize;
                 for idx in [1, len / 3, 2 * len / 3, len - 2] {
                     let original = select(&mut loras[slot])[idx];
                     select(&mut loras[slot])[idx] = original + EPS;
@@ -2334,23 +2342,21 @@ mod ffn_seq_forward_tests {
                         "layer {slot} {name}[{idx}]: analytic {ana:.6e} vs finite-difference {numeric:.6e}"
                     );
                     checked += 1;
-                    if ana.abs() > 10.0 * ABS_TOL {
+                    if ana.abs() > SIGNIFICANT {
                         significant += 1;
                         worst_rel =
                             worst_rel.max((ana - numeric).abs() / ana.abs().max(numeric.abs()));
                     }
                 }
+                assert!(
+                    significant >= MIN_SIGNIFICANT_PER_GROUP,
+                    "layer {slot} {name}: only {significant} sampled gradients exceed {SIGNIFICANT:e}"
+                );
             }
         }
         eprintln!(
-            "gradient check: {significant}/{checked} significant entries, worst relative error {worst_rel:.2e}"
+            "gradient check: {checked} entries, worst significant relative error {worst_rel:.2e}"
         );
         assert_eq!(checked, 32);
-        // Entries well above the absolute floor are the ones the relative bound actually
-        // constrains; without enough of them the check could pass on near-zero gradients.
-        assert!(
-            significant >= 16,
-            "only {significant} of {checked} sampled gradients exceed the absolute floor"
-        );
     }
 }
