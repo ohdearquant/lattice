@@ -22,8 +22,9 @@
 //! the full assistant message, the finish reason and the completion token count,
 //! requested with greedy decoding (`temperature: 0`). Greedy decoding is not taken
 //! to be deterministic on the backend: repeatability is observed for the exact
-//! request sequence below, and each comparison is preceded by a repeat of the same
-//! request.
+//! request sequence below, not assumed. The base request is compared with a repeat
+//! of itself first (step 1); the adapted and reloaded requests are repeated after
+//! they have been compared with the base output.
 //!
 //! Resident adapters are never applied implicitly: this server has no router, so
 //! a request that omits `lora` selects the base model whether or not an adapter
@@ -457,7 +458,8 @@ impl Server {
     }
 }
 
-/// Everything about a completion that greedy decoding makes deterministic.
+/// What the chat response exposes and the test compares: the message, the finish
+/// reason and the completion token count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Output {
     message: String,
