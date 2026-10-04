@@ -1185,6 +1185,8 @@ jobs:
         env:
           LATTICE_VISION_S3_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
           LATTICE_VISION_S3_GATE_ENFORCE: '1'
+          # Hosted runners' bf16 model load has measured close to the 120 s test default.
+          LATTICE_VISION_SERVE_HEALTH_TIMEOUT_SECS: '300'
         run: |
           if cargo test --release -p lattice-inference --features f16,metal-gpu \
             --test vision_serve_e2e_test \
