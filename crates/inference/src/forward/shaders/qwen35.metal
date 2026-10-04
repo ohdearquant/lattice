@@ -2338,6 +2338,71 @@ kernel void lora_gemv_b_accum(
     y[gid] += scale * sum;
 }
 
+// ===== Row-aware LoRA phase 1: T[t, j] = sum_k A[j, k] * X[t, k] =====
+// A is row-major float32 [rank, K]; X holds `rows` input rows `x_stride` floats apart
+// (the host binds X at the first row's byte offset). T is row-major [rows, rank], so each
+// token row owns its own rank-wide slice of the scratch buffer.
+// Dispatch: threadgroups=(rank, rows, 1), threads=(32, 4, 1)
+kernel void lora_gemm_a_rows(
+    device const float* x       [[buffer(0)]],
+    device const float* A       [[buffer(1)]],
+    device float* intermediate  [[buffer(2)]],
+    constant uint& rank_val     [[buffer(3)]],
+    constant uint& K            [[buffer(4)]],
+    constant uint& rows         [[buffer(5)]],
+    constant uint& x_stride     [[buffer(6)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint r = tgpig.x;
+    uint t = tgpig.y;
+    if (r >= rank_val || t >= rows) return;
+
+    device const float* row = A + (ulong)r * K;
+    device const float* xr = x + (ulong)t * x_stride;
+    float partial = 0.0f;
+    for (uint k = tiisg + sgitg * 32; k < K; k += 128) {
+        partial += row[k] * xr[k];
+    }
+    partial = simd_sum(partial);
+
+    threadgroup float sg_sums[4];
+    if (tiisg == 0) sg_sums[sgitg] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        intermediate[(ulong)t * rank_val + r] = sg_sums[0] + sg_sums[1] + sg_sums[2] + sg_sums[3];
+    }
+}
+
+// ===== Row-aware LoRA phase 2: Y[t, o] += scale * sum_j B[o, j] * T[t, j] =====
+// B is row-major float32 [N, rank]; T is the [rows, rank] scratch written by phase 1.
+// Y holds `rows` output rows `y_stride` floats apart (bound at the first row's byte offset).
+// The rank loop runs to the runtime `rank_val`; there is no fixed rank limit.
+// Dispatch: threadgroups=(ceil(N/256), rows, 1), threads=(256, 1, 1)
+kernel void lora_gemm_b_accum_rows(
+    device const float* intermediate  [[buffer(0)]],
+    device const float* B             [[buffer(1)]],
+    device float* y                   [[buffer(2)]],
+    constant uint& N                  [[buffer(3)]],
+    constant uint& rank_val           [[buffer(4)]],
+    constant float& scale             [[buffer(5)]],
+    constant uint& rows               [[buffer(6)]],
+    constant uint& y_stride           [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint o = gid.x;
+    uint t = gid.y;
+    if (o >= N || t >= rows) return;
+    device const float* brow = B + (ulong)o * rank_val;
+    device const float* trow = intermediate + (ulong)t * rank_val;
+    float sum = 0.0f;
+    for (uint j = 0; j < rank_val; j++) {
+        sum += brow[j] * trow[j];
+    }
+    y[(ulong)t * y_stride + o] += scale * sum;
+}
+
 // ===== MoE: zero a float buffer =====
 // Used to clear scratch_out before accumulating expert outputs.
 kernel void zero_buf(
