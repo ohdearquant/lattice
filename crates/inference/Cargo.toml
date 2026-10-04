@@ -264,6 +264,13 @@ required-features = ["f16", "metal-gpu"]
 name = "bench_serve_prepare"
 required-features = ["serve"]
 
+# HTTP-level serving measurement: spawns the built `lattice` binary. `test = true`
+# runs its model-free refusal controls under a plain `cargo test`.
+[[example]]
+name = "bench_serve_http"
+required-features = ["serve", "download"]
+test = true
+
 [[example]]
 name = "bench_gpu"
 required-features = ["f16", "wgpu-gpu"]

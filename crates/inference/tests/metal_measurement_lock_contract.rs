@@ -406,6 +406,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "benches/quarot_hadamard_bench.rs",
     "benches/tokenizer_bench.rs",
     "examples/bench_gdn.rs",
+    "examples/bench_serve_http.rs",
     "examples/diff_attn_layer23.rs",
     "examples/diff_gdn_layer.rs",
     "examples/ernie45_trace_dump.rs",

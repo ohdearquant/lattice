@@ -622,6 +622,29 @@ jobs:
       - name: embed — metal-gpu (macOS only)
         if: runner.os == 'macOS'
         run: cargo build -p lattice-embed --features metal-gpu
+      # bench_serve_http is the HTTP measurement harness for `lattice serve`. Its
+      # tests check that it refuses to certify a run that measured nothing (a
+      # missing checkpoint or binary, a server that never listens, a response
+      # with no tokens, a stream with no content). They need no model. The
+      # example sets `test = true`, so `cargo test --workspace` also runs them,
+      # but only while `serve` and `download` stay default features: cargo skips
+      # a target whose required features are off and does not fail. Naming the
+      # target turns that case into an error, and the count catches a module
+      # that was emptied.
+      - name: inference — bench_serve_http harness tests (example target)
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p lattice-inference --example bench_serve_http 2>&1) || {
+            status=$?
+            printf '%s\n' "$out"
+            exit "$status"
+          }
+          printf '%s\n' "$out"
+          passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
+          if [ -z "$passed" ] || [ "$passed" -lt 19 ]; then
+            echo "expected at least 19 passing bench_serve_http tests, parsed '${passed:-<none>}'" >&2
+            exit 1
+          fi
       # The two metal-gpu legs above build the lattice-inference and lattice-embed
       # libraries (the embed leg pulls in lattice-inference/metal-gpu transitively),
       # so a stale-field constructor in either library is already caught there. What
