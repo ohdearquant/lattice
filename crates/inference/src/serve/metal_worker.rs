@@ -3198,13 +3198,17 @@ mod tests {
         // Distinct from the dequeue-time receiver test (the receiver is open
         // when job 1 is dequeued) and from the flag-driven prefill test (job
         // 1's cancel guard is kept alive for the whole test, so the cancel
-        // flag never flips). The only thing that can stop job 1 inside its
-        // prefill-like phase is `should_cancel` observing the closed receiver.
+        // flag stays unset through the observed generation; the guards drop
+        // at scope exit, after the worker is joined). The only thing that
+        // can stop job 1 inside its prefill-like phase is `should_cancel`
+        // observing the closed receiver.
         //
         // The receiver is dropped only after `generate` has been entered, and
         // the generator holds its first predicate poll until that drop has
         // happened, so the first poll is causally after the close and no
-        // sleep orders anything. Every wait below is bounded.
+        // sleep orders anything. Every wait below is bounded except the final
+        // join, which cannot hang the test: it follows the done signal, and
+        // that is sent only after the worker loop has returned.
         const WAIT: Duration = Duration::from_secs(10);
 
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
