@@ -257,4 +257,51 @@ mod tests {
         // Extra slot c[2]: content is platform-defined, we only guarantee no panic and
         // correct values in c[0..m*n]. This test proves the >= bound is correct.
     }
+
+    // A zero dimension is an empty GEMM, not a shape error: Accelerate aborts the process on a
+    // zero leading dimension, so each case runs through the public entry point on every backend.
+    // The sentinel suffix lies beyond m*n, which `matmul_bt` must leave untouched here.
+    const SENTINEL: f32 = 7.5;
+
+    #[test]
+    fn matmul_bt_zero_rows_writes_nothing() {
+        let (m, k, n) = (0usize, 3usize, 2usize);
+        let b = [1.0f32; 6];
+        let mut c = [SENTINEL; 4];
+        matmul_bt(&[], &b, &mut c, m, k, n);
+        assert!(c.iter().all(|&v| v == SENTINEL), "m=0 must not write c");
+    }
+
+    #[test]
+    fn matmul_bt_zero_columns_writes_nothing() {
+        let (m, k, n) = (2usize, 3usize, 0usize);
+        let a = [1.0f32; 6];
+        let mut c = [SENTINEL; 4];
+        matmul_bt(&a, &[], &mut c, m, k, n);
+        assert!(c.iter().all(|&v| v == SENTINEL), "n=0 must not write c");
+    }
+
+    #[test]
+    fn matmul_bt_zero_inner_dimension_zero_fills_output() {
+        let (m, k, n) = (3usize, 0usize, 2usize);
+        let mut c = [SENTINEL; 9];
+        matmul_bt(&[], &[], &mut c, m, k, n);
+        assert!(
+            c[..m * n].iter().all(|&v| v == 0.0),
+            "k=0 must zero c[..m*n], got {:?}",
+            &c[..m * n]
+        );
+        assert!(
+            c[m * n..].iter().all(|&v| v == SENTINEL),
+            "k=0 must leave the suffix beyond m*n untouched"
+        );
+    }
+
+    #[test]
+    fn matmul_bt_zero_inner_dimension_single_row_zero_fills_output() {
+        let mut c = [SENTINEL; 5];
+        matmul_bt(&[], &[], &mut c, 1, 0, 4);
+        assert!(c[..4].iter().all(|&v| v == 0.0));
+        assert_eq!(c[4], SENTINEL);
+    }
 }

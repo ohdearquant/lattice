@@ -418,4 +418,24 @@ mod tests {
         let w_down = vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0];
         let _ = swiglu_forward_seq(&x, &w_gate, &w_up, &w_down, 2, hidden, inter);
     }
+
+    // Zero-width intermediate or hidden dimension: both reach `matmul_bt` with an empty
+    // dimension, which must produce correctly sized (empty or zero) outputs, not abort.
+    #[test]
+    fn swiglu_forward_seq_zero_intermediate_returns_zero_output() {
+        let (rows, hidden) = (3usize, 4usize);
+        let x = vec![0.5f32; rows * hidden];
+        let (out, gate_pre, up_pre) = swiglu_forward_seq(&x, &[], &[], &[], rows, hidden, 0);
+        assert_eq!(out, vec![0.0f32; rows * hidden]);
+        assert!(gate_pre.is_empty() && up_pre.is_empty());
+    }
+
+    #[test]
+    fn swiglu_forward_seq_zero_hidden_returns_empty_output() {
+        let (rows, inter) = (3usize, 5usize);
+        let (out, gate_pre, up_pre) = swiglu_forward_seq(&[], &[], &[], &[], rows, 0, inter);
+        assert!(out.is_empty());
+        assert_eq!(gate_pre, vec![0.0f32; rows * inter]);
+        assert_eq!(up_pre, vec![0.0f32; rows * inter]);
+    }
 }

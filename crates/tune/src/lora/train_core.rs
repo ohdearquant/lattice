@@ -2050,6 +2050,32 @@ mod ffn_seq_forward_tests {
         cfg
     }
 
+    fn tiny_dims(cfg: &Qwen35Config) -> Dims {
+        let dims = Dims {
+            hidden: cfg.hidden_size,
+            vocab: cfg.vocab_size,
+            num_q_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            rope_dim: cfg.rope_dim(),
+            inter: cfg.intermediate_size,
+            q_dim: cfg.full_q_dim(),
+            kv_dim: cfg.full_kv_dim(),
+            eps: cfg.rms_norm_eps,
+        };
+        assert_eq!(dims.rope_dim, ROPE_DIM);
+        dims
+    }
+
+    fn rope_tables() -> (Vec<f32>, Vec<f32>) {
+        let half = ROPE_DIM / 2;
+        let angle =
+            |i: usize| (i / half) as f32 / 10000f32.powf(2.0 * (i % half) as f32 / ROPE_DIM as f32);
+        let cos = (0..SEQ * half).map(|i| angle(i).cos()).collect();
+        let sin = (0..SEQ * half).map(|i| angle(i).sin()).collect();
+        (cos, sin)
+    }
+
     #[test]
     fn rows_by_position_leaves_uncomputed_positions_empty() {
         let width = 3;
@@ -2072,19 +2098,7 @@ mod ffn_seq_forward_tests {
     #[test]
     fn forward_full_ffn_matches_per_position_reference() {
         let cfg = tiny_cfg();
-        let dims = Dims {
-            hidden: cfg.hidden_size,
-            vocab: cfg.vocab_size,
-            num_q_heads: cfg.num_attention_heads,
-            num_kv_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-            rope_dim: cfg.rope_dim(),
-            inter: cfg.intermediate_size,
-            q_dim: cfg.full_q_dim(),
-            kv_dim: cfg.full_kv_dim(),
-            eps: cfg.rms_norm_eps,
-        };
-        assert_eq!(dims.rope_dim, ROPE_DIM);
+        let dims = tiny_dims(&cfg);
         let gdn_dims = GdnDims::from_cfg(&cfg);
         let slot_layers = [1usize];
         let no_gdn_slots: [usize; 0] = [];
@@ -2108,17 +2122,7 @@ mod ffn_seq_forward_tests {
             a_v: rand_fill(&mut rng, RANK * HIDDEN, 0.2),
             b_v: rand_fill(&mut rng, dims.kv_dim * RANK, 0.2),
         }];
-        let half = ROPE_DIM / 2;
-        let cos: Vec<f32> = (0..SEQ * half)
-            .map(|i| {
-                ((i / half) as f32 / 10000f32.powf(2.0 * (i % half) as f32 / ROPE_DIM as f32)).cos()
-            })
-            .collect();
-        let sin: Vec<f32> = (0..SEQ * half)
-            .map(|i| {
-                ((i / half) as f32 / 10000f32.powf(2.0 * (i % half) as f32 / ROPE_DIM as f32)).sin()
-            })
-            .collect();
+        let (cos, sin) = rope_tables();
         let ctx = SeqCtx {
             h_in: rand_fill(&mut rng, SEQ * HIDDEN, 1.0),
             cos,
@@ -2206,6 +2210,147 @@ mod ffn_seq_forward_tests {
         assert!(
             grads[0].b_q.iter().any(|g| g.abs() > 1e-8),
             "b_q gradient is identically zero"
+        );
+    }
+
+    // Mean completion NLL accumulated in f64 from the stored logits, so the finite-difference
+    // quotient below is not limited by an f32 sum or an f32 cast of the result.
+    fn mean_nll_f64(fwd: &FullFwd) -> f64 {
+        let mut total = 0.0f64;
+        for p in &fwd.positions {
+            let max = p.logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let sum_exp: f64 = p.logits.iter().map(|&l| (l as f64 - max).exp()).sum();
+            total += max + sum_exp.ln() - p.logits[p.target as usize] as f64;
+        }
+        total / fwd.positions.len() as f64
+    }
+
+    // Whole-model gradient check through the same `forward_full` + `nll_and_grads` path
+    // training uses. Both layers carry a LoRA slot. Layer 0 is non-terminal, so its FFN block
+    // covers every position (rows start at position 0); layer 1 is terminal, so its FFN block
+    // covers only the completion positions (rows start at position `COMPLETION_START - 1`).
+    // A wrong flat-row to position mapping in either block changes the loss the forward
+    // computes without changing what the backward reads, so the analytic gradient and the
+    // finite difference of the loss disagree.
+    #[test]
+    fn forward_full_lora_gradients_match_finite_differences() {
+        // Central differences on an f32 forward: the loss itself carries roughly 1e-6 of f32
+        // rounding noise, so eps = 1e-2 keeps that noise near 5e-5 in the quotient while the
+        // O(eps^2) truncation term stays below 1e-4 for parameters of magnitude 0.2.
+        const EPS: f32 = 1e-2;
+        // Relative to the larger of the two gradients, plus an absolute floor at the noise
+        // level for entries whose true gradient is near zero.
+        const REL_TOL: f64 = 5e-2;
+        const ABS_TOL: f64 = 2e-4;
+
+        let cfg = tiny_cfg();
+        let dims = tiny_dims(&cfg);
+        let gdn_dims = GdnDims::from_cfg(&cfg);
+        let slot_layers = [0usize, 1];
+        let no_gdn_slots: [usize; 0] = [];
+        let train = TrainCtx::try_new(
+            TapeGeometry::new(&dims, &gdn_dims, &cfg),
+            RANK,
+            2.0 * RANK as f32,
+            SlotLayout::new(&slot_layers, &no_gdn_slots),
+            AdamConfig::new(1e-3, 0.9, 0.999, 1e-8),
+        )
+        .expect("tiny geometry is valid");
+
+        let mut rng = 0xC0FF_EE11_u64;
+        let w0 = tiny_layer(&mut rng);
+        let w1 = tiny_layer(&mut rng);
+        let layers = [layer_w(&w0, Some(0)), layer_w(&w1, Some(1))];
+        let mut loras: Vec<LoraParams> = (0..2)
+            .map(|_| LoraParams {
+                a_q: rand_fill(&mut rng, RANK * HIDDEN, 0.2),
+                b_q: rand_fill(&mut rng, 2 * dims.q_dim * RANK, 0.2),
+                a_v: rand_fill(&mut rng, RANK * HIDDEN, 0.2),
+                b_v: rand_fill(&mut rng, dims.kv_dim * RANK, 0.2),
+            })
+            .collect();
+        let (cos, sin) = rope_tables();
+        let ctx = SeqCtx {
+            h_in: rand_fill(&mut rng, SEQ * HIDDEN, 1.0),
+            cos,
+            sin,
+            tokens: (0..SEQ as u32)
+                .map(|t| (t * 5 + 1) % VOCAB as u32)
+                .collect(),
+            completion_start: COMPLETION_START,
+            seq_len: SEQ,
+        };
+        let lm_head = rand_fill(&mut rng, VOCAB * HIDDEN, 0.3);
+        let final_shift = shifted(&rand_fill(&mut rng, HIDDEN, 0.1));
+        let head = Head {
+            lm_head: &lm_head,
+            final_shift: &final_shift,
+        };
+
+        let fwd = forward_full(&ctx, &layers, &loras, &[], &head, &train).expect("forward_full");
+        let (nll_sum, n, mut grads, _) =
+            nll_and_grads(&fwd, &layers, &loras, &head, &train).expect("nll_and_grads");
+        let loss = mean_nll_f64(&fwd);
+        assert!(
+            (nll_sum as f64 / n as f64 - loss).abs() < 1e-5,
+            "loss mismatch: reverse pass {} vs f64 recompute {loss}",
+            nll_sum as f64 / n as f64
+        );
+
+        type Select = fn(&mut LoraParams) -> &mut Vec<f32>;
+        let tensors: [(&str, Select); 4] = [
+            ("a_q", |l| &mut l.a_q),
+            ("b_q", |l| &mut l.b_q),
+            ("a_v", |l| &mut l.a_v),
+            ("b_v", |l| &mut l.b_v),
+        ];
+        let mut checked = 0usize;
+        let mut significant = 0usize;
+        let mut worst_rel = 0.0f64;
+        for slot in 0..2 {
+            for (name, select) in tensors {
+                let g = select(&mut grads[slot]).clone();
+                let len = g.len();
+                for idx in [1, len / 3, 2 * len / 3, len - 2] {
+                    let original = select(&mut loras[slot])[idx];
+                    select(&mut loras[slot])[idx] = original + EPS;
+                    let plus = mean_nll_f64(
+                        &forward_full(&ctx, &layers, &loras, &[], &head, &train)
+                            .expect("forward_full +eps"),
+                    );
+                    select(&mut loras[slot])[idx] = original - EPS;
+                    let minus = mean_nll_f64(
+                        &forward_full(&ctx, &layers, &loras, &[], &head, &train)
+                            .expect("forward_full -eps"),
+                    );
+                    select(&mut loras[slot])[idx] = original;
+
+                    let numeric = (plus - minus) / (2.0 * EPS as f64);
+                    let ana = g[idx] as f64;
+                    let tol = REL_TOL * ana.abs().max(numeric.abs()) + ABS_TOL;
+                    // `!(diff <= tol)` so a NaN quotient fails instead of passing.
+                    assert!(
+                        (ana - numeric).abs() <= tol,
+                        "layer {slot} {name}[{idx}]: analytic {ana:.6e} vs finite-difference {numeric:.6e}"
+                    );
+                    checked += 1;
+                    if ana.abs() > 10.0 * ABS_TOL {
+                        significant += 1;
+                        worst_rel =
+                            worst_rel.max((ana - numeric).abs() / ana.abs().max(numeric.abs()));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "gradient check: {significant}/{checked} significant entries, worst relative error {worst_rel:.2e}"
+        );
+        assert_eq!(checked, 32);
+        // Entries well above the absolute floor are the ones the relative bound actually
+        // constrains; without enough of them the check could pass on near-zero gradients.
+        assert!(
+            significant >= 16,
+            "only {significant} of {checked} sampled gradients exceed the absolute floor"
         );
     }
 }

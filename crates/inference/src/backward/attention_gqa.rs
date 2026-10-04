@@ -396,8 +396,8 @@ pub fn gqa_forward_with_cache(
     let mut h_v = vec![0.0f32; seq_len * lora_rank];
 
     // q+gate projection: full 2*q_dim rows of w_q, LoRA on the full output, then
-    // deinterleave per head into Q (q_dim) and gate_z (q_dim). Every projection is one
-    // GEMM over all positions.
+    // deinterleave per head into Q (q_dim) and gate_z (q_dim). Each base projection is one
+    // GEMM over all positions; an adapted projection adds two more for the LoRA delta.
     let mut q_and_gate = vec![0.0f32; seq_len * 2 * q_dim];
     matmul_bt(x, w_q, &mut q_and_gate, seq_len, hidden, 2 * q_dim);
     if let (Some(la), Some(lb)) = (lora_a_q, lora_b_q) {
@@ -1277,5 +1277,55 @@ mod tests {
         assert_eq!(cache_none.q_raw, cache_empty.q_raw);
         assert_eq!(cache_none.v, cache_empty.v);
         assert!(cache_empty.h_q.is_empty() && cache_empty.h_v.is_empty());
+    }
+
+    // No query heads: q_dim = 0, so the Q projection has n = 0 and the output projection has
+    // k = 0. Both reach `matmul_bt` with an empty dimension and must return, not abort.
+    #[test]
+    fn gqa_forward_with_cache_zero_query_heads_returns_zero_output() {
+        let seq_len = 3;
+        let hidden = 8;
+        let num_q_heads = 0;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let rope_dim = 2;
+        let kv_dim = num_kv_heads * head_dim;
+        let half = rope_dim / 2;
+
+        let mut rng = 0xBEEF_0043_u64;
+        let w_k = rand_vec(&mut rng, kv_dim * hidden, 0.3);
+        let w_v = rand_vec(&mut rng, kv_dim * hidden, 0.3);
+        let norm_w = vec![0.0f32; head_dim];
+        let x = rand_vec(&mut rng, seq_len * hidden, 1.0);
+        let cos_table = vec![1.0f32; seq_len * half];
+        let sin_table = vec![0.0f32; seq_len * half];
+
+        let (out, cache) = gqa_forward_with_cache(
+            &x,
+            &[],
+            &w_k,
+            &w_v,
+            &[],
+            &norm_w,
+            &norm_w,
+            None,
+            None,
+            None,
+            None,
+            0,
+            1.0,
+            seq_len,
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            &cos_table,
+            &sin_table,
+            1e-6,
+        );
+        assert_eq!(out, vec![0.0f32; seq_len * hidden]);
+        assert!(cache.q_raw.is_empty());
+        assert_eq!(cache.v.len(), seq_len * kv_dim);
     }
 }
