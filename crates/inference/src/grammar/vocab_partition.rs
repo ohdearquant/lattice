@@ -91,10 +91,14 @@ impl VocabPartition {
     /// vocabulary of `vocab_size` tokens.
     ///
     /// For each precomputed state, one [`ByteTrie::classify`] walk visits the
-    /// vocabulary's shared byte prefixes and classifies every token the way
-    /// `simulate_token` would: a rejected first byte rejects the token, a
-    /// rejection after the first byte makes it context-dependent, and a fully
-    /// accepted token is allowed. Cost is O(|states| × trie nodes) PDA steps
+    /// vocabulary's shared byte prefixes and classifies every non-empty token
+    /// the way `simulate_token` would: a rejected first byte rejects the token,
+    /// a rejection after the first byte makes it context-dependent, and a
+    /// fully accepted token is allowed. Empty tokens are always blocked (an
+    /// empty token emits no bytes, so allowing one would let decoding make no
+    /// progress), as in the previous per-token builder, although
+    /// `simulate_token` returns `Accept` for an empty slice. Cost is
+    /// O(|states| × trie nodes) PDA steps
     /// plus the size of each state's context-dependent set; a rejected byte
     /// prunes every token sharing that prefix at once. `trie` must have been
     /// built from the same vocabulary of `vocab_size` tokens.
@@ -122,10 +126,12 @@ impl VocabPartition {
         // ids, read back in increasing id order.
         let mut ctx_dep_bits = vec![0u64; mask_stride];
         let mut context_dependent_by_state = Vec::with_capacity(effective_states);
-        // Keep the aggregate payload capacity of the new state-local lists no
-        // larger than the existing mask table. A dense adversarial grammar can
-        // classify every token as context-dependent in every state; storing
-        // all of those ids would otherwise cost 64x the masks on 64-bit hosts.
+        // Keep the aggregate length of the new state-local lists no larger
+        // than the existing mask table (measured in entries, not allocator
+        // capacity, so the decision is deterministic). A dense adversarial
+        // grammar can classify every token as context-dependent in every
+        // state; storing all of those ids would otherwise cost 64x the masks
+        // on 64-bit hosts.
         // Falling back to the global union preserves exact masking semantics.
         let context_entry_budget =
             masks.len().saturating_mul(std::mem::size_of::<u64>()) / std::mem::size_of::<usize>();
@@ -148,10 +154,10 @@ impl VocabPartition {
                 state_mask[token_id / 64] |= 1u64 << (token_id % 64);
                 ctx_dep_bits[token_id / 64] |= 1u64 << (token_id % 64);
             }
-            state_context_dependent.shrink_to_fit();
-            let stored_capacity = state_context_dependent.capacity();
-            if context_entries_stored.saturating_add(stored_capacity) <= context_entry_budget {
-                context_entries_stored += stored_capacity;
+            let stored_len = state_context_dependent.len();
+            if context_entries_stored.saturating_add(stored_len) <= context_entry_budget {
+                context_entries_stored += stored_len;
+                state_context_dependent.shrink_to_fit();
                 context_dependent_by_state.push(Some(state_context_dependent));
             } else {
                 context_dependent_by_state.push(None);
@@ -527,6 +533,8 @@ mod tests {
         for (state_id, grammar_state) in grammar_states[..effective_states].iter().enumerate() {
             let mut state_context_dependent = Vec::new();
             for (token_id, token_bytes) in vocab_bytes.iter().enumerate() {
+                // Empty tokens are always blocked, although `simulate_token`
+                // returns `Accept` for an empty slice.
                 if token_bytes.is_empty() {
                     continue;
                 }
@@ -543,10 +551,10 @@ mod tests {
                     SimResult::Reject => {}
                 }
             }
-            state_context_dependent.shrink_to_fit();
-            let stored_capacity = state_context_dependent.capacity();
-            if context_entries_stored.saturating_add(stored_capacity) <= context_entry_budget {
-                context_entries_stored += stored_capacity;
+            let stored_len = state_context_dependent.len();
+            if context_entries_stored.saturating_add(stored_len) <= context_entry_budget {
+                context_entries_stored += stored_len;
+                state_context_dependent.shrink_to_fit();
                 context_dependent_by_state.push(Some(state_context_dependent));
             } else {
                 context_dependent_by_state.push(None);
@@ -602,6 +610,14 @@ mod tests {
         assert_eq!(got.vocab_size, want.vocab_size, "{label}: vocab_size");
         assert_eq!(got.mask_stride, want.mask_stride, "{label}: mask_stride");
         assert_eq!(got.states.len(), want.states.len(), "{label}: state count");
+        for (i, (g, w)) in got.states.iter().zip(&want.states).enumerate() {
+            assert_eq!(g.stack, w.stack, "{label}: state {i} stack");
+            assert_eq!(g.complete, w.complete, "{label}: state {i} complete");
+            assert_eq!(
+                g.partial_token_bytes, w.partial_token_bytes,
+                "{label}: state {i} partial_token_bytes"
+            );
+        }
         assert_eq!(got.masks, want.masks, "{label}: masks");
         assert_eq!(
             got.context_dependent, want.context_dependent,
@@ -614,7 +630,8 @@ mod tests {
     }
 
     /// Builds with both constructions (and through a prebuilt trie) and
-    /// requires every field to match.
+    /// requires every field to match, including each stored state's stack,
+    /// completion flag and partial bytes.
     fn assert_trie_build_matches_oracle(
         grammar: &CompiledGrammar,
         states: Vec<GrammarState>,
@@ -631,7 +648,7 @@ mod tests {
     }
 
     /// All 256 single bytes, JSON-shaped multi-byte tokens sharing prefixes,
-    /// two ids on one byte sequence, and an empty token.
+    /// two ids on one byte sequence, and empty tokens (always blocked).
     fn equivalence_vocab() -> Vec<Vec<u8>> {
         let mut vocab: Vec<Vec<u8>> = (0u16..256).map(|b| vec![b as u8]).collect();
         for frag in [
@@ -846,8 +863,11 @@ mod tests {
         );
     }
 
+    /// Empty tokens are always blocked, as in the previous per-token builder
+    /// (an empty token emits no bytes), even though `simulate_token` returns
+    /// `Accept` for an empty slice; the oracle skips them the same way.
     #[test]
-    fn trie_build_with_only_empty_tokens_sets_no_bits() {
+    fn trie_build_blocks_empty_tokens_like_the_previous_builder() {
         let grammar = or_grammar();
         let states = vec![GrammarState::initial()];
         for vocab in [vec![Vec::new(); 97], Vec::new()] {
@@ -857,5 +877,69 @@ mod tests {
             assert!(partition.context_dependent_ids().is_empty());
             assert_eq!(partition.context_dependent_by_state, vec![Some(Vec::new())]);
         }
+    }
+
+    /// A vocabulary token's byte length must not drive the native call depth
+    /// of the classification walk: a 200_000-byte token is classified on a
+    /// thread with a 256 KiB stack, which a recursive walk overflows.
+    #[test]
+    fn trie_build_classifies_a_very_long_token_on_a_small_stack() {
+        const LONG: usize = 200_000;
+        // A flat chain keeps the PDA stack shallow however many bytes are
+        // accepted (a `*` repetition recurses and would hit `MAX_PDA_DEPTH`).
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![vec![Symbol::Terminal(b'a'); LONG]],
+            }],
+        };
+        let mut vocab = vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"aa".to_vec(),
+            b"ab".to_vec(),
+            b"ba".to_vec(),
+        ];
+        // Accepted at every byte: classified through accepted edges only.
+        let accepted_id = vocab.len();
+        vocab.push(vec![b'a'; LONG]);
+        // Rejected on its second byte: the whole long chain below the
+        // rejected edge is collected as context-dependent.
+        let context_id = vocab.len();
+        let mut straddle = b"ab".to_vec();
+        straddle.extend(std::iter::repeat_n(b'c', LONG));
+        vocab.push(straddle);
+        let states = vec![initial_grammar_state(&grammar)];
+
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn_scoped(scope, || {
+                    let partition = assert_trie_build_matches_oracle(
+                        &grammar,
+                        states.clone(),
+                        &vocab,
+                        "long token",
+                    );
+                    assert!(
+                        partition.masks[accepted_id / 64] & (1u64 << (accepted_id % 64)) != 0,
+                        "the all-accepted long token must be allowed"
+                    );
+                    assert!(
+                        !partition
+                            .context_dependent_ids_for_state(0)
+                            .contains(&accepted_id)
+                    );
+                    assert!(
+                        partition
+                            .context_dependent_ids_for_state(0)
+                            .contains(&context_id),
+                        "the long token rejected after its first byte is context-dependent"
+                    );
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        });
     }
 }

@@ -470,9 +470,15 @@ impl GrammarEngine {
 
     /// True when state enumeration hit `MAX_GRAMMAR_STATES` (256) before
     /// covering the whole reachable state graph. Once true, some runtime
-    /// states have no precomputed mask and every step in that state pays
-    /// `mask_by_simulation`'s full-vocab scan instead of a bitmask lookup --
-    /// an unbounded-latency mode unacceptable for an unrestricted serve API.
+    /// states have no precomputed mask and every step in that state pays a
+    /// `mask_by_trie` walk instead of a bitmask lookup: a DFS over the byte
+    /// trie that takes one PDA step per trie edge it probes (a rejected edge
+    /// prunes its whole subtree, but each child of a visited node is still
+    /// probed), clones the state at branching nodes, and then applies the
+    /// resulting mask over the whole logits row. Cheaper than simulating
+    /// every token, but its cost follows the grammar state and the trie's
+    /// shape rather than being a constant lookup -- an unbounded-latency
+    /// mode unacceptable for an unrestricted serve API.
     /// Callers that need a bounded-latency guarantee (e.g. HTTP strict
     /// structured-output admission) should reject the schema instead of
     /// using an engine that reports `true` here.
