@@ -77,8 +77,9 @@ fn load_scalar<T: TensorSource + ?Sized>(
     Ok(data[0])
 }
 
-/// Copies every tensor to f32 except `embed_tokens_per_layer`, which stays in the checkpoint
-/// mapping ([`load_per_layer_embeddings`]).
+/// Copies to f32 the tensors the model reads, except `embed_tokens_per_layer`, which stays in
+/// the checkpoint mapping ([`load_per_layer_embeddings`]). KV-shared layers load no K/V
+/// projections or K norm.
 pub(super) fn load_weights<T: TensorSource + ?Sized>(
     source: &mut T,
     cfg: &Gemma4Config,
@@ -578,6 +579,11 @@ mod tests {
         let Ok(table) = load_per_layer_embeddings(file, &cfg) else {
             panic!("a well-formed BF16 table must load");
         };
+        assert_eq!(
+            table.cached_f32_tensor_count(),
+            0,
+            "loading the table must not widen it to f32"
+        );
         for row in 0..cfg.vocab_size {
             let got = table.scaled_row(row, 1.0).expect("row is in range");
             let want: Vec<f32> = bits[row * packed..(row + 1) * packed]
@@ -591,6 +597,11 @@ mod tests {
         assert!(
             table.scaled_row(cfg.vocab_size, 1.0).is_err(),
             "a row past the vocabulary must be refused, not read out of bounds"
+        );
+        assert_eq!(
+            table.cached_f32_tensor_count(),
+            0,
+            "reading rows must widen only those rows, never cache the whole table as f32"
         );
     }
 

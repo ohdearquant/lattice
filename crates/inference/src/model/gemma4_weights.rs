@@ -118,6 +118,12 @@ impl PerLayerEmbeddings {
             .map(|pair| bf16_bits_to_f32(u16::from_le_bytes([pair[0], pair[1]])) * scale)
             .collect())
     }
+
+    /// Number of tensors in the kept file that hold a cached f32 conversion.
+    #[cfg(test)]
+    pub(crate) fn cached_f32_tensor_count(&self) -> usize {
+        self.file.cached_f32_tensor_count()
+    }
 }
 
 #[cfg(test)]
