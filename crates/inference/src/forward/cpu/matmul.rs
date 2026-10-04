@@ -76,7 +76,7 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
     {
         // Use cache-blocked (tiled) path for large matrices where blocking pays off.
         // Two conditions must be met:
-        //   1. Total work > 1M elements (below this, overhead dominates).
+        //   1. Total work m*n*k >= 1024*1024 (below this, overhead dominates).
         //   2. K >= 128 (the shared dimension must be large enough that B-rows don't fit
         //      in L1 cache naturally). When K is small (e.g. 32), each B-row is only
         //      128 bytes and fits in L1 without tiling. Tiling would only change the
@@ -117,7 +117,7 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
     {
         // Use cache-blocked (tiled) path for large matrices where blocking pays off.
         // Two conditions must be met:
-        //   1. Total work > 1M elements (below this, overhead dominates).
+        //   1. Total work m*n*k >= 1024*1024 (below this, overhead dominates).
         //   2. K >= 128 (the shared dimension must be large enough that B-rows don't fit
         //      in L1 cache naturally). When K is small (e.g. 32), each B-row is only
         //      128 bytes and fits in L1 without tiling. Tiling would only change the
@@ -310,21 +310,39 @@ mod tests {
         // correct values in c[0..m*n]. This test proves the >= bound is correct.
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn lcg_vec(len: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 8) as f32 / (1u32 << 24) as f32) * 0.04 - 0.02
+            })
+            .collect()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn every_small_m_matches_scalar_reference() {
+        let (k, n) = (256usize, 1024usize);
+        let b = lcg_vec(n * k, 0x0E55);
+        for m in 1..=9usize {
+            let a = lcg_vec(m * k, 0x0F66 + m as u32);
+            let mut got = vec![0.0f32; m * n];
+            let mut want = vec![0.0f32; m * n];
+            matmul_bt(&a, &b, &mut got, m, k, n);
+            matmul_bt_scalar(&a, &b, &mut want, m, k, n);
+            for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!((g - w).abs() < 1e-4, "m={m} idx={idx}: got {g}, want {w}");
+            }
+        }
+    }
+
     // --- x86_64: small-m rows must not run through the tiled kernel's scalar edge loop ---
 
     #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
     mod small_m_dispatch {
         use super::*;
-
-        fn lcg_vec(len: usize, seed: u32) -> Vec<f32> {
-            let mut state = seed;
-            (0..len)
-                .map(|_| {
-                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    ((state >> 8) as f32 / (1u32 << 24) as f32) * 0.04 - 0.02
-                })
-                .collect()
-        }
 
         fn bits(v: &[f32]) -> Vec<u32> {
             v.iter().map(|x| x.to_bits()).collect()
@@ -376,22 +394,6 @@ mod tests {
             let mut tail = vec![0.0f32; n];
             matmul_bt(&a[4 * k..], &b, &mut tail, 1, k, n);
             assert_eq!(bits(&whole[4 * n..]), bits(&tail));
-        }
-
-        #[test]
-        fn every_small_m_matches_scalar_reference() {
-            let (k, n) = (256usize, 1024usize);
-            let b = lcg_vec(n * k, 0x0E55);
-            for m in 1..=9usize {
-                let a = lcg_vec(m * k, 0x0F66 + m as u32);
-                let mut got = vec![0.0f32; m * n];
-                let mut want = vec![0.0f32; m * n];
-                matmul_bt(&a, &b, &mut got, m, k, n);
-                matmul_bt_scalar(&a, &b, &mut want, m, k, n);
-                for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
-                    assert!((g - w).abs() < 1e-4, "m={m} idx={idx}: got {g}, want {w}");
-                }
-            }
         }
 
         /// A `c` longer than m*n keeps its suffix untouched, for m < TILE_I and for an m
