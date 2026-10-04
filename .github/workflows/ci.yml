@@ -631,8 +631,8 @@ jobs:
           }
           printf '%s\n' "$out"
           passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
-          if [ -z "$passed" ] || [ "$passed" -lt 7 ]; then
-            echo "expected at least 7 passing bench_suite tests, parsed '${passed:-<none>}'" >&2
+          if [ -z "$passed" ] || [ "$passed" -lt 14 ]; then
+            echo "expected at least 14 passing bench_suite tests, parsed '${passed:-<none>}'" >&2
             exit 1
           fi
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.

@@ -8,11 +8,12 @@
 //!   cargo run --release -p lattice-inference --example bench_suite -- --json
 //!   cargo run --release -p lattice-inference --example bench_suite -- --json --baseline benchmarks/baseline.json
 //!
-//! One standalone wrapper per invocation (`f16`, `q8`, `q8_neon`) with `--llm --wrapper <name>`.
-//! A named wrapper that prints `SKIP`, or never prints `ROUTE`, exits 2: a run that did not
+//! One wrapper per invocation (`base`, `f16`, `q8`, `q8_neon`, `metal`) with `--llm --wrapper <name>`.
+//! A named wrapper whose call did not run or returned no metrics exits 2, and so does a standalone
+//! wrapper (`f16`, `q8`, `q8_neon`) that prints `SKIP` or never prints `ROUTE`: a run that did not
 //! exercise the wrapper must not read as "no metric changed". `--refusals` additionally runs each
-//! wrapper's refusal controls after its timed loop and prints one `REFUSAL` line per control; a
-//! control that does not return its exact expected message also exits 2.
+//! standalone wrapper's refusal controls after its timed loop and prints one `REFUSAL` line per
+//! control; a control that does not return its exact expected message also exits 2.
 #![allow(clippy::field_reassign_with_default)]
 // A test build replaces `main` with the harness, so everything only `main` reaches looks unused.
 #![cfg_attr(test, allow(dead_code))]
@@ -40,6 +41,7 @@ const MARKED_WRAPPERS: &[&str] = &["f16", "q8", "q8_neon"];
 static ROUTE_SEEN: AtomicBool = AtomicBool::new(false);
 static SKIP_SEEN: AtomicBool = AtomicBool::new(false);
 static REFUSAL_MISMATCH: AtomicBool = AtomicBool::new(false);
+static WRAPPER_MEASURED: AtomicBool = AtomicBool::new(false);
 
 fn emit_route(wrapper: &str, func: &str, calls: usize) {
     println!("ROUTE wrapper={wrapper} fn={func} calls={calls}");
@@ -51,29 +53,64 @@ fn emit_skip(wrapper: &str, func: &str, model_dir: &str) {
     SKIP_SEEN.store(true, Ordering::Relaxed);
 }
 
+/// Records one refusal arm's outcome. A single mismatch stays recorded for the whole process.
+fn record_refusal_arm(all_matched: bool) {
+    REFUSAL_MISMATCH.fetch_or(!all_matched, Ordering::Relaxed);
+}
+
+/// Appends the metrics one `--llm` wrapper call returned and records whether it returned any.
+/// Only wrapper calls go through here, so metrics from the GDN and embedding benchmarks
+/// never count as the named wrapper having measured.
+fn collect_wrapper_metrics(metrics: &mut Vec<Metric>, returned: Vec<Metric>) {
+    if !returned.is_empty() {
+        WRAPPER_MEASURED.store(true, Ordering::Relaxed);
+    }
+    metrics.extend(returned);
+}
+
 /// Why this run must not be read as a measurement, or `None` when it may be.
 ///
-/// Only a named, marked wrapper is held to `ROUTE`: the default run still prints its
-/// markers and still exits 0, and `base` and `metal` have no marker to hold them to.
+/// A refusal-control mismatch refuses every run, whatever the selection. Without it a run
+/// with no `--wrapper` is never refused. A run that names a wrapper is refused unless that
+/// wrapper's call ran in this process and returned at least one metric (`wrapper_measured`):
+/// `base` with no checkpoint, `metal` on a build without `metal-gpu`, and a wrapper named
+/// without `--llm` all return nothing. The wrappers in `MARKED_WRAPPERS` are additionally held
+/// to their markers: `SKIP` refuses, and a missing `ROUTE` refuses.
 fn refusal_to_certify(
     wrapper: Option<&str>,
     routed: bool,
     skipped: bool,
     refusal_mismatch: bool,
+    wrapper_measured: bool,
 ) -> Option<&'static str> {
     if refusal_mismatch {
         return Some("a refusal control did not return its expected message");
     }
-    if !wrapper.is_some_and(|w| MARKED_WRAPPERS.contains(&w)) {
-        return None;
+    let wrapper = wrapper?;
+    if MARKED_WRAPPERS.contains(&wrapper) {
+        if skipped {
+            return Some("the named wrapper printed SKIP");
+        }
+        if !routed {
+            return Some("the named wrapper printed no ROUTE line");
+        }
     }
-    if skipped {
-        Some("the named wrapper printed SKIP")
-    } else if !routed {
-        Some("the named wrapper printed no ROUTE line")
-    } else {
-        None
+    if !wrapper_measured {
+        return Some("the named wrapper did not run or returned no metrics");
     }
+    None
+}
+
+/// The gate as `main` applies it: every input but the wrapper name is read from the state the
+/// emitters, the refusal recorder and the wrapper collector left in this process.
+fn certification_refusal(wrapper: Option<&str>) -> Option<&'static str> {
+    refusal_to_certify(
+        wrapper,
+        ROUTE_SEEN.load(Ordering::Relaxed),
+        SKIP_SEEN.load(Ordering::Relaxed),
+        REFUSAL_MISMATCH.load(Ordering::Relaxed),
+        WRAPPER_MEASURED.load(Ordering::Relaxed),
+    )
 }
 
 /// One control a standalone wrapper must refuse, and the exact `InvalidInput` text it returns.
@@ -470,7 +507,7 @@ fn bench_llm_f16(refusals: bool) -> Vec<Metric> {
         let all_matched = run_refusal_arm("f16", &|refusal_cfg| {
             generate_f16(&f16_weights, &cfg, &tokenizer, &rope, "Hello", refusal_cfg)
         });
-        REFUSAL_MISMATCH.fetch_or(!all_matched, Ordering::Relaxed);
+        record_refusal_arm(all_matched);
     }
 
     let tok_per_sec = total_tok as f64 / (total_ms / 1000.0);
@@ -562,7 +599,7 @@ fn bench_llm_q8(refusals: bool) -> Vec<Metric> {
         let all_matched = run_refusal_arm("q8", &|refusal_cfg| {
             generate_q8(&q8_weights, &cfg, &tokenizer, &rope, "Hello", refusal_cfg)
         });
-        REFUSAL_MISMATCH.fetch_or(!all_matched, Ordering::Relaxed);
+        record_refusal_arm(all_matched);
     }
 
     let tok_per_sec = total_tok as f64 / (total_ms / 1000.0);
@@ -652,7 +689,7 @@ fn bench_llm_q8_neon(refusals: bool) -> Vec<Metric> {
         let all_matched = run_refusal_arm("q8_neon", &|refusal_cfg| {
             generate_q8_neon(&q8_model, &cfg, &tokenizer, &rope, "Hello", refusal_cfg)
         });
-        REFUSAL_MISMATCH.fetch_or(!all_matched, Ordering::Relaxed);
+        record_refusal_arm(all_matched);
     }
 
     let tok_per_sec = total_tok as f64 / (total_ms / 1000.0);
@@ -1042,29 +1079,29 @@ fn main() {
     if run_llm {
         if run_wrapper("base") {
             eprintln!("[bench_suite] Running LLM benchmark (Qwen3.5-2B)...");
-            metrics.extend(bench_llm());
+            collect_wrapper_metrics(&mut metrics, bench_llm());
         }
 
         #[cfg(feature = "f16")]
         if run_wrapper("f16") {
             eprintln!("[bench_suite] Running F16 LLM benchmark (Qwen3.5-2B)...");
-            metrics.extend(bench_llm_f16(refusals));
+            collect_wrapper_metrics(&mut metrics, bench_llm_f16(refusals));
         }
 
         if run_wrapper("q8") {
             eprintln!("[bench_suite] Running Q8 LLM benchmark (Qwen3.5-2B)...");
-            metrics.extend(bench_llm_q8(refusals));
+            collect_wrapper_metrics(&mut metrics, bench_llm_q8(refusals));
         }
 
         if run_wrapper("q8_neon") {
             eprintln!("[bench_suite] Running Q8 NEON LLM benchmark (Qwen3.5-2B)...");
-            metrics.extend(bench_llm_q8_neon(refusals));
+            collect_wrapper_metrics(&mut metrics, bench_llm_q8_neon(refusals));
         }
 
         #[cfg(feature = "metal-gpu")]
         if run_wrapper("metal") {
             eprintln!("[bench_suite] Running Metal GPU LLM benchmark (Qwen3.5-2B)...");
-            metrics.extend(bench_llm_metal());
+            collect_wrapper_metrics(&mut metrics, bench_llm_metal());
         }
     }
 
@@ -1079,12 +1116,7 @@ fn main() {
         metrics.len()
     );
 
-    if let Some(reason) = refusal_to_certify(
-        wrapper_filter,
-        ROUTE_SEEN.load(Ordering::Relaxed),
-        SKIP_SEEN.load(Ordering::Relaxed),
-        REFUSAL_MISMATCH.load(Ordering::Relaxed),
-    ) {
+    if let Some(reason) = certification_refusal(wrapper_filter) {
         eprintln!("[bench_suite] refusing to certify this run: {reason}");
         std::process::exit(2);
     }
@@ -1110,7 +1142,7 @@ mod tests {
     fn named_wrapper_that_skips_is_not_certified() {
         for &wrapper in MARKED_WRAPPERS {
             assert_eq!(
-                refusal_to_certify(Some(wrapper), false, true, false),
+                refusal_to_certify(Some(wrapper), false, true, false, true),
                 Some("the named wrapper printed SKIP"),
                 "{wrapper}"
             );
@@ -1121,7 +1153,7 @@ mod tests {
     fn named_wrapper_without_route_is_not_certified() {
         for &wrapper in MARKED_WRAPPERS {
             assert_eq!(
-                refusal_to_certify(Some(wrapper), false, false, false),
+                refusal_to_certify(Some(wrapper), false, false, false, true),
                 Some("the named wrapper printed no ROUTE line"),
                 "{wrapper}"
             );
@@ -1132,7 +1164,7 @@ mod tests {
     fn routed_named_wrapper_is_certified() {
         for &wrapper in MARKED_WRAPPERS {
             assert_eq!(
-                refusal_to_certify(Some(wrapper), true, false, false),
+                refusal_to_certify(Some(wrapper), true, false, false, true),
                 None,
                 "{wrapper}"
             );
@@ -1140,22 +1172,146 @@ mod tests {
     }
 
     #[test]
-    fn default_run_and_unmarked_wrappers_keep_exiting_zero() {
-        assert_eq!(refusal_to_certify(None, false, true, false), None);
-        assert_eq!(refusal_to_certify(None, false, false, false), None);
-        assert_eq!(refusal_to_certify(Some("base"), false, false, false), None);
-        assert_eq!(refusal_to_certify(Some("metal"), false, true, false), None);
+    fn any_named_wrapper_that_measured_nothing_is_not_certified() {
+        for wrapper in ["base", "f16", "q8", "q8_neon", "metal"] {
+            assert_eq!(
+                refusal_to_certify(Some(wrapper), true, false, false, false),
+                Some("the named wrapper did not run or returned no metrics"),
+                "{wrapper}"
+            );
+        }
+        for wrapper in ["base", "metal"] {
+            assert_eq!(
+                refusal_to_certify(Some(wrapper), false, false, false, true),
+                None,
+                "{wrapper}"
+            );
+        }
     }
 
     #[test]
-    fn refusal_mismatch_is_not_certified_for_any_wrapper() {
-        for wrapper in [None, Some("base"), Some("f16"), Some("q8_neon")] {
+    fn default_run_is_not_held_to_any_wrapper_marker() {
+        assert_eq!(refusal_to_certify(None, false, true, false, false), None);
+        assert_eq!(refusal_to_certify(None, false, false, false, false), None);
+        assert_eq!(refusal_to_certify(None, true, true, false, true), None);
+    }
+
+    #[test]
+    fn refusal_mismatch_is_not_certified_for_any_selection() {
+        for wrapper in [
+            None,
+            Some("base"),
+            Some("f16"),
+            Some("q8_neon"),
+            Some("metal"),
+        ] {
             assert_eq!(
-                refusal_to_certify(wrapper, true, false, true),
+                refusal_to_certify(wrapper, true, false, true, true),
                 Some("a refusal control did not return its expected message"),
                 "{wrapper:?}"
             );
         }
+    }
+
+    // The tests below read the process-wide flags the emitters, the refusal recorder and the
+    // wrapper collector write, so they run one at a time and each starts from a clean state.
+    static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clean_state() -> std::sync::MutexGuard<'static, ()> {
+        let guard = STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for flag in [
+            &ROUTE_SEEN,
+            &SKIP_SEEN,
+            &REFUSAL_MISMATCH,
+            &WRAPPER_MEASURED,
+        ] {
+            flag.store(false, Ordering::Relaxed);
+        }
+        guard
+    }
+
+    fn one_metric() -> Vec<Metric> {
+        vec![Metric {
+            name: "m",
+            value: 1.0,
+            unit: "x",
+        }]
+    }
+
+    #[test]
+    fn clean_state_refuses_a_named_wrapper_and_passes_the_default_run() {
+        let _guard = clean_state();
+        assert_eq!(certification_refusal(None), None);
+        for wrapper in ["base", "f16", "q8", "q8_neon", "metal"] {
+            assert!(certification_refusal(Some(wrapper)).is_some(), "{wrapper}");
+        }
+    }
+
+    #[test]
+    fn emit_route_and_collected_metrics_certify_a_marked_wrapper() {
+        let _guard = clean_state();
+        let mut metrics = Vec::new();
+        emit_route("q8", "generate_q8", 3);
+        collect_wrapper_metrics(&mut metrics, one_metric());
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(certification_refusal(Some("q8")), None);
+    }
+
+    #[test]
+    fn emit_route_without_collected_metrics_is_not_certified() {
+        let _guard = clean_state();
+        emit_route("q8", "generate_q8", 3);
+        assert_eq!(
+            certification_refusal(Some("q8")),
+            Some("the named wrapper did not run or returned no metrics")
+        );
+    }
+
+    #[test]
+    fn emit_skip_is_not_certified_even_with_a_route_and_metrics() {
+        let _guard = clean_state();
+        let mut metrics = Vec::new();
+        emit_skip("f16", "generate_f16", "/nowhere");
+        assert_eq!(
+            certification_refusal(Some("f16")),
+            Some("the named wrapper printed SKIP")
+        );
+        emit_route("f16", "generate_f16", 3);
+        collect_wrapper_metrics(&mut metrics, one_metric());
+        assert_eq!(
+            certification_refusal(Some("f16")),
+            Some("the named wrapper printed SKIP")
+        );
+    }
+
+    #[test]
+    fn collected_metrics_certify_an_unmarked_wrapper_only_when_non_empty() {
+        let _guard = clean_state();
+        let mut metrics = Vec::new();
+        collect_wrapper_metrics(&mut metrics, Vec::new());
+        assert!(metrics.is_empty());
+        assert_eq!(
+            certification_refusal(Some("base")),
+            Some("the named wrapper did not run or returned no metrics")
+        );
+        collect_wrapper_metrics(&mut metrics, one_metric());
+        assert_eq!(certification_refusal(Some("base")), None);
+        assert_eq!(certification_refusal(Some("metal")), None);
+    }
+
+    #[test]
+    fn a_recorded_refusal_mismatch_refuses_every_selection_and_stays_recorded() {
+        let _guard = clean_state();
+        record_refusal_arm(true);
+        assert_eq!(certification_refusal(None), None);
+        record_refusal_arm(false);
+        let expected = Some("a refusal control did not return its expected message");
+        assert_eq!(certification_refusal(None), expected);
+        assert_eq!(certification_refusal(Some("base")), expected);
+        record_refusal_arm(true);
+        assert_eq!(certification_refusal(None), expected);
     }
 
     fn hollow_fixture() -> (Qwen35Config, BpeTokenizer, RopeTable) {
@@ -1216,8 +1372,9 @@ mod tests {
         }));
     }
 
-    /// A wrapper that returns some other error, or that does not refuse at all, must be
-    /// reported as a mismatch: the arm has to be able to fail.
+    /// A wrapper that returns some other error, another error variant, or a successful
+    /// generation instead of the refusal must be reported as a mismatch: the arm has to be
+    /// able to fail.
     #[test]
     fn refusal_arm_reports_a_wrapper_with_the_wrong_message() {
         let wrong_message = run_refusal_arm("wrong", &|_| {
@@ -1233,5 +1390,18 @@ mod tests {
             ))
         });
         assert!(!wrong_variant);
+
+        let does_not_refuse = run_refusal_arm("wrong", &|_| {
+            Ok(lattice_inference::GenerateOutput {
+                text: String::new(),
+                token_ids: Vec::new(),
+                prompt_tokens: 0,
+                generated_tokens: 0,
+                stopped: false,
+                stop_reason: None,
+                token_logprobs: Vec::new(),
+            })
+        });
+        assert!(!does_not_refuse);
     }
 }
