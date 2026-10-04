@@ -8,8 +8,9 @@
 //!
 //! The session carries the wrappers' narrower contract. [`ExecutionCapabilities`] is all
 //! `false`, so `driver::run` refuses grammar, logprobs, stop strings and a reasoning budget
-//! before it calls the session, and `select` and `metadata` refuse the same controls if a
-//! caller reaches them directly. `prepare_generation` with
+//! before it calls the session. A caller that reaches the session directly gets the same
+//! refusals from `select`, which rejects a grammar mask, logprobs, stop strings and a reasoning
+//! budget, and from `metadata`, which rejects every logprobs request. `prepare_generation` with
 //! `GenerationEntryContract::StandaloneCpu` still runs first and keeps its refusal text.
 //!
 //! A session runs one generation. `prefill` is refused the second time it is called, because
@@ -509,8 +510,8 @@ pub(crate) mod parity {
 
     /// Replays the session step by step against a hand-driven copy of the wrapper's own forward
     /// step and requires bit-identical logits for the final prefill position and for each decode
-    /// step's output. Token outputs do not depend on the position and window the session feeds
-    /// the forward step, the logits do.
+    /// step's output. Comparing logits rather than tokens matters because a wrong position or
+    /// window can change the logits without changing the sampled token on a given prompt.
     pub(crate) fn assert_logits_replay(
         weights: StandaloneWeights<'_>,
         cfg: &Qwen35Config,
