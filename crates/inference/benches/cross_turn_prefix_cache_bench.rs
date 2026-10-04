@@ -7,8 +7,16 @@
 //! turn's shared KV/GDN state and prefills only the new suffix), at a couple
 //! of conversation depths.
 //!
+//! Besides those two, the cache path is timed on three more request shapes,
+//! each asserting the `CrossTurnCacheStats` mode it is named for and a
+//! nonempty output: `cache_aware_fresh` (nothing retained, so `FullRefill`),
+//! `cache_aware_invalidated` (a warm entry the new history diverges from, so
+//! `FullRefill` again) and `cache_aware_cancelled` (an exact append cancelled
+//! after its first delta).
+//!
 //! Requires a real Qwen3.5 model at `~/.lattice/models/qwen3.5-0.8b/`
-//! (config.json + safetensors + tokenizer.json).
+//! (config.json + safetensors + tokenizer.json). A missing or unloadable model
+//! panics: a run that measured nothing must not read as a pass.
 //!
 //! Run: `cargo bench -p lattice-inference --features metal-gpu,f16 -- cross_turn_prefix_cache`
 #![allow(clippy::field_reassign_with_default)]
@@ -22,7 +30,7 @@ use lattice_inference::GenerateConfig;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use lattice_inference::kv_cache::CrossTurnSlotId;
+use lattice_inference::kv_cache::{CrossTurnSlotId, PrefixReuseMode};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
@@ -45,6 +53,12 @@ const USER_TURNS: &[&str] = &[
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 const SYSTEM_PROMPT: &str = "You are a helpful, concise travel assistant.";
 
+/// Shares only a short opening with `SYSTEM_PROMPT`, so a history that starts
+/// with it diverges from a warm entry built on `SYSTEM_PROMPT` before any turn
+/// boundary the entry retains a checkpoint at.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const DIVERGENT_SYSTEM_PROMPT: &str = "You are a terse assistant.";
+
 fn safetensors_model_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let dir = PathBuf::from(format!("{home}/.lattice/models/qwen3.5-0.8b"));
@@ -56,14 +70,69 @@ fn safetensors_model_dir() -> Option<PathBuf> {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-fn load_state_and_tokenizer() -> Option<(MetalQwen35State, BpeTokenizer)> {
+fn load_state_and_tokenizer() -> Result<(MetalQwen35State, BpeTokenizer), String> {
     use lattice_inference::model::qwen35::Qwen35Model;
-    let dir = safetensors_model_dir()?;
-    let model = Qwen35Model::from_safetensors(&dir).ok()?;
+    let dir = safetensors_model_dir().ok_or_else(|| {
+        "no config.json under ~/.lattice/models/qwen3.5-0.8b (or HOME is unset)".to_string()
+    })?;
+    let model = Qwen35Model::from_safetensors(&dir)
+        .map_err(|error| format!("loading the safetensors weights failed: {error}"))?;
     let cfg = model.config().clone();
-    let state = MetalQwen35State::new(model.weights(), &cfg, 4096).ok()?;
-    let tokenizer = BpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json")).ok()?;
-    Some((state, tokenizer))
+    let state = MetalQwen35State::new(model.weights(), &cfg, 4096)
+        .map_err(|error| format!("building the Metal state failed: {error}"))?;
+    let tokenizer = BpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json"))
+        .map_err(|error| format!("loading tokenizer.json failed: {error}"))?;
+    Ok((state, tokenizer))
+}
+
+/// Replays `prior_turns` real exchanges through the prefix-cache path from an
+/// empty cache, so the slot ends up holding the conversation so far, and
+/// returns that history with the next user turn appended.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn warm_cache_through_prior_turns(
+    state: &mut MetalQwen35State,
+    tokenizer: &BpeTokenizer,
+    gen_cfg: &GenerateConfig,
+    slot_id: CrossTurnSlotId,
+    prior_turns: usize,
+) -> Vec<ChatMessage> {
+    state.reset_state();
+    state.clear_cross_turn_prefix_cache();
+    let mut history = vec![ChatMessage::system(SYSTEM_PROMPT)];
+    for user_text in &USER_TURNS[..prior_turns] {
+        history.push(ChatMessage::user(*user_text));
+        let out = state
+            .chat_completion_streaming_with_prefix_cache(
+                slot_id,
+                &history,
+                tokenizer,
+                gen_cfg,
+                |_delta, _id| true,
+            )
+            .expect("cache warm-up turn must succeed");
+        history.push(out.output.message);
+    }
+    history.push(ChatMessage::user(USER_TURNS[prior_turns]));
+    history
+}
+
+/// An arm that did not take the path it is named for, or produced nothing,
+/// measured something else: refuse instead of timing it.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn require_arm(
+    arm: &str,
+    mode: PrefixReuseMode,
+    expected_mode: PrefixReuseMode,
+    completion_tokens: usize,
+) {
+    assert_eq!(
+        mode, expected_mode,
+        "{arm} arm must plan {expected_mode:?}, got {mode:?}"
+    );
+    assert!(
+        completion_tokens > 0,
+        "{arm} arm produced no completion tokens"
+    );
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -166,34 +235,151 @@ fn bench_depth(
         b.iter_batched(
             || {
                 let mut state = state_cell.borrow_mut();
+                warm_cache_through_prior_turns(
+                    &mut state,
+                    tokenizer,
+                    &gen_cfg,
+                    slot_id,
+                    prior_turns,
+                )
+            },
+            |history| {
+                let mut state = state_cell.borrow_mut();
+                let out = state
+                    .chat_completion_streaming_with_prefix_cache(
+                        slot_id,
+                        &history,
+                        tokenizer,
+                        &gen_cfg,
+                        |_delta, _id| true,
+                    )
+                    .expect("exact-append turn must succeed");
+                require_arm(
+                    "cache_aware_incremental",
+                    out.cache.mode,
+                    PrefixReuseMode::ExactAppend,
+                    out.output.completion_tokens,
+                );
+                out
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Fresh: the same history `full_reprefill` times, sent through the prefix
+    // cache with nothing retained, so the entry cannot help and the whole
+    // history is prefilled.
+    group.bench_function(BenchmarkId::new("cache_aware_fresh", label), |b| {
+        b.iter_batched(
+            || {
+                let mut state = state_cell.borrow_mut();
                 state.reset_state();
                 state.clear_cross_turn_prefix_cache();
-                let mut history = vec![ChatMessage::system(SYSTEM_PROMPT)];
-                for user_text in &USER_TURNS[..prior_turns] {
-                    history.push(ChatMessage::user(*user_text));
-                    let out = state
-                        .chat_completion_streaming_with_prefix_cache(
-                            slot_id,
-                            &history,
-                            tokenizer,
-                            &gen_cfg,
-                            |_delta, _id| true,
-                        )
-                        .expect("cache warm-up turn must succeed");
-                    history.push(out.output.message);
-                }
-                history.push(ChatMessage::user(next_user));
+            },
+            |()| {
+                let mut state = state_cell.borrow_mut();
+                let out = state
+                    .chat_completion_streaming_with_prefix_cache(
+                        slot_id,
+                        &old_path_history,
+                        tokenizer,
+                        &gen_cfg,
+                        |_delta, _id| true,
+                    )
+                    .expect("fresh cache-path turn must succeed");
+                require_arm(
+                    "cache_aware_fresh",
+                    out.cache.mode,
+                    PrefixReuseMode::FullRefill,
+                    out.output.completion_tokens,
+                );
+                out
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Invalidated: a warm entry exists, but the history sent opens with a
+    // different system prompt, so it mismatches the entry near its start and
+    // the whole history is prefilled after the entry is discarded.
+    group.bench_function(BenchmarkId::new("cache_aware_invalidated", label), |b| {
+        b.iter_batched(
+            || {
+                let mut state = state_cell.borrow_mut();
+                let mut history = warm_cache_through_prior_turns(
+                    &mut state,
+                    tokenizer,
+                    &gen_cfg,
+                    slot_id,
+                    prior_turns,
+                );
+                history[0] = ChatMessage::system(DIVERGENT_SYSTEM_PROMPT);
                 history
             },
             |history| {
                 let mut state = state_cell.borrow_mut();
-                state.chat_completion_streaming_with_prefix_cache(
-                    slot_id,
-                    &history,
+                let out = state
+                    .chat_completion_streaming_with_prefix_cache(
+                        slot_id,
+                        &history,
+                        tokenizer,
+                        &gen_cfg,
+                        |_delta, _id| true,
+                    )
+                    .expect("invalidated turn must succeed");
+                require_arm(
+                    "cache_aware_invalidated",
+                    out.cache.mode,
+                    PrefixReuseMode::FullRefill,
+                    out.output.completion_tokens,
+                );
+                out
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Cancelled: the exact append of `cache_aware_incremental`, cancelled as
+    // soon as the first delta has been delivered.
+    group.bench_function(BenchmarkId::new("cache_aware_cancelled", label), |b| {
+        b.iter_batched(
+            || {
+                let mut state = state_cell.borrow_mut();
+                warm_cache_through_prior_turns(
+                    &mut state,
                     tokenizer,
                     &gen_cfg,
-                    |_delta, _id| true,
+                    slot_id,
+                    prior_turns,
                 )
+            },
+            |history| {
+                let mut state = state_cell.borrow_mut();
+                let first_delta_delivered = std::cell::Cell::new(false);
+                let out = state
+                    .chat_completion_streaming_with_prefix_cache_and_cancel(
+                        slot_id,
+                        &history,
+                        tokenizer,
+                        &gen_cfg,
+                        |_delta, _id| {
+                            first_delta_delivered.set(true);
+                            true
+                        },
+                        || first_delta_delivered.get(),
+                    )
+                    .expect("cancelled turn must succeed");
+                require_arm(
+                    "cache_aware_cancelled",
+                    out.cache.mode,
+                    PrefixReuseMode::ExactAppend,
+                    out.output.completion_tokens,
+                );
+                assert!(
+                    !out.output.stopped && out.output.completion_tokens < gen_cfg.max_new_tokens,
+                    "cache_aware_cancelled arm must be cut short by the cancel, not run to its end"
+                );
+                out
             },
             BatchSize::SmallInput,
         );
@@ -211,12 +397,13 @@ fn bench_cross_turn_prefix_cache(c: &mut Criterion) {
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
-        let Some((mut state, tokenizer)) = load_state_and_tokenizer() else {
-            eprintln!(
-                "SKIP: cross_turn_prefix_cache bench requires a real model at \
-                 ~/.lattice/models/qwen3.5-0.8b (config.json + safetensors + tokenizer.json)"
-            );
-            return;
+        let (mut state, tokenizer) = match load_state_and_tokenizer() {
+            Ok(loaded) => loaded,
+            Err(reason) => panic!(
+                "cross_turn_prefix_cache bench requires a real model at \
+                 ~/.lattice/models/qwen3.5-0.8b (config.json + safetensors + tokenizer.json): \
+                 {reason}"
+            ),
         };
 
         bench_depth(c, &mut state, &tokenizer, 2, "2_prior_turns");

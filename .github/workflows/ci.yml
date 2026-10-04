@@ -600,8 +600,8 @@ jobs:
           }
           printf '%s\n' "$out"
           passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
-          if [ -z "$passed" ] || [ "$passed" -lt 2 ]; then
-            echo "expected at least 2 passing allocation-arm controls, parsed '${passed:-<none>}'" >&2
+          if [ -z "$passed" ] || [ "$passed" -lt 4 ]; then
+            echo "expected at least 4 passing allocation-arm controls, parsed '${passed:-<none>}'" >&2
             exit 1
           fi
       # `cargo test --workspace`'s default target set is lib, bins, tests,
@@ -615,6 +615,51 @@ jobs:
       # the example target explicitly so they cannot silently rot.
       - name: transport — drift_compare example regressions (unreached by cargo test --workspace)
         run: cargo test -p lattice-transport --example drift_compare
+      # bench_suite decides whether a standalone-wrapper run may be certified: a
+      # named wrapper that printed SKIP or no ROUTE line must not be, and the
+      # refusal arm must match every control. Those tests live in the example's
+      # own test module, and the example requires `f16`, so neither
+      # `cargo test --workspace` nor a default-feature `--all-targets` run builds
+      # them. Run the target explicitly and read the count it reports.
+      - name: inference — bench_suite certification tests (example target, needs f16)
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p lattice-inference --features f16 --example bench_suite 2>&1) || {
+            status=$?
+            printf '%s\n' "$out"
+            exit "$status"
+          }
+          printf '%s\n' "$out"
+          passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
+          if [ -z "$passed" ] || [ "$passed" -lt 14 ]; then
+            echo "expected at least 14 passing bench_suite tests, parsed '${passed:-<none>}'" >&2
+            exit 1
+          fi
+      # The tests above call the gate directly; they do not run `main`, so a
+      # `main` that stopped applying the gate would leave them green. Run the
+      # built example itself with a named wrapper and no checkpoint to read. `--llm
+      # --wrapper base` selects only the base LLM wrapper, and with HOME pointing at
+      # an empty directory it cannot find a model, so it measures nothing and must
+      # exit 2 with the refusal text. Cargo is run first with the real HOME; only
+      # the example runs with the empty one. Output goes to a file and the status is
+      # read on its own, so a pipe cannot hide it.
+      - name: inference — bench_suite refuses a named wrapper that measured nothing
+        run: |
+          set -euo pipefail
+          cargo build -p lattice-inference --features f16 --example bench_suite
+          empty_home=$(mktemp -d)
+          log=$(mktemp)
+          status=0
+          env HOME="$empty_home" "${CARGO_TARGET_DIR:-target}/debug/examples/bench_suite" --llm --wrapper base >"$log" 2>&1 || status=$?
+          cat "$log"
+          if [ "$status" -ne 2 ]; then
+            echo "expected bench_suite to exit 2 for a named wrapper with no checkpoint, got $status" >&2
+            exit 1
+          fi
+          if ! grep -F -q "refusing to certify this run: the named wrapper did not run or returned no metrics" "$log"; then
+            echo "bench_suite exited 2 but did not print the certification refusal" >&2
+            exit 1
+          fi
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
       - name: inference — metal-gpu (macOS only)
         if: runner.os == 'macOS'
@@ -887,6 +932,51 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # A grammar that rejects a budget-forced think-close token ends the prefix-cache
+      # streaming loop after the previous token was already forwarded. This test pins the
+      # boundary that exit saves. No other step here selects it, and without the env var a
+      # runner with no Metal device would return early and report it as passed.
+      - name: inference — Metal prefix-cache boundary after a grammar rejection (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-prefix-cache-grammar-rejection.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_saves_consistent_boundary' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # What the prefix-cache slot holds after each streaming exit the group covers. The
+      # group is selected by its module path, so the count pins the population: a test
+      # renamed out of the module, or skipped on a runner with no Metal device, fails here.
+      # The count is read from the last `test result:` line of the output, matched whole,
+      # so text a test prints cannot stand in for the harness summary.
+      - name: inference — Metal prefix-cache disposition per exit path (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-prefix-cache-disposition.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::prefix_cache_disposition::' \
+            -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          summary=$(grep -E '^test result: ' "$log" | tail -n 1)
+          printf '%s\n' "$summary"
+          printf '%s\n' "$summary" | grep -Eq '^test result: ok\. 19 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$'
       # #1583 / PR #1652: the Metal GDN Q/K L2 normalisation had no epsilon while the
       # CPU reference computes 1/sqrt(sum_sq + 1e-6). These two tests are the regression
       # guard, and neither runs under any other step here: `--lib forward::metal::` does
@@ -1368,7 +1458,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
+      - uses: crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 # v1.50.3
 
   # Cheap ubuntu workflow/config lint. Catches malformed expressions, unknown
   # contexts/inputs, shellcheck-level issues, and changed-file range regressions

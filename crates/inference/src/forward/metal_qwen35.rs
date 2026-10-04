@@ -14292,12 +14292,12 @@ mod inner {
                 if use_compact {
                     self.disengage_compact_route();
                 }
-                // The caller cut the stream after exactly one forwarded
-                // token (the prefill sample) — state represents prompt +
-                // that one token already (forward happens on the *next*
-                // iteration in the loop below, which never runs here).
-                // Nothing further was forwarded, so do not save a cache
-                // entry claiming more than live state represents.
+                // The caller cut the stream on the prefill-derived first token.
+                // That token is pushed but not forwarded: its forward step is
+                // the first thing the decode loop below does, and the loop
+                // never runs here. Live state therefore holds only the prompt.
+                // The consumed entry was already taken, so returning without a
+                // save leaves the slot empty.
                 return Ok(CachedGenerateOutput {
                     output: GenerateOutput {
                         text,
@@ -14334,6 +14334,11 @@ mod inner {
             }
             let mut stopped = false;
             let mut stopped_by_caller = false;
+            // A token the grammar rejects (a budget-forced `</think>` it forbids)
+            // leaves `stopped` false, as the streaming entry reports it, but the
+            // step that sampled it already forwarded the last pushed token at the
+            // loop top, so the silent step below must not forward it again.
+            let mut stopped_by_grammar_rejection = false;
             let mut stop_reason = StopReason::Length;
             // A grammar completed by the prefill-derived first token with no
             // legal continuation is a successful stop, mirroring the CPU
@@ -14364,10 +14369,14 @@ mod inner {
                 // this iteration's delta ends up non-empty — mirrors
                 // `generate_streaming_with_cancel`'s decode-loop check and
                 // closes the same UTF-8-boundary gap `on_token`-only
-                // cancellation has. Every generated token up to this point
-                // was already forwarded (`forward_step` ran on the previous
-                // iteration), so this is exactly the on_token-returns-false
-                // case below: state is fully consistent, safe to save below.
+                // cancellation has. At a loop top every pushed token except the
+                // most recent one has been forwarded; the most recent one is
+                // forwarded by this iteration's `forward_step_decode`, which a
+                // cancel here skips. At the first loop top that means nothing
+                // has been forwarded past the prompt. The exit sets
+                // `stopped_by_caller`, the same flag an on_token rejection
+                // sets, so the silent step below is skipped and the boundary
+                // saved is the forwarded prefix.
                 if should_cancel() {
                     stopped_by_caller = true;
                     stop_reason = StopReason::Interrupt;
@@ -14441,6 +14450,7 @@ mod inner {
 
                 let (next_id, answer_budget_exhausted) = match outcome {
                     crate::model::qwen35::StepOutcome::GrammarStop => {
+                        stopped_by_grammar_rejection = true;
                         stop_reason = StopReason::Grammar;
                         break;
                     }
@@ -14527,24 +14537,44 @@ mod inner {
                 self.cross_turn_prefix_cache.remove(slot_id);
             } else {
                 // Every exit above leaves the last *pushed* generated token
-                // un-forwarded EXCEPT the `is_stop` break, where the stop token
-                // itself was never pushed and every element of `generated_ids`
-                // was already forwarded by the following iteration's
-                // `forward_step` call. Run one silent step so the next turn can
+                // un-forwarded EXCEPT the `is_stop` break and a grammar
+                // rejection, where the stop or rejected token itself was never
+                // pushed and every element of `generated_ids` was already
+                // forwarded by the following iteration's `forward_step` call.
+                // Run one silent step so the next turn can
                 // reuse through the full assistant output (design.md step 8,
                 // "Better v1"). This must not sample or emit anything.
                 //
                 // `stopped_by_caller` is excluded from this silent step
-                // deliberately: it means `on_token` returned false for
-                // `last_pushed_id` itself (the caller rejected delivery of, or
-                // disconnected on, exactly that token), and that token has not
-                // been forwarded into KV yet at this point (forwarding happens
-                // on the loop iteration that never ran). Running the silent
-                // step here would forward and then persist a boundary that
-                // includes a token the caller never received. Leaving
-                // `kv_cache.seq_len` where it is instead naturally excludes
-                // `last_pushed_id` from `represented_len` below.
-                if !generated_ids.is_empty() && !stopped && !stopped_by_caller {
+                // deliberately. Two exits set it, and they leave
+                // `last_pushed_id` in different states:
+                //
+                // - `should_cancel()` at a decode-loop top: `last_pushed_id`
+                //   is the latest delivered token and has not been forwarded
+                //   yet, because forwarding it is the step this iteration
+                //   never reached. The silent step would forward it and
+                //   persist a boundary past the point the cancelled turn
+                //   reached; skipping it saves the forwarded prefix and the
+                //   next turn replays that token as part of its suffix.
+                // - `on_token` returning false inside the step (the caller
+                //   rejected delivery of, or disconnected on, the new token):
+                //   this iteration already forwarded the prior token, and the
+                //   exit comes before `last_pushed_id = next_id`, so
+                //   `last_pushed_id` still names that already-forwarded
+                //   token. The silent step would forward it a second time,
+                //   advancing `kv_cache.seq_len` by a position that holds no
+                //   new generated token. The rejected token itself sits in
+                //   `generated_ids` unforwarded and must stay out of the
+                //   saved boundary, since it is text the caller never
+                //   received.
+                //
+                // Leaving `kv_cache.seq_len` where it is keeps both cases
+                // consistent with `represented_len` below.
+                if !generated_ids.is_empty()
+                    && !stopped
+                    && !stopped_by_caller
+                    && !stopped_by_grammar_rejection
+                {
                     let seq_len = self.session.kv_cache.seq_len;
                     if seq_len < self.session.kv_cache.max_cache_len {
                         let _ = self.forward_step_decode(last_pushed_id, seq_len);
@@ -14669,6 +14699,7 @@ mod inner {
     mod tests {
         mod dispatch;
         mod path_proof_bytes;
+        mod prefix_cache_disposition;
 
         use super::super::{
             LM_HEAD_TOPK_TIE_EPSILON, LM_HEAD_TOPK_TIE_EPSILON_Q4, TopkSetAgreement,
@@ -39033,6 +39064,128 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "a decode-loop grammar-fail-closed turn must not leave a stale \
                  cache entry behind"
             );
+        }
+
+        /// The reasoning budget forces `</think>` on the first decode step, and a
+        /// grammar that expects another `a` rejects it. The request ends with
+        /// `StopReason::Grammar`, and the boundary it saves must be one live
+        /// KV/GDN state actually represents: the rejected step already forwarded
+        /// the one pushed token, so nothing may forward it a second time.
+        #[test]
+        fn generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_saves_consistent_boundary()
+         {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use std::collections::HashMap;
+            use std::sync::Arc;
+
+            const THINK_CLOSE_ID: usize = 30;
+            let mut vocab_bytes = single_char_vocab_bytes();
+            vocab_bytes[THINK_CLOSE_ID] = b"</think>".to_vec();
+            let vocab: HashMap<String, u32> = vocab_bytes
+                .iter()
+                .zip(0u32..)
+                .map(|(bytes, id)| (String::from_utf8_lossy(bytes).into_owned(), id))
+                .collect();
+            let tokenizer =
+                crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+                    .expect("thinking vocab tokenizer build");
+            let engine = Arc::new(
+                GrammarEngine::new(
+                    &GrammarSpec::Gbnf("root ::= \"a\" \"a\"\n".to_string()),
+                    vocab_bytes,
+                )
+                .expect("grammar engine builds over the thinking vocab"),
+            );
+            let gen_cfg = GenerateConfig {
+                min_p: 0.0,
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: true,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: Some(1),
+                logprobs: None,
+            };
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let mut streamed = String::new();
+            let turn = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "a",
+                    &tokenizer,
+                    &gen_cfg,
+                    |delta, _id| {
+                        streamed.push_str(delta);
+                        true
+                    },
+                )
+                .expect("a budget-forced token the grammar rejects is a stop, not an error");
+
+            assert_eq!(turn.output.stop_reason, Some(StopReason::Grammar));
+            assert_eq!(
+                turn.output.token_ids,
+                vec![0],
+                "the forced </think> is rejected before it is pushed"
+            );
+            assert_eq!(turn.output.text, "a");
+            assert_eq!(streamed, "a");
+            assert!(
+                !turn.output.stopped,
+                "a grammar rejection reports stopped: false, as the streaming entry does"
+            );
+
+            let prompt_len = turn.cache.prompt_tokens;
+            let entry = state
+                .cross_turn_prefix_cache
+                .get(slot_id)
+                .expect("a grammar rejection saves the boundary live state represents");
+            let represented_len = entry.generic.represented_len;
+            assert_eq!(
+                represented_len,
+                prompt_len + 1,
+                "the boundary covers the prompt and the one pushed token the rejected \
+                 step forwarded, and nothing beyond it"
+            );
+            assert_eq!(entry.generic.token_ids.len(), represented_len);
+            assert_eq!(entry.generic.token_ids[prompt_len..], [0]);
+            assert_eq!(entry.generic.gdn_snapshot_len, represented_len);
+            assert_eq!(state.session.kv_cache.seq_len, represented_len);
+
+            let follow_up = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &format!("a{}q", turn.output.text),
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(3, 2),
+                    |_, _| true,
+                )
+                .expect("a follow-up on the saved boundary must not error");
+            assert_eq!(
+                follow_up.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "the saved boundary must be reusable by a turn that extends it"
+            );
+            assert_eq!(follow_up.cache.reused_tokens, represented_len);
         }
     }
     // -----------------------------------------------------------------------
