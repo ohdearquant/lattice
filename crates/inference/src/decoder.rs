@@ -36,6 +36,10 @@ pub(crate) mod qwen_metal;
 /// that drives [`DecodePolicy`](crate::generation::DecodePolicy) unchanged.
 pub(crate) mod driver;
 
+/// One [`DecoderSession`] for the three standalone CPU generation wrappers
+/// (`generate_f16`, `generate_q8`, `generate_q8_neon`), run by the shared driver.
+pub(crate) mod standalone_cpu;
+
 // ---------------------------------------------------------------------------
 // PredictionId / PredictionLedger
 // ---------------------------------------------------------------------------
