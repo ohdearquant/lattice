@@ -15,16 +15,36 @@
 # for the absolute gold-standard baseline.
 #
 # Output: docs/bench_results/perplexity.tsv (engine<TAB>tier<TAB>ppl<TAB>tokens)
+#
+# eval_perplexity takes the Metal GPU lock itself, once per process, so each
+# lattice tier is one GPU-handoff run (bench-command.sh builds the binary and
+# launches it under the machine locks). The MLX cross-check also drives the GPU,
+# but MLX never takes the lock itself, so it runs as its own plain, durable
+# bench-command.sh launch, which holds both machine locks around it. This script
+# is not supervised as a whole: only its argument handling, output parsing and
+# report writing run outside the locks. The handoff admits a commit-clean
+# checkout only and runs from the repository root; the staged result file is a
+# git-ignored scratch file for that reason.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-source "$REPO/scripts/lib/bench-supervision.sh"
+
+absolute_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$PWD" "$1" ;;
+  esac
+}
 
 bench_quality_measurement() {
-EVAL_BIN="$REPO/target/release/eval_perplexity"
 Q4_DIR="${Q4_DIR:-$HOME/.lattice/models/qwen3.5-0.8b-q4}"
 QUAROT_DIR="${QUAROT_DIR:-$HOME/.lattice/models/qwen3.5-0.8b-q4-quarot}"
 TOK_DIR="${TOK_DIR:-$HOME/.lattice/models/qwen3.5-0.8b}"
+# The handoff runs from the repository root, so a relative directory the caller
+# gave is resolved against the caller's directory first.
+Q4_DIR="$(absolute_path "$Q4_DIR")"
+QUAROT_DIR="$(absolute_path "$QUAROT_DIR")"
+TOK_DIR="$(absolute_path "$TOK_DIR")"
 OUT="$REPO/docs/bench_results"
 CORPUS="$OUT/wiki.test.raw"
 DATA="$OUT/perplexity.tsv"
@@ -52,11 +72,6 @@ if [[ ! -d "$QUAROT_DIR" ]]; then
 fi
 if [[ ! -d "$TOK_DIR" ]]; then
   echo "  ERROR: tokenizer directory not found: $TOK_DIR" >&2
-  exit 1
-fi
-if [[ ! -x "$EVAL_BIN" ]]; then
-  echo "  ERROR: $EVAL_BIN is not executable. Build it with:" >&2
-  echo "    cargo build --release -p lattice-inference --bin eval_perplexity" >&2
   exit 1
 fi
 if [[ "$SKIP_MLX" != "0" ]] && [[ "$SKIP_MLX" != "1" ]]; then
@@ -125,6 +140,13 @@ echo "=== Perplexity bench | Qwen3.5-0.8B | WikiText-2 test | window=$WINDOW str
 
 echo "  Corpus: $CORPUS ($(wc -c < "$CORPUS") bytes)"
 
+# One tier per call: the handoff admits a single GPU lock acquisition per process.
+eval_perplexity_handoff() {
+  (cd "$REPO" && "$REPO/scripts/bench-command.sh" --gpu-handoff --durable --label quality-perplexity -- \
+    cargo run --locked --release -p lattice-inference --bin eval_perplexity \
+    --features metal-gpu -- "$@")
+}
+
 extract_ppl() {
   # Match exactly the eval_perplexity output line: "PPL:                NN.NNNNNN"
   awk '/^PPL:[[:space:]]+[0-9]+\.[0-9]+/{ print $2; exit }'
@@ -132,7 +154,7 @@ extract_ppl() {
 
 # ---- Lattice Q4 (unrotated) ----
 echo "─── Lattice Q4 (unrotated) ───"
-OUT_TXT=$("$EVAL_BIN" --q4-dir "$Q4_DIR" --tokenizer-dir "$TOK_DIR" \
+OUT_TXT=$(eval_perplexity_handoff --q4-dir "$Q4_DIR" --tokenizer-dir "$TOK_DIR" \
   --corpus-file "$CORPUS" --window "$WINDOW" --stride "$STRIDE" \
   --max-tokens "$MAX_TOKENS" 2>&1)
 EVAL_RC=$?
@@ -152,7 +174,7 @@ append_row "lattice/q4 result" "lattice" "q4" "$PPL" "$MAX_TOKENS"
 
 # ---- Lattice Q4-QuaRot ----
 echo "─── Lattice Q4-QuaRot (lattice product) ───"
-OUT_TXT=$("$EVAL_BIN" --quarot-q4-dir "$QUAROT_DIR" --tokenizer-dir "$TOK_DIR" \
+OUT_TXT=$(eval_perplexity_handoff --quarot-q4-dir "$QUAROT_DIR" --tokenizer-dir "$TOK_DIR" \
   --corpus-file "$CORPUS" --window "$WINDOW" --stride "$STRIDE" \
   --max-tokens "$MAX_TOKENS" 2>&1)
 EVAL_RC=$?
@@ -185,12 +207,17 @@ echo "─── MLX (Q8 + Q4 cross-check) ───"
 # Capture stdout to a temp; only clean "mlx<TAB>..." rows are appended to the
 # unpublished result so a
 # broken mlx-lm (import/tokenizer errors) can never pollute the data file. stderr → log.
+# The pass is a plain bench-command.sh launch (no --gpu-handoff: MLX does not call
+# gpu_test_lock(), so the supervisor keeps both locks held around it), durable like
+# the lattice tiers. The launcher's own quiet-probe lines share this stdout; the
+# row filter below keeps only exact "mlx<TAB>tier<TAB>ppl<TAB>tokens" rows.
 MLX_TMP="$(mktemp)"
 if [[ -z "$MLX_TMP" ]] || [[ ! -f "$MLX_TMP" ]]; then
   echo "  ERROR: failed to create the MLX output tempfile" >&2
   exit 1
 fi
-uv run --quiet --with mlx-lm python3 - "$TOK_DIR" "$CORPUS" "$WINDOW" "$STRIDE" "$MAX_TOKENS" > "$MLX_TMP" 2>"$MLX_LOG" <<'PY'
+"$REPO/scripts/bench-command.sh" --durable --label quality-mlx -- \
+  uv run --quiet --with mlx-lm python3 - "$TOK_DIR" "$CORPUS" "$WINDOW" "$STRIDE" "$MAX_TOKENS" > "$MLX_TMP" 2>"$MLX_LOG" <<'PY'
 import sys, math
 mdir, corpus, window, stride, max_tokens = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
 import mlx.core as mx
@@ -298,4 +325,4 @@ echo ""
 echo "Raw data: $DATA"
 }
 
-bench_supervise_entry "quality-perplexity" durable bench_quality_measurement "$@"
+bench_quality_measurement "$@"

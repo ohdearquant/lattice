@@ -81,6 +81,11 @@ Thumbs.db
 # Local gate/report output written into the repo root by scripts and one-off runs
 /REPORT.md
 
+# scripts/bench_quality.sh stages its result here (mktemp template
+# .perplexity.tsv.XXXXXX) while the GPU handoff runs, and the handoff admits only
+# a commit-clean worktree, so the staged file has to be ignored.
+/docs/bench_results/.perplexity.tsv.*
+
 *__pycache__/
 uv.lock
 

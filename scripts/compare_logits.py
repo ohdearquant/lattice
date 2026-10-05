@@ -5,12 +5,22 @@ compare_logits.py — Side-by-side logit divergence: Lattice (F16 Metal) vs MLX.
 Loads Qwen3.5-0.8B in both engines, runs prefill on the first 32 tokens of
 WikiText-2, and prints per-position diagnostics.
 
+bench_logit_dump takes the Metal GPU lock itself, so the Lattice side runs as a
+GPU-handoff run (scripts/bench-command.sh builds the binary and launches it under
+the machine locks). The MLX side also drives the GPU but never takes that lock, so
+all of it (tokenizer load, token ids, prefill logits) runs in one child of this
+script, launched as a plain bench-command.sh run that holds both machine locks
+around it. The two runs are sequential: the MLX child finishes before the Lattice
+run starts. Only argument handling, the analysis and output parsing run outside
+the locks. The handoff admits a commit-clean checkout only and runs from the
+repository root; it builds the binary itself, so a prebuilt binary directory is
+not accepted.
+
 Usage:
     PYTHONPATH=<mlx-site-packages> python3.11 scripts/compare_logits.py [--n-tokens N]
 
 Env:
     LATTICE_MODEL_DIR     model dir (default ~/.lattice/models/qwen3.5-0.8b)
-    LATTICE_BIN_DIR       dir containing bench_logit_dump (default ./target/release)
     LATTICE_LOGIT_TMP     temp file for binary logit dump (default /tmp/lattice_logits.bin)
     CORPUS_FILE           wiki corpus path (default docs/bench_results/wiki.test.raw)
     MLX_MODEL_PATH        local MLX model path (default same as LATTICE_MODEL_DIR)
@@ -18,17 +28,16 @@ Env:
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
+from collections.abc import Mapping
 from pathlib import Path
-
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-    from bench_supervision import ensure_python_entrypoint
-
-    ensure_python_entrypoint("logit-divergence")
 
 import numpy as np
 
@@ -39,17 +48,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HOME = Path.home()
 
 MODEL_DIR = Path(os.environ.get("LATTICE_MODEL_DIR", HOME / ".lattice/models/qwen3.5-0.8b"))
-BIN_DIR = Path(os.environ.get("LATTICE_BIN_DIR", REPO_ROOT / "target/release"))
 LOGIT_TMP = os.environ.get("LATTICE_LOGIT_TMP", "/tmp/lattice_logits.bin")
 CORPUS_FILE = Path(os.environ.get("CORPUS_FILE", REPO_ROOT / "docs/bench_results/wiki.test.raw"))
 MLX_MODEL_PATH = os.environ.get("MLX_MODEL_PATH", str(MODEL_DIR))
 
 N_TOKENS = 32  # number of prefill positions to compare
+MLX_CHILD_DIR: str | None = None  # set only in the MLX child: where it writes its results
 for arg in sys.argv[1:]:
     if arg.startswith("--n-tokens="):
         N_TOKENS = int(arg.split("=", 1)[1])
     elif arg == "--n-tokens" and sys.argv.index(arg) + 1 < len(sys.argv):
         N_TOKENS = int(sys.argv[sys.argv.index(arg) + 1])
+    elif arg == "--mlx-child" and sys.argv.index(arg) + 1 < len(sys.argv):
+        MLX_CHILD_DIR = sys.argv[sys.argv.index(arg) + 1]
 
 # ---------------------------------------------------------------------------
 # Step 1: Tokenize corpus with Lattice tokenizer (via BPE JSON)
@@ -85,42 +96,76 @@ def tokenize_via_mlx(corpus_path: Path, model_dir: Path, n: int) -> list[int]:
 # Step 2: Lattice logit dump (via bench_logit_dump subprocess)
 # ---------------------------------------------------------------------------
 
-def run_lattice_logit_dump(token_ids: list[int], model_dir: Path, bin_dir: Path, out_path: str) -> np.ndarray:
-    """Run bench_logit_dump, return float32 array [n_pos, vocab]."""
-    binary = bin_dir / "bench_logit_dump"
-    if not binary.exists():
-        raise FileNotFoundError(f"bench_logit_dump not found at {binary}")
+# The handoff builds bench_logit_dump itself, so the arguments below are the whole
+# launch: the binary comes from this cargo invocation, never from a prebuilt path.
+HANDOFF_ARGV = [
+    "--gpu-handoff", "--label", "logit-divergence", "--",
+    "cargo", "run", "--locked", "--release", "-p", "lattice-inference",
+    "--bin", "bench_logit_dump", "--features", "metal-gpu,f16",
+]
 
+VOCAB_LINE = re.compile(r"VOCAB=(\d+)")
+NPOS_LINE = re.compile(r"NPOS=(\d+)")
+
+
+def parse_dump_header(output: str) -> tuple[int | None, int | None]:
+    """Read VOCAB=N and NPOS=N from the handoff output.
+
+    The handoff merges the binary's standard error into the stream, so progress
+    lines share it; only a line that is exactly a header record counts.
+    """
+    vocab, npos = None, None
+    for line in output.splitlines():
+        record = line.rstrip("\r")
+        if (match := VOCAB_LINE.fullmatch(record)) is not None:
+            vocab = int(match.group(1))
+        elif (match := NPOS_LINE.fullmatch(record)) is not None:
+            npos = int(match.group(1))
+    return vocab, npos
+
+
+def reject_prebuilt_binary_dir(env: Mapping[str, str]) -> None:
+    """Refuse the retired LATTICE_BIN_DIR override instead of silently ignoring it."""
+    if env.get("LATTICE_BIN_DIR"):
+        raise SystemExit(
+            "LATTICE_BIN_DIR is not supported: the GPU handoff builds and launches "
+            "bench_logit_dump itself and cannot run a prebuilt binary; unset it"
+        )
+
+
+def run_lattice_logit_dump(token_ids: list[int], model_dir: Path, out_path: str) -> np.ndarray:
+    """Run bench_logit_dump under the GPU handoff, return float32 array [n_pos, vocab]."""
+    # The handoff runs from the repository root, so a relative path the caller
+    # gave is made absolute against the caller's directory first.
+    out_file = os.path.abspath(out_path)
     env = os.environ.copy()
-    env["LATTICE_MODEL_DIR"] = str(model_dir)
-    env["LATTICE_LOGIT_OUT"] = out_path
+    env["LATTICE_MODEL_DIR"] = os.path.abspath(model_dir)
+    env["LATTICE_LOGIT_OUT"] = out_file
     env["LATTICE_TOKENS"] = " ".join(str(t) for t in token_ids)
+    if env.get("LATTICE_TOKENIZER_DIR"):
+        env["LATTICE_TOKENIZER_DIR"] = os.path.abspath(env["LATTICE_TOKENIZER_DIR"])
 
-    print(f"[lattice] running {binary} ({len(token_ids)} tokens)...")
+    print(f"[lattice] running bench_logit_dump under the GPU handoff ({len(token_ids)} tokens)...")
     result = subprocess.run(
-        [str(binary)],
+        [str(REPO_ROOT / "scripts" / "bench-command.sh"), *HANDOFF_ARGV],
         capture_output=True,
         text=True,
         env=env,
+        cwd=REPO_ROOT,
     )
     if result.returncode != 0:
+        print(result.stdout[-2000:], file=sys.stderr)
         print(result.stderr[-2000:], file=sys.stderr)
         raise RuntimeError(f"bench_logit_dump exited {result.returncode}")
 
-    # Parse VOCAB=N and NPOS=N from stdout
-    vocab, npos = None, None
-    for line in result.stdout.splitlines():
-        if line.startswith("VOCAB="):
-            vocab = int(line.split("=", 1)[1])
-        elif line.startswith("NPOS="):
-            npos = int(line.split("=", 1)[1])
+    vocab, npos = parse_dump_header(result.stdout)
 
-    print(result.stderr[-500:], file=sys.stderr)
+    print(result.stdout[-500:], file=sys.stderr)
 
     if vocab is None or npos is None:
-        raise RuntimeError(f"bench_logit_dump stdout missing VOCAB/NPOS: {result.stdout}")
+        raise RuntimeError(f"bench_logit_dump output missing VOCAB/NPOS: {result.stdout}")
 
-    raw = Path(out_path).read_bytes()
+    raw = Path(out_file).read_bytes()
     arr = np.frombuffer(raw, dtype="<f4").reshape(npos, vocab).copy()
     print(f"[lattice] loaded logits: shape={arr.shape}")
     return arr
@@ -153,6 +198,71 @@ def run_mlx_logits(token_ids: list[int], model_path: str) -> np.ndarray:
     arr = logits_np
     print(f"[mlx] loaded logits: shape={arr.shape}")
     return arr
+
+
+# MLX child: every MLX pass of this script runs in one child process, launched as
+# a plain (no --gpu-handoff) bench-command.sh run. MLX does not call
+# gpu_test_lock(), so the supervisor keeps both machine locks held around the
+# child. The child is this script in an explicit mode, started with the parent's
+# interpreter and environment, and hands its results back through files.
+MLX_LAUNCH_ARGV = [
+    "--label", "logit-mlx", "--",
+    sys.executable, str(Path(__file__).resolve()), "--mlx-child",
+]
+MLX_TOKENS_FILE = "mlx_tokens.json"
+MLX_LOGITS_FILE = "mlx_logits.bin"
+
+
+def run_mlx_child(out_dir: str) -> None:
+    """Child mode: tokenize, run the MLX prefill, write both results into out_dir."""
+    print("\n[step 1] tokenizing corpus with MLX tokenizer...")
+    try:
+        token_ids = tokenize_via_mlx(CORPUS_FILE, MLX_MODEL_PATH, N_TOKENS)
+    except Exception as e:
+        print(f"  mlx_lm tokenizer failed ({e}), trying transformers...")
+        try:
+            token_ids = tokenize_corpus_bpe(CORPUS_FILE, MODEL_DIR, N_TOKENS)
+        except Exception as e2:
+            raise RuntimeError(f"Tokenization failed: {e}, {e2}") from e2
+    print(f"  token_ids: {token_ids[:10]}... ({len(token_ids)} tokens)")
+
+    print("\n[step 2] collecting MLX logits...")
+    logits = run_mlx_logits(token_ids, MLX_MODEL_PATH)
+
+    out = Path(out_dir)
+    (out / MLX_LOGITS_FILE).write_bytes(logits.astype("<f4").tobytes())
+    # Written last and renamed into place, so the parent finds it only when the logits are complete.
+    pending = out / (MLX_TOKENS_FILE + ".part")
+    pending.write_text(json.dumps({"token_ids": token_ids, "n_pos": int(logits.shape[0]), "vocab": int(logits.shape[1])}))
+    pending.replace(out / MLX_TOKENS_FILE)
+
+
+def collect_mlx_via_child() -> tuple[list[int], np.ndarray]:
+    """Run the MLX child under the machine locks and read back its token ids and logits."""
+    work = tempfile.mkdtemp(prefix="compare-logits-mlx-")
+    try:
+        # Neither stream is captured: the child's progress lines reach the caller's console.
+        result = subprocess.run(
+            [str(REPO_ROOT / "scripts" / "bench-command.sh"), *MLX_LAUNCH_ARGV, work,
+             f"--n-tokens={N_TOKENS}"],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"MLX child exited {result.returncode}")
+        meta_path = Path(work) / MLX_TOKENS_FILE
+        if not meta_path.is_file():
+            raise RuntimeError(f"MLX child exited 0 but wrote no {MLX_TOKENS_FILE}")
+        meta = json.loads(meta_path.read_text())
+        raw = (Path(work) / MLX_LOGITS_FILE).read_bytes()
+        token_ids = [int(t) for t in meta["token_ids"]]
+        n_pos, vocab = int(meta["n_pos"]), int(meta["vocab"])
+        if len(raw) != n_pos * vocab * 4:
+            raise RuntimeError(f"MLX logits file is {len(raw)} bytes, expected {n_pos * vocab * 4}")
+        arr = np.frombuffer(raw, dtype="<f4").reshape(n_pos, vocab).copy()
+        print(f"[mlx] child returned {len(token_ids)} token ids and logits shape={arr.shape}")
+        return token_ids, arr
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -236,31 +346,21 @@ def analyze(lat: np.ndarray, mlx: np.ndarray, token_ids: list[int]) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    reject_prebuilt_binary_dir(os.environ)
+    if MLX_CHILD_DIR is not None:
+        run_mlx_child(MLX_CHILD_DIR)
+        return
     print(f"[setup] model dir  : {MODEL_DIR}")
     print(f"[setup] corpus     : {CORPUS_FILE}")
     print(f"[setup] n_tokens   : {N_TOKENS}")
 
-    # Tokenize
-    print("\n[step 1] tokenizing corpus with MLX tokenizer...")
-    try:
-        token_ids = tokenize_via_mlx(CORPUS_FILE, MLX_MODEL_PATH, N_TOKENS)
-    except Exception as e:
-        print(f"  mlx_lm tokenizer failed ({e}), trying transformers...")
-        try:
-            token_ids = tokenize_corpus_bpe(CORPUS_FILE, MODEL_DIR, N_TOKENS)
-        except Exception as e2:
-            # Fallback: read raw token IDs from a pre-computed source
-            raise RuntimeError(f"Tokenization failed: {e}, {e2}") from e2
-
-    print(f"  token_ids: {token_ids[:10]}... ({len(token_ids)} tokens)")
-
-    # MLX logits
-    print("\n[step 2] collecting MLX logits...")
-    mlx_logits = run_mlx_logits(token_ids, MLX_MODEL_PATH)
+    # Steps 1 and 2: tokenizer, token ids and MLX logits, all in the MLX child.
+    # It finishes before the Lattice run starts; the two never overlap.
+    token_ids, mlx_logits = collect_mlx_via_child()
 
     # Lattice logits
     print("\n[step 3] collecting Lattice logits (F16 Metal)...")
-    lat_logits = run_lattice_logit_dump(token_ids, MODEL_DIR, BIN_DIR, LOGIT_TMP)
+    lat_logits = run_lattice_logit_dump(token_ids, MODEL_DIR, LOGIT_TMP)
 
     # Align sequence lengths
     n = min(lat_logits.shape[0], mlx_logits.shape[0], len(token_ids))
