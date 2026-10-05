@@ -15005,13 +15005,14 @@ mod inner {
                         tail_rejected = true;
                         stop_reason = StopReason::Interrupt;
                     }
-                    crate::generation::StopCheckOutcome::Stopped if !stopped => {
-                        stopped = true;
+                    crate::generation::StopCheckOutcome::Stopped => {
                         stopped_by_stop_string = true;
-                        stop_reason = StopReason::Eos;
+                        if !stopped {
+                            stopped = true;
+                            stop_reason = StopReason::Eos;
+                        }
                     }
-                    crate::generation::StopCheckOutcome::Stopped
-                    | crate::generation::StopCheckOutcome::Continue => {}
+                    crate::generation::StopCheckOutcome::Continue => {}
                 }
             }
 
