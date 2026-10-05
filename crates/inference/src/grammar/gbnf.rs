@@ -669,6 +669,19 @@ mod tests {
     }
 
     #[test]
+    fn gbnf_empty_root_is_complete_before_any_byte() {
+        let g = parse_gbnf("root ::= \"\"\n").unwrap();
+        assert!(GrammarState::for_grammar(&g).is_complete());
+
+        let g = parse_gbnf("root ::= \"x\"?\n").unwrap();
+        assert!(GrammarState::for_grammar(&g).is_complete());
+
+        // Control: a literal root is not complete before any byte.
+        let g = parse_gbnf("root ::= \"x\"\n").unwrap();
+        assert!(!GrammarState::for_grammar(&g).is_complete());
+    }
+
+    #[test]
     fn gbnf_plus() {
         let g = parse_gbnf("root ::= [0-9]+\n").unwrap();
         assert!(accepts(&g, b"5"));
