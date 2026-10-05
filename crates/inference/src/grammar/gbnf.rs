@@ -306,12 +306,22 @@ impl<'a> Lexer<'a> {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Maximum nesting of parenthesised groups the parser will descend.
+///
+/// Each `(` re-enters `parse_expr`, so unbounded nesting grows the native stack
+/// one parser frame set per group and aborts the process on adversarial input.
+/// Real grammars nest a handful of levels; 128 matches the limit `serde_json`
+/// applies to the JSON schemas the sibling compiler accepts.
+const MAX_GROUP_DEPTH: usize = 128;
+
 struct Parser<'a> {
     lexer: Lexer<'a>,
     lookahead: Option<Token>,
     builder: GrammarBuilder,
     /// Counter for auto-generated rule names (for desugared repetition).
     anon_counter: usize,
+    /// Number of parenthesised groups currently open.
+    group_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -323,6 +333,7 @@ impl<'a> Parser<'a> {
             lookahead: Some(tok),
             builder: GrammarBuilder::new(),
             anon_counter: 0,
+            group_depth: 0,
         })
     }
 
@@ -508,7 +519,15 @@ impl<'a> Parser<'a> {
             }
             Token::LParen => {
                 self.consume()?;
-                let alts = self.parse_expr()?;
+                if self.group_depth >= MAX_GROUP_DEPTH {
+                    return Err(GbnfError(format!(
+                        "group nesting exceeds the supported depth ({MAX_GROUP_DEPTH})"
+                    )));
+                }
+                self.group_depth += 1;
+                let alts = self.parse_expr();
+                self.group_depth -= 1;
+                let alts = alts?;
                 match self.consume()? {
                     Token::RParen => {}
                     tok => {
@@ -753,5 +772,36 @@ mod tests {
     fn gbnf_comment_skipped() {
         let g = parse_gbnf("# this is a comment\nroot ::= \"ok\"\n").unwrap();
         assert!(accepts(&g, b"ok"));
+    }
+
+    fn nested_groups(depth: usize) -> String {
+        format!("root ::= {}\"a\"{}\n", "(".repeat(depth), ")".repeat(depth))
+    }
+
+    #[test]
+    fn group_nesting_at_the_limit_parses() {
+        let g = parse_gbnf(&nested_groups(MAX_GROUP_DEPTH)).unwrap();
+        assert!(accepts(&g, b"a"));
+    }
+
+    #[test]
+    fn group_nesting_past_the_limit_is_rejected() {
+        let err = parse_gbnf(&nested_groups(MAX_GROUP_DEPTH + 1)).unwrap_err();
+        assert!(err.to_string().contains("nesting"), "{err}");
+    }
+
+    /// Without a depth bound the parser recurses once per `(`, so a few thousand
+    /// groups overflow a small native stack before the grammar is ever matched.
+    #[test]
+    fn deeply_nested_groups_are_rejected_on_a_bounded_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let err = parse_gbnf(&nested_groups(100_000)).unwrap_err();
+                assert!(err.to_string().contains("nesting"), "{err}");
+            })
+            .expect("bounded-stack regression thread spawns")
+            .join()
+            .expect("deep nesting must be rejected, not overflow the stack");
     }
 }
