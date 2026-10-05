@@ -423,10 +423,10 @@ impl DecodePolicy {
     // family): CPU production code now calls `init_with_metadata`/`transition_with_metadata`
     // instead, which share this method's internals via `construct`/`transition_inner` but
     // route metadata through a session rather than a direct logits slice. `init`/`transition`
-    // themselves stay byte-identical on purpose -- Metal's `metal_qwen35.rs` still calls them
-    // directly and is unbuildable/unverifiable outside the `metal-gpu` feature, so under a
-    // CPU-only (non-`metal-gpu`) build these are reachable only from this module's own tests.
-    #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+    // themselves stay byte-identical on purpose -- the Metal prefix-cache loop kept under
+    // `#[cfg(test)]` in `metal_qwen35.rs` still calls them directly, so outside a test build
+    // they have no caller.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn init(
         gen_cfg: &GenerateConfig,
         think_close_id: Option<u32>,
@@ -592,7 +592,7 @@ impl DecodePolicy {
     /// full per-step ordering. Row R03: those two are themselves
     /// `metal-gpu`-only in a CPU production build (see the `cfg_attr` on
     /// `init`'s own doc comment) -- this method inherits the same reachability.
-    #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn record_logprob(
         &self,
         token_logprobs: &mut Vec<TokenLogprob>,
@@ -768,7 +768,7 @@ impl DecodePolicy {
     // Row R03: same `metal-gpu`-only-in-CPU-production-build reachability as
     // `DecodePolicy::init` above -- see that method's doc comment. CPU
     // production code now calls `transition_with_metadata` instead.
-    #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn transition(
         &mut self,
         token_logprobs: &mut Vec<TokenLogprob>,

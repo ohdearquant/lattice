@@ -11,7 +11,7 @@
 use super::*;
 use crate::kv_cache::{CrossTurnSlotId, PrefixReuseMode};
 
-fn metal_device_present() -> bool {
+pub(super) fn metal_device_present() -> bool {
     let present = Device::system_default().is_some();
     assert!(
         present || std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_none(),

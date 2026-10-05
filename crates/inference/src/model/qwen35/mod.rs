@@ -91,7 +91,7 @@ pub(crate) use generation::check_context_budget;
 // from here unchanged so `crate::model::qwen35::DecodePolicy` and its siblings
 // keep resolving for the Metal consumer, which is what R02's "old exports"
 // means for these three: they are `pub(crate)`, so no external path is at stake.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use crate::generation::{DecodePolicy, StepOutcome, StopCheckOutcome};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::{REASONING_CLOSE_MARKER, resolve_reasoning_close_token};

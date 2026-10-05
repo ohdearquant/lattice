@@ -573,7 +573,9 @@ mod inner {
     };
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
-    use crate::generation::{GenerateConfig, GenerateOutput, TokenLogprob};
+    #[cfg(test)]
+    use crate::generation::TokenLogprob;
+    use crate::generation::{GenerateConfig, GenerateOutput};
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{
         AttentionWeights, GenerationEntryContract, GenerationPlan, GenerationPreparation,
@@ -9976,6 +9978,7 @@ mod inner {
             )
         }
 
+        #[cfg(test)]
         fn configure_sampling_route(
             &mut self,
             gen_cfg: &GenerateConfig,
@@ -14080,6 +14083,37 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
+            self.generate_streaming_with_prefix_cache_with_trace(
+                slot_id,
+                prompt,
+                tokenizer,
+                gen_cfg,
+                on_token,
+                should_cancel,
+            )
+            .map(|(output, _trace)| output)
+        }
+
+        /// The prefix-cache entry's one implementation: the output
+        /// [`Self::generate_streaming_with_prefix_cache_and_cancel`] returns, with
+        /// the driver trace of the request that produced it. The trace is all
+        /// zeroes when the request returned before reaching the driver.
+        pub(crate) fn generate_streaming_with_prefix_cache_with_trace<F, C>(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            prompt: &str,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            on_token: F,
+            should_cancel: C,
+        ) -> Result<
+            (CachedGenerateOutput, crate::decoder::driver::DriverTrace),
+            crate::error::InferenceError,
+        >
+        where
+            F: FnMut(&str, u32) -> bool,
+            C: FnMut() -> bool,
+        {
             // #856/#922/#827/#1354: prompt tokenization, the empty-prompt
             // guard, and the prompt-plus-decode-budget context bound are
             // delegated to the same `prepare_generation` shared preparation
@@ -14111,24 +14145,25 @@ mod inner {
                 self.max_context(),
                 crate::model::qwen35::GenerationEntryContract::MetalPrefixCacheStreaming,
             )?;
-            let (prompt_ids, rng_state) = match prompt_prep {
+            let gen_plan = match prompt_prep {
                 crate::model::qwen35::GenerationPreparation::Complete(output) => {
                     // Zero-budget requests return before any state mutation,
                     // leaving an existing cache entry exactly as-is.
-                    return Ok(CachedGenerateOutput {
-                        cache: CrossTurnCacheStats {
-                            slot_id,
-                            prompt_tokens: output.prompt_tokens,
-                            reused_tokens: 0,
-                            prefetched_tokens: 0,
-                            mode: crate::kv_cache::PrefixReuseMode::FullRefill,
+                    return Ok((
+                        CachedGenerateOutput {
+                            cache: CrossTurnCacheStats {
+                                slot_id,
+                                prompt_tokens: output.prompt_tokens,
+                                reused_tokens: 0,
+                                prefetched_tokens: 0,
+                                mode: crate::kv_cache::PrefixReuseMode::FullRefill,
+                            },
+                            output,
                         },
-                        output,
-                    });
+                        crate::decoder::driver::DriverTrace::default(),
+                    ));
                 }
-                crate::model::qwen35::GenerationPreparation::Ready(plan) => {
-                    (plan.prompt_ids, plan.rng_state)
-                }
+                crate::model::qwen35::GenerationPreparation::Ready(plan) => plan,
             };
 
             // #835: validate the suffix a reuse plan would select for this
@@ -14148,8 +14183,8 @@ mod inner {
             // returned for `max_new_tokens == 0`, so `max_new_tokens > 0` is
             // guaranteed from here on.
             let metadata = self.cross_turn_metadata(tokenizer);
-            let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
-            self.plan_prefix_request(&prompt_ids, &plan)?;
+            let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &gen_plan.prompt_ids);
+            self.plan_prefix_request(&gen_plan.prompt_ids, &plan)?;
 
             // Budget forcing: validate the </think> token id here too,
             // before `_inner` is even called -- same reasoning as the
@@ -14185,8 +14220,7 @@ mod inner {
 
             match self.generate_streaming_with_prefix_cache_and_cancel_inner(
                 slot_id,
-                prompt_ids,
-                rng_state,
+                gen_plan,
                 tokenizer,
                 gen_cfg,
                 on_token,
@@ -14204,7 +14238,219 @@ mod inner {
             }
         }
 
+        /// Restores the plan's reusable boundary (or resets the state for a full
+        /// refill), runs the suffix through the shared decoder driver over a
+        /// [`crate::decoder::qwen_metal::QwenMetalSession`], then commits the
+        /// cross-turn slot as the request's exit dictates (see
+        /// `crate::decoder::qwen_metal::run_prefix_cache_streaming`).
+        ///
+        /// The preflights the public entry ran (suffix content, `</think>` id) run
+        /// again here, before any state or slot is touched, so this function's own
+        /// ordering invariant does not rest on its one caller.
         fn generate_streaming_with_prefix_cache_and_cancel_inner<F, C>(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            gen_plan: crate::model::qwen35::GenerationPlan,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            on_token: F,
+            should_cancel: C,
+        ) -> Result<
+            (CachedGenerateOutput, crate::decoder::driver::DriverTrace),
+            crate::error::InferenceError,
+        >
+        where
+            F: FnMut(&str, u32) -> bool,
+            C: FnMut() -> bool,
+        {
+            use crate::decoder::qwen_metal::{
+                PrefixCommit, QwenMetalSession, run_prefix_cache_streaming,
+            };
+            use crate::kv_cache::PrefixReuseMode;
+
+            let prompt_ids = gen_plan.prompt_ids.clone();
+            let prompt_len = prompt_ids.len();
+            debug_assert!(
+                prompt_len > 0,
+                "the wrapper's check_prompt_not_empty (#856) must reject an \
+                 empty prompt before calling _inner"
+            );
+            debug_assert!(
+                gen_cfg.max_new_tokens > 0,
+                "the wrapper's prepare_generation zero-budget short-circuit \
+                 (#827) must return before calling _inner"
+            );
+
+            let metadata = self.cross_turn_metadata(tokenizer);
+            let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
+            self.plan_prefix_request(&prompt_ids, &plan)?;
+
+            let think_close_id = crate::model::qwen35::resolve_reasoning_close_token(
+                tokenizer,
+                gen_cfg.reasoning_budget,
+                gen_cfg.enable_thinking,
+                self.engine.config.vocab_size,
+            )?;
+
+            // The consumed entry (ExactAppend / ReplayFromCheckpoint) is
+            // carried to the end-of-generation save so its checkpoint ring
+            // and boundary snapshot survive across turns (#590).
+            let mut consumed_entry = match plan.mode {
+                PrefixReuseMode::ExactAppend | PrefixReuseMode::ReplayFromCheckpoint { .. } => {
+                    self.restore_cross_turn_prefix(slot_id, &plan)?
+                }
+                PrefixReuseMode::FullRefill => {
+                    self.reset_state();
+                    None
+                }
+            };
+
+            // The session borrows the state for the whole run and tears the
+            // sampling route down when it drops, before the commit below.
+            let eos_token_id = self.engine.config.eos_token_id;
+            let run = {
+                let mut session = QwenMetalSession::over_restored_state(
+                    self,
+                    gen_plan,
+                    plan.suffix_start,
+                    gen_cfg,
+                    SamplingRouteEnvironment::current(),
+                )?;
+                run_prefix_cache_streaming(
+                    &mut session,
+                    gen_cfg,
+                    think_close_id,
+                    &prompt_ids,
+                    eos_token_id,
+                    tokenizer,
+                    on_token,
+                    should_cancel,
+                )?
+            };
+
+            match run.commit {
+                PrefixCommit::Leave => self.cross_turn_prefix_cache.remove(slot_id),
+                PrefixCommit::Save { silent_step } => {
+                    // The silent step forwards the last pushed token so the next
+                    // turn can reuse through the full assistant output. It
+                    // samples and emits nothing. A full KV cache leaves the
+                    // boundary one token short, which stays consistent: KV, GDN
+                    // and `represented_len` all agree there.
+                    if silent_step && let Some(&last_pushed_id) = run.output.token_ids.last() {
+                        let seq_len = self.session.kv_cache.seq_len;
+                        if seq_len < self.session.kv_cache.max_cache_len {
+                            let _ = self.forward_step_decode(last_pushed_id, seq_len);
+                        }
+                    }
+                    let represented_len = self.session.kv_cache.seq_len;
+                    debug_assert!(represented_len >= prompt_len);
+                    let mut represented_token_ids = prompt_ids;
+                    represented_token_ids
+                        .extend_from_slice(&run.output.token_ids[..represented_len - prompt_len]);
+                    self.save_cross_turn_prefix_or_clear(
+                        slot_id,
+                        metadata,
+                        represented_token_ids,
+                        consumed_entry.take(),
+                    );
+                }
+            }
+
+            Ok((
+                CachedGenerateOutput {
+                    output: run.output,
+                    cache: CrossTurnCacheStats {
+                        slot_id,
+                        prompt_tokens: prompt_len,
+                        reused_tokens: if run.prefill_ran {
+                            plan.reusable_len
+                        } else {
+                            0
+                        },
+                        prefetched_tokens: if run.prefill_ran { plan.suffix_len } else { 0 },
+                        mode: plan.mode,
+                    },
+                },
+                run.trace,
+            ))
+        }
+
+        /// The prefix-cache entry as it ran before it was routed through the
+        /// driver: the same preflights and recovery arm around the legacy loop.
+        /// A differential oracle only.
+        #[cfg(test)]
+        fn generate_streaming_with_prefix_cache_and_cancel_legacy<F, C>(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            prompt: &str,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            on_token: F,
+            should_cancel: C,
+        ) -> Result<CachedGenerateOutput, crate::error::InferenceError>
+        where
+            F: FnMut(&str, u32) -> bool,
+            C: FnMut() -> bool,
+        {
+            let prompt_prep = crate::model::qwen35::prepare_generation(
+                tokenizer,
+                prompt,
+                gen_cfg,
+                self.engine.config.vocab_size,
+                self.max_context(),
+                crate::model::qwen35::GenerationEntryContract::MetalPrefixCacheStreaming,
+            )?;
+            let (prompt_ids, rng_state) = match prompt_prep {
+                crate::model::qwen35::GenerationPreparation::Complete(output) => {
+                    return Ok(CachedGenerateOutput {
+                        cache: CrossTurnCacheStats {
+                            slot_id,
+                            prompt_tokens: output.prompt_tokens,
+                            reused_tokens: 0,
+                            prefetched_tokens: 0,
+                            mode: crate::kv_cache::PrefixReuseMode::FullRefill,
+                        },
+                        output,
+                    });
+                }
+                crate::model::qwen35::GenerationPreparation::Ready(plan) => {
+                    (plan.prompt_ids, plan.rng_state)
+                }
+            };
+
+            let metadata = self.cross_turn_metadata(tokenizer);
+            let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
+            self.plan_prefix_request(&prompt_ids, &plan)?;
+
+            if gen_cfg.max_new_tokens > 0 {
+                crate::model::qwen35::resolve_reasoning_close_token(
+                    tokenizer,
+                    gen_cfg.reasoning_budget,
+                    gen_cfg.enable_thinking,
+                    self.engine.config.vocab_size,
+                )?;
+            }
+
+            match self.generate_streaming_with_prefix_cache_and_cancel_legacy_inner(
+                slot_id,
+                prompt_ids,
+                rng_state,
+                tokenizer,
+                gen_cfg,
+                on_token,
+                should_cancel,
+            ) {
+                Ok(out) => Ok(out),
+                Err(e) => {
+                    self.reset_state();
+                    self.cross_turn_prefix_cache.remove(slot_id);
+                    Err(e)
+                }
+            }
+        }
+
+        #[cfg(test)]
+        fn generate_streaming_with_prefix_cache_and_cancel_legacy_inner<F, C>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
             prompt_ids: Vec<u32>,
@@ -14960,6 +15206,7 @@ mod inner {
         mod dispatch;
         mod path_proof_bytes;
         mod prefix_cache_disposition;
+        mod prefix_cache_route;
 
         use super::super::{
             LM_HEAD_TOPK_TIE_EPSILON, LM_HEAD_TOPK_TIE_EPSILON_Q4, TopkSetAgreement,
@@ -42046,7 +42293,7 @@ mod multimodal_preflight_tests {
 
 /// Returns `true` when at least one logit is strictly greater than
 /// `f32::NEG_INFINITY` — i.e. the grammar mask leaves at least one legal token.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+#[cfg(test)]
 pub(crate) fn has_finite_logit(logits: &[f32]) -> bool {
     logits.iter().any(|&l| l > f32::NEG_INFINITY)
 }
