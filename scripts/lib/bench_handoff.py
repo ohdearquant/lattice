@@ -304,9 +304,11 @@ class HandoffService:
                 TARGET_ENVS[0]: "0",
                 TARGET_ENVS[1]: control_path,
                 TARGET_ENVS[2]: token,
-                "CRITERION_HOME": entry["criterion_home"],
             }
         )
+        # Criterion evidence belongs to bench targets; a binary has none.
+        if entry["criterion_home"] is not None:
+            child_env["CRITERION_HOME"] = entry["criterion_home"]
         proc: subprocess.Popen | None = None
         try:
             with self.active_lock:

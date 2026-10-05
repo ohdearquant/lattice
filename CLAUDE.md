@@ -34,7 +34,7 @@ The proof must name the population it searched, because the two targets `bench-c
 
 "Run it" assumes the reachable target sits inside `bench-compare`'s paired machinery. It doesn't always: `scripts/lib/bench-compare-impl.sh` drives exactly two packages, `lattice-inference` and `lattice-embed`, each through `cargo bench`'s Criterion `--save-baseline`/`--baseline` pair, and `Makefile`'s `bench-compare` target reaches only that script. A reachable target outside those two packages, or one that never calls into Criterion in the first place (a plain `fn main()` binary, not `criterion_group!`/`criterion_main!`, so there is no baseline to save or diff against), has no route through that pair — `crates/fann`'s `router_online` is both at once: it lives in `lattice-fann`, not `lattice-inference`/`lattice-embed`, and its body is a plain `fn main()` (`crates/fann/benches/router_online.rs:412`) with no Criterion dependency anywhere in `lattice-fann`'s manifest. For that target, the disposition still requires a before/after comparison; it's just not `bench-compare`'s. Check out base, run the target once under `scripts/bench-command.sh --label <name> --durable -- <command>` (`--durable` is required for this: it takes the same two machine-wide locks `bench-compare.sh` uses, plus a CPU-idle floor check before the command; the after-check runs only if the command exits zero — a nonzero exit returns that status immediately and skips the after-sample, so a failed run is gated only on entry — omitting `--durable` still takes both locks but runs no idle check at all. Even with `--durable`, this is a narrower gate than `bench-compare.sh`'s — it has no macOS cooldown, AC-power, thermal, or HID-idle checkpoint, so treat it as lock-serialized and CPU-idle-gated, not as the full quiet-machine discipline), record its output, then repeat at head and diff the two outputs by hand. A single run of such a target — head only, or base only — is supplemental: it shows the change executes, not how it moved anything, and it does not substitute for the paired before/after comparison the disposition requires.
 
-A target that calls `gpu_test_lock()` itself (`git grep -l 'gpu_test_lock()'` finds them, across `benches/`, `examples/`, and `src/bin/`) cannot run under `scripts/bench-command.sh` at all: the wrapper already holds the same GPU lock without handing it to the child, so the target's own guard now refuses immediately instead of waiting out its 30-minute timeout (issue #1643). The route that works for those targets, recorded against `bench_vision_prefill_ab` (issue #1563): hold the machine bench window yourself, let the target's `gpu_test_lock()` call take the GPU lock as its own code already expects, and gate each arm with `scripts/lib/quiet-probe.py --phase before|after --floor 70`. That keeps machine-window serialization, correct GPU exclusivity, and an idle floor, but gives up `bench-compare.sh`'s macOS cooldown, AC-power, thermal and HID-idle checkpoints and in-phase sampling — say so beside any figure produced this way.
+A target that calls `gpu_test_lock()` itself (`git grep -l 'gpu_test_lock()'` finds them, across `benches/`, `examples/`, and `src/bin/`) cannot run under `scripts/bench-command.sh` unless the declared targets and binaries admitted by `--gpu-handoff` (described below) include it: without the handoff, the wrapper already holds the same GPU lock without handing it to the child, so the target's own guard now refuses immediately instead of waiting out its 30-minute timeout (issue #1643). The route that works for the targets outside that list, recorded against `bench_vision_prefill_ab` (issue #1563): hold the machine bench window yourself, let the target's `gpu_test_lock()` call take the GPU lock as its own code already expects, and gate each arm with `scripts/lib/quiet-probe.py --phase before|after --floor 70`. That keeps machine-window serialization, correct GPU exclusivity, and an idle floor, but gives up `bench-compare.sh`'s macOS cooldown, AC-power, thermal and HID-idle checkpoints and in-phase sampling — say so beside any figure produced this way.
 
 This reachability search covers runtime source changes: it answers whether a call path reaches an edited line, which presupposes the edit is a line a call path could reach. It does not cover the change's build inputs. A manifest change (including a `[[bench]]` table or a `required-features` list), a dependency or lockfile bump — `crates/inference/Cargo.toml`'s `criterion` entry is a direct input to the locked bench invocation (`cargo bench --locked`, `scripts/lib/bench-compare-impl.sh:509-510`) — a feature or default-feature change, a `[profile.*]` change, a build script, generated source, or a change to a bench target's own definition or to the bench harness has no absent call path to name and no `cfg` or `required-features` gate to name closed: the change alters what gets compiled or how the runner invokes it before any function body executes. No `cfg`-gate or absent-call-path proof is available for these, and their absence from a call graph is not evidence that they don't move the numbers. The structural waiver applies only to runtime source changes whose performance-relevant build inputs — manifest, dependency and lockfile versions, feature set, profile, build script and generated output, bench-target definitions, and harness — are identical between base and head; run a measured target whenever one of those inputs differs and can affect a bench.
 
@@ -114,11 +114,16 @@ Metal lock coverage is enforced by `crates/inference/tests/metal_measurement_loc
 All reviewed Metal benchmarks additionally validate Criterion registration and explicit caller chains. One registered wrapper must hold the same guard across the entire ordered target list, including compared arms and CPU groups in mixed benchmarks. Helper-local and separate per-arm guards do not establish that span. Constructor coverage in those benchmarks depends on the same ownership check. This target-owned span applies to the active Metal configuration; it does not establish GPU exclusion for CPU-only builds.
 
 The explicit `--gpu-handoff` mode on `scripts/bench-command.sh` and
-`scripts/bench-compare.sh` admits the six declared Metal benchmark targets under
-continuous supervisor ownership. Admission checks each measured revision and its
-effective features before acquiring the benchmark window. A historical revision
-without the protocol is refused; a newer invoking checkout does not make an old
-binary participate. Both comparison arms must be eligible.
+`scripts/bench-compare.sh` admits the declared Metal benchmark targets under
+continuous supervisor ownership, and `scripts/bench-command.sh` also admits the
+declared binaries (see below). Both lists live in `crates/inference/Cargo.toml`
+under `[package.metadata.gpu-bench-handoff]` as `targets` and `bins`; the
+required-feature tables in `scripts/lib/bench_admission.py` must name the same
+sets, and admission refuses a revision where they differ. Admission checks each
+measured revision and its effective features before acquiring the benchmark
+window. A historical revision without the protocol, or without a `bins`
+declaration for a binary, is refused; a newer invoking checkout does not make an
+old binary participate. Both comparison arms must be eligible.
 
 Cargo compiles the selected target without lock descriptors. The supervisor then
 launches that exact executable with the held GPU descriptor on stdin and a private
@@ -156,6 +161,30 @@ For paired measurements, select the same target and features with
 `BENCH_GROUPS_INFERENCE`, and pass `--gpu-handoff` to `scripts/bench-compare.sh`.
 Ordinary invocations retain their existing behavior; an opt-in flag is not a
 replacement for successful admission.
+
+A declared binary is admitted through `cargo run --locked [--release] -p
+lattice-inference --bin NAME [--features F] [-- ARGS]`. The helper builds it with
+`cargo build --locked` and no lock descriptors, then launches the exact
+executable from the invocation directory, as `cargo run` does, with the same
+descriptor, acknowledgement and quiet checks as a bench target. The binary
+arguments are frozen at admission. Each binary needs the features of its own
+`cfg` gate and `required-features` entry: `metal-gpu` for all four, plus `f16`
+for `bench_decode_ab` and `bench_logit_dump`. The comparison route admits bench
+targets only. For example:
+
+```bash
+BENCH_N=64 scripts/bench-command.sh --gpu-handoff --label decode-ab -- \
+  cargo run --locked --release -p lattice-inference --bin bench_decode_ab \
+  --features metal-gpu,f16
+```
+
+The handoff acknowledgement channel closes after the first acknowledgement, so a
+binary may take the GPU lock once per process. `eval_perplexity` takes it once
+per Metal mode, so it is admitted with exactly one of `--metal-model-dir`,
+`--q4-dir` or `--quarot-q4-dir`; the dual-Q4 invocation (both Q4 flags) takes the
+lock twice and is refused at admission, as is the CPU mode, which takes none.
+The launched binary's standard error is merged into its standard output, so a
+post-processor that parses standard output also sees the binary's progress lines.
 
 The lock blocks for up to 30 minutes, then panics with an `lsof /tmp/lion-metal-gpu-test.lock` hint rather than hanging silently. If a run appears stuck at test start, another process is holding the GPU; check who with `lsof` before killing anything.
 
