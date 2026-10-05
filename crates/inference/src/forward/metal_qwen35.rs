@@ -6002,14 +6002,7 @@ mod inner {
                         hidden,
                     )
                 };
-                let mut sum_sq = 0.0f32;
-                for &v in normed_embed.iter() {
-                    sum_sq += v * v;
-                }
-                let inv_rms = 1.0 / (sum_sq / hidden as f32 + cfg.rms_norm_eps).sqrt();
-                for (v, &g) in normed_embed.iter_mut().zip(gamma.iter()) {
-                    *v = *v * inv_rms * g;
-                }
+                Self::mtp_pre_fc_rmsnorm(&mut normed_embed, gamma, cfg.rms_norm_eps);
             }
 
             let mut normed_hidden = hidden_in.to_vec();
@@ -6025,14 +6018,7 @@ mod inner {
                         hidden,
                     )
                 };
-                let mut sum_sq = 0.0f32;
-                for &v in normed_hidden.iter() {
-                    sum_sq += v * v;
-                }
-                let inv_rms = 1.0 / (sum_sq / hidden as f32 + cfg.rms_norm_eps).sqrt();
-                for (v, &g) in normed_hidden.iter_mut().zip(gamma.iter()) {
-                    *v = *v * inv_rms * g;
-                }
+                Self::mtp_pre_fc_rmsnorm(&mut normed_hidden, gamma, cfg.rms_norm_eps);
             }
 
             {
@@ -18400,6 +18386,135 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  pre_fc_norm_embedding regressed to plain `gamma` (effective scale \
                  -0.5), inverting the sign of every channel it touches",
                 out.logits[2]
+            );
+        }
+
+        /// The prompt-row path (`mtp_prefill_append_dispatch`) and the decode draft
+        /// path (`mtp_forward_one_dispatch`) must write the same MTP K/V row for the
+        /// same token, hidden vector and position. Both pre-fc weights are
+        /// non-uniform and centre negative, so plain `gamma` and `1.0 + gamma`
+        /// differ in sign on most channels of both halves of the concat, and the
+        /// non-uniform values keep the difference visible after the
+        /// scale-invariant `input_layernorm` that follows `fc`. The rows are read
+        /// back from the MTP cache buffers.
+        #[test]
+        fn mtp_prefill_append_row_matches_decode_draft_row_with_negative_pre_fc_weights() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let hidden = cfg.hidden_size;
+            let kv_dim = cfg.full_kv_dim();
+
+            let gamma_embedding: Vec<f32> = (0..hidden)
+                .map(|i| -0.5 + 0.1 * ((i as f32) * 0.11).sin())
+                .collect();
+            let gamma_hidden: Vec<f32> = (0..hidden)
+                .map(|i| -0.6 + 0.2 * ((i as f32) * 0.07).cos())
+                .collect();
+            let hidden_in: Vec<f32> = (0..hidden)
+                .map(|i| ((i as f32) * 0.013).sin() * 0.25 + 0.05)
+                .collect();
+
+            let build_state = || {
+                let mut engine = MetalQwen35Engine::new(&weights, &cfg)
+                    .expect("tiny MetalQwen35Engine with nonzero-KV MTP fixture constructs");
+                let mut mtp_weights =
+                    synthetic_mtp_weights_with_nonzero_kv_for_test(&engine.device, &cfg);
+                mtp_weights.pre_fc_norm_embedding = make_buffer(
+                    &engine.device,
+                    &gamma_embedding,
+                    "test.mtp.pre_fc_norm_embedding.negative_nonuniform",
+                );
+                mtp_weights.pre_fc_norm_hidden = make_buffer(
+                    &engine.device,
+                    &gamma_hidden,
+                    "test.mtp.pre_fc_norm_hidden.negative_nonuniform",
+                );
+                engine.mtp_weights = Some(mtp_weights);
+                let session = engine.new_session(16).expect("tiny MTP session constructs");
+                MetalQwen35State {
+                    engine,
+                    session,
+                    lora: None,
+                    use_gdn_chunked: true,
+                    use_kv_f16: false,
+                    cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                    path_proof_enabled: false,
+                    path_proof: PathProofCounters::default(),
+                }
+            };
+
+            fn read_row(buf: &Buffer, row: usize, row_len: usize) -> Vec<f32> {
+                // SAFETY: `MetalMtpCache`'s `k_buf`/`v_buf` are StorageModeShared
+                // f32 buffers; both dispatches wait for their command buffer
+                // before returning, so no GPU write is in flight here.
+                unsafe {
+                    let ptr = (buf.contents() as *const f32).add(row * row_len);
+                    std::slice::from_raw_parts(ptr, row_len).to_vec()
+                }
+            }
+
+            // Token 2's embedding is one-hot at component 0 (+1.0).
+            let token = 2u32;
+            let position = 3usize;
+
+            let mut decode_state = build_state();
+            decode_state.session.last_pre_final_hidden = hidden_in.clone();
+            let _ = decode_state.mtp_forward_one(token, position);
+            assert_eq!(
+                decode_state.session.mtp.as_ref().unwrap().cache.seq_len,
+                1,
+                "the decode draft must append exactly one MTP row"
+            );
+            let decode_k = read_row(
+                &decode_state.session.mtp.as_ref().unwrap().cache.k_buf,
+                0,
+                kv_dim,
+            );
+            let decode_v = read_row(
+                &decode_state.session.mtp.as_ref().unwrap().cache.v_buf,
+                0,
+                kv_dim,
+            );
+
+            let mut prefill_state = build_state();
+            prefill_state.mtp_prefill_append(token, &hidden_in, position);
+            assert_eq!(
+                prefill_state.session.mtp.as_ref().unwrap().cache.seq_len,
+                1,
+                "the prompt-row path must append exactly one MTP row"
+            );
+            let prefill_k = read_row(
+                &prefill_state.session.mtp.as_ref().unwrap().cache.k_buf,
+                0,
+                kv_dim,
+            );
+            let prefill_v = read_row(
+                &prefill_state.session.mtp.as_ref().unwrap().cache.v_buf,
+                0,
+                kv_dim,
+            );
+
+            assert!(
+                decode_k.iter().any(|&v| v != 0.0) && decode_v.iter().any(|&v| v != 0.0),
+                "fixture sanity: the decode row must be non-zero for the comparison to \
+                 discriminate; got K={decode_k:?} V={decode_v:?}"
+            );
+            assert_eq!(
+                prefill_k, decode_k,
+                "the prompt-row K row must equal the decode draft's K row: a mismatch \
+                 means one pre-fc norm in `mtp_prefill_append_dispatch` applies plain \
+                 `gamma` instead of the shifted `1.0 + gamma` convention"
+            );
+            assert_eq!(
+                prefill_v, decode_v,
+                "the prompt-row V row must equal the decode draft's V row: a mismatch \
+                 means one pre-fc norm in `mtp_prefill_append_dispatch` applies plain \
+                 `gamma` instead of the shifted `1.0 + gamma` convention"
             );
         }
 
