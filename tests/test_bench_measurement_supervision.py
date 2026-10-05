@@ -259,6 +259,8 @@ def _python_measurement_evidence(source: str, path: Path) -> set[str]:
             evidence.add("wall or monotonic timer")
         if isinstance(node, ast.Constant) and node.value == "--gpu-handoff":
             evidence.add("GPU handoff measurement launch")
+        if isinstance(node, ast.Call) and _dotted_name(node.func) == "harness.run_lattice_handoff":
+            evidence.add("decode lattice handoff")
         if (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
@@ -366,7 +368,7 @@ def gpu_handoff_launches(path: str, source: str) -> list[dict[str, str]]:
             if (
                 isinstance(node, ast.Assign)
                 and any(
-                    isinstance(target, ast.Name) and target.id == "HANDOFF_ARGV"
+                    isinstance(target, ast.Name) and target.id in {"HANDOFF_ARGV", "LATTICE_HANDOFF_ARGV"}
                     for target in node.targets
                 )
                 and isinstance(node.value, ast.List)
@@ -378,7 +380,12 @@ def gpu_handoff_launches(path: str, source: str) -> list[dict[str, str]]:
                 argv = [item.value for item in node.value.elts]
         # The launcher path is built at run time, so the argv list must be the one
         # handed to it: the script has to splice HANDOFF_ARGV after bench-command.sh.
-        if argv is None or "bench-command.sh" not in source or "*HANDOFF_ARGV" not in source:
+        argv_name = "LATTICE_HANDOFF_ARGV" if "LATTICE_HANDOFF_ARGV" in source else "HANDOFF_ARGV"
+        if (
+            argv is None
+            or "bench-command.sh" not in source
+            or f"*{argv_name}" not in source
+        ):
             return []
         text = "bench-command.sh " + " ".join(argv)
     else:
@@ -483,6 +490,134 @@ def _mlx_call_violations(tree: ast.Module) -> tuple[int, list[str]]:
     return len(importers), violations
 
 
+def decode_worker_boundary(source: str) -> bool:
+    """Check the shared source for the two worker routes and their ordering."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    launches = gpu_handoff_launches("scripts/bench_decode_harness.py", source)
+    if launches != [{"durable": " --durable", "label": "UNIQUE_LABEL", "bin": "bench_decode_ab", "features": "metal-gpu,f16"}]:
+        return False
+    launch_fn = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run_lattice_handoff"), None)
+    plain_fn = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_launch_plain_worker"), None)
+    worker_fn = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run_decode_worker"), None)
+    run_fn = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run_profile"), None)
+    prompt_fn = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "prepare_worker_prompt"), None)
+    unload_fn = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_ollama_unload"), None)
+    url_fn = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "validate_ollama_url"), None)
+    main_fn = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main"), None)
+    if not all((launch_fn, plain_fn, worker_fn, run_fn, prompt_fn, unload_fn, url_fn, main_fn)):
+        return False
+    if not any(isinstance(node, ast.Call) and ast.unparse(node.func) == "subprocess.run" for node in ast.walk(launch_fn)):
+        return False
+    if "--durable" not in ast.unparse(plain_fn) or "--gpu-handoff" in ast.unparse(plain_fn):
+        return False
+    worker_dispatch = next(
+        (
+            node for node in ast.walk(run_fn)
+            if isinstance(node, ast.If)
+            and "supervised_children" in ast.unparse(node.test)
+            and "group.name in {'mlx', 'ollama'}" in ast.unparse(node.test)
+            and any(
+                isinstance(child, ast.Call) and ast.unparse(child.func) == "_launch_plain_worker"
+                for child in ast.walk(node)
+            )
+        ),
+        None,
+    )
+    if worker_dispatch is None:
+        return False
+    if not all(text in ast.unparse(prompt_fn) for text in ("prepare_prompt", "mlx", "_launch_plain_worker")):
+        return False
+    statements = list(worker_fn.body)
+    handoff_at = next((i for i, node in enumerate(statements) if "sample_measurement_handoff" in ast.unparse(node)), None)
+    import_at = next((i for i, node in enumerate(statements) if "importlib.import_module" in ast.unparse(node)), None)
+    if handoff_at is None or import_at is None or handoff_at >= import_at:
+        return False
+    child_run = next(
+        (
+            node for node in ast.walk(worker_fn)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "run_profile"
+            and "{engine: tracked}" in ast.unparse(node)
+        ),
+        None,
+    )
+    if child_run is None or statements.index(next(node for node in statements if child_run in ast.walk(node))) < import_at:
+        return False
+    if not all(text in ast.unparse(unload_fn) for text in ("keep_alive", "/api/ps", "model in names")):
+        return False
+    if not all(text in ast.unparse(url_fn) for text in ("localhost", "127.0.0.1", "::1")):
+        return False
+    plain_source = ast.unparse(plain_fn)
+    if plain_source.find("proc.returncode != 0") < 0 or plain_source.find("result_path.read_text()") < plain_source.find("proc.returncode != 0"):
+        return False
+    if "uuid.uuid4" not in ast.unparse(launch_fn):
+        return False
+    unload_calls = [
+        node for node in ast.walk(worker_fn)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_ollama_unload"
+    ]
+    if len(unload_calls) != 1:
+        return False
+    parents = {child: node for node in ast.walk(worker_fn) for child in ast.iter_child_nodes(node)}
+    unload_parent = parents.get(unload_calls[0])
+    while unload_parent is not None and not isinstance(unload_parent, ast.If):
+        unload_parent = parents.get(unload_parent)
+    if (
+        not isinstance(unload_parent, ast.If)
+        or "tracked.started" not in ast.unparse(unload_parent.test)
+        or "engine == 'ollama'" not in ast.unparse(unload_parent.test)
+    ):
+        return False
+    host_check = next(
+        (
+            node for node in ast.walk(url_fn)
+            if isinstance(node, ast.Compare)
+            and ast.unparse(node.left) == "parsed.hostname"
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.NotIn)
+            and len(node.comparators) == 1
+            and isinstance(node.comparators[0], ast.Set)
+        ),
+        None,
+    )
+    if host_check is None:
+        return False
+    hosts = {
+        item.value for item in host_check.comparators[0].elts
+        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+    }
+    if hosts != {"localhost", "127.0.0.1", "::1"}:
+        return False
+    coordinator = next(
+        (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "coordinator_is_supervised"),
+        None,
+    )
+    if coordinator is None or "LATTICE_GPU_HANDOFF_CONTROL" not in ast.unparse(coordinator):
+        return False
+    main_source = ast.unparse(main_fn)
+    if "command_line[:1] == ['run']" not in main_source or "coordinator_is_supervised()" not in main_source:
+        return False
+    if main_source.find("coordinator_is_supervised()") > main_source.find("build_arg_parser()"):
+        return False
+    run_calls = [
+        node for node in ast.walk(main_fn)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "run_profile"
+        and any(
+            keyword.arg == "supervised_children"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in node.keywords
+        )
+    ]
+    if not run_calls:
+        return False
+    return True
+
+
 def mlx_launch_report(path: str, source: str, *, durable: bool) -> tuple[int, list[str]]:
     """(MLX use sites found, violations): MLX may be reached only through a plain launch.
 
@@ -499,6 +634,38 @@ def mlx_launch_report(path: str, source: str, *, durable: bool) -> tuple[int, li
     uses = 0
     if path.endswith(".py"):
         tree = ast.parse(source, filename=path)
+        if path.startswith("scripts/bench_decode_"):
+            parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules = [alias.name.split(".")[0] for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    modules = [(node.module or "").split(".")[0]]
+                else:
+                    continue
+                if any(module in {"mlx", "mlx_lm"} for module in modules):
+                    uses += 1
+                    owner = node
+                    in_mlx_method = False
+                    while owner is not None:
+                        if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            parent = parents.get(owner)
+                            if isinstance(parent, ast.ClassDef) and parent.name == "MlxAdapter":
+                                in_mlx_method = True
+                            break
+                        owner = parents.get(owner)
+                    if not in_mlx_method:
+                        problems.append(f"line {node.lineno}: MLX import is outside an MlxAdapter method")
+            if any(isinstance(node, (ast.Import, ast.ImportFrom)) and
+                   ((isinstance(node, ast.Import) and any(a.name.split('.')[0] in {'mlx','mlx_lm'} for a in node.names)) or
+                    (isinstance(node, ast.ImportFrom) and (node.module or '').split('.')[0] in {'mlx','mlx_lm'}))
+                   for node in tree.body):
+                problems.append("decode coordinator imports MLX at module scope")
+            shared_path = REPO / "scripts/bench_decode_harness.py"
+            shared = shared_path.read_text()
+            if not decode_worker_boundary(shared):
+                problems.append("shared decode harness does not constrain MLX to its durable worker entry")
+            return uses, problems
         uses, calls = _mlx_call_violations(tree)
         problems.extend(calls)
         for node in tree.body:
@@ -876,11 +1043,62 @@ class InventoryContract(unittest.TestCase):
             ("scripts/bench_decode_slopefit.sh", "gpu-handoff-child+quiet"),
             ("scripts/bench_quality.sh", "gpu-handoff-child+quiet"),
             ("scripts/compare_logits.py", "gpu-handoff-child"),
+            ("scripts/bench_decode_harness.py", "gpu-handoff-child+quiet"),
+            ("scripts/bench_decode_adapters_apples_to_apples.py", "gpu-handoff-child+quiet"),
+            ("scripts/bench_decode_adapters_apples_precise.py", "gpu-handoff-child+quiet"),
+            ("scripts/bench_decode_adapters_q4_apples.py", "gpu-handoff-child+quiet"),
+            ("scripts/bench_decode_adapters_context_scaling.py", "gpu-handoff-child+quiet"),
+            ("scripts/bench_decode_adapters_agentic.py", "gpu-handoff-child+quiet"),
         ):
             with self.subTest(path=path):
-                self.assertIn("GPU handoff measurement launch", evidence[path])
+                if path in {
+                    "scripts/bench_decode_adapters_apples_to_apples.py",
+                    "scripts/bench_decode_adapters_apples_precise.py",
+                    "scripts/bench_decode_adapters_q4_apples.py",
+                    "scripts/bench_decode_adapters_context_scaling.py",
+                    "scripts/bench_decode_adapters_agentic.py",
+                }:
+                    self.assertIn("decode lattice handoff", evidence[path])
+                else:
+                    self.assertIn("GPU handoff measurement launch", evidence[path])
                 self.assertEqual(entries[path]["role"], "measurement")
                 self.assertEqual(entries[path]["supervision"], supervision)
+
+    def test_decode_worker_source_contract(self):
+        """Static checks see launch grammar, worker ordering, and the MLX import boundary."""
+        harness_source = (REPO / "scripts/bench_decode_harness.py").read_text()
+        self.assertTrue(decode_worker_boundary(harness_source))
+        for path in (
+            "scripts/bench_decode_adapters_agentic.py",
+            "scripts/bench_decode_adapters_apples_precise.py",
+            "scripts/bench_decode_adapters_apples_to_apples.py",
+            "scripts/bench_decode_adapters_context_scaling.py",
+            "scripts/bench_decode_adapters_q4_apples.py",
+        ):
+            source = (REPO / path).read_text()
+            self.assertIn("harness.run_lattice_handoff", source)
+            uses, violations = mlx_launch_report(path, source, durable=True)
+            self.assertGreater(uses, 0)
+            self.assertEqual(violations, [])
+            self.assertNotIn('if __name__ == "__main__"', source)
+
+    def test_decode_publication_follows_all_requested_handoffs(self):
+        agentic_source = (REPO / "scripts/bench_decode_adapters_agentic.py").read_text()
+        tree = ast.parse(agentic_source)
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        text = ast.unparse(main)
+        self.assertLess(text.index("for ctx in contexts"), text.index("for ctx in completed_contexts"))
+        self.assertLess(text.index("for ctx in completed_contexts"), text.index("shutil.copy2"))
+
+        context_source = (REPO / "scripts/bench_decode_adapters_context_scaling.py").read_text()
+        context_tree = ast.parse(context_source)
+        context_main = next(node for node in context_tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        context_text = ast.unparse(context_main)
+        self.assertLess(context_text.index("harness.run_profile"), context_text.index("shutil.copy2"))
+
+    def test_linkedin_post_script_is_retired_from_inventory(self):
+        self.assertFalse((REPO / "scripts/bench_linkedin_post.py").exists())
+        self.assertNotIn("scripts/bench_linkedin_post.py", MANIFEST.read_text())
 
     def test_handoff_launch_grammar_is_parsed_from_source(self):
         """Mutation-sensitive: the parser behind the live-guard check reads the launch
@@ -930,6 +1148,12 @@ class InventoryContract(unittest.TestCase):
             ("scripts/bench_decode_slopefit.sh", 0),
             ("scripts/bench_quality.sh", 1),
             ("scripts/compare_logits.py", 1),
+            ("scripts/bench_decode_harness.py", 0),
+            ("scripts/bench_decode_adapters_apples_to_apples.py", 1),
+            ("scripts/bench_decode_adapters_apples_precise.py", 1),
+            ("scripts/bench_decode_adapters_q4_apples.py", 1),
+            ("scripts/bench_decode_adapters_context_scaling.py", 1),
+            ("scripts/bench_decode_adapters_agentic.py", 1),
         ):
             with self.subTest(path=path):
                 durable = entries[path]["supervision"].endswith("+quiet")
@@ -1323,11 +1547,18 @@ class InventoryContract(unittest.TestCase):
         """A handoff child delegates its binary and never supervises around it."""
 
         for token in SELF_SUPERVISION_TOKENS:
+            if token == "bench_supervision" and path == "scripts/bench_decode_harness.py":
+                continue  # The shared worker entry samples the outer plain launch witness.
             self.assertNotIn(token, source)
         # Any other GPU pass (MLX) is reachable only through a plain launch under both locks.
         _, violations = mlx_launch_report(path, source, durable=supervision.endswith("+quiet"))
         self.assertEqual(violations, [])
-        launches = gpu_handoff_launches(path, source)
+        if path.startswith("scripts/bench_decode_adapters_"):
+            self.assertIn("harness.run_lattice_handoff", source)
+            shared_source = (REPO / "scripts/bench_decode_harness.py").read_text()
+            launches = gpu_handoff_launches("scripts/bench_decode_harness.py", shared_source)
+        else:
+            launches = gpu_handoff_launches(path, source)
         self.assertTrue(launches, f"{path} has no GPU handoff launch")
         spec = importlib.util.spec_from_file_location(
             "bench_admission_for_inventory", REPO / "scripts/lib/bench_admission.py"
@@ -1759,8 +1990,7 @@ class RuntimeContract(unittest.TestCase):
         """bench-command.sh must pass --entrypoint to bench_supervision.py.
 
         Without it, a wrapped command that is itself a self-supervising
-        Python entry point (one that calls ensure_python_entrypoint, like
-        scripts/bench_linkedin_post.py) sees LATTICE_BENCH_LOCK_STATUS and
+        Python entry point that calls ensure_python_entrypoint sees LATTICE_BENCH_LOCK_STATUS and
         concludes a supervisor is already present, then refuses because the
         liveness pipe it looks for (LATTICE_BENCH_SUPERVISOR_FD) was never
         created for it.

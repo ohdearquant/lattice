@@ -99,8 +99,8 @@ bench-compare:
 	BENCH_GROUPS_INFERENCE="$(value BENCH_GROUPS_INFERENCE)" BENCH_GROUPS_EMBED="$(value BENCH_GROUPS_EMBED)" ./scripts/bench-compare.sh $(or $(BASE),origin/main) $(or $(HEAD),HEAD)
 
 # Agentic-workload benchmark: lattice vs ollama vs MLX at 1000/2000/4000-token context.
-# Prereqs: bench_decode_ab binary built, ollama serve running, mlx_lm available.
-# Build binary: cargo build --release --bin bench_decode_ab -p lattice-inference --features "f16,metal-gpu"
+# Prereqs: local model files, mlx_lm available to the worker, and an external loopback Ollama server.
+# Lattice is built and admitted for each observation through the GPU handoff supervisor.
 bench-agentic:
 	uv run --with mlx-lm python3 scripts/bench_decode_harness.py run --profile agentic --sweep --allow-missing-engine
 

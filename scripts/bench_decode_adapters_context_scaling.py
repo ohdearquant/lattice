@@ -33,19 +33,9 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
-
-if (
-    __name__ == "__main__"
-    and "--chart-only" not in sys.argv[1:]
-    and not {"-h", "--help"}.intersection(sys.argv[1:])
-):
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-    from bench_supervision import ensure_python_entrypoint
-
-    ensure_python_entrypoint("decode-context-scaling", quiet=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_decode_harness as harness  # noqa: E402
@@ -57,7 +47,6 @@ DATA_TSV = OUT_DIR / "context_scaling.tsv"
 CHART_PNG = OUT_DIR / "context_scaling_benchmark.png"
 CHART_SCRIPT = REPO_ROOT / "scripts" / "bench_context_scaling_chart.py"
 
-LAT_BIN = REPO_ROOT / "target" / "release" / "bench_decode_ab"
 MODEL_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b"
 
 _RESULT_RE = re.compile(r"^RESULT n_req=(\d+) completion=(\d+) total_ms=([\d.]+)$")
@@ -71,7 +60,7 @@ def parse_lattice_result_line(line: str) -> tuple[int, int, float] | None:
 
 
 class LatticeUnavailableError(RuntimeError):
-    """`bench_decode_ab` is not built, or the model dir is missing."""
+    """The lattice model directory is missing or its supervised handoff failed."""
 
 
 class LatticeResultError(RuntimeError):
@@ -103,8 +92,7 @@ def extract_single_result(stdout: str, *, n_tokens: int) -> tuple[int, int, floa
 
 
 class LatticeAdapter:
-    def __init__(self, bin_path: Path = LAT_BIN, model_dir: Path = MODEL_DIR):
-        self.bin_path = bin_path
+    def __init__(self, model_dir: Path = MODEL_DIR):
         self.model_dir = model_dir
 
     def run(
@@ -115,10 +103,8 @@ class LatticeAdapter:
         env = os.environ.copy()
         env["BENCH_N"] = str(n_tokens)
         env["BENCH_RUNS"] = "1"
-        env["LATTICE_MODEL_DIR"] = str(self.model_dir)
-        proc = subprocess.run(
-            [str(self.bin_path)], env=env, capture_output=True, text=True, timeout=600, check=False
-        )
+        env["LATTICE_MODEL_DIR"] = str(self.model_dir.resolve())
+        proc = harness.run_lattice_handoff(env)
         if proc.returncode != 0:
             raise LatticeUnavailableError(
                 f"lattice: bench_decode_ab exited {proc.returncode}: {proc.stderr.strip()[-2000:]}"
@@ -134,25 +120,8 @@ class LatticeAdapter:
         )
 
 
-def lattice_available(bin_path: Path = LAT_BIN, model_dir: Path = MODEL_DIR) -> bool:
-    return bin_path.is_file() and os.access(bin_path, os.X_OK) and model_dir.is_dir()
-
-
-def build_lattice_binary_if_missing() -> None:
-    """Mirrors the legacy script's own `if [[ ! -x "$LAT_BIN" ]]; then cargo
-    build ...`. Best-effort: failures are swallowed here exactly like the
-    legacy script's own `2>/dev/null` did, and surface later as a normal
-    missing-adapter skip."""
-    if LAT_BIN.is_file() and os.access(LAT_BIN, os.X_OK):
-        return
-    print("Building bench_decode_ab (release)...")
-    subprocess.run(
-        [
-            "cargo", "build", "--release", "-p", "lattice-inference",
-            "--bin", "bench_decode_ab", "--features", "f16,metal-gpu",
-        ],
-        cwd=REPO_ROOT, capture_output=True, check=False,
-    )
+def lattice_available(model_dir: Path = MODEL_DIR) -> bool:
+    return model_dir.is_dir()
 
 
 # --------------------------------------------------------------------------
@@ -206,7 +175,7 @@ def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
 
 class OllamaAdapter:
     def __init__(self, base_url: str = OLLAMA_BASE_URL):
-        self.base_url = base_url
+        self.base_url = harness.validate_ollama_url(base_url)
 
     def run(
         self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str
@@ -231,22 +200,7 @@ class OllamaAdapter:
 
 
 def ollama_available(base_url: str = OLLAMA_BASE_URL, *, model_tag: str = OLLAMA_MODEL_TAG) -> bool:
-    """Mirrors the legacy script's ollama preflight: binary + model pulled +
-    server reachable. Unlike the legacy script's `command -v ollama &&
-    curl ... | python3 -c "..."` one-liner, this does not attempt to start a
-    down server (the legacy context-scaling script's own preflight is a pure
-    check, not a start-if-down like legacy apples-to-apples consumer's)."""
-    if shutil.which("ollama") is None:
-        return False
-    try:
-        urllib.request.urlopen(f"{base_url}/api/tags", timeout=3).read()
-    except (urllib.error.URLError, OSError):
-        return False
-    try:
-        listed = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return model_tag in listed.stdout
+    return harness.ollama_model_available(base_url, model_tag)
 
 
 # --------------------------------------------------------------------------
@@ -290,14 +244,6 @@ class MlxAdapter:
         return harness.AdapterRunResult(actual_completion_tokens=n_tokens, engine_version="mlx_lm")
 
 
-def mlx_available() -> bool:
-    try:
-        import mlx_lm  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
 # --------------------------------------------------------------------------
 # registration
 # --------------------------------------------------------------------------
@@ -308,19 +254,18 @@ def register_available_adapters() -> None:
         harness.register_adapter("lattice", LatticeAdapter())
         print("  lattice: adapter registered")
     else:
-        print(f"  lattice: BIN MISSING or MODEL MISSING ({LAT_BIN}, {MODEL_DIR}) — skipping")
+        harness.register_missing_adapter("lattice", "model directory is missing")
+        print("  lattice: model directory is missing, skipping")
 
     if ollama_available():
         harness.register_adapter("ollama", OllamaAdapter())
         print("  ollama: adapter registered")
     else:
+        harness.register_missing_adapter("ollama", "not running or qwen3.5:0.8b not pulled")
         print("  ollama: not running or qwen3.5:0.8b not pulled — skipping")
 
-    if mlx_available():
-        harness.register_adapter("mlx", MlxAdapter())
-        print("  mlx: adapter registered")
-    else:
-        print("  mlx: mlx_lm not importable — run via `uv run --with mlx-lm ...` — skipping")
+    harness.register_adapter("mlx", MlxAdapter())
+    print("  mlx: worker adapter registered")
 
 
 # --------------------------------------------------------------------------
@@ -454,21 +399,24 @@ def render_legacy_tsv(
     slopes: list[harness.SlopeResult],
     window_medians: dict[tuple[str, int], float],
 ) -> str:
-    """`engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns` -- the exact
-    header/column shape `bench_context_scaling_chart.py` parses (it only
-    reads columns 0/1/2 positionally, but the full shape is reproduced for
-    anyone reading the raw TSV directly, matching the legacy script).
+    """Render chart-compatible columns plus each engine row's scope.
+    `bench_context_scaling_chart.py` reads columns 0/1/2 positionally, so the
+    appended scope column keeps its input valid while documenting the
+    external Ollama request and unload boundary in the saved report.
     `t1_ms`/`t2_ms` are read from `window_medians` -- the SAME per-(engine,
     window) aggregate `compute_context_scaling_aggregate` used to compute
     `s.slope_tok_per_s` -- never independently recomputed, so the TSV can
     never render a `t1_ms`/`t2_ms` pair inconsistent with the slope next to
     it (issue #813 codex round-1 finding 2c)."""
-    lines = ["engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns"]
+    lines = ["engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope"]
     baseline_window = run_result.profile.windows[0]
     for s in slopes:
         t1_ms = window_medians[(s.engine, baseline_window)] * 1000
         t2_ms = window_medians[(s.engine, s.window)] * 1000
-        lines.append(f"{s.engine}\t{s.window}\t{s.slope_tok_per_s:.1f}\t{t1_ms:.3f}\t{t2_ms:.3f}\t{s.window_n}")
+        scope = harness.OLLAMA_SCOPE if s.engine == "ollama" else ""
+        lines.append(
+            f"{s.engine}\t{s.window}\t{s.slope_tok_per_s:.1f}\t{t1_ms:.3f}\t{t2_ms:.3f}\t{s.window_n}\t{scope}"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -483,9 +431,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if harness.coordinator_is_supervised():
+        return 2
     args = build_arg_parser().parse_args(argv)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
+    if args.out is not None:
+        args.out = args.out.resolve()
     if args.chart_only:
         print(f"=== Regenerating chart from {DATA_TSV} ===")
         proc = subprocess.run(
@@ -511,30 +461,41 @@ def main(argv: list[str] | None = None) -> int:
     if args.runs is not None:
         profile = dataclasses.replace(profile, measured_repeats=args.runs)
 
-    build_lattice_binary_if_missing()
     register_available_adapters()
 
     try:
-        result = harness.run_profile(profile, harness.ADAPTER_REGISTRY, allow_missing_engine=args.allow_missing_engine)
-    except harness.MissingEngineError as exc:
+        result = harness.run_profile(
+            profile, harness.ADAPTER_REGISTRY, allow_missing_engine=args.allow_missing_engine, supervised_children=True
+        )
+    except (harness.MissingEngineError, RuntimeError, OSError, ValueError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 
     slopes, window_medians = compute_context_scaling_aggregate(result)
-    print(harness.render_report(result, slopes))
+    stage_dir = REPO_ROOT / ".cache" / f"context-scaling-stage-{uuid.uuid4().hex}"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    report_path = stage_dir / "report.txt"
+    report_path.write_text(harness.render_report(result, slopes) + "\n")
+    print(report_path.read_text(), end="")
 
     if args.out is not None:
-        harness.write_jsonl(list(result.observations), args.out)
+        staged_out = stage_dir / "observations.jsonl"
+        harness.write_jsonl(list(result.observations), staged_out)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(staged_out, args.out)
         print(f"\nRaw observations: {args.out}")
 
-    DATA_TSV.write_text(render_legacy_tsv(result, slopes, window_medians))
-    print(f"Raw data (chart-compatible TSV): {DATA_TSV}")
+    staged_tsv = stage_dir / "context_scaling.tsv"
+    staged_chart = stage_dir / "context_scaling_benchmark.png"
+    staged_tsv.write_text(render_legacy_tsv(result, slopes, window_medians))
 
     print("\n--- Generating chart ---")
-    subprocess.run([sys.executable, str(CHART_SCRIPT), str(DATA_TSV), str(CHART_PNG)], cwd=REPO_ROOT, check=False)
+    subprocess.run([sys.executable, str(CHART_SCRIPT), str(staged_tsv), str(staged_chart)], cwd=REPO_ROOT, check=False)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(staged_tsv, DATA_TSV)
+    if staged_chart.is_file():
+        shutil.copy2(staged_chart, CHART_PNG)
+    print(f"Raw data (chart-compatible TSV): {DATA_TSV}")
     print(f"Chart: {CHART_PNG}")
+    shutil.rmtree(stage_dir)
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

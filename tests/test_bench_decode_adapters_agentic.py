@@ -162,18 +162,17 @@ class CanonicalCliTest(unittest.TestCase):
             ["--ctx", "2048", "--runs", "3", "--allow-missing-engine"]
         )
 
-    def test_mlx_prompt_load_failure_also_skips_lattice_fail_closed(self):
+    def test_missing_worker_padded_prompt_also_skips_lattice_fail_closed(self):
         with (
-            mock.patch.object(agentic, "_mlx_available", return_value=True),
             mock.patch.object(agentic, "_ollama_available", return_value=False),
-            mock.patch.object(agentic.MlxAdapter, "padded_prompt", side_effect=RuntimeError("bad tokenizer")),
         ):
-            registered, missing, prompt = agentic.register_available_adapters(1000)
+            registered, missing, prompt, prompt_tokens = agentic.register_available_adapters(1000)
         self.assertNotIn("mlx", registered)
         self.assertNotIn("lattice", registered)
-        self.assertIn("tokenizer load failed", missing["mlx"])
+        self.assertIn("tokenizer-padded prompt", missing["mlx"])
         self.assertIn("tokenizer-padded prompt", missing["lattice"])
         self.assertTrue(prompt.startswith(agentic.BASE))
+        self.assertIsNone(prompt_tokens)
 
 
 class ExitStatusMeansMeasuredTest(unittest.TestCase):
@@ -210,7 +209,7 @@ class PartialSweepIsPersistedTest(unittest.TestCase):
     """A sweep that dies partway still wrote measurements; they must survive.
 
     Engine availability differs between contexts -- the per-context
-    `padded_prompt(ctx)` call drops both mlx and lattice when it fails -- so a
+    tokenizer preparation child drops both mlx and lattice when it fails -- so a
     long context can measure nothing where a short one measured fine. The run
     must fail, because it did not complete, and it must still persist what it
     measured, under a name that cannot be mistaken for a complete sweep.

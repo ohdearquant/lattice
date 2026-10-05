@@ -161,10 +161,10 @@ class LatticeAdapterEnvVarCorrectionTest(unittest.TestCase):
 
         captured = {}
 
-        def fake_run(cmd, env, capture_output, text, timeout, check):
+        def fake_handoff(env):
             captured.update(env)
             return subprocess.CompletedProcess(
-                cmd, 0, stdout="RESULT n_req=32 completion=32 total_ms=100.0\n", stderr=""
+                ["bench-command.sh"], 0, stdout="RESULT n_req=32 completion=32 total_ms=100.0\n", stderr=""
             )
 
         import tempfile
@@ -173,9 +173,9 @@ class LatticeAdapterEnvVarCorrectionTest(unittest.TestCase):
             model_dir = Path(tmp)
             (model_dir / "weights.q4").write_bytes(b"stub")
             adapter = adapters.LatticeAdapter(
-                bin_path=Path("/bin/true"), model_dir=model_dir, tokenizer_dir=model_dir
+                model_dir=model_dir, tokenizer_dir=model_dir
             )
-            with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(harness, "run_lattice_handoff", side_effect=fake_handoff):
                 adapter.run(
                     prompt="hi", n_tokens=32, warmup=False, model="qwen3.5-0.8b-q4", quantization="q4"
                 )
@@ -194,7 +194,7 @@ class LatticeAdapterModelIdentityTest(unittest.TestCase):
 
     def _adapter_for(self, model_dir):
         return adapters.LatticeAdapter(
-            bin_path=Path("/bin/true"), model_dir=model_dir, tokenizer_dir=model_dir
+            model_dir=model_dir, tokenizer_dir=model_dir
         )
 
     def test_refuses_safetensors_shaped_dir_even_with_q4_files(self):
@@ -245,7 +245,7 @@ class LatticeAdapterQ4IdentityOSErrorTest(unittest.TestCase):
             model_dir.chmod(0o000)
             try:
                 adapter = adapters.LatticeAdapter(
-                    bin_path=Path("/bin/true"), model_dir=model_dir, tokenizer_dir=model_dir
+                    model_dir=model_dir, tokenizer_dir=model_dir
                 )
                 with self.assertRaises(adapters.LatticeUnavailableError) as ctx:
                     adapter.run(
@@ -266,7 +266,7 @@ class LatticeAdapterQ4IdentityOSErrorTest(unittest.TestCase):
             model_dir.mkdir()
             (model_dir / "weights.q4").write_bytes(b"stub")
             adapter = adapters.LatticeAdapter(
-                bin_path=Path("/bin/true"), model_dir=model_dir, tokenizer_dir=model_dir
+                model_dir=model_dir, tokenizer_dir=model_dir
             )
 
             def _raise_missing(self):
@@ -296,7 +296,7 @@ class LatticeIsDirPreflightOSErrorTest(unittest.TestCase):
             model_dir.mkdir()
             (model_dir / "weights.q4").write_bytes(b"stub")
             adapter = adapters.LatticeAdapter(
-                bin_path=Path("/bin/true"), model_dir=model_dir, tokenizer_dir=model_dir
+                model_dir=model_dir, tokenizer_dir=model_dir
             )
 
             def _raise_permission(self):
@@ -313,9 +313,6 @@ class LatticeIsDirPreflightOSErrorTest(unittest.TestCase):
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as tmp:
-            bin_path = Path(tmp) / "bin_stub"
-            bin_path.write_bytes(b"#!/bin/sh\n")
-            bin_path.chmod(0o755)
             model_dir = Path(tmp) / "q4model"
             model_dir.mkdir()
 
@@ -324,7 +321,7 @@ class LatticeIsDirPreflightOSErrorTest(unittest.TestCase):
 
             with mock.patch.object(Path, "is_dir", _raise_permission):
                 self.assertFalse(
-                    adapters.lattice_available(bin_path=bin_path, model_dir=model_dir)
+                    adapters.lattice_available(model_dir=model_dir)
                 )
 
 

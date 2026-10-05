@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bench_decode_harness.py"
 _SPEC = importlib.util.spec_from_file_location("bench_decode_harness", _SCRIPT)
@@ -55,6 +56,7 @@ def _valid_observation(**overrides) -> dict:
         "engine_native_ns": 900_000,
         "hardware_id": "Darwin-arm64-testhost",
         "timestamp": "2026-07-10T00:00:00+00:00",
+        "scope": None,
     }
     row.update(overrides)
     return row
@@ -114,6 +116,71 @@ class _FakeAdapter:
             engine_version=self.engine_version,
             component_ns=self.component_ns,
         )
+
+
+class OllamaAvailabilityTest(unittest.TestCase):
+    class _Response:
+        def __init__(self, value):
+            self.value = json.dumps(value).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return self.value
+
+    def test_reachable_model_does_not_require_the_ollama_cli(self):
+        with (
+            mock.patch.object(
+                harness.urllib.request,
+                "urlopen",
+                return_value=self._Response({"models": [{"name": "qwen3.5:0.8b"}]}),
+            ),
+            mock.patch.object(harness.shutil, "which", return_value=None),
+            mock.patch.object(harness.subprocess, "run") as run,
+        ):
+            self.assertTrue(harness.ollama_model_available("http://localhost:11434", "qwen3.5:0.8b"))
+        run.assert_not_called()
+
+    def test_unreachable_server_is_missing_without_running_pull(self):
+        with (
+            mock.patch.object(
+                harness.urllib.request,
+                "urlopen",
+                side_effect=harness.urllib.error.URLError("connection refused"),
+            ),
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run") as run,
+        ):
+            self.assertFalse(
+                harness.ollama_model_available("http://127.0.0.1:11434", "qwen3.5:0.8b", pull_if_missing=True)
+            )
+        run.assert_not_called()
+
+    def test_missing_model_uses_pull_then_checks_the_configured_server(self):
+        empty = self._Response({"models": []})
+        present = self._Response({"models": [{"model": "qwen3.5:0.8b"}]})
+        list_result = mock.Mock(returncode=0, stdout="NAME\n", stderr="")
+        pull_result = mock.Mock(returncode=0, stdout="success", stderr="")
+        with (
+            mock.patch.object(harness.urllib.request, "urlopen", side_effect=[empty, present]),
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run", side_effect=[list_result, pull_result]) as run,
+        ):
+            self.assertTrue(
+                harness.ollama_model_available("http://localhost:11434", "qwen3.5:0.8b", pull_if_missing=True)
+            )
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["ollama", "list"], ["ollama", "pull", "qwen3.5:0.8b"]])
+        self.assertTrue(all(call.kwargs["env"]["OLLAMA_HOST"] == "http://localhost:11434" for call in run.call_args_list))
+
+    def test_non_loopback_url_is_rejected_before_network_access(self):
+        with mock.patch.object(harness.urllib.request, "urlopen") as urlopen:
+            with self.assertRaises(ValueError):
+                harness.ollama_model_available("http://203.0.113.1:11434", "qwen3.5:0.8b")
+        urlopen.assert_not_called()
 
 
 def _engine(
@@ -179,6 +246,62 @@ class ValidateObservationTest(unittest.TestCase):
         row = _valid_observation(extra_field="nope")
         with self.assertRaisesRegex(harness.ObservationValidationError, "unexpected field"):
             harness.validate_observation(row)
+
+    def test_row_without_scope_validates(self):
+        row = _valid_observation()
+        del row["scope"]
+        harness.validate_observation(row)  # rows written before `scope` existed
+
+    def test_scope_string_and_null_accepted(self):
+        harness.validate_observation(_valid_observation(scope=harness.OLLAMA_SCOPE))
+        harness.validate_observation(_valid_observation(scope=None))
+
+    def test_empty_scope_rejected(self):
+        with self.assertRaisesRegex(harness.ObservationValidationError, "scope"):
+            harness.validate_observation(_valid_observation(scope=""))
+
+    def test_non_string_scope_rejected(self):
+        with self.assertRaisesRegex(harness.ObservationValidationError, "scope"):
+            harness.validate_observation(_valid_observation(scope=5))
+
+    def test_unknown_field_still_rejected_beside_optional_scope(self):
+        row = _valid_observation(scope=None, scope_extra="nope")
+        with self.assertRaisesRegex(harness.ObservationValidationError, "unexpected field"):
+            harness.validate_observation(row)
+
+    def test_missing_required_field_still_rejected_without_scope(self):
+        row = _valid_observation()
+        del row["scope"]
+        del row["model"]
+        with self.assertRaisesRegex(harness.ObservationValidationError, r"missing required field.*model"):
+            harness.validate_observation(row)
+
+    def test_worker_rows_keep_the_scope_comparison_for_their_group(self):
+        def rows_for(engine: str, scope):
+            profile = _profile(windows=[32, 256], measured_repeats=1, engines=[_engine(name=engine)])
+            rows = []
+            for index, window in enumerate((32, 256)):
+                row = _valid_observation(
+                    profile=profile.name,
+                    engine=engine,
+                    requested_completion_tokens=window,
+                    prompt_hash=harness.prompt_hash(profile.prompt),
+                    order_index=index,
+                )
+                if scope == "absent":
+                    del row["scope"]
+                else:
+                    row["scope"] = scope
+                rows.append(row)
+            return profile, rows
+
+        profile, rows = rows_for("ollama", harness.OLLAMA_SCOPE)
+        harness._validate_worker_observations(profile, profile.engine_groups[0], rows)
+        profile, rows = rows_for("ollama", "absent")
+        with self.assertRaisesRegex(RuntimeError, "does not match the requested schedule"):
+            harness._validate_worker_observations(profile, profile.engine_groups[0], rows)
+        profile, rows = rows_for("fake", "absent")
+        harness._validate_worker_observations(profile, profile.engine_groups[0], rows)
 
     def test_wrong_schema_version_rejected(self):
         row = _valid_observation(schema_version=999)
@@ -789,6 +912,26 @@ quantization = "q8"
 
 
 class RunProfileTest(unittest.TestCase):
+    def test_supervised_lattice_records_binary_time_without_parent_clock(self):
+        class _ForbiddenClock:
+            def __call__(self):
+                raise AssertionError("coordinator clock surrounded a supervised lattice launch")
+
+        profile = _profile(engines=[_engine("lattice")], measured_repeats=1)
+        result = harness.run_profile(
+            profile,
+            {"lattice": _FakeAdapter(native_ns_per_token=10)},
+            clock=_ForbiddenClock(),
+            supervised_children=True,
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+        self.assertEqual(
+            [row.elapsed_ns for row in result.observations],
+            [row.engine_native_ns for row in result.observations],
+        )
+        self.assertEqual([row.elapsed_ns for row in result.observations], [320, 2560])
+
     def test_produces_expected_observation_count(self):
         profile = _profile(
             engines=[_engine(warmup_repeats=2, warmup_tokens=8)], measured_repeats=3, windows=[32, 256]
@@ -1750,6 +1893,57 @@ class RenderReportTest(unittest.TestCase):
         self.assertIn("unit_test", report)
         self.assertIn("ghost", report)
         self.assertIn("fake", report)
+
+    def _run_with_missing_ghost(self, **metadata):
+        profile = _profile(engines=[_engine("fake"), _engine("ghost")])
+        result = harness.run_profile(
+            profile,
+            {"fake": _FakeAdapter()},
+            allow_missing_engine=True,
+            clock=_FakeClock(),
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+        return dataclasses.replace(result, engine_metadata={**result.engine_metadata, **metadata})
+
+    def test_report_prints_the_worker_reason_for_a_missing_engine(self):
+        reason = "mlx_lm is not importable by /opt/env/bin/python"
+        result = self._run_with_missing_ghost(ghost={"missing_reason": reason})
+        lines = harness.render_report(result, harness.aggregate(result)).splitlines()
+        skipped = next(i for i, line in enumerate(lines) if "missing engine adapter(s), skipped: ghost" in line)
+        self.assertEqual(lines[skipped + 1], f"    ghost: {reason}")
+
+    def test_report_prints_no_reason_line_for_a_present_engine(self):
+        # control: only the missing engine carries a reason line; `fake` ran
+        result = self._run_with_missing_ghost(
+            ghost={"missing_reason": "gone"}, fake={"scope": "does not matter"}
+        )
+        report = harness.render_report(result, harness.aggregate(result))
+        self.assertIn("    ghost: gone", report)
+        self.assertFalse([line for line in report.splitlines() if line.startswith("    fake:")], report)
+
+    def test_report_without_any_reason_adds_no_reason_line(self):
+        result = self._run_with_missing_ghost()
+        report = harness.render_report(result, harness.aggregate(result))
+        self.assertFalse([line for line in report.splitlines() if line.startswith("    ghost:")], report)
+
+    def test_registry_reason_reaches_the_report_only_for_a_missing_engine(self):
+        profile = _profile(engines=[_engine("fake"), _engine("ghost")])
+        with mock.patch.dict(
+            harness.ADAPTER_MISSING_REASONS, {"ghost": "model directory is missing", "fake": "stale"}, clear=True
+        ):
+            result = harness.run_profile(
+                profile,
+                {"fake": _FakeAdapter()},
+                allow_missing_engine=True,
+                clock=_FakeClock(),
+                git_sha_value="x",
+                hardware_id_value="h",
+            )
+        self.assertEqual(result.engine_metadata, {"ghost": {"missing_reason": "model directory is missing"}})
+        report = harness.render_report(result, harness.aggregate(result))
+        self.assertIn("    ghost: model directory is missing", report)
+        self.assertNotIn("stale", report)
 
     def test_report_handles_no_measured_data(self):
         # `run_profile` no longer returns an observation-free result, so the

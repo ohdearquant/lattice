@@ -35,27 +35,17 @@ import json
 import math
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
-
-if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-    from bench_supervision import ensure_python_entrypoint
-
-    ensure_python_entrypoint("decode-apples-precise", quiet=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_decode_harness as harness  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# -- lattice: exactly legacy precise apples-to-apples consumer's LAT_BIN/MODEL_DIR --
-LAT_BIN = REPO_ROOT / "target" / "release" / "bench_decode_ab"
+# -- lattice: exactly legacy precise apples-to-apples consumer's model dir --
 MODEL_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b"
 
 _RESULT_RE = re.compile(r"^RESULT n_req=(\d+) completion=(\d+) total_ms=([\d.]+)$")
@@ -71,7 +61,7 @@ def parse_lattice_result_line(line: str) -> tuple[int, int, float] | None:
 
 
 class LatticeUnavailableError(RuntimeError):
-    """`bench_decode_ab` is not built, or the model dir is missing."""
+    """The lattice model directory is missing or its supervised handoff failed."""
 
 
 class LatticeResultError(RuntimeError):
@@ -105,14 +95,13 @@ def extract_single_result(stdout: str, *, n_tokens: int) -> tuple[int, int, floa
 
 
 class LatticeAdapter:
-    """Invokes `target/release/bench_decode_ab` against the Q8 safetensors
-    dir, mirroring `legacy precise apples-to-apples consumer`'s lattice section (including its
-    own untimed pre-loop warmup, now represented as the profile's
-    `warmup_repeats=2`/`warmup_tokens=512` instead of the legacy script's
-    inline `for _ in $(seq 1 $WARMUP)` loop)."""
+    """Runs the Q8 safetensors dir through the admitted lattice handoff.
 
-    def __init__(self, bin_path: Path = LAT_BIN, model_dir: Path = MODEL_DIR):
-        self.bin_path = bin_path
+    The legacy untimed pre-loop warmup is represented by the profile's
+    `warmup_repeats=2`/`warmup_tokens=512` schedule.
+    """
+
+    def __init__(self, model_dir: Path = MODEL_DIR):
         self.model_dir = model_dir
 
     def run(
@@ -123,10 +112,8 @@ class LatticeAdapter:
         env = os.environ.copy()
         env["BENCH_N"] = str(n_tokens)
         env["BENCH_RUNS"] = "1"
-        env["LATTICE_MODEL_DIR"] = str(self.model_dir)
-        proc = subprocess.run(
-            [str(self.bin_path)], env=env, capture_output=True, text=True, timeout=600, check=False
-        )
+        env["LATTICE_MODEL_DIR"] = str(self.model_dir.resolve())
+        proc = harness.run_lattice_handoff(env)
         if proc.returncode != 0:
             raise LatticeUnavailableError(
                 f"lattice: bench_decode_ab exited {proc.returncode}: {proc.stderr.strip()[-2000:]}"
@@ -142,8 +129,8 @@ class LatticeAdapter:
         )
 
 
-def lattice_available(bin_path: Path = LAT_BIN, model_dir: Path = MODEL_DIR) -> bool:
-    return bin_path.is_file() and os.access(bin_path, os.X_OK) and model_dir.is_dir()
+def lattice_available() -> bool:
+    return MODEL_DIR.is_dir()
 
 
 # --------------------------------------------------------------------------
@@ -202,7 +189,7 @@ class OllamaAdapter:
     profile's `warmup_repeats=2`)."""
 
     def __init__(self, base_url: str = OLLAMA_BASE_URL):
-        self.base_url = base_url
+        self.base_url = harness.validate_ollama_url(base_url)
 
     def run(
         self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str
@@ -227,30 +214,7 @@ class OllamaAdapter:
 
 
 def ollama_available(base_url: str = OLLAMA_BASE_URL, *, model_tag: str = OLLAMA_MODEL_TAG) -> bool:
-    if shutil.which("ollama") is None:
-        return False
-    try:
-        listed = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if model_tag not in listed.stdout:
-        pulled = subprocess.run(["ollama", "pull", model_tag], capture_output=True, text=True, timeout=600, check=False)
-        if pulled.returncode != 0:
-            return False
-    try:
-        urllib.request.urlopen(f"{base_url}/api/tags", timeout=3).read()
-        return True
-    except (urllib.error.URLError, OSError):
-        try:
-            subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            return False
-        time.sleep(3)
-        try:
-            urllib.request.urlopen(f"{base_url}/api/tags", timeout=3).read()
-            return True
-        except (urllib.error.URLError, OSError):
-            return False
+    return harness.ollama_model_available(base_url, model_tag, pull_if_missing=True)
 
 
 # --------------------------------------------------------------------------
@@ -304,14 +268,6 @@ class MlxAdapter:
         )
 
 
-def mlx_available() -> bool:
-    try:
-        import mlx_lm  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
 # --------------------------------------------------------------------------
 # registration + CLI delegation
 # --------------------------------------------------------------------------
@@ -322,21 +278,15 @@ def register_available_adapters() -> None:
         harness.register_adapter("lattice", LatticeAdapter())
         print("  lattice: adapter registered")
     else:
-        print(f"  lattice: BIN MISSING or MODEL MISSING ({LAT_BIN}, {MODEL_DIR}) — skipping")
+        harness.register_missing_adapter("lattice", "model directory is missing")
+        print("  lattice: model directory is missing, skipping")
 
     if ollama_available():
         harness.register_adapter("ollama", OllamaAdapter())
         print("  ollama: adapter registered")
     else:
+        harness.register_missing_adapter("ollama", "not installed, unreachable, or model pull failed")
         print("  ollama: not installed, unreachable, or model pull failed — skipping")
 
-    if mlx_available():
-        harness.register_adapter("mlx", MlxAdapter())
-        print("  mlx: adapter registered")
-    else:
-        print("  mlx: mlx_lm not importable — run via `uv run --with mlx-lm ...` — skipping")
-
-
-if __name__ == "__main__":
-    register_available_adapters()
-    sys.exit(harness.main())
+    harness.register_adapter("mlx", MlxAdapter())
+    print("  mlx: worker adapter registered")
