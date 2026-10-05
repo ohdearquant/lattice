@@ -157,7 +157,6 @@
 //! - MoE expert weights (DeepSeekMoE-style routed experts in Qwen3.5 MoE
 //!   layers — same absorption pattern but applied per-expert slice;
 //!   tensor names `mlp.experts.gate_up_proj`, `mlp.experts.down_proj`)
-//! - Batch LoRA kernel for prefill (currently falls back to sequential)
 
 use std::collections::HashSet;
 

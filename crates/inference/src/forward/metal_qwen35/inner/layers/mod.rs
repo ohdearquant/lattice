@@ -50,6 +50,70 @@ impl MetalQwen35State {
         );
     }
 
+    /// Row-aware sibling of [`Self::dispatch_lora_if_active`] for a batched prefill chunk:
+    /// `Y[t] += scale * B @ (A @ X[t])` for each of `rows` token rows.
+    ///
+    /// `x_byte_offset` / `y_byte_offset` address the first row; consecutive rows sit
+    /// `x_stride` / `y_stride` floats apart (the row width of the buffer the base projection
+    /// reads and writes). `layer_idx` is the ORIGINAL layer index, which keys the adapter;
+    /// it differs from the compact index into `engine.layer_weights` when `layer_mask`
+    /// deactivates an earlier layer.
+    ///
+    /// No-op if no adapter is loaded or no adapter exists for the given layer/module.
+    pub(super) fn dispatch_lora_rows_if_active(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        x_byte_offset: u64,
+        x_stride: u32,
+        y: &Buffer,
+        y_byte_offset: u64,
+        y_stride: u32,
+        rows: u32,
+        layer_idx: usize,
+        module: &str,
+    ) {
+        let Some(adapter) = &self.lora else { return };
+        let Some(proj) = adapter.get_projection(layer_idx, module) else {
+            return;
+        };
+        // The rank scratch holds one `rank`-wide row per token for the largest chunk.
+        assert!(
+            rows as usize <= adapter.max_rows,
+            "LoRA batched dispatch: rows={rows} exceeds the adapter scratch capacity {}",
+            adapter.max_rows
+        );
+
+        // Phase 1: T[t, j] = sum_k A[j, k] * X[t, k]
+        enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemm_a_rows);
+        enc.set_buffer(0, Some(x), x_byte_offset);
+        enc.set_buffer(1, Some(&proj.a_buf), 0);
+        enc.set_buffer(2, Some(&adapter.intermediate), 0);
+        enc.set_bytes(3, 4, &proj.rank as *const u32 as *const _);
+        enc.set_bytes(4, 4, &proj.d_in as *const u32 as *const _);
+        enc.set_bytes(5, 4, &rows as *const u32 as *const _);
+        enc.set_bytes(6, 4, &x_stride as *const u32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(proj.rank as u64, rows as u64, 1),
+            MTLSize::new(32, 4, 1),
+        );
+
+        // Phase 2: Y[t, o] += scale * sum_j B[o, j] * T[t, j]
+        enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemm_b_accum_rows);
+        enc.set_buffer(0, Some(&adapter.intermediate), 0);
+        enc.set_buffer(1, Some(&proj.b_buf), 0);
+        enc.set_buffer(2, Some(y), y_byte_offset);
+        enc.set_bytes(3, 4, &proj.d_out as *const u32 as *const _);
+        enc.set_bytes(4, 4, &proj.rank as *const u32 as *const _);
+        enc.set_bytes(5, 4, &adapter.scale as *const f32 as *const _);
+        enc.set_bytes(6, 4, &rows as *const u32 as *const _);
+        enc.set_bytes(7, 4, &y_stride as *const u32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(proj.d_out.div_ceil(256) as u64, rows as u64, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
     /// Encode the MLP tail shared by every layer (both GDN and GQA).
     ///
     /// Dispatches: fused residual-add-norm → gate_up_proj GEMV → LoRA(gate/up) →
