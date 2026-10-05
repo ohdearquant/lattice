@@ -57,8 +57,10 @@ Three cases:
 
 1. **Unrotated checkpoints**: on the Metal Q4 path the final norm is applied with the checkpoint's own `g_final`, and the
    head receives the post-final-norm hidden. The Metal dense (non-quantized) constructor loads no MTP weights, so it has no
-   MTP path to change. The CPU MTP head in `speculative.rs` takes the target hidden from its caller and already documents it
-   as the normalized hidden state, which is the same contract.
+   MTP path to change. The CPU MTP head in `speculative.rs` (`MtpVerifier`, reached through `mtp_verify_draft`) takes the
+   target hidden from its caller and documents that input as the normalized hidden state. Nothing in this repository outside that
+   file's tests constructs it or calls `mtp_verify_draft`, so this change has no in-repo caller to update; an external caller
+   is expected to pass the post-final-norm hidden, as that documentation says.
 2. **Rotated checkpoints whose artifact carries the original final-norm scale**: the engine counter-rotates, then applies that
    scale. The head receives the post-final-norm hidden. The scale is an optional tensor written by conversion beside the fused
    weights; an older runtime ignores it, and a newer runtime accepts its absence (case 3). This case is defined here and is
