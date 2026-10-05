@@ -29,6 +29,54 @@ build ever produced one, so the amendment closes a path rather than invalidating
 
 ---
 
+## Amendment 2 (2026-10-05): the MTP head receives the post-final-norm hidden state
+
+The context below names the MTP input `h_{t-1}^{pre}`, the pre-final-norm hidden state, and the Phase 1 listing feeds
+`last_pre_final_hidden` to `pre_fc_norm_hidden`. That described this engine, not the reference implementations. vLLM, SGLang and
+llama.cpp all feed the Qwen3.5 MTP head the target's hidden state after the model's final RMSNorm, the same vector the lm_head
+reads:
+
+- vLLM `4ff028d77e063e0055849ffec3855c6634179158`: `Qwen3NextModel.forward` returns `self.norm(hidden_states, residual)`
+  (`vllm/model_executor/models/qwen3_next.py:730`), inherited by `Qwen3_5Model`; the GPU model runner passes that output to the
+  drafter as `target_hidden_states` (`vllm/v1/worker/gpu_model_runner.py:5153`).
+- SGLang `83a6e1d39b465034dd78f63bce255f07e2851521`: `Qwen3_5ForCausalLM.forward` applies `final_norm` and returns the result
+  (`python/sglang/srt/models/qwen3_5.py:1855-1864`); that tensor is stored for the draft model
+  (`layers/logits_processor.py:815-866`) and read by `models/qwen3_5_mtp.py:228-245`.
+- llama.cpp `8f9ae20c86ab9d7f092a0c95921f416125907337`: `src/models/qwen35.cpp:210-213` applies `output_norm` and stores the result
+  as `t_h_nextn`, which the MTP speculative path feeds to the MTP graph (`common/speculative.cpp:1581-1592`).
+
+The engine now matches them. This is a conformance change: it is made because it matches the reference implementations, and no
+acceptance-rate gain is claimed for it.
+
+`pre_fc_norm_hidden` is itself an RMSNorm, so the two candidate inputs differ only by the final norm's elementwise scale
+`(1 + g_final)`; the per-row rescale cancels. The engine therefore keeps reading back the pre-norm hidden and applies the
+target's final norm on the CPU, after the counter-rotation and before `pre_fc_norm_hidden`, at both places a target hidden
+enters the head: the draft step and the prompt/accepted-row append.
+
+Three cases:
+
+1. **Unrotated checkpoints**: on the Metal Q4 path the final norm is applied with the checkpoint's own `g_final`, and the
+   head receives the post-final-norm hidden. The Metal dense (non-quantized) constructor loads no MTP weights, so it has no
+   MTP path to change. The CPU MTP head in `speculative.rs` takes the target hidden from its caller and already documents it
+   as the normalized hidden state, which is the same contract.
+2. **Rotated checkpoints whose artifact carries the original final-norm scale**: the engine counter-rotates, then applies that
+   scale. The head receives the post-final-norm hidden. The scale is an optional tensor written by conversion beside the fused
+   weights; an older runtime ignores it, and a newer runtime accepts its absence (case 3). This case is defined here and is
+   implemented by the conversion and loading change that adds the tensor; until that change lands, every rotated artifact is
+   in case 3.
+3. **Rotated checkpoints without it** (every artifact converted before that tensor existed): QuaRot fusion folds
+   `(1 + g_final)` into lm_head and stores the neutral scale (ADR-044), so the original scale cannot be recovered at runtime.
+   The head keeps receiving the pre-final-norm hidden, computed exactly as before. The state is reported rather than silent:
+   `MetalQwen35State::mtp_hidden_tap()` returns `MtpHiddenTap::PreFinalNorm`, the load logs it once, and every
+   `LATTICE_MTP_VERBOSE` line carries `tap=pre-final-norm`, so a measurement on such an artifact is not read as the conformant
+   path.
+
+In the sections below, read `h_{t-1}^{pre}` as "the target hidden the MTP head receives" and step 3 of the Phase 1 listing as
+"counter-rotate `last_pre_final_hidden`, then apply the target's final norm in cases 1 and 2". The counter-rotation and
+re-rotation analysis is unchanged: the final norm is applied in the original basis, after `R^T`.
+
+---
+
 ## Context
 
 ADR-044 ships QuaRot Q4 quantization for Qwen3.5. It applies a global random Hadamard rotation R

@@ -560,7 +560,7 @@ mod inner {
     // top level (module-scope, above `mod inner`) so CPU-only builds can
     // render through the same `format_chat_template` this Metal path uses,
     // same reasoning as the MTP resolution helpers below.
-    use super::{ChatMessage, format_chat_template};
+    use super::{ChatMessage, MtpHiddenTap, format_chat_template};
     // MTP Q4/F16 flavor + shape resolution (#630, #636) lives in a private
     // portable sibling module so it compiles and is unit-testable without the
     // `metal-gpu` feature at all.
@@ -1049,6 +1049,8 @@ mod inner {
         pre_fc_norm_hidden: Buffer,    // [hidden]
         layers: Vec<MetalMtpLayerWeights>,
         norm: Buffer, // [hidden]
+        /// Which target hidden the head receives; decided once at load.
+        hidden_tap: MtpHiddenTap,
     }
 
     struct MtpQ4LoadResult {
@@ -1248,6 +1250,8 @@ mod inner {
         // Flash decode partitioned path (H3): [max_partitions * num_q_heads * (head_dim+2)] f32
         attn_partials: Buffer,
         // MTP: pre-final hidden state (before final RMSNorm) for the last processed token.
+        // The draft head applies the final norm to it on the CPU on unrotated
+        // checkpoints (`MtpHiddenTap`), so this buffer stays pre-norm.
         pre_final_hidden: Buffer, // [hidden_size]
         // Pooled-embedding capture: the last processed token's hidden state
         // AFTER the final RMSNorm. Deliberately a separate buffer from
@@ -1660,8 +1664,11 @@ mod inner {
         pub(crate) mtp_weights: Option<MetalMtpWeights>,
         /// Rotation for QuaRot counter-rotate path. `Some` iff model was loaded from
         /// a QuaRot q4 artifact (from_q4_dir) and the config carries a rotation seed.
-        /// Used by mtp_forward_one to apply R^T to embed and pre-final-hidden before
-        /// the O-space MTP forward, and R to mtp_h_out before the logits GEMV.
+        /// Used by mtp_forward_one to apply R^T to embed and the captured target
+        /// hidden before the O-space MTP forward, and R to mtp_h_out before the
+        /// logits GEMV. Its presence also selects `MtpHiddenTap::PreFinalNorm`: the
+        /// head keeps the pre-final-norm hidden because the final-norm scale is
+        /// folded into lm_head in a rotated artifact.
         pub(crate) quarot_rotation: Option<crate::quant::quarot::hadamard::RandomizedHadamard>,
         /// The base model's own QuaRot rotation seed, independent of whether MTP
         /// weights are present (unlike `quarot_rotation`, which is only built when
@@ -3808,6 +3815,12 @@ mod inner {
             self.session.mtp.is_some()
         }
 
+        /// Which target hidden state the MTP draft head receives, decided when the
+        /// MTP weights loaded. `None` when no MTP weights are loaded.
+        pub fn mtp_hidden_tap(&self) -> Option<MtpHiddenTap> {
+            self.engine.mtp_weights.as_ref().map(|w| w.hidden_tap)
+        }
+
         /// Zeroes the Metal path-proof counters.
         ///
         /// Call before a one-shot `generate`/`generate_streaming` run so
@@ -5450,11 +5463,36 @@ mod inner {
             }
         }
 
+        /// Brings a captured (pre-final-norm) target hidden to the form the MTP
+        /// head's hidden-state input expects, per [`MtpHiddenTap`]: under
+        /// `PostFinalNorm` the target's final RMSNorm is applied here (CPU, same
+        /// shifted convention and scale buffer the GPU final norm uses); under
+        /// `PreFinalNorm` the hidden is left untouched. Both MTP entry points call
+        /// this after the QuaRot counter-rotation and before `pre_fc_norm_hidden`.
+        fn mtp_apply_hidden_tap(&self, hidden: &mut [f32]) {
+            if self.mtp_hidden_tap() != Some(MtpHiddenTap::PostFinalNorm) {
+                return;
+            }
+            debug_assert!(self.engine.final_norm.length() as usize >= hidden.len() * 4);
+            // SAFETY: `final_norm` is a StorageModeShared f32 buffer of `hidden_size`
+            // values written at load; `hidden` has `hidden_size` values.
+            let gamma = unsafe {
+                std::slice::from_raw_parts(
+                    self.engine.final_norm.contents() as *const f32,
+                    hidden.len(),
+                )
+            };
+            Self::mtp_pre_fc_rmsnorm(hidden, gamma, self.engine.config.rms_norm_eps);
+        }
+
         /// Draft one extra token using the MTP module.
         ///
-        /// Runs the single MTP attention+MLP layer on top of the target model's
-        /// pre-final hidden state (`self.session.last_pre_final_hidden`) to predict
-        /// `pending_token + 1`.  Returns the draft token id and logits.
+        /// Runs the single MTP attention+MLP layer on the target model's hidden
+        /// state to predict `pending_token + 1`. The hidden state is captured before
+        /// the target's final norm (`self.session.last_pre_final_hidden`); the head
+        /// receives it after the final norm on unrotated checkpoints and before it
+        /// on rotated ones (see [`MtpHiddenTap`], [`Self::mtp_apply_hidden_tap`]).
+        /// Returns the draft token id and logits.
         ///
         /// Panics if `self.session.mtp` is None.
         fn mtp_forward_one_dispatch(
@@ -5506,13 +5544,16 @@ mod inner {
                 Self::mtp_pre_fc_rmsnorm(&mut normed_embed, gamma, cfg.rms_norm_eps);
             }
 
-            // 3. CPU RMSNorm of target pre-final hidden using pre_fc_norm_hidden weights.
+            // 3. CPU RMSNorm of the target hidden using pre_fc_norm_hidden weights. The
+            // captured hidden is pre-final-norm; `mtp_apply_hidden_tap` applies the
+            // target's final norm first on unrotated checkpoints.
             let mut normed_hidden = self.session.last_pre_final_hidden.clone();
             if let Some(ref rot) = self.engine.quarot_rotation {
                 // See note above: rotation dim == hidden_size by construction.
                 debug_assert_eq!(rot.dim(), normed_hidden.len());
                 let _ = rot.apply_inverse(&mut normed_hidden);
             }
+            self.mtp_apply_hidden_tap(&mut normed_hidden);
             {
                 let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
                 let gamma = unsafe {
@@ -5919,12 +5960,15 @@ mod inner {
         /// wrote, independent of the prompt.
         ///
         /// `mtp_forward_one(pending_token, pos)` pairs `pending_token`'s embedding
-        /// with `last_pre_final_hidden` — the target's pre-final hidden state from
-        /// the position *before* `pending_token`, i.e. the hidden state that
-        /// predicted it. This mirrors that pairing across the whole prompt: for each
-        /// position `p` in `1..prompt_ids.len()`, it pairs `prompt_ids[p]` with the
-        /// target's pre-final hidden state at position `p - 1`, captured into
-        /// `self.session.mtp_prefill_hidden` by `forward_prefill_batched_chunk`.
+        /// with `last_pre_final_hidden` — the target's hidden state, captured before
+        /// the final norm, from the position *before* `pending_token`, i.e. the
+        /// hidden state that predicted it. This mirrors that pairing across the whole
+        /// prompt: for each position `p` in `1..prompt_ids.len()`, it pairs
+        /// `prompt_ids[p]` with the target's captured hidden state at position
+        /// `p - 1`, stored in `self.session.mtp_prefill_hidden` by
+        /// `forward_prefill_batched_chunk`. Each append then brings the captured
+        /// hidden to the head's input per [`MtpHiddenTap`], exactly as the live
+        /// draft does.
         /// Position 0 has no predecessor hidden state (nothing came before the first
         /// prompt token) and is intentionally not represented in the MTP cache, so a
         /// prompt of length `L` yields `L - 1` prefilled entries; the live call for
@@ -5963,9 +6007,10 @@ mod inner {
         }
 
         /// Appends one MTP cache entry (K/V only — no Q, attention, MLP, or logits)
-        /// for `token_id` at absolute position `position`, using `hidden_in` as the
-        /// target's pre-final hidden state input in place of
-        /// `self.session.last_pre_final_hidden`. Mirrors the CPU phase and GPU
+        /// for `token_id` at absolute position `position`, using `hidden_in` (the
+        /// target's hidden state captured before the final norm) in place of
+        /// `self.session.last_pre_final_hidden`; the head's hidden-state input is
+        /// derived from it per [`MtpHiddenTap`]. Mirrors the CPU phase and GPU
         /// dispatch sequence of `mtp_forward_one` up through the KV cache append —
         /// everything after that point (attention, gating, MLP, logits) only matters
         /// for a position acting as a *query*, and a prefilled position is only ever
@@ -6012,6 +6057,7 @@ mod inner {
                 debug_assert_eq!(rot.dim(), normed_hidden.len());
                 let _ = rot.apply_inverse(&mut normed_hidden);
             }
+            self.mtp_apply_hidden_tap(&mut normed_hidden);
             {
                 let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
                 let gamma = unsafe {
@@ -9518,7 +9564,7 @@ mod inner {
 
             if crate::env_switch_enabled("LATTICE_MTP_VERBOSE") {
                 eprintln!(
-                    "[MTP] rounds={} mtp_fwd={} verify={} accepted_extra={} rollbacks={} fallbacks={} mtp_ms={:.1} verify_ms={:.1} rb_ms={:.1}",
+                    "[MTP] rounds={} mtp_fwd={} verify={} accepted_extra={} rollbacks={} fallbacks={} mtp_ms={:.1} verify_ms={:.1} rb_ms={:.1} tap={}",
                     metrics.rounds,
                     metrics.mtp_forwards,
                     metrics.verify_calls,
@@ -9528,6 +9574,7 @@ mod inner {
                     metrics.mtp_ms,
                     metrics.verify_ms,
                     metrics.rollback_ms,
+                    self.mtp_hidden_tap().map_or("none", MtpHiddenTap::label),
                 );
             }
 
@@ -12234,6 +12281,17 @@ mod inner {
                 let norm = load_norm_as_f32("mtp.norm.weight", &[hidden], "mtp.norm")?;
 
                 eprintln!("[mtp] Loaded MTP layer 0 weights from {}", q4_dir.display());
+                // A rotated checkpoint carries a neutral final-norm scale (the real
+                // scale is folded into lm_head), so only an unrotated one can supply
+                // the post-final-norm hidden the reference implementations feed the head.
+                let hidden_tap = MtpHiddenTap::for_checkpoint(is_quarot);
+                let hidden_tap_note = match hidden_tap {
+                    MtpHiddenTap::PostFinalNorm => "",
+                    MtpHiddenTap::PreFinalNorm => {
+                        " (rotated checkpoint: the final-norm scale is folded into lm_head)"
+                    }
+                };
+                eprintln!("[mtp] hidden tap: {}{hidden_tap_note}", hidden_tap.label());
                 Ok(MetalMtpWeights {
                     fc,
                     pre_fc_norm_embedding,
@@ -12254,6 +12312,7 @@ mod inner {
                         },
                     }],
                     norm,
+                    hidden_tap,
                 })
             })();
 
@@ -18458,6 +18517,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     },
                 }],
                 norm: make_buffer(device, &vec![1.0; hidden], "test.mtp.norm"),
+                hidden_tap: MtpHiddenTap::PostFinalNorm,
             }
         }
 
@@ -18468,7 +18528,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         ) -> MetalQwen35State {
             let mut engine = MetalQwen35Engine::new(weights, cfg)
                 .expect("tiny MetalQwen35Engine with MTP fixture constructs");
-            engine.mtp_weights = Some(synthetic_mtp_weights_for_test(&engine.device, cfg));
+            let mut mtp_weights = synthetic_mtp_weights_for_test(&engine.device, cfg);
+            // Mirror the loader's decision: a rotated checkpoint keeps the pre-norm hidden.
+            mtp_weights.hidden_tap = MtpHiddenTap::for_checkpoint(rotation.is_some());
+            engine.mtp_weights = Some(mtp_weights);
             engine.quarot_rotation = rotation;
             let session = engine.new_session(16).expect("tiny MTP session constructs");
             MetalQwen35State {
@@ -18565,6 +18628,299 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                      (2 * inv_rms(0.5) * (1.0 + 0.5)); plain gamma would give 0.5"
                 );
             }
+        }
+
+        // ---- MTP hidden-state tap ----------------------------------------------
+        //
+        // The final-norm scale and `pre_fc_norm_hidden` are both non-uniform, with
+        // `1 + gamma` changing sign across the final-norm scale, so the head's
+        // hidden-state input differs by far more than float noise depending on
+        // whether the target's final norm was applied (RMSNorm is scale-invariant,
+        // so a uniform scale could not tell the two apart).
+
+        fn mtp_tap_final_norm_gamma(hidden: usize) -> Vec<f32> {
+            (0..hidden)
+                .map(|i| 1.5 * ((i as f32) * 0.37).sin())
+                .collect()
+        }
+
+        fn mtp_tap_pre_fc_hidden_gamma(hidden: usize) -> Vec<f32> {
+            (0..hidden)
+                .map(|i| -0.4 + 0.3 * ((i as f32) * 0.07).cos())
+                .collect()
+        }
+
+        fn mtp_tap_target_hidden(hidden: usize) -> Vec<f32> {
+            (0..hidden)
+                .map(|i| ((i as f32) * 0.013).sin() * 0.25 + 0.05)
+                .collect()
+        }
+
+        /// Shifted RMSNorm in f64, independent of the production helper.
+        fn shifted_rmsnorm_reference(x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
+            let mean_sq =
+                x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / x.len() as f64;
+            let inv_rms = 1.0 / (mean_sq + f64::from(eps)).sqrt();
+            x.iter()
+                .zip(gamma)
+                .map(|(&v, &g)| (f64::from(v) * inv_rms * (1.0 + f64::from(g))) as f32)
+                .collect()
+        }
+
+        fn metal_state_for_mtp_tap_test(
+            weights: &ModelWeights,
+            cfg: &Qwen35Config,
+            rotation: Option<crate::quant::quarot::hadamard::RandomizedHadamard>,
+        ) -> MetalQwen35State {
+            let hidden = cfg.hidden_size;
+            let mut state = metal_state_with_synthetic_mtp_for_test(weights, cfg, rotation);
+            state.engine.final_norm = make_buffer(
+                &state.engine.device,
+                &mtp_tap_final_norm_gamma(hidden),
+                "test.final_norm.nonuniform",
+            );
+            let pre_fc_norm_hidden = make_buffer(
+                &state.engine.device,
+                &mtp_tap_pre_fc_hidden_gamma(hidden),
+                "test.mtp.pre_fc_norm_hidden.nonuniform",
+            );
+            state
+                .engine
+                .mtp_weights
+                .as_mut()
+                .expect("synthetic MTP weights present")
+                .pre_fc_norm_hidden = pre_fc_norm_hidden;
+            state
+        }
+
+        /// The hidden half of the fused `[embedding || hidden]` buffer the head's
+        /// `fc` consumes, as left by the most recent MTP entry-point call.
+        fn mtp_fused_hidden_half(state: &MetalQwen35State) -> Vec<f32> {
+            let hidden = state.engine.config.hidden_size;
+            let fused = &state.session.mtp.as_ref().unwrap().activations.fused;
+            // SAFETY: `fused` is a StorageModeShared f32 buffer of `2 * hidden`
+            // values; both MTP entry points wait for their command buffer before
+            // returning, so no GPU write is in flight here.
+            unsafe {
+                std::slice::from_raw_parts((fused.contents() as *const f32).add(hidden), hidden)
+                    .to_vec()
+            }
+        }
+
+        /// Decode path, unrotated checkpoint: the head's hidden input is
+        /// `pre_fc_norm_hidden(final_norm(h))`, not `pre_fc_norm_hidden(h)`.
+        #[test]
+        fn mtp_forward_one_feeds_head_the_post_final_norm_hidden() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let hidden = cfg.hidden_size;
+            let mut state = metal_state_for_mtp_tap_test(&weights, &cfg, None);
+            assert_eq!(state.mtp_hidden_tap(), Some(MtpHiddenTap::PostFinalNorm));
+
+            let h = mtp_tap_target_hidden(hidden);
+            let gamma_final = mtp_tap_final_norm_gamma(hidden);
+            let gamma_pre = mtp_tap_pre_fc_hidden_gamma(hidden);
+            let eps = cfg.rms_norm_eps;
+            let expected_post = shifted_rmsnorm_reference(
+                &shifted_rmsnorm_reference(&h, &gamma_final, eps),
+                &gamma_pre,
+                eps,
+            );
+            let without_final_norm = shifted_rmsnorm_reference(&h, &gamma_pre, eps);
+            let separation = max_abs_diff(&expected_post, &without_final_norm);
+            assert!(
+                separation > 0.2,
+                "fixture must separate the two candidate inputs; max diff {separation}"
+            );
+
+            state.session.last_pre_final_hidden = h;
+            let _ = state.mtp_forward_one(2u32, 0);
+            let got = mtp_fused_hidden_half(&state);
+
+            let to_post = max_abs_diff(&got, &expected_post);
+            let to_pre = max_abs_diff(&got, &without_final_norm);
+            assert!(
+                to_post < 1e-4,
+                "hidden half must equal pre_fc_norm_hidden(final_norm(h)); max diff {to_post} \
+                 (distance to the no-final-norm candidate: {to_pre})"
+            );
+            assert!(
+                to_pre > 0.2,
+                "hidden half must not equal pre_fc_norm_hidden(h); max diff {to_pre}"
+            );
+        }
+
+        /// Prompt/accepted-row path, unrotated checkpoint: same input as the decode path.
+        #[test]
+        fn mtp_prefill_append_feeds_head_the_post_final_norm_hidden() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let hidden = cfg.hidden_size;
+            let mut state = metal_state_for_mtp_tap_test(&weights, &cfg, None);
+            assert_eq!(state.mtp_hidden_tap(), Some(MtpHiddenTap::PostFinalNorm));
+
+            let h = mtp_tap_target_hidden(hidden);
+            let gamma_final = mtp_tap_final_norm_gamma(hidden);
+            let gamma_pre = mtp_tap_pre_fc_hidden_gamma(hidden);
+            let eps = cfg.rms_norm_eps;
+            let expected_post = shifted_rmsnorm_reference(
+                &shifted_rmsnorm_reference(&h, &gamma_final, eps),
+                &gamma_pre,
+                eps,
+            );
+            let without_final_norm = shifted_rmsnorm_reference(&h, &gamma_pre, eps);
+            let separation = max_abs_diff(&expected_post, &without_final_norm);
+            assert!(
+                separation > 0.2,
+                "fixture must separate the two candidate inputs; max diff {separation}"
+            );
+
+            state.mtp_prefill_append(2u32, &h, 3);
+            let got = mtp_fused_hidden_half(&state);
+
+            let to_post = max_abs_diff(&got, &expected_post);
+            let to_pre = max_abs_diff(&got, &without_final_norm);
+            assert!(
+                to_post < 1e-4,
+                "hidden half must equal pre_fc_norm_hidden(final_norm(h)); max diff {to_post} \
+                 (distance to the no-final-norm candidate: {to_pre})"
+            );
+            assert!(
+                to_pre > 0.2,
+                "hidden half must not equal pre_fc_norm_hidden(h); max diff {to_pre}"
+            );
+        }
+
+        /// Rotated checkpoint: the tap stays pre-final-norm and both entry points
+        /// compute exactly the counter-rotate-then-`pre_fc_norm_hidden` input, with
+        /// no final norm even though the engine holds a non-uniform final-norm scale.
+        #[test]
+        fn mtp_rotated_checkpoint_keeps_the_pre_final_norm_hidden() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let hidden = cfg.hidden_size;
+            let rotation =
+                crate::quant::quarot::hadamard::RandomizedHadamard::new(0x51_51_51_u64, hidden)
+                    .unwrap();
+
+            let h = mtp_tap_target_hidden(hidden);
+            let mut h_rotated = h.clone();
+            rotation.apply(&mut h_rotated).unwrap();
+            let gamma_pre = mtp_tap_pre_fc_hidden_gamma(hidden);
+
+            // The input as computed before the tap existed: counter-rotation, then
+            // the pre-fc norm.
+            let mut unchanged = h_rotated.clone();
+            rotation.apply_inverse(&mut unchanged).unwrap();
+            let mut with_final_norm = unchanged.clone();
+            MetalQwen35State::mtp_pre_fc_rmsnorm(
+                &mut with_final_norm,
+                &mtp_tap_final_norm_gamma(hidden),
+                cfg.rms_norm_eps,
+            );
+            MetalQwen35State::mtp_pre_fc_rmsnorm(&mut unchanged, &gamma_pre, cfg.rms_norm_eps);
+            MetalQwen35State::mtp_pre_fc_rmsnorm(
+                &mut with_final_norm,
+                &gamma_pre,
+                cfg.rms_norm_eps,
+            );
+            let separation = max_abs_diff(&unchanged, &with_final_norm);
+            assert!(
+                separation > 0.2,
+                "fixture must separate the two candidate inputs; max diff {separation}"
+            );
+
+            let mut decode_state =
+                metal_state_for_mtp_tap_test(&weights, &cfg, Some(rotation.clone()));
+            assert_eq!(
+                decode_state.mtp_hidden_tap(),
+                Some(MtpHiddenTap::PreFinalNorm)
+            );
+            decode_state.session.last_pre_final_hidden = h_rotated.clone();
+            let _ = decode_state.mtp_forward_one(2u32, 0);
+            assert_eq!(
+                mtp_fused_hidden_half(&decode_state),
+                unchanged,
+                "decode path on a rotated checkpoint must feed the head exactly the \
+                 counter-rotated, pre_fc-normed hidden with no final norm"
+            );
+
+            let mut prefill_state = metal_state_for_mtp_tap_test(&weights, &cfg, Some(rotation));
+            assert_eq!(
+                prefill_state.mtp_hidden_tap(),
+                Some(MtpHiddenTap::PreFinalNorm)
+            );
+            prefill_state.mtp_prefill_append(2u32, &h_rotated, 3);
+            assert_eq!(
+                mtp_fused_hidden_half(&prefill_state),
+                unchanged,
+                "prompt/accepted-row path on a rotated checkpoint must feed the head \
+                 exactly the counter-rotated, pre_fc-normed hidden with no final norm"
+            );
+        }
+
+        #[test]
+        fn mtp_hidden_tap_is_none_without_mtp_weights() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let engine = MetalQwen35Engine::new(&weights, &cfg)
+                .expect("tiny MetalQwen35Engine without MTP weights constructs");
+            assert!(engine.mtp_weights.is_none());
+            let session = engine.new_session(16).expect("tiny session constructs");
+            let state = MetalQwen35State {
+                engine,
+                session,
+                lora: None,
+                use_gdn_chunked: true,
+                use_kv_f16: false,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled: false,
+                path_proof: PathProofCounters::default(),
+            };
+            assert!(!state.has_mtp());
+            assert_eq!(state.mtp_hidden_tap(), None);
+        }
+
+        #[test]
+        fn mtp_hidden_tap_follows_checkpoint_rotation_on_constructed_states() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let plain = metal_state_with_synthetic_mtp_for_test(&weights, &cfg, None);
+            assert!(plain.engine.quarot_rotation.is_none());
+            assert_eq!(plain.mtp_hidden_tap(), Some(MtpHiddenTap::PostFinalNorm));
+
+            let rotation = crate::quant::quarot::hadamard::RandomizedHadamard::new(
+                0x51_51_51_u64,
+                cfg.hidden_size,
+            )
+            .unwrap();
+            let rotated = metal_state_with_synthetic_mtp_for_test(&weights, &cfg, Some(rotation));
+            assert!(rotated.engine.quarot_rotation.is_some());
+            assert_eq!(rotated.mtp_hidden_tap(), Some(MtpHiddenTap::PreFinalNorm));
         }
 
         /// Regression test on the PRODUCTION `mtp_forward_one` path (not a test-only
@@ -18944,6 +19300,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     },
                 }],
                 norm: make_buffer(device, &vec![1.0; hidden], "test.mtp.norm"),
+                hidden_tap: MtpHiddenTap::PostFinalNorm,
             }
         }
 
@@ -24176,6 +24533,62 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  layout; first_missing_file={:?}",
                 result.first_missing_file
             );
+        }
+
+        #[test]
+        fn load_mtp_q4_weights_taps_the_post_final_norm_hidden_on_an_unrotated_checkpoint() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            write_full_mtp_fixture(tmp.path(), &cfg, /* proj_as_q4 */ true);
+
+            let result = MetalQwen35State::load_mtp_q4_weights(
+                tmp.path(),
+                &cfg,
+                &device,
+                /* is_quarot */ false,
+            )
+            .expect("well-formed plain-Q4 MTP directory must not hard-error");
+
+            let weights = result.weights.expect("MTP weights load");
+            assert_eq!(weights.hidden_tap, MtpHiddenTap::PostFinalNorm);
+        }
+
+        #[test]
+        fn load_mtp_q4_weights_keeps_the_pre_final_norm_hidden_on_a_rotated_checkpoint() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            write_full_mtp_fixture(tmp.path(), &cfg, /* proj_as_q4 */ false);
+
+            let result = MetalQwen35State::load_mtp_q4_weights(
+                tmp.path(),
+                &cfg,
+                &device,
+                /* is_quarot */ true,
+            )
+            .expect("well-formed all-.f16 QuaRot MTP directory must not hard-error");
+
+            let weights = result.weights.expect("MTP weights load");
+            assert_eq!(weights.hidden_tap, MtpHiddenTap::PreFinalNorm);
         }
 
         #[test]
@@ -42494,6 +42907,69 @@ pub fn mtp_missing_weights_warning(
 // every platform without Metal GPU hardware.
 // ---------------------------------------------------------------------------
 
+/// Which target hidden state the MTP draft head receives as its hidden-state input.
+///
+/// The reference Qwen3.5 MTP implementations feed the head the target's hidden
+/// state after the model's final RMSNorm, the same vector the language-model head
+/// reads. The target forward captures the hidden state before that norm, so the
+/// head applies the final norm itself unless the checkpoint cannot supply the
+/// norm's scale. The tap is decided once when the MTP weights load and does not
+/// change afterwards; query it with `MetalQwen35State::mtp_hidden_tap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtpHiddenTap {
+    /// The head receives the target's hidden state after the final RMSNorm,
+    /// matching the reference implementations.
+    PostFinalNorm,
+    /// The head receives the target's hidden state before the final RMSNorm.
+    /// Used for rotated (QuaRot) checkpoints: conversion folds the final-norm
+    /// scale into the language-model head and stores a neutral scale in its
+    /// place, so the original scale is not available at runtime.
+    PreFinalNorm,
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+impl MtpHiddenTap {
+    /// The tap for a checkpoint: rotated checkpoints keep the pre-norm hidden.
+    pub(crate) fn for_checkpoint(rotated: bool) -> Self {
+        if rotated {
+            Self::PreFinalNorm
+        } else {
+            Self::PostFinalNorm
+        }
+    }
+
+    /// Stable lowercase name used in load and statistics log lines.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PostFinalNorm => "post-final-norm",
+            Self::PreFinalNorm => "pre-final-norm",
+        }
+    }
+}
+
+#[cfg(test)]
+mod mtp_hidden_tap_tests {
+    use super::MtpHiddenTap;
+
+    #[test]
+    fn rotated_checkpoints_keep_the_pre_final_norm_hidden() {
+        assert_eq!(
+            MtpHiddenTap::for_checkpoint(true),
+            MtpHiddenTap::PreFinalNorm
+        );
+        assert_eq!(
+            MtpHiddenTap::for_checkpoint(false),
+            MtpHiddenTap::PostFinalNorm
+        );
+    }
+
+    #[test]
+    fn labels_are_the_stable_log_names() {
+        assert_eq!(MtpHiddenTap::PostFinalNorm.label(), "post-final-norm");
+        assert_eq!(MtpHiddenTap::PreFinalNorm.label(), "pre-final-norm");
+    }
+}
+
 /// Outcome of one greedy-MTP round after verification against the target model.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MtpRoundOutcome {
@@ -43003,6 +43479,11 @@ impl MetalQwen35State {
     /// Stub: always returns false without metal-gpu feature.
     pub fn has_mtp(&self) -> bool {
         false
+    }
+
+    /// Stub: always returns `None` without metal-gpu feature.
+    pub fn mtp_hidden_tap(&self) -> Option<MtpHiddenTap> {
+        None
     }
 
     /// **Unstable**: Metal single-token forward step stub.
