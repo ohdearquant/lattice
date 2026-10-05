@@ -7,6 +7,9 @@
 //! through this session and [`run_streaming`]; the direct entry runs its
 //! ordinary requests through it and [`run_direct`], and keeps its MTP and
 //! GDN-first self-speculative routes, which this session refuses.
+//! [`MetalEntryProfile::PrefixCacheStreaming`] is the prefix-cache entry's
+//! session: [`QwenMetalSession::over_restored_state`] builds it over a state the
+//! caller restored to a reusable boundary, and it prefills only the suffix.
 //!
 //! **Owned state.** The session borrows the caller's `MetalQwen35State`
 //! mutably for its whole life, so the GPU caches, scratch and the compact
@@ -89,6 +92,10 @@ pub(crate) enum MetalEntryProfile {
     Direct,
     /// `MetalQwen35State::generate_streaming_with_cancel`.
     Streaming,
+    /// `MetalQwen35State::generate_streaming_with_prefix_cache_and_cancel`:
+    /// the streaming loop over a state the caller restored to a reusable prefix
+    /// boundary (or reset, for a full refill), prefilling only the suffix.
+    PrefixCacheStreaming,
 }
 
 /// The direct entry refuses `reasoning_budget` and `logprobs` before
@@ -106,6 +113,16 @@ const DIRECT_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
 const STREAMING_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
     grammar: true,
     logprobs: true,
+    stop_strings: true,
+    reasoning_budget: true,
+};
+
+/// The prefix-cache entry refuses `logprobs` and `enable_mtp`
+/// (`GenerationEntryContract::MetalPrefixCacheStreaming`) and wires grammar
+/// masking, stop strings and the reasoning budget like the streaming entry.
+const PREFIX_CACHE_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
+    grammar: true,
+    logprobs: false,
     stop_strings: true,
     reasoning_budget: true,
 };
@@ -208,9 +225,12 @@ fn refuse_route_owned_elsewhere(
 /// the module doc comment for what it owns and why.
 pub(crate) struct QwenMetalSession<'state> {
     state: &'state mut MetalQwen35State,
+    profile: MetalEntryProfile,
     capabilities: ExecutionCapabilities,
     mode: ReadbackMode,
     prompt_ids: Vec<u32>,
+    /// Where the suffix the prefix-cache profile prefills begins; 0 otherwise.
+    suffix_start: usize,
     rng_state: u64,
     temperature: f32,
     ledger: PredictionLedger,
@@ -257,6 +277,9 @@ impl<'state> QwenMetalSession<'state> {
 
     /// [`Self::new`] with the route environment the caller already read, so a
     /// caller that planned the route to choose this session plans the same one.
+    ///
+    /// The prefix-cache profile built here is a full refill: it resets the state
+    /// and prefills the whole prompt through `forward_prefill_from` at position 0.
     pub(crate) fn with_route_environment(
         state: &'state mut MetalQwen35State,
         plan: GenerationPlan,
@@ -264,9 +287,61 @@ impl<'state> QwenMetalSession<'state> {
         profile: MetalEntryProfile,
         environment: SamplingRouteEnvironment,
     ) -> Result<Self, InferenceError> {
-        if profile == MetalEntryProfile::Direct {
-            check_reasoning_budget_not_set(gen_cfg)?;
-            check_logprobs_not_set(gen_cfg)?;
+        Self::construct(state, plan, 0, gen_cfg, profile, environment, true)
+    }
+
+    /// The prefix-cache profile over a `state` the caller already restored to the
+    /// reusable boundary `suffix_start` (its KV cursor and recurrent state), which
+    /// this constructor leaves untouched. Prefill runs only
+    /// `plan.prompt_ids[suffix_start..]`, at its absolute position. A caller whose
+    /// plan is a full refill resets the state itself and passes 0.
+    ///
+    /// # Errors
+    ///
+    /// Before any state mutation: the prefix-cache entry's `logprobs` refusal, a
+    /// non-dense grammar request as in [`Self::with_route_environment`], and a
+    /// `suffix_start` beyond the prompt.
+    #[allow(dead_code)] // no production caller until the prefix-cache entry runs through this session
+    pub(crate) fn over_restored_state(
+        state: &'state mut MetalQwen35State,
+        plan: GenerationPlan,
+        suffix_start: usize,
+        gen_cfg: &GenerateConfig,
+        environment: SamplingRouteEnvironment,
+    ) -> Result<Self, InferenceError> {
+        Self::construct(
+            state,
+            plan,
+            suffix_start,
+            gen_cfg,
+            MetalEntryProfile::PrefixCacheStreaming,
+            environment,
+            false,
+        )
+    }
+
+    fn construct(
+        state: &'state mut MetalQwen35State,
+        plan: GenerationPlan,
+        suffix_start: usize,
+        gen_cfg: &GenerateConfig,
+        profile: MetalEntryProfile,
+        environment: SamplingRouteEnvironment,
+        reset_state: bool,
+    ) -> Result<Self, InferenceError> {
+        match profile {
+            MetalEntryProfile::Direct => {
+                check_reasoning_budget_not_set(gen_cfg)?;
+                check_logprobs_not_set(gen_cfg)?;
+            }
+            MetalEntryProfile::PrefixCacheStreaming => check_logprobs_not_set(gen_cfg)?,
+            MetalEntryProfile::Streaming => {}
+        }
+        if suffix_start > plan.prompt_ids.len() {
+            return Err(InferenceError::InvalidInput(format!(
+                "suffix_start {suffix_start} is beyond the {} prompt tokens",
+                plan.prompt_ids.len()
+            )));
         }
 
         let route = plan_sampling_route(gen_cfg, plan.prompt_ids.is_empty(), environment);
@@ -293,7 +368,9 @@ impl<'state> QwenMetalSession<'state> {
             ),
         )?;
 
-        state.reset_state();
+        if reset_state {
+            state.reset_state();
+        }
         let route_engaged = apply_sampling_route_plan(
             route,
             &mut state.session.compact_route,
@@ -303,12 +380,15 @@ impl<'state> QwenMetalSession<'state> {
 
         Ok(Self {
             state,
+            profile,
             capabilities: match profile {
                 MetalEntryProfile::Direct => DIRECT_CAPABILITIES,
                 MetalEntryProfile::Streaming => STREAMING_CAPABILITIES,
+                MetalEntryProfile::PrefixCacheStreaming => PREFIX_CACHE_CAPABILITIES,
             },
             mode,
             prompt_ids: plan.prompt_ids,
+            suffix_start,
             rng_state: plan.rng_state,
             temperature: gen_cfg.temperature,
             ledger: PredictionLedger::new(),
@@ -344,17 +424,28 @@ impl DecoderSession for QwenMetalSession<'_> {
         &self.capabilities
     }
 
-    /// Batched prefill through `try_forward_prefill`, the fallible entry both
-    /// legacy loops call: it refuses before any state mutation (a non-fresh
-    /// session, an out-of-vocabulary id, a range beyond capacity, a
+    /// Batched prefill through `try_forward_prefill`, the fallible entry the
+    /// direct and streaming loops call: it refuses before any state mutation (a
+    /// non-fresh session, an out-of-vocabulary id, a range beyond capacity, a
     /// multi-token prompt on an MoE model without LoRA), so an error here
-    /// leaves nothing to undo except the route, which `Drop` tears down.
+    /// leaves nothing to undo except the route, which `Drop` tears down. The
+    /// prefix-cache profile prefills its suffix through `forward_prefill_from`
+    /// at the restored boundary, as the prefix-cache loop does, because
+    /// `try_forward_prefill` refuses any session that is not fresh.
     fn prefill(&mut self, cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
         if cancel.is_cancelled() {
             return Err(InferenceError::Inference("cancelled before prefill".into()));
         }
         self.ledger.reset();
-        let logits = self.state.try_forward_prefill(&self.prompt_ids)?;
+        let logits = if self.profile == MetalEntryProfile::PrefixCacheStreaming {
+            self.state.forward_prefill_from(
+                &self.prompt_ids[self.suffix_start..],
+                self.suffix_start,
+                false,
+            )?
+        } else {
+            self.state.try_forward_prefill(&self.prompt_ids)?
+        };
         self.readback = match self.mode {
             ReadbackMode::Compact { .. } => Readback::Compact,
             ReadbackMode::Dense | ReadbackMode::GreedyArgmax => Readback::Dense(logits),
@@ -794,6 +885,15 @@ mod tests {
             ExecutionCapabilities {
                 grammar: true,
                 logprobs: true,
+                stop_strings: true,
+                reasoning_budget: true,
+            }
+        );
+        assert_eq!(
+            PREFIX_CACHE_CAPABILITIES,
+            ExecutionCapabilities {
+                grammar: true,
+                logprobs: false,
                 stop_strings: true,
                 reasoning_budget: true,
             }
@@ -1271,6 +1371,165 @@ mod tests {
         )
         .expect("streaming admits logprobs");
         assert_eq!(s.mode(), ReadbackMode::Dense);
+    }
+
+    /// The tiny fixture with nonzero attention weights and embeddings, so a
+    /// prefill's logits depend on the prefix rows already in the KV cache.
+    fn varied_fixture() -> (Qwen35Config, ModelWeights) {
+        let (cfg, mut weights) = tiny_fixture();
+        let fill = |values: &mut Vec<f32>, salt: usize| {
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = (((i * 31 + salt * 17) % 23) as f32 - 11.0) * 0.01;
+            }
+        };
+        fill(&mut weights.embed_tokens, 1);
+        let Some((AttentionWeights::Full(full), _)) = weights.layers.first_mut() else {
+            panic!("the tiny fixture has one full-attention layer");
+        };
+        fill(&mut full.q_proj, 2);
+        fill(&mut full.k_proj, 3);
+        fill(&mut full.v_proj, 4);
+        fill(&mut full.o_proj, 5);
+        (cfg, weights)
+    }
+
+    /// A state holding the boundary an `ExactAppend` restore leaves: the KV rows
+    /// and cursor of `prefix`, with the cursor at `prefix.len()`.
+    fn state_restored_to(
+        weights: &ModelWeights,
+        cfg: &Qwen35Config,
+        prefix: &[u32],
+    ) -> MetalQwen35State {
+        let mut state = MetalQwen35State::new(weights, cfg, TINY_CACHE).expect("tiny Metal state");
+        state.try_forward_prefill(prefix).expect("prefix prefill");
+        assert_eq!(state.session.position(), prefix.len());
+        state
+    }
+
+    fn argmax(logits: &[f32]) -> u32 {
+        let mut best = 0;
+        for (id, value) in logits.iter().enumerate() {
+            if *value > logits[best] {
+                best = id;
+            }
+        }
+        best as u32
+    }
+
+    /// The prefix-cache session prefills the suffix of a restored state exactly
+    /// as the prefix-cache loop does: through `forward_prefill_from` at the
+    /// boundary, without resetting what the restore left. A batched suffix and a
+    /// single-token suffix take different branches of that primitive, and the
+    /// single-token one refuses any cursor that is not the boundary.
+    #[test]
+    fn prefix_session_prefill_on_restored_state_matches_legacy_suffix_prefill() {
+        let Some(_) = metal::Device::system_default() else {
+            return;
+        };
+        let _gpu = gpu_test_lock();
+        let (cfg, weights) = varied_fixture();
+        let prefix = [1u32, 2, 3];
+        let gen_cfg = greedy();
+
+        for prompt in [vec![1u32, 2, 3, 4, 5], vec![1u32, 2, 3, 4]] {
+            let suffix_start = prefix.len();
+            let mut legacy = state_restored_to(&weights, &cfg, &prefix);
+            let expected = legacy
+                .forward_prefill_from(&prompt[suffix_start..], suffix_start, false)
+                .expect("legacy suffix prefill");
+            assert!(
+                expected.iter().any(|v| *v != expected[0]),
+                "fixture shape: the readback must not be constant"
+            );
+
+            // Control: the fresh-prompt entry refuses the restored state, which is
+            // why the prefix profile cannot prefill through it.
+            let refused = state_restored_to(&weights, &cfg, &prefix).try_forward_prefill(&prompt);
+            assert!(
+                matches!(&refused, Err(InferenceError::InvalidInput(msg)) if msg.contains("fresh session")),
+                "{refused:?}"
+            );
+
+            let mut state = state_restored_to(&weights, &cfg, &prefix);
+            let mut s = QwenMetalSession::over_restored_state(
+                &mut state,
+                plan(prompt.clone(), 7),
+                suffix_start,
+                &gen_cfg,
+                DENSE_ENV,
+            )
+            .expect("a restored prefix constructs a session");
+            assert_eq!(s.mode(), ReadbackMode::Dense);
+            assert_eq!(
+                s.state.session.position(),
+                suffix_start,
+                "construction must leave the restored boundary alone"
+            );
+
+            let stamp = s.prefill(&|| false).expect("prefix prefill");
+            assert_eq!(stamp.evaluated_len, prompt.len());
+            assert_eq!(s.state.session.position(), legacy.session.position());
+            match &s.readback {
+                Readback::Dense(logits) => assert_eq!(logits, &expected),
+                other => panic!("expected a dense readback, got {other:?}"),
+            }
+            let c = candidate(s.select(&request(&gen_cfg, &prompt)).expect("select"));
+            assert_eq!(c.candidate_id, argmax(&expected));
+        }
+    }
+
+    #[test]
+    fn prefix_session_construction_refuses_logprobs_and_a_suffix_beyond_the_prompt() {
+        let Some(_) = metal::Device::system_default() else {
+            return;
+        };
+        let _gpu = gpu_test_lock();
+        let (cfg, weights) = varied_fixture();
+        let prefix = [1u32, 2, 3];
+        let mut state = state_restored_to(&weights, &cfg, &prefix);
+
+        let logprobs = GenerateConfig {
+            logprobs: Some(1),
+            ..greedy()
+        };
+        let refused = QwenMetalSession::over_restored_state(
+            &mut state,
+            plan(vec![1, 2, 3, 4], 7),
+            3,
+            &logprobs,
+            COMPACT_ENV,
+        )
+        .err();
+        assert!(
+            matches!(&refused, Some(InferenceError::InvalidInput(msg)) if msg.contains("logprobs")),
+            "{refused:?}"
+        );
+        let beyond = QwenMetalSession::over_restored_state(
+            &mut state,
+            plan(vec![1, 2, 3, 4], 7),
+            5,
+            &greedy(),
+            COMPACT_ENV,
+        )
+        .err();
+        assert!(
+            matches!(&beyond, Some(InferenceError::InvalidInput(msg)) if msg.contains("suffix_start")),
+            "{beyond:?}"
+        );
+        assert_eq!(state.session.position(), prefix.len());
+        assert_route_disengaged(&state);
+
+        // Control: the same state and a valid boundary construct, and the route the
+        // environment plans is engaged.
+        let s = QwenMetalSession::over_restored_state(
+            &mut state,
+            plan(vec![1, 2, 3, 4], 7),
+            3,
+            &greedy(),
+            COMPACT_ENV,
+        )
+        .expect("a valid boundary constructs");
+        assert_eq!(s.state.session.compact_topk, 1);
     }
 
     /// A decode error after the prediction was consumed, injected by filling

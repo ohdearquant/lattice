@@ -13751,7 +13751,7 @@ mod inner {
         /// position 0, including their `len == 1` fast path), every branch
         /// here honors `start_pos`, so a single reused-prefix token forwards
         /// at its true absolute position.
-        fn forward_prefill_from(
+        pub(crate) fn forward_prefill_from(
             &mut self,
             token_ids: &[u32],
             start_pos: usize,
