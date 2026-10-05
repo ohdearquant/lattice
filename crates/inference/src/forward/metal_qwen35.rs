@@ -7676,6 +7676,48 @@ mod inner {
             }
         }
 
+        /// **Unstable**: score a list of option letters with one prompt prefill (ADR-097).
+        ///
+        /// Resets the recurrent and KV state, runs exactly one
+        /// [`Self::try_forward_prefill`] over `prompt_ids` and reads the last-position logits at
+        /// `letter_ids`. There is no sampling and no decode step. The returned
+        /// [`OptionScores`](crate::option_scoring::OptionScores) holds the k raw logits in the
+        /// caller's order, their softmax over the k, and the full-vocabulary mass on the k letters.
+        ///
+        /// The scorer never loads or unloads an adapter: whichever adapter the state holds is the
+        /// one in effect. On a dense model an active adapter is applied inside the batched prefill;
+        /// on a model with MoE layers it keeps the per-token path. Because the call
+        /// resets the state first, any session that was in progress is discarded, and the state is
+        /// left advanced by the prompt, so the next call resets again.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before any state reset or GPU
+        /// dispatch for an empty `prompt_ids`, a prompt token outside the vocabulary, a prompt
+        /// longer than the session capacity, an empty `letter_ids`, a letter id outside the
+        /// vocabulary or a repeated letter id; a rejected call leaves the session untouched.
+        /// Returns [`crate::error::InferenceError::UnsupportedModel`] for a multi-token prompt on
+        /// an MoE model with no active adapter, and [`crate::error::InferenceError::Inference`]
+        /// when the logits contain a non-finite value.
+        pub fn score_option_letters(
+            &mut self,
+            prompt_ids: &[u32],
+            letter_ids: &[u32],
+        ) -> Result<crate::option_scoring::OptionScores, crate::error::InferenceError> {
+            if prompt_ids.is_empty() {
+                return Err(crate::error::InferenceError::InvalidInput(
+                    "score_option_letters: prompt_ids must not be empty".into(),
+                ));
+            }
+            crate::option_scoring::check_letter_ids(self.engine.config.vocab_size, letter_ids)?;
+            self.check_forward_token_ids("score_option_letters", prompt_ids)?;
+            self.check_forward_range_capacity(0, prompt_ids.len(), false)?;
+            self.check_prefill_moe_batched_unsupported("score_option_letters", prompt_ids.len())?;
+            self.reset_state();
+            let logits = self.try_forward_prefill(prompt_ids)?;
+            crate::option_scoring::option_scores_from_logits(&logits, letter_ids)
+        }
+
         /// **Unstable**: fallible prompt prefill with explicit hidden readback.
         ///
         /// Returns `(last_token_logits, pre_final_hidden)`. The hidden row is
@@ -26798,6 +26840,226 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             (cfg, weights)
         }
 
+        /// `tiny_hybrid_fixture` with token embeddings that spread the letter logits: every row
+        /// has two non-zero entries, so the logit at a letter depends on the last prompt token and
+        /// differs from letter to letter. The full-attention layer also carries one token-mixing
+        /// path: q_proj and k_proj stay zero, so attention is uniform over the positions seen so
+        /// far, value channel 0 reads hidden[0], and o_proj routes that channel into hidden[1].
+        /// The last position's letter logits therefore depend on every earlier prompt token.
+        fn option_scoring_fixture() -> (Qwen35Config, ModelWeights) {
+            let (cfg, mut weights) = tiny_hybrid_fixture();
+            let hidden = cfg.hidden_size;
+            let q_dim = cfg.full_q_dim();
+            for token in 0..cfg.vocab_size {
+                let row = &mut weights.embed_tokens[token * hidden..(token + 1) * hidden];
+                row[0] = (token % 5) as f32 - 2.0;
+                row[1] = (token % 3) as f32 - 1.0;
+            }
+            let Some((AttentionWeights::Full(full), _)) = weights.layers.last_mut() else {
+                panic!("the last fixture layer is full attention");
+            };
+            full.v_proj[0] = 1.0;
+            // o_proj is [hidden, q_dim] row-major: row 1, column 0 writes head 0 channel 0 into hidden[1].
+            full.o_proj[q_dim] = 1.0;
+            (cfg, weights)
+        }
+
+        const OPTION_PROMPT: [u32; 5] = [4, 9, 13, 20, 11];
+        const OPTION_LETTERS: [u32; 4] = [3, 8, 14, 30];
+        const OPTION_CACHE_LEN: usize = 16;
+
+        /// A state on `option_scoring_fixture`, or `None` when this host has no Metal device.
+        /// Callers hold `gpu_test_lock()` before calling.
+        fn option_scoring_state(context: &str) -> Option<MetalQwen35State> {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!("[METAL_TEST_SKIP] context={context} reason=no_metal_device");
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present ({context})"
+                );
+                return None;
+            };
+            let (cfg, weights) = option_scoring_fixture();
+            Some(
+                MetalQwen35State::new(&weights, &cfg, OPTION_CACHE_LEN)
+                    .expect("option scoring fixture constructs"),
+            )
+        }
+
+        /// Leave the state mid-session: one KV row written and a non-initial GDN state.
+        fn dirty_option_scoring_state(state: &mut MetalQwen35State) {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            state.reset_state();
+            state
+                .try_forward_step(2, 0)
+                .expect("step at the live cursor");
+            let mut seeded = state.snapshot_gdn_states();
+            seeded[0].0[0] = 1.0;
+            seeded[0].1[0] = -1.0;
+            state.restore_gdn_states(&seeded);
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+            assert!(!state.gdn_state_is_initial());
+        }
+
+        fn f32_bits(values: &[f32]) -> Vec<u32> {
+            values.iter().map(|v| v.to_bits()).collect()
+        }
+
+        #[test]
+        fn score_option_letters_logits_equal_try_forward_prefill_at_the_letters_bitwise() {
+            let _gpu = gpu_test_lock();
+            let Some(mut state) = option_scoring_state(
+                "score_option_letters_logits_equal_try_forward_prefill_at_the_letters_bitwise",
+            ) else {
+                return;
+            };
+
+            state.reset_state();
+            let full = state
+                .try_forward_prefill(&OPTION_PROMPT)
+                .expect("reference prefill");
+            let expected = f32_bits(
+                &OPTION_LETTERS
+                    .iter()
+                    .map(|&id| full[id as usize])
+                    .collect::<Vec<_>>(),
+            );
+
+            // The reference prefill left the session advanced, so the scorer has to reset it.
+            let scores = state
+                .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+                .expect("scores");
+            assert_eq!(f32_bits(&scores.logits), expected);
+            assert_eq!(
+                scores,
+                crate::option_scoring::option_scores_from_logits(&full, &OPTION_LETTERS)
+                    .expect("pure scoring of the reference row"),
+                "probs and label_mass derive from the same row"
+            );
+
+            // The fixture can tell the letters apart and can tell the last position from the first.
+            let mut sorted = expected.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                OPTION_LETTERS.len(),
+                "letter logits must not tie"
+            );
+            state.reset_state();
+            let first = state
+                .try_forward_prefill(&OPTION_PROMPT[..1])
+                .expect("one-token prefill");
+            let at_first = f32_bits(
+                &OPTION_LETTERS
+                    .iter()
+                    .map(|&id| first[id as usize])
+                    .collect::<Vec<_>>(),
+            );
+            assert_ne!(at_first, expected, "first-position read must differ");
+        }
+
+        #[test]
+        fn score_option_letters_logits_depend_on_earlier_prompt_tokens() {
+            let _gpu = gpu_test_lock();
+            let Some(mut state) =
+                option_scoring_state("score_option_letters_logits_depend_on_earlier_prompt_tokens")
+            else {
+                return;
+            };
+
+            let mut other_prompt = OPTION_PROMPT;
+            other_prompt[2] = 14;
+            assert_eq!(other_prompt.last(), OPTION_PROMPT.last());
+            let base = state
+                .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+                .expect("scores");
+            let changed = state
+                .score_option_letters(&other_prompt, &OPTION_LETTERS)
+                .expect("scores with a different earlier token");
+            assert_ne!(
+                f32_bits(&base.logits),
+                f32_bits(&changed.logits),
+                "letter logits must see the earlier prompt tokens"
+            );
+        }
+
+        #[test]
+        fn score_option_letters_repeat_calls_are_bit_identical_from_any_session_state() {
+            let _gpu = gpu_test_lock();
+            let Some(mut state) = option_scoring_state(
+                "score_option_letters_repeat_calls_are_bit_identical_from_any_session_state",
+            ) else {
+                return;
+            };
+
+            let fresh = state
+                .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+                .expect("scores on a fresh session");
+            let repeat = state
+                .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+                .expect("scores on the session the first call left advanced");
+            assert_eq!(f32_bits(&repeat.logits), f32_bits(&fresh.logits));
+            assert_eq!(f32_bits(&repeat.probs), f32_bits(&fresh.probs));
+            assert_eq!(repeat.label_mass.to_bits(), fresh.label_mass.to_bits());
+
+            dirty_option_scoring_state(&mut state);
+            let after_dirty = state
+                .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+                .expect("scores on a mid-session state");
+            assert_eq!(f32_bits(&after_dirty.logits), f32_bits(&fresh.logits));
+            assert_eq!(f32_bits(&after_dirty.probs), f32_bits(&fresh.probs));
+            assert_eq!(after_dirty.label_mass.to_bits(), fresh.label_mass.to_bits());
+
+            let sum: f32 = fresh.probs.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-6, "probs sum to {sum}");
+            assert!((0.0..=1.0).contains(&fresh.label_mass));
+        }
+
+        #[test]
+        fn score_option_letters_refuses_before_resetting_or_dispatching() {
+            let _gpu = gpu_test_lock();
+            let Some(mut state) = option_scoring_state(
+                "score_option_letters_refuses_before_resetting_or_dispatching",
+            ) else {
+                return;
+            };
+            dirty_option_scoring_state(&mut state);
+            let seq_len_before = state.session.kv_cache.seq_len;
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = snapshot_gdn_bytes(&state);
+            let vocab = state.engine.config.vocab_size as u32;
+            let too_long = vec![1_u32; OPTION_CACHE_LEN + 1];
+            let oov_prompt = [1_u32, vocab];
+
+            let cases: [(&str, &[u32], &[u32]); 7] = [
+                ("empty prompt", &[], &OPTION_LETTERS),
+                ("no letters", &OPTION_PROMPT, &[]),
+                ("letter id at vocab", &OPTION_PROMPT, &[3, vocab]),
+                ("duplicate letter ids", &OPTION_PROMPT, &[3, 8, 3]),
+                ("prompt token at vocab", &oov_prompt, &OPTION_LETTERS),
+                ("prompt beyond capacity", &too_long, &OPTION_LETTERS),
+                ("letter id far out of range", &OPTION_PROMPT, &[u32::MAX]),
+            ];
+            for (name, prompt, letters) in cases {
+                match state.score_option_letters(prompt, letters) {
+                    Err(crate::error::InferenceError::InvalidInput(_)) => {}
+                    other => panic!("{name}: expected InvalidInput, got {other:?}"),
+                }
+                assert_eq!(state.session.kv_cache.seq_len, seq_len_before, "{name}");
+                assert_eq!(snapshot_kv_bytes(&state), kv_before, "{name}");
+                assert_eq!(snapshot_gdn_bytes(&state), gdn_before, "{name}");
+            }
+
+            // The capacity boundary itself is admitted.
+            let at_capacity = vec![1_u32; OPTION_CACHE_LEN];
+            state
+                .score_option_letters(&at_capacity, &OPTION_LETTERS)
+                .expect("a prompt of exactly the session capacity is valid");
+        }
+
         /// Single full-attention MoE layer — batched prefill does not support MoE
         /// (`assert_batched_prefill_dense_only`), so this is the minimal fixture for
         /// exercising the up-front rejection path before any state mutation.
@@ -41008,6 +41270,7 @@ mod public_scheduling_entry_point_tests {
                 "check_raw_prefill_fresh_session",
             ),
             ("pub fn forward_prefill(", "try_forward_prefill"),
+            ("pub fn score_option_letters(", "try_forward_prefill"),
             (
                 "pub fn forward_prefill_with_hidden(",
                 "check_hidden_prefill_fresh_session",
@@ -42253,6 +42516,22 @@ impl MetalQwen35State {
         ))
     }
 
+    /// **Unstable**: Metal option-letter scoring stub.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`crate::error::InferenceError::Inference`] without
+    /// macOS + `metal-gpu` support.
+    pub fn score_option_letters(
+        &mut self,
+        _prompt_ids: &[u32],
+        _letter_ids: &[u32],
+    ) -> Result<crate::option_scoring::OptionScores, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
     /// **Unstable**: Metal n-gram speculative generation stub.
     ///
     /// Always returns a typed capability error without macOS + `metal-gpu`.
@@ -42417,6 +42696,17 @@ mod non_metal_stub_tests {
         let mut state = MetalQwen35State;
         let result = state.try_forward_prefill(&[1, 2]);
         match result {
+            Err(InferenceError::Inference(message)) => {
+                assert!(message.contains("metal-gpu"), "{message}");
+            }
+            other => panic!("expected Metal capability error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_metal_stub_score_option_letters_returns_capability_error() {
+        let mut state = MetalQwen35State;
+        match state.score_option_letters(&[1, 2], &[3, 4]) {
             Err(InferenceError::Inference(message)) => {
                 assert!(message.contains("metal-gpu"), "{message}");
             }

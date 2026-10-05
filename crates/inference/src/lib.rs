@@ -111,6 +111,10 @@ pub mod mixture;
 /// frequency admission) to measure hit-rate deltas before any engine
 /// eviction-policy change. See [`moe_admission`]'s module doc comment.
 pub mod moe_admission;
+/// Option-letter scoring: one prefill, with the answer read from the next-token logits at
+/// the option letters. Holds [`option_scoring::OptionScores`] and the letter helpers shared by
+/// the CPU and Metal Qwen3.5 scorers. See [`model`] and [`tokenizer`].
+pub mod option_scoring;
 /// Embedding pooling helpers (mean, CLS, last-token) including [`BertPooling`]. Used by
 /// [`model::BertModel`] and [`model::QwenModel`].
 pub mod pool;

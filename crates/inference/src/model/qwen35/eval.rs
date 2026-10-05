@@ -22,6 +22,7 @@ use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
+use crate::option_scoring::{OptionScores, check_letter_ids, option_scores_from_logits};
 
 /// Configuration for [`Qwen35Model::compute_perplexity`].
 #[derive(Clone, Copy, Debug)]
@@ -135,6 +136,59 @@ impl Qwen35Model {
         }
 
         Ok(nlls)
+    }
+
+    /// **Unstable**: score a list of option letters with one prompt prefill (ADR-097).
+    ///
+    /// Runs the model over `prompt_ids` from a fresh recurrent and KV state, takes the logits at
+    /// the last prompt position and reads them at `letter_ids`. There is no sampling and no decode
+    /// step. The model is not modified: every call builds its own state, so repeat calls on the
+    /// same inputs return bit-identical scores. This is the CPU counterpart of
+    /// `MetalQwen35State::score_option_letters`; it takes `&self` because the CPU model keeps no
+    /// session state.
+    ///
+    /// The logits come from [`Qwen35Model::forward_prompt_debug`], the existing serial
+    /// last-position path, so they equal the logits a hand-driven `forward_step` loop leaves in
+    /// its scratch buffer. See [`crate::option_scoring::resolve_option_letters`] for turning
+    /// letters into ids.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::InvalidInput`] before any forward pass for an empty `prompt_ids`, a prompt
+    /// longer than [`Self::max_context`], a prompt token outside the vocabulary, an empty
+    /// `letter_ids`, a letter id outside the vocabulary or a repeated letter id.
+    /// [`InferenceError::Inference`] when the last-position logits contain a non-finite value.
+    pub fn score_option_letters(
+        &self,
+        prompt_ids: &[u32],
+        letter_ids: &[u32],
+    ) -> Result<OptionScores, InferenceError> {
+        let vocab_size = self.config.vocab_size;
+        if prompt_ids.is_empty() {
+            return Err(InferenceError::InvalidInput(
+                "score_option_letters: prompt_ids must not be empty".into(),
+            ));
+        }
+        check_letter_ids(vocab_size, letter_ids)?;
+        if prompt_ids.len() > self.max_context() {
+            return Err(InferenceError::InvalidInput(format!(
+                "score_option_letters: prompt_ids.len() ({}) exceeds RoPE capacity ({})",
+                prompt_ids.len(),
+                self.max_context()
+            )));
+        }
+        if let Some((index, &token_id)) = prompt_ids
+            .iter()
+            .enumerate()
+            .find(|&(_, &t)| t as usize >= vocab_size)
+        {
+            return Err(InferenceError::InvalidInput(format!(
+                "score_option_letters: prompt_ids[{index}]={token_id} out of range: \
+                 vocab_size is {vocab_size}"
+            )));
+        }
+        let logits = self.forward_prompt_debug(prompt_ids)?;
+        option_scores_from_logits(&logits, letter_ids)
     }
 
     /// **Unstable (train-backward)**: per-position final hidden states.
@@ -1136,5 +1190,166 @@ mod tests {
         let half = model.config.rope_dim() / 2;
         assert_eq!(cos.len(), max_context * half);
         assert_eq!(sin.len(), max_context * half);
+    }
+
+    /// Last-position logits read by hand: drive `forward_step` over the prompt and copy the
+    /// scratch logits, independent of `forward_prompt_debug` and of the scorer.
+    fn hand_read_last_logits(model: &Qwen35Model, prompt: &[u32]) -> Vec<f32> {
+        let cfg = &model.config;
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::new(cfg))
+            .collect();
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        let mut scratch = ForwardScratch::new();
+        for (pos, &token) in prompt.iter().enumerate() {
+            model.forward_step(token, pos, &mut gdn_states, &mut kv_cache, &mut scratch);
+            if pos + 1 < prompt.len() {
+                kv_cache.seq_len += 1;
+            }
+        }
+        scratch.logits[..cfg.vocab_size].to_vec()
+    }
+
+    #[test]
+    fn score_option_letters_logits_equal_the_hand_read_last_position_bitwise() {
+        let model = build_model(test_config(), 0x0A71_0C01);
+        let prompt: Vec<u32> = vec![11, 42, 7, 7, 63, 5, 20];
+        let letters: Vec<u32> = vec![33, 8, 90, 1];
+
+        let scores = model
+            .score_option_letters(&prompt, &letters)
+            .expect("valid prompt and letters");
+
+        let last = hand_read_last_logits(&model, &prompt);
+        let expected: Vec<u32> = letters
+            .iter()
+            .map(|&i| last[i as usize].to_bits())
+            .collect();
+        let actual: Vec<u32> = scores.logits.iter().map(|l| l.to_bits()).collect();
+        assert_eq!(
+            actual, expected,
+            "scorer logits are the last-position logits at the letters"
+        );
+
+        // The fixture must be able to tell the last position from an earlier one: the same read
+        // at position 0 gives different values, and the letters do not all tie.
+        let first = hand_read_last_logits(&model, &prompt[..1]);
+        let at_first: Vec<u32> = letters
+            .iter()
+            .map(|&i| first[i as usize].to_bits())
+            .collect();
+        assert_ne!(
+            at_first, expected,
+            "position 0 must differ from the last position"
+        );
+        assert!(
+            scores
+                .logits
+                .windows(2)
+                .any(|w| w[0].to_bits() != w[1].to_bits()),
+            "fixture letters must not all tie"
+        );
+    }
+
+    #[test]
+    fn score_option_letters_summary_matches_the_full_row_and_repeats_bit_identically() {
+        let model = build_model(test_config(), 0x0A71_0C02);
+        let prompt: Vec<u32> = vec![3, 14, 15, 92, 65];
+        let letters: Vec<u32> = vec![10, 20, 30];
+
+        let first = model
+            .score_option_letters(&prompt, &letters)
+            .expect("scores");
+        let second = model
+            .score_option_letters(&prompt, &letters)
+            .expect("scores");
+        assert_eq!(
+            first.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            second
+                .logits
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first.probs.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            second.probs.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(first.label_mass.to_bits(), second.label_mass.to_bits());
+
+        let sum: f32 = first.probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "probs sum to {sum}");
+        assert!((0.0..=1.0).contains(&first.label_mass));
+
+        // label_mass is the mass of the full softmax over the hand-read row.
+        let row = hand_read_last_logits(&model, &prompt);
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let total: f64 = row.iter().map(|&l| f64::from(l - max).exp()).sum();
+        let on_letters: f64 = letters
+            .iter()
+            .map(|&i| f64::from(row[i as usize] - max).exp())
+            .sum();
+        assert!((f64::from(first.label_mass) - on_letters / total).abs() < 1e-6);
+    }
+
+    #[test]
+    fn score_option_letters_depends_on_the_whole_prompt() {
+        let model = build_model(test_config(), 0x0A71_0C03);
+        let letters = [4_u32, 5, 6];
+        let a = model
+            .score_option_letters(&[9, 8, 7], &letters)
+            .expect("scores");
+        let b = model
+            .score_option_letters(&[1, 8, 7], &letters)
+            .expect("scores");
+        assert_ne!(
+            a.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "changing an earlier prompt token must change the last-position logits"
+        );
+    }
+
+    #[test]
+    fn score_option_letters_refuses_bad_input_before_any_forward_pass() {
+        let mut cfg = test_config();
+        cfg.max_position_embeddings = 8;
+        let model = build_model(cfg, 0x0A71_0C04);
+        assert_eq!(model.max_context(), 8);
+        let vocab = model.config.vocab_size as u32;
+
+        let invalid = |result: Result<OptionScores, InferenceError>, needle: &str| match result {
+            Err(InferenceError::InvalidInput(message)) => {
+                assert!(message.contains(needle), "{message}");
+            }
+            other => panic!("expected InvalidInput containing {needle:?}, got {other:?}"),
+        };
+
+        invalid(
+            model.score_option_letters(&[], &[1, 2]),
+            "must not be empty",
+        );
+        invalid(
+            model.score_option_letters(&[1, 2], &[]),
+            "must not be empty",
+        );
+        invalid(
+            model.score_option_letters(&[1, 2], &[1, vocab]),
+            "out of range",
+        );
+        invalid(model.score_option_letters(&[1, 2], &[3, 4, 3]), "duplicate");
+        // A prompt token outside the vocabulary must be an error, not the panic `forward_step` raises.
+        invalid(
+            model.score_option_letters(&[1, vocab], &[1, 2]),
+            "prompt_ids[1]",
+        );
+        invalid(
+            model.score_option_letters(&[1; 9], &[1, 2]),
+            "exceeds RoPE capacity",
+        );
+
+        // The boundary itself is accepted.
+        model
+            .score_option_letters(&[1; 8], &[1, 2])
+            .expect("a prompt of exactly max_context tokens is valid");
     }
 }
