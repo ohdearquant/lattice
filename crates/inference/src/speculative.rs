@@ -751,7 +751,8 @@ impl<'a> MtpVerifier<'a> {
         previous_hidden: &[f32],
     ) -> Result<MtpForwardOutput, crate::error::InferenceError> {
         use crate::error::InferenceError;
-        use crate::forward::cpu::{matmul_bt, rms_norm};
+        use crate::forward::cpu::matmul_bt;
+        use crate::model::qwen35::qwen35_rms_norm;
 
         // At capacity (`seq_len == max_seq_len`) this step indexes per-position
         // buffers (RoPE position tables, then the raw `k_buffer_mut(0)` K/V write at
@@ -815,9 +816,9 @@ impl<'a> MtpVerifier<'a> {
             .embedding
             .copy_from_slice(&self.embed_tokens[tok * hidden..(tok + 1) * hidden]);
 
-        // 2. Pre-fusion normalization (plain RMSNorm, not shifted)
+        // 2. Pre-fusion normalization (shifted RMSNorm: x / rms(x) * (1 + gamma))
         self.scratch.norm_hidden.copy_from_slice(previous_hidden);
-        rms_norm(
+        qwen35_rms_norm(
             &mut self.scratch.norm_hidden,
             &self.weights.pre_fc_norm_hidden_weight,
             hidden,
@@ -827,7 +828,7 @@ impl<'a> MtpVerifier<'a> {
         self.scratch
             .norm_embedding
             .copy_from_slice(&self.scratch.embedding);
-        rms_norm(
+        qwen35_rms_norm(
             &mut self.scratch.norm_embedding,
             &self.weights.pre_fc_norm_embedding_weight,
             hidden,
@@ -850,8 +851,8 @@ impl<'a> MtpVerifier<'a> {
         // Save residual for attention
         self.scratch.residual.copy_from_slice(&self.scratch.hidden);
 
-        // Pre-attention layernorm (plain RMSNorm)
-        rms_norm(
+        // Pre-attention layernorm (shifted RMSNorm)
+        qwen35_rms_norm(
             &mut self.scratch.hidden,
             &layer.input_layernorm,
             hidden,
@@ -898,10 +899,10 @@ impl<'a> MtpVerifier<'a> {
             kv_dim,
         );
 
-        // Per-head QK normalization (plain RMSNorm)
+        // Per-head QK normalization (shifted RMSNorm over each head's head_dim row)
         for h in 0..num_q_heads {
             let start = h * head_dim;
-            rms_norm(
+            qwen35_rms_norm(
                 &mut self.scratch.q[start..start + head_dim],
                 &layer.self_attn.q_norm,
                 head_dim,
@@ -910,7 +911,7 @@ impl<'a> MtpVerifier<'a> {
         }
         for h in 0..num_kv_heads {
             let start = h * head_dim;
-            rms_norm(
+            qwen35_rms_norm(
                 &mut self.scratch.k[start..start + head_dim],
                 &layer.self_attn.k_norm,
                 head_dim,
@@ -1046,9 +1047,9 @@ impl<'a> MtpVerifier<'a> {
         // Advance KV cache after layer completes
         self.cache.advance_by(1)?;
 
-        // Post-attention layernorm (plain RMSNorm), save residual for FFN
+        // Post-attention layernorm (shifted RMSNorm), save residual for FFN
         self.scratch.residual.copy_from_slice(&self.scratch.hidden);
-        rms_norm(
+        qwen35_rms_norm(
             &mut self.scratch.hidden,
             &layer.post_attention_layernorm,
             hidden,
@@ -1219,8 +1220,8 @@ impl<'a> MtpVerifier<'a> {
             self.scratch.hidden[i] = self.scratch.residual[i] + self.scratch.moe_out[i];
         }
 
-        // 5. Final MTP norm (plain RMSNorm)
-        rms_norm(
+        // 5. Final MTP norm (shifted RMSNorm)
+        qwen35_rms_norm(
             &mut self.scratch.hidden,
             &self.weights.norm_weight,
             hidden,
@@ -5201,6 +5202,239 @@ mod tests {
                  stale f16 dequant scratch is contaminating attention output"
             );
         }
+    }
+
+    /// Qwen3.5 checkpoints store every RMSNorm weight for the shifted convention
+    /// `x / rms(x) * (1 + gamma)`. This test compares two `forward_one` steps against a
+    /// test-local f64 reference written from that convention, on a fixture whose norm
+    /// weights centre negative and differ per site, so applying plain `gamma` at any one
+    /// of the seven norm sites moves the logits far outside the tolerance:
+    /// pre-fc embedding, pre-fc hidden, input layernorm, per-head q, per-head k,
+    /// post-attention layernorm and the final MTP norm.
+    ///
+    /// Step 1 attends to a single key, where the softmax is 1 whatever q and k are, so it
+    /// cannot see the q/k norms. Step 2 attends to two keys, so both q and k norms move
+    /// its scores.
+    #[test]
+    fn mtp_forward_one_applies_shifted_norm_convention_at_every_site() {
+        let cfg = tiny_mtp_config();
+        let (h, hd, nh, nkv) = (
+            cfg.hidden_size,
+            cfg.head_dim,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+        );
+        let (q_dim, kv_dim) = (nh * hd, nkv * hd);
+        let (moe_inter, shared_inter) = (
+            cfg.moe_intermediate_size,
+            cfg.shared_expert_intermediate_size,
+        );
+        assert_eq!((cfg.num_experts, cfg.num_experts_per_tok), (1, 1));
+
+        let gen_w = |n: usize, salt: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| scale * (i as f32 * 1.7 + salt as f32 * 2.3 + 0.4).sin())
+                .collect()
+        };
+        // Centred at -0.6 and non-uniform: `1 + gamma` is in [0.1, 0.7], plain `gamma` in
+        // [-0.9, -0.3], so the two conventions differ in sign and in shape per channel.
+        let gen_norm = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| -0.6 + 0.3 * (i as f32 * 2.1 + salt as f32 * 1.9 + 0.7).sin())
+                .collect()
+        };
+
+        let weights = MtpWeights {
+            fc_weight: gen_w(h * 2 * h, 1, 1.0),
+            layers: vec![MtpLayerWeights {
+                input_layernorm: gen_norm(h, 2),
+                post_attention_layernorm: gen_norm(h, 3),
+                self_attn: MtpAttentionWeights {
+                    q_proj: gen_w(2 * q_dim * h, 4, 1.0),
+                    k_proj: gen_w(kv_dim * h, 5, 1.0),
+                    v_proj: gen_w(kv_dim * h, 6, 1.0),
+                    o_proj: gen_w(h * q_dim, 7, 1.0),
+                    q_norm: gen_norm(hd, 8),
+                    k_norm: gen_norm(hd, 9),
+                },
+                mlp: MtpMoeWeights {
+                    router_gate: gen_w(h, 10, 1.0),
+                    experts_gate_up_proj: gen_w(2 * moe_inter * h, 11, 1.0),
+                    experts_down_proj: gen_w(h * moe_inter, 12, 1.0),
+                    shared_gate_proj: gen_w(shared_inter * h, 13, 1.0),
+                    shared_up_proj: gen_w(shared_inter * h, 14, 1.0),
+                    shared_down_proj: gen_w(h * shared_inter, 15, 1.0),
+                    shared_expert_gate: gen_w(h, 16, 1.0),
+                },
+            }],
+            norm_weight: gen_norm(h, 17),
+            pre_fc_norm_embedding_weight: gen_norm(h, 18),
+            pre_fc_norm_hidden_weight: gen_norm(h, 19),
+        };
+        let embed = gen_w(cfg.vocab_size * h, 20, 1.0);
+        let lm_head = gen_w(cfg.vocab_size * h, 21, 1.0);
+
+        // --- Test-local reference, f64, written from the shifted convention. ---
+        let eps = cfg.rms_norm_eps as f64;
+        let norm = |x: &[f64], gamma: &[f32]| -> Vec<f64> {
+            let inv = 1.0 / (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + eps).sqrt();
+            x.iter()
+                .zip(gamma)
+                .map(|(v, g)| v * inv * (1.0 + *g as f64))
+                .collect()
+        };
+        // y = W x, W row-major [rows, cols]
+        let matvec = |w: &[f32], rows: usize, cols: usize, x: &[f64]| -> Vec<f64> {
+            assert_eq!((w.len(), x.len()), (rows * cols, cols));
+            (0..rows)
+                .map(|r| (0..cols).map(|c| w[r * cols + c] as f64 * x[c]).sum())
+                .collect()
+        };
+        let sigmoid = |v: f64| 1.0 / (1.0 + (-v).exp());
+        let silu = |v: f64| v * sigmoid(v);
+        let rot = (hd as f32 * cfg.partial_rotary_factor) as usize;
+        // x * cos + rotate_half(x) * sin on the first `rot` dims, rotate_half(x) = [-x2, x1].
+        let rope = |x: &mut [f64], pos: usize| {
+            let half = rot / 2;
+            let orig = x[..rot].to_vec();
+            for i in 0..half {
+                let angle = pos as f64 * cfg.rope_theta.powf(-(2.0 * i as f64) / rot as f64);
+                let (s, c) = angle.sin_cos();
+                x[i] = orig[i] * c - orig[half + i] * s;
+                x[half + i] = orig[half + i] * c + orig[i] * s;
+            }
+        };
+        // The verifier stores K/V in an f16 cache; round the same way.
+        let f16r = |v: f64| half::f16::from_f32(v as f32).to_f32() as f64;
+        let mut kv_rows: Vec<(Vec<f64>, Vec<f64>)> = Vec::new();
+        let mut ref_step = |token: usize, pos: usize, prev: &[f32]| -> (Vec<f64>, Vec<f64>) {
+            let l = &weights.layers[0];
+            let emb: Vec<f64> = embed[token * h..(token + 1) * h]
+                .iter()
+                .map(|&v| v as f64)
+                .collect();
+            let prev: Vec<f64> = prev.iter().map(|&v| v as f64).collect();
+            let cat = [
+                norm(&emb, &weights.pre_fc_norm_embedding_weight),
+                norm(&prev, &weights.pre_fc_norm_hidden_weight),
+            ]
+            .concat();
+            let x = matvec(&weights.fc_weight, h, 2 * h, &cat);
+
+            let a = norm(&x, &l.input_layernorm);
+            let qg = matvec(&l.self_attn.q_proj, 2 * q_dim, h, &a);
+            let mut q = Vec::new();
+            let mut gate = Vec::new();
+            for head in 0..nh {
+                q.extend_from_slice(&qg[head * 2 * hd..head * 2 * hd + hd]);
+                gate.extend_from_slice(&qg[head * 2 * hd + hd..(head + 1) * 2 * hd]);
+            }
+            let mut k = matvec(&l.self_attn.k_proj, kv_dim, h, &a);
+            let v = matvec(&l.self_attn.v_proj, kv_dim, h, &a);
+            for head in 0..nh {
+                let n = norm(&q[head * hd..(head + 1) * hd], &l.self_attn.q_norm);
+                q[head * hd..(head + 1) * hd].copy_from_slice(&n);
+                rope(&mut q[head * hd..(head + 1) * hd], pos);
+            }
+            for head in 0..nkv {
+                let n = norm(&k[head * hd..(head + 1) * hd], &l.self_attn.k_norm);
+                k[head * hd..(head + 1) * hd].copy_from_slice(&n);
+                rope(&mut k[head * hd..(head + 1) * hd], pos);
+            }
+            kv_rows.push((
+                k.iter().map(|&t| f16r(t)).collect(),
+                v.iter().map(|&t| f16r(t)).collect(),
+            ));
+
+            let mut ctx = vec![0.0f64; q_dim];
+            for head in 0..nh {
+                let kvh = head / (nh / nkv);
+                let scores: Vec<f64> = kv_rows
+                    .iter()
+                    .map(|(kr, _)| {
+                        (0..hd)
+                            .map(|d| q[head * hd + d] * kr[kvh * hd + d])
+                            .sum::<f64>()
+                            / (hd as f64).sqrt()
+                    })
+                    .collect();
+                let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let z: f64 = e.iter().sum();
+                for d in 0..hd {
+                    let o: f64 = kv_rows
+                        .iter()
+                        .zip(&e)
+                        .map(|((_, vr), w)| w / z * vr[kvh * hd + d])
+                        .sum();
+                    ctx[head * hd + d] = o * sigmoid(gate[head * hd + d]);
+                }
+            }
+            let attn = matvec(&l.self_attn.o_proj, h, q_dim, &ctx);
+            let x1: Vec<f64> = x.iter().zip(&attn).map(|(r, a)| r + a).collect();
+
+            let m = norm(&x1, &l.post_attention_layernorm);
+            // One expert: router softmax is 1.0 and the top-1 renormalisation keeps it there.
+            let gu = matvec(&l.mlp.experts_gate_up_proj, 2 * moe_inter, h, &m);
+            let act: Vec<f64> = (0..moe_inter)
+                .map(|j| silu(gu[j]) * gu[moe_inter + j])
+                .collect();
+            let expert = matvec(&l.mlp.experts_down_proj, h, moe_inter, &act);
+            let sg = matvec(&l.mlp.shared_gate_proj, shared_inter, h, &m);
+            let su = matvec(&l.mlp.shared_up_proj, shared_inter, h, &m);
+            let sact: Vec<f64> = (0..shared_inter).map(|j| silu(sg[j]) * su[j]).collect();
+            let shared = matvec(&l.mlp.shared_down_proj, h, shared_inter, &sact);
+            let gate_scalar = sigmoid(
+                m.iter()
+                    .zip(&l.mlp.shared_expert_gate)
+                    .map(|(a, b)| a * *b as f64)
+                    .sum(),
+            );
+            let x2: Vec<f64> = (0..h)
+                .map(|i| x1[i] + expert[i] + gate_scalar * shared[i])
+                .collect();
+
+            let hidden = norm(&x2, &weights.norm_weight);
+            let logits = matvec(&lm_head, cfg.vocab_size, h, &hidden);
+            (logits, hidden)
+        };
+
+        let steps: [(u32, usize, [f32; 4]); 2] = [
+            (1, 0, [0.7, -1.2, 0.4, 1.6]),
+            (2, 1, [-0.9, 0.5, 1.3, -0.3]),
+        ];
+        let mut verifier = MtpVerifier::new(cfg.clone(), &weights, &embed, &lm_head, 8).unwrap();
+        const TOL_ABS: f64 = 1e-4;
+        const TOL_REL: f64 = 1e-4;
+        let mut worst = (0.0f64, String::new());
+        for (step, (token, pos, prev)) in steps.iter().enumerate() {
+            let out = verifier.forward_one(*token, *pos, prev).unwrap();
+            let (ref_logits, ref_hidden) = ref_step(*token as usize, *pos, prev);
+            for (name, got, want) in [
+                ("logits", &out.logits, &ref_logits),
+                ("hidden", &out.hidden, &ref_hidden),
+            ] {
+                assert_eq!(got.len(), want.len());
+                for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                    let err = (*g as f64 - w).abs();
+                    let ratio = err / (TOL_ABS + TOL_REL * w.abs());
+                    if ratio > worst.0 {
+                        worst = (
+                            ratio,
+                            format!(
+                                "step {} {name}[{i}]: verifier {g} vs shifted-convention reference {w} (|diff| {err:.3e})",
+                                step + 1
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            worst.0 <= 1.0,
+            "{}; a norm site is applying plain gamma instead of 1 + gamma",
+            worst.1
+        );
     }
 
     #[test]
