@@ -98,11 +98,11 @@ observations always record the actual invoked identity, never a value
 merely assumed from the profile.
 
 Raw JSONL observation schema (the contract; see `OBSERVATION_FIELDS` /
-`validate_observation`): schema version, git SHA, profile name, engine +
+`OPTIONAL_OBSERVATION_FIELDS` / `validate_observation`): schema version, git SHA, profile name, engine +
 version, model/quantization, prompt hash, requested and actual prompt/
 completion token counts, warmup/measured flag, run and order indices, the
 harness-measured elapsed nanoseconds, an optional engine-native nanosecond
-figure, a hardware identifier, and a timestamp. Reports render from this raw
+figure, a hardware identifier, a timestamp, and an optional scope string. Reports render from this raw
 data; they are not the source of truth.
 
 `trimmed_mean` aggregation reports `slope_ci95_legacy`: the pre-existing
@@ -234,6 +234,12 @@ OBSERVATION_FIELDS: dict[str, object] = {
     "engine_native_ns": (int, type(None)),
     "hardware_id": str,
     "timestamp": str,
+}
+
+# Fields added after the first v1 rows were written. Absent is accepted so
+# stored rows keep validating; present values are type-checked like any other
+# field. `SCHEMA_VERSION` stays 1 because the contract only grows additively.
+OPTIONAL_OBSERVATION_FIELDS: dict[str, object] = {
     "scope": (str, type(None)),
 }
 
@@ -286,21 +292,22 @@ def validate_observation(row: dict) -> None:
     if not isinstance(row, dict):
         raise ObservationValidationError(f"observation must be an object, got {type(row).__name__}")
 
-    extra = set(row) - set(OBSERVATION_FIELDS)
+    extra = set(row) - set(OBSERVATION_FIELDS) - set(OPTIONAL_OBSERVATION_FIELDS)
     if extra:
         raise ObservationValidationError(f"unexpected field(s): {sorted(extra)}")
     missing = set(OBSERVATION_FIELDS) - set(row)
     if missing:
         raise ObservationValidationError(f"missing required field(s): {sorted(missing)}")
 
-    for name, expected in OBSERVATION_FIELDS.items():
-        _check_field_type(name, row[name], expected)
+    for name, expected in {**OBSERVATION_FIELDS, **OPTIONAL_OBSERVATION_FIELDS}.items():
+        if name in row:
+            _check_field_type(name, row[name], expected)
 
     if row["schema_version"] != SCHEMA_VERSION:
         raise ObservationValidationError(
             f"schema_version {row['schema_version']!r} != supported {SCHEMA_VERSION}"
         )
-    if row["scope"] is not None and not row["scope"]:
+    if row.get("scope") is not None and not row["scope"]:
         raise ObservationValidationError("field 'scope' must be non-empty or null")
     for name in _NON_EMPTY_STRING_FIELDS:
         if not row[name]:
@@ -1086,7 +1093,7 @@ def _validate_worker_observations(profile: ProfileConfig, group: EngineRunGroup,
             or row["requested_completion_tokens"] != window
             or row["prompt_hash"] != prompt_hash(prompt)
             or row["order_index"] != index
-            or row["scope"] != (OLLAMA_SCOPE if group.name == "ollama" else None)
+            or row.get("scope") != (OLLAMA_SCOPE if group.name == "ollama" else None)
         ):
             raise RuntimeError(f"decode worker observation {index} does not match the requested schedule")
         if type(row["elapsed_ns"]) is not int or row["elapsed_ns"] < 0:

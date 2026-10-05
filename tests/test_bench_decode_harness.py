@@ -247,6 +247,62 @@ class ValidateObservationTest(unittest.TestCase):
         with self.assertRaisesRegex(harness.ObservationValidationError, "unexpected field"):
             harness.validate_observation(row)
 
+    def test_row_without_scope_validates(self):
+        row = _valid_observation()
+        del row["scope"]
+        harness.validate_observation(row)  # rows written before `scope` existed
+
+    def test_scope_string_and_null_accepted(self):
+        harness.validate_observation(_valid_observation(scope=harness.OLLAMA_SCOPE))
+        harness.validate_observation(_valid_observation(scope=None))
+
+    def test_empty_scope_rejected(self):
+        with self.assertRaisesRegex(harness.ObservationValidationError, "scope"):
+            harness.validate_observation(_valid_observation(scope=""))
+
+    def test_non_string_scope_rejected(self):
+        with self.assertRaisesRegex(harness.ObservationValidationError, "scope"):
+            harness.validate_observation(_valid_observation(scope=5))
+
+    def test_unknown_field_still_rejected_beside_optional_scope(self):
+        row = _valid_observation(scope=None, scope_extra="nope")
+        with self.assertRaisesRegex(harness.ObservationValidationError, "unexpected field"):
+            harness.validate_observation(row)
+
+    def test_missing_required_field_still_rejected_without_scope(self):
+        row = _valid_observation()
+        del row["scope"]
+        del row["model"]
+        with self.assertRaisesRegex(harness.ObservationValidationError, r"missing required field.*model"):
+            harness.validate_observation(row)
+
+    def test_worker_rows_keep_the_scope_comparison_for_their_group(self):
+        def rows_for(engine: str, scope):
+            profile = _profile(windows=[32, 256], measured_repeats=1, engines=[_engine(name=engine)])
+            rows = []
+            for index, window in enumerate((32, 256)):
+                row = _valid_observation(
+                    profile=profile.name,
+                    engine=engine,
+                    requested_completion_tokens=window,
+                    prompt_hash=harness.prompt_hash(profile.prompt),
+                    order_index=index,
+                )
+                if scope == "absent":
+                    del row["scope"]
+                else:
+                    row["scope"] = scope
+                rows.append(row)
+            return profile, rows
+
+        profile, rows = rows_for("ollama", harness.OLLAMA_SCOPE)
+        harness._validate_worker_observations(profile, profile.engine_groups[0], rows)
+        profile, rows = rows_for("ollama", "absent")
+        with self.assertRaisesRegex(RuntimeError, "does not match the requested schedule"):
+            harness._validate_worker_observations(profile, profile.engine_groups[0], rows)
+        profile, rows = rows_for("fake", "absent")
+        harness._validate_worker_observations(profile, profile.engine_groups[0], rows)
+
     def test_wrong_schema_version_rejected(self):
         row = _valid_observation(schema_version=999)
         with self.assertRaisesRegex(harness.ObservationValidationError, "schema_version"):
