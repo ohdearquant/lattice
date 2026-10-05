@@ -186,9 +186,9 @@ impl CompiledGrammar {
         self.rules.len()
     }
 
-    /// Return the root rule (index 0).
-    pub fn root(&self) -> &Rule {
-        &self.rules[0]
+    /// Return the root rule (index 0), or `None` when the grammar has no rules.
+    pub fn root(&self) -> Option<&Rule> {
+        self.rules.first()
     }
 }
 
@@ -2099,5 +2099,21 @@ mod tests {
         // subsequent collapse into the dangling ancestor.
         let result = advance_byte(&mut state, &grammar, b'x');
         assert_eq!(result, StepResult::Accepted);
+    }
+
+    #[test]
+    fn root_is_rule_zero_when_present() {
+        let grammar = ab_grammar();
+
+        let root = grammar.root().expect("a grammar with rules has a root");
+
+        assert_eq!(root.name, "root");
+    }
+
+    #[test]
+    fn root_of_a_grammar_without_rules_is_none() {
+        let grammar = GrammarBuilder::new().build();
+
+        assert!(grammar.root().is_none());
     }
 }
