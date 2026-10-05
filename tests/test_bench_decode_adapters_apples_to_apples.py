@@ -229,9 +229,9 @@ class CallScheduleContractTest(unittest.TestCase):
         for obs in result.observations:
             harness.validate_observation(obs.to_dict())
 
-    def test_missing_engine_binary_falls_back_to_allow_missing_engine(self):
+    def test_missing_engine_adapter_falls_back_to_allow_missing_engine(self):
         # Reproduces the wrapper script's --allow-missing-engine usage: an
-        # engine with no adapter registered (e.g. lattice not built) is
+        # engine with no adapter registered (e.g. lattice model unavailable) is
         # skipped, not fatal, matching the legacy script's per-engine
         # graceful skip.
         profile = self.profiles["apples_to_apples_q8"]
@@ -426,43 +426,40 @@ class OllamaResponseParsingTest(unittest.TestCase):
 
 
 class AvailabilityCheckTest(unittest.TestCase):
-    def test_lattice_available_false_when_binary_missing(self):
+    def test_lattice_unavailable_when_model_directory_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
-            missing = Path(tmp) / "bench_decode_ab"
-            self.assertFalse(adapters.lattice_available(missing))
+            missing = Path(tmp) / "model"
+            with mock.patch.object(adapters, "Q8_MODEL_DIR", missing):
+                self.assertFalse(adapters.lattice_available())
 
-    def test_lattice_available_true_when_binary_executable(self):
+    def test_lattice_available_when_model_directory_exists_without_prebuilt_binary(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bin_path = Path(tmp) / "bench_decode_ab"
-            bin_path.write_text("#!/bin/sh\n")
-            bin_path.chmod(0o755)
-            self.assertTrue(adapters.lattice_available(bin_path))
+            model_dir = Path(tmp) / "model"
+            model_dir.mkdir()
+            with mock.patch.object(adapters, "Q8_MODEL_DIR", model_dir):
+                self.assertTrue(adapters.lattice_available())
 
-    def test_ollama_available_false_when_binary_not_on_path(self):
-        with mock.patch.object(adapters.shutil, "which", return_value=None):
+    def test_ollama_unavailable_when_loopback_server_is_unreachable(self):
+        with mock.patch.object(
+            adapters.urllib.request,
+            "urlopen",
+            side_effect=adapters.urllib.error.URLError("connection refused"),
+        ):
             self.assertFalse(adapters.ollama_available(model_tag="qwen3.5:0.8b"))
 
-    @unittest.skipUnless(
-        importlib.util.find_spec("mlx_lm") is not None,
-        "asserts the import-success case, so mlx_lm must be installed "
-        "(macOS-only dependency; skipped on Linux CI)",
-    )
-    def test_mlx_available_reflects_import_success(self):
-        # mlx_lm is a declared project dependency (pyproject.toml); this
-        # documents the expectation rather than mocking import machinery.
-        self.assertTrue(adapters.mlx_available())
+    def test_mlx_adapter_can_be_registered_without_importing_mlx(self):
+        self.assertTrue(callable(adapters.MlxAdapter().run))
 
 
 # --------------------------------------------------------------------------
-# Model-aware --allow-missing-engine: binary present + model dir absent must
-# reproduce the legacy per-engine graceful skip, not raise mid-run.
+# Model-aware --allow-missing-engine: an absent model dir is skipped before
+# the per-observation handoff; build and admission failures remain fatal.
 # --------------------------------------------------------------------------
 
 
 class LatticeModelAwareAvailabilityTest(unittest.TestCase):
-    """Real-adapter coverage: a present, executable binary with a missing
-    model directory must (a) make the real `LatticeAdapter.run()` raise
-    cleanly (defense in depth, unchanged), and (b) make the REGISTRATION
+    """Real-adapter coverage: a missing model directory must (a) make the
+    real `LatticeAdapter.run()` raise cleanly and (b) make REGISTRATION
     decision skip lattice entirely for the profile that needs that model,
     so `--allow-missing-engine` actually engages instead of a
     `LatticeUnavailableError` aborting the tier mid-run.
@@ -473,13 +470,9 @@ class LatticeModelAwareAvailabilityTest(unittest.TestCase):
         _, cls.profiles = harness.load_profiles_file(DEFAULT_PROFILES_FILE)
 
     def test_lattice_adapter_run_raises_when_model_dir_missing(self):
-        # The literal "binary present, model dir absent" scenario, exercised
-        # against the REAL LatticeAdapter (not a fake).
+        # The missing-model scenario is exercised against the real adapter.
         with tempfile.TemporaryDirectory() as tmp:
-            bin_path = Path(tmp) / "bench_decode_ab"
-            bin_path.write_text("#!/bin/sh\necho should-not-run\n")
-            bin_path.chmod(0o755)
-            adapter = adapters.LatticeAdapter(bin_path=bin_path, tokenizer_dir=Path(tmp))
+            adapter = adapters.LatticeAdapter(tokenizer_dir=Path(tmp))
             missing_dir = Path(tmp) / "does-not-exist"
             with mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"qwen3.5-0.8b": missing_dir}):
                 with self.assertRaises(adapters.LatticeUnavailableError):
@@ -490,45 +483,38 @@ class LatticeModelAwareAvailabilityTest(unittest.TestCase):
     def test_registration_status_skips_when_profile_model_dir_missing(self):
         profile = self.profiles["apples_to_apples_q8"]
         with tempfile.TemporaryDirectory() as tmp:
-            bin_path = Path(tmp) / "bench_decode_ab"
-            bin_path.write_text("#!/bin/sh\n")
-            bin_path.chmod(0o755)
             missing_dir = Path(tmp) / "does-not-exist"
             with mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"qwen3.5-0.8b": missing_dir}):
-                should_register, missing = adapters.lattice_registration_status(profile, bin_path=bin_path)
+                should_register, missing = adapters.lattice_registration_status(profile)
         self.assertFalse(should_register)
         self.assertEqual(missing, (missing_dir,))
 
-    def test_registration_status_registers_when_binary_and_model_dir_present(self):
+    def test_registration_status_registers_when_model_dir_present(self):
         profile = self.profiles["apples_to_apples_q8"]
         with tempfile.TemporaryDirectory() as tmp:
-            bin_path = Path(tmp) / "bench_decode_ab"
-            bin_path.write_text("#!/bin/sh\n")
-            bin_path.chmod(0o755)
             model_dir = Path(tmp) / "model"
             model_dir.mkdir()
             with mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"qwen3.5-0.8b": model_dir}):
-                should_register, missing = adapters.lattice_registration_status(profile, bin_path=bin_path)
+                should_register, missing = adapters.lattice_registration_status(profile)
         self.assertTrue(should_register)
         self.assertEqual(missing, ())
 
-    def test_registration_status_false_when_binary_missing_even_if_model_present(self):
+    def test_registration_status_registers_with_model_and_no_prebuilt_binary(self):
         profile = self.profiles["apples_to_apples_q8"]
         with tempfile.TemporaryDirectory() as tmp:
-            bin_path = Path(tmp) / "bench_decode_ab"  # never created
             model_dir = Path(tmp) / "model"
             model_dir.mkdir()
             with mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"qwen3.5-0.8b": model_dir}):
-                should_register, missing = adapters.lattice_registration_status(profile, bin_path=bin_path)
-        self.assertFalse(should_register)
-        self.assertEqual(missing, ())  # binary check fails before model dirs are even inspected
+                should_register, missing = adapters.lattice_registration_status(profile)
+        self.assertTrue(should_register)
+        self.assertEqual(missing, ())
 
-    def test_registration_status_falls_back_to_binary_only_when_profile_unknown(self):
+    def test_registration_status_checks_default_model_when_profile_unknown(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bin_path = Path(tmp) / "bench_decode_ab"
-            bin_path.write_text("#!/bin/sh\n")
-            bin_path.chmod(0o755)
-            should_register, missing = adapters.lattice_registration_status(None, bin_path=bin_path)
+            model_dir = Path(tmp) / "model"
+            model_dir.mkdir()
+            with mock.patch.object(adapters, "Q8_MODEL_DIR", model_dir):
+                should_register, missing = adapters.lattice_registration_status(None)
         self.assertTrue(should_register)
         self.assertEqual(missing, ())
 
@@ -544,7 +530,7 @@ class LatticeModelAwareAvailabilityTest(unittest.TestCase):
             bin_path.chmod(0o755)
             missing_dir = Path(tmp) / "does-not-exist"
             with mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"qwen3.5-0.8b": missing_dir}):
-                should_register, _missing = adapters.lattice_registration_status(profile, bin_path=bin_path)
+                should_register, _missing = adapters.lattice_registration_status(profile)
         self.assertFalse(should_register)
         result = harness.run_profile(
             profile,
@@ -590,28 +576,18 @@ class RegisterAvailableAdaptersEndToEndTest(unittest.TestCase):
         )
         return profiles_file
 
-    def _make_binary(self, tmp: Path) -> Path:
-        bin_path = tmp / "bench_decode_ab"
-        bin_path.write_text("#!/bin/sh\n")
-        bin_path.chmod(0o755)
-        return bin_path
-
     def setUp(self):
         # register_available_adapters() mutates the module-global registry
         # -- isolate this test class from it and from every other test.
         self._registry_backup = dict(harness.ADAPTER_REGISTRY)
         harness.ADAPTER_REGISTRY.clear()
         self.addCleanup(self._restore_registry)
-        # Real ollama/mlx probing does real subprocess/import work that is
-        # unrelated to what this class covers (the lattice argv-peek path)
+        # Real Ollama preflight does subprocess work unrelated to this class.
         # -- stub both out so this stays fast and hermetic, matching this
         # file's own no-binary/no-network design (see module docstring).
         patcher_ollama = mock.patch.object(adapters, "ollama_available", return_value=False)
-        patcher_mlx = mock.patch.object(adapters, "mlx_available", return_value=False)
         patcher_ollama.start()
-        patcher_mlx.start()
         self.addCleanup(patcher_ollama.stop)
-        self.addCleanup(patcher_mlx.stop)
 
     def _restore_registry(self):
         harness.ADAPTER_REGISTRY.clear()
@@ -621,10 +597,8 @@ class RegisterAvailableAdaptersEndToEndTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_s:
             tmp = Path(tmp_s)
             profiles_file = self._write_solo_lattice_profile(tmp)
-            bin_path = self._make_binary(tmp)
             missing_dir = tmp / "does-not-exist"
             with (
-                mock.patch.object(adapters, "LAT_BIN", bin_path),
                 mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"test-model": missing_dir}),
             ):
                 adapters.register_available_adapters(
@@ -636,11 +610,9 @@ class RegisterAvailableAdaptersEndToEndTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_s:
             tmp = Path(tmp_s)
             profiles_file = self._write_solo_lattice_profile(tmp)
-            bin_path = self._make_binary(tmp)
             model_dir = tmp / "model"
             model_dir.mkdir()
             with (
-                mock.patch.object(adapters, "LAT_BIN", bin_path),
                 mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"test-model": model_dir}),
             ):
                 adapters.register_available_adapters(
@@ -654,10 +626,8 @@ class RegisterAvailableAdaptersEndToEndTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_s:
             tmp = Path(tmp_s)
             profiles_file = self._write_solo_lattice_profile(tmp)
-            bin_path = self._make_binary(tmp)
             missing_dir = tmp / "does-not-exist"
             with (
-                mock.patch.object(adapters, "LAT_BIN", bin_path),
                 mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"test-model": missing_dir}),
             ):
                 adapters.register_available_adapters(
@@ -672,11 +642,9 @@ class RegisterAvailableAdaptersEndToEndTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_s:
             tmp = Path(tmp_s)
             profiles_file = self._write_solo_lattice_profile(tmp)
-            bin_path = self._make_binary(tmp)
             model_dir = tmp / "model"
             model_dir.mkdir()
             with (
-                mock.patch.object(adapters, "LAT_BIN", bin_path),
                 mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"test-model": model_dir}),
             ):
                 adapters.register_available_adapters(
@@ -684,21 +652,16 @@ class RegisterAvailableAdaptersEndToEndTest(unittest.TestCase):
                 )
         self.assertIn("lattice", harness.ADAPTER_REGISTRY)
 
-    def test_peek_falls_back_to_binary_only_when_profile_omitted(self):
+    def test_peek_falls_back_to_default_model_when_profile_omitted(self):
         # No --profile at all: _peek_requested_profile can't resolve a
-        # profile (harness.main() itself would later fail closed on the
-        # missing required argument), so registration falls back to
-        # binary-only availability -- the pre-fix behavior -- rather than
-        # silently never registering lattice for an unrecognized invocation.
+        # profile, so registration checks the default model directory rather
+        # than silently omitting lattice for an unrecognized invocation.
         with tempfile.TemporaryDirectory() as tmp_s:
             tmp = Path(tmp_s)
             profiles_file = self._write_solo_lattice_profile(tmp)
-            bin_path = self._make_binary(tmp)
-            missing_dir = tmp / "does-not-exist"
-            with (
-                mock.patch.object(adapters, "LAT_BIN", bin_path),
-                mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"test-model": missing_dir}),
-            ):
+            default_model = tmp / "default-model"
+            default_model.mkdir()
+            with mock.patch.object(adapters, "Q8_MODEL_DIR", default_model):
                 adapters.register_available_adapters(["run", "--profiles-file", str(profiles_file)])
         self.assertIn("lattice", harness.ADAPTER_REGISTRY)
 

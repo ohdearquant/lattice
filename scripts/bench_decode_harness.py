@@ -122,14 +122,21 @@ import argparse
 import dataclasses
 import hashlib
 import importlib
+import importlib.util
+import inspect
 import json
 import math
 import os
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
 import time
+import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -147,17 +154,6 @@ except ImportError:
     raise SystemExit(_PYTHON_REQUIREMENT_ERROR) from None
 if sys.version_info[:2] < (3, 11):
     raise SystemExit(_PYTHON_REQUIREMENT_ERROR)
-
-if (
-    __name__ == "__main__"
-    and len(sys.argv) > 1
-    and sys.argv[1] == "run"
-    and not {"-h", "--help"}.intersection(sys.argv[2:])
-):
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-    from bench_supervision import ensure_python_entrypoint
-
-    ensure_python_entrypoint("decode-harness", quiet=True)
 
 sys.modules.setdefault("bench_decode_harness", sys.modules[__name__])
 
@@ -238,6 +234,7 @@ OBSERVATION_FIELDS: dict[str, object] = {
     "engine_native_ns": (int, type(None)),
     "hardware_id": str,
     "timestamp": str,
+    "scope": (str, type(None)),
 }
 
 _NON_EMPTY_STRING_FIELDS = (
@@ -273,6 +270,7 @@ class Observation:
     engine_native_ns: int | None
     hardware_id: str
     timestamp: str
+    scope: str | None = None
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -302,6 +300,8 @@ def validate_observation(row: dict) -> None:
         raise ObservationValidationError(
             f"schema_version {row['schema_version']!r} != supported {SCHEMA_VERSION}"
         )
+    if row["scope"] is not None and not row["scope"]:
+        raise ObservationValidationError("field 'scope' must be non-empty or null")
     for name in _NON_EMPTY_STRING_FIELDS:
         if not row[name]:
             raise ObservationValidationError(f"field {name!r} must be non-empty")
@@ -887,6 +887,7 @@ class AdapterRunResult:
     actual_model: str | None = None
     actual_quantization: str | None = None
     component_ns: Mapping[int, int] | None = None
+    scope: str | None = None
 
 
 class EngineAdapter(Protocol):
@@ -905,6 +906,469 @@ def register_adapter(name: str, adapter: EngineAdapter) -> None:
     ADAPTER_REGISTRY[name] = adapter
 
 
+OLLAMA_SCOPE = "external server; only request interval and unload/check ran under the locks"
+WORKER_PROTOCOL_VERSION = 1
+LATTICE_HANDOFF_ARGV = [
+    "--gpu-handoff", "--durable", "--label", "UNIQUE_LABEL", "--", "cargo", "run", "--locked",
+    "--release", "-p", "lattice-inference", "--bin", "bench_decode_ab", "--features", "metal-gpu,f16",
+]
+
+
+def run_lattice_handoff(env: Mapping[str, str]) -> subprocess.CompletedProcess[str]:
+    command = [str((REPO_ROOT / "scripts" / "bench-command.sh").resolve()), *LATTICE_HANDOFF_ARGV]
+    command[4] = f"decode-lattice-{uuid.uuid4().hex}"
+    return subprocess.run(command, cwd=REPO_ROOT, env=dict(env), capture_output=True, text=True, check=False)
+
+
+def validate_ollama_url(base_url: str) -> str:
+    parsed = urllib.parse.urlsplit(base_url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("LATTICE_BENCH_OLLAMA_URL must be an http loopback URL")
+    return f"http://{parsed.netloc}"
+
+
+def ollama_model_available(base_url: str, model_tag: str, *, pull_if_missing: bool = False) -> bool:
+    """Check the configured Ollama server for a model, optionally pulling it when absent."""
+    base_url = validate_ollama_url(base_url)
+
+    def listed_models() -> set[str] | None:
+        try:
+            with urllib.request.urlopen(f"{base_url}/api/tags", timeout=3) as response:
+                data = json.loads(response.read())
+        except (OSError, ValueError, urllib.error.URLError):
+            return None
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            return None
+        names: set[str] = set()
+        for model in models:
+            if isinstance(model, dict):
+                names.update(value for value in (model.get("name"), model.get("model")) if isinstance(value, str))
+        return names
+
+    names = listed_models()
+    if names is None:
+        return False
+    if model_tag in names:
+        return True
+    if not pull_if_missing or shutil.which("ollama") is None:
+        return False
+
+    env = os.environ.copy()
+    env["OLLAMA_HOST"] = base_url
+    try:
+        listed = subprocess.run(
+            ["ollama", "list"], capture_output=True, text=True, timeout=30, check=False, env=env
+        )
+        if listed.returncode != 0:
+            return False
+        if model_tag not in listed.stdout:
+            pulled = subprocess.run(
+                ["ollama", "pull", model_tag], capture_output=True, text=True, timeout=600, check=False, env=env
+            )
+            if pulled.returncode != 0:
+                return False
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    names = listed_models()
+    return names is not None and model_tag in names
+
+
+def _wire_group(group: EngineRunGroup) -> dict:
+    return {
+        "name": group.name,
+        "warmup_repeats": group.warmup_repeats,
+        "warmup_tokens": group.warmup_tokens,
+        "warmup_prompt": group.warmup_prompt,
+        "model": group.model,
+        "quantization": group.quantization,
+        "measured_calls": None if group.measured_calls is None else [dataclasses.asdict(call) for call in group.measured_calls],
+        "measured_order": group.measured_order,
+        "measured_prompt": group.measured_prompt,
+    }
+
+
+def _wire_profile(profile: ProfileConfig, group: EngineRunGroup) -> dict:
+    return {
+        "name": profile.name,
+        "description": profile.description,
+        "windows": list(profile.windows),
+        "measured_repeats": profile.measured_repeats,
+        "engine_groups": [_wire_group(group)],
+        "prompt": profile.prompt,
+        "aggregation": profile.aggregation,
+        "trim": profile.trim,
+        "requested_prompt_tokens": profile.requested_prompt_tokens,
+    }
+
+
+def _adapter_wire(adapter: EngineAdapter) -> dict:
+    cls = type(adapter)
+    values = vars(adapter)
+    kwargs: dict[str, object] = {}
+    for name, parameter in inspect.signature(cls.__init__).parameters.items():
+        if name == "self":
+            continue
+        if name not in values:
+            if parameter.default is inspect.Parameter.empty:
+                raise RuntimeError(f"worker adapter {cls.__name__} has no serializable value for {name}")
+            continue
+        value = values[name]
+        if isinstance(value, Path):
+            value = str(value.resolve())
+        if value is not None and type(value) not in (str, int, float, bool):
+            raise RuntimeError(f"worker adapter {cls.__name__}.{name} is not JSON serializable")
+        kwargs[name] = value
+    return {"module": cls.__module__, "class": cls.__name__, "kwargs": kwargs}
+
+
+def prepare_worker_prompt(adapter: EngineAdapter, context_tokens: int) -> tuple[str, int] | None:
+    result = _launch_plain_worker(
+        {
+            "protocol_version": WORKER_PROTOCOL_VERSION,
+            "operation": "prepare_prompt",
+            "engine": "mlx",
+            "profile": None,
+            "group": None,
+            "adapter": _adapter_wire(adapter),
+            "prepared_prompt_tokens": None,
+            "prompt_context": context_tokens,
+        },
+        label=f"decode-mlx-prompt-{uuid.uuid4().hex[:12]}",
+    )
+    if result["status"] == "missing":
+        return None
+    prompt = result["prepared_prompt"]
+    count = result["prompt_tokens"]
+    if not prompt or type(count) is not int or count < context_tokens:
+        raise RuntimeError("MLX prompt worker returned an invalid padded prompt")
+    return prompt, count
+
+
+def _group_schedule(profile: ProfileConfig, group: EngineRunGroup) -> list[tuple[bool, int, int, str]]:
+    expected: list[tuple[bool, int, int, str]] = []
+    if group.warmup_repeats:
+        prompt = group.warmup_prompt if group.warmup_prompt is not None else profile.prompt
+        expected.extend((True, n, group.warmup_tokens, prompt) for n in range(1, group.warmup_repeats + 1))
+    calls = group.measured_calls or tuple(MeasuredCall(n_tokens=w, yields_windows=(w,)) for w in profile.windows)
+    prompt = group.measured_prompt if group.measured_prompt is not None else profile.prompt
+    if group.measured_order == "repeat_major":
+        sequence = ((call, n) for n in range(1, profile.measured_repeats + 1) for call in calls)
+    else:
+        sequence = ((call, n) for call in calls for n in range(1, profile.measured_repeats + 1))
+    for call, n in sequence:
+        expected.extend((False, n, window, prompt) for window in call.yields_windows)
+    return expected
+
+
+def _validate_worker_observations(profile: ProfileConfig, group: EngineRunGroup, rows: object) -> tuple[Observation, ...]:
+    if not isinstance(rows, list):
+        raise RuntimeError("decode worker observations must be an array")
+    schedule = _group_schedule(profile, group)
+    if len(rows) != len(schedule):
+        raise RuntimeError(f"decode worker returned {len(rows)} observations; expected {len(schedule)}")
+    observations = []
+    for index, (row, (warmup, run_index, window, prompt)) in enumerate(zip(rows, schedule, strict=True)):
+        validate_observation(row)
+        if (
+            row["profile"] != profile.name
+            or row["engine"] != group.name
+            or row["warmup"] is not warmup
+            or row["run_index"] != run_index
+            or row["requested_completion_tokens"] != window
+            or row["prompt_hash"] != prompt_hash(prompt)
+            or row["order_index"] != index
+            or row["scope"] != (OLLAMA_SCOPE if group.name == "ollama" else None)
+        ):
+            raise RuntimeError(f"decode worker observation {index} does not match the requested schedule")
+        if type(row["elapsed_ns"]) is not int or row["elapsed_ns"] < 0:
+            raise RuntimeError(f"decode worker observation {index} has invalid elapsed_ns")
+        native = row["engine_native_ns"]
+        if native is not None and (type(native) is not int or native < 0):
+            raise RuntimeError(f"decode worker observation {index} has invalid engine_native_ns")
+        observations.append(Observation(**row))
+    return tuple(observations)
+
+
+def _validate_worker_result(result: object) -> dict:
+    keys = {"result_version", "status", "reason", "observations", "metadata", "prepared_prompt", "prompt_tokens"}
+    if not isinstance(result, dict) or set(result) != keys:
+        raise RuntimeError("decode worker result has invalid fields")
+    if type(result["result_version"]) is not int or result["result_version"] != WORKER_PROTOCOL_VERSION:
+        raise RuntimeError("decode worker result has an unsupported version")
+    if result["status"] not in {"ok", "missing"}:
+        raise RuntimeError("decode worker result has an invalid status")
+    if result["reason"] is not None and not isinstance(result["reason"], str):
+        raise RuntimeError("decode worker reason must be a string or null")
+    if not isinstance(result["observations"], list) or not isinstance(result["metadata"], dict):
+        raise RuntimeError("decode worker result observations or metadata have an invalid type")
+    if set(result["metadata"]) - {"ollama_breakdowns", "scope", "unload_confirmed"}:
+        raise RuntimeError("decode worker metadata has unexpected fields")
+    if "scope" in result["metadata"] and result["metadata"]["scope"] != OLLAMA_SCOPE:
+        raise RuntimeError("decode worker scope is invalid")
+    if "unload_confirmed" in result["metadata"] and result["metadata"]["unload_confirmed"] is not True:
+        raise RuntimeError("decode worker unload confirmation is invalid")
+    if "ollama_breakdowns" in result["metadata"]:
+        breakdowns = result["metadata"]["ollama_breakdowns"]
+        fields = {"load_ms", "prompt_eval_ms", "eval_ms", "prompt_eval_count"}
+        if not isinstance(breakdowns, list):
+            raise RuntimeError("decode worker Ollama breakdowns must be an array")
+        for breakdown in breakdowns:
+            if not isinstance(breakdown, dict) or set(breakdown) != fields:
+                raise RuntimeError("decode worker Ollama breakdown has invalid fields")
+            for field, value in breakdown.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                    raise RuntimeError(f"decode worker Ollama breakdown {field} is invalid")
+    if result["status"] == "missing":
+        if not result["reason"] or result["observations"] or result["metadata"]:
+            raise RuntimeError("missing decode worker result has inconsistent contents")
+    elif result["reason"] is not None:
+        raise RuntimeError("successful decode worker result must have a null reason")
+    if result["prepared_prompt"] is not None and not isinstance(result["prepared_prompt"], str):
+        raise RuntimeError("decode worker prepared_prompt must be a string or null")
+    if result["prompt_tokens"] is not None and (type(result["prompt_tokens"]) is not int or result["prompt_tokens"] < 1):
+        raise RuntimeError("decode worker prompt_tokens must be a positive int or null")
+    return result
+
+
+def _launch_plain_worker(request: dict, *, label: str) -> dict:
+    cache = REPO_ROOT / ".cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    request_path = cache / f"decode-worker-{token}.json"
+    result_path = cache / f"decode-worker-{token}-result.json"
+    request = {**request, "result_path": str(result_path.resolve())}
+    request_path.write_text(json.dumps(request, separators=(",", ":")) + "\n")
+    command = [
+        str((REPO_ROOT / "scripts" / "bench-command.sh").resolve()), "--durable", "--label", label, "--",
+        str(Path(sys.executable).resolve()), str(Path(__file__).resolve()), "worker", "--request", str(request_path.resolve()),
+    ]
+    try:
+        proc = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"decode worker supervisor exited {proc.returncode}: {proc.stderr[-2000:]}")
+        # The after-probe is part of the supervisor result: don't inspect rows before this status is zero.
+        return _validate_worker_result(json.loads(result_path.read_text()))
+    finally:
+        request_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
+
+
+def _require_worker_keys(value: object, keys: set[str], where: str) -> dict:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError(f"decode worker {where} has invalid fields")
+    return value
+
+
+def _read_worker_profile(raw: object) -> ProfileConfig:
+    keys = {"name", "description", "windows", "measured_repeats", "engine_groups", "prompt", "aggregation", "trim", "requested_prompt_tokens"}
+    item = _require_worker_keys(raw, keys, "profile")
+    for name in ("name", "description", "prompt", "aggregation"):
+        if not isinstance(item[name], str):
+            raise ValueError(f"decode worker profile {name} must be a string")
+    if not isinstance(item["windows"], list) or any(type(x) is not int for x in item["windows"]):
+        raise ValueError("decode worker profile windows must be an integer array")
+    if type(item["measured_repeats"]) is not int or type(item["trim"]) is not int:
+        raise ValueError("decode worker profile counts must be integers")
+    prompt_tokens = item["requested_prompt_tokens"]
+    if prompt_tokens is not None and type(prompt_tokens) is not int:
+        raise ValueError("decode worker requested_prompt_tokens must be an integer or null")
+    if not isinstance(item["engine_groups"], list) or len(item["engine_groups"]) != 1:
+        raise ValueError("decode worker profile must contain one engine group")
+    group = _read_worker_group(item["engine_groups"][0])
+    return ProfileConfig(
+        name=item["name"], description=item["description"], windows=tuple(item["windows"]),
+        measured_repeats=item["measured_repeats"], engine_groups=(group,), prompt=item["prompt"],
+        aggregation=item["aggregation"], trim=item["trim"], requested_prompt_tokens=prompt_tokens,
+    )
+
+
+def _read_worker_group(raw: object) -> EngineRunGroup:
+    keys = {"name", "warmup_repeats", "warmup_tokens", "warmup_prompt", "model", "quantization", "measured_calls", "measured_order", "measured_prompt"}
+    item = _require_worker_keys(raw, keys, "group")
+    for name in ("name", "model", "quantization", "measured_order"):
+        if not isinstance(item[name], str):
+            raise ValueError(f"decode worker group {name} must be a string")
+    for name in ("warmup_prompt", "measured_prompt"):
+        if item[name] is not None and not isinstance(item[name], str):
+            raise ValueError(f"decode worker group {name} must be a string or null")
+    if type(item["warmup_repeats"]) is not int:
+        raise ValueError("decode worker warmup_repeats must be an integer")
+    if item["warmup_tokens"] is not None and type(item["warmup_tokens"]) is not int:
+        raise ValueError("decode worker warmup_tokens must be an integer or null")
+    calls = item["measured_calls"]
+    if calls is not None:
+        if not isinstance(calls, list):
+            raise ValueError("decode worker measured_calls must be an array or null")
+        parsed = []
+        for call in calls:
+            call = _require_worker_keys(call, {"n_tokens", "yields_windows"}, "measured call")
+            if type(call["n_tokens"]) is not int or not isinstance(call["yields_windows"], list) or any(type(x) is not int for x in call["yields_windows"]):
+                raise ValueError("decode worker measured call has invalid token fields")
+            parsed.append(MeasuredCall(call["n_tokens"], tuple(call["yields_windows"])))
+        calls = tuple(parsed)
+    return EngineRunGroup(
+        name=item["name"], warmup_repeats=item["warmup_repeats"], warmup_tokens=item["warmup_tokens"],
+        warmup_prompt=item["warmup_prompt"], model=item["model"], quantization=item["quantization"],
+        measured_calls=calls, measured_order=item["measured_order"], measured_prompt=item["measured_prompt"],
+    )
+
+
+def _atomic_worker_result(path: Path, *, status: str, reason: str | None = None,
+                          observations: list[dict] | None = None, metadata: dict | None = None,
+                          prepared_prompt: str | None = None, prompt_tokens: int | None = None) -> None:
+    payload = {
+        "result_version": WORKER_PROTOCOL_VERSION,
+        "status": status,
+        "reason": reason,
+        "observations": observations or [],
+        "metadata": metadata or {},
+        "prepared_prompt": prepared_prompt,
+        "prompt_tokens": prompt_tokens,
+    }
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+    temporary.replace(path)
+
+
+class _TrackedAdapter:
+    def __init__(self, adapter: EngineAdapter):
+        self.adapter = adapter
+        self.started = False
+
+    def run(self, **kwargs) -> AdapterRunResult:
+        self.started = True
+        return self.adapter.run(**kwargs)
+
+
+def run_decode_worker(request_path: Path) -> int:
+    """Child entry for versioned group requests. Called only under a plain durable launch."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from bench_supervision import sample_measurement_handoff
+
+    _, pipe_fd, _ = sample_measurement_handoff()
+    os.close(pipe_fd)
+    keys = {"protocol_version", "operation", "engine", "profile", "group", "adapter", "prepared_prompt_tokens", "prompt_context", "result_path"}
+    request = _require_worker_keys(json.loads(request_path.read_text()), keys, "request")
+    if type(request["protocol_version"]) is not int or request["protocol_version"] != WORKER_PROTOCOL_VERSION:
+        raise ValueError("decode worker request has an unsupported version")
+    if request["operation"] not in {"group", "prepare_prompt"}:
+        raise ValueError("decode worker operation is invalid")
+    engine = request["engine"]
+    if engine not in {"mlx", "ollama"} and request["operation"] == "group":
+        raise ValueError("decode worker only accepts MLX or Ollama groups")
+    result_path = Path(request["result_path"]).resolve()
+    try:
+        result_path.relative_to((REPO_ROOT / ".cache").resolve())
+    except ValueError as exc:
+        raise ValueError("decode worker result path must be inside repository .cache") from exc
+    adapter_spec = _require_worker_keys(request["adapter"], {"module", "class", "kwargs"}, "adapter")
+    if not isinstance(adapter_spec["module"], str) or not adapter_spec["module"].startswith("bench_decode_adapters_"):
+        raise ValueError("decode worker adapter module is invalid")
+    if not isinstance(adapter_spec["class"], str) or not isinstance(adapter_spec["kwargs"], dict):
+        raise ValueError("decode worker adapter class or kwargs are invalid")
+    if any(not isinstance(k, str) or (v is not None and type(v) not in (str, int, float, bool)) for k, v in adapter_spec["kwargs"].items()):
+        raise ValueError("decode worker adapter kwargs have invalid types")
+    if request["operation"] == "prepare_prompt":
+        context = request["prompt_context"]
+        if type(context) is not int or context < 1 or request["engine"] != "mlx":
+            raise ValueError("decode worker prompt preparation request is invalid")
+    else:
+        if request["prompt_context"] is not None or request["profile"] is None or request["group"] is None:
+            raise ValueError("decode worker group request is invalid")
+    module = importlib.import_module(adapter_spec["module"])
+    adapter_type = getattr(module, adapter_spec["class"], None)
+    if not isinstance(adapter_type, type) or adapter_type.__module__ != adapter_spec["module"]:
+        raise ValueError("decode worker adapter class does not match its module")
+    adapter = adapter_type(**adapter_spec["kwargs"])
+    if request["operation"] == "prepare_prompt":
+        if importlib.util.find_spec("mlx_lm") is None:
+            _atomic_worker_result(result_path, status="missing", reason="mlx_lm is unavailable")
+            return 0
+        prepared = adapter.padded_prompt(request["prompt_context"])
+        token_count = adapter._prompt_token_counts[prepared]
+        _atomic_worker_result(result_path, status="ok", prepared_prompt=prepared, prompt_tokens=token_count)
+        return 0
+    profile = _read_worker_profile(request["profile"])
+    group = _read_worker_group(request["group"])
+    if len(profile.engine_groups) != 1 or profile.engine_groups[0] != group or group.name != engine:
+        raise ValueError("decode worker profile and group do not match")
+    prepared_tokens = request["prepared_prompt_tokens"]
+    if prepared_tokens is not None and (type(prepared_tokens) is not int or prepared_tokens < 1):
+        raise ValueError("decode worker prepared_prompt_tokens must be a positive integer or null")
+    if engine == "mlx" and importlib.util.find_spec("mlx_lm") is None:
+        _atomic_worker_result(result_path, status="missing", reason="mlx_lm is unavailable")
+        return 0
+    if engine == "ollama":
+        adapter.base_url = validate_ollama_url(adapter.base_url)
+    tracked = _TrackedAdapter(adapter)
+    if engine == "mlx" and prepared_tokens is not None:
+        prompt = group.measured_prompt if group.measured_prompt is not None else profile.prompt
+        if hasattr(adapter, "_prompt_token_counts"):
+            adapter._prompt_token_counts[prompt] = prepared_tokens
+    run_error: BaseException | None = None
+    run_result = None
+    try:
+        run_result = run_profile(profile, {engine: tracked})
+    except BaseException as exc:
+        run_error = exc
+    unload_error: BaseException | None = None
+    if engine == "ollama" and tracked.started:
+        try:
+            _ollama_unload(adapter.base_url, group.model)
+        except BaseException as exc:
+            unload_error = exc
+    if unload_error is not None:
+        raise RuntimeError(f"ollama unload/check failed: {unload_error}") from unload_error
+    if run_error is not None:
+        raise run_error
+    assert run_result is not None
+    metadata: dict[str, object] = {}
+    breakdowns = getattr(adapter, "breakdowns", None)
+    if isinstance(breakdowns, list):
+        metadata["ollama_breakdowns"] = breakdowns
+    if engine == "ollama":
+        metadata["scope"] = OLLAMA_SCOPE
+        metadata["unload_confirmed"] = True
+    _atomic_worker_result(
+        result_path,
+        status="ok",
+        observations=[observation.to_dict() for observation in run_result.observations],
+        metadata=metadata,
+    )
+    return 0
+
+
+def _ollama_unload(base_url: str, model: str) -> None:
+    base_url = validate_ollama_url(base_url)
+    body = json.dumps({"model": model, "prompt": "", "stream": False, "keep_alive": 0}).encode()
+    request = urllib.request.Request(f"{base_url}/api/generate", data=body,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=600) as response:
+        unloaded = json.loads(response.read())
+    if not isinstance(unloaded, dict) or unloaded.get("done") is not True:
+        raise RuntimeError("ollama unload request did not return done=true")
+    with urllib.request.urlopen(f"{base_url}/api/ps", timeout=30) as response:
+        loaded = json.loads(response.read())
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("models"), list):
+        raise RuntimeError("ollama /api/ps response did not contain a models array")
+    names = []
+    for entry in loaded["models"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"]:
+            raise RuntimeError("ollama /api/ps contains an invalid model entry")
+        names.append(entry["name"])
+    if model in names:
+        raise RuntimeError(f"ollama model {model!r} remains loaded after unload")
+
+
 # --------------------------------------------------------------------------
 # Run
 # --------------------------------------------------------------------------
@@ -915,6 +1379,7 @@ class HarnessRunResult:
     profile: ProfileConfig
     observations: tuple[Observation, ...]
     missing_engines: tuple[str, ...]
+    engine_metadata: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
 
 def git_sha(repo_root: Path | None = None) -> str:
@@ -945,6 +1410,21 @@ def prompt_hash(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
 
 
+def coordinator_is_supervised() -> bool:
+    if any(
+        os.environ.get(name)
+        for name in (
+            "LATTICE_BENCH_LOCK_STATUS",
+            "LATTICE_BENCH_LOCK_FDS",
+            "LATTICE_BENCH_SUPERVISOR_FD",
+            "LATTICE_GPU_HANDOFF_CONTROL",
+        )
+    ):
+        print("FAIL: decode coordinator refuses to run inside existing benchmark supervision", file=sys.stderr)
+        return True
+    return False
+
+
 def _utc_timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -959,6 +1439,8 @@ def run_profile(
     hardware_id_value: str | None = None,
     timestamp_fn: Callable[[], str] = _utc_timestamp,
     repo_root: Path | None = None,
+    supervised_children: bool = False,
+    worker_prompt_tokens: int | None = None,
 ) -> HarnessRunResult:
     """Execute `profile` against `adapters` and return every raw observation.
 
@@ -1009,6 +1491,7 @@ def run_profile(
         )
 
     observations: list[Observation] = []
+    engine_metadata: dict[str, object] = {}
     order_index = 0
 
     def _append_observation(
@@ -1046,6 +1529,7 @@ def run_profile(
             engine_native_ns=result.native_ns,
             hardware_id=resolved_hardware_id,
             timestamp=timestamp_fn(),
+            scope=result.scope if result.scope is not None else (OLLAMA_SCOPE if group.name == "ollama" else None),
         )
         validate_observation(obs.to_dict())
         observations.append(obs)
@@ -1062,15 +1546,27 @@ def run_profile(
         run_index: int,
     ) -> None:
         """Single call, single window (warmup calls always take this path)."""
-        t0 = clock()
-        result = adapter.run(
-            prompt=call_prompt,
-            n_tokens=n_tokens,
-            warmup=is_warmup,
-            model=group.model,
-            quantization=group.quantization,
-        )
-        t1 = clock()
+        if supervised_children and group.name == "lattice":
+            result = adapter.run(
+                prompt=call_prompt,
+                n_tokens=n_tokens,
+                warmup=is_warmup,
+                model=group.model,
+                quantization=group.quantization,
+            )
+            if result.native_ns is None:
+                raise AdapterContractError("lattice handoff must return the binary's per-call duration")
+            elapsed_ns = result.native_ns
+        else:
+            t0 = clock()
+            result = adapter.run(
+                prompt=call_prompt,
+                n_tokens=n_tokens,
+                warmup=is_warmup,
+                model=group.model,
+                quantization=group.quantization,
+            )
+            elapsed_ns = clock() - t0
         _append_observation(
             group=group,
             result=result,
@@ -1078,7 +1574,7 @@ def run_profile(
             window=n_tokens,
             is_warmup=is_warmup,
             run_index=run_index,
-            elapsed_ns=t1 - t0,
+            elapsed_ns=elapsed_ns,
         )
 
     def _record_measured_call(
@@ -1093,15 +1589,27 @@ def run_profile(
         """One measured call, possibly yielding more than one window's
         observation from a single adapter invocation (see `MeasuredCall`).
         """
-        t0 = clock()
-        result = adapter.run(
-            prompt=call_prompt,
-            n_tokens=call.n_tokens,
-            warmup=False,
-            model=group.model,
-            quantization=group.quantization,
-        )
-        t1 = clock()
+        if supervised_children and group.name == "lattice":
+            result = adapter.run(
+                prompt=call_prompt,
+                n_tokens=call.n_tokens,
+                warmup=False,
+                model=group.model,
+                quantization=group.quantization,
+            )
+            if result.native_ns is None:
+                raise AdapterContractError("lattice handoff must return the binary's per-call duration")
+            elapsed_ns = result.native_ns
+        else:
+            t0 = clock()
+            result = adapter.run(
+                prompt=call_prompt,
+                n_tokens=call.n_tokens,
+                warmup=False,
+                model=group.model,
+                quantization=group.quantization,
+            )
+            elapsed_ns = clock() - t0
         if len(call.yields_windows) == 1:
             _append_observation(
                 group=group,
@@ -1110,7 +1618,7 @@ def run_profile(
                 window=call.yields_windows[0],
                 is_warmup=False,
                 run_index=run_index,
-                elapsed_ns=t1 - t0,
+                elapsed_ns=elapsed_ns,
             )
             return
         if result.component_ns is None:
@@ -1143,6 +1651,39 @@ def run_profile(
         if group.name not in active:
             continue
         adapter = adapters[group.name]
+
+        if (
+            supervised_children
+            and group.name in {"mlx", "ollama"}
+            and type(adapter).__module__.startswith("bench_decode_adapters_")
+        ):
+            worker = _launch_plain_worker(
+                {
+                    "protocol_version": WORKER_PROTOCOL_VERSION,
+                    "operation": "group",
+                    "engine": group.name,
+                    "profile": _wire_profile(profile, group),
+                    "group": _wire_group(group),
+                    "adapter": _adapter_wire(adapter),
+                    "prepared_prompt_tokens": worker_prompt_tokens,
+                    "prompt_context": None,
+                },
+                label=f"decode-{group.name}-{uuid.uuid4().hex[:12]}",
+            )
+            if worker["status"] == "missing":
+                missing.append(group.name)
+                engine_metadata[group.name] = {"missing_reason": worker["reason"]}
+                if not allow_missing_engine:
+                    raise MissingEngineError(
+                        f"profile {profile.name!r} requires {group.name}, unavailable: {worker['reason']}"
+                    )
+                continue
+            child_rows = _validate_worker_observations(profile, group, worker["observations"])
+            for child_row in child_rows:
+                observations.append(dataclasses.replace(child_row, order_index=order_index))
+                order_index += 1
+            engine_metadata[group.name] = worker["metadata"]
+            continue
 
         # Warmup batch: once, before any measured call, at the group's
         # own token budget and prompt (default: profile.prompt).
@@ -1214,6 +1755,7 @@ def run_profile(
         profile=profile,
         observations=tuple(observations),
         missing_engines=tuple(missing),
+        engine_metadata=engine_metadata,
     )
 
 
@@ -1378,6 +1920,11 @@ def render_report(run_result: HarnessRunResult, slopes: list[SlopeResult]) -> st
     lines = [f"=== {profile.name} | windows={list(profile.windows)} | aggregation={profile.aggregation} ==="]
     if run_result.missing_engines:
         lines.append(f"  (missing engine adapter(s), skipped: {', '.join(run_result.missing_engines)})")
+    if "ollama" in profile.engines:
+        lines.append(f"  ollama scope: {OLLAMA_SCOPE}")
+        ollama_metadata = run_result.engine_metadata.get("ollama", {})
+        if isinstance(ollama_metadata, Mapping) and ollama_metadata.get("unload_confirmed") is True:
+            lines.append("  ollama unload/check: confirmed")
     if not slopes:
         lines.append("  (no measured data)")
         return "\n".join(lines)
@@ -2591,7 +3138,18 @@ def _load_profile_adapters(args: argparse.Namespace) -> int | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    command_line = list(sys.argv[1:] if argv is None else argv)
+    if command_line[:1] == ["worker"]:
+        parser = argparse.ArgumentParser(prog="bench_decode_harness.py worker")
+        parser.add_argument("--request", type=Path, required=True)
+        try:
+            return run_decode_worker(parser.parse_args(command_line[1:]).request)
+        except Exception as exc:  # worker failure must fail the supervising command
+            print(f"FAIL: decode worker: {exc}", file=sys.stderr)
+            return 1
+    if command_line[:1] == ["run"] and coordinator_is_supervised():
+        return 2
+    args = build_arg_parser().parse_args(command_line)
 
     if args.command == "validate":
         try:
@@ -2624,15 +3182,30 @@ def main(argv: list[str] | None = None) -> int:
         if dispatched is not None:
             return dispatched
         try:
-            result = run_profile(profile, ADAPTER_REGISTRY, allow_missing_engine=args.allow_missing_engine)
-        except MissingEngineError as exc:
+            if args.out is not None:
+                args.out = args.out.resolve()
+            result = run_profile(
+                profile,
+                ADAPTER_REGISTRY,
+                allow_missing_engine=args.allow_missing_engine,
+                supervised_children=True,
+            )
+        except (MissingEngineError, RuntimeError, OSError, ValueError) as exc:
             print(f"FAIL: {exc}", file=sys.stderr)
             return 1
         slopes = aggregate(result)
-        print(render_report(result, slopes))
+        stage_dir = REPO_ROOT / ".cache" / f"decode-report-{uuid.uuid4().hex}"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        report_path = stage_dir / "report.txt"
+        report_path.write_text(render_report(result, slopes) + "\n")
+        print(report_path.read_text(), end="")
         if args.out is not None:
-            write_jsonl(list(result.observations), args.out)
+            staged_out = stage_dir / "observations.jsonl"
+            write_jsonl(list(result.observations), staged_out)
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(staged_out, args.out)
             print(f"\nRaw observations: {args.out}")
+        shutil.rmtree(stage_dir)
         return 0
 
     return 1  # pragma: no cover -- argparse `required=True` makes this unreachable

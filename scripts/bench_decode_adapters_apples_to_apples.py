@@ -68,27 +68,17 @@ import json
 import math
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
-
-if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-    from bench_supervision import ensure_python_entrypoint
-
-    ensure_python_entrypoint("decode-apples-to-apples", quiet=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_decode_harness as harness  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# -- lattice: exactly legacy apples-to-apples consumer's Q8_DIR/Q4_DIR/LAT_BIN --
-LAT_BIN = REPO_ROOT / "target" / "release" / "bench_decode_ab"
+# -- lattice: exactly legacy apples-to-apples consumer's Q8_DIR/Q4_DIR --
 Q8_MODEL_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b"
 Q4_MODEL_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b-q4-quarot"
 # The legacy script's Q4 lattice invocation keeps LATTICE_TOKENIZER_DIR
@@ -122,15 +112,15 @@ def parse_lattice_result_line(line: str) -> tuple[int, int, float] | None:
 
 
 class LatticeUnavailableError(RuntimeError):
-    """`bench_decode_ab` is not built, or the requested model dir is missing."""
+    """The requested model dir is missing or its supervised handoff failed."""
 
 
 class LatticeResultError(RuntimeError):
-    """`bench_decode_ab` ran and exited 0, but its RESULT output failed
+    """The lattice handoff exited 0, but its RESULT output failed
     validation: not exactly one full-line RESULT record, a `n_req` that
     does not match the window actually requested, or a non-finite/negative
-    measurement. Distinct from `LatticeUnavailableError` (binary/model not
-    present, a registration-time condition) -- this is a data-integrity
+    measurement. Distinct from a missing model directory, which can be
+    detected at registration time. This is a data-integrity
     failure from an engine that DID run, and must crash loud rather than
     silently become a fabricated or mislabeled observation.
     """
@@ -174,14 +164,12 @@ def extract_single_result(stdout: str, *, n_tokens: int) -> tuple[int, int, floa
 
 
 class LatticeAdapter:
-    """Invokes `target/release/bench_decode_ab`, mirroring
-    `legacy apples-to-apples consumer`'s `bench_lattice()` exactly, one measured
-    repeat per call (`BENCH_RUNS=1`) -- see module docstring for the
-    disclosed model-load-per-call methodology note.
+    """Runs one measured repeat through the admitted lattice handoff
+    (`BENCH_RUNS=1`). See the module docstring for the per-call model-load
+    methodology note.
     """
 
-    def __init__(self, bin_path: Path = LAT_BIN, tokenizer_dir: Path = Q8_MODEL_DIR):
-        self.bin_path = bin_path
+    def __init__(self, tokenizer_dir: Path = Q8_MODEL_DIR):
         self.tokenizer_dir = tokenizer_dir
 
     def run(
@@ -196,19 +184,13 @@ class LatticeAdapter:
         env = os.environ.copy()
         env["BENCH_N"] = str(n_tokens)
         env["BENCH_RUNS"] = "1"
-        env["LATTICE_MODEL_DIR"] = str(model_dir)
-        env["LATTICE_TOKENIZER_DIR"] = str(self.tokenizer_dir)
+        env["LATTICE_MODEL_DIR"] = str(model_dir.resolve())
+        env["LATTICE_TOKENIZER_DIR"] = str(self.tokenizer_dir.resolve())
+        env.pop("LATTICE_QUANT_FORMAT", None)
         if quantization == "q4":
             env["LATTICE_QUANT_FORMAT"] = "Q4"
 
-        proc = subprocess.run(
-            [str(self.bin_path)],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False,
-        )
+        proc = harness.run_lattice_handoff(env)
         if proc.returncode != 0:
             raise LatticeUnavailableError(
                 f"lattice: bench_decode_ab exited {proc.returncode}: {proc.stderr.strip()[-2000:]}"
@@ -224,8 +206,10 @@ class LatticeAdapter:
         )
 
 
-def lattice_available(bin_path: Path = LAT_BIN) -> bool:
-    return bin_path.is_file() and os.access(bin_path, os.X_OK)
+def lattice_available(profile: harness.ProfileConfig | None = None) -> bool:
+    if profile is None:
+        return Q8_MODEL_DIR.is_dir()
+    return all(path.is_dir() for path in _lattice_required_model_dirs(profile))
 
 
 def _lattice_required_model_dirs(profile: harness.ProfileConfig) -> tuple[Path, ...]:
@@ -244,32 +228,23 @@ def _lattice_required_model_dirs(profile: harness.ProfileConfig) -> tuple[Path, 
 
 
 def lattice_registration_status(
-    profile: harness.ProfileConfig | None, *, bin_path: Path = LAT_BIN
+    profile: harness.ProfileConfig | None
 ) -> tuple[bool, tuple[Path, ...]]:
     """Whether the lattice adapter should be registered for `profile`, and
     which of the profile's required model directories (if any) are missing.
 
-    Binary presence alone is NOT sufficient: a binary present with a
-    profile-required model directory absent must reproduce the legacy
-    script's per-engine graceful skip (`bench_lattice`'s own
-    `[[ ! -d "$model_dir" ]] && echo MODEL MISSING && return`) at
-    REGISTRATION time, not surface as a `LatticeUnavailableError` raised
-    mid-run that `--allow-missing-engine` cannot catch (the harness only
-    treats an engine as "missing" when its name is absent from the adapter
-    registry entirely -- see `bench_decode_harness.run_profile`).
+    A missing profile-required model directory is left unregistered to
+    preserve the per-engine graceful skip. Build and admission failures
+    happen inside the measured handoff and propagate as failures; they are
+    not converted into missing-engine results.
 
     `profile=None` (the requested profile could not be determined, e.g. no
-    `--profile` argument was found while peeking argv) falls back to
-    binary-only availability -- the pre-fix behavior, so an unrecognized
-    invocation shape still registers lattice and lets the harness's
-    `MissingEngineError` / this module's `LatticeUnavailableError` surface
-    any problem, rather than silently never registering lattice at all.
+    `--profile` argument was found while peeking argv) falls back to the
+    default model directory check so an unrecognized invocation does not
+    silently omit lattice.
     """
-    bin_ok = bin_path.is_file() and os.access(bin_path, os.X_OK)
-    if not bin_ok:
-        return False, ()
     if profile is None:
-        return True, ()
+        return Q8_MODEL_DIR.is_dir(), (() if Q8_MODEL_DIR.is_dir() else (Q8_MODEL_DIR,))
     required = _lattice_required_model_dirs(profile)
     missing = tuple(d for d in required if not d.is_dir())
     return (len(missing) == 0), missing
@@ -284,9 +259,8 @@ def _peek_requested_profile(argv: list[str]) -> harness.ProfileConfig | None:
     own lightweight peek rather than wait for the harness's own parse.
 
     Returns `None` (never raises) on anything unexpected: no `--profile`
-    found, an unknown profile name, or a profiles file that fails to load --
-    `lattice_registration_status` treats `None` as "fall back to binary-only
-    availability", matching this module's pre-fix behavior.
+    found, an unknown profile name, or a profiles file that fails to load.
+    `lattice_registration_status` then checks the default model directory.
     """
     peek = argparse.ArgumentParser(add_help=False)
     peek.add_argument("--profile", default=None)
@@ -381,7 +355,7 @@ class OllamaAdapter:
     neither does this profile)."""
 
     def __init__(self, base_url: str = OLLAMA_BASE_URL):
-        self.base_url = base_url
+        self.base_url = harness.validate_ollama_url(base_url)
 
     def run(
         self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str
@@ -405,44 +379,9 @@ class OllamaAdapter:
         return ollama_response_to_result(data)
 
 
-def ollama_available(
-    base_url: str = OLLAMA_BASE_URL, *, model_tag: str, start_if_down: bool = True
-) -> bool:
-    """Mirrors `legacy apples-to-apples consumer`'s `bench_ollama()` preflight:
-    binary installed, model pulled (best-effort pull if missing), server
-    reachable (best-effort `ollama serve &` + 3s settle if not)."""
-    if shutil.which("ollama") is None:
-        return False
-    try:
-        listed = subprocess.run(
-            ["ollama", "list"], capture_output=True, text=True, timeout=30, check=False
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if model_tag not in listed.stdout:
-        pulled = subprocess.run(
-            ["ollama", "pull", model_tag], capture_output=True, text=True, timeout=600, check=False
-        )
-        if pulled.returncode != 0:
-            return False
-    try:
-        urllib.request.urlopen(f"{base_url}/api/tags", timeout=3).read()
-        return True
-    except (urllib.error.URLError, OSError):
-        if not start_if_down:
-            return False
-        try:
-            subprocess.Popen(
-                ["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except OSError:
-            return False
-        time.sleep(3)
-        try:
-            urllib.request.urlopen(f"{base_url}/api/tags", timeout=3).read()
-            return True
-        except (urllib.error.URLError, OSError):
-            return False
+def ollama_available(base_url: str = OLLAMA_BASE_URL, *, model_tag: str) -> bool:
+    """Check the external loopback server and preserve the prior pull-if-missing behavior."""
+    return harness.ollama_model_available(base_url, model_tag, pull_if_missing=True)
 
 
 # --------------------------------------------------------------------------
@@ -527,54 +466,29 @@ class MlxAdapter:
         )
 
 
-def mlx_available() -> bool:
-    try:
-        import mlx_lm  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
 # --------------------------------------------------------------------------
 # registration + CLI delegation
 # --------------------------------------------------------------------------
 
 
 def register_available_adapters(argv: list[str] | None = None) -> None:
-    """Registers whichever of lattice/ollama/mlx are actually available,
-    printing a legacy-style message for each -- mirroring
-    `legacy apples-to-apples consumer`'s per-engine graceful skip (missing binary /
-    missing model dir / ollama not installed all print-and-continue rather
-    than aborting the whole run).
+    """Registers adapters available for the selected profile.
 
-    Lattice's registration is MODEL-aware, not just binary-aware: the binary
-    can be present while the specific profile about to run needs a model
-    directory that is not (e.g. Q8 weights present, Q4 weights absent). A
-    `LatticeUnavailableError` raised mid-run for that case is not caught
-    anywhere `--allow-missing-engine` can act on, so it must not be
-    registered in the first place -- see `lattice_registration_status` and
-    `_peek_requested_profile`.
+    Lattice registration checks the profile's model directories so a missing
+    model can be skipped before measurement. Build and admission failures
+    happen inside the supervised handoff and remain fatal. See
+    `lattice_registration_status` and `_peek_requested_profile`.
     """
     argv = sys.argv[1:] if argv is None else argv
     profile = _peek_requested_profile(argv)
-    # Pass the module-level LAT_BIN explicitly (looked up fresh here, at
-    # call time) rather than relying on lattice_registration_status's own
-    # `bin_path` default -- a keyword-only default is bound ONCE when the
-    # function is defined, so a test (or any caller) that reassigns the
-    # module-level LAT_BIN after import would silently keep hitting the
-    # original path if this call omitted it.
-    should_register, missing_model_dirs = lattice_registration_status(profile, bin_path=LAT_BIN)
+    should_register, missing_model_dirs = lattice_registration_status(profile)
     if should_register:
         harness.register_adapter("lattice", LatticeAdapter())
         print("  lattice: adapter registered")
     elif missing_model_dirs:
-        joined = ", ".join(str(d) for d in missing_model_dirs)
-        print(f"  lattice: MODEL MISSING ({joined}) — build/download first — skipping")
+        print("  lattice: requested model directory is missing, skipping")
     else:
-        print(
-            f"  lattice: BIN MISSING ({LAT_BIN}) — build first "
-            "(cargo build --release --bin bench_decode_ab)"
-        )
+        print("  lattice: model directory is missing, skipping")
 
     if ollama_available(model_tag="qwen3.5:0.8b"):
         harness.register_adapter("ollama", OllamaAdapter())
@@ -582,13 +496,5 @@ def register_available_adapters(argv: list[str] | None = None) -> None:
     else:
         print("  ollama: not installed, unreachable, or model pull failed — skipping")
 
-    if mlx_available():
-        harness.register_adapter("mlx", MlxAdapter())
-        print("  mlx: adapter registered")
-    else:
-        print("  mlx: mlx_lm not importable — run via `uv run --with mlx-lm ...` — skipping")
-
-
-if __name__ == "__main__":
-    register_available_adapters()
-    sys.exit(harness.main())
+    harness.register_adapter("mlx", MlxAdapter())
+    print("  mlx: worker adapter registered")

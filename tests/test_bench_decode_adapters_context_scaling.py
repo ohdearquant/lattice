@@ -164,18 +164,25 @@ class LegacyTsvRenderingTest(unittest.TestCase):
     def test_header_and_columns(self):
         _, profiles = harness.load_profiles_file(DEFAULT_PROFILES_FILE)
         profile = profiles["context_scaling"]
-        result = harness.run_profile(profile, {"lattice": _FakeAdapter()}, allow_missing_engine=True, clock=_FakeClock())
+        result = harness.run_profile(
+            profile,
+            {"lattice": _FakeAdapter(), "ollama": _FakeAdapter(), "mlx": _FakeAdapter()},
+            clock=_FakeClock(),
+        )
         slopes, medians = adapters.compute_context_scaling_aggregate(result)
         tsv = adapters.render_legacy_tsv(result, slopes, medians)
         lines = tsv.strip("\n").split("\n")
-        self.assertEqual(lines[0], "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns")
+        self.assertEqual(lines[0], "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope")
         self.assertEqual(len(lines), 1 + len(slopes))
         for line in lines[1:]:
             parts = line.split("\t")
-            self.assertEqual(len(parts), 6)
-            self.assertEqual(parts[0], "lattice")
+            self.assertEqual(len(parts), 7)
             int(parts[1])  # context_tokens parses as int
             float(parts[2])  # slope_tok_s parses as float
+            if parts[0] == "ollama":
+                self.assertEqual(parts[6], harness.OLLAMA_SCOPE)
+            else:
+                self.assertEqual(parts[6], "")
 
 
 class ContextsAndRunsOverrideTest(unittest.TestCase):
@@ -317,7 +324,7 @@ class ContextScalingEvenRunsLegacyMedianTest(unittest.TestCase):
 
         tsv = adapters.render_legacy_tsv(result, slopes, medians)
         for line in tsv.strip("\n").split("\n")[1:]:
-            engine, _ctx, _slope, t1_ms, t2_ms, _runs = line.split("\t")
+            engine, _ctx, _slope, t1_ms, t2_ms, _runs, _scope = line.split("\t")
             if engine == "lattice":
                 self.assertAlmostEqual(float(t1_ms), 30.0, places=3)
                 self.assertAlmostEqual(float(t2_ms), 300.0, places=3)
@@ -356,7 +363,7 @@ class ContextScalingSkewedFiveSampleTsvTest(unittest.TestCase):
         slopes, medians = adapters.compute_context_scaling_aggregate(result)
         tsv = adapters.render_legacy_tsv(result, slopes, medians)
         line = tsv.strip("\n").split("\n")[1]
-        _engine, _ctx, _slope, t1_ms, t2_ms, _runs = line.split("\t")
+        _engine, _ctx, _slope, t1_ms, t2_ms, _runs, _scope = line.split("\t")
         self.assertAlmostEqual(float(t1_ms), 20.0, places=3)
         self.assertAlmostEqual(float(t2_ms), 205.0, places=3)
         self.assertNotAlmostEqual(float(t1_ms), 40.0, places=1)
@@ -402,7 +409,6 @@ class WrapperExitStatusTest(unittest.TestCase):
         harness.ADAPTER_REGISTRY.update(registry)
         try:
             with (
-                mock.patch.object(adapters, "build_lattice_binary_if_missing"),
                 mock.patch.object(adapters, "register_available_adapters"),
                 mock.patch.object(adapters, "OUT_DIR", tmp),
                 mock.patch.object(adapters, "DATA_TSV", tmp / "data.tsv"),

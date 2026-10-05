@@ -17,17 +17,11 @@ import math
 import os
 import re
 import statistics
-import subprocess
+import shutil
 import sys
-import urllib.error
+import uuid
 import urllib.request
 from pathlib import Path
-
-if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-    from bench_supervision import ensure_python_entrypoint
-
-    ensure_python_entrypoint("decode-agentic", quiet=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_decode_harness as harness  # noqa: E402
@@ -35,7 +29,6 @@ import bench_decode_harness as harness  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROFILES_FILE = REPO_ROOT / "scripts" / "bench_decode_profiles.toml"
 OUT_DIR = REPO_ROOT / "docs" / "bench_results"
-LAT_BIN = REPO_ROOT / "target" / "release" / "bench_decode_ab"
 MODEL_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b"
 OLLAMA_URL = os.environ.get("LATTICE_BENCH_OLLAMA_URL", "http://localhost:11434")
 SWEEP_CONTEXTS = (1000, 2000, 4000)
@@ -47,11 +40,8 @@ BASE = (
 )
 
 _RESULT_RE = re.compile(r"^RESULT n_req=(\d+) completion=(\d+) total_ms=([\d.]+)$")
-# Anchored and matched per line, like _RESULT_RE above. The emitter writes this
-# marker alone on a line (`eprintln!("[bench] prompt_tokens={}", ...)`), so a
-# whole-line match loses nothing, while an unanchored search over the whole
-# stderr blob would accept the marker embedded in a longer diagnostic and turn
-# whatever followed `=` into benchmark evidence.
+# Anchored and matched per line. The admitted launcher forwards the selected
+# binary's combined output stream, so this marker can arrive on either channel.
 _PROMPT_RE = re.compile(r"^\[bench\] prompt_tokens=(\d+)$")
 
 
@@ -115,7 +105,7 @@ def parse_lattice_output(stdout: str, stderr: str, *, n_tokens: int) -> harness.
     if not math.isfinite(elapsed_ms) or elapsed_ms < 0:
         raise AdapterOutputError(f"lattice: invalid total_ms={total_ms}")
     prompt_matches = [
-        match for line in stderr.splitlines() if (match := _PROMPT_RE.fullmatch(line))
+        match for line in (stdout + "\n" + stderr).splitlines() if (match := _PROMPT_RE.fullmatch(line))
     ]
     if len(prompt_matches) != 1:
         raise AdapterOutputError(
@@ -131,9 +121,8 @@ def parse_lattice_output(stdout: str, stderr: str, *, n_tokens: int) -> harness.
 
 
 class LatticeAdapter:
-    def __init__(self, ctx: int, bin_path: Path = LAT_BIN, model_dir: Path = MODEL_DIR):
+    def __init__(self, ctx: int, model_dir: Path = MODEL_DIR):
         self.ctx = ctx
-        self.bin_path = bin_path
         self.model_dir = model_dir
 
     def run(self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str):
@@ -142,16 +131,9 @@ class LatticeAdapter:
             BENCH_N=str(n_tokens),
             BENCH_RUNS="1",
             BENCH_PROMPT_TOKENS=str(self.ctx),
-            LATTICE_MODEL_DIR=str(self.model_dir),
+            LATTICE_MODEL_DIR=str(self.model_dir.resolve()),
         )
-        proc = subprocess.run(
-            [str(self.bin_path)],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False,
-        )
+        proc = harness.run_lattice_handoff(env)
         if proc.returncode != 0:
             raise AdapterOutputError(f"lattice exited {proc.returncode}: {proc.stderr[-1000:]}")
         return parse_lattice_output(proc.stdout, proc.stderr, n_tokens=n_tokens)
@@ -183,7 +165,7 @@ def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
 
 class OllamaAdapter:
     def __init__(self, base_url: str = OLLAMA_URL):
-        self.base_url = base_url
+        self.base_url = harness.validate_ollama_url(base_url)
         self.breakdowns: list[dict[str, int]] = []
 
     def run(self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str):
@@ -271,53 +253,31 @@ class MlxAdapter:
 
 
 def _ollama_available(base_url: str = OLLAMA_URL) -> bool:
-    try:
-        with urllib.request.urlopen(f"{base_url}/api/tags", timeout=3) as response:
-            data = json.loads(response.read())
-    except (OSError, ValueError, urllib.error.URLError):
-        return False
-    return any(model.get("name") == "qwen3.5:0.8b" for model in data.get("models", []))
+    return harness.ollama_model_available(base_url, "qwen3.5:0.8b")
 
 
-def _mlx_available() -> bool:
-    try:
-        import mlx_lm  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-def register_available_adapters(ctx: int) -> tuple[dict[str, object], dict[str, str], str]:
+def register_available_adapters(
+    ctx: int, prepared_prompt: tuple[str, int] | None = None
+) -> tuple[dict[str, object], dict[str, str], str, int | None]:
     adapters: dict[str, object] = {}
     missing: dict[str, str] = {}
-    mlx_adapter: MlxAdapter | None = None
-    if LAT_BIN.is_file() and os.access(LAT_BIN, os.X_OK) and MODEL_DIR.is_dir():
+    padded_prompt = prepared_prompt[0] if prepared_prompt is not None else make_fallback_padded_prompt(ctx)
+    prompt_tokens = prepared_prompt[1] if prepared_prompt is not None else None
+    if prepared_prompt is not None and MODEL_DIR.is_dir():
         adapters["lattice"] = LatticeAdapter(ctx)
     else:
-        missing["lattice"] = "bench_decode_ab binary or model directory is missing"
+        missing["lattice"] = "the tokenizer-padded prompt could not be constructed in the MLX worker"
     if _ollama_available():
         adapters["ollama"] = OllamaAdapter()
     else:
         missing["ollama"] = "ollama server or qwen3.5:0.8b model is unavailable"
-    if _mlx_available():
-        mlx_adapter = MlxAdapter()
-        adapters["mlx"] = mlx_adapter
+    if prepared_prompt is not None:
+        adapters["mlx"] = MlxAdapter()
     else:
-        missing["mlx"] = "mlx_lm is unavailable"
-    if mlx_adapter is not None:
-        try:
-            padded_prompt = mlx_adapter.padded_prompt(ctx)
-        except Exception as exc:  # noqa: BLE001 -- an unavailable optional engine is reported, never substituted
-            adapters.pop("mlx", None)
-            adapters.pop("lattice", None)
-            missing["mlx"] = f"mlx_lm model/tokenizer load failed: {exc}"
-            missing["lattice"] = "the shared tokenizer-padded prompt could not be constructed"
-            padded_prompt = make_fallback_padded_prompt(ctx)
-    else:
-        adapters.pop("lattice", None)
-        missing["lattice"] = "mlx_lm is required to construct the exact tokenizer-padded Lattice prompt"
-        padded_prompt = make_fallback_padded_prompt(ctx)
-    return adapters, missing, padded_prompt
+        missing["mlx"] = (
+            "mlx_lm or its tokenizer is unavailable while preparing the tokenizer-padded prompt"
+        )
+    return adapters, missing, padded_prompt, prompt_tokens
 
 
 def _median_ms(result: harness.HarnessRunResult, engine: str, window: int) -> float | None:
@@ -334,6 +294,7 @@ def result_rows(
     missing_reasons: dict[str, str],
     ollama_adapter: OllamaAdapter | None,
 ) -> list[dict]:
+    ollama_breakdowns = result.engine_metadata.get("ollama", {}).get("ollama_breakdowns", [])
     ttft_window, total_window = result.profile.windows[0], result.profile.windows[-1]
     rows: list[dict] = []
     for engine in result.profile.engines:
@@ -358,6 +319,7 @@ def result_rows(
                     "decode_tok_s": None,
                     "source": "unavailable",
                     "unavailable_reason": missing_reasons.get(engine, "engine was not run"),
+                    **({"scope": harness.OLLAMA_SCOPE} if engine == "ollama" else {}),
                 }
             )
             continue
@@ -375,14 +337,17 @@ def result_rows(
             "decode_tok_s": round(total_window / (decode_ms / 1000)) if decode_ms > 0 else 0,
             "source": "live",
         }
-        if engine == "ollama" and ollama_adapter is not None and ollama_adapter.breakdowns:
+        if engine == "ollama" and ollama_breakdowns:
             row["ollama_breakdown"] = {
-                key: round(statistics.median(item[key] for item in ollama_adapter.breakdowns), 1)
+                key: round(statistics.median(item[key] for item in ollama_breakdowns), 1)
                 for key in ("load_ms", "prompt_eval_ms", "eval_ms")
             }
             row["ollama_breakdown"]["prompt_eval_count"] = round(
-                statistics.median(item["prompt_eval_count"] for item in ollama_adapter.breakdowns)
+                statistics.median(item["prompt_eval_count"] for item in ollama_breakdowns)
             )
+        if engine == "ollama":
+            row["scope"] = harness.OLLAMA_SCOPE
+            row["unload_confirmed"] = result.engine_metadata.get("ollama", {}).get("unload_confirmed") is True
         rows.append(row)
     return rows
 
@@ -404,27 +369,37 @@ def render_table(rows: list[dict], ctx: int, response_window: int) -> str:
         )
     lines.append(
         "\n*ollama prefill tok/s reflects prefix-cache lookup for repeated filler text, not fresh-token prefill.\n"
+        f"Ollama scope: {harness.OLLAMA_SCOPE}.\n"
         "Precision note: MLX runs bf16 (~2x memory bandwidth vs lattice Q8). "
         "The lattice decode gap is conservative — bandwidth-adjusted, the gap is larger.\n"
     )
     return "".join(lines)
 
 
-def run_context(ctx: int, runs: int, allow_missing: bool, out: Path | None) -> list[dict]:
+def run_context(
+    ctx: int, runs: int, allow_missing: bool, out: Path | None, *, stage_dir: Path
+) -> list[dict]:
     default_profile = _default_profile()
-    adapters, missing, padded_prompt = register_available_adapters(ctx)
+    prepared_prompt = harness.prepare_worker_prompt(MlxAdapter(), ctx)
+    adapters, missing, padded_prompt, prompt_tokens = register_available_adapters(ctx, prepared_prompt)
     profile = configure_profile(default_profile, ctx=ctx, runs=runs, padded_prompt=padded_prompt)
-    result = harness.run_profile(profile, adapters, allow_missing_engine=allow_missing)
-    raw_path = out if out is not None else OUT_DIR / f"agentic_{ctx}tok_raw.jsonl"
+    result = harness.run_profile(
+        profile,
+        adapters,
+        allow_missing_engine=allow_missing,
+        supervised_children=True,
+        worker_prompt_tokens=prompt_tokens,
+    )
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = stage_dir / f"agentic_{ctx}tok_raw.jsonl"
     harness.write_jsonl(list(result.observations), raw_path)
-    ollama = adapters.get("ollama")
-    rows = result_rows(result, missing, ollama if isinstance(ollama, OllamaAdapter) else None)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / f"agentic_{ctx}tok.json").write_text(json.dumps(rows, indent=2) + "\n")
+    rows = result_rows(result, missing, None)
+    (stage_dir / f"agentic_{ctx}tok.json").write_text(json.dumps(rows, indent=2) + "\n")
     if abs(ctx - default_profile.requested_prompt_tokens) <= 50:
-        (OUT_DIR / "agentic_1k_compare.json").write_text(json.dumps(rows, indent=2) + "\n")
-    print(render_table(rows, ctx, default_profile.windows[-1]))
-    print(f"Raw observations: {raw_path}")
+        (stage_dir / "agentic_1k_compare.json").write_text(json.dumps(rows, indent=2) + "\n")
+    (stage_dir / f"agentic_{ctx}tok.txt").write_text(
+        render_table(rows, ctx, default_profile.windows[-1])
+    )
     return rows
 
 
@@ -440,12 +415,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if harness.coordinator_is_supervised():
+        return 2
     args = build_parser().parse_args(argv)
     if args.sweep and args.out is not None:
         print("FAIL: --out cannot be combined with --sweep", file=sys.stderr)
         return 1
     contexts = SWEEP_CONTEXTS if args.sweep else (args.ctx,)
+    if args.out is not None:
+        args.out = args.out.resolve()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    stage_dir = REPO_ROOT / ".cache" / f"agentic-stage-{uuid.uuid4().hex}"
     all_rows: list[dict] = []
+    completed_contexts: list[int] = []
     # A context that loses every engine now aborts the loop, because
     # `run_profile` refuses to return a result it did not measure. The contexts
     # that already ran did produce measurements, and discarding them would make
@@ -458,19 +440,43 @@ def main(argv: list[str] | None = None) -> int:
     failure: str | None = None
     try:
         for ctx in contexts:
-            all_rows.extend(run_context(ctx, args.runs, args.allow_missing_engine, args.out))
-    except (ValueError, harness.MissingEngineError, AdapterOutputError) as exc:
+            rows = run_context(ctx, args.runs, args.allow_missing_engine, args.out, stage_dir=stage_dir)
+            all_rows.extend(rows)
+            completed_contexts.append(ctx)
+    except (ValueError, RuntimeError, OSError, harness.MissingEngineError, AdapterOutputError) as exc:
         failure = str(exc)
+    for ctx in completed_contexts:
+        raw_source = stage_dir / f"agentic_{ctx}tok_raw.jsonl"
+        json_source = stage_dir / f"agentic_{ctx}tok.json"
+        raw_destination = args.out if args.out is not None and not args.sweep else OUT_DIR / raw_source.name
+        if raw_source.is_file():
+            raw_destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(raw_source, raw_destination)
+        if json_source.is_file():
+            shutil.copy2(json_source, OUT_DIR / json_source.name)
+        compare_source = stage_dir / "agentic_1k_compare.json"
+        if compare_source.is_file() and abs(ctx - _default_profile().requested_prompt_tokens) <= 50:
+            shutil.copy2(compare_source, OUT_DIR / compare_source.name)
+        report_source = stage_dir / f"agentic_{ctx}tok.txt"
+        if report_source.is_file():
+            print(report_source.read_text())
+        raw_destination = args.out if args.out is not None and not args.sweep else OUT_DIR / raw_source.name
+        if raw_source.is_file():
+            print(f"Raw observations: {raw_destination}")
     if args.sweep:
         # A partial sweep is written under a different name rather than a
         # differently-shaped payload: readers keep the schema they expect, and
         # nothing that looks for the canonical artifact can silently pick up a
         # sweep that stopped early.
-        path = OUT_DIR / ("agentic_sweep.json" if failure is None else "agentic_sweep.partial.json")
-        path.write_text(json.dumps(all_rows, indent=2) + "\n")
+        staged_sweep = stage_dir / ("agentic_sweep.json" if failure is None else "agentic_sweep.partial.json")
+        staged_sweep.parent.mkdir(parents=True, exist_ok=True)
+        staged_sweep.write_text(json.dumps(all_rows, indent=2) + "\n")
+        path = OUT_DIR / staged_sweep.name
+        shutil.copy2(staged_sweep, path)
         print(f"Sweep JSON: {path}")
     if failure is not None:
         print(f"FAIL: {failure}", file=sys.stderr)
+        shutil.rmtree(stage_dir, ignore_errors=True)
         return 1
     notices = [row for row in all_rows if row.get("source") != "live"]
     if notices:
@@ -492,9 +498,7 @@ def main(argv: list[str] | None = None) -> int:
             "--allow-missing-engine tolerates a missing engine, not a missing measurement.",
             file=sys.stderr,
         )
+        shutil.rmtree(stage_dir, ignore_errors=True)
         return 1
+    shutil.rmtree(stage_dir, ignore_errors=True)
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

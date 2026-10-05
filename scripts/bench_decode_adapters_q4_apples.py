@@ -25,26 +25,16 @@ import json
 import math
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
-
-if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-    from bench_supervision import ensure_python_entrypoint
-
-    ensure_python_entrypoint("decode-q4-apples", quiet=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_decode_harness as harness  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-LAT_BIN = REPO_ROOT / "target" / "release" / "bench_decode_ab"
 # Plain per-row Q4 (legacy Q4 comparison consumer's Q4_DIR), tied embeddings; tokenizer
 # comes from the Q8 f16 source dir (legacy Q4 comparison consumer's TOK_DIR), matching
 # the legacy script's declared-but-unreachable `BENCH_TOKENIZER_DIR` intent.
@@ -62,7 +52,7 @@ def parse_lattice_result_line(line: str) -> tuple[int, int, float] | None:
 
 
 class LatticeUnavailableError(RuntimeError):
-    """`bench_decode_ab` is not built, or the Q4 model dir is missing."""
+    """The Q4 model directory is missing or its supervised handoff failed."""
 
 
 class LatticeResultError(RuntimeError):
@@ -96,14 +86,14 @@ def extract_single_result(stdout: str, *, n_tokens: int) -> tuple[int, int, floa
 
 
 class LatticeAdapter:
-    """Invokes `target/release/bench_decode_ab` against the real Q4
-    directory (`LATTICE_QUANT_FORMAT` is NOT set here -- unlike
+    """Runs the real Q4 directory through the admitted lattice handoff.
+
+    `LATTICE_QUANT_FORMAT` is not set here, unlike
     `apples_to_apples_q4`'s adapter, `bench_decode_ab.rs` detects Q4 vs
     safetensors from the model dir's own contents via `detect_format`, so no
     override env var is needed for a genuine `.q4`-file directory)."""
 
-    def __init__(self, bin_path: Path = LAT_BIN, model_dir: Path = Q4_MODEL_DIR, tokenizer_dir: Path = TOKENIZER_DIR):
-        self.bin_path = bin_path
+    def __init__(self, model_dir: Path = Q4_MODEL_DIR, tokenizer_dir: Path = TOKENIZER_DIR):
         self.model_dir = model_dir
         self.tokenizer_dir = tokenizer_dir
 
@@ -159,11 +149,9 @@ class LatticeAdapter:
         env = os.environ.copy()
         env["BENCH_N"] = str(n_tokens)
         env["BENCH_RUNS"] = "1"
-        env["LATTICE_MODEL_DIR"] = str(self.model_dir)
-        env["LATTICE_TOKENIZER_DIR"] = str(self.tokenizer_dir)
-        proc = subprocess.run(
-            [str(self.bin_path)], env=env, capture_output=True, text=True, timeout=600, check=False
-        )
+        env["LATTICE_MODEL_DIR"] = str(self.model_dir.resolve())
+        env["LATTICE_TOKENIZER_DIR"] = str(self.tokenizer_dir.resolve())
+        proc = harness.run_lattice_handoff(env)
         if proc.returncode != 0:
             raise LatticeUnavailableError(
                 f"lattice: bench_decode_ab exited {proc.returncode}: {proc.stderr.strip()[-2000:]}"
@@ -179,9 +167,7 @@ class LatticeAdapter:
         )
 
 
-def lattice_available(bin_path: Path = LAT_BIN, model_dir: Path = Q4_MODEL_DIR) -> bool:
-    if not (bin_path.is_file() and os.access(bin_path, os.X_OK)):
-        return False
+def lattice_available(model_dir: Path = Q4_MODEL_DIR) -> bool:
     try:
         return model_dir.is_dir()
     except OSError:
@@ -233,7 +219,7 @@ def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
 
 class OllamaAdapter:
     def __init__(self, base_url: str = OLLAMA_BASE_URL):
-        self.base_url = base_url
+        self.base_url = harness.validate_ollama_url(base_url)
 
     def run(
         self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str
@@ -258,30 +244,7 @@ class OllamaAdapter:
 
 
 def ollama_available(base_url: str = OLLAMA_BASE_URL, *, model_tag: str = OLLAMA_MODEL_TAG) -> bool:
-    if shutil.which("ollama") is None:
-        return False
-    try:
-        listed = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if model_tag not in listed.stdout:
-        pulled = subprocess.run(["ollama", "pull", model_tag], capture_output=True, text=True, timeout=600, check=False)
-        if pulled.returncode != 0:
-            return False
-    try:
-        urllib.request.urlopen(f"{base_url}/api/tags", timeout=3).read()
-        return True
-    except (urllib.error.URLError, OSError):
-        try:
-            subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            return False
-        time.sleep(3)
-        try:
-            urllib.request.urlopen(f"{base_url}/api/tags", timeout=3).read()
-            return True
-        except (urllib.error.URLError, OSError):
-            return False
+    return harness.ollama_model_available(base_url, model_tag, pull_if_missing=True)
 
 
 # --------------------------------------------------------------------------
@@ -335,14 +298,6 @@ class MlxAdapter:
         )
 
 
-def mlx_available() -> bool:
-    try:
-        import mlx_lm  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
 # --------------------------------------------------------------------------
 # registration + CLI delegation
 # --------------------------------------------------------------------------
@@ -353,7 +308,7 @@ def register_available_adapters() -> None:
         harness.register_adapter("lattice", LatticeAdapter())
         print("  lattice Q4: adapter registered")
     else:
-        print(f"  lattice: BIN MISSING or Q4 MODEL MISSING ({LAT_BIN}, {Q4_MODEL_DIR}) — build/download first")
+        print("  lattice: Q4 model directory is missing, skipping")
 
     if ollama_available():
         harness.register_adapter("ollama", OllamaAdapter())
@@ -361,13 +316,5 @@ def register_available_adapters() -> None:
     else:
         print("  ollama: not installed, unreachable, or model pull failed — skipping")
 
-    if mlx_available():
-        harness.register_adapter("mlx", MlxAdapter())
-        print("  mlx Q4: adapter registered")
-    else:
-        print("  mlx: mlx_lm not importable — run via `uv run --with mlx-lm ...` — skipping")
-
-
-if __name__ == "__main__":
-    register_available_adapters()
-    sys.exit(harness.main())
+    harness.register_adapter("mlx", MlxAdapter())
+    print("  mlx Q4: worker adapter registered")

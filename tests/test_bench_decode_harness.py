@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bench_decode_harness.py"
 _SPEC = importlib.util.spec_from_file_location("bench_decode_harness", _SCRIPT)
@@ -55,6 +56,7 @@ def _valid_observation(**overrides) -> dict:
         "engine_native_ns": 900_000,
         "hardware_id": "Darwin-arm64-testhost",
         "timestamp": "2026-07-10T00:00:00+00:00",
+        "scope": None,
     }
     row.update(overrides)
     return row
@@ -114,6 +116,71 @@ class _FakeAdapter:
             engine_version=self.engine_version,
             component_ns=self.component_ns,
         )
+
+
+class OllamaAvailabilityTest(unittest.TestCase):
+    class _Response:
+        def __init__(self, value):
+            self.value = json.dumps(value).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return self.value
+
+    def test_reachable_model_does_not_require_the_ollama_cli(self):
+        with (
+            mock.patch.object(
+                harness.urllib.request,
+                "urlopen",
+                return_value=self._Response({"models": [{"name": "qwen3.5:0.8b"}]}),
+            ),
+            mock.patch.object(harness.shutil, "which", return_value=None),
+            mock.patch.object(harness.subprocess, "run") as run,
+        ):
+            self.assertTrue(harness.ollama_model_available("http://localhost:11434", "qwen3.5:0.8b"))
+        run.assert_not_called()
+
+    def test_unreachable_server_is_missing_without_running_pull(self):
+        with (
+            mock.patch.object(
+                harness.urllib.request,
+                "urlopen",
+                side_effect=harness.urllib.error.URLError("connection refused"),
+            ),
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run") as run,
+        ):
+            self.assertFalse(
+                harness.ollama_model_available("http://127.0.0.1:11434", "qwen3.5:0.8b", pull_if_missing=True)
+            )
+        run.assert_not_called()
+
+    def test_missing_model_uses_pull_then_checks_the_configured_server(self):
+        empty = self._Response({"models": []})
+        present = self._Response({"models": [{"model": "qwen3.5:0.8b"}]})
+        list_result = mock.Mock(returncode=0, stdout="NAME\n", stderr="")
+        pull_result = mock.Mock(returncode=0, stdout="success", stderr="")
+        with (
+            mock.patch.object(harness.urllib.request, "urlopen", side_effect=[empty, present]),
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run", side_effect=[list_result, pull_result]) as run,
+        ):
+            self.assertTrue(
+                harness.ollama_model_available("http://localhost:11434", "qwen3.5:0.8b", pull_if_missing=True)
+            )
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["ollama", "list"], ["ollama", "pull", "qwen3.5:0.8b"]])
+        self.assertTrue(all(call.kwargs["env"]["OLLAMA_HOST"] == "http://localhost:11434" for call in run.call_args_list))
+
+    def test_non_loopback_url_is_rejected_before_network_access(self):
+        with mock.patch.object(harness.urllib.request, "urlopen") as urlopen:
+            with self.assertRaises(ValueError):
+                harness.ollama_model_available("http://203.0.113.1:11434", "qwen3.5:0.8b")
+        urlopen.assert_not_called()
 
 
 def _engine(
@@ -789,6 +856,26 @@ quantization = "q8"
 
 
 class RunProfileTest(unittest.TestCase):
+    def test_supervised_lattice_records_binary_time_without_parent_clock(self):
+        class _ForbiddenClock:
+            def __call__(self):
+                raise AssertionError("coordinator clock surrounded a supervised lattice launch")
+
+        profile = _profile(engines=[_engine("lattice")], measured_repeats=1)
+        result = harness.run_profile(
+            profile,
+            {"lattice": _FakeAdapter(native_ns_per_token=10)},
+            clock=_ForbiddenClock(),
+            supervised_children=True,
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+        self.assertEqual(
+            [row.elapsed_ns for row in result.observations],
+            [row.engine_native_ns for row in result.observations],
+        )
+        self.assertEqual([row.elapsed_ns for row in result.observations], [320, 2560])
+
     def test_produces_expected_observation_count(self):
         profile = _profile(
             engines=[_engine(warmup_repeats=2, warmup_tokens=8)], measured_repeats=3, windows=[32, 256]
