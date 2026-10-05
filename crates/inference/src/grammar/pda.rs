@@ -237,6 +237,10 @@ pub struct GrammarState {
 impl GrammarState {
     /// Initial state: a single stack with one frame at the root rule, its
     /// alternative not yet chosen, at sym_pos 0.
+    ///
+    /// This takes no grammar, so it cannot know whether the root accepts the
+    /// empty string: `complete` is `false` even when it does. A caller that
+    /// holds the grammar should start from [`GrammarState::for_grammar`].
     pub fn initial() -> Self {
         Self {
             stacks: vec![vec![StackFrame {
@@ -247,6 +251,15 @@ impl GrammarState {
             partial_token_bytes: Vec::new(),
             complete: false,
         }
+    }
+
+    /// Initial state for `grammar`: the same stack as [`GrammarState::initial`],
+    /// with `complete` set from the grammar, so a root that accepts the empty
+    /// string reports [`GrammarState::is_complete`] before any byte.
+    pub fn for_grammar(grammar: &CompiledGrammar) -> Self {
+        let mut state = Self::initial();
+        state.complete = is_accepting(&state, grammar);
+        state
     }
 
     /// Returns true if the automaton has consumed all input and is in an
@@ -264,9 +277,7 @@ impl GrammarState {
 }
 
 pub(crate) fn initial_grammar_state(grammar: &CompiledGrammar) -> GrammarState {
-    let mut state = GrammarState::initial();
-    state.complete = is_accepting(&state, grammar);
-    state
+    GrammarState::for_grammar(grammar)
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,6 +1346,76 @@ mod tests {
         b.set_alts(root_id, vec![vec![Symbol::NonTerminal(empty_id)]])
             .unwrap();
         assert!(initial_grammar_state(&b.build()).is_complete());
+    }
+
+    /// `GrammarState::initial()` takes no grammar, so `complete` starts `false`
+    /// even when the root accepts the empty string.
+    #[test]
+    fn initial_state_does_not_consult_the_grammar() {
+        let mut b = GrammarBuilder::new();
+        b.add_rule("root", vec![vec![]]);
+        let g = b.build();
+
+        assert!(!GrammarState::initial().is_complete());
+        // The grammar-aware initializer sees the same root as nullable.
+        assert!(initial_grammar_state(&g).is_complete());
+    }
+
+    /// `root ::= ""`: the empty input is in the language, so the grammar-aware
+    /// constructor reports completion before any byte.
+    #[test]
+    fn for_grammar_reports_an_empty_root_complete_before_any_byte() {
+        let mut b = GrammarBuilder::new();
+        b.add_rule("root", vec![vec![]]);
+        let g = b.build();
+
+        assert!(GrammarState::for_grammar(&g).is_complete());
+    }
+
+    /// `root ::= "a" | ""` and `root ::= E` (with `E ::= ""`) are nullable
+    /// without the root's first alternative being empty.
+    #[test]
+    fn for_grammar_reports_an_optional_and_a_delegating_root_complete() {
+        let mut b = GrammarBuilder::new();
+        b.add_rule("root", vec![vec![Symbol::Terminal(b'a')], vec![]]);
+        assert!(GrammarState::for_grammar(&b.build()).is_complete());
+
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let empty_id = b.reserve("E");
+        b.set_alts(root_id, vec![vec![Symbol::NonTerminal(empty_id)]])
+            .unwrap();
+        b.set_alts(empty_id, vec![vec![]]).unwrap();
+        assert!(GrammarState::for_grammar(&b.build()).is_complete());
+    }
+
+    /// Control: a root that needs at least one byte is not complete before any
+    /// byte, whichever constructor builds the state.
+    #[test]
+    fn for_grammar_reports_a_non_nullable_root_incomplete() {
+        for g in [ab_grammar(), or_grammar(), digits_grammar()] {
+            assert!(!GrammarState::for_grammar(&g).is_complete());
+        }
+    }
+
+    /// The grammar-aware constructor differs from `initial()` only in
+    /// `complete`, so it is a drop-in start state for `advance_byte`.
+    #[test]
+    fn for_grammar_differs_from_initial_only_in_complete() {
+        let g = ab_grammar();
+        let from_grammar = GrammarState::for_grammar(&g);
+        let initial = GrammarState::initial();
+        assert_eq!(from_grammar.stacks, initial.stacks);
+        assert_eq!(
+            from_grammar.partial_token_bytes,
+            initial.partial_token_bytes
+        );
+        assert_eq!(from_grammar.complete, initial.complete);
+
+        let mut state = GrammarState::for_grammar(&g);
+        assert_eq!(advance_byte(&mut state, &g, b'a'), StepResult::Accepted);
+        assert_eq!(advance_byte(&mut state, &g, b'b'), StepResult::Accepted);
+        assert!(state.is_complete());
     }
 
     /// `root ::= "a" root | ""` accepts every run of `a` bytes, each one a
