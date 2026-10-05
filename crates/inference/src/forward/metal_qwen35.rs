@@ -41717,8 +41717,9 @@ mod public_scheduling_entry_point_tests {
                 "check_raw_prefill_fresh_session",
             ),
             ("fn forward_prefill_from(", "reject_moe_batched"),
-            // The direct and streaming entries decode through the Metal decoder session,
-            // whose `Drop` and `finish` own the compact-route teardown on every exit path.
+            // The direct, streaming and prefix-cache entries decode through the Metal
+            // decoder session, whose `Drop` and `finish` own the compact-route teardown
+            // on every exit path.
             (
                 "pub fn generate(",
                 "QwenMetalSession::with_route_environment",
@@ -41729,7 +41730,7 @@ mod public_scheduling_entry_point_tests {
             ),
             (
                 "fn generate_streaming_with_prefix_cache_and_cancel_inner<F, C>(",
-                "disengage_compact_route",
+                "QwenMetalSession::over_restored_state",
             ),
             ("fn verify_tokens(", "check_live_cursor"),
             ("fn rollback_cache_to(", "rollback_speculative_state_to"),
