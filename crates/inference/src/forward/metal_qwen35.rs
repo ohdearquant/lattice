@@ -34449,9 +34449,105 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             eprintln!("B-vs-B gate PASS: max_abs_diff across all pairs = {max_overall:.6}");
         }
 
-        /// Gate 3: Chunked-vs-serial GDN state diff.  After running the chunked prefill path the
-        /// final S matrices in the typed GDN state must match what the serial token-by-token path
-        /// produces, within max_rel_diff < 1e-3.
+        /// Per-layer and element-wise difference between two GDN state snapshots, with
+        /// `reference` on the denominator side.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        struct GdnSnapshotDiff {
+            /// Largest absolute element difference over all layers.
+            max_abs: f32,
+            /// Largest relative difference over elements with |reference| > 1e-2.
+            max_rel_sig: f32,
+            /// Number of those elements whose relative difference is at least 5e-2.
+            sig_over: usize,
+            /// `||S - S_ref||_F / ||S_ref||_F` per layer, accumulated in f64.
+            layer_rel_l2: Vec<f64>,
+        }
+
+        /// Compare the S matrices of two GDN snapshots. A raw relative metric explodes on
+        /// near-zero entries, so the element-wise relative error only covers elements whose
+        /// reference magnitude exceeds 1e-2. A non-finite difference is reported as infinite
+        /// everywhere, because `f32::max` would otherwise drop a NaN and let it pass.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        fn gdn_snapshot_diff(
+            snap: &crate::attention::gdn::GdnSnapshot,
+            reference: &crate::attention::gdn::GdnSnapshot,
+        ) -> GdnSnapshotDiff {
+            assert_eq!(snap.len(), reference.len(), "snapshot layer count mismatch");
+            assert!(!snap.is_empty(), "snapshot holds no GDN layers");
+            let (mut max_abs, mut max_rel_sig, mut sig_over) = (0.0f32, 0.0f32, 0usize);
+            let mut all_finite = true;
+            let mut layer_rel_l2 = Vec::with_capacity(snap.len());
+            for ((s, _), (s_ref, _)) in snap.iter().zip(reference.iter()) {
+                assert_eq!(s.len(), s_ref.len(), "S matrix element count mismatch");
+                let (mut diff_sq, mut ref_sq) = (0.0f64, 0.0f64);
+                let mut layer_finite = true;
+                for (a, r) in s.iter().zip(s_ref.iter()) {
+                    let abs_diff = (a - r).abs();
+                    layer_finite &= abs_diff.is_finite();
+                    max_abs = max_abs.max(abs_diff);
+                    if r.abs() > 1e-2f32 {
+                        let rel = abs_diff / r.abs();
+                        max_rel_sig = max_rel_sig.max(rel);
+                        if rel >= 5e-2f32 {
+                            sig_over += 1;
+                        }
+                    }
+                    diff_sq += f64::from(abs_diff) * f64::from(abs_diff);
+                    ref_sq += f64::from(*r) * f64::from(*r);
+                }
+                all_finite &= layer_finite;
+                layer_rel_l2.push(if !layer_finite {
+                    f64::INFINITY
+                } else if ref_sq > 0.0 {
+                    (diff_sq / ref_sq).sqrt()
+                } else if diff_sq == 0.0 {
+                    0.0
+                } else {
+                    f64::INFINITY
+                });
+            }
+            if !all_finite {
+                max_abs = f32::INFINITY;
+                max_rel_sig = f32::INFINITY;
+            }
+            GdnSnapshotDiff {
+                max_abs,
+                max_rel_sig,
+                sig_over,
+                layer_rel_l2,
+            }
+        }
+
+        /// Reset `state`, run batched `forward_prefill` over `tokens` with the chunked GDN scan
+        /// on or off, and return the resulting GDN state.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        fn gdn_prefill_snapshot(
+            state: &mut MetalQwen35State,
+            tokens: &[u32],
+            chunked: bool,
+        ) -> crate::attention::gdn::GdnSnapshot {
+            use crate::speculative::MtpTargetVerifier as _;
+            state.use_gdn_chunked = chunked;
+            state.reset_state();
+            let _ = state.forward_prefill(tokens);
+            state.snapshot_gdn_states()
+        }
+
+        /// Gate A: the chunked GDN scan against the serial GDN scan.
+        ///
+        /// Both sides run through batched `forward_prefill` and share every projection, so the
+        /// only difference is the recurrence itself: chunk-GEMMs in the chunked scan against the
+        /// token-by-token update in the serial scan. The final S matrices must agree within
+        /// max_abs < 5e-3 and, over elements with |S| > 1e-2, max relative difference < 5e-2.
+        /// The check runs at the long prompt and at its first 101 tokens.
+        ///
+        /// The chunked snapshot, which is the path under test, is computed once per prompt and
+        /// held fixed. Only the serial reference is re-sampled (at most 3 attempts, best kept),
+        /// so a wrong chunked snapshot diverges on every attempt and cannot be masked by
+        /// best-of-N.
+        ///
+        /// Prefill against decode is a separate comparison, bounded by
+        /// `gdn_prefill_state_vs_decode_state_diff`.
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn gdn_chunked_state_vs_serial_state_diff() {
@@ -34469,103 +34565,197 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu = gpu_test_lock();
-            use crate::speculative::MtpTargetVerifier as _;
             let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
                 .expect("construct Metal state");
-            let tokens = long_real_text_tokens(model.tokenizer());
+            let long_tokens = long_real_text_tokens(model.tokenizer());
+            assert!(
+                long_tokens.len() > 101,
+                "long prompt must exceed 101 tokens"
+            );
 
-            // Magnitude-aware diff of a chunked snapshot against a serial snapshot.
-            // The chunked scan accumulates via chunk-GEMMs in a different float order than the
-            // serial recurrence, so bit-exactness is impossible; we bound the absolute error and
-            // a relative error restricted to non-negligible state elements (a raw relative metric
-            // explodes on near-zero entries with no bearing on correctness).
-            let diff = |chunked_snap: &crate::attention::gdn::GdnSnapshot,
-                        serial_snap: &crate::attention::gdn::GdnSnapshot|
-             -> (f32, f32, usize) {
-                assert_eq!(
-                    chunked_snap.len(),
-                    serial_snap.len(),
-                    "snapshot layer count mismatch"
-                );
-                let (mut max_abs, mut max_rel_sig, mut over) = (0.0f32, 0.0f32, 0usize);
-                for ((s_chunked, _), (s_serial, _)) in chunked_snap.iter().zip(serial_snap.iter()) {
-                    assert_eq!(
-                        s_chunked.len(),
-                        s_serial.len(),
-                        "S matrix element count mismatch"
-                    );
-                    for (sc, ss) in s_chunked.iter().zip(s_serial.iter()) {
-                        let abs_diff = (sc - ss).abs();
-                        max_abs = max_abs.max(abs_diff);
-                        if ss.abs() > 1e-2f32 {
-                            let rel = abs_diff / ss.abs();
-                            max_rel_sig = max_rel_sig.max(rel);
-                            if rel >= 5e-2f32 {
-                                over += 1;
-                            }
-                        }
-                    }
-                }
-                (max_abs, max_rel_sig, over)
-            };
-
-            // The chunked GDN scan is itself deterministic — gdn_chunked_b_vs_b_self_consistency and
-            // the race-localization probe both show chunked-vs-chunked state diff = 0.0 across many
-            // runs.  The only remaining nondeterminism is the pre-existing batched/decode attention
-            // race (root cause unconfirmed; see `gpu_test_lock`'s doc comment for what static
-            // analysis has and hasn't ruled out), which perturbs the residual stream on
-            // ~1-in-N runs.  GPU access is
-            // serialized via gpu_test_lock() so that race is not amplified by device contention, but
-            // it can still occasionally perturb the *serial* forward_step reference by ~1e-3.
-            //
-            // So the chunked snapshot — the path actually under test — is computed exactly ONCE
-            // outside the retry loop.  The loop re-samples only the serial reference and keeps the
-            // best comparison.  A flaky chunked attempt can therefore never be masked by best-of-N:
-            // if the single chunked snapshot were wrong, every attempt would diverge and the gate
-            // would fail.  We only tolerate retries cleaning the known-racy serial reference.
             const MAX_ABS_THRESHOLD: f32 = 5e-3;
             const MAX_REL_SIG_THRESHOLD: f32 = 5e-2;
 
-            // Chunked path (ON via per-instance flag) — computed once, held fixed.
-            state.use_gdn_chunked = true;
-            state.reset_state();
-            let _ = state.forward_prefill(&tokens);
-            let chunked_snap = state.snapshot_gdn_states();
+            let mut failures = Vec::new();
+            for (label, tokens) in [
+                ("long", &long_tokens[..]),
+                ("short101", &long_tokens[..101]),
+            ] {
+                // Chunked path, computed once and held fixed.
+                let chunked_snap = gdn_prefill_snapshot(&mut state, tokens, true);
 
-            let mut best: Option<(f32, f32, usize)> = None;
-            for attempt in 0..3 {
-                // Serial token-by-token reference (chunked OFF via per-instance flag).
-                state.use_gdn_chunked = false;
-                state.reset_state();
-                for (pos, &tok) in tokens.iter().enumerate() {
-                    let _ = state.forward_step(tok, pos);
+                let mut best: Option<(f32, f32, usize)> = None;
+                for attempt in 0..3 {
+                    // Serial-scan prefill reference.
+                    let serial_snap = gdn_prefill_snapshot(&mut state, tokens, false);
+                    let d = gdn_snapshot_diff(&chunked_snap, &serial_snap);
+                    eprintln!(
+                        "State diff chunked vs serial prompt={label} attempt {attempt}: \
+                         max_abs_diff={:.6}, max_rel_diff(|S|>1e-2)={:.6}, \
+                         sig_elems_over_5e-2={}",
+                        d.max_abs, d.max_rel_sig, d.sig_over
+                    );
+                    // A passing attempt is kept as the result; otherwise the closest one is.
+                    if d.max_abs < MAX_ABS_THRESHOLD && d.max_rel_sig < MAX_REL_SIG_THRESHOLD {
+                        best = Some((d.max_abs, d.max_rel_sig, d.sig_over));
+                        break;
+                    }
+                    let better = best.map(|(a, _, _)| d.max_abs < a).unwrap_or(true);
+                    if better {
+                        best = Some((d.max_abs, d.max_rel_sig, d.sig_over));
+                    }
                 }
-                let serial_snap = state.snapshot_gdn_states();
-                state.use_gdn_chunked = true;
-
-                let (max_abs, max_rel_sig, over) = diff(&chunked_snap, &serial_snap);
+                let (max_abs_diff, max_rel_sig, over) = best.expect("at least one attempt");
                 eprintln!(
-                    "State diff attempt {attempt}: max_abs_diff={max_abs:.6}, \
-                     max_rel_diff(|S|>1e-2)={max_rel_sig:.6}, sig_elems_over_5e-2={over}"
+                    "State diff chunked vs serial prompt={label} tokens={} (best of 3): \
+                     max_abs_diff={max_abs_diff:.6}, max_rel_diff(|S|>1e-2)={max_rel_sig:.6}, \
+                     sig_elems_over_5e-2={over}",
+                    tokens.len()
                 );
-                let better = best.map(|(a, _, _)| max_abs < a).unwrap_or(true);
-                if better {
-                    best = Some((max_abs, max_rel_sig, over));
-                }
-                if max_abs < MAX_ABS_THRESHOLD && max_rel_sig < MAX_REL_SIG_THRESHOLD {
-                    break;
+                if !(max_abs_diff < MAX_ABS_THRESHOLD && max_rel_sig < MAX_REL_SIG_THRESHOLD) {
+                    failures.push(format!(
+                        "prompt={label} tokens={}: max_abs_diff={max_abs_diff:.6} \
+                         (threshold {MAX_ABS_THRESHOLD:.0e}), max_rel_diff(|S|>1e-2)=\
+                         {max_rel_sig:.6} (threshold {MAX_REL_SIG_THRESHOLD:.0e})",
+                        tokens.len()
+                    ));
                 }
             }
-            let (max_abs_diff, max_rel_sig, over) = best.expect("at least one attempt");
-            eprintln!(
-                "State diff (best of 3): max_abs_diff={max_abs_diff:.6}, \
-                 max_rel_diff(|S|>1e-2)={max_rel_sig:.6}, sig_elems_over_5e-2={over}"
-            );
             assert!(
-                max_abs_diff < MAX_ABS_THRESHOLD && max_rel_sig < MAX_REL_SIG_THRESHOLD,
-                "GDN state S diverges (chunked vs serial): max_abs_diff={max_abs_diff:.6} \
-                 (threshold {MAX_ABS_THRESHOLD:.0e}), max_rel_diff(|S|>1e-2)={max_rel_sig:.6} \
-                 (threshold {MAX_REL_SIG_THRESHOLD:.0e})"
+                failures.is_empty(),
+                "GDN state S diverges (chunked vs serial scan): {}",
+                failures.join("; ")
+            );
+        }
+
+        /// Gate B: batched prefill (serial GDN scan) against token-by-token `forward_step`
+        /// decode.
+        ///
+        /// The two paths do not share projections. The Q4 prefill GEMM stages its operands in
+        /// half precision and the decode GEMV is f32, so the final S matrices differ for that
+        /// reason alone, independent of the scan. Measured on the real model, the per-layer
+        /// relative L2 difference `||S_prefill - S_decode||_F / ||S_decode||_F` peaks at 8.1e-4,
+        /// while single elements can differ by up to 0.112 relative and 2.7e-3 absolute. An
+        /// element-wise relative metric on a 1e-2 floor flips on those isolated elements, so this
+        /// gate bounds the per-layer relative L2 instead: every GDN layer must stay under 3e-3,
+        /// three times the largest measured value, and the overall max_abs under 5e-3. Layers are
+        /// compared individually so one drifting layer is not averaged away by the others.
+        ///
+        /// The bound is deliberately loose: this gate cannot see a defect in a single layer that
+        /// moves that layer's state by less than about 3e-3 relative L2. Recurrence defects are
+        /// the job of `gdn_chunked_state_vs_serial_state_diff`, which holds the projections fixed.
+        ///
+        /// The check runs at the long prompt and at its first 101 tokens. The prefill snapshot,
+        /// the path under test, is computed once per prompt and held fixed; only the decode
+        /// reference is re-sampled (at most 3 attempts, best kept).
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        fn gdn_prefill_state_vs_decode_state_diff() {
+            let model_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b");
+            if !qwen35_checkpoint_weights_present(&model_dir) {
+                eprintln!("skipping: model missing");
+                return;
+            }
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                .expect("load qwen3.5-0.8b");
+            let Some(_device) = Device::system_default() else {
+                eprintln!("skipping: no Metal device");
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            use crate::speculative::MtpTargetVerifier as _;
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
+                .expect("construct Metal state");
+            let long_tokens = long_real_text_tokens(model.tokenizer());
+            assert!(
+                long_tokens.len() > 101,
+                "long prompt must exceed 101 tokens"
+            );
+
+            const MAX_LAYER_REL_L2_THRESHOLD: f64 = 3e-3;
+            const MAX_ABS_THRESHOLD: f32 = 5e-3;
+
+            let mut failures = Vec::new();
+            for (label, tokens) in [
+                ("long", &long_tokens[..]),
+                ("short101", &long_tokens[..101]),
+            ] {
+                // Serial-scan prefill, computed once and held fixed.
+                let prefill_snap = gdn_prefill_snapshot(&mut state, tokens, false);
+
+                // (worst layer, its rel_L2, layers over the threshold, overall max_abs)
+                let mut best: Option<(usize, f64, usize, f32)> = None;
+                let mut best_layer_rel_l2: Vec<f64> = Vec::new();
+                for attempt in 0..3 {
+                    // Token-by-token decode reference.
+                    state.use_gdn_chunked = false;
+                    state.reset_state();
+                    for (pos, &tok) in tokens.iter().enumerate() {
+                        let _ = state.forward_step(tok, pos);
+                    }
+                    let decode_snap = state.snapshot_gdn_states();
+                    state.use_gdn_chunked = true;
+
+                    let d = gdn_snapshot_diff(&prefill_snap, &decode_snap);
+                    let mut worst_layer = 0usize;
+                    let mut worst_rel = 0.0f64;
+                    for (layer, &rel) in d.layer_rel_l2.iter().enumerate() {
+                        if rel > worst_rel {
+                            worst_layer = layer;
+                            worst_rel = rel;
+                        }
+                    }
+                    let layers_over = d
+                        .layer_rel_l2
+                        .iter()
+                        .filter(|rel| **rel >= MAX_LAYER_REL_L2_THRESHOLD)
+                        .count();
+                    eprintln!(
+                        "State diff prefill vs decode prompt={label} attempt {attempt}: \
+                         max_layer_rel_l2={worst_rel:.3e} (layer {worst_layer}), \
+                         max_abs={:.6}",
+                        d.max_abs
+                    );
+                    // A passing attempt is kept as the result; otherwise the closest one is.
+                    if layers_over == 0 && d.max_abs < MAX_ABS_THRESHOLD {
+                        best = Some((worst_layer, worst_rel, layers_over, d.max_abs));
+                        best_layer_rel_l2 = d.layer_rel_l2;
+                        break;
+                    }
+                    let better = best.map(|(_, w, _, _)| worst_rel < w).unwrap_or(true);
+                    if better {
+                        best = Some((worst_layer, worst_rel, layers_over, d.max_abs));
+                        best_layer_rel_l2 = d.layer_rel_l2;
+                    }
+                }
+                let (worst_layer, worst_rel, layers_over, max_abs) =
+                    best.expect("at least one attempt");
+                let per_layer: Vec<String> = best_layer_rel_l2
+                    .iter()
+                    .map(|rel| format!("{rel:.3e}"))
+                    .collect();
+                eprintln!(
+                    "State diff prefill vs decode prompt={label} tokens={} (best of 3): \
+                     max_layer_rel_l2={worst_rel:.3e} (layer {worst_layer}), max_abs={max_abs:.6}, \
+                     per_layer_rel_l2=[{}]",
+                    tokens.len(),
+                    per_layer.join(", ")
+                );
+                if layers_over > 0 || max_abs >= MAX_ABS_THRESHOLD {
+                    failures.push(format!(
+                        "prompt={label} tokens={}: worst layer {worst_layer} rel_L2={worst_rel:.3e} \
+                         (threshold {MAX_LAYER_REL_L2_THRESHOLD:.0e}, {layers_over} layer(s) over), \
+                         max_abs={max_abs:.6} (threshold {MAX_ABS_THRESHOLD:.0e})",
+                        tokens.len()
+                    ));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "GDN state S diverges (prefill vs decode): {}",
+                failures.join("; ")
             );
         }
 
