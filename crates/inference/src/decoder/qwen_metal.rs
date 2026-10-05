@@ -888,11 +888,9 @@ pub(crate) fn run_prefix_cache_streaming(
 ///   refused natural-end flush leave the slot empty. A cancel at a decode-loop
 ///   top and a refused later token save the forwarded prefix, with no silent
 ///   step: the last pushed token was not forwarded.
-/// - A confirmed stop-string match, and a flush that completes one after a
-///   grammar rejection or a length stop, leave the slot empty: the saved
-///   tokens would represent text the caller never received. A flush that
-///   completes one after a stop token leaves the disposition unchanged and
-///   saves.
+/// - A confirmed stop-string match, and a flush that completes one however the
+///   loop ended, leave the slot empty: the saved tokens would represent text
+///   the caller never received.
 /// - A grammar that blocks every token before the first, and is complete,
 ///   leaves the slot empty.
 /// - Every other exit saves. The silent step runs only when the last pushed
@@ -911,12 +909,7 @@ fn prefix_commit(run: &StreamRun) -> PrefixCommit {
             _ => PrefixCommit::Save { silent_step: false },
         };
     }
-    let flush_flipped_a_length_stop =
-        reason == Some(StopReason::Eos) && run.trace.opened == generated;
-    if run.confirmed_stop_string_match
-        || (run.flush_completed_stop_string
-            && (run.grammar_rejection || flush_flipped_a_length_stop))
-    {
+    if run.confirmed_stop_string_match || run.flush_completed_stop_string {
         return PrefixCommit::Leave;
     }
     if reason == Some(StopReason::Grammar) && generated == 0 && run.trace.opened == 0 {
@@ -2403,9 +2396,9 @@ mod tests {
         assert_eq!(run.commit, PrefixCommit::Save { silent_step: false });
     }
 
-    /// The flush can complete a stop string. After a length stop or a grammar
-    /// rejection that leaves the slot empty; after a stop token it does not
-    /// change the exit and the slot is saved, as the entry's own loop did.
+    /// The flush can complete a stop string. However the loop ended, a stop
+    /// string the flush completes leaves the slot empty: after a stop token the
+    /// exit is unchanged, but the caller's text was still truncated by the match.
     #[test]
     fn prefix_commit_reads_a_stop_string_completed_by_the_flush_per_exit() {
         let flush = |gen_cfg: GenerateConfig| GenerateConfig {
@@ -2442,7 +2435,7 @@ mod tests {
         assert!(run.output.stopped);
         assert_eq!(
             run.commit,
-            PrefixCommit::Save { silent_step: false },
+            PrefixCommit::Leave,
             "a stop token the flush then follows"
         );
     }
