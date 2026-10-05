@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use syn::ext::IdentExt;
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
@@ -820,6 +821,8 @@ impl ModuleGraph<'_> {
             let syn::Item::Mod(module) = item else {
                 continue;
             };
+            // A raw identifier (`mod r#loop;`) names the file `loop.rs`, not `r#loop.rs`.
+            let module_name = module.ident.unraw().to_string();
             let module_cfg = CfgFormula::all([
                 inherited_cfg.clone(),
                 syn_attributes_formula(&module.attrs, self.test_cfg, &context)?,
@@ -837,7 +840,7 @@ impl ModuleGraph<'_> {
                 self.walk_items(
                     contents,
                     source_path,
-                    &module_dir.join(module.ident.to_string()),
+                    &module_dir.join(&module_name),
                     module_cfg,
                 )?;
                 continue;
@@ -846,8 +849,8 @@ impl ModuleGraph<'_> {
             let target = if let Some(relative) = direct_path {
                 module_dir.join(relative)
             } else {
-                let flat = module_dir.join(format!("{}.rs", module.ident));
-                let nested = module_dir.join(module.ident.to_string()).join("mod.rs");
+                let flat = module_dir.join(format!("{module_name}.rs"));
+                let nested = module_dir.join(&module_name).join("mod.rs");
                 match (flat.exists(), nested.exists()) {
                     (true, false) => flat,
                     (false, true) => nested,
@@ -868,10 +871,7 @@ impl ModuleGraph<'_> {
             let child_module_dir = if target.file_name().is_some_and(|name| name == "mod.rs") {
                 target.parent().unwrap_or(module_dir).to_path_buf()
             } else {
-                target
-                    .parent()
-                    .unwrap_or(module_dir)
-                    .join(module.ident.to_string())
+                target.parent().unwrap_or(module_dir).join(&module_name)
             };
             self.load(&target, &child_module_dir, module_cfg)?;
         }
