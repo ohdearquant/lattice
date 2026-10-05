@@ -39,6 +39,10 @@
 //!   subtree (`SimResult::Reject`, first-byte rejection);
 //! - a byte rejected below the root makes every token in that child's
 //!   subtree `SimResult::ContextDependent`;
+//! - a byte whose step exceeds the matcher's stack limits makes every token in
+//!   that child's subtree `SimResult::StackLimitExceeded`: none of them is
+//!   reported as accepted or context-dependent, and the walk reports that the
+//!   limit was hit;
 //! - a terminal reached through accepted edges only is `SimResult::Accept`.
 //!
 //! `VocabPartition` calls it once per precomputed state, so building the
@@ -77,7 +81,9 @@
 //! additionally clears it after every accepted byte, so its clones never copy
 //! the trie-prefix bytes either; `mark_allowed` only trims the root.
 
-use crate::grammar::pda::{CompiledGrammar, GrammarState, StepResult, advance_byte};
+use crate::grammar::pda::{
+    CompiledGrammar, GrammarState, StackLimitError, StepResult, advance_byte,
+};
 
 // Reused across every `ByteTrie::mask` call on this thread so the hot
 // over-cap path doesn't heap-allocate a fresh `vocab_size / 64`-word bitvec
@@ -161,13 +167,19 @@ impl ByteTrie {
     /// `GrammarEngine::mask_by_simulation`: sets disallowed positions to
     /// `f32::NEG_INFINITY`, leaves allowed positions' original values
     /// untouched).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StackLimitError`] when a byte step exceeds the matcher's stack
+    /// limits; `logits` is left untouched in that case, since the mask cannot
+    /// be computed exactly.
     pub fn mask(
         &self,
         state: &GrammarState,
         grammar: &CompiledGrammar,
         vocab_size: usize,
         logits: &mut [f32],
-    ) {
+    ) -> Result<(), StackLimitError> {
         let mask_stride = vocab_size.div_ceil(64);
         MASK_SCRATCH.with(|scratch| {
             let mut allowed = scratch.borrow_mut();
@@ -179,31 +191,36 @@ impl ByteTrie {
                 walk_root_state(state),
                 grammar,
                 &mut allowed,
-            );
+            )?;
             apply_allowed_mask(&allowed, vocab_size, logits);
-        });
+            Ok(())
+        })
     }
 
     /// Classify every non-empty vocabulary token against `state` in one walk,
     /// matching `simulate_token` per token: `SimResult::Accept` tokens get
     /// their bit set in `accepted`, `SimResult::ContextDependent` token ids
     /// are appended to `context_dependent`, and `SimResult::Reject` tokens are
-    /// left untouched. Empty tokens are not in the trie, so they are never
-    /// reported and stay blocked (the previous partition builder's behaviour,
-    /// not `simulate_token`'s `Accept` for an empty slice).
+    /// left untouched. Tokens for which `simulate_token` would return
+    /// `SimResult::StackLimitExceeded` are also left untouched (no bit, no
+    /// entry in `context_dependent`); the return value is `true` when there is
+    /// at least one such token. Empty tokens are not in the trie, so they are
+    /// never reported and stay blocked (the previous partition builder's
+    /// behaviour, not `simulate_token`'s `Accept` for an empty slice).
     ///
     /// `accepted` must hold `vocab_size.div_ceil(64)` words; bits are only
     /// ever OR-ed in. `context_dependent` ids arrive in walk order, not
     /// token-id order, so a caller that needs them sorted sorts them. The walk
     /// keeps an explicit stack, so its call depth does not grow with token
     /// length.
+    #[must_use = "a true result means some tokens were not classified"]
     pub(crate) fn classify(
         &self,
         state: &GrammarState,
         grammar: &CompiledGrammar,
         accepted: &mut [u64],
         context_dependent: &mut Vec<usize>,
-    ) {
+    ) -> bool {
         classify_node(
             &self.nodes,
             0,
@@ -211,13 +228,13 @@ impl ByteTrie {
             grammar,
             accepted,
             context_dependent,
-        );
+        )
     }
 }
 
 /// Build the DFS walk's root state from the live decode-step `state`.
 ///
-/// Carries a clone of `stack` and `complete` (the only fields `advance_byte`
+/// Carries a clone of `stacks` and `complete` (the only fields `advance_byte`
 /// and `is_accepting` ever read) but starts `partial_token_bytes` empty
 /// instead of cloning the live state's history. `advance_byte` (pda.rs)
 /// unconditionally *appends* to `partial_token_bytes` and nothing in PDA
@@ -230,7 +247,7 @@ impl ByteTrie {
 /// decode, not just within one trie walk.
 fn walk_root_state(state: &GrammarState) -> GrammarState {
     GrammarState {
-        stack: state.stack.clone(),
+        stacks: state.stacks.clone(),
         partial_token_bytes: Vec::new(),
         complete: state.complete,
     }
@@ -238,14 +255,14 @@ fn walk_root_state(state: &GrammarState) -> GrammarState {
 
 /// DFS from `node_idx` carrying an owned live `state`. Marks every
 /// terminal token reachable via an all-accepted byte path as allowed in
-/// `allowed`.
+/// `allowed`. Fails if any byte step exceeds the matcher's stack limits.
 fn mark_allowed(
     nodes: &[TrieNode],
     node_idx: u32,
     state: GrammarState,
     grammar: &CompiledGrammar,
     allowed: &mut [u64],
-) {
+) -> Result<(), StackLimitError> {
     let node = &nodes[node_idx as usize];
     for &token_id in &node.terminals {
         let idx = token_id as usize;
@@ -254,7 +271,7 @@ fn mark_allowed(
 
     let children = &node.children;
     let Some((&last, rest)) = children.split_last() else {
-        return;
+        return Ok(());
     };
 
     // Every non-last child needs its own state: cloning here (rather than
@@ -263,16 +280,22 @@ fn mark_allowed(
     // token — clone-free.
     for &(byte, child_idx) in rest {
         let mut child_state = state.clone();
-        if advance_byte(&mut child_state, grammar, byte) == StepResult::Accepted {
-            mark_allowed(nodes, child_idx, child_state, grammar, allowed);
+        match advance_byte(&mut child_state, grammar, byte) {
+            StepResult::Accepted => {
+                mark_allowed(nodes, child_idx, child_state, grammar, allowed)?;
+            }
+            StepResult::Rejected => {}
+            StepResult::StackLimitExceeded => return Err(StackLimitError),
         }
     }
 
     // Last child reuses (moves) the caller's owned state — no clone.
     let (byte, child_idx) = last;
     let mut last_state = state;
-    if advance_byte(&mut last_state, grammar, byte) == StepResult::Accepted {
-        mark_allowed(nodes, child_idx, last_state, grammar, allowed);
+    match advance_byte(&mut last_state, grammar, byte) {
+        StepResult::Accepted => mark_allowed(nodes, child_idx, last_state, grammar, allowed),
+        StepResult::Rejected => Ok(()),
+        StepResult::StackLimitExceeded => Err(StackLimitError),
     }
 }
 
@@ -280,7 +303,10 @@ fn mark_allowed(
 /// the way `simulate_token` does. Terminals at a node reached through accepted
 /// edges are `Accept`. A rejected child edge drops its whole subtree: at the
 /// root that is `Reject` (nothing to record), below the root every token in
-/// it is `ContextDependent`.
+/// it is `ContextDependent`. A child edge whose step exceeds the stack limits
+/// drops its subtree without recording any of its tokens, since each of them
+/// is `StackLimitExceeded`. Returns `true` when any edge below `root_idx`
+/// exceeded the limits.
 ///
 /// Iterative over an explicit stack, so the native call depth does not grow
 /// with the longest token's byte length. Walk states drop
@@ -293,7 +319,8 @@ fn classify_node(
     grammar: &CompiledGrammar,
     accepted: &mut [u64],
     context_dependent: &mut Vec<usize>,
-) {
+) -> bool {
+    let mut limit_hit = false;
     let mut pending = vec![(root_idx, root_state)];
     while let Some((node_idx, state)) = pending.pop() {
         let node = &nodes[node_idx as usize];
@@ -311,23 +338,36 @@ fn classify_node(
         // Same clone-avoidance as `mark_allowed`: only non-last children clone.
         for &(byte, child_idx) in rest {
             let mut child_state = state.clone();
-            if advance_byte(&mut child_state, grammar, byte) == StepResult::Accepted {
-                child_state.partial_token_bytes.clear();
-                pending.push((child_idx, child_state));
-            } else if below_root {
-                collect_subtree_terminals(nodes, child_idx, context_dependent);
+            match advance_byte(&mut child_state, grammar, byte) {
+                StepResult::Accepted => {
+                    child_state.partial_token_bytes.clear();
+                    pending.push((child_idx, child_state));
+                }
+                StepResult::Rejected => {
+                    if below_root {
+                        collect_subtree_terminals(nodes, child_idx, context_dependent);
+                    }
+                }
+                StepResult::StackLimitExceeded => limit_hit = true,
             }
         }
 
         let (byte, child_idx) = last;
         let mut last_state = state;
-        if advance_byte(&mut last_state, grammar, byte) == StepResult::Accepted {
-            last_state.partial_token_bytes.clear();
-            pending.push((child_idx, last_state));
-        } else if below_root {
-            collect_subtree_terminals(nodes, child_idx, context_dependent);
+        match advance_byte(&mut last_state, grammar, byte) {
+            StepResult::Accepted => {
+                last_state.partial_token_bytes.clear();
+                pending.push((child_idx, last_state));
+            }
+            StepResult::Rejected => {
+                if below_root {
+                    collect_subtree_terminals(nodes, child_idx, context_dependent);
+                }
+            }
+            StepResult::StackLimitExceeded => limit_hit = true,
         }
     }
+    limit_hit
 }
 
 /// Append every terminal token id in the subtree rooted at `node_idx`
@@ -404,7 +444,8 @@ mod tests {
         let trie = ByteTrie::build(&vocab);
         let state = GrammarState::initial();
         let mut logits = vec![1.0f32, 2.0f32, 3.0f32];
-        trie.mask(&state, &grammar, vocab.len(), &mut logits);
+        trie.mask(&state, &grammar, vocab.len(), &mut logits)
+            .expect("fixture stays inside the stack limits");
         assert!(logits[0] > f32::NEG_INFINITY, "'a' allowed");
         assert!(logits[1] > f32::NEG_INFINITY, "'b' allowed");
         assert_eq!(logits[2], f32::NEG_INFINITY, "'c' blocked");
@@ -417,7 +458,8 @@ mod tests {
         let trie = ByteTrie::build(&vocab);
         let state = GrammarState::initial();
         let mut logits = vec![1.0f32, 1.0f32];
-        trie.mask(&state, &grammar, vocab.len(), &mut logits);
+        trie.mask(&state, &grammar, vocab.len(), &mut logits)
+            .expect("fixture stays inside the stack limits");
         assert!(logits[0] > f32::NEG_INFINITY);
         assert_eq!(logits[1], f32::NEG_INFINITY, "empty token always blocked");
     }
@@ -455,7 +497,7 @@ mod tests {
              state.clone() here reintroduces O(generation-so-far) DFS clones",
             root.partial_token_bytes.len()
         );
-        assert_eq!(root.stack, state.stack, "walk root must preserve stack");
+        assert_eq!(root.stacks, state.stacks, "walk root must preserve stacks");
         assert_eq!(
             root.complete, state.complete,
             "walk root must preserve the complete flag"
@@ -474,12 +516,14 @@ mod tests {
 
         let clean_state = GrammarState::initial();
         let mut clean_logits = vec![1.0f32, 2.0f32, 3.0f32];
-        trie.mask(&clean_state, &grammar, vocab.len(), &mut clean_logits);
+        trie.mask(&clean_state, &grammar, vocab.len(), &mut clean_logits)
+            .expect("fixture stays inside the stack limits");
 
         let mut heavy_state = GrammarState::initial();
         heavy_state.partial_token_bytes = vec![b'x'; 64 * 1024];
         let mut heavy_logits = vec![1.0f32, 2.0f32, 3.0f32];
-        trie.mask(&heavy_state, &grammar, vocab.len(), &mut heavy_logits);
+        trie.mask(&heavy_state, &grammar, vocab.len(), &mut heavy_logits)
+            .expect("fixture stays inside the stack limits");
 
         assert_eq!(
             clean_logits, heavy_logits,

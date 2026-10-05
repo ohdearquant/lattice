@@ -2,17 +2,49 @@
 //!
 //! # Design
 //!
-//! The grammar is compiled to a set of *rules*, each of which is a sequence
-//! of *symbols* (either a terminal byte or a non-terminal rule reference).
-//! Execution is modelled as a stack of `StackFrame`s:
+//! The grammar is compiled to a set of *rules*, each of which is a set of
+//! alternatives, each alternative being an ordered sequence of *symbols*
+//! (either a terminal byte or a non-terminal rule reference). A parse in
+//! progress is a stack of `StackFrame`s:
 //!
 //! ```text
-//! frame = (rule_id, position_within_rule, alt_index)
+//! frame = (rule_id, alt_idx, sym_pos)
+//! stack = [frame, ...]        bottom = root rule, top = innermost rule
 //! ```
 //!
-//! The `advance_byte` operation pops frames that have been fully consumed,
-//! pushes frames for non-terminal expansions, and checks whether the current
-//! terminal symbol matches the incoming byte.
+//! In every frame below the top, `sym_pos` points at the non-terminal that the
+//! frame above it is currently matching.
+//!
+//! # One parse is not enough
+//!
+//! The matcher does not commit to a single parse. A `GrammarState` holds the
+//! whole *set* of stacks that are consistent with the bytes seen so far, and
+//! `advance_byte(b)` advances every stack that can consume `b`, expanding
+//! non-terminals into each of their alternatives on the way, and drops the
+//! rest. Two alternatives that begin with the same byte therefore both stay
+//! alive until a later byte tells them apart, and a byte is rejected only when
+//! no stack can consume it. There is no backtracking and no record of which
+//! bytes a frame has consumed: a parse that turns out to be wrong simply stops
+//! being in the set. This is the design llama.cpp uses for GBNF.
+//!
+//! After every byte the set is sorted and deduplicated, so two states that
+//! hold the same stacks compare equal. The vocabulary partition keys on that
+//! set.
+//!
+//! # Limits
+//!
+//! * `MAX_PDA_DEPTH` bounds the length of one stack. A left-recursive or
+//!   cyclic grammar pushes frames without consuming a byte, so a step that
+//!   needs a stack past the bound stops there (issue #343).
+//! * `MAX_LIVE_STACKS` bounds how many distinct stacks one step may keep alive
+//!   and `MAX_EXPANSION_STEPS` bounds how many structural expansion steps it
+//!   may take.
+//!
+//! A grammar that needs more than any of the three is too ambiguous or too
+//! deeply nested for set-of-stacks matching, and `advance_byte` returns
+//! `StepResult::StackLimitExceeded`. That outcome is deliberately separate from
+//! `StepResult::Rejected`, so that a caller cannot mistake an overloaded
+//! matcher for a grammar that refuses the input.
 //!
 //! # Grammar representation
 //!
@@ -26,7 +58,8 @@
 //! Symbol::AnyByte   — matches any single byte (used for GBNF `.` and `[^...]`)
 //! ```
 //!
-//! The root rule has id 0 (by convention enforced by `CompiledGrammar`).
+//! The root rule has id 0 (by convention enforced by `CompiledGrammar`). A
+//! rule with no alternatives matches the empty string.
 //!
 //! # The UTF-8 contract, and where it stops
 //!
@@ -61,22 +94,21 @@
 //! A `GrammarState` encodes the full PDA configuration:
 //!
 //! ```text
-//! stack: Vec<StackFrame>
-//!   StackFrame { rule_id, alt_idx, sym_pos, consumed }
-//! partial_bytes: Vec<u8>  — bytes of current token received so far
+//! stacks: Vec<Vec<StackFrame>>   sorted, deduplicated
+//! partial_bytes: Vec<u8>         bytes of current token received so far
+//! complete: bool                 some stack can finish with no further input
 //! ```
 //!
-//! `consumed` records whether a byte has been consumed under a frame's current
-//! alternative; it gates backtracking so a committed frame is never switched to
-//! a sibling alternative (no input rewind). See [`StackFrame::consumed`].
+//! The automaton starts with one stack holding a single frame for the root
+//! rule whose alternative is not chosen yet (`UNCHOSEN_ALT`); the first byte
+//! expands it into one stack per root alternative.
+//! `advance_byte(b)` returns whether the byte `b` is accepted (some stack can
+//! consume it) and updates the stack set in-place.
 //!
-//! The automaton starts with a single frame at `(root, 0, 0)`.
-//! `advance_byte(b)` returns whether the byte `b` is accepted (the PDA can
-//! make progress) and updates the stack in-place.
-//!
-//! `can_accept_more()` returns whether the current stack state can still
+//! `can_accept_more()` returns whether the current stack set can still
 //! accept additional input (used for context-dependent token masking).
-//! `is_complete()` returns whether a terminal state has been reached.
+//! `is_complete()` returns whether some stack can finish through nullable
+//! symbols alone, i.e. whether the bytes so far are a complete match.
 
 use std::collections::HashMap;
 
@@ -94,23 +126,44 @@ pub enum Symbol {
     NonTerminal(usize),
 }
 
-/// Maximum PDA stack depth before an advance is rejected.
+/// Maximum stack length a byte step may build.
 ///
 /// A left-recursive or cyclic grammar (`root ::= root`, or a JSON-Schema `$ref`
-/// cycle) makes `try_advance_stack` push non-terminal frames without ever
-/// consuming a byte, growing the stack without bound — a hang reachable from
-/// untrusted grammar input at `GrammarEngine::new` (issue #343). Capping the
-/// depth turns that into a bounded rejection (the grammar becomes a dead
-/// grammar that accepts nothing) instead of an OOM. The bound is far above any
+/// cycle) makes the matcher push non-terminal frames without ever consuming a
+/// byte, growing the stack without bound — a hang reachable from untrusted
+/// grammar input at `GrammarEngine::new` (issue #343). A step that would grow a
+/// stack past this depth fails with `StepResult::StackLimitExceeded` instead of
+/// running out of memory. That is a limit of the matcher, not a verdict on the
+/// input: a productive recursion such as `root ::= "a" root | ""` accepts every
+/// run of `a` bytes, and the byte that needs the stack to pass this depth is
+/// reported as a limit rather than as a rejection. The bound is far above any
 /// real nesting: `serde_json` itself caps recursion at 128, and each JSON level
 /// expands to only a handful of PDA frames, so 8192 frames is unreachable by a
 /// well-formed grammar on well-formed output.
 pub(crate) const MAX_PDA_DEPTH: usize = 8192;
 
-/// Maximum checkpoint restores per byte (see `try_backtrack`, #322). Nested
-/// nullable alternatives can multiply restores combinatorially; capped low
-/// enough to stay cheap, past which a byte falls back to outright rejection.
-pub(crate) const MAX_BACKTRACK_RESTORES: usize = 256;
+/// Maximum number of distinct stacks one byte step may keep alive, counting
+/// both the stacks it has produced and the ones still waiting to be explored.
+///
+/// A grammar whose ambiguity keeps more parses open than this at once is too
+/// ambiguous for set-of-stacks matching. The step then fails with
+/// `StepResult::StackLimitExceeded` instead of growing without bound or
+/// pretending the grammar rejected the byte. The bound is far above what the
+/// schema compiler produces: an object with N optional properties keeps about
+/// N stacks open at a key boundary, and identical stacks are merged before
+/// they are counted.
+pub(crate) const MAX_LIVE_STACKS: usize = 1024;
+
+/// Maximum number of structural expansion steps one byte step may take before
+/// it gives up.
+///
+/// A structural step opens the top frame of one stack: it chooses among the
+/// alternatives of a rule, enters a non-terminal, or leaves an exhausted frame.
+/// Distinct live stacks are not the only cost: nested nullable alternatives and
+/// long runs of nullable symbols can multiply the steps a byte has to take even
+/// when no parse survives it, so the work needs its own bound. Exceeding it
+/// reports `StepResult::StackLimitExceeded`, like `MAX_LIVE_STACKS`.
+pub(crate) const MAX_EXPANSION_STEPS: usize = 16 * MAX_LIVE_STACKS;
 
 /// A compiled grammar rule: a name and a set of alternatives.
 #[derive(Debug, Clone)]
@@ -139,44 +192,42 @@ impl CompiledGrammar {
     }
 }
 
-/// One frame on the PDA execution stack.
+/// `StackFrame::alt_idx` of a frame whose rule has been entered but whose
+/// alternative has not been chosen yet.
 ///
-/// `Eq + Hash` (added alongside `PartialEq`, structurally over the same
-/// fields) let a `GrammarState`'s `(stack, complete)` pair — the same
-/// identity `states_equal` in `engine.rs` already compares by — key a
-/// `HashMap` for state-revisit / memoization profiling without changing any
-/// existing comparison semantics.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// The matcher replaces it with one frame per alternative of the rule when it
+/// next steps the stack, so only a freshly pushed frame (and the root frame of
+/// the initial state) ever carries it.
+pub const UNCHOSEN_ALT: usize = usize::MAX;
+
+/// One frame on a PDA stack.
+///
+/// `Ord` sorts the stacks of a `GrammarState` into a canonical order, and
+/// `Eq + Hash` let a `GrammarState`'s `(stacks, complete)` pair — the same
+/// identity `states_equal` in `engine.rs` compares by — key a `HashMap` for
+/// state-revisit / memoization profiling.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StackFrame {
     /// Index into `CompiledGrammar::rules`.
     pub rule_id: usize,
-    /// Index into `rules[rule_id].alts`.
+    /// Index into `rules[rule_id].alts`, or [`UNCHOSEN_ALT`].
     pub alt_idx: usize,
     /// Position within the chosen alternative (0 = before the first symbol).
     pub sym_pos: usize,
-    /// `true` once any input byte has been consumed while this frame has been
-    /// at its current `alt_idx` (set for every frame on the stack on each byte
-    /// match; reset when the frame switches to a new alternative). A frame with
-    /// `consumed == true` is *committed* to its alternative: because this is a
-    /// no-rewind byte matcher, switching it to a sibling alternative would
-    /// re-interpret already-consumed bytes as if they never existed. The
-    /// backtracking logic refuses that switch, which is what closes the
-    /// trailing-comma / optional-collapse over-acceptance class (#353). Note it
-    /// tracks byte consumption, not `sym_pos`: a frame can advance `sym_pos`
-    /// past nullable nonterminals without consuming a byte, and such a frame
-    /// must still be free to switch (otherwise `[]` and similar over-reject).
-    pub consumed: bool,
 }
 
 /// Runtime state of the PDA for one decode sequence.
 ///
 /// Clone this at each step to enable parallel-beam grammar tracking.  The
-/// cost is O(stack depth), which for well-formed JSON is at most O(nesting
-/// depth) — typically 2-6 frames.
+/// cost is O(total frames over the live stacks): a single stack of 2-6 frames
+/// at positions where only one parse is open, a few more where alternatives
+/// that share a prefix have not been told apart yet.
 #[derive(Debug, Clone)]
 pub struct GrammarState {
-    /// Execution stack; top of stack is the last element.
-    pub stack: Vec<StackFrame>,
+    /// The live stacks; the top of each stack is its last element. Sorted and
+    /// free of duplicates after every accepted byte, so equal sets of stacks
+    /// compare equal.
+    pub stacks: Vec<Vec<StackFrame>>,
     /// Bytes accumulated within the current token (context-dependent checks).
     pub partial_token_bytes: Vec<u8>,
     /// `true` once the root rule has been fully matched (EOS is valid).
@@ -184,23 +235,23 @@ pub struct GrammarState {
 }
 
 impl GrammarState {
-    /// Initial state: single frame at root rule, alt 0, sym_pos 0.
+    /// Initial state: a single stack with one frame at the root rule, its
+    /// alternative not yet chosen, at sym_pos 0.
     pub fn initial() -> Self {
         Self {
-            stack: vec![StackFrame {
+            stacks: vec![vec![StackFrame {
                 rule_id: 0,
-                alt_idx: 0,
+                alt_idx: UNCHOSEN_ALT,
                 sym_pos: 0,
-                consumed: false,
-            }],
+            }]],
             partial_token_bytes: Vec::new(),
             complete: false,
         }
     }
 
     /// Returns true if the automaton has consumed all input and is in an
-    /// accepting configuration (stack is empty or all remaining frames are at
-    /// rules whose alternatives can complete with zero bytes).
+    /// accepting configuration (some stack is empty or all its remaining
+    /// frames are at rules whose alternatives can complete with zero bytes).
     pub fn is_complete(&self) -> bool {
         self.complete
     }
@@ -208,7 +259,7 @@ impl GrammarState {
     /// Returns true if the automaton could potentially accept more bytes.
     /// Used during context-dependent token inspection.
     pub fn can_accept_more(&self) -> bool {
-        !self.complete || !self.stack.is_empty()
+        !self.complete || self.stacks.iter().any(|stack| !stack.is_empty())
     }
 }
 
@@ -222,286 +273,304 @@ pub(crate) fn initial_grammar_state(grammar: &CompiledGrammar) -> GrammarState {
 // PDA execution engine
 // ---------------------------------------------------------------------------
 
+/// A byte step needed more stacks than `MAX_LIVE_STACKS` allows, more
+/// expansion work than `MAX_EXPANSION_STEPS` allows, or a stack deeper than
+/// `MAX_PDA_DEPTH`.
+///
+/// This is a limit of the matcher, not a verdict on the input: it says the
+/// grammar is too ambiguous or too deeply nested to track, not that the grammar
+/// rejects the byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackLimitError;
+
+impl std::fmt::Display for StackLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "grammar is too ambiguous or too deeply nested to match: one step needed more than {MAX_LIVE_STACKS} live stacks, {MAX_EXPANSION_STEPS} expansion steps or {MAX_PDA_DEPTH} stack frames"
+        )
+    }
+}
+impl std::error::Error for StackLimitError {}
+
 /// Result of attempting to advance the PDA by one byte.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepResult {
     /// The byte was accepted; the state has been updated.
     Accepted,
-    /// The byte was rejected by the current grammar state.
+    /// No live stack can consume the byte; the state is unchanged.
     Rejected,
+    /// The step needed more live stacks, more expansion work or a deeper stack
+    /// than the matcher allows (see [`StackLimitError`]); the state is
+    /// unchanged.
+    ///
+    /// This says nothing about whether the grammar admits the byte, so it must
+    /// not be handled as a grammar rejection. Compare against
+    /// [`StepResult::Accepted`] rather than against `Rejected` when deciding
+    /// whether a byte went through.
+    StackLimitExceeded,
+}
+
+/// One parse in progress; the top frame is the last element.
+type Stack = Vec<StackFrame>;
+
+/// What the top of a stack needs next.
+enum Top {
+    /// The stack is empty: the root rule has been matched in full.
+    Empty,
+    /// The top symbol matches one byte: `Some(b)` for a terminal, `None` for
+    /// `Symbol::AnyByte`.
+    Byte(Option<u8>),
+    /// The top has to be expanded before it can match a byte: an alternative
+    /// not chosen yet, a non-terminal, or an exhausted frame.
+    Open,
+    /// The stack is deeper than `MAX_PDA_DEPTH`: the step cannot tell whether
+    /// it could match, so it fails with a stack limit.
+    TooDeep,
+    /// The stack can never match anything: it names a rule, alternative or
+    /// non-terminal that does not exist.
+    Dead,
+}
+
+fn classify_top(stack: &[StackFrame], grammar: &CompiledGrammar) -> Top {
+    let Some(frame) = stack.last() else {
+        return Top::Empty;
+    };
+    if stack.len() > MAX_PDA_DEPTH {
+        // Cyclic / left-recursive grammar pushing frames without progress
+        // (issue #343). Stop rather than grow the stack unbounded.
+        return Top::TooDeep;
+    }
+    let Some(rule) = grammar.rules.get(frame.rule_id) else {
+        return Top::Dead;
+    };
+    // A rule with no alternatives matches the empty string.
+    if rule.alts.is_empty() || frame.alt_idx == UNCHOSEN_ALT {
+        return Top::Open;
+    }
+    let Some(alt) = rule.alts.get(frame.alt_idx) else {
+        return Top::Dead;
+    };
+    match alt.get(frame.sym_pos) {
+        None => Top::Open,
+        Some(Symbol::Terminal(t)) => Top::Byte(Some(*t)),
+        Some(Symbol::AnyByte) => Top::Byte(None),
+        Some(Symbol::NonTerminal(rule_id)) => {
+            if grammar.rules.get(*rule_id).is_some() {
+                Top::Open
+            } else {
+                Top::Dead
+            }
+        }
+    }
+}
+
+fn byte_matches(want: Option<u8>, b: u8) -> bool {
+    want.is_none_or(|w| w == b)
 }
 
 /// Advance a `GrammarState` by one byte `b` against `grammar`.
 ///
-/// The algorithm:
-/// 1. Inspect the top frame.
-/// 2. Get the current symbol at `(rule_id, alt_idx, sym_pos)`.
-/// 3. If terminal: match against `b`.  If match, increment `sym_pos`.
-///    If the frame is exhausted, pop it and increment sym_pos of the parent
-///    (repeatedly until a non-exhausted frame is found or the stack is empty).
-/// 4. If non-terminal: push a new frame for the referenced rule (alt 0, pos 0)
-///    and retry step 1 — but we do not consume a byte when pushing, so we
-///    loop until we reach a terminal.
+/// Every live stack is stepped: a stack whose next symbol is a terminal takes
+/// the byte if it matches, and a stack that needs expanding is expanded into
+/// each alternative that could consume `b`. Stacks that cannot consume `b` are
+/// dropped. The byte is accepted when at least one stack survives, and the
+/// surviving stacks are sorted and deduplicated.
 ///
-/// If no alternative can accept `b`, try other alternatives for the current
-/// frame's rule via backtracking.
+/// Returns [`StepResult::Rejected`] when no stack survives, and
+/// [`StepResult::StackLimitExceeded`] when the step needed more stacks, more
+/// work or a deeper stack than `MAX_LIVE_STACKS` / `MAX_EXPANSION_STEPS` /
+/// `MAX_PDA_DEPTH` allow. In both cases `state` is left unchanged.
 pub fn advance_byte(state: &mut GrammarState, grammar: &CompiledGrammar, b: u8) -> StepResult {
-    // `try_advance_byte` operates on a clone of `state.stack` and only writes it
-    // back on success, so `state.stack` is already left untouched on rejection.
-    // No outer snapshot/restore is needed (would be one redundant clone per byte).
-    if try_advance_byte(state, grammar, b) {
-        state.partial_token_bytes.push(b);
-        // Check for completion after consuming the byte.
-        state.complete = is_accepting(state, grammar);
-        StepResult::Accepted
-    } else {
-        StepResult::Rejected
-    }
-}
-
-/// Attempt to advance the PDA by byte `b`.  Returns `true` on success,
-/// `false` on rejection.  Mutates `state.stack` in place.
-fn try_advance_byte(state: &mut GrammarState, grammar: &CompiledGrammar, b: u8) -> bool {
-    // The PDA loop: walk down non-terminals until we hit a terminal.
-    // We may need to backtrack across alternative choices.
-
-    // Work on a copy of the stack to support backtracking.
-    let mut stack = state.stack.clone();
-
-    if try_advance_stack(&mut stack, grammar, b) {
-        state.stack = stack;
-        return true;
-    }
-    false
-}
-
-/// Advance `stack` by byte `b`. Returns true on success.
-fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: u8) -> bool {
-    // Checkpoints of nullable, uncommitted choices popped without consuming a
-    // byte (#322). See `try_backtrack`. `restores_left` bounds total restores
-    // this call; nested nullable alternatives can multiply them.
-    let mut checkpoints: Vec<Vec<StackFrame>> = Vec::new();
-    let mut restores_left = MAX_BACKTRACK_RESTORES;
-    loop {
-        if stack.is_empty() {
-            // Still have a byte pending: try a checkpointed choice first.
-            if !try_backtrack(stack, &mut checkpoints, &mut restores_left) {
-                return false;
-            }
-            continue;
-        }
-        if stack.len() > MAX_PDA_DEPTH {
-            // Cyclic / left-recursive grammar pushing frames without progress
-            // (issue #343). Reject rather than grow the stack unbounded.
-            return false;
-        }
-
-        let frame_idx = stack.len() - 1;
-        let frame = &stack[frame_idx];
-        let Some(rule) = grammar.rules.get(frame.rule_id) else {
-            return false;
-        };
-
-        // Rule with no alternatives: dead end → reject via next-alt or backtrack.
-        if rule.alts.is_empty() {
-            if !try_next_alt(stack, grammar, frame_idx)
-                && !try_backtrack(stack, &mut checkpoints, &mut restores_left)
-            {
-                return false;
-            }
-            continue;
-        }
-
-        let Some(alt) = rule.alts.get(frame.alt_idx) else {
-            return false;
-        };
-
-        if frame.sym_pos >= alt.len() {
-            // Exhausted without consuming a byte, with an untried sibling
-            // alternative left: checkpoint before popping, else this choice
-            // is lost (#322). See `try_backtrack`.
-            if !frame.consumed && frame.alt_idx + 1 < rule.alts.len() {
-                checkpoints.push(stack.clone());
-            }
-            stack.pop();
-            if let Some(parent) = stack.last_mut() {
-                parent.sym_pos += 1;
-            }
-            // Continue the loop to handle parent frame.
-            continue;
-        }
-
-        let sym = &alt[frame.sym_pos].clone();
-        match sym {
-            Symbol::Terminal(t) => {
-                if *t == b {
-                    // Match: a byte is consumed. Mark every frame currently on
-                    // the stack as having consumed under its current alternative
-                    // — the matching frame is the top, and every frame below it
-                    // is an ancestor whose active subtree just consumed this byte
-                    // (#353). Then advance position and pop exhausted frames.
-                    mark_consumed(stack);
-                    stack[frame_idx].sym_pos += 1;
-                    collapse_exhausted(stack, grammar);
-                    return true;
-                } else {
-                    // Byte doesn't match this terminal. Try this frame's next
-                    // alternative; `try_next_alt` enforces the consumed-guard:
-                    // a frame that has consumed a byte under its current
-                    // alternative is committed and cannot switch (the consumed
-                    // bytes cannot be "un-consumed" — no input rewind), while a
-                    // frame that only advanced `sym_pos` past nullable
-                    // nonterminals is still free to switch (e.g. a tail rule
-                    // reaching its `ε` alternative). This single path replaces
-                    // the old `sym_pos == 0` heuristic and closes both halves of
-                    // #353 (the trailing-comma over-acceptance and the
-                    // nullable-prefix over-rejection).
-                    if !try_next_alt(stack, grammar, frame_idx)
-                        && !try_backtrack(stack, &mut checkpoints, &mut restores_left)
-                    {
-                        return false;
-                    }
-                    continue;
-                }
-            }
-            Symbol::AnyByte => {
-                // AnyByte matches any single byte: a byte is consumed.
-                mark_consumed(stack);
-                stack[frame_idx].sym_pos += 1;
-                collapse_exhausted(stack, grammar);
-                return true;
-            }
-            Symbol::NonTerminal(rule_id) => {
-                let rid = *rule_id;
-                // Push a new frame for the non-terminal's first alt.
-                // Before pushing, check if the referenced rule has any alts.
-                let Some(referenced_rule) = grammar.rules.get(rid) else {
-                    return false;
-                };
-                if referenced_rule.alts.is_empty() {
-                    // Empty rule = epsilon; advance past the non-terminal.
-                    stack[frame_idx].sym_pos += 1;
-                    continue;
-                }
-                stack.push(StackFrame {
-                    rule_id: rid,
-                    alt_idx: 0,
-                    sym_pos: 0,
-                    consumed: false,
-                });
-                // Continue loop: now top frame is the pushed non-terminal.
-            }
-        }
-    }
-}
-
-/// Try alternative `alt_idx + 1` for the rule at `frame_idx`.
-fn try_next_alt(
-    stack: &mut Vec<StackFrame>,
-    grammar: &CompiledGrammar,
-    mut frame_idx: usize,
-) -> bool {
-    // Consumed-guard (#353). If this frame has consumed an input byte under its
-    // current alternative it is committed: switching it to a sibling alternative
-    // — or popping it to switch an ancestor — would re-interpret the consumed
-    // bytes as if they never existed, and this byte-level matcher has no input
-    // rewind. Reject instead. `mark_consumed` flags every frame on the stack at
-    // each byte match, so any ancestor of a committed frame is committed too.
-    // This is the guard whose absence over-accepted trailing commas (`[1,]`,
-    // `{"r":1,"o1":2,}`). It tracks byte consumption, not `sym_pos`, so a frame
-    // that only advanced past nullable nonterminals (e.g. an optional `ws`
-    // before a `,`) is NOT committed and still reaches its `ε` alternative below
-    // — which is what keeps `[]`, `[5]`, and `[1,2]` accepting (the
-    // over-rejection dual).
-    //
-    // SOUNDNESS (no over-acceptance): rejecting here never admits invalid input.
-    // After a byte is consumed, escalating to an ancestor's sibling alternative
-    // could only re-interpret that already-consumed byte under a different rule;
-    // with no rewind, any acceptance it produced would be an over-accept, never
-    // a faithful parse. Refusing the switch is the correct direction.
-    //
-    // KNOWN LIMITATION (not complete; pre-existing, NOT introduced by #353): for
-    // grammars with shared-prefix sibling alternatives a faithful parse can
-    // genuinely need to switch siblings *after* consuming the shared prefix —
-    // e.g. enum `["foo","food"]`, where `"food"` requires the second member once
-    // `foo` is consumed. A no-rewind single-stack matcher cannot do this and
-    // over-REJECTS the longer member (verified byte-identical on origin/main —
-    // this guard neither causes nor fixes it). Over-rejection is the safe
-    // direction for constrained decoding (the model simply cannot emit one valid
-    // member; it never emits invalid output). Making shared-prefix alternatives
-    // complete needs ambiguity-preserving matching (a trie/NFA compiled form or
-    // parallel active stacks) and is out of scope here. See the
-    // `shared_prefix_enum_known_limitation` regression anchor in json_schema.rs.
-    loop {
-        if stack[frame_idx].consumed {
-            return false;
-        }
-
-        let rule_id = stack[frame_idx].rule_id;
-        let next_alt = stack[frame_idx].alt_idx + 1;
-        let Some(rule) = grammar.rules.get(rule_id) else {
-            return false;
-        };
-        let num_alts = rule.alts.len();
-
-        if next_alt < num_alts {
-            // Switch to the next alternative in the same rule (reset position and the
-            // consumed flag — the new alternative has consumed nothing yet).
-            stack[frame_idx].alt_idx = next_alt;
-            stack[frame_idx].sym_pos = 0;
-            stack[frame_idx].consumed = false;
-            // Truncate any frames pushed during the failed attempt.
-            stack.truncate(frame_idx + 1);
-            return true;
-        }
-
-        // No more alternatives at this (uncommitted) level: pop the frame and
-        // inspect the parent. Sound because this frame consumed no byte under
-        // its current alternative, so removing it un-interprets nothing.
-        if frame_idx == 0 {
-            return false;
-        }
-        stack.truncate(frame_idx);
-        frame_idx -= 1;
-    }
-}
-
-/// Restore the most recent checkpointed nullable choice (#322): a frame
-/// popped via nullability without consuming a byte, retried at its next
-/// alternative. Sound (never rewinds a consumed byte); bounded by `restores_left`.
-///
-/// Scoped to one `try_advance_stack` call, i.e. one byte: a choice already
-/// committed on an EARLIER byte cannot be reopened here.
-fn try_backtrack(
-    stack: &mut Vec<StackFrame>,
-    checkpoints: &mut Vec<Vec<StackFrame>>,
-    restores_left: &mut usize,
-) -> bool {
-    if *restores_left == 0 {
-        return false;
-    }
-    let Some(mut restored) = checkpoints.pop() else {
-        return false;
+    let next = match step_stacks(&state.stacks, grammar, b) {
+        Ok(next) => next,
+        Err(StackLimitError) => return StepResult::StackLimitExceeded,
     };
-    *restores_left -= 1;
-    if let Some(top) = restored.last_mut() {
-        top.alt_idx += 1;
-        top.sym_pos = 0;
-        top.consumed = false;
+    if next.is_empty() {
+        return StepResult::Rejected;
     }
-    *stack = restored;
-    true
+    state.stacks = next;
+    state.partial_token_bytes.push(b);
+    // Check for completion after consuming the byte.
+    state.complete = is_accepting(state, grammar);
+    StepResult::Accepted
 }
 
-/// Mark every frame currently on the stack as having consumed a byte under its
-/// current alternative. Called on each successful byte match: the matching
-/// frame is the top of the stack and every frame below it is an ancestor whose
-/// active subtree just consumed the byte, so all of them become committed to
-/// their current alternative (#353). See [`StackFrame::consumed`].
-fn mark_consumed(stack: &mut [StackFrame]) {
-    for frame in stack.iter_mut() {
-        frame.consumed = true;
+/// Step every stack in `stacks` by `b`; the result is sorted and deduplicated.
+///
+/// Expansion and the byte filter run together: an alternative whose first
+/// symbol is a terminal other than `b` is never materialised, so a rule with
+/// many alternatives that start with different bytes (a character class)
+/// costs one scan of the alternatives rather than one stack per alternative.
+///
+/// Fails with [`StackLimitError`] when more than `MAX_LIVE_STACKS` distinct
+/// stacks are alive at once (checked as each sibling is created), when the
+/// step takes more than `MAX_EXPANSION_STEPS` structural expansion steps (one
+/// per `open_top` call), or when a stack grows deeper than `MAX_PDA_DEPTH`.
+fn step_stacks(
+    stacks: &[Stack],
+    grammar: &CompiledGrammar,
+    b: u8,
+) -> Result<Vec<Stack>, StackLimitError> {
+    let mut next: Vec<Stack> = Vec::new();
+    let mut pending: Vec<Stack> = Vec::new();
+    for stack in stacks {
+        match classify_top(stack, grammar) {
+            Top::Byte(want) if byte_matches(want, b) => {
+                let mut stepped = stack.clone();
+                consume_top(&mut stepped, grammar);
+                next.push(stepped);
+            }
+            Top::Open => pending.push(stack.clone()),
+            Top::TooDeep => return Err(StackLimitError),
+            Top::Byte(_) | Top::Empty | Top::Dead => {}
+        }
     }
+    bound_live(&mut pending, &mut next)?;
+
+    let mut steps_left = MAX_EXPANSION_STEPS;
+    while let Some(mut stack) = pending.pop() {
+        loop {
+            match classify_top(&stack, grammar) {
+                Top::Empty | Top::Dead => break,
+                Top::TooDeep => return Err(StackLimitError),
+                Top::Byte(want) => {
+                    if byte_matches(want, b) {
+                        consume_top(&mut stack, grammar);
+                        next.push(stack);
+                    }
+                    break;
+                }
+                Top::Open => {
+                    steps_left = steps_left.checked_sub(1).ok_or(StackLimitError)?;
+                    if !open_top(&mut stack, grammar, b, &mut pending, &mut next)? {
+                        break;
+                    }
+                }
+            }
+        }
+        bound_live(&mut pending, &mut next)?;
+    }
+
+    next.sort_unstable();
+    next.dedup();
+    Ok(next)
+}
+
+/// Fail when more than [`MAX_LIVE_STACKS`] distinct stacks are alive.
+///
+/// Identical stacks are merged first, so duplicates produced by alternatives
+/// that lead to the same parse never count against the limit.
+fn bound_live(pending: &mut Vec<Stack>, next: &mut Vec<Stack>) -> Result<(), StackLimitError> {
+    if pending.len() + next.len() <= MAX_LIVE_STACKS {
+        return Ok(());
+    }
+    pending.sort_unstable();
+    pending.dedup();
+    next.sort_unstable();
+    next.dedup();
+    if pending.len() + next.len() > MAX_LIVE_STACKS {
+        Err(StackLimitError)
+    } else {
+        Ok(())
+    }
+}
+
+/// Expand the top frame of `stack` by one structural step so that it can
+/// eventually match `b`. The top must be [`Top::Open`].
+///
+/// An unchosen alternative is replaced by one frame per alternative that could
+/// consume `b`: the siblings go to `pending` and the last one is kept in
+/// place. Each sibling is counted together with `pending` and `next` as it is
+/// created, so a rule with more matching alternatives than `MAX_LIVE_STACKS`
+/// fails before all of them are cloned. Returns `Ok(false)` when no alternative
+/// can lead to a match of `b`, or the stack names something that does not
+/// exist, so the stack is dropped.
+fn open_top(
+    stack: &mut Stack,
+    grammar: &CompiledGrammar,
+    b: u8,
+    pending: &mut Vec<Stack>,
+    next: &mut Vec<Stack>,
+) -> Result<bool, StackLimitError> {
+    let Some(&StackFrame {
+        rule_id,
+        alt_idx,
+        sym_pos,
+    }) = stack.last()
+    else {
+        return Ok(false);
+    };
+    let Some(rule) = grammar.rules.get(rule_id) else {
+        return Ok(false);
+    };
+    if rule.alts.is_empty() {
+        collapse_exhausted(stack, grammar);
+        return Ok(true);
+    }
+    if alt_idx == UNCHOSEN_ALT {
+        let mut kept: Option<usize> = None;
+        for (candidate, alt) in rule.alts.iter().enumerate() {
+            if let Some(Symbol::Terminal(first)) = alt.first()
+                && *first != b
+            {
+                continue;
+            }
+            if let Some(earlier) = kept.replace(candidate) {
+                let mut sibling = stack.clone();
+                if let Some(top) = sibling.last_mut() {
+                    top.alt_idx = earlier;
+                }
+                pending.push(sibling);
+                bound_live(pending, next)?;
+            }
+        }
+        let Some(chosen) = kept else {
+            return Ok(false);
+        };
+        if let Some(top) = stack.last_mut() {
+            top.alt_idx = chosen;
+        }
+        return Ok(true);
+    }
+    let Some(alt) = rule.alts.get(alt_idx) else {
+        return Ok(false);
+    };
+    match alt.get(sym_pos) {
+        // Exhausted frame: pop it and move the parent past the non-terminal.
+        None => {
+            collapse_exhausted(stack, grammar);
+            Ok(true)
+        }
+        Some(Symbol::NonTerminal(rule_id)) => {
+            let Some(referenced) = grammar.rules.get(*rule_id) else {
+                return Ok(false);
+            };
+            if referenced.alts.is_empty() {
+                // A rule with no alternatives matches the empty string.
+                if let Some(top) = stack.last_mut() {
+                    top.sym_pos += 1;
+                }
+            } else {
+                stack.push(StackFrame {
+                    rule_id: *rule_id,
+                    alt_idx: UNCHOSEN_ALT,
+                    sym_pos: 0,
+                });
+            }
+            Ok(true)
+        }
+        Some(Symbol::Terminal(_)) | Some(Symbol::AnyByte) => Ok(false),
+    }
+}
+
+/// Consume the byte matched by the top symbol: advance its position and pop
+/// every frame that this exhausts.
+fn consume_top(stack: &mut Stack, grammar: &CompiledGrammar) {
+    if let Some(top) = stack.last_mut() {
+        top.sym_pos += 1;
+    }
+    collapse_exhausted(stack, grammar);
 }
 
 /// Pop exhausted frames from the top of the stack after a successful byte match.
@@ -543,9 +612,17 @@ fn collapse_exhausted(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar) {
 
 /// Returns true if `state` is in an accepting configuration.
 ///
-/// A state is accepting if all remaining work on the stack can be resolved
-/// with zero additional bytes — i.e., all remaining symbols are *nullable*
-/// (can derive the empty string).
+/// A state is accepting if at least one live stack can be resolved with zero
+/// additional bytes — i.e., all remaining symbols on that stack are
+/// *nullable* (can derive the empty string).
+fn is_accepting(state: &GrammarState, grammar: &CompiledGrammar) -> bool {
+    state
+        .stacks
+        .iter()
+        .any(|stack| stack_is_accepting(stack, grammar))
+}
+
+/// Returns true if every symbol still to be matched on `stack` is nullable.
 ///
 /// The stack represents a nested call structure.  The bottom frame contains
 /// the root rule; child frames sit on top.  Each non-bottom frame is the
@@ -556,15 +633,24 @@ fn collapse_exhausted(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar) {
 /// - The **top** (innermost) frame must be nullable from its current `sym_pos`.
 /// - Each **non-top** frame must be nullable from `sym_pos + 1` (the current
 ///   symbol at `sym_pos` is the one being expanded by the frame above it).
-fn is_accepting(state: &GrammarState, grammar: &CompiledGrammar) -> bool {
-    let n = state.stack.len();
-    for (i, frame) in state.stack.iter().enumerate() {
-        if frame.rule_id >= grammar.rules.len() {
+/// - A frame whose alternative is not chosen yet is nullable when any
+///   alternative of its rule is.
+fn stack_is_accepting(stack: &[StackFrame], grammar: &CompiledGrammar) -> bool {
+    let n = stack.len();
+    for (i, frame) in stack.iter().enumerate() {
+        let Some(rule) = grammar.rules.get(frame.rule_id) else {
             return false;
-        }
-        let rule = &grammar.rules[frame.rule_id];
+        };
         if rule.alts.is_empty() {
             // A rule with no alts is an empty / epsilon rule — always nullable.
+            continue;
+        }
+        if frame.alt_idx == UNCHOSEN_ALT {
+            if !(0..rule.alts.len())
+                .any(|alt_idx| remaining_is_nullable(grammar, frame.rule_id, alt_idx, 0))
+            {
+                return false;
+            }
             continue;
         }
         if frame.alt_idx >= rule.alts.len() {
@@ -627,7 +713,8 @@ std::thread_local! {
 ///
 /// This mirrors the natural mutually-recursive definition (an alt is nullable
 /// iff every remaining symbol is nullable; a non-terminal is nullable iff
-/// *some* alternative of the rule it names is nullable) but walks an explicit,
+/// *some* alternative of the rule it names is nullable, or the rule has no
+/// alternatives, which matches the empty string) but walks an explicit,
 /// heap-allocated worklist (`stack`) instead of native call frames. A cyclic
 /// grammar is bounded by the per-path `visited` guard below, same as before;
 /// an *acyclic* grammar is bounded by the number of distinct rules it can
@@ -635,10 +722,6 @@ std::thread_local! {
 /// forbids revisiting a rule id — either way the frames live on `stack`, not
 /// the native stack, so neither shape can overflow it. `MAX_PDA_DEPTH` is a
 /// different bound (the live PDA execution stack) and does not apply here.
-#[expect(
-    clippy::unwrap_used,
-    reason = "the loop body is entered only after stack.last() returned Some"
-)]
 fn remaining_is_nullable(
     grammar: &CompiledGrammar,
     rule_id: usize,
@@ -696,11 +779,13 @@ fn remaining_is_nullable(
                         Some(Symbol::NonTerminal(rid)) => {
                             let rid = *rid;
                             // Persist the (possibly advanced) `pos` before descending.
-                            *stack.last_mut().unwrap() = Frame::Alt {
-                                rule_id,
-                                alt_idx,
-                                pos,
-                            };
+                            if let Some(top) = stack.last_mut() {
+                                *top = Frame::Alt {
+                                    rule_id,
+                                    alt_idx,
+                                    pos,
+                                };
+                            }
                             if !visited.insert(rid) {
                                 // Already checking this rule on this path (cycle):
                                 // conservatively non-nullable.
@@ -732,11 +817,17 @@ fn remaining_is_nullable(
                         pending = Some(false);
                         continue;
                     };
-                    if alt_idx >= rule.alts.len() {
+                    if rule.alts.is_empty() {
+                        // A rule with no alternatives matches the empty string.
+                        stack.pop();
+                        pending = Some(true);
+                    } else if alt_idx >= rule.alts.len() {
                         stack.pop();
                         pending = Some(false);
                     } else {
-                        *stack.last_mut().unwrap() = Frame::Rule { rule_id, alt_idx };
+                        if let Some(top) = stack.last_mut() {
+                            *top = Frame::Rule { rule_id, alt_idx };
+                        }
                         stack.push(Frame::Alt {
                             rule_id,
                             alt_idx,
@@ -763,6 +854,10 @@ pub enum SimResult {
     ContextDependent,
     /// Byte rejected.
     Reject,
+    /// A byte step exceeded the matcher's stack limits (see
+    /// [`StepResult::StackLimitExceeded`]), so the token cannot be classified.
+    /// This is not a rejection by the grammar.
+    StackLimitExceeded,
 }
 
 /// Simulate consuming all bytes of `token` from state `start`.
@@ -782,6 +877,7 @@ pub fn simulate_token(
                 }
                 return (SimResult::Reject, state);
             }
+            StepResult::StackLimitExceeded => return (SimResult::StackLimitExceeded, state),
         }
     }
     (SimResult::Accept, state)
@@ -863,7 +959,8 @@ impl GrammarBuilder {
 
     /// Consume the builder and produce a `CompiledGrammar`.
     ///
-    /// Panics if the root rule (index 0, name "root") has no alternatives.
+    /// The grammar is not validated: a rule without alternatives, the root
+    /// included, matches the empty string.
     pub fn build(self) -> CompiledGrammar {
         CompiledGrammar { rules: self.rules }
     }
@@ -959,16 +1056,17 @@ mod tests {
         grammar
     }
 
-    /// Minimal grammar isolating the no-rewind trailing-comma class, free of
-    /// the JSON-schema compiler:
+    /// Minimal grammar isolating the trailing-comma class, free of the
+    /// JSON-schema compiler:
     ///   root = '[' body ']'
     ///   body = elem tail | ε
     ///   tail = ',' elem tail | ε
     ///   elem = 'x'
-    /// A trailing comma (`[x,]`) must reject: the `tail` frame that consumed
-    /// the `,` byte may not backtrack to its ε alternative once a byte is
-    /// committed.  The nullable `body`/`tail` ε arms must still let valid
-    /// forms through (refs #353).
+    /// A trailing comma (`[x,]`) must reject: once the `,` is consumed only the
+    /// parse that took `tail`'s `',' elem tail` alternative is alive, and it
+    /// needs an `elem` next, not `]`. The ε arm of `tail` belongs to another
+    /// stack that never saw the `,`.  The nullable `body`/`tail` ε arms must
+    /// still let valid forms through (refs #353).
     fn comma_list_grammar() -> CompiledGrammar {
         let mut b = GrammarBuilder::new();
         let root_id = b.reserve("root"); // index 0
@@ -1021,9 +1119,316 @@ mod tests {
         assert!(accepts_str(&g, b"[]")); // nullable body reaches ε, no byte consumed
         assert!(accepts_str(&g, b"[x]")); // clean tail reaches ε
         assert!(accepts_str(&g, b"[x,x]")); // nested tail
-        assert!(!accepts_str(&g, b"[x,]")); // trailing comma: dirty tail must not switch to ε
+        assert!(!accepts_str(&g, b"[x,]")); // trailing comma: the ε stack never saw the ','
         assert!(!accepts_str(&g, b"[x,x,]")); // same, one level deeper
         assert!(!accepts_str(&g, b"[,]")); // leading comma
+    }
+
+    /// Grammar: root = "ab" | "ac" (two alternatives with one shared first byte).
+    fn shared_first_byte_grammar() -> CompiledGrammar {
+        let mut b = GrammarBuilder::new();
+        b.add_rule(
+            "root",
+            vec![
+                vec![Symbol::Terminal(b'a'), Symbol::Terminal(b'b')],
+                vec![Symbol::Terminal(b'a'), Symbol::Terminal(b'c')],
+            ],
+        );
+        b.build()
+    }
+
+    #[test]
+    fn alternatives_sharing_a_first_byte_both_stay_alive() {
+        let g = shared_first_byte_grammar();
+        for follower in [b'b', b'c'] {
+            let mut state = GrammarState::initial();
+            assert_eq!(advance_byte(&mut state, &g, b'a'), StepResult::Accepted);
+            assert_eq!(
+                state.stacks.len(),
+                2,
+                "one stack per alternative that took 'a'"
+            );
+            assert!(
+                state.stacks.windows(2).all(|pair| pair[0] < pair[1]),
+                "stacks must be sorted and free of duplicates"
+            );
+            assert!(!state.is_complete());
+            assert_eq!(
+                advance_byte(&mut state, &g, follower),
+                StepResult::Accepted,
+                "follower {:?}",
+                follower as char
+            );
+            assert!(state.is_complete());
+        }
+
+        let mut state = GrammarState::initial();
+        assert_eq!(advance_byte(&mut state, &g, b'a'), StepResult::Accepted);
+        let before = state.clone();
+        assert_eq!(advance_byte(&mut state, &g, b'd'), StepResult::Rejected);
+        assert_eq!(state.stacks, before.stacks);
+    }
+
+    /// `root ::= "ab" | "a" tail`, `tail ::= "x" | ""`. After "a" the first
+    /// stack (alternative 0) still needs "b" while the second can finish
+    /// through the nullable `tail`, so completeness has to look past the first
+    /// stack.
+    #[test]
+    fn completion_is_judged_over_every_live_stack() {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let tail_id = b.reserve("tail");
+        b.set_alts(tail_id, vec![vec![Symbol::Terminal(b'x')], vec![]])
+            .unwrap();
+        b.set_alts(
+            root_id,
+            vec![
+                vec![Symbol::Terminal(b'a'), Symbol::Terminal(b'b')],
+                vec![Symbol::Terminal(b'a'), Symbol::NonTerminal(tail_id)],
+            ],
+        )
+        .unwrap();
+        let g = b.build();
+
+        let mut state = GrammarState::initial();
+        assert_eq!(advance_byte(&mut state, &g, b'a'), StepResult::Accepted);
+        assert_eq!(state.stacks.len(), 2);
+        assert!(state.is_complete(), "\"a\" completes through `tail`");
+        assert!(accepts_str(&g, b"ab"));
+        assert!(accepts_str(&g, b"ax"));
+        assert!(!accepts_str(&g, b"abx"));
+    }
+
+    /// `root ::= x root | ""`, `x ::= "a" | "a"`. The two `x` alternatives lead
+    /// to the same parse, so without merging identical stacks the live set
+    /// would double on every byte.
+    #[test]
+    fn identical_stacks_are_merged_after_every_byte() {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let x_id = b.reserve("x");
+        b.set_alts(
+            x_id,
+            vec![vec![Symbol::Terminal(b'a')], vec![Symbol::Terminal(b'a')]],
+        )
+        .unwrap();
+        b.set_alts(
+            root_id,
+            vec![
+                vec![Symbol::NonTerminal(x_id), Symbol::NonTerminal(root_id)],
+                vec![],
+            ],
+        )
+        .unwrap();
+        let g = b.build();
+
+        let mut state = GrammarState::initial();
+        for i in 0..40 {
+            assert_eq!(
+                advance_byte(&mut state, &g, b'a'),
+                StepResult::Accepted,
+                "byte {i}"
+            );
+            assert_eq!(
+                state.stacks.len(),
+                1,
+                "byte {i}: identical stacks must collapse into one"
+            );
+        }
+        assert!(state.is_complete());
+    }
+
+    /// `n` alternatives that all start with "a" and differ only in their index,
+    /// so each one is a distinct live stack after that byte.
+    fn many_distinct_alternatives_grammar(n: usize) -> CompiledGrammar {
+        CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![vec![Symbol::Terminal(b'a'), Symbol::Terminal(b'b')]; n],
+            }],
+        }
+    }
+
+    #[test]
+    fn live_stack_limit_is_inclusive_and_reported_distinctly() {
+        let at_limit = many_distinct_alternatives_grammar(MAX_LIVE_STACKS);
+        let mut state = GrammarState::initial();
+        assert_eq!(
+            advance_byte(&mut state, &at_limit, b'a'),
+            StepResult::Accepted
+        );
+        assert_eq!(state.stacks.len(), MAX_LIVE_STACKS);
+
+        let past_limit = many_distinct_alternatives_grammar(MAX_LIVE_STACKS + 1);
+        let mut state = GrammarState::initial();
+        let before = state.clone();
+        assert_eq!(
+            advance_byte(&mut state, &past_limit, b'a'),
+            StepResult::StackLimitExceeded
+        );
+        assert_eq!(state.stacks, before.stacks);
+        assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
+        assert_eq!(state.complete, before.complete);
+
+        // The token-level classification keeps the same distinction instead of
+        // folding the limit into a rejection.
+        let (result, _) = simulate_token(&GrammarState::initial(), &past_limit, b"ab");
+        assert_eq!(result, SimResult::StackLimitExceeded);
+
+        // A byte that no alternative takes is still an ordinary rejection.
+        let mut state = GrammarState::initial();
+        assert_eq!(
+            advance_byte(&mut state, &past_limit, b'z'),
+            StepResult::Rejected
+        );
+    }
+
+    /// `root ::= root "a" | "b"` is left-recursive with a base case: every
+    /// level of expansion yields one more distinct stack, so the live-stack
+    /// limit reports it instead of the byte looking rejected.
+    #[test]
+    fn left_recursive_grammar_with_a_base_case_reports_the_stack_limit() {
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![
+                    vec![Symbol::NonTerminal(0), Symbol::Terminal(b'a')],
+                    vec![Symbol::Terminal(b'b')],
+                ],
+            }],
+        };
+        let mut state = GrammarState::initial();
+        assert_eq!(
+            advance_byte(&mut state, &grammar, b'b'),
+            StepResult::StackLimitExceeded
+        );
+    }
+
+    /// `root ::= "a" E` with `E` a rule that has no alternatives (it matches
+    /// the empty string): the completion analysis must treat `E` as nullable,
+    /// as execution does when it steps past the reference.
+    #[test]
+    fn referenced_rule_without_alternatives_is_nullable() {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let empty_id = b.reserve("E");
+        b.set_alts(
+            root_id,
+            vec![vec![Symbol::Terminal(b'a'), Symbol::NonTerminal(empty_id)]],
+        )
+        .unwrap();
+        let g = b.build();
+
+        let mut state = GrammarState::initial();
+        assert_eq!(advance_byte(&mut state, &g, b'a'), StepResult::Accepted);
+        assert!(
+            state.is_complete(),
+            "\"a\" completes through the empty rule"
+        );
+        assert!(accepts_str(&g, b"a"));
+        assert!(!accepts_str(&g, b"ab"));
+
+        // The same rule reached before any byte: `root ::= E`.
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let empty_id = b.reserve("E");
+        b.set_alts(root_id, vec![vec![Symbol::NonTerminal(empty_id)]])
+            .unwrap();
+        assert!(initial_grammar_state(&b.build()).is_complete());
+    }
+
+    /// `root ::= "a" root | ""` accepts every run of `a` bytes, each one a
+    /// level deeper on the stack. The byte that needs the stack past
+    /// `MAX_PDA_DEPTH` is reported as a limit, not as a rejection, and leaves
+    /// the state as it was.
+    #[test]
+    fn recursion_past_the_depth_cap_reports_the_stack_limit() {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        b.set_alts(
+            root_id,
+            vec![
+                vec![Symbol::Terminal(b'a'), Symbol::NonTerminal(root_id)],
+                vec![],
+            ],
+        )
+        .unwrap();
+        let g = b.build();
+
+        let mut state = GrammarState::initial();
+        for i in 0..MAX_PDA_DEPTH {
+            assert_eq!(
+                advance_byte(&mut state, &g, b'a'),
+                StepResult::Accepted,
+                "byte {i} is inside the depth cap"
+            );
+        }
+        assert!(state.is_complete());
+        let before = state.clone();
+        assert_eq!(
+            advance_byte(&mut state, &g, b'a'),
+            StepResult::StackLimitExceeded
+        );
+        assert_eq!(state.stacks, before.stacks);
+        assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
+    }
+
+    /// `root ::= E{n} "a"` with `E` a rule without alternatives: one stack, one
+    /// structural step per `E`, no sibling and no depth. Choosing root's
+    /// alternative is one more step, so `MAX_EXPANSION_STEPS - 1` references
+    /// fit the budget and `MAX_EXPANSION_STEPS` do not.
+    fn empty_rule_run_grammar(references: usize) -> CompiledGrammar {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let empty_id = b.reserve("E");
+        let mut alt = vec![Symbol::NonTerminal(empty_id); references];
+        alt.push(Symbol::Terminal(b'a'));
+        b.set_alts(root_id, vec![alt]).unwrap();
+        b.build()
+    }
+
+    /// The expansion budget is charged for every structural step a stack
+    /// takes, not once per stack taken off the pending list: a single stack
+    /// walking a long run of nullable references pays for each of them.
+    #[test]
+    fn expansion_budget_is_charged_per_structural_step() {
+        let within = empty_rule_run_grammar(MAX_EXPANSION_STEPS - 1);
+        let mut state = GrammarState::initial();
+        assert_eq!(
+            advance_byte(&mut state, &within, b'a'),
+            StepResult::Accepted
+        );
+
+        let over = empty_rule_run_grammar(MAX_EXPANSION_STEPS);
+        let mut state = GrammarState::initial();
+        assert_eq!(
+            advance_byte(&mut state, &over, b'a'),
+            StepResult::StackLimitExceeded
+        );
+    }
+
+    /// Creating siblings counts against `MAX_LIVE_STACKS` as they are made: a
+    /// rule with far more matching alternatives than the limit fails after the
+    /// first `MAX_LIVE_STACKS + 1` clones instead of cloning all of them first.
+    #[test]
+    fn sibling_generation_stops_at_the_live_stack_limit() {
+        let g = many_distinct_alternatives_grammar(4 * MAX_LIVE_STACKS);
+        let mut stack = vec![StackFrame {
+            rule_id: 0,
+            alt_idx: UNCHOSEN_ALT,
+            sym_pos: 0,
+        }];
+        let mut pending = Vec::new();
+        let mut next = Vec::new();
+        assert_eq!(
+            open_top(&mut stack, &g, b'a', &mut pending, &mut next),
+            Err(StackLimitError)
+        );
+        assert_eq!(
+            pending.len(),
+            MAX_LIVE_STACKS + 1,
+            "sibling creation must stop as soon as the limit is passed"
+        );
     }
 
     #[test]
@@ -1056,20 +1461,18 @@ mod tests {
         // A rejected byte must not corrupt the matcher: the consumed prefix
         // stays committed and the correct continuation still completes. This
         // locks the rollback-on-reject contract that `advance_byte` relies on
-        // (`try_advance_byte` clones the stack and only commits it on success,
-        // so no outer snapshot is needed).
+        // (`step_stacks` builds the next stack set separately and `advance_byte`
+        // only commits it on success, so no outer snapshot is needed).
         //
-        // The grammar must be *nested* so the rejecting byte forces
-        // `try_advance_stack` to truncate a child frame before it fails:
+        // The grammar must be *nested* so the rejecting byte is checked
+        // against a stack with a child frame on it:
         //   root  ::= "a" child
         //   child ::= "bc"
         // Feeding `a`,`b` descends into `child` (frame pushed, one byte
-        // consumed). The wrong byte at child's second position truncates the
-        // child frame, then exhausts root's alternatives and returns false,
-        // mutating the working stack en route. Only the inner clone keeps
-        // `state.stack` intact so the correct `c` can still complete. A flat
-        // grammar (reject at the root frame returns false without mutating)
-        // never exercises this and would make the test vacuous.
+        // consumed). The wrong byte at child's second position matches no
+        // stack, and the state must keep that child frame so the correct `c`
+        // can still complete. A flat grammar never exercises this and would
+        // make the test vacuous.
         let mut b = GrammarBuilder::new();
         let root_id = b.reserve("root");
         let child_id = b.reserve("child");
@@ -1111,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_child_backtracks_to_parent_alternative() {
+    fn dead_child_alternative_does_not_block_a_sibling() {
         let mut builder = GrammarBuilder::new();
         let root_id = builder.reserve("root");
         let dead_id = builder.reserve("dead");
@@ -1182,7 +1585,7 @@ mod tests {
     /// cyclic case its only historical bound was call-frame depth.
     /// `is_accepting` runs on `initial_grammar_state`, before any byte is
     /// consumed — a single-frame state referencing the head of such a chain
-    /// must not overflow the native stack even though `state.stack.len()`
+    /// must not overflow the native stack even though `state.stacks.len()`
     /// never leaves 1 (the nullability walk descends the *static* rule graph,
     /// not the PDA execution stack `MAX_PDA_DEPTH` bounds).
     #[test]
@@ -1237,11 +1640,13 @@ mod tests {
             StepResult::Accepted
         );
 
+        // One rule deeper needs a stack past the cap: the matcher reports its
+        // limit instead of rejecting a byte the grammar accepts.
         let past_limit = nested_terminal_grammar(MAX_PDA_DEPTH + 1, b'x');
         let mut state = GrammarState::initial();
         assert_eq!(
             advance_byte(&mut state, &past_limit, b'x'),
-            StepResult::Rejected
+            StepResult::StackLimitExceeded
         );
     }
 
@@ -1369,7 +1774,7 @@ mod tests {
             advance_byte(&mut state, &grammar, b'x'),
             StepResult::Rejected
         );
-        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.stacks, before.stacks);
         assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
         assert_eq!(state.complete, before.complete);
     }
@@ -1383,12 +1788,11 @@ mod tests {
             }],
         };
         let mut state = GrammarState {
-            stack: vec![StackFrame {
+            stacks: vec![vec![StackFrame {
                 rule_id: 1,
                 alt_idx: 0,
                 sym_pos: 0,
-                consumed: false,
-            }],
+            }]],
             partial_token_bytes: Vec::new(),
             complete: false,
         };
@@ -1398,7 +1802,7 @@ mod tests {
             advance_byte(&mut state, &grammar, b'x'),
             StepResult::Rejected
         );
-        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.stacks, before.stacks);
         assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
         assert_eq!(state.complete, before.complete);
     }
@@ -1418,7 +1822,7 @@ mod tests {
             advance_byte(&mut state, &grammar, b'x'),
             StepResult::Rejected
         );
-        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.stacks, before.stacks);
         assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
         assert_eq!(state.complete, before.complete);
     }
@@ -1460,12 +1864,11 @@ mod tests {
             }],
         };
         let mut state = GrammarState {
-            stack: vec![StackFrame {
+            stacks: vec![vec![StackFrame {
                 rule_id: 0,
                 alt_idx: 7, // no alt at index 7
                 sym_pos: 0,
-                consumed: false,
-            }],
+            }]],
             partial_token_bytes: Vec::new(),
             complete: false,
         };
@@ -1475,19 +1878,19 @@ mod tests {
             advance_byte(&mut state, &grammar, b'x'),
             StepResult::Rejected
         );
-        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.stacks, before.stacks);
         assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
         assert_eq!(state.complete, before.complete);
     }
 
     #[test]
-    fn dangling_ancestor_rule_id_rejects_during_backtrack_without_panicking() {
+    fn dangling_ancestor_rule_id_rejects_on_mismatch_without_panicking() {
         // A non-top (ancestor) frame can carry a rule id that no longer
         // exists in the grammar — the state a dangling NonTerminal reference
         // would leave behind. The top frame is valid but its only alt
-        // mismatches the incoming byte, forcing `try_next_alt` to exhaust the
-        // top frame and walk into the invalid ancestor. That ancestor walk
-        // must reject, not index `grammar.rules[rule_id]` unchecked.
+        // mismatches the incoming byte, so the stack is dropped without ever
+        // being popped into the invalid ancestor. The byte must reject, not
+        // index `grammar.rules[rule_id]` unchecked.
         let grammar = CompiledGrammar {
             rules: vec![Rule {
                 name: "child".to_string(),
@@ -1495,20 +1898,18 @@ mod tests {
             }],
         };
         let mut state = GrammarState {
-            stack: vec![
+            stacks: vec![vec![
                 StackFrame {
                     rule_id: 999, // dangling: no such rule
                     alt_idx: 0,
                     sym_pos: 0,
-                    consumed: false,
                 },
                 StackFrame {
                     rule_id: 0, // valid, but its only alt won't match b'x'
                     alt_idx: 0,
                     sym_pos: 0,
-                    consumed: false,
                 },
-            ],
+            ]],
             partial_token_bytes: Vec::new(),
             complete: false,
         };
@@ -1518,7 +1919,7 @@ mod tests {
             advance_byte(&mut state, &grammar, b'x'),
             StepResult::Rejected
         );
-        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.stacks, before.stacks);
         assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
         assert_eq!(state.complete, before.complete);
     }
@@ -1554,9 +1955,8 @@ mod tests {
         b.build()
     }
 
-    /// `r ::= "" | "a"`, `root ::= r "a" "c"`: accepting "aac" needs `r`'s
-    /// epsilon choice reopened after the SECOND byte fails, one byte past
-    /// where `try_backtrack` can still reach it (#322, remaining gap).
+    /// `r ::= "" | "a"`, `root ::= r "a" "c"`: accepting "aac" needs both of
+    /// `r`'s choices to stay open across the first byte (#322).
     fn epsilon_first_multi_byte_grammar() -> CompiledGrammar {
         let mut b = GrammarBuilder::new();
         let root_id = b.reserve("root");
@@ -1577,7 +1977,7 @@ mod tests {
 
     /// Deeply nested `r_i ::= "" | (r_{i+1} "a") | (r_{i+1} "b")`, base case
     /// `r_depth ::= "" | "a" | "b"`; each level doubles fresh re-exploration
-    /// of the next, so full search is ~2^depth restores.
+    /// of the next, so exploring every parse is ~2^depth work.
     fn nested_nullable_branch_grammar(depth: usize) -> CompiledGrammar {
         let mut b = GrammarBuilder::new();
         let root_id = b.reserve("root");
@@ -1637,12 +2037,11 @@ mod tests {
         assert!(!accepts_str(&g, b"aab"));
     }
 
-    /// Remaining #322 gap: the checkpoint trail lives inside one
-    /// `try_advance_stack` call (one byte). `r`'s epsilon choice for "aac"
-    /// is committed on byte 1 and cannot reopen on byte 2's mismatch.
+    /// `r`'s epsilon choice for "aac" is still open after byte 1: the stack
+    /// that took `r ::= "a"` and the stack that took `r ::= ""` both stay
+    /// alive, and byte 2 settles which one the input follows.
     #[test]
-    #[ignore = "requires multi-byte backtracking"]
-    fn epsilon_first_choice_across_a_later_byte_is_not_reopened() {
+    fn epsilon_first_choice_stays_open_across_a_later_byte() {
         let g = epsilon_first_multi_byte_grammar();
         assert!(
             accepts_str(&g, b"aac"),
@@ -1650,20 +2049,26 @@ mod tests {
         );
     }
 
-    /// Full search of `depth`-nested branches is ~2^depth restores,
-    /// intractable if unbounded; completing at all proves the budget capped
-    /// it. "x" matches no alternative anywhere, so rejection is correct
-    /// regardless of how much of the search the budget allowed.
+    /// Exploring every parse of `depth`-nested branches is ~2^depth work,
+    /// intractable if unbounded; completing at all proves the expansion budget
+    /// capped it. The step reports the limit rather than a rejection, because
+    /// the matcher gave up before it could tell whether "x" fits.
     #[test]
-    fn nested_nullable_alternatives_reject_within_restore_budget() {
+    fn nested_nullable_alternatives_report_the_expansion_limit() {
         let g = nested_nullable_branch_grammar(40);
-        assert!(!accepts_str(&g, b"x"));
+        let mut state = GrammarState::initial();
+        assert_eq!(
+            advance_byte(&mut state, &g, b'x'),
+            StepResult::StackLimitExceeded
+        );
+        let (result, _) = simulate_token(&GrammarState::initial(), &g, b"x");
+        assert_eq!(result, SimResult::StackLimitExceeded);
     }
 
     #[test]
     fn dangling_ancestor_rule_id_stops_collapse_without_panicking() {
         // Same dangling-ancestor shape as above, but reached via the
-        // post-match `collapse_exhausted` walk instead of `try_next_alt`:
+        // post-match `collapse_exhausted` walk instead of a mismatch:
         // the top frame's byte DOES match and exhausts its only alt, so
         // popping it advances into the invalid ancestor while collapsing.
         let grammar = CompiledGrammar {
@@ -1673,20 +2078,18 @@ mod tests {
             }],
         };
         let mut state = GrammarState {
-            stack: vec![
+            stacks: vec![vec![
                 StackFrame {
                     rule_id: 999, // dangling: no such rule
                     alt_idx: 0,
                     sym_pos: 0,
-                    consumed: false,
                 },
                 StackFrame {
                     rule_id: 0, // valid; matches b'x' and then exhausts
                     alt_idx: 0,
                     sym_pos: 0,
-                    consumed: false,
                 },
-            ],
+            ]],
             partial_token_bytes: Vec::new(),
             complete: false,
         };

@@ -41,7 +41,9 @@ fn fixture() -> (GrammarEngine, GrammarState, usize) {
     let measured_state = STATE_COUNT / 2;
     for token_id in 0..measured_state {
         assert!(
-            engine.advance(&mut state, token_id as u32),
+            engine
+                .advance(&mut state, token_id as u32)
+                .expect("fixture token stays inside the matcher limits"),
             "single-byte fixture token must advance the PDA"
         );
     }

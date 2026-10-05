@@ -19,7 +19,7 @@
 //!     forward_pass(input) → logits
 //!     engine.mask_logits(&mut state, logits)? — apply grammar constraint
 //!     token = sampler.sample(logits)
-//!     engine.advance(&mut state, token_id)  — update grammar state
+//!     engine.advance(&mut state, token_id)? — update grammar state
 //! }
 //! ```
 //!
@@ -46,8 +46,8 @@
 use crate::grammar::gbnf::parse_gbnf;
 use crate::grammar::json_schema::compile;
 use crate::grammar::pda::{
-    CompiledGrammar, GrammarState, SimResult, StepResult, advance_byte, initial_grammar_state,
-    simulate_token,
+    CompiledGrammar, GrammarState, SimResult, StackLimitError, StepResult, advance_byte,
+    initial_grammar_state, simulate_token,
 };
 use crate::grammar::spec::GrammarSpec;
 use crate::grammar::trie::ByteTrie;
@@ -224,7 +224,7 @@ pub fn probe_reachable_states(
         GrammarSpec::JsonSchema(schema) => compile(schema)?,
         GrammarSpec::Gbnf(gbnf) => parse_gbnf(gbnf)?,
     };
-    Ok(enumerate_grammar_states(&grammar, vocab_bytes, max_states).len())
+    Ok(enumerate_grammar_states(&grammar, vocab_bytes, max_states)?.len())
 }
 
 /// Error from `GrammarEngine::new`.
@@ -262,23 +262,34 @@ impl From<crate::grammar::pda::BuilderError> for GrammarError {
     }
 }
 
+impl From<StackLimitError> for GrammarError {
+    fn from(e: StackLimitError) -> Self {
+        GrammarError(e.to_string())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State enumeration
 // ---------------------------------------------------------------------------
 
 /// Enumerate all reachable grammar states via BFS from the initial state.
 ///
-/// Each unique PDA stack configuration encountered while simulating all
+/// Each unique set of live PDA stacks encountered while simulating all
 /// single-token prefixes is added to the returned set.  This is a
 /// conservative superset: some states may not be reachable for a given
 /// model vocabulary, but all reachable states are included.
 ///
 /// For v0 we use a depth-limited BFS to bound memory and runtime.
+///
+/// # Errors
+///
+/// Returns [`StackLimitError`] when simulating a token needs more live stacks
+/// than the matcher allows: the grammar is too ambiguous to precompute.
 fn enumerate_grammar_states(
     grammar: &CompiledGrammar,
     vocab_bytes: &[Vec<u8>],
     max_states: usize,
-) -> Vec<GrammarState> {
+) -> Result<Vec<GrammarState>, StackLimitError> {
     let initial = initial_grammar_state(grammar);
     let mut queue: Vec<GrammarState> = vec![initial.clone()];
     let mut visited: Vec<GrammarState> = vec![initial];
@@ -293,6 +304,9 @@ fn enumerate_grammar_states(
                 continue;
             }
             let (result, next_state) = simulate_token(&state, grammar, token_bytes);
+            if result == SimResult::StackLimitExceeded {
+                return Err(StackLimitError);
+            }
             if result == SimResult::Accept || result == SimResult::ContextDependent {
                 // Only add if the stack configuration is new.
                 if !visited.iter().any(|s| states_equal(s, &next_state)) {
@@ -305,16 +319,26 @@ fn enumerate_grammar_states(
         }
     }
 
-    visited
+    Ok(visited)
 }
 
 /// Compare two grammar states by their PDA stack configurations.
 ///
-/// We only compare the stack frames (not partial_token_bytes, which is
-/// transient).  Two states with identical stack frames will produce
-/// identical bitmasks.
+/// We only compare the sets of stack frames (not partial_token_bytes, which
+/// is transient).  A state's stacks are sorted and deduplicated, so two
+/// states holding the same stacks compare equal and produce identical
+/// bitmasks.
 fn states_equal(a: &GrammarState, b: &GrammarState) -> bool {
-    a.stack == b.stack && a.complete == b.complete
+    a.stacks == b.stacks && a.complete == b.complete
+}
+
+/// Whether a simulated token counts as a way to continue the grammar.
+///
+/// A token the matcher could not classify counts as a continuation: calling
+/// the state terminal on the strength of an overloaded matcher would end
+/// generation silently, while `mask_logits` raises the limit as an error.
+fn continues_grammar((result, _): (SimResult, GrammarState)) -> bool {
+    matches!(result, SimResult::Accept | SimResult::StackLimitExceeded)
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +433,7 @@ impl GrammarEngine {
             &grammar,
             &vocab_bytes,
             crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
-        );
+        )?;
         let bfs_ns = bfs_t0.elapsed().as_nanos() as u64;
 
         let state_limit_exceeded =
@@ -432,6 +456,9 @@ impl GrammarEngine {
         let partition_t0 = std::time::Instant::now();
         let partition = VocabPartition::build_from_trie(&grammar, states, vocab_size, &trie);
         let partition_build_ns = partition_t0.elapsed().as_nanos() as u64;
+        if partition.stack_limit_exceeded() {
+            return Err(StackLimitError.into());
+        }
 
         BUILD_PROFILE.with(|p| {
             *p.borrow_mut() = BuildProfile {
@@ -577,6 +604,9 @@ impl GrammarEngine {
                         }
                         // All bytes consumed with no rejection: the token is legal.
                         SimResult::Accept => {}
+                        // The matcher could not classify the token. Masking it
+                        // would pass off a matcher limit as a grammar rejection.
+                        SimResult::StackLimitExceeded => return Err(StackLimitError.into()),
                     }
                 }
                 if let Some(t1) = t1 {
@@ -609,7 +639,7 @@ impl GrammarEngine {
                 // construction; see `Self::trie_build_ns`), so the first call
                 // here pays no build cost.
                 let t0 = profiling.then(std::time::Instant::now);
-                self.mask_by_trie(state, logits);
+                self.mask_by_trie(state, logits)?;
                 if let Some(t0) = t0 {
                     let ns = find_ns + t0.elapsed().as_nanos() as u64;
                     MASK_PROFILE.with(|p| {
@@ -647,7 +677,8 @@ impl GrammarEngine {
     /// # Errors
     ///
     /// Returns [`GrammarError`] when `logits` is shorter than the engine's
-    /// vocabulary.
+    /// vocabulary, or when simulating a token needs more live stacks than the
+    /// matcher allows (the grammar is too ambiguous to mask exactly).
     pub fn mask_by_simulation(
         &self,
         state: &GrammarState,
@@ -664,8 +695,12 @@ impl GrammarEngine {
                 continue;
             }
             let (result, _) = simulate_token(state, &self.grammar, token_bytes);
-            if result != SimResult::Accept {
-                logits[token_id] = f32::NEG_INFINITY;
+            match result {
+                SimResult::Accept => {}
+                SimResult::Reject | SimResult::ContextDependent => {
+                    logits[token_id] = f32::NEG_INFINITY;
+                }
+                SimResult::StackLimitExceeded => return Err(StackLimitError.into()),
             }
         }
         Ok(())
@@ -677,18 +712,31 @@ impl GrammarEngine {
     /// used as the over-cap fallback in `mask_logits` in place of the
     /// full-vocab independent simulation. Uses the trie `new` built; the
     /// initializer below only runs if that cell were ever left empty.
-    fn mask_by_trie(&self, state: &GrammarState, logits: &mut [f32]) {
+    fn mask_by_trie(
+        &self,
+        state: &GrammarState,
+        logits: &mut [f32],
+    ) -> Result<(), StackLimitError> {
         let trie = self.trie.get_or_init(|| ByteTrie::build(&self.vocab_bytes));
-        trie.mask(state, &self.grammar, self.vocab_size, logits);
+        trie.mask(state, &self.grammar, self.vocab_size, logits)
     }
 
     /// Advance the grammar state by one token.
     ///
     /// Call this after sampling `token_id` to update the grammar state for
-    /// the next step.  Returns `true` if the token was accepted, `false` if
-    /// the grammar rejected it (caller should treat this as an error and stop
-    /// generation).
-    pub fn advance(&self, state: &mut GrammarState, token_id: u32) -> bool {
+    /// the next step.  Returns `Ok(true)` if the token was accepted and
+    /// `Ok(false)` if the grammar rejected it (caller should stop generation).
+    /// A token that needs more live stacks, more expansion steps or a deeper
+    /// stack than the matcher allows is not a grammar verdict: it is returned
+    /// as an error, and `state` may have advanced past the bytes that were
+    /// accepted before the limit was hit. `mask_logits` reports the same
+    /// condition as an error before a token is sampled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrammarError`] when the matcher exceeds its stack limits
+    /// while advancing over the token's bytes.
+    pub fn advance(&self, state: &mut GrammarState, token_id: u32) -> Result<bool, GrammarError> {
         let profiling = mask_profiling_enabled();
         let t0 = profiling.then(std::time::Instant::now);
         let result = self.advance_inner(state, token_id);
@@ -703,22 +751,24 @@ impl GrammarEngine {
         result
     }
 
-    fn advance_inner(&self, state: &mut GrammarState, token_id: u32) -> bool {
+    fn advance_inner(&self, state: &mut GrammarState, token_id: u32) -> Result<bool, GrammarError> {
         let token_id = token_id as usize;
         if token_id >= self.vocab_size {
-            return false;
+            return Ok(false);
         }
         let token_bytes = &self.vocab_bytes[token_id];
         if token_bytes.is_empty() {
             // Empty token: no grammar advancement, treat as accepted.
-            return true;
+            return Ok(true);
         }
         for &b in token_bytes {
-            if advance_byte(state, &self.grammar, b) == StepResult::Rejected {
-                return false;
+            match advance_byte(state, &self.grammar, b) {
+                StepResult::Accepted => {}
+                StepResult::Rejected => return Ok(false),
+                StepResult::StackLimitExceeded => return Err(StackLimitError.into()),
             }
         }
-        true
+        Ok(true)
     }
 
     /// Return whether `state` is accepting and no non-empty vocabulary token
@@ -730,18 +780,21 @@ impl GrammarEngine {
 
         let has_continuation = match self.find_state_id(state) {
             Some(state_id) => self.partition.any_allowed_token(state_id, |token_id| {
-                simulate_token(state, &self.grammar, &self.vocab_bytes[token_id]).0
-                    == SimResult::Accept
+                continues_grammar(simulate_token(
+                    state,
+                    &self.grammar,
+                    &self.vocab_bytes[token_id],
+                ))
             }),
             None => self.vocab_bytes.iter().any(|token_bytes| {
                 !token_bytes.is_empty()
-                    && simulate_token(state, &self.grammar, token_bytes).0 == SimResult::Accept
+                    && continues_grammar(simulate_token(state, &self.grammar, token_bytes))
             }),
         };
         !has_continuation
     }
 
-    /// Find the partition state id for `state` by matching stack configuration.
+    /// Find the partition state id for `state` by matching its set of stacks.
     ///
     /// Returns `None` when no matching precomputed state exists. This happens
     /// only for grammars that exceed `MAX_GRAMMAR_STATES`, where the BFS state
@@ -754,7 +807,7 @@ impl GrammarEngine {
     fn find_state_id(&self, state: &GrammarState) -> Option<usize> {
         for sid in 0..self.partition.num_states() {
             if let Some(ps) = self.partition.grammar_state(sid)
-                && ps.stack == state.stack
+                && ps.stacks == state.stacks
                 && ps.complete == state.complete
             {
                 return Some(sid);
@@ -801,15 +854,17 @@ mod tests {
     /// Regression (issue #343): a left-recursive GBNF grammar (`root ::= root`)
     /// must not hang. Before the PDA depth cap, `enumerate_grammar_states` grew
     /// the PDA stack without bound inside a single `simulate_token` call. The
-    /// depth cap turns it into a bounded dead grammar; construction returns.
+    /// depth cap stops that growth and construction reports the stack limit
+    /// instead of returning.
     #[test]
     fn cyclic_gbnf_does_not_hang() {
         let vocab = tiny_vocab();
         let spec = GrammarSpec::Gbnf("root ::= root\n".to_string());
-        let result = GrammarEngine::new(&spec, vocab);
-        // Bounded construction (Ok with a dead grammar) is the contract — the
-        // point is that it terminates rather than hanging or OOMing.
-        assert!(result.is_ok(), "cyclic GBNF should construct, not hang");
+        let err = match GrammarEngine::new(&spec, vocab) {
+            Ok(_) => panic!("a cyclic grammar cannot be matched and must not construct"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("too deeply nested"), "{err}");
     }
 
     /// Regression (issue #343): a JSON-Schema `$ref` cycle compiles to a cyclic
@@ -821,11 +876,11 @@ mod tests {
             "$ref": "#/$defs/Node",
             "$defs": { "Node": { "$ref": "#/$defs/Node" } }
         }));
-        let result = GrammarEngine::new(&spec, vocab);
-        assert!(
-            result.is_ok(),
-            "cyclic $ref schema should construct, not hang"
-        );
+        let err = match GrammarEngine::new(&spec, vocab) {
+            Ok(_) => panic!("a cyclic $ref schema cannot be matched and must not construct"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("too deeply nested"), "{err}");
     }
 
     /// Regression (issue #343): an array schema with an absurd `maxItems`
@@ -969,7 +1024,7 @@ mod tests {
 
         let mut state = engine.initial_state();
         // Advance by token 0 ('n'): should be accepted.
-        assert!(engine.advance(&mut state, 0));
+        assert!(engine.advance(&mut state, 0).unwrap());
     }
 
     #[test]
@@ -981,7 +1036,7 @@ mod tests {
 
         let mut state = engine.initial_state();
         // Token 0 = 'x' should be rejected in the "null" grammar.
-        let result = engine.advance(&mut state, 0);
+        let result = engine.advance(&mut state, 0).unwrap();
         assert!(!result, "'x' should be rejected for null grammar");
     }
 
@@ -1043,7 +1098,7 @@ mod tests {
         let engine = GrammarEngine::new(&spec, vocab).unwrap();
         let mut state = engine.initial_state();
 
-        assert!(engine.advance(&mut state, 0));
+        assert!(engine.advance(&mut state, 0).unwrap());
         assert!(engine.is_complete_without_continuation(&state));
     }
 
@@ -1054,10 +1109,10 @@ mod tests {
         let engine = GrammarEngine::new(&spec, vocab).unwrap();
         let mut state = engine.initial_state();
 
-        assert!(engine.advance(&mut state, 0));
+        assert!(engine.advance(&mut state, 0).unwrap());
         assert!(state.is_complete());
         assert!(!engine.is_complete_without_continuation(&state));
-        assert!(engine.advance(&mut state, 0));
+        assert!(engine.advance(&mut state, 0).unwrap());
     }
 
     #[test]
@@ -1101,7 +1156,10 @@ mod tests {
         ];
         let engine = GrammarEngine::new(&spec, vocab).expect("fixture grammar must compile");
         let mut state = engine.initial_state();
-        assert!(engine.advance(&mut state, 0), "token 'a' must advance");
+        assert!(
+            engine.advance(&mut state, 0).unwrap(),
+            "token 'a' must advance"
+        );
 
         reset_context_recheck_candidates_for_test();
         let mut actual = vec![0.0; 8];
@@ -1119,6 +1177,179 @@ mod tests {
             .mask_by_simulation(&state, &mut oracle)
             .expect("fixture logits match the vocabulary");
         assert_eq!(actual, oracle);
+    }
+
+    /// Two alternatives that share their first byte stay reachable through the
+    /// engine: after "a" both continuations are allowed, and the state after
+    /// "a" is one of the precomputed partition states.
+    #[test]
+    fn shared_first_byte_alternatives_stay_reachable_through_the_engine() {
+        let spec = GrammarSpec::Gbnf("root ::= \"ab\" | \"ac\"\n".to_string());
+        let vocab = vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec(),
+            b"ab".to_vec(),
+            b"ac".to_vec(),
+            b"ad".to_vec(),
+        ];
+        let engine = GrammarEngine::new(&spec, vocab).expect("fixture grammar must compile");
+        let mut state = engine.initial_state();
+        assert!(
+            engine.advance(&mut state, 0).unwrap(),
+            "token 'a' must advance"
+        );
+        assert!(
+            engine.find_state_id(&state).is_some(),
+            "the state after 'a' must be a precomputed partition state"
+        );
+
+        let mut logits = vec![0.0f32; 7];
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("fixture logits match the vocabulary");
+        let allowed: Vec<bool> = logits.iter().map(|l| *l != f32::NEG_INFINITY).collect();
+        assert_eq!(
+            allowed,
+            vec![false, true, true, false, false, false, false],
+            "after 'a' only 'b' and 'c' continue a parse"
+        );
+
+        let mut via_b = state.clone();
+        assert!(engine.advance(&mut via_b, 1).unwrap(), "'ab' must complete");
+        assert!(via_b.is_complete());
+        let mut via_c = state.clone();
+        assert!(engine.advance(&mut via_c, 2).unwrap(), "'ac' must complete");
+        assert!(via_c.is_complete());
+        let mut via_d = state;
+        assert!(
+            !engine.advance(&mut via_d, 3).unwrap(),
+            "'ad' must be rejected"
+        );
+    }
+
+    /// Byte-at-a-time walk through a schema whose optional keys share the
+    /// prefix `"al`, including the member that skips the first optional key.
+    /// At every step the mask must leave the next byte of the valid input
+    /// allowed, and the finished input must be complete.
+    #[test]
+    fn optional_keys_sharing_a_prefix_are_reachable_through_mask_logits() {
+        let spec = GrammarSpec::JsonSchema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "alpha": {"type": "integer"},
+                "alps": {"type": "integer"}
+            },
+            "additionalProperties": false
+        }));
+        let vocab: Vec<Vec<u8>> = (0u16..256).map(|b| vec![b as u8]).collect();
+        let engine = GrammarEngine::new(&spec, vocab).expect("fixture schema must compile");
+
+        for input in [
+            &br#"{"alpha":1}"#[..],
+            &br#"{"alps":2}"#[..],
+            &br#"{"alpha":1,"alps":2}"#[..],
+            &b"{}"[..],
+        ] {
+            let mut state = engine.initial_state();
+            for (at, &byte) in input.iter().enumerate() {
+                let mut logits = vec![0.0f32; 256];
+                engine
+                    .mask_logits(&mut state, &mut logits)
+                    .expect("fixture logits match the vocabulary");
+                assert!(
+                    logits[byte as usize] != f32::NEG_INFINITY,
+                    "{}: byte {at} ({:?}) was masked although it continues a valid object",
+                    String::from_utf8_lossy(input),
+                    byte as char
+                );
+                assert!(
+                    engine.advance(&mut state, u32::from(byte)).unwrap(),
+                    "{}: byte {at} must advance",
+                    String::from_utf8_lossy(input)
+                );
+            }
+            assert!(
+                state.is_complete(),
+                "{} must end in a complete state",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// A grammar that needs more live stacks than the matcher allows is
+    /// refused at construction with an error that names the limit, instead of
+    /// being built over a matcher that silently drops stacks.
+    #[test]
+    fn engine_construction_reports_the_live_stack_limit() {
+        let alternatives: Vec<String> = (0..=crate::grammar::pda::MAX_LIVE_STACKS)
+            .map(|i| format!("\"a\" \"{i}\""))
+            .collect();
+        let spec = GrammarSpec::Gbnf(format!("root ::= {}\n", alternatives.join(" | ")));
+        let vocab = vec![b"a".to_vec(), b"0".to_vec()];
+        let err = match GrammarEngine::new(&spec, vocab) {
+            Ok(_) => panic!("a grammar past the live-stack limit must not construct"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("live stacks"),
+            "the error must name the stack limit: {err}"
+        );
+    }
+
+    /// The runtime paths report the live-stack limit instead of masking the
+    /// affected tokens as if the grammar had rejected them: the exact
+    /// simulation and trie masks return an error, `advance` fails, and a state
+    /// whose continuations cannot be classified is not called terminal.
+    #[test]
+    fn runtime_paths_report_the_live_stack_limit() {
+        use crate::grammar::pda::{CompiledGrammar, MAX_LIVE_STACKS, Rule, Symbol};
+
+        // The root is nullable (its first alternative is empty), so the initial
+        // state is accepting; every other alternative starts with "a".
+        let mut alts = vec![Vec::new()];
+        alts.extend(vec![
+            vec![Symbol::Terminal(b'a'), Symbol::Terminal(b'b')];
+            MAX_LIVE_STACKS + 1
+        ]);
+        let over_limit = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts,
+            }],
+        };
+        let vocab = vec![b"a".to_vec(), b"z".to_vec()];
+        let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+        let mut engine = GrammarEngine::new(&spec, vocab).expect("fixture grammar must compile");
+        engine.grammar = over_limit;
+
+        let mut state = initial_grammar_state(&engine.grammar);
+        assert!(
+            state.is_complete(),
+            "the nullable root accepts the empty input"
+        );
+        let mut logits = vec![0.0f32; 2];
+        let err = engine
+            .mask_by_simulation(&state, &mut logits)
+            .expect_err("simulation must report the stack limit");
+        assert!(err.0.contains("live stacks"), "{}", err.0);
+        assert_eq!(logits, vec![0.0, 0.0], "no token may be masked on an error");
+
+        let mut logits = vec![0.0f32; 2];
+        assert!(
+            engine.mask_by_trie(&state, &mut logits).is_err(),
+            "the trie mask must report the stack limit"
+        );
+
+        let err = engine
+            .advance(&mut state, 0)
+            .expect_err("advance must report the stack limit as an error");
+        assert!(err.0.contains("live stacks"), "{}", err.0);
+        assert!(
+            !engine.is_complete_without_continuation(&state),
+            "an unclassifiable continuation must not read as a terminal state"
+        );
     }
 
     #[test]
@@ -1154,7 +1385,8 @@ mod tests {
             &grammar,
             &vocab,
             crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
-        );
+        )
+        .expect("fixture stays inside the stack limits");
         // Enumeration must have hit the cap, otherwise the test is vacuous.
         assert_eq!(
             states.len(),
@@ -1166,9 +1398,15 @@ mod tests {
 
         // Drive into a deep state beyond the enumerated cap: quote + 270 a's.
         let mut state = engine.initial_state();
-        assert!(engine.advance(&mut state, 0), "opening quote accepted");
+        assert!(
+            engine.advance(&mut state, 0).unwrap(),
+            "opening quote accepted"
+        );
         for _ in 0..270 {
-            assert!(engine.advance(&mut state, 1), "mid-chain 'a' accepted");
+            assert!(
+                engine.advance(&mut state, 1).unwrap(),
+                "mid-chain 'a' accepted"
+            );
         }
 
         // The deep state must NOT be in the enumerated partition — otherwise
@@ -1237,6 +1475,12 @@ mod tests {
     // generation trajectory against the exact schema shape
     // `gramperf_profile` profiles (crates/inference/src/bin/
     // gramperf_profile.rs), then compare the two algorithms directly.
+    //
+    // They are equivalence tests: both algorithms run the same
+    // `advance_byte` matcher, so they pin the trie walk to the per-token
+    // simulation, not the matcher's language. The language is pinned by the
+    // matcher tests in `pda.rs` and
+    // `tests/grammar_shared_first_byte_alternatives.rs`.
     // -----------------------------------------------------------------
 
     /// The #734-shape schema from `gramperf_profile`: 4 nested object
@@ -1427,7 +1671,9 @@ mod tests {
             engine
                 .mask_by_simulation(state, &mut oracle_logits)
                 .expect("matching vocab length");
-            engine.mask_by_trie(state, &mut trie_logits);
+            engine
+                .mask_by_trie(state, &mut trie_logits)
+                .expect("fixture stays inside the stack limits");
             if engine.find_state_id(state).is_none() {
                 over_cap_states += 1;
             }
@@ -1470,7 +1716,9 @@ mod tests {
             engine
                 .mask_by_simulation(state, &mut oracle_logits)
                 .expect("matching vocab length");
-            engine.mask_by_trie(state, &mut trie_logits);
+            engine
+                .mask_by_trie(state, &mut trie_logits)
+                .expect("fixture stays inside the stack limits");
             for tok in 0..vocab.len() {
                 let oracle_blocked = oracle_logits[tok] == f32::NEG_INFINITY;
                 let trie_allowed = trie_logits[tok] != f32::NEG_INFINITY;
@@ -1592,7 +1840,9 @@ mod tests {
             engine
                 .mask_by_simulation(state, &mut oracle_logits)
                 .expect("matching vocab length");
-            engine.mask_by_trie(state, &mut trie_logits);
+            engine
+                .mask_by_trie(state, &mut trie_logits)
+                .expect("fixture stays inside the stack limits");
             if engine.find_state_id(state).is_none() {
                 over_cap_states += 1;
             }

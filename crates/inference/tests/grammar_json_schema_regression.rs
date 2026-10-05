@@ -7,7 +7,7 @@ use lattice_inference::grammar::pda::{CompiledGrammar, GrammarState, StepResult,
 fn full_accept(g: &CompiledGrammar, s: &[u8]) -> bool {
     let mut st = GrammarState::initial();
     for &b in s {
-        if advance_byte(&mut st, g, b) == StepResult::Rejected {
+        if advance_byte(&mut st, g, b) != StepResult::Accepted {
             return false;
         }
     }

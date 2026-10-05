@@ -1784,7 +1784,7 @@ mod tests {
                 logits[token_id as usize].is_finite(),
                 "split UTF-8 token {token_id} must remain grammar-legal"
             );
-            assert!(engine.advance(&mut state, token_id));
+            assert!(engine.advance(&mut state, token_id).unwrap());
         }
     }
 

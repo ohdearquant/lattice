@@ -761,7 +761,9 @@ impl DecodePolicy {
     /// check is skipped in both cases, matching every site's original control
     /// flow, which broke out of the loop before ever reaching it); or
     /// [`StepOutcome::Emitted`] once the token has been pushed and every
-    /// remaining control, including a `Continue` stop-check, applied.
+    /// remaining control, including a `Continue` stop-check, applied. An `Err`
+    /// from `grammar_advance` (the matcher exceeded its stack limits, which is
+    /// not a grammar verdict) is returned as is, before any other callback runs.
     #[allow(clippy::too_many_arguments)]
     // Row R03: same `metal-gpu`-only-in-CPU-production-build reachability as
     // `DecodePolicy::init` above -- see that method's doc comment. CPU
@@ -774,14 +776,14 @@ impl DecodePolicy {
         logits: &[f32],
         temperature: f32,
         generated_len_before: usize,
-        grammar_advance: impl FnMut(u32) -> bool,
+        grammar_advance: impl FnMut(u32) -> Result<bool, InferenceError>,
         is_eos: impl FnMut(u32) -> bool,
         push: impl FnMut(u32),
         decode_delta: impl FnMut(u32) -> String,
         text: &mut String,
         token_logprob_end_offsets: &mut Vec<usize>,
         emit_confirmed: impl FnMut(&str, u32) -> bool,
-    ) -> StepOutcome {
+    ) -> Result<StepOutcome, InferenceError> {
         self.transition_inner(
             token_logprobs,
             sampled_id,
@@ -794,10 +796,6 @@ impl DecodePolicy {
             text,
             token_logprob_end_offsets,
             emit_confirmed,
-        )
-        .expect(
-            "transition_inner's only Err path is a fallible record_metadata callback, and \
-             this closure (a direct compute_step_logprobs call) is infallible",
         )
     }
 
@@ -816,7 +814,7 @@ impl DecodePolicy {
         token_logprobs: &mut Vec<TokenLogprob>,
         sampled_id: u32,
         generated_len_before: usize,
-        grammar_advance: impl FnMut(u32) -> bool,
+        grammar_advance: impl FnMut(u32) -> Result<bool, InferenceError>,
         is_eos: impl FnMut(u32) -> bool,
         push: impl FnMut(u32),
         record_metadata: impl FnMut(u32, usize) -> Result<(f32, Vec<TopLogprob>), InferenceError>,
@@ -855,7 +853,7 @@ impl DecodePolicy {
         token_logprobs: &mut Vec<TokenLogprob>,
         sampled_id: u32,
         generated_len_before: usize,
-        mut grammar_advance: impl FnMut(u32) -> bool,
+        mut grammar_advance: impl FnMut(u32) -> Result<bool, InferenceError>,
         mut is_eos: impl FnMut(u32) -> bool,
         mut push: impl FnMut(u32),
         mut record_metadata: impl FnMut(u32, usize) -> Result<(f32, Vec<TopLogprob>), InferenceError>,
@@ -866,7 +864,7 @@ impl DecodePolicy {
     ) -> Result<StepOutcome, InferenceError> {
         let next_id = self.apply_override(generated_len_before, sampled_id);
 
-        if !grammar_advance(next_id) {
+        if !grammar_advance(next_id)? {
             return Ok(StepOutcome::GrammarStop);
         }
 
