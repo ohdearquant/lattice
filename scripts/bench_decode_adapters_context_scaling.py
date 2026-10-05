@@ -254,12 +254,14 @@ def register_available_adapters() -> None:
         harness.register_adapter("lattice", LatticeAdapter())
         print("  lattice: adapter registered")
     else:
+        harness.register_missing_adapter("lattice", "model directory is missing")
         print("  lattice: model directory is missing, skipping")
 
     if ollama_available():
         harness.register_adapter("ollama", OllamaAdapter())
         print("  ollama: adapter registered")
     else:
+        harness.register_missing_adapter("ollama", "not running or qwen3.5:0.8b not pulled")
         print("  ollama: not running or qwen3.5:0.8b not pulled — skipping")
 
     harness.register_adapter("mlx", MlxAdapter())

@@ -380,8 +380,11 @@ def run_context(
     ctx: int, runs: int, allow_missing: bool, out: Path | None, *, stage_dir: Path
 ) -> list[dict]:
     default_profile = _default_profile()
-    prepared_prompt = harness.prepare_worker_prompt(MlxAdapter(), ctx)
+    prompt_missing: list[str] = []
+    prepared_prompt = harness.prepare_worker_prompt(MlxAdapter(), ctx, prompt_missing)
     adapters, missing, padded_prompt, prompt_tokens = register_available_adapters(ctx, prepared_prompt)
+    if prompt_missing:
+        missing["mlx"] = prompt_missing[0]
     profile = configure_profile(default_profile, ctx=ctx, runs=runs, padded_prompt=padded_prompt)
     result = harness.run_profile(
         profile,

@@ -440,6 +440,25 @@ int main(int argc, char **argv) {
             "result = harness.run_profile(profile, {'ollama': adapter}, allow_missing_engine=True, supervised_children=True)\n"
             "Path(os.environ['FIXTURE_DRIVER_RESULT']).write_text(json.dumps([row.to_dict() for row in result.observations]))\n"
         )
+        (self.root / "scripts/fixture_worker_env_driver.py").write_text(
+            "import dataclasses, json, os, sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).parent))\n"
+            "import bench_decode_harness as harness\n"
+            "import bench_decode_adapters_agentic as agentic\n"
+            "import bench_decode_adapters_q4_apples as q4\n"
+            "ops = os.environ['FIXTURE_WORKER_OPS'].split(',')\n"
+            "out = {'executable': sys.executable, 'prepared': None, 'prompt_missing': [], 'group_error': None}\n"
+            "if 'prepare' in ops:\n"
+            "    out['prepared'] = harness.prepare_worker_prompt(agentic.MlxAdapter(), 4, out['prompt_missing']) is not None\n"
+            "if 'group' in ops:\n"
+            "    _, profiles = harness.load_profiles_file(Path(__file__).parent / 'bench_decode_profiles.toml')\n"
+            "    profile = profiles['q4_apples']\n"
+            "    profile = dataclasses.replace(profile, engine_groups=tuple(g for g in profile.engine_groups if g.name == 'mlx'))\n"
+            "    try: harness.run_profile(profile, {'mlx': q4.MlxAdapter()}, supervised_children=True)\n"
+            "    except harness.MissingEngineError as exc: out['group_error'] = str(exc)\n"
+            "Path(os.environ['FIXTURE_DRIVER_RESULT']).write_text(json.dumps(out))\n"
+        )
 
     def _commit_fixture(self):
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
@@ -750,6 +769,75 @@ class BenchDecodeSupervisedEndToEndTest(unittest.TestCase):
         self.assertTrue(any(request.get("prompt") == "" for request in server.requests))
         self.assertTrue(any(request.get("path") == "/api/ps" for request in server.requests))
         self.assertFalse((self.fixture.root / ".cache/ollama.json").exists())
+
+    def _run_worker_env_driver(self, python, ops):
+        result_path = self.fixture.root / ".cache/worker-env.json"
+        result_path.unlink(missing_ok=True)
+        env = self.fixture.env(
+            {
+                # no fixture stubs: whatever the worker can import comes from its own interpreter
+                "PYTHONPATH": str(self.fixture.root / "scripts"),
+                "FIXTURE_DRIVER_RESULT": str(result_path),
+                "FIXTURE_WORKER_OPS": ops,
+            }
+        )
+        proc = subprocess.run(
+            [str(python), str(self.fixture.root / "scripts/fixture_worker_env_driver.py")],
+            cwd=self.fixture.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=180,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(result_path.read_text())
+
+    @staticmethod
+    def _sees_mlx_lm(python) -> bool:
+        env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        probe = "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('mlx_lm') else 1)"
+        return subprocess.run([str(python), "-c", probe], env=env, check=False).returncode == 0
+
+    def test_worker_runs_under_the_parent_environments_interpreter(self):
+        venv = Path(self.fixture.temporary.name) / "parent-venv"
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", "--symlinks", str(venv)], check=True, capture_output=True)
+        venv_python = venv / "bin" / "python"
+        base_python = Path(os.path.realpath(venv_python))
+        # A venv interpreter is a symlink to the base interpreter on POSIX, so resolving
+        # it leaves the environment: this is what makes the test discriminate.
+        self.assertTrue(venv_python.is_symlink(), venv_python)
+        self.assertFalse(base_python.is_relative_to(venv), (venv_python, base_python))
+        purelib = subprocess.run(
+            [str(venv_python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        marker = Path(purelib) / "mlx_lm"
+        marker.mkdir(parents=True)
+        (marker / "__init__.py").write_text("")
+        (marker / "utils.py").write_text(
+            "class _Tokenizer:\n"
+            "    def encode(self, text): return text.split()\n"
+            "def load_tokenizer(model_id): return _Tokenizer()\n"
+        )
+        self.assertTrue(self._sees_mlx_lm(venv_python))
+        if self._sees_mlx_lm(base_python):
+            self.skipTest(f"the base interpreter {base_python} already imports mlx_lm; the marker cannot discriminate")
+
+        report = self._run_worker_env_driver(venv_python, "prepare")
+        self.assertEqual(report["executable"], str(venv_python))
+        self.assertEqual(report["prompt_missing"], [])
+        self.assertIs(report["prepared"], True)
+
+    def test_worker_missing_reason_names_the_interpreter(self):
+        if self._sees_mlx_lm(sys.executable):
+            self.skipTest("this interpreter imports mlx_lm, so the worker would not report it missing")
+        report = self._run_worker_env_driver(sys.executable, "prepare,group")
+        reason = f"mlx_lm is not importable by {report['executable']}"
+        self.assertIs(report["prepared"], False)
+        self.assertEqual(report["prompt_missing"], [reason])
+        self.assertIsNotNone(report["group_error"])
+        self.assertIn(f"unavailable: {reason}", report["group_error"])
 
     def test_mlx_load_quantize_warmup_and_measurements_live_in_child(self):
         result = self.fixture.run(

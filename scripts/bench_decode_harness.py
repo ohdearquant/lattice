@@ -913,6 +913,14 @@ def register_adapter(name: str, adapter: EngineAdapter) -> None:
     ADAPTER_REGISTRY[name] = adapter
 
 
+# Why an engine was left out of ADAPTER_REGISTRY, so the report can say so.
+ADAPTER_MISSING_REASONS: dict[str, str] = {}
+
+
+def register_missing_adapter(name: str, reason: str) -> None:
+    ADAPTER_MISSING_REASONS[name] = reason
+
+
 OLLAMA_SCOPE = "external server; only request interval and unload/check ran under the locks"
 WORKER_PROTOCOL_VERSION = 1
 LATTICE_HANDOFF_ARGV = [
@@ -1037,7 +1045,9 @@ def _adapter_wire(adapter: EngineAdapter) -> dict:
     return {"module": cls.__module__, "class": cls.__name__, "kwargs": kwargs}
 
 
-def prepare_worker_prompt(adapter: EngineAdapter, context_tokens: int) -> tuple[str, int] | None:
+def prepare_worker_prompt(
+    adapter: EngineAdapter, context_tokens: int, missing_reason: list[str] | None = None
+) -> tuple[str, int] | None:
     result = _launch_plain_worker(
         {
             "protocol_version": WORKER_PROTOCOL_VERSION,
@@ -1052,6 +1062,8 @@ def prepare_worker_prompt(adapter: EngineAdapter, context_tokens: int) -> tuple[
         label=f"decode-mlx-prompt-{uuid.uuid4().hex[:12]}",
     )
     if result["status"] == "missing":
+        if missing_reason is not None:
+            missing_reason.append(result["reason"])
         return None
     prompt = result["prepared_prompt"]
     count = result["prompt_tokens"]
@@ -1146,6 +1158,10 @@ def _validate_worker_result(result: object) -> dict:
     return result
 
 
+def _mlx_missing_reason() -> str:
+    return f"mlx_lm is not importable by {sys.executable}"
+
+
 def _launch_plain_worker(request: dict, *, label: str) -> dict:
     cache = REPO_ROOT / ".cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -1156,7 +1172,9 @@ def _launch_plain_worker(request: dict, *, label: str) -> dict:
     request_path.write_text(json.dumps(request, separators=(",", ":")) + "\n")
     command = [
         str((REPO_ROOT / "scripts" / "bench-command.sh").resolve()), "--durable", "--label", label, "--",
-        str(Path(sys.executable).resolve()), str(Path(__file__).resolve()), "worker", "--request", str(request_path.resolve()),
+        # Not resolved: inside a virtual environment sys.executable is a symlink to the base
+        # interpreter, and resolving it would start a worker that cannot see the environment's packages.
+        os.path.abspath(sys.executable), str(Path(__file__).resolve()), "worker", "--request", str(request_path.resolve()),
     ]
     try:
         proc = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
@@ -1298,7 +1316,7 @@ def run_decode_worker(request_path: Path) -> int:
     adapter = adapter_type(**adapter_spec["kwargs"])
     if request["operation"] == "prepare_prompt":
         if importlib.util.find_spec("mlx_lm") is None:
-            _atomic_worker_result(result_path, status="missing", reason="mlx_lm is unavailable")
+            _atomic_worker_result(result_path, status="missing", reason=_mlx_missing_reason())
             return 0
         prepared = adapter.padded_prompt(request["prompt_context"])
         token_count = adapter._prompt_token_counts[prepared]
@@ -1312,7 +1330,7 @@ def run_decode_worker(request_path: Path) -> int:
     if prepared_tokens is not None and (type(prepared_tokens) is not int or prepared_tokens < 1):
         raise ValueError("decode worker prepared_prompt_tokens must be a positive integer or null")
     if engine == "mlx" and importlib.util.find_spec("mlx_lm") is None:
-        _atomic_worker_result(result_path, status="missing", reason="mlx_lm is unavailable")
+        _atomic_worker_result(result_path, status="missing", reason=_mlx_missing_reason())
         return 0
     if engine == "ollama":
         adapter.base_url = validate_ollama_url(adapter.base_url)
@@ -1499,6 +1517,9 @@ def run_profile(
 
     observations: list[Observation] = []
     engine_metadata: dict[str, object] = {}
+    for name in missing:
+        if name in ADAPTER_MISSING_REASONS:
+            engine_metadata[name] = {"missing_reason": ADAPTER_MISSING_REASONS[name]}
     order_index = 0
 
     def _append_observation(
@@ -1927,6 +1948,11 @@ def render_report(run_result: HarnessRunResult, slopes: list[SlopeResult]) -> st
     lines = [f"=== {profile.name} | windows={list(profile.windows)} | aggregation={profile.aggregation} ==="]
     if run_result.missing_engines:
         lines.append(f"  (missing engine adapter(s), skipped: {', '.join(run_result.missing_engines)})")
+        for name in run_result.missing_engines:
+            metadata = run_result.engine_metadata.get(name)
+            reason = metadata.get("missing_reason") if isinstance(metadata, Mapping) else None
+            if reason:
+                lines.append(f"    {name}: {reason}")
     if "ollama" in profile.engines:
         lines.append(f"  ollama scope: {OLLAMA_SCOPE}")
         ollama_metadata = run_result.engine_metadata.get("ollama", {})
@@ -3137,6 +3163,7 @@ def _load_profile_adapters(args: argparse.Namespace) -> int | None:
     if unsupported:
         raise ProfileConfigError(f"profile {args.profile!r} does not accept the requested runtime override")
     ADAPTER_REGISTRY.clear()
+    ADAPTER_MISSING_REASONS.clear()
     if args.profile.startswith("apples_to_apples_"):
         module.register_available_adapters(["run", "--profile", args.profile])
     else:

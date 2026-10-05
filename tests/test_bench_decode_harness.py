@@ -1894,6 +1894,57 @@ class RenderReportTest(unittest.TestCase):
         self.assertIn("ghost", report)
         self.assertIn("fake", report)
 
+    def _run_with_missing_ghost(self, **metadata):
+        profile = _profile(engines=[_engine("fake"), _engine("ghost")])
+        result = harness.run_profile(
+            profile,
+            {"fake": _FakeAdapter()},
+            allow_missing_engine=True,
+            clock=_FakeClock(),
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+        return dataclasses.replace(result, engine_metadata={**result.engine_metadata, **metadata})
+
+    def test_report_prints_the_worker_reason_for_a_missing_engine(self):
+        reason = "mlx_lm is not importable by /opt/env/bin/python"
+        result = self._run_with_missing_ghost(ghost={"missing_reason": reason})
+        lines = harness.render_report(result, harness.aggregate(result)).splitlines()
+        skipped = next(i for i, line in enumerate(lines) if "missing engine adapter(s), skipped: ghost" in line)
+        self.assertEqual(lines[skipped + 1], f"    ghost: {reason}")
+
+    def test_report_prints_no_reason_line_for_a_present_engine(self):
+        # control: only the missing engine carries a reason line; `fake` ran
+        result = self._run_with_missing_ghost(
+            ghost={"missing_reason": "gone"}, fake={"scope": "does not matter"}
+        )
+        report = harness.render_report(result, harness.aggregate(result))
+        self.assertIn("    ghost: gone", report)
+        self.assertFalse([line for line in report.splitlines() if line.startswith("    fake:")], report)
+
+    def test_report_without_any_reason_adds_no_reason_line(self):
+        result = self._run_with_missing_ghost()
+        report = harness.render_report(result, harness.aggregate(result))
+        self.assertFalse([line for line in report.splitlines() if line.startswith("    ghost:")], report)
+
+    def test_registry_reason_reaches_the_report_only_for_a_missing_engine(self):
+        profile = _profile(engines=[_engine("fake"), _engine("ghost")])
+        with mock.patch.dict(
+            harness.ADAPTER_MISSING_REASONS, {"ghost": "model directory is missing", "fake": "stale"}, clear=True
+        ):
+            result = harness.run_profile(
+                profile,
+                {"fake": _FakeAdapter()},
+                allow_missing_engine=True,
+                clock=_FakeClock(),
+                git_sha_value="x",
+                hardware_id_value="h",
+            )
+        self.assertEqual(result.engine_metadata, {"ghost": {"missing_reason": "model directory is missing"}})
+        report = harness.render_report(result, harness.aggregate(result))
+        self.assertIn("    ghost: model directory is missing", report)
+        self.assertNotIn("stale", report)
+
     def test_report_handles_no_measured_data(self):
         # `run_profile` no longer returns an observation-free result, so the
         # renderer's empty case is exercised on a directly constructed one.
