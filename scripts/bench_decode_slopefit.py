@@ -30,6 +30,7 @@ import subprocess
 import sys
 import uuid
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -112,19 +113,22 @@ def null_bench(unit: str, higher_is_better: bool) -> dict:
     return bench_entry(None, None, None, unit, higher_is_better)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out", type=str, default=None)
-    args = parser.parse_args()
+def parse_stream(
+    lines: Iterable[str],
+) -> tuple[
+    dict[int, list[float]], dict[int, list[int]], dict[int, int], dict[str, int] | None
+]:
+    """Collect SLOPEFIT / SLOPEFIT_META records, ignoring every other line.
 
-    is_full = os.environ.get("SLOPEFIT_FULL", "") == "1"
-
+    The GPU handoff merges the binary's standard error (progress lines) and the
+    supervisor's own notices into the stream, so only the tagged records count.
+    """
     raw: dict[int, list[float]] = defaultdict(list)
     tokens_by_ctx: dict[int, list[int]] = defaultdict(list)
     meta_ctx: dict[int, int] = {}
     meta_run: dict[str, int] | None = None
 
-    for line in sys.stdin:
+    for line in lines:
         m = SLOPEFIT_RE.search(line)
         if m:
             ctx, tokens, measure_ms = int(m.group(1)), int(m.group(2)), float(m.group(3))
@@ -145,6 +149,18 @@ def main() -> None:
         if m:
             meta_ctx[int(m.group(1))] = int(m.group(2))
             continue
+
+    return raw, tokens_by_ctx, meta_ctx, meta_run
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", type=str, default=None)
+    args = parser.parse_args()
+
+    is_full = os.environ.get("SLOPEFIT_FULL", "") == "1"
+
+    raw, tokens_by_ctx, meta_ctx, meta_run = parse_stream(sys.stdin)
 
     # --- TBV self-checks (ADR-064 harness spec) -----------------------------
     if meta_run is None:

@@ -19,7 +19,8 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$REPO/scripts/lib/ensure-noindex-marker.sh"
 # The measurement body, not the entry point: scripts/bench-compare.sh only
 # takes the machine-wide locks and execs this. The slopefit driver is the build
-# path used by the scheduled macOS measurement workflow.
+# path used by the scheduled macOS measurement workflow; its GPU-handoff launch
+# builds into .cache, so that is the tree it protects.
 COMPARE_CALLER="$REPO/scripts/lib/bench-compare-impl.sh"
 SLOPEFIT_CALLER="$REPO/scripts/bench_decode_slopefit.sh"
 for caller in "$COMPARE_CALLER" "$SLOPEFIT_CALLER"; do
@@ -165,10 +166,10 @@ else
   echo "  FAIL: bench-compare no longer protects its in-place target"; fail=$((fail+1))
 fi
 
-if grep -qF "$target_call" "$SLOPEFIT_CALLER"; then
-  echo "  PASS: slopefit protects its in-place target"; pass=$((pass+1))
+if grep -qF "$cache_call" "$SLOPEFIT_CALLER"; then
+  echo "  PASS: slopefit protects its handoff build tree"; pass=$((pass+1))
 else
-  echo "  FAIL: slopefit no longer protects its in-place target"; fail=$((fail+1))
+  echo "  FAIL: slopefit no longer protects its handoff build tree"; fail=$((fail+1))
 fi
 
 # 12. Each marker must exist before the operation that creates or builds the
@@ -189,12 +190,12 @@ else
   echo "  FAIL: target guard does not precede bench-compare build (guard=$target_guard_ln build=$compare_build_ln)"; fail=$((fail+1))
 fi
 
-slopefit_guard_ln=$(grep -nF "$target_call" "$SLOPEFIT_CALLER" | head -1 | cut -d: -f1)
-slopefit_build_ln=$(grep -n '^cargo build' "$SLOPEFIT_CALLER" | head -1 | cut -d: -f1)
+slopefit_guard_ln=$(grep -nF "$cache_call" "$SLOPEFIT_CALLER" | head -1 | cut -d: -f1)
+slopefit_build_ln=$(grep -nF 'bench-command.sh" --gpu-handoff' "$SLOPEFIT_CALLER" | head -1 | cut -d: -f1)
 if [ -n "$slopefit_guard_ln" ] && [ -n "$slopefit_build_ln" ] && [ "$slopefit_guard_ln" -lt "$slopefit_build_ln" ]; then
-  echo "  PASS: target guard precedes slopefit build (line $slopefit_guard_ln < $slopefit_build_ln)"; pass=$((pass+1))
+  echo "  PASS: cache guard precedes slopefit handoff build (line $slopefit_guard_ln < $slopefit_build_ln)"; pass=$((pass+1))
 else
-  echo "  FAIL: target guard does not precede slopefit build (guard=$slopefit_guard_ln build=$slopefit_build_ln)"; fail=$((fail+1))
+  echo "  FAIL: cache guard does not precede slopefit handoff build (guard=$slopefit_guard_ln build=$slopefit_build_ln)"; fail=$((fail+1))
 fi
 
 # 13. CLOSED STDERR. Every FATAL diagnostic writes to fd 2 under `set -e`

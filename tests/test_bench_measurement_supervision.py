@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import fcntl
+import importlib.util
 import os
 import re
 import shlex
@@ -42,6 +43,37 @@ MEASUREMENT_SIGNAL = re.compile(
     r"elapsed_ns|elapsed_s|total_ms|tokens/s|tok/s|PPL:"
 )
 CARGO_BENCH_LITERAL = re.compile(r"\bcargo[ \t\r\n]+bench\b")
+# A script that delegates its measured binary to the GPU handoff launcher is a
+# measurement entry point even though it never calls `cargo bench` itself.
+GPU_HANDOFF_LAUNCH_SIGNAL = re.compile(
+    r'(?m)^[^#\n]*bench-command\.sh"?[ \t]+--gpu-handoff\b'
+)
+GPU_HANDOFF_LAUNCH = re.compile(
+    r'bench-command\.sh"?\s+--gpu-handoff(?P<durable>\s+--durable)?'
+    r"\s+--label\s+(?P<label>\S+)\s+--\s+"
+    r"cargo\s+run\s+--locked\s+--release\s+-p\s+lattice-inference"
+    r'\s+--bin\s+(?P<bin>\w+)\s+--features\s+"?(?P<features>[\w,-]+)"?'
+)
+# A plain launch: the launcher without --gpu-handoff, so the supervisor holds both machine
+# locks around a command that never takes the GPU lock itself (MLX does not call
+# gpu_test_lock()).
+PLAIN_LAUNCH = re.compile(
+    r'bench-command\.sh"?[ \t]+(?P<durable>--durable[ \t]+)?--label[ \t]+\S+[ \t]+--[ \t]'
+)
+# What counts as MLX use in a shell script: the package by name, an import of it, or a
+# script file named after it. Prose and variable names in capitals are not MLX use.
+SHELL_MLX_USE = re.compile(
+    r"mlx[_-]lm|\b(?:import|from)[ \t]+mlx\b|\bmlx\.(?:core|nn)\b|\bmlx[\w-]*\.py\b"
+)
+HEREDOC_OPEN = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1")
+# Each of these would make a handoff child supervise itself around the binary it
+# delegates to the handoff, which can then never receive the GPU lock.
+SELF_SUPERVISION_TOKENS = (
+    "bench_supervise_entry",
+    "bench-supervision.sh",
+    "bench_supervision",
+    "ensure_python_entrypoint",
+)
 CARGO_BENCH_ARGV_LITERAL = re.compile(
     r'''["']cargo["']\s*,\s*(?:\[\s*)?["']bench["']'''
 )
@@ -225,6 +257,8 @@ def _python_measurement_evidence(source: str, path: Path) -> set[str]:
 
         if isinstance(node, ast.Attribute) and _dotted_name(node) in PYTHON_TIMING_CALLS:
             evidence.add("wall or monotonic timer")
+        if isinstance(node, ast.Constant) and node.value == "--gpu-handoff":
+            evidence.add("GPU handoff measurement launch")
         if (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
@@ -257,6 +291,8 @@ def _shell_or_node_measurement_evidence(source: str) -> set[str]:
         source,
     ):
         evidence.add("measurement supervisor invocation")
+    if GPU_HANDOFF_LAUNCH_SIGNAL.search(source):
+        evidence.add("GPU handoff measurement launch")
     if re.search(r"process\.hrtime\.bigint\(|performance\.now\(|Date\.now\(", source):
         evidence.add("JavaScript timer")
     if re.search(r"(?m)^[ \t]*(?:from[ \t]+mlx|import[ \t]+mlx)", source):
@@ -303,6 +339,223 @@ def _shell_commands(source: str) -> list[tuple[int, list[str]]]:
         if tokens:
             commands.append((line_number, tokens))
     return commands
+
+
+def _logical_lines(source: str) -> list[str]:
+    """Shell lines with backslash continuations joined and comment lines dropped."""
+    lines: list[str] = []
+    pending = ""
+    for line in source.splitlines():
+        stripped = line.rstrip()
+        if stripped.endswith("\\"):
+            pending += stripped[:-1] + " "
+            continue
+        lines.append(pending + stripped)
+        pending = ""
+    if pending:
+        lines.append(pending)
+    return [line for line in lines if not line.lstrip().startswith("#")]
+
+
+def gpu_handoff_launches(path: str, source: str) -> list[dict[str, str]]:
+    """Every delegated GPU-handoff launch of a declared binary in one script."""
+    if path.endswith(".py"):
+        tree = ast.parse(source, filename=path)
+        argv: list[str] | None = None
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "HANDOFF_ARGV"
+                    for target in node.targets
+                )
+                and isinstance(node.value, ast.List)
+                and all(
+                    isinstance(item, ast.Constant) and isinstance(item.value, str)
+                    for item in node.value.elts
+                )
+            ):
+                argv = [item.value for item in node.value.elts]
+        # The launcher path is built at run time, so the argv list must be the one
+        # handed to it: the script has to splice HANDOFF_ARGV after bench-command.sh.
+        if argv is None or "bench-command.sh" not in source or "*HANDOFF_ARGV" not in source:
+            return []
+        text = "bench-command.sh " + " ".join(argv)
+    else:
+        text = "\n".join(_logical_lines(source))
+    return [match.groupdict() for match in GPU_HANDOFF_LAUNCH.finditer(text)]
+
+
+def _shell_units(source: str) -> list[tuple[str, str]]:
+    """(command line, heredoc body) pairs: continuations joined, comment lines dropped."""
+    units: list[tuple[str, str]] = []
+    pending = ""
+    lines = iter(source.splitlines())
+    for raw in lines:
+        stripped = raw.rstrip()
+        if not pending and stripped.lstrip().startswith("#"):
+            continue
+        if stripped.endswith("\\"):
+            pending += stripped[:-1] + " "
+            continue
+        # A trailing comment is prose, not a command (a `#` inside quotes is a blind spot).
+        command = re.sub(r"[ \t]#.*$", "", pending + stripped)
+        pending = ""
+        body: list[str] = []
+        opener = HEREDOC_OPEN.search(command)
+        if opener is not None:
+            for inner in lines:
+                if inner.strip() == opener.group(2):
+                    break
+                body.append(inner)
+        units.append((command, "\n".join(body)))
+    return units
+
+
+def _mlx_call_violations(tree: ast.Module) -> tuple[int, list[str]]:
+    """(functions importing mlx, calls that reach MLX from outside the child branch).
+
+    A function reaches MLX if it imports mlx/mlx_lm or makes an unguarded call to one that
+    does; a call guarded by an `if` testing MLX_CHILD_DIR does not propagate. A call to a
+    function that reaches MLX is allowed when it is guarded, or when its caller is itself
+    only ever entered from guarded calls (the child entry and what it calls).
+    """
+
+    def imports_mlx(node: ast.AST) -> bool:
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Import):
+                if any(alias.name.split(".")[0] in {"mlx", "mlx_lm"} for alias in inner.names):
+                    return True
+            elif isinstance(inner, ast.ImportFrom):
+                if (inner.module or "").split(".")[0] in {"mlx", "mlx_lm"}:
+                    return True
+        return False
+
+    sites: list[tuple[str, str, bool, int]] = []  # (caller, callee, guarded, line)
+
+    def walk(node: ast.AST, owner: str, guarded: bool) -> None:
+        if isinstance(node, ast.FunctionDef):
+            owner, guarded = node.name, False
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            sites.append((owner, node.func.id, guarded, node.lineno))
+        for field, value in ast.iter_fields(node):
+            for child in value if isinstance(value, list) else [value]:
+                if isinstance(child, ast.AST):
+                    walk(
+                        child,
+                        owner,
+                        guarded
+                        or (
+                            isinstance(node, ast.If)
+                            and field == "body"
+                            and "MLX_CHILD_DIR" in ast.unparse(node.test)
+                        ),
+                    )
+
+    walk(tree, "<module>", False)
+    functions = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    importers = {name for name, fn in functions.items() if imports_mlx(fn)}
+    reaching = set(importers)
+    changed = True
+    while changed:
+        changed = False
+        for caller, callee, guarded, _ in sites:
+            if not guarded and callee in reaching and caller in functions and caller not in reaching:
+                reaching.add(caller)
+                changed = True
+    entered_only_from_children = set(reaching)
+    changed = True
+    while changed:
+        changed = False
+        for caller, callee, guarded, _ in sites:
+            if (
+                callee in entered_only_from_children
+                and not guarded
+                and caller not in entered_only_from_children
+            ):
+                entered_only_from_children.discard(callee)
+                changed = True
+    violations = [
+        f"line {line}: {callee}() reaches MLX outside the child branch"
+        for caller, callee, guarded, line in sites
+        if callee in reaching and not guarded and caller not in entered_only_from_children
+    ]
+    return len(importers), violations
+
+
+def mlx_launch_report(path: str, source: str, *, durable: bool) -> tuple[int, list[str]]:
+    """(MLX use sites found, violations): MLX may be reached only through a plain launch.
+
+    Shell: every command (with its heredoc program) that uses MLX must be a plain
+    `bench-command.sh [--durable] --label L --` launch, with --durable present exactly
+    when the entry is `+quiet`, and the MLX words must come after the `--`.
+    Python: no module-level MLX import; every call of a function that reaches MLX, from
+    code that does not itself reach MLX, sits in the body of an `if` testing the child
+    flag MLX_CHILD_DIR; and the child flag appears only in one list, MLX_LAUNCH_ARGV,
+    which names no --gpu-handoff, carries --durable exactly when the entry is `+quiet`, and is
+    spread only into a call whose first element is the bench-command.sh path.
+    """
+    problems: list[str] = []
+    uses = 0
+    if path.endswith(".py"):
+        tree = ast.parse(source, filename=path)
+        uses, calls = _mlx_call_violations(tree)
+        problems.extend(calls)
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                module = node.module if isinstance(node, ast.ImportFrom) else node.names[0].name
+                if (module or "").split(".")[0] in {"mlx", "mlx_lm"}:
+                    problems.append(f"line {node.lineno}: module-level MLX import")
+        if uses:
+            lists = [
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.List)
+                and any(isinstance(e, ast.Constant) and e.value == "--mlx-child" for e in node.elts)
+            ]
+            argv = next(
+                (
+                    [e.value for e in node.value.elts if isinstance(e, ast.Constant)]
+                    for node in tree.body
+                    if isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "MLX_LAUNCH_ARGV" for t in node.targets)
+                    and isinstance(node.value, ast.List)
+                ),
+                None,
+            )
+            if argv is None or len(lists) != 1:
+                problems.append("MLX is reachable but there is not exactly one MLX_LAUNCH_ARGV child launch list")
+            else:
+                if "--gpu-handoff" in argv:
+                    problems.append("the MLX child launch names --gpu-handoff")
+                if ("--durable" in argv) != durable:
+                    problems.append("the MLX child launch's --durable does not match the entry's +quiet")
+                if argv[:1] != ["--label"] or "--" not in argv:
+                    problems.append("the MLX child launch is not `--label L -- COMMAND`")
+            spreads = [
+                argument for call in ast.walk(tree) if isinstance(call, ast.Call)
+                for argument in call.args
+                if isinstance(argument, ast.List) and any(
+                    isinstance(e, ast.Starred) and ast.unparse(e.value) == "MLX_LAUNCH_ARGV" for e in argument.elts)
+            ]
+            if len(spreads) != 1 or "bench-command.sh" not in ast.unparse(spreads[0].elts[0]):
+                problems.append("MLX_LAUNCH_ARGV is not spread exactly once after the bench-command.sh path")
+        return uses, problems
+
+    for command, body in _shell_units(source):
+        match = SHELL_MLX_USE.search(command + "\n" + body)
+        if match is None:
+            continue
+        uses += 1
+        launch = PLAIN_LAUNCH.search(command)
+        if launch is None or "--gpu-handoff" in command:
+            problems.append(f"MLX used outside a plain bench-command.sh launch: {command.strip()[:100]}")
+            continue
+        if (launch.group("durable") is not None) != durable:
+            problems.append(f"--durable does not match the entry's +quiet: {command.strip()[:100]}")
+        in_command = SHELL_MLX_USE.search(command)
+        if in_command is not None and in_command.start() < launch.end():
+            problems.append(f"MLX words precede the `--` of the launch: {command.strip()[:100]}")
+    return uses, problems
 
 
 def _shell_command_argv(tokens: list[str]) -> list[str]:
@@ -477,6 +730,8 @@ class InventoryContract(unittest.TestCase):
                         "both-locks+quiet",
                         "both-locks+quiet-baseline",
                         "both-locks+three-phase-quiet",
+                        "gpu-handoff-child",
+                        "gpu-handoff-child+quiet",
                     },
                 )
                 self.assertTrue((REPO / entry["path"]).is_file())
@@ -577,6 +832,172 @@ class InventoryContract(unittest.TestCase):
         """Source evidence, not manifest claims, determines this requirement."""
 
         validate_direct_measurement_supervision()
+
+    def test_gpu_handoff_launch_is_measurement_evidence(self):
+        """Mutation-sensitive: a script that only delegates to the handoff launcher
+        must still be discovered as a measurement entry point, or its role could
+        drift to consumer/none without any test noticing."""
+
+        fixture_repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        scripts = fixture_repo / "scripts"
+        scripts.mkdir()
+        (scripts / "bench_handoff_child.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            '"$REPO/scripts/bench-command.sh" --gpu-handoff --label x -- \\\n'
+            "    cargo run --locked --release -p lattice-inference --bin eval_perplexity\n"
+        )
+        (scripts / "bench_handoff_child.py").write_text(
+            "#!/usr/bin/env python3\n"
+            'HANDOFF_ARGV = ["--gpu-handoff", "--label", "x", "--"]\n'
+        )
+        (scripts / "bench_handoff_comment.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            "# bench-command.sh --gpu-handoff is described here, never run\n"
+        )
+
+        evidence = discovered_measurement_evidence(fixture_repo)
+        self.assertEqual(
+            evidence["scripts/bench_handoff_child.sh"],
+            {"GPU handoff measurement launch"},
+        )
+        self.assertEqual(
+            evidence["scripts/bench_handoff_child.py"],
+            {"GPU handoff measurement launch"},
+        )
+        self.assertNotIn("scripts/bench_handoff_comment.sh", evidence)
+
+    def test_migrated_scripts_are_measurement_evidence_with_a_handoff_supervision(self):
+        """The three scripts that delegate their binary to the handoff launcher are
+        found by the source scan and carry a handoff supervision class."""
+
+        evidence = discovered_measurement_evidence()
+        entries = manifest_entries()
+        for path, supervision in (
+            ("scripts/bench_decode_slopefit.sh", "gpu-handoff-child+quiet"),
+            ("scripts/bench_quality.sh", "gpu-handoff-child+quiet"),
+            ("scripts/compare_logits.py", "gpu-handoff-child"),
+        ):
+            with self.subTest(path=path):
+                self.assertIn("GPU handoff measurement launch", evidence[path])
+                self.assertEqual(entries[path]["role"], "measurement")
+                self.assertEqual(entries[path]["supervision"], supervision)
+
+    def test_handoff_launch_grammar_is_parsed_from_source(self):
+        """Mutation-sensitive: the parser behind the live-guard check reads the launch
+        words, so a flipped --durable or an unlisted binary is seen."""
+
+        shell = (
+            '(cd "$REPO" && "$REPO/scripts/bench-command.sh" --gpu-handoff --durable '
+            "--label q -- \\\n"
+            "    cargo run --locked --release -p lattice-inference --bin eval_perplexity \\\n"
+            '    --features metal-gpu -- "$@")\n'
+        )
+        self.assertEqual(
+            gpu_handoff_launches("scripts/x.sh", shell),
+            [
+                {
+                    "durable": " --durable",
+                    "label": "q",
+                    "bin": "eval_perplexity",
+                    "features": "metal-gpu",
+                }
+            ],
+        )
+        self.assertEqual(gpu_handoff_launches("scripts/x.sh", "# " + shell), [])
+        plain = shell.replace(" --durable", "")
+        self.assertIsNone(gpu_handoff_launches("scripts/x.sh", plain)[0]["durable"])
+        python = (
+            'HANDOFF_ARGV = ["--gpu-handoff", "--label", "l", "--", "cargo", "run", '
+            '"--locked", "--release", "-p", "lattice-inference", "--bin", '
+            '"bench_logit_dump", "--features", "metal-gpu,f16"]\n'
+            'subprocess.run(["scripts/bench-command.sh", *HANDOFF_ARGV])\n'
+        )
+        self.assertEqual(
+            [launch["bin"] for launch in gpu_handoff_launches("scripts/x.py", python)],
+            ["bench_logit_dump"],
+        )
+        self.assertEqual(
+            gpu_handoff_launches("scripts/x.py", python.replace("*HANDOFF_ARGV", "")),
+            [],
+        )
+
+    def test_handoff_children_reach_mlx_only_through_a_plain_launch(self):
+        """Known positives: the check must see MLX in the two scripts that use it, or a
+        clean result on them would mean nothing."""
+
+        entries = manifest_entries()
+        for path, minimum in (
+            ("scripts/bench_decode_slopefit.sh", 0),
+            ("scripts/bench_quality.sh", 1),
+            ("scripts/compare_logits.py", 1),
+        ):
+            with self.subTest(path=path):
+                durable = entries[path]["supervision"].endswith("+quiet")
+                uses, violations = mlx_launch_report(path, (REPO / path).read_text(), durable=durable)
+                self.assertEqual(violations, [])
+                self.assertEqual(uses >= 1, minimum >= 1)
+
+    def test_mlx_reachability_check_flags_the_unlocked_shapes(self):
+        """Mutation-sensitive: the earlier shapes (MLX run bare, or in the parent) are reported."""
+
+        compliant_shell = (
+            '"$REPO/scripts/bench-command.sh" --durable --label q-mlx -- \\\n'
+            '  uv run --quiet --with mlx-lm python3 - "$A" > "$T" 2>"$L" <<\'PY\'\n'
+            "import mlx.core as mx\nPY\n"
+            "# uv run --with mlx-lm is described here, never run\n"
+            'echo "MLX cross-check" ; awk \'$1 == "mlx"\' file\n'
+        )
+        self.assertEqual(mlx_launch_report("x.sh", compliant_shell, durable=True), (1, []))
+        bare = compliant_shell.replace('"$REPO/scripts/bench-command.sh" --durable --label q-mlx -- \\\n  ', "")
+        uses, problems = mlx_launch_report("x.sh", bare, durable=True)
+        self.assertEqual((uses, len(problems)), (1, 1))
+        self.assertIn("outside a plain bench-command.sh launch", problems[0])
+        no_durable = compliant_shell.replace("--durable ", "")
+        self.assertIn("--durable does not match", mlx_launch_report("x.sh", no_durable, durable=True)[1][0])
+        self.assertIn("--durable does not match", mlx_launch_report("x.sh", compliant_shell, durable=False)[1][0])
+        handoff = compliant_shell.replace("--durable ", "--gpu-handoff --durable ")
+        self.assertIn("outside a plain", mlx_launch_report("x.sh", handoff, durable=True)[1][0])
+        body_only = 'python3 - <<\'PY\'\nfrom mlx_lm import load\nPY\n'
+        self.assertEqual(mlx_launch_report("x.sh", body_only, durable=False)[0], 1)
+        self.assertEqual(len(mlx_launch_report("x.sh", body_only, durable=False)[1]), 1)
+        self.assertEqual(mlx_launch_report("x.sh", "# import mlx\n", durable=False), (0, []))
+
+        compliant_python = (
+            "import subprocess, sys\n"
+            "MLX_CHILD_DIR = None\n"
+            "MLX_LAUNCH_ARGV = ['--label', 'l', '--', sys.executable, 'f.py', '--mlx-child']\n"
+            "def tokenize():\n    from mlx_lm import load\n"
+            "def run_child(d):\n    tokenize()\n"
+            "def collect():\n    subprocess.run([str(R / 'scripts' / 'bench-command.sh'), *MLX_LAUNCH_ARGV, 'd'])\n"
+            "def main():\n"
+            "    if MLX_CHILD_DIR is not None:\n        run_child(MLX_CHILD_DIR)\n        return\n"
+            "    collect()\n"
+            "if __name__ == '__main__':\n    main()\n"
+        )
+        self.assertEqual(mlx_launch_report("x.py", compliant_python, durable=False), (1, []))
+
+        def flagged(source, needle, durable=False):
+            _, found = mlx_launch_report("x.py", source, durable=durable)
+            self.assertTrue(any(needle in item for item in found), (needle, found))
+
+        in_parent = compliant_python.replace(
+            "    collect()\n", "    tokenize()\n    collect()\n")
+        flagged(in_parent, "tokenize() reaches MLX outside the child branch")
+        in_parent_via_child = compliant_python.replace("    collect()\n", "    run_child('d')\n    collect()\n")
+        flagged(in_parent_via_child, "run_child() reaches MLX outside the child branch")
+        unguarded = compliant_python.replace("if MLX_CHILD_DIR is not None:", "if True:")
+        flagged(unguarded, "run_child() reaches MLX outside the child branch")
+        flagged(compliant_python.replace("import subprocess, sys\n", "import subprocess, sys\nimport mlx.core\n"), "module-level MLX import")
+        without_launcher = compliant_python.replace(
+            "[str(R / 'scripts' / 'bench-command.sh'), *MLX_LAUNCH_ARGV, 'd']", "[sys.executable, 'f.py', '--mlx-child', 'd']")
+        flagged(without_launcher, "not exactly one MLX_LAUNCH_ARGV")
+        no_spread = compliant_python.replace("*MLX_LAUNCH_ARGV, 'd'", "'d'")
+        flagged(no_spread, "not spread exactly once")
+        flagged(compliant_python.replace("'--label', 'l', '--',", "'--gpu-handoff', '--label', 'l', '--',"), "names --gpu-handoff")
+        flagged(compliant_python.replace("'--label', 'l'", "'--durable', '--label', 'l'"), "--durable does not match")
+        flagged(compliant_python, "--durable does not match", durable=True)
+        other_launcher = compliant_python.replace("'bench-command.sh'", "'run.sh'")
+        flagged(other_launcher, "not spread exactly once")
 
     def test_no_shebang_javascript_measurement_is_discovered(self):
         """Explicit Node invocation does not require a shebang or executable bit."""
@@ -898,6 +1319,39 @@ class InventoryContract(unittest.TestCase):
                 if decision.state in {"measurement", "advisory-no-match"}:
                     self.assertTrue(decision.evidence)
 
+    def assert_gpu_handoff_child(self, path: str, source: str, supervision: str) -> None:
+        """A handoff child delegates its binary and never supervises around it."""
+
+        for token in SELF_SUPERVISION_TOKENS:
+            self.assertNotIn(token, source)
+        # Any other GPU pass (MLX) is reachable only through a plain launch under both locks.
+        _, violations = mlx_launch_report(path, source, durable=supervision.endswith("+quiet"))
+        self.assertEqual(violations, [])
+        launches = gpu_handoff_launches(path, source)
+        self.assertTrue(launches, f"{path} has no GPU handoff launch")
+        spec = importlib.util.spec_from_file_location(
+            "bench_admission_for_inventory", REPO / "scripts/lib/bench_admission.py"
+        )
+        assert spec is not None and spec.loader is not None
+        admission = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(admission)
+        manifest = tomllib.loads((REPO / "crates/inference/Cargo.toml").read_text())
+        declared = {item["name"]: item for item in manifest.get("bin", [])}
+        for launch in launches:
+            with self.subTest(binary=launch["bin"]):
+                # +quiet means the before/after ambient-idle checks are requested.
+                self.assertEqual(
+                    launch["durable"] is not None, supervision.endswith("+quiet")
+                )
+                self.assertIn(launch["bin"], admission.BINS)
+                required = admission.BINS[launch["bin"]] | set(
+                    declared.get(launch["bin"], {}).get("required-features", [])
+                )
+                self.assertLessEqual(
+                    required,
+                    set(admission.feature_closure(manifest, launch["features"])),
+                )
+
     def test_every_measurement_entry_has_a_live_guard(self):
         """Mutation-sensitive: deleting any entry-point guard fails this scan."""
 
@@ -907,7 +1361,9 @@ class InventoryContract(unittest.TestCase):
             source_path = REPO / path
             source = source_path.read_text()
             with self.subTest(path=path):
-                if path == "scripts/bench-compare.sh":
+                if entry["supervision"].startswith("gpu-handoff-child"):
+                    self.assert_gpu_handoff_child(path, source, entry["supervision"])
+                elif path == "scripts/bench-compare.sh":
                     commands = _shell_commands(source)
                     self.assertTrue(
                         any(
