@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Revision-bound admission and descriptor-free builds for selected Metal benches."""
+"""Revision-bound admission and descriptor-free builds for selected Metal benches and binaries."""
 
 from __future__ import annotations
 
@@ -26,6 +26,18 @@ TARGETS = {
     "lm_head_bench": {"metal-gpu", "f16", "bench-internals"},
     "topk_readback": {"metal-gpu"},
 }
+# Declared binaries that call gpu_test_lock() themselves. Each is launched as the
+# built executable, like a bench target. A binary may take the GPU lock once per
+# process: the control channel closes after the first READY.
+BINS = {
+    "bench_decode_slopefit": {"metal-gpu"},
+    "bench_decode_ab": {"metal-gpu", "f16"},
+    "bench_logit_dump": {"metal-gpu", "f16"},
+    "eval_perplexity": {"metal-gpu"},
+}
+# eval_perplexity takes the lock once per Metal mode flag (two in dual-Q4 mode)
+# and not at all in CPU mode, so only a single Metal mode is admitted.
+EVAL_PERPLEXITY_METAL_MODES = ("--metal-model-dir", "--q4-dir", "--quarot-q4-dir")
 BROKER_ENV = "LATTICE_GPU_HANDOFF_BROKER"
 BROKER_TOKEN_ENV = "LATTICE_GPU_HANDOFF_BROKER_TOKEN"
 MAX_FRAME = 2 * 1024 * 1024
@@ -122,39 +134,69 @@ def _host(env: Mapping[str, str]) -> str:
     return "darwin"
 
 
+def _bin_arguments(entry_id: str, target: str, args: list[str]) -> None:
+    if target != "eval_perplexity":
+        return
+    modes = [arg for arg in args if arg in EVAL_PERPLEXITY_METAL_MODES]
+    if len(modes) != 1:
+        raise AdmissionError(
+            f"{entry_id}: eval_perplexity needs exactly one of "
+            f"{', '.join(EVAL_PERPLEXITY_METAL_MODES)}; the handoff admits one GPU lock "
+            f"acquisition per process (got {len(modes)})"
+        )
+
+
 def _entry(
     repo: Path, sha: str, target: str, features: str, *, entry_id: str,
-    cwd: Path, criterion_home: Path, criterion_args: list[str], platform: str,
+    cwd: Path, criterion_home: Path | None, target_args: list[str], platform: str,
+    kind: str = "bench", release: bool = False,
 ) -> dict:
-    if target not in TARGETS:
+    table = TARGETS if kind == "bench" else BINS
+    if target not in table:
         raise AdmissionError(f"{entry_id}: unsupported self-locking target {target!r}")
+    if kind == "bin":
+        _bin_arguments(entry_id, target, target_args)
     manifest = _manifest(repo, sha, "crates/inference/Cargo.toml")
     package = manifest.get("package", {})
     if not isinstance(package, dict) or not isinstance(package.get("metadata", {}), dict):
         raise AdmissionError(f"{entry_id} {sha}: invalid package metadata")
     policy = package.get("metadata", {}).get("gpu-bench-handoff", {})
-    declared = policy.get("targets", []) if isinstance(policy, dict) else []
+    key = "targets" if kind == "bench" else "bins"
+    declared = policy.get(key, []) if isinstance(policy, dict) else []
     if (not isinstance(policy, dict) or type(policy.get("version")) is not int
             or policy.get("version") != PROTOCOL or not isinstance(declared, list)
             or not all(isinstance(name, str) for name in declared)
-            or sorted(declared) != sorted(TARGETS)):
-        raise AdmissionError(f"{entry_id} {sha}: revision has no supported GPU handoff declaration")
-    declarations = manifest.get("bench", [])
-    if not isinstance(declarations, list) or not all(isinstance(item, dict) for item in declarations):
-        raise AdmissionError(f"{entry_id} {sha}: invalid benchmark declarations")
-    benches = [item for item in declarations if item.get("name") == target]
-    if len(benches) != 1 or benches[0].get("harness") is not False:
-        raise AdmissionError(f"{entry_id} {sha}: {target} is not one declared Criterion target")
-    source_path = benches[0].get("path", f"benches/{target}.rs")
-    if source_path != f"benches/{target}.rs":
-        raise AdmissionError(f"{entry_id} {sha}: unsupported benchmark source {source_path!r}")
+            or sorted(declared) != sorted(table)):
+        raise AdmissionError(f"{entry_id} {sha}: revision has no supported GPU handoff declaration for {key}")
+    if kind == "bench":
+        declarations = manifest.get("bench", [])
+        if not isinstance(declarations, list) or not all(isinstance(item, dict) for item in declarations):
+            raise AdmissionError(f"{entry_id} {sha}: invalid benchmark declarations")
+        matches = [item for item in declarations if item.get("name") == target]
+        if len(matches) != 1 or matches[0].get("harness") is not False:
+            raise AdmissionError(f"{entry_id} {sha}: {target} is not one declared Criterion target")
+        declaration = matches[0]
+        default_source = f"benches/{target}.rs"
+    else:
+        declarations = manifest.get("bin", [])
+        if not isinstance(declarations, list) or not all(isinstance(item, dict) for item in declarations):
+            raise AdmissionError(f"{entry_id} {sha}: invalid binary declarations")
+        matches = [item for item in declarations if item.get("name") == target]
+        if len(matches) > 1 or (not matches and package.get("autobins") is False):
+            raise AdmissionError(f"{entry_id} {sha}: {target} is not one discoverable binary target")
+        # A binary without a [[bin]] table is auto-discovered from src/bin/<name>.rs.
+        declaration = matches[0] if matches else {}
+        default_source = f"src/bin/{target}.rs"
+    source_path = declaration.get("path", default_source)
+    if source_path != default_source:
+        raise AdmissionError(f"{entry_id} {sha}: unsupported {kind} source {source_path!r}")
     source_path = f"crates/inference/{source_path}"
     _git(repo, "show", f"{sha}:{source_path}")
     feature_set = feature_closure(manifest, features)
-    cargo_required = benches[0].get("required-features", [])
+    cargo_required = declaration.get("required-features", [])
     if not isinstance(cargo_required, list) or not all(isinstance(name, str) for name in cargo_required):
         raise AdmissionError(f"{entry_id} {sha}: invalid target required-features")
-    required = TARGETS[target] | set(cargo_required)
+    required = table[target] | set(cargo_required)
     missing = required - set(feature_set)
     if missing:
         raise AdmissionError(f"{entry_id} {sha}: {target} lacks features {sorted(missing)}")
@@ -168,11 +210,14 @@ def _entry(
     target_dir = repo / ".cache" / "bench-gpu-handoff-build" / sha / target
     return {
         "id": entry_id, "revision": sha, "package": PACKAGE, "target": target,
+        "kind": kind, "release": release,
         "features": features, "feature_set": feature_set, "source_path": source_path,
-        "platform": platform, "cwd": str(cwd), "run_cwd": str(cwd / "crates/inference"),
-        "criterion_home": str(criterion_home),
-        "argv": ["--bench", *criterion_args], "target_dir": str(target_dir),
-        "package_version": version,
+        "platform": platform, "cwd": str(cwd),
+        # `cargo bench` runs from the package directory; `cargo run` keeps the caller's cwd.
+        "run_cwd": str(cwd / "crates/inference") if kind == "bench" else str(cwd),
+        "criterion_home": str(criterion_home) if criterion_home is not None else None,
+        "argv": ["--bench", *target_args] if kind == "bench" else list(target_args),
+        "target_dir": str(target_dir), "package_version": version,
     }
 
 
@@ -224,7 +269,7 @@ def plan_compare(repo: Path, args: list[str], env: Mapping[str, str]) -> dict:
     ]
     entries = [
         _entry(repo, sha, target, features, entry_id=entry_id, cwd=repo / ".cache" / directory,
-               criterion_home=home, criterion_args=[*prefix, operation, baseline, *suffix],
+               criterion_home=home, target_args=[*prefix, operation, baseline, *suffix],
                platform=platform)
         for entry_id, sha, directory, home, operation, baseline in locations
     ]
@@ -260,59 +305,70 @@ def command_criterion_home(repo: Path, env: Mapping[str, str]) -> Path:
 
 
 def plan_command(repo: Path, command: list[str], env: Mapping[str, str]) -> dict:
-    """Admit one explicit Cargo bench command; unknown command grammar refuses."""
+    """Admit one explicit Cargo bench or run command; unknown command grammar refuses."""
     repo = Path(repo).resolve()
     platform = _host(env)
     if Path.cwd().resolve() != repo:
         raise AdmissionError("explicit bench-command must run from its repository root")
-    if command[:2] != ["cargo", "bench"]:
-        raise AdmissionError("GPU handoff accepts only cargo bench with one explicit target")
+    # `cargo bench` selects a declared bench target; `cargo run` selects a declared
+    # binary and keeps the caller's cwd, as Cargo does when it launches the binary.
+    kind = {"bench": "bench", "run": "bin"}.get(command[1]) if command[:1] == ["cargo"] and len(command) > 1 else None
+    if kind is None:
+        raise AdmissionError("GPU handoff accepts only cargo bench or cargo run with one explicit target")
+    selector = "--bench" if kind == "bench" else "--bin"
     rest = list(command[2:])
     values: dict[str, str] = {}
     locked = False
-    criterion_args: list[str] = []
+    release = False
+    target_args: list[str] = []
     while rest:
         flag = rest.pop(0)
         if flag == "--":
-            criterion_args = _criterion_args(rest)
+            target_args = _criterion_args(rest)
             break
         if flag == "--locked" and not locked:
             locked = True
             continue
-        key = {"-p": "package", "--package": "package", "--bench": "target", "--features": "features"}.get(flag)
+        if flag == "--release" and kind == "bin" and not release:
+            release = True
+            continue
+        key = {"-p": "package", "--package": "package", selector: "target", "--features": "features"}.get(flag)
         if key is None or key in values or not rest:
-            raise AdmissionError(f"unsupported or repeated cargo bench argument {flag!r}")
+            raise AdmissionError(f"unsupported or repeated cargo {command[1]} argument {flag!r}")
         values[key] = rest.pop(0)
     if not locked or values.get("package") != PACKAGE or "target" not in values:
-        raise AdmissionError("require cargo bench --locked -p lattice-inference --bench TARGET")
+        raise AdmissionError(f"require cargo {command[1]} --locked -p lattice-inference {selector} TARGET")
     revision = _revision(repo, "HEAD")
     _clean_revision(repo, revision)
-    home = command_criterion_home(repo, env)
+    # Criterion evidence belongs to bench targets only.
+    home = command_criterion_home(repo, env).resolve() if kind == "bench" else None
     features = values.get("features", "")
     entry = _entry(repo, revision, values["target"], features, entry_id="command", cwd=repo,
-                   criterion_home=home.resolve(), criterion_args=criterion_args, platform=platform)
+                   criterion_home=home, target_args=target_args, platform=platform,
+                   kind=kind, release=release)
     return {
         "version": PROTOCOL, "mode": "command", "repo": str(repo), "entries": [entry],
         "environment": {},
         "command": [sys.executable, str(repo / "scripts/lib/bench_admission.py"), "measure",
                     "--entry", "command", "--revision", revision, "--target", entry["target"],
-                    "--features", features, "--", *criterion_args],
+                    "--features", features, "--kind", kind, *(["--release"] if release else []),
+                    "--", *target_args],
     }
 
 
 def validate_artifact(entry: dict, artifact: dict, cwd: Path) -> Path:
-    """Validate Cargo's selected bench record against the admitted source/configuration."""
+    """Validate Cargo's selected bench or binary record against the admitted source/configuration."""
     target = artifact.get("target", {})
     source = cwd / entry["source_path"]
     if (
         artifact.get("reason") != "compiler-artifact"
         or target.get("name") != entry["target"]
-        or target.get("kind") != ["bench"]
+        or target.get("kind") != [entry["kind"]]
         or not isinstance(target.get("src_path"), str)
         or Path(target["src_path"]).resolve() != source.resolve()
         or sorted(artifact.get("features", [])) != entry["feature_set"]
     ):
-        raise AdmissionError("Cargo artifact does not match admitted bench source/features")
+        raise AdmissionError("Cargo artifact does not match admitted target source/features")
     package_id = artifact.get("package_id", "")
     package_uri = (cwd / "crates/inference").resolve().as_uri()
     expected_id = f"path+{package_uri}#{PACKAGE}@{entry['package_version']}"
@@ -340,6 +396,7 @@ def validate_measurement_request(entry: dict, request: dict) -> Path:
         "entry": entry["id"], "cwd": entry["cwd"], "revision": entry["revision"],
         "run_cwd": entry["run_cwd"],
         "target": entry["target"], "features": entry["features"],
+        "kind": entry["kind"], "release": entry["release"],
         "criterion_home": entry["criterion_home"], "argv": entry["argv"],
     }
     for field, value in expected.items():
@@ -373,19 +430,27 @@ def measure(args: argparse.Namespace) -> int:
     if len(matches) != 1:
         raise AdmissionError("measurement entry is absent from the frozen plan")
     entry = matches[0]
-    criterion_args = args.criterion[1:] if args.criterion[:1] == ["--"] else args.criterion
-    if (str(cwd), args.revision, args.target, args.features, ["--bench", *criterion_args]) != (
-        entry["cwd"], entry["revision"], entry["target"], entry["features"], entry["argv"]
+    target_args = args.criterion[1:] if args.criterion[:1] == ["--"] else args.criterion
+    expected_argv = ["--bench", *target_args] if args.kind == "bench" else list(target_args)
+    if (str(cwd), args.revision, args.target, args.features, expected_argv, args.kind, args.release) != (
+        entry["cwd"], entry["revision"], entry["target"], entry["features"], entry["argv"],
+        entry["kind"], entry["release"],
     ):
         raise AdmissionError("measurement helper arguments differ from the frozen plan")
-    home = Path(os.environ.get("CRITERION_HOME", entry["criterion_home"]))
-    if not home.is_absolute():
-        home = Path(entry["run_cwd"]) / home
-    if home.resolve() != Path(entry["criterion_home"]).resolve():
-        raise AdmissionError("measurement evidence directory differs from the frozen plan")
+    if entry["kind"] == "bench":
+        home = Path(os.environ.get("CRITERION_HOME", entry["criterion_home"]))
+        if not home.is_absolute():
+            home = Path(entry["run_cwd"]) / home
+        if home.resolve() != Path(entry["criterion_home"]).resolve():
+            raise AdmissionError("measurement evidence directory differs from the frozen plan")
     _clean_revision(cwd, entry["revision"])
-    command = ["cargo", "bench", "--locked", "-p", entry["package"], "--bench", entry["target"],
-               "--no-run", "--message-format=json", "--target-dir", entry["target_dir"]]
+    if entry["kind"] == "bench":
+        command = ["cargo", "bench", "--locked", "-p", entry["package"], "--bench", entry["target"],
+                   "--no-run", "--message-format=json", "--target-dir", entry["target_dir"]]
+    else:
+        command = ["cargo", "build", "--locked", *(["--release"] if entry["release"] else []),
+                   "-p", entry["package"], "--bin", entry["target"],
+                   "--message-format=json", "--target-dir", entry["target_dir"]]
     if entry["features"]:
         command.extend(["--features", entry["features"]])
     build = subprocess.run(command, cwd=cwd, env=_cargo_environment(), capture_output=True, text=True)
@@ -401,15 +466,16 @@ def measure(args: argparse.Namespace) -> int:
             raise AdmissionError("Cargo emitted an invalid JSON build record") from exc
         if artifact.get("reason") == "compiler-artifact" and artifact.get("executable"):
             target = artifact.get("target", {})
-            if target.get("name") == entry["target"] and target.get("kind") == ["bench"]:
+            if target.get("name") == entry["target"] and target.get("kind") == [entry["kind"]]:
                 artifacts.append(artifact)
     if len(artifacts) != 1:
-        raise AdmissionError("Cargo did not emit exactly one selected benchmark executable")
+        raise AdmissionError("Cargo did not emit exactly one selected executable")
     executable = validate_artifact(entry, artifacts[0], cwd)
     request = {
         "protocol": PROTOCOL, "token": os.environ.get(BROKER_TOKEN_ENV), "entry": entry["id"],
         "cwd": str(cwd), "run_cwd": entry["run_cwd"],
         "revision": entry["revision"], "target": entry["target"],
+        "kind": entry["kind"], "release": entry["release"],
         "features": entry["features"], "executable": str(executable),
         "criterion_home": entry["criterion_home"], "argv": entry["argv"], "artifact": artifacts[0],
     }
@@ -444,6 +510,8 @@ def main() -> int:
     run.add_argument("--revision", required=True)
     run.add_argument("--target", required=True)
     run.add_argument("--features", required=True)
+    run.add_argument("--kind", choices=("bench", "bin"), default="bench")
+    run.add_argument("--release", action="store_true")
     run.add_argument("criterion", nargs=argparse.REMAINDER)
     try:
         return measure(parser.parse_args())

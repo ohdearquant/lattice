@@ -30,6 +30,14 @@ targets = [
     "mtp_decode",
     "topk_readback",
 ]
+# Binaries launched as built executables under the same handoff. Each takes the
+# GPU lock itself; a binary may do so once per process.
+bins = [
+    "bench_decode_ab",
+    "bench_decode_slopefit",
+    "bench_logit_dump",
+    "eval_perplexity",
+]
 
 [features]
 default = ["std", "download", "serve"]
