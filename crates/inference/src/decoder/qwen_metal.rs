@@ -59,7 +59,7 @@
 //! auto-trait implementation. A compile-time control in the test module pins
 //! that.
 
-use super::driver;
+use super::driver::{self, DriverTrace};
 use super::qwen_cpu::has_finite_logit;
 use super::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
@@ -301,7 +301,6 @@ impl<'state> QwenMetalSession<'state> {
     /// Before any state mutation: the prefix-cache entry's `logprobs` refusal, a
     /// non-dense grammar request as in [`Self::with_route_environment`], and a
     /// `suffix_start` beyond the prompt.
-    #[allow(dead_code)] // no production caller until the prefix-cache entry runs through this session
     pub(crate) fn over_restored_state(
         state: &'state mut MetalQwen35State,
         plan: GenerationPlan,
@@ -634,16 +633,41 @@ impl<F: FnMut() -> bool> Cancellation for FnMutCancellation<'_, F> {
     }
 }
 
-/// Runs one `MetalQwen35State::generate_streaming_with_cancel` request through
-/// [`driver::run`] over `session` and returns that entry's output.
+/// How a request that ended with [`StopReason::Interrupt`] was cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptSource {
+    /// The cancellation poll returned true.
+    Cancel,
+    /// `on_token` refused text; `tail` is set when it refused the natural-end flush.
+    Delivery { tail: bool },
+}
+
+/// What [`stream_through_driver`] reports beyond the entry's output.
+struct StreamRun {
+    output: GenerateOutput,
+    trace: DriverTrace,
+    /// Set exactly when `output.stop_reason` is `Interrupt`.
+    interrupt: Option<InterruptSource>,
+    confirmed_stop_string_match: bool,
+    /// The natural-end flush completed a stop string. Meaningless, and false,
+    /// when the flush did not run.
+    flush_completed_stop_string: bool,
+    /// A sampled or budget-forced token the grammar rejected ended the request,
+    /// as the driver reported it (before the entry's `stopped` adaptation).
+    grammar_rejection: bool,
+    prefill_ran: bool,
+}
+
+/// Runs one streaming request through [`driver::run`] over `session` and
+/// adapts the driver's result to the streaming entries' shared contract.
 ///
 /// `should_cancel` is polled at the driver's three checkpoints: before
 /// prefill, right after it, and at the top of every decode iteration. Text
 /// reaches `on_token` through an incremental detokenizer and the policy's
-/// stop-string matcher, as it did in the entry's own loop.
+/// stop-string matcher, as it did in the entries' own loops.
 ///
-/// Three parts of the entry's contract differ from what the driver reports,
-/// and this function keeps the entry's:
+/// Three parts of the contract differ from what the driver reports, and this
+/// function keeps the entries':
 ///
 /// 1. The text released by the natural-end flush reaches `on_token` with the
 ///    id of the last emitted token; the driver hands the flush the id 0.
@@ -656,9 +680,9 @@ impl<F: FnMut() -> bool> Cancellation for FnMutCancellation<'_, F> {
 ///    read from the trace; the flush completed a stop string exactly when the
 ///    matcher withheld decoded text from `text`.
 /// 3. A grammar that blocks every token before the first one is emitted keeps
-///    the entry's step-0 message.
+///    the entries' step-0 message.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_streaming(
+fn stream_through_driver(
     session: &mut dyn DecoderSession,
     gen_cfg: &GenerateConfig,
     think_close_id: Option<u32>,
@@ -666,14 +690,23 @@ pub(crate) fn run_streaming(
     eos_token_id: u32,
     tokenizer: &BpeTokenizer,
     mut on_token: impl FnMut(&str, u32) -> bool,
-    should_cancel: impl FnMut() -> bool,
-) -> Result<GenerateOutput, InferenceError> {
-    let should_cancel = RefCell::new(should_cancel);
+    mut should_cancel: impl FnMut() -> bool,
+) -> Result<StreamRun, InferenceError> {
+    let cancel_fired = Cell::new(false);
+    let should_cancel = RefCell::new(|| {
+        let cancelled = should_cancel();
+        if cancelled {
+            cancel_fired.set(true);
+        }
+        cancelled
+    });
     let cancel = FnMutCancellation(&should_cancel);
     let detok = RefCell::new(IncrementalDetokenizer::new());
     let last_pushed: Cell<Option<u32>> = Cell::new(None);
     let decoded_len = Cell::new(0usize);
     let flushing_tail = Cell::new(false);
+    let delivery_refused: Cell<Option<bool>> = Cell::new(None);
+    let prefill_ran = Cell::new(false);
     let mut text = String::new();
     let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
@@ -700,9 +733,13 @@ pub(crate) fn run_streaming(
             } else {
                 next_id
             };
-            on_token(delta, id)
+            let accepted = on_token(delta, id);
+            if !accepted {
+                delivery_refused.set(Some(flushing_tail.get()));
+            }
+            accepted
         },
-        || {},
+        || prefill_ran.set(true),
         || {
             flushing_tail.set(true);
             let tail = detok.borrow_mut().finish();
@@ -719,25 +756,175 @@ pub(crate) fn run_streaming(
         other => other?,
     };
 
+    let flush_completed_stop_string = result.stop_reason != StopReason::Interrupt
+        && !result.confirmed_stop_string_match
+        && text.len() < decoded_len.get();
+    let grammar_rejection = result.stop_reason == StopReason::Grammar
+        && result.trace.opened == result.generated_ids.len() + 1;
+    let interrupt = (result.stop_reason == StopReason::Interrupt).then(|| {
+        if cancel_fired.get() {
+            InterruptSource::Cancel
+        } else {
+            InterruptSource::Delivery {
+                tail: delivery_refused.get().unwrap_or(false),
+            }
+        }
+    });
+
     let mut stopped = result.stopped;
     let mut stop_reason = result.stop_reason;
-    if stop_reason == StopReason::Grammar && result.trace.opened == result.generated_ids.len() + 1 {
-        let flush_completed_stop_string = text.len() < decoded_len.get();
+    if grammar_rejection {
         stopped = flush_completed_stop_string;
         if flush_completed_stop_string {
             stop_reason = StopReason::Eos;
         }
     }
 
-    Ok(GenerateOutput {
-        text,
-        prompt_tokens: prompt_ids.len(),
-        generated_tokens: result.generated_ids.len(),
-        token_ids: result.generated_ids,
-        stopped,
-        stop_reason: Some(stop_reason),
-        token_logprobs: result.token_logprobs,
+    Ok(StreamRun {
+        output: GenerateOutput {
+            text,
+            prompt_tokens: prompt_ids.len(),
+            generated_tokens: result.generated_ids.len(),
+            token_ids: result.generated_ids,
+            stopped,
+            stop_reason: Some(stop_reason),
+            token_logprobs: result.token_logprobs,
+        },
+        trace: result.trace,
+        interrupt,
+        confirmed_stop_string_match: result.confirmed_stop_string_match,
+        flush_completed_stop_string,
+        grammar_rejection,
+        prefill_ran: prefill_ran.get(),
     })
+}
+
+/// Runs one `MetalQwen35State::generate_streaming_with_cancel` request through
+/// [`driver::run`] over `session` and returns that entry's output; see
+/// [`stream_through_driver`] for the parts of its contract the driver does not
+/// report.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_streaming(
+    session: &mut dyn DecoderSession,
+    gen_cfg: &GenerateConfig,
+    think_close_id: Option<u32>,
+    prompt_ids: &[u32],
+    eos_token_id: u32,
+    tokenizer: &BpeTokenizer,
+    on_token: impl FnMut(&str, u32) -> bool,
+    should_cancel: impl FnMut() -> bool,
+) -> Result<GenerateOutput, InferenceError> {
+    Ok(stream_through_driver(
+        session,
+        gen_cfg,
+        think_close_id,
+        prompt_ids,
+        eos_token_id,
+        tokenizer,
+        on_token,
+        should_cancel,
+    )?
+    .output)
+}
+
+/// What the cross-turn slot holds after a prefix-cache request, decided by the
+/// path the request ended on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixCommit {
+    /// The slot stays empty: the restore already consumed the warm entry.
+    Leave,
+    /// Save the boundary live state represents. With `silent_step`, first
+    /// forward the last pushed token so the next turn can reuse through it.
+    Save { silent_step: bool },
+}
+
+/// A prefix-cache request's output, the driver trace that proves which route
+/// ran it, and what to do with the cross-turn slot.
+pub(crate) struct PrefixStreamRun {
+    pub(crate) output: GenerateOutput,
+    pub(crate) trace: DriverTrace,
+    /// The suffix prefill ran; false for a cancel before it.
+    pub(crate) prefill_ran: bool,
+    pub(crate) commit: PrefixCommit,
+}
+
+/// Runs one prefix-cache streaming request through [`driver::run`] over a
+/// session built with [`QwenMetalSession::over_restored_state`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_prefix_cache_streaming(
+    session: &mut dyn DecoderSession,
+    gen_cfg: &GenerateConfig,
+    think_close_id: Option<u32>,
+    prompt_ids: &[u32],
+    eos_token_id: u32,
+    tokenizer: &BpeTokenizer,
+    on_token: impl FnMut(&str, u32) -> bool,
+    should_cancel: impl FnMut() -> bool,
+) -> Result<PrefixStreamRun, InferenceError> {
+    let run = stream_through_driver(
+        session,
+        gen_cfg,
+        think_close_id,
+        prompt_ids,
+        eos_token_id,
+        tokenizer,
+        on_token,
+        should_cancel,
+    )?;
+    let commit = prefix_commit(&run);
+    Ok(PrefixStreamRun {
+        output: run.output,
+        trace: run.trace,
+        prefill_ran: run.prefill_ran,
+        commit,
+    })
+}
+
+/// The cross-turn slot rule of the prefix-cache entry, path by path. The
+/// request's exit is read from what the shared stream core recorded, because
+/// the entry's rules separate exits the driver reports alike:
+///
+/// - A cancel before the first token, a first token the caller refused, and a
+///   refused natural-end flush leave the slot empty. A cancel at a decode-loop
+///   top and a refused later token save the forwarded prefix, with no silent
+///   step: the last pushed token was not forwarded.
+/// - A confirmed stop-string match, and a flush that completes one after a
+///   grammar rejection or a length stop, leave the slot empty: the saved
+///   tokens would represent text the caller never received. A flush that
+///   completes one after a stop token leaves the disposition unchanged and
+///   saves.
+/// - A grammar that blocks every token before the first, and is complete,
+///   leaves the slot empty.
+/// - Every other exit saves. The silent step runs only when the last pushed
+///   token was not forwarded and no stop token, completed grammar or grammar
+///   rejection ended the request.
+fn prefix_commit(run: &StreamRun) -> PrefixCommit {
+    let generated = run.output.generated_tokens;
+    let reason = run.output.stop_reason;
+    if reason == Some(StopReason::Interrupt) {
+        return match run.interrupt {
+            Some(InterruptSource::Cancel) if generated == 0 => PrefixCommit::Leave,
+            Some(InterruptSource::Delivery { tail: true }) => PrefixCommit::Leave,
+            Some(InterruptSource::Delivery { tail: false }) if run.trace.consumed == 0 => {
+                PrefixCommit::Leave
+            }
+            _ => PrefixCommit::Save { silent_step: false },
+        };
+    }
+    let flush_flipped_a_length_stop =
+        reason == Some(StopReason::Eos) && run.trace.opened == generated;
+    if run.confirmed_stop_string_match
+        || (run.flush_completed_stop_string
+            && (run.grammar_rejection || flush_flipped_a_length_stop))
+    {
+        return PrefixCommit::Leave;
+    }
+    if reason == Some(StopReason::Grammar) && generated == 0 && run.trace.opened == 0 {
+        return PrefixCommit::Leave;
+    }
+    PrefixCommit::Save {
+        silent_step: generated > 0 && !run.output.stopped && !run.grammar_rejection,
+    }
 }
 
 /// Runs one `MetalQwen35State::generate` request through [`driver::run`] over
@@ -2055,5 +2242,208 @@ mod tests {
             }
             other => panic!("expected the decode-step grammar block, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // `run_prefix_cache_streaming` over a scripted session: the cross-turn
+    // slot rule, one case per exit the prefix-cache entry distinguishes.
+    // -----------------------------------------------------------------
+
+    /// What a prefix-cache request over `script` commits and how it ended.
+    /// `cancel_from` makes the poll return true from that poll on;
+    /// `refuse_from` makes `on_token` refuse from that delivery on.
+    fn prefix_script(
+        script: Vec<u32>,
+        gen_cfg: &GenerateConfig,
+        cancel_from: Option<u32>,
+        refuse_from: Option<u32>,
+    ) -> (PrefixStreamRun, Vec<(String, u32)>) {
+        let mut session = ScriptedSession {
+            caps: PREFIX_CACHE_CAPABILITIES,
+            ledger: PredictionLedger::new(),
+            script,
+            selects: 0,
+        };
+        let tokenizer = scripted_tokenizer();
+        let mut calls = Vec::new();
+        let polls = Cell::new(0u32);
+        let run = run_prefix_cache_streaming(
+            &mut session,
+            gen_cfg,
+            Some(SCRIPTED_THINK_CLOSE),
+            &[0],
+            SCRIPTED_EOS,
+            &tokenizer,
+            |text, id| {
+                calls.push((text.to_string(), id));
+                refuse_from.is_none_or(|n| (calls.len() as u32) < n)
+            },
+            || {
+                polls.set(polls.get() + 1);
+                cancel_from.is_some_and(|n| polls.get() >= n)
+            },
+        )
+        .expect("a scripted prefix-cache request runs");
+        (run, calls)
+    }
+
+    fn capped(max_new_tokens: usize) -> GenerateConfig {
+        GenerateConfig {
+            max_new_tokens,
+            ..Default::default()
+        }
+    }
+
+    /// Ids: 0 reads "a", 1 renders U+FFFD only in the final flush, 2 reads "x"
+    /// and is the budget-forced close id.
+    #[test]
+    fn prefix_commit_saves_the_exits_that_forwarded_their_tokens() {
+        // A length stop: the last pushed token is not forwarded yet.
+        let (run, _) = prefix_script(vec![0, 0], &capped(2), None, None);
+        assert_eq!(run.output.stop_reason, Some(StopReason::Length));
+        assert_eq!(run.commit, PrefixCommit::Save { silent_step: true });
+
+        // A stop token inside the loop: every pushed token was forwarded.
+        let (run, _) = prefix_script(vec![0, SCRIPTED_EOS], &capped(4), None, None);
+        assert_eq!(run.output.token_ids, vec![0]);
+        assert_eq!(run.commit, PrefixCommit::Save { silent_step: false });
+
+        // A stop token on the first sample saves the prompt-only boundary.
+        let (run, _) = prefix_script(vec![SCRIPTED_EOS], &capped(4), None, None);
+        assert!(run.output.token_ids.is_empty());
+        assert_eq!(run.commit, PrefixCommit::Save { silent_step: false });
+
+        // A grammar the first token completes: the token was never forwarded.
+        let completes = GenerateConfig {
+            grammar: Some(scripted_grammar("root ::= \"a\"\n", b"b")),
+            ..capped(4)
+        };
+        let (run, _) = prefix_script(vec![0], &completes, None, None);
+        assert_eq!(run.output.stop_reason, Some(StopReason::Grammar));
+        assert!(run.output.stopped);
+        assert_eq!(run.commit, PrefixCommit::Save { silent_step: false });
+
+        // A budget-forced token the grammar rejects: the loop top forwarded the
+        // last pushed token, so the silent step must not forward it again.
+        let rejects = GenerateConfig {
+            enable_thinking: true,
+            reasoning_budget: Some(1),
+            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
+            ..capped(4)
+        };
+        let (run, _) = prefix_script(vec![1], &rejects, None, None);
+        assert_eq!(run.output.stop_reason, Some(StopReason::Grammar));
+        assert!(!run.output.stopped);
+        assert_eq!(run.commit, PrefixCommit::Save { silent_step: false });
+    }
+
+    #[test]
+    fn prefix_commit_leaves_the_slot_empty_for_the_exits_that_saved_nothing() {
+        // A cancel before prefill and one right after it, with the stats flag.
+        let (run, _) = prefix_script(vec![0, 0], &capped(3), Some(1), None);
+        assert_eq!(run.output.stop_reason, Some(StopReason::Interrupt));
+        assert!(!run.prefill_ran);
+        assert_eq!(run.commit, PrefixCommit::Leave);
+        let (run, _) = prefix_script(vec![0, 0], &capped(3), Some(2), None);
+        assert!(run.prefill_ran);
+        assert_eq!(run.commit, PrefixCommit::Leave);
+
+        // The caller refusing the first token's text.
+        let (run, _) = prefix_script(vec![0, 0], &capped(3), None, Some(1));
+        assert_eq!(run.output.token_ids, vec![0]);
+        assert_eq!(run.commit, PrefixCommit::Leave);
+
+        // The caller refusing the natural-end flush (control: a refusal of the
+        // same text one delivery earlier would not be the tail).
+        let (run, _) = prefix_script(vec![0, 1], &capped(2), None, Some(2));
+        assert_eq!(run.output.stop_reason, Some(StopReason::Interrupt));
+        assert_eq!(run.commit, PrefixCommit::Leave);
+
+        // A stop string the first token completes, and one a later token does.
+        let first = GenerateConfig {
+            stop_strings: vec!["a".into()],
+            ..capped(4)
+        };
+        let (run, _) = prefix_script(vec![0, 0], &first, None, None);
+        assert_eq!(run.commit, PrefixCommit::Leave);
+        let later = GenerateConfig {
+            stop_strings: vec!["x".into()],
+            ..capped(4)
+        };
+        let (run, _) = prefix_script(vec![0, 2], &later, None, None);
+        assert_eq!(run.output.text, "a");
+        assert_eq!(run.commit, PrefixCommit::Leave);
+
+        // A grammar that blocks every token before the first one and is
+        // complete without a continuation.
+        let complete_at_start = GenerateConfig {
+            grammar: Some(scripted_grammar("root ::= \"\"\n", b"b")),
+            ..capped(4)
+        };
+        let (run, _) = prefix_script(vec![0], &complete_at_start, None, None);
+        assert_eq!(run.output.stop_reason, Some(StopReason::Grammar));
+        assert!(run.output.token_ids.is_empty());
+        assert_eq!(run.commit, PrefixCommit::Leave);
+    }
+
+    /// A cancel at a decode-loop top and a refused later token save the
+    /// forwarded prefix, with no silent step.
+    #[test]
+    fn prefix_commit_saves_the_forwarded_prefix_on_a_mid_request_interrupt() {
+        // Polls 1 and 2 bracket prefill, poll 3 is the first loop top.
+        let (run, _) = prefix_script(vec![0, 0, 0], &capped(4), Some(3), None);
+        assert_eq!(run.output.stop_reason, Some(StopReason::Interrupt));
+        assert_eq!(run.output.token_ids.len(), 1);
+        assert_eq!(run.commit, PrefixCommit::Save { silent_step: false });
+
+        // The second delivery refused: the first loop iteration's token.
+        let (run, _) = prefix_script(vec![0, 0, 0], &capped(4), None, Some(2));
+        assert_eq!(run.output.stop_reason, Some(StopReason::Interrupt));
+        assert_eq!(run.output.token_ids.len(), 2);
+        assert_eq!(run.commit, PrefixCommit::Save { silent_step: false });
+    }
+
+    /// The flush can complete a stop string. After a length stop or a grammar
+    /// rejection that leaves the slot empty; after a stop token it does not
+    /// change the exit and the slot is saved, as the entry's own loop did.
+    #[test]
+    fn prefix_commit_reads_a_stop_string_completed_by_the_flush_per_exit() {
+        let flush = |gen_cfg: GenerateConfig| GenerateConfig {
+            stop_strings: vec!["\u{fffd}".into()],
+            ..gen_cfg
+        };
+
+        let (run, _) = prefix_script(vec![0, 1], &flush(capped(2)), None, None);
+        assert_eq!(run.output.stop_reason, Some(StopReason::Eos));
+        assert!(run.output.stopped);
+        assert_eq!(
+            run.commit,
+            PrefixCommit::Leave,
+            "a length stop the flush ends"
+        );
+
+        let rejects = GenerateConfig {
+            enable_thinking: true,
+            reasoning_budget: Some(1),
+            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
+            ..capped(4)
+        };
+        let (run, _) = prefix_script(vec![1], &flush(rejects), None, None);
+        assert_eq!(run.output.stop_reason, Some(StopReason::Eos));
+        assert!(run.output.stopped);
+        assert_eq!(
+            run.commit,
+            PrefixCommit::Leave,
+            "a rejection the flush ends"
+        );
+
+        let (run, _) = prefix_script(vec![1, SCRIPTED_EOS], &flush(capped(4)), None, None);
+        assert_eq!(run.output.stop_reason, Some(StopReason::Eos));
+        assert!(run.output.stopped);
+        assert_eq!(
+            run.commit,
+            PrefixCommit::Save { silent_step: false },
+            "a stop token the flush then follows"
+        );
     }
 }
