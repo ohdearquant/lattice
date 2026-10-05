@@ -18,9 +18,10 @@
 //! the most recent logit readback.
 //!
 //! **Readback mode, fixed at construction.** Which readback a forward pass
-//! produces is decided once, in [`QwenMetalSession::new`], by the same
-//! `plan_sampling_route` the two legacy loops call, plus the direct entry's
-//! greedy zero-copy predicate:
+//! produces is decided once, in [`QwenMetalSession::new`], by
+//! `plan_sampling_route`, which the direct entry also calls to choose between
+//! its speculative routes and this session, plus the direct entry's greedy
+//! zero-copy predicate:
 //!
 //! - [`ReadbackMode::Compact`]: the planner engaged a GPU top-k route; every
 //!   forward pass (prefill included) leaves a candidate shortlist in the
@@ -35,9 +36,8 @@
 //! The mode is never re-planned per step.
 //!
 //! **RNG.** Seeded from `GenerationPlan::rng_state`, the value
-//! `prepare_generation` derives from `GenerateConfig::seed` and the value
-//! both legacy loops destructure, and drawn only inside `select`, with the
-//! legacy per-mode schedule: the prefill-derived token uses
+//! `prepare_generation` derives from `GenerateConfig::seed`, and drawn only
+//! inside `select`, with a per-mode schedule: the prefill-derived token uses
 //! `sample_from_candidates` (compact) or `sample_token` (dense and greedy
 //! argmax), every later token uses `sample_decode_traced` (compact and dense)
 //! or no draw at all (greedy argmax).
@@ -575,9 +575,9 @@ impl DecoderSession for QwenMetalSession<'_> {
 
     /// Scores `final_token` against the live prediction's dense logits, after
     /// any grammar mask `select` applied, with the same
-    /// `compute_step_logprobs` the legacy streaming loop reaches through
-    /// `DecodePolicy`. Only the dense readback has a full distribution to
-    /// score.
+    /// `compute_step_logprobs` the CPU sessions' `metadata` also call; the
+    /// driver reaches it through `DecodePolicy::transition_with_metadata`. Only
+    /// the dense readback has a full distribution to score.
     fn metadata(
         &mut self,
         prediction: PredictionId,
