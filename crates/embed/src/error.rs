@@ -66,6 +66,13 @@ pub enum EmbedError {
     #[error("model not supported: {0}")]
     UnsupportedModel(String),
 
+    /// Operation not implemented by this service.
+    ///
+    /// Returned by the default bodies of trait methods that an implementation has not
+    /// overridden. The message names the service and the operation.
+    #[error("operation not supported: {0}")]
+    Unsupported(String),
+
     /// An attestation report is outside the closed public byte bound.
     #[error("attestation report size {length} bytes is outside {min}..={max}")]
     AttestationReportSize {
@@ -146,6 +153,12 @@ mod tests {
 
         let err = EmbedError::UnsupportedModel("gpt4".into());
         assert!(err.to_string().contains("not supported"));
+
+        let err = EmbedError::Unsupported("probe does not implement count_tokens".into());
+        assert_eq!(
+            err.to_string(),
+            "operation not supported: probe does not implement count_tokens"
+        );
 
         let err = EmbedError::Internal("bug".into());
         assert!(err.to_string().contains("internal"));

@@ -1082,6 +1082,56 @@ fn pooling_covers_the_beginning_and_end_tokens() {
 }
 
 #[test]
+fn token_counts_are_exact_one_under_at_and_one_over_the_limit() {
+    // Every "a" is one token, so a text of n letters is n + 2 tokens with the wrapping pair.
+    let limited = fixture_with_tokenizer()
+        .model
+        .with_max_tokens(Some(5))
+        .expect("limit of 5 is valid");
+    let cases: [(usize, usize, usize); 4] = [(2, 4, 4), (3, 5, 5), (4, 6, 5), (20, 22, 5)];
+    for (letters, before, embedded) in cases {
+        let text = "a".repeat(letters);
+        let (ids, counts) = limited.tokenize_with_counts(&text).expect("tokenizes");
+        assert_eq!(
+            (counts.before_truncation, counts.embedded),
+            (before, embedded),
+            "{letters} letters"
+        );
+        assert_eq!(ids.len(), counts.embedded);
+        assert_eq!(ids, limited.tokenize(&text).unwrap(), "{letters} letters");
+    }
+
+    let fx = fixture_with_tokenizer();
+    let limit = EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS;
+    let at_the_limit = [(limit - 1, limit - 1), (limit, limit), (limit + 1, limit)];
+    for (model_visible, embedded) in at_the_limit {
+        let text = "a".repeat(model_visible - 2);
+        let (ids, counts) = fx.model.tokenize_with_counts(&text).expect("tokenizes");
+        assert_eq!(counts.before_truncation, model_visible);
+        assert_eq!(counts.embedded, embedded);
+        assert_eq!(ids, fx.model.tokenize(&text).unwrap());
+        assert_eq!((ids.first(), ids.last()), (Some(&2), Some(&1)));
+    }
+
+    // No limit: nothing is cut, and both counts agree.
+    let unlimited = fixture_with_tokenizer()
+        .model
+        .with_max_tokens(None)
+        .expect("no limit is valid");
+    let (_, counts) = unlimited
+        .tokenize_with_counts(&"a".repeat(limit + 100))
+        .expect("tokenizes");
+    assert_eq!(counts.before_truncation, limit + 102);
+    assert_eq!(counts.embedded, counts.before_truncation);
+
+    // A model built without a tokenizer reports the same error as `tokenize`.
+    assert!(matches!(
+        fixture().model.tokenize_with_counts("a"),
+        Err(InferenceError::Tokenizer(_))
+    ));
+}
+
+#[test]
 fn the_token_limit_keeps_both_wrapping_tokens_and_cuts_the_text() {
     let text = "a".repeat(20);
     let fx = fixture_with_tokenizer();

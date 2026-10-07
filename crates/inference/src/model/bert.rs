@@ -14,7 +14,7 @@ use crate::forward::cpu::{
 };
 use crate::lora_hook::{LoraHook, NoopLoraHook, apply_lora_rows};
 use crate::pool::{BertPooling, cls_pool, l2_normalize, mean_pool};
-use crate::tokenizer::common::{Tokenizer, load_tokenizer};
+use crate::tokenizer::common::{EmbeddingTokenCounts, Tokenizer, load_tokenizer};
 use crate::weights::{BertWeights, SafetensorsFile, TransformerLayerWeights};
 use std::fs;
 use std::path::Path;
@@ -361,6 +361,19 @@ impl BertModel {
     /// **Unstable**: tokenizer accessor; exposed for testing only, may be removed.
     pub fn tokenizer(&self) -> &dyn Tokenizer {
         self.tokenizer.as_ref()
+    }
+
+    /// **Unstable**: token counts of `text` as `encode` and `encode_batch` consume it.
+    ///
+    /// `before_truncation` is the tokenizer's own pre-truncation length, special tokens
+    /// included, so one tokenization yields both figures. `embedded` is the part of it the
+    /// model keeps: the tokenizer's sequence limit and the position-embedding table both cap it.
+    pub fn embedding_token_counts(&self, text: &str) -> EmbeddingTokenCounts {
+        let input = self.tokenizer.tokenize(text);
+        EmbeddingTokenCounts {
+            before_truncation: input.pre_truncation_len,
+            embedded: input.real_length.min(self.config.max_position_embeddings),
+        }
     }
 
     /// **Stable**: embedding dimensionality; used by `lattice-embed` to size output buffers.

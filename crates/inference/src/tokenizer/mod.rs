@@ -10,7 +10,9 @@ pub mod wordpiece;
 pub use self::wordpiece::*;
 // Re-export key types from other tokenizer modules
 pub use self::bpe::BpeTokenizer;
-pub use self::common::{TokenizedInput, Tokenizer, load_tokenizer, tokenizer_from_json_str};
+pub use self::common::{
+    EmbeddingTokenCounts, TokenizedInput, Tokenizer, load_tokenizer, tokenizer_from_json_str,
+};
 pub use self::gemma_bpe::{
     GEMMA4_AUDIO_FRAME_LENGTH_SAMPLES, GEMMA4_AUDIO_HOP_LENGTH_SAMPLES,
     GEMMA4_AUDIO_MAX_SOFT_TOKENS, GEMMA4_AUDIO_MS_PER_SOFT_TOKEN, GEMMA4_AUDIO_SAMPLING_RATE_HZ,

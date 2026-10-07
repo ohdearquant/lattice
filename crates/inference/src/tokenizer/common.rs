@@ -38,6 +38,20 @@ pub struct TokenizedInput {
     pub pre_truncation_len: usize,
 }
 
+/// **Unstable**: token counts for one embedding input, measured on the sequence the
+/// embedding model consumes.
+///
+/// Special tokens and any end-of-sequence token the model appends are counted. A
+/// model-specific `embedding_token_counts` method fills this in from the tokenizer's
+/// own pre-truncation length, so measuring costs no second tokenization pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingTokenCounts {
+    /// Length of the sequence before any limit was applied.
+    pub before_truncation: usize,
+    /// Length of the sequence the model embeds. Never above `before_truncation`.
+    pub embedded: usize,
+}
+
 /// **Stable**: object-safe tokenizer trait; concrete impls (`WordPieceTokenizer`,
 /// `BpeTokenizer`, `SentencePieceTokenizer`) are boxed behind this.
 pub trait Tokenizer: Send + Sync {

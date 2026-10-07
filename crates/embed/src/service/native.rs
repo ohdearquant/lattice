@@ -3,12 +3,15 @@
 //! Model loading is lazy and cancellation-safe; BERT-family and Qwen models take different
 //! loading and batching paths. See `docs/service.md` for lifecycle and persistence details.
 
-use super::{EmbeddingRole, EmbeddingService, MAX_TEXT_BYTES, ValidatedTextBatch};
+use super::{
+    EmbeddingRole, EmbeddingService, EmbeddingsWithReport, MAX_TEXT_BYTES, TokenCount,
+    ValidatedTextBatch,
+};
 use crate::error::{EmbedError, Result};
 use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
 use lattice_inference::model::embeddinggemma2::EmbeddingGemma2Model;
-use lattice_inference::{BertModel, QwenModel};
+use lattice_inference::{BertModel, EmbeddingTokenCounts, QwenModel};
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
@@ -43,11 +46,83 @@ impl LoadedModel {
         }
     }
 
+    /// Token counts per text, from the tokenizer's own pre-truncation length.
+    fn count_batch(&self, texts: &[&str]) -> std::result::Result<Vec<TokenCount>, String> {
+        match self {
+            LoadedModel::Bert(m) => Ok(texts
+                .iter()
+                .map(|text| token_count(m.embedding_token_counts(text)))
+                .collect()),
+            LoadedModel::Qwen(m) => Ok(texts
+                .iter()
+                .map(|text| token_count(m.embedding_token_counts(text)))
+                .collect()),
+            LoadedModel::EmbeddingGemma2 { model, .. } => texts
+                .iter()
+                .map(|text| {
+                    model
+                        .tokenize_with_counts(text)
+                        .map(|(_, counts)| token_count(counts))
+                        .map_err(|e| e.to_string())
+                })
+                .collect(),
+        }
+    }
+
+    /// Embeddings from the same computation as [`LoadedModel::encode_batch`], plus counts.
+    ///
+    /// EmbeddingGemma 2 tokenizes once and embeds those ids, which is exactly what its
+    /// `encode` does. BERT and Qwen tokenize for the counts and again inside their
+    /// encode entry points, which take text rather than ids.
+    fn encode_batch_with_report(
+        &self,
+        texts: &[&str],
+    ) -> std::result::Result<(Vec<Vec<f32>>, Vec<TokenCount>), String> {
+        match self {
+            LoadedModel::Bert(_) | LoadedModel::Qwen(_) => {
+                let counts = self.count_batch(texts)?;
+                Ok((self.encode_batch(texts)?, counts))
+            }
+            LoadedModel::EmbeddingGemma2 { model, output_dim } => {
+                let mut embeddings = Vec::with_capacity(texts.len());
+                let mut counts = Vec::with_capacity(texts.len());
+                for text in texts {
+                    let (ids, text_counts) = model
+                        .tokenize_with_counts(text)
+                        .map_err(|e| e.to_string())?;
+                    embeddings.push(
+                        model
+                            .encode_ids(&ids, *output_dim)
+                            .map_err(|e| e.to_string())?,
+                    );
+                    counts.push(token_count(text_counts));
+                }
+                Ok((embeddings, counts))
+            }
+        }
+    }
+
     fn cache_size(&self) -> usize {
         match self {
             LoadedModel::Qwen(m) => m.cache_size(),
             _ => 0,
         }
+    }
+}
+
+fn token_count(counts: EmbeddingTokenCounts) -> TokenCount {
+    TokenCount::new(counts.before_truncation, counts.embedded)
+}
+
+/// Borrowed views of the prepared texts: the instruction-prefixed copies when a role added
+/// one, otherwise the caller's own text.
+fn prepared_views<'a>(
+    texts: &'a ValidatedTextBatch<'_>,
+    prefixed: Option<&'a [String]>,
+) -> Vec<&'a str> {
+    match prefixed {
+        Some(prefixed) => prefixed.iter().map(String::as_str).collect(),
+        None => (0..texts.len()).map(|index| texts.get(index)).collect(),
     }
 }
 
@@ -216,6 +291,56 @@ impl NativeEmbeddingService {
         loaded
             .encode_batch(texts)
             .map_err(EmbedError::InferenceFailed)
+    }
+
+    /// The checks `encode_prepared` makes before it touches the model, for the count and
+    /// report paths.
+    fn check_prepared(&self, texts: &[&str], model: EmbeddingModel) -> Result<()> {
+        if model != self.model_config.model {
+            return Err(EmbedError::InvalidInput(format!(
+                "requested model {:?} but this service is loaded with {:?}",
+                model, self.model_config.model
+            )));
+        }
+        super::validate_texts_bounded(
+            texts,
+            MAX_TEXT_BYTES.saturating_add(model.max_instruction_bytes()),
+        )
+    }
+
+    async fn count_prevalidated_with_role(
+        &self,
+        texts: ValidatedTextBatch<'_>,
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<TokenCount>> {
+        let prefixed = role
+            .instruction(model)
+            .map(|prefix| texts.to_owned_with_prefix(Some(prefix)));
+        let views = prepared_views(&texts, prefixed.as_deref());
+        self.check_prepared(&views, model)?;
+        let loaded = self.ensure_model().await?;
+        loaded
+            .count_batch(&views)
+            .map_err(EmbedError::InferenceFailed)
+    }
+
+    async fn report_prevalidated_with_role(
+        &self,
+        texts: ValidatedTextBatch<'_>,
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<EmbeddingsWithReport> {
+        let prefixed = role
+            .instruction(model)
+            .map(|prefix| texts.to_owned_with_prefix(Some(prefix)));
+        let views = prepared_views(&texts, prefixed.as_deref());
+        self.check_prepared(&views, model)?;
+        let loaded = self.ensure_model().await?;
+        let (embeddings, token_counts) = loaded
+            .encode_batch_with_report(&views)
+            .map_err(EmbedError::InferenceFailed)?;
+        Ok(EmbeddingsWithReport::new(embeddings, token_counts))
     }
 
     async fn encode_prevalidated_with_role(
@@ -420,6 +545,26 @@ impl EmbeddingService for NativeEmbeddingService {
         role: EmbeddingRole,
     ) -> Result<Vec<Vec<f32>>> {
         self.encode_prevalidated_with_role(texts, model, role).await
+    }
+
+    async fn count_tokens(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<TokenCount>> {
+        let texts = ValidatedTextBatch::new(texts)?;
+        self.count_prevalidated_with_role(texts, model, role).await
+    }
+
+    async fn embed_with_report(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<EmbeddingsWithReport> {
+        let texts = ValidatedTextBatch::new(texts)?;
+        self.report_prevalidated_with_role(texts, model, role).await
     }
 
     fn model_config(&self, model: EmbeddingModel) -> ModelConfig {

@@ -36,7 +36,10 @@ pub use error::{EmbedError, Result};
 pub use model::{EmbeddingModel, MIN_MRL_OUTPUT_DIM, ModelConfig, ModelProvenance};
 #[allow(deprecated)]
 pub use service::MAX_TEXT_CHARS;
-pub use service::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_TEXT_BYTES};
+pub use service::{
+    DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, EmbeddingsWithReport, MAX_TEXT_BYTES,
+    TokenCount,
+};
 pub use simd::{SimdConfig, simd_config};
 
 #[cfg(feature = "native")]

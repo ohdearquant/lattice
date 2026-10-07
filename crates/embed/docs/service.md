@@ -97,6 +97,62 @@ It applies the same prefix but records `Query` or `Passage` in the cache key. Th
 `embed_query("text")`, `embed_passage("text")`, and `embed("text")` from sharing a cache entry
 solely because their raw input happens to match.
 
+### Token counts and truncation reports
+
+Every model truncates input at a token limit and never rejects it, and a byte budget such as
+`MAX_TEXT_BYTES` does not bound the token count: dense scripts and digits approach one token per
+byte. Two trait methods tell a caller what the model actually saw.
+
+- `count_tokens(texts, model, role)` tokenizes without embedding and returns one `TokenCount` per
+  input, in input order. Use it to chunk text before submitting it.
+- `embed_with_report(texts, model, role)` returns `EmbeddingsWithReport`: the vectors that
+  `embed_with_role` returns for the same request, bit for bit, and the same `TokenCount` per
+  input in `token_counts`.
+
+Both take the role explicitly and share `embed_with_role`'s validation and instruction prefix, so
+the counts describe the sequence that call embeds. `EmbeddingRole::Generic` adds no instruction
+and counts the text `embed` sees.
+
+A `TokenCount` has two fields, measured on the sequence the model consumes. The beginning and end
+tokens a model wraps around a sequence, and any role instruction, are counted.
+
+| Field               | Meaning                                                                      |
+| ------------------- | ---------------------------------------------------------------------------- |
+| `before_truncation` | Length of the sequence had no limit applied                                  |
+| `embedded`          | Length of the sequence the model embedded; never above `before_truncation`   |
+
+`truncated()` is `embedded < before_truncation`, so an input that fills the limit exactly is not
+truncated and one token more is. The limit is the one the loaded model applies and it is not the
+same number for every model: it can differ from `EmbeddingModel::max_input_tokens`, which is a
+conservative figure for chunking. For Qwen3 Embedding the limit applied today is the tokenizer's
+2048 tokens, while `max_input_tokens` reports 8192; that mismatch is tracked in issue #1849. Size
+chunks from `count_tokens`, not from `max_input_tokens`.
+
+Both methods have default bodies that return `EmbedError::Unsupported`, naming the service and the
+operation, so a third-party `EmbeddingService` keeps compiling and gets a typed refusal instead of
+invented numbers. `TokenCount::new` and `EmbeddingsWithReport::new` exist because both structs are
+`#[non_exhaustive]`, which would otherwise stop an implementor outside this crate from returning
+them.
+
+`NativeEmbeddingService` produces the counts from the tokenizers' own pre-truncation length, so
+counting costs one tokenization per text:
+
+| Family                   | `before_truncation`                              | `embedded`                                               |
+| ------------------------ | ------------------------------------------------ | -------------------------------------------------------- |
+| BERT family (BGE, E5, MiniLM) | Tokenizer length with `[CLS]`/`[SEP]` or `<s>`/`</s>` | That length capped by the tokenizer's sequence limit and the model's position table |
+| Qwen3 Embedding          | Tokenizer length, plus the end token when the model has to append it | Length of the sequence the model embeds, capped at the tokenizer's 2048: the end token is appended, or replaces the last token when the limit is full |
+| EmbeddingGemma 2         | Text tokens plus the beginning and end tokens    | Capped at 8192 including both wrapping tokens             |
+
+The count paths load the model, because the tokenizer lives with it. `embed_with_report` on
+EmbeddingGemma 2 tokenizes once and embeds those ids. On the BERT and Qwen paths the model's
+encode entry points take text, so the batch is tokenized for the counts and again inside the encode
+call.
+
+`CachedEmbeddingService` forwards `count_tokens` to the wrapped service. `embed_with_report` takes
+its vectors through the cache exactly as `embed_with_role` does and its counts from the wrapped
+service's `count_tokens`, which tokenizes the batch a second time. Counts are not cached, so an
+all-hit request still reaches the wrapped service for them.
+
 ## Request validation
 
 The cache wrapper validates empty batches, batch size, and text length before any lookup. A direct
@@ -269,6 +325,7 @@ native embedding call.
 | `TextTooLong`            | A text exceeded the service's length check                                          | Chunk or shorten the caller-supplied input                                       |
 | `DimensionMismatch`      | An operation received vectors of different expected and actual dimensions           | Keep model/config/index namespaces consistent                                    |
 | `UnsupportedModel`       | The selected service cannot provide that model                                      | Select a capable service or model                                                |
+| `Unsupported`            | The service does not implement the requested operation (a default trait method)     | Choose a service that implements it, or fall back to the methods it does provide |
 | `AttestationReportSize`  | A caller attestor returned fewer than 1 or more than 4,096 report bytes             | Fix or reconfigure the attestor; do not retry the same output unchanged          |
 | `ResourceBudgetOverflow` | Retained and transient-work pool ceilings cannot be summed in `u64`                 | Reduce one or both explicit resource ceilings                                    |
 | `Internal`               | An invariant failed, such as a missing single-item result                           | Treat as a bug report; do not synthesize a vector                                |
