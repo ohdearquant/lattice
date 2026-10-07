@@ -409,6 +409,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "examples/bench_serve_http.rs",
     "examples/diff_attn_layer23.rs",
     "examples/diff_gdn_layer.rs",
+    "examples/dump_embeddinggemma2.rs",
     "examples/ernie45_trace_dump.rs",
     "examples/load_cross_encoder.rs",
     "src/bin/bench_gemma4_driver_pair.rs",
