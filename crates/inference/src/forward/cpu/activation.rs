@@ -1,49 +1,54 @@
 //! CPU activation and bias helpers, including tanh, GELU, add-bias, and fused add-bias-GELU paths.
 // ===================================================================
-// Fast tanh approximation: odd 9/6 rational, single precision
+// Fast tanh approximation: odd 13/6 rational, single precision
 // ===================================================================
 
 use super::simd::simd_config;
 
-// tanh(x) ~= x * P(s) / Q(s) with s = x * x, where
-//   P(s) = 1 + p1*s + p2*s^2 + p3*s^3 + p4*s^4
-//   Q(s) = 1 + q1*s + q2*s^2 + q3*s^3
-// The coefficients are a minimax fit made for this kernel (no external source), fitted so
-// that the single-precision Horner evaluation below stays within 5e-7 of `tanh` on
-// [-12, 12]. The scalar, NEON and AVX2 paths all evaluate this same formula.
-const TANH_P1: f32 = 1.2722152e-01;
-const TANH_P2: f32 = 2.7064576e-03;
-const TANH_P3: f32 = 7.238811e-06;
-const TANH_P4: f32 = -6.2816117e-09;
-const TANH_Q1: f32 = 4.605535e-01;
-const TANH_Q2: f32 = 2.289296e-02;
-const TANH_Q3: f32 = 1.9804214e-04;
+// Coefficients of the single-precision tanh rational used by Eigen
+// (`generic_fast_tanh_float` in Eigen/src/Core/MathFunctionsImpl.h, MPL-2.0): a
+// degree-13 odd numerator over a degree-6 even denominator, accurate to a couple
+// of ulp on [-9, 9]. The scalar, NEON and AVX2 paths all evaluate this same
+// formula.
+const TANH_ALPHA_1: f32 = 4.8935246e-03;
+const TANH_ALPHA_3: f32 = 6.3726195e-04;
+const TANH_ALPHA_5: f32 = 1.48572235e-05;
+const TANH_ALPHA_7: f32 = 5.1222973e-08;
+const TANH_ALPHA_9: f32 = -8.604672e-11;
+const TANH_ALPHA_11: f32 = 2.000188e-13;
+const TANH_ALPHA_13: f32 = -2.7607684e-16;
+const TANH_BETA_0: f32 = 4.893525e-03;
+const TANH_BETA_2: f32 = 2.2684347e-03;
+const TANH_BETA_4: f32 = 1.1853471e-04;
+const TANH_BETA_6: f32 = 1.1982584e-06;
 
 /// Inputs are clamped to `[-TANH_CLAMP, TANH_CLAMP]` before the rational is evaluated;
-/// beyond it `tanh` is within 2.8e-7 of ±1.
-const TANH_CLAMP: f32 = 7.9;
+/// beyond it `tanh` is within 3e-8 of ±1.
+const TANH_CLAMP: f32 = 9.0;
 
-/// Fast tanh approximation: a 9/6 rational with inputs clamped to [-7.9, 7.9].
+/// Fast tanh approximation: a 13/6 rational with inputs clamped to [-9, 9].
 ///
 /// Max absolute error against `f64::tanh` is below 1e-6 over every finite `f32` input
-/// (measured at 4.8e-7 on a dense sweep of [-12, 12] plus a stride sweep of all finite
+/// (measured at 3.5e-7 on a dense sweep of [-12, 12] plus a stride sweep of all finite
 /// `f32` bit patterns). The result is clamped to [-1, 1]. `NaN` propagates; `±inf` maps
-/// to the value at the clamp point, within 1e-6 of `±1`; `±0` is preserved.
+/// to `±1`; `±0` is preserved.
 #[inline]
 pub fn fast_tanh(x: f32) -> f32 {
     // `f32::clamp` returns NaN for a NaN input.
     let x = x.clamp(-TANH_CLAMP, TANH_CLAMP);
-    let s = x * x;
-    let mut p = TANH_P4;
-    p = s * p + TANH_P3;
-    p = s * p + TANH_P2;
-    p = s * p + TANH_P1;
-    p = s * p + 1.0;
+    let x2 = x * x;
+    let mut p = TANH_ALPHA_13;
+    p = x2 * p + TANH_ALPHA_11;
+    p = x2 * p + TANH_ALPHA_9;
+    p = x2 * p + TANH_ALPHA_7;
+    p = x2 * p + TANH_ALPHA_5;
+    p = x2 * p + TANH_ALPHA_3;
+    p = x2 * p + TANH_ALPHA_1;
     let num = x * p;
-    let mut q = TANH_Q3;
-    q = s * q + TANH_Q2;
-    q = s * q + TANH_Q1;
-    q = s * q + 1.0;
+    let mut q = TANH_BETA_6;
+    q = x2 * q + TANH_BETA_4;
+    q = x2 * q + TANH_BETA_2;
+    q = x2 * q + TANH_BETA_0;
     (num / q).clamp(-1.0, 1.0)
 }
 
@@ -95,7 +100,7 @@ pub fn gelu_scalar(x: &mut [f32]) {
 }
 
 /// SIMD vectorized form of [`fast_tanh`] for 4 NEON lanes (same rational, FMA evaluation).
-/// Clamps the input to [-7.9, 7.9] and the output to [-1, 1]; `NaN` lanes propagate.
+/// Clamps the input to [-9, 9] and the output to [-1, 1]; `NaN` lanes propagate.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
@@ -107,23 +112,25 @@ unsafe fn fast_tanh_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch
         vmaxq_f32(x, vdupq_n_f32(-TANH_CLAMP)),
         vdupq_n_f32(TANH_CLAMP),
     );
-    let s = vmulq_f32(x, x);
-    let one = vdupq_n_f32(1.0);
+    let x2 = vmulq_f32(x, x);
 
-    let mut p = vdupq_n_f32(TANH_P4);
-    p = vfmaq_f32(vdupq_n_f32(TANH_P3), s, p);
-    p = vfmaq_f32(vdupq_n_f32(TANH_P2), s, p);
-    p = vfmaq_f32(vdupq_n_f32(TANH_P1), s, p);
-    p = vfmaq_f32(one, s, p);
+    let mut p = vdupq_n_f32(TANH_ALPHA_13);
+    p = vfmaq_f32(vdupq_n_f32(TANH_ALPHA_11), x2, p);
+    p = vfmaq_f32(vdupq_n_f32(TANH_ALPHA_9), x2, p);
+    p = vfmaq_f32(vdupq_n_f32(TANH_ALPHA_7), x2, p);
+    p = vfmaq_f32(vdupq_n_f32(TANH_ALPHA_5), x2, p);
+    p = vfmaq_f32(vdupq_n_f32(TANH_ALPHA_3), x2, p);
+    p = vfmaq_f32(vdupq_n_f32(TANH_ALPHA_1), x2, p);
     let num = vmulq_f32(x, p);
 
-    let mut q = vdupq_n_f32(TANH_Q3);
-    q = vfmaq_f32(vdupq_n_f32(TANH_Q2), s, q);
-    q = vfmaq_f32(vdupq_n_f32(TANH_Q1), s, q);
-    q = vfmaq_f32(one, s, q);
+    let mut q = vdupq_n_f32(TANH_BETA_6);
+    q = vfmaq_f32(vdupq_n_f32(TANH_BETA_4), x2, q);
+    q = vfmaq_f32(vdupq_n_f32(TANH_BETA_2), x2, q);
+    q = vfmaq_f32(vdupq_n_f32(TANH_BETA_0), x2, q);
 
     let result = vdivq_f32(num, q);
 
+    let one = vdupq_n_f32(1.0);
     let neg_one = vdupq_n_f32(-1.0);
     vminq_f32(vmaxq_f32(result, neg_one), one)
 }
@@ -214,7 +221,7 @@ unsafe fn gelu_neon(x: &mut [f32]) {
 }
 
 /// SIMD vectorized form of [`fast_tanh`] for 8 AVX2 lanes (same rational, FMA evaluation).
-/// Clamps the input to [-7.9, 7.9] and the output to [-1, 1]; `NaN` lanes propagate.
+/// Clamps the input to [-9, 9] and the output to [-1, 1]; `NaN` lanes propagate.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2", enable = "fma")]
@@ -227,23 +234,25 @@ unsafe fn fast_tanh_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m
         _mm256_set1_ps(-TANH_CLAMP),
         _mm256_min_ps(_mm256_set1_ps(TANH_CLAMP), x),
     );
-    let s = _mm256_mul_ps(x, x);
-    let one = _mm256_set1_ps(1.0);
+    let x2 = _mm256_mul_ps(x, x);
 
-    let mut p = _mm256_set1_ps(TANH_P4);
-    p = _mm256_fmadd_ps(s, p, _mm256_set1_ps(TANH_P3));
-    p = _mm256_fmadd_ps(s, p, _mm256_set1_ps(TANH_P2));
-    p = _mm256_fmadd_ps(s, p, _mm256_set1_ps(TANH_P1));
-    p = _mm256_fmadd_ps(s, p, one);
+    let mut p = _mm256_set1_ps(TANH_ALPHA_13);
+    p = _mm256_fmadd_ps(x2, p, _mm256_set1_ps(TANH_ALPHA_11));
+    p = _mm256_fmadd_ps(x2, p, _mm256_set1_ps(TANH_ALPHA_9));
+    p = _mm256_fmadd_ps(x2, p, _mm256_set1_ps(TANH_ALPHA_7));
+    p = _mm256_fmadd_ps(x2, p, _mm256_set1_ps(TANH_ALPHA_5));
+    p = _mm256_fmadd_ps(x2, p, _mm256_set1_ps(TANH_ALPHA_3));
+    p = _mm256_fmadd_ps(x2, p, _mm256_set1_ps(TANH_ALPHA_1));
     let num = _mm256_mul_ps(x, p);
 
-    let mut q = _mm256_set1_ps(TANH_Q3);
-    q = _mm256_fmadd_ps(s, q, _mm256_set1_ps(TANH_Q2));
-    q = _mm256_fmadd_ps(s, q, _mm256_set1_ps(TANH_Q1));
-    q = _mm256_fmadd_ps(s, q, one);
+    let mut q = _mm256_set1_ps(TANH_BETA_6);
+    q = _mm256_fmadd_ps(x2, q, _mm256_set1_ps(TANH_BETA_4));
+    q = _mm256_fmadd_ps(x2, q, _mm256_set1_ps(TANH_BETA_2));
+    q = _mm256_fmadd_ps(x2, q, _mm256_set1_ps(TANH_BETA_0));
 
     let result = _mm256_div_ps(num, q);
 
+    let one = _mm256_set1_ps(1.0);
     let neg_one = _mm256_set1_ps(-1.0);
     _mm256_max_ps(neg_one, _mm256_min_ps(one, result))
 }
@@ -691,10 +700,8 @@ mod fast_tanh_tests {
 
     #[test]
     fn fast_tanh_special_values() {
-        // Infinities land on the clamp point, where the rational is within the 1e-6 bound of ±1.
-        assert!((fast_tanh(f32::INFINITY) - 1.0).abs() <= 1e-6);
-        assert!((fast_tanh(f32::NEG_INFINITY) + 1.0).abs() <= 1e-6);
-        assert_eq!(fast_tanh(f32::INFINITY), fast_tanh(TANH_CLAMP));
+        assert_eq!(fast_tanh(f32::INFINITY), 1.0);
+        assert_eq!(fast_tanh(f32::NEG_INFINITY), -1.0);
         assert!(fast_tanh(f32::NAN).is_nan(), "NaN must propagate");
         let pz = fast_tanh(0.0);
         assert!(pz == 0.0 && pz.is_sign_positive());
@@ -746,7 +753,6 @@ mod fast_tanh_tests {
             -1e10,
             -9.5,
             -9.0,
-            -7.9,
             -3.25,
             -0.5,
             -1e-30,
@@ -754,7 +760,6 @@ mod fast_tanh_tests {
             1e-30,
             0.5,
             3.25,
-            7.9,
             9.0,
             9.5,
             1e10,
