@@ -7,6 +7,9 @@
 use super::*;
 use std::collections::HashMap;
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+mod metal_parity;
+
 const PREFIX: &str = "language_model.";
 
 /// 4 layers (sliding, full, sliding, full), a sliding window of 2 and distinct rope bases so a
