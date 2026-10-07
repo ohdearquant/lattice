@@ -21592,97 +21592,39 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             )
         }
 
-        /// The checkpoint's MTP tensors as `MtpWeights`. The 0.8B checkpoint carries a dense
-        /// MLP in its MTP layer, while `MtpWeights` holds a routed one. A dense MLP is the
-        /// routed layout with one expert, top-1 routing (the router softmax over one expert
-        /// is exactly 1.0) and a shared expert whose down projection is zero, so the gate and
-        /// up rows are stacked into the single expert and the shared expert is zeroed.
-        fn real_loop_head_weights(
+        /// The checkpoint's MTP head through the public loader and config constructor. The 0.8B
+        /// checkpoint carries a dense MLP in its MTP layer, which the loader stores as one
+        /// expert with top-1 routing and a zero-width shared expert.
+        fn real_loop_head(
             dir: &std::path::Path,
             cfg: &Qwen35Config,
-        ) -> crate::speculative::MtpWeights {
-            use crate::speculative::{
-                MtpAttentionWeights, MtpLayerWeights, MtpMoeWeights, MtpWeights,
-            };
-            use crate::weights::{SafetensorsFile, ShardedSafetensors, TensorSource};
+        ) -> (
+            crate::speculative::MtpConfig,
+            crate::speculative::MtpWeights,
+        ) {
+            use crate::speculative::{MtpConfig, MtpWeights};
+            use crate::weights::{SafetensorsFile, ShardedSafetensors};
 
+            let head_cfg = MtpConfig::from_qwen35(cfg, REAL_LOOP_DRAFT_LENGTH)
+                .expect("build the MTP config from the model config");
             let single = dir.join("model.safetensors");
-            let index = dir.join("model.safetensors.index.json");
-            let mut source: Box<dyn TensorSource> = if single.exists() {
-                Box::new(SafetensorsFile::open(&single).expect("open model.safetensors"))
+            let weights = if single.exists() {
+                let mut source = SafetensorsFile::open(&single).expect("open model.safetensors");
+                MtpWeights::load_from_source(&mut source, &head_cfg)
             } else {
-                Box::new(ShardedSafetensors::open_index(&index).expect("open sharded index"))
-            };
-            let hidden = cfg.hidden_size;
-            let inter = cfg.intermediate_size;
-            let q_rows = 2 * cfg.num_attention_heads * cfg.head_dim;
-            let kv_rows = cfg.num_key_value_heads * cfg.head_dim;
-            let o_cols = cfg.num_attention_heads * cfg.head_dim;
-            let mut take = |name: &str, shape: &[usize]| -> Vec<f32> {
-                let (data, got) = source
-                    .get_f32_tensor_owned(name)
-                    .unwrap_or_else(|e| panic!("{name}: {e}"));
-                assert_eq!(got, shape, "{name}: shape");
-                assert!(
-                    data.len() <= 4096 || data.iter().any(|&v| v != 0.0),
-                    "{name}: all zero, so the head would not read the checkpoint"
-                );
-                data
-            };
-            let p = "mtp.layers.0";
-            let mut gate_up = take(&format!("{p}.mlp.gate_proj.weight"), &[inter, hidden]);
-            gate_up.extend(take(&format!("{p}.mlp.up_proj.weight"), &[inter, hidden]));
-            let layer = MtpLayerWeights {
-                input_layernorm: take(&format!("{p}.input_layernorm.weight"), &[hidden]),
-                post_attention_layernorm: take(
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    &[hidden],
-                ),
-                self_attn: MtpAttentionWeights {
-                    q_proj: take(&format!("{p}.self_attn.q_proj.weight"), &[q_rows, hidden]),
-                    k_proj: take(&format!("{p}.self_attn.k_proj.weight"), &[kv_rows, hidden]),
-                    v_proj: take(&format!("{p}.self_attn.v_proj.weight"), &[kv_rows, hidden]),
-                    o_proj: take(&format!("{p}.self_attn.o_proj.weight"), &[hidden, o_cols]),
-                    q_norm: take(&format!("{p}.self_attn.q_norm.weight"), &[cfg.head_dim]),
-                    k_norm: take(&format!("{p}.self_attn.k_norm.weight"), &[cfg.head_dim]),
-                },
-                mlp: MtpMoeWeights {
-                    router_gate: vec![0.0; hidden],
-                    experts_gate_up_proj: gate_up,
-                    experts_down_proj: take(&format!("{p}.mlp.down_proj.weight"), &[hidden, inter]),
-                    shared_gate_proj: vec![0.0; hidden],
-                    shared_up_proj: vec![0.0; hidden],
-                    shared_down_proj: vec![0.0; hidden],
-                    shared_expert_gate: vec![0.0; hidden],
-                },
-            };
-            MtpWeights {
-                fc_weight: take("mtp.fc.weight", &[hidden, 2 * hidden]),
-                layers: vec![layer],
-                norm_weight: take("mtp.norm.weight", &[hidden]),
-                pre_fc_norm_embedding_weight: take("mtp.pre_fc_norm_embedding.weight", &[hidden]),
-                pre_fc_norm_hidden_weight: take("mtp.pre_fc_norm_hidden.weight", &[hidden]),
+                let mut source =
+                    ShardedSafetensors::open_index(&dir.join("model.safetensors.index.json"))
+                        .expect("open sharded index");
+                MtpWeights::load_from_source(&mut source, &head_cfg)
             }
-        }
-
-        fn real_loop_head_config(cfg: &Qwen35Config) -> crate::speculative::MtpConfig {
-            crate::speculative::MtpConfig {
-                draft_length: REAL_LOOP_DRAFT_LENGTH,
-                num_hidden_layers: 1,
-                hidden_size: cfg.hidden_size,
-                vocab_size: cfg.vocab_size,
-                num_attention_heads: cfg.num_attention_heads,
-                num_key_value_heads: cfg.num_key_value_heads,
-                head_dim: cfg.head_dim,
-                rms_norm_eps: cfg.rms_norm_eps,
-                rope_theta: cfg.rope_theta,
-                partial_rotary_factor: cfg.partial_rotary_factor,
-                num_experts: 1,
-                num_experts_per_tok: 1,
-                moe_intermediate_size: cfg.intermediate_size,
-                shared_expert_intermediate_size: 1,
-                use_dedicated_embeddings: false,
-            }
+            .expect("load the MTP head");
+            let mlp = &weights.layers[0].mlp;
+            assert!(
+                mlp.experts_gate_up_proj.iter().any(|&v| v != 0.0)
+                    && mlp.experts_down_proj.iter().any(|&v| v != 0.0),
+                "the MLP tensors are all zero, so the head would not read the checkpoint"
+            );
+            (head_cfg, weights)
         }
 
         struct RealLoopHead<'a> {
@@ -22181,9 +22123,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "final_norm is an identity on this checkpoint (max |gamma| = {max_gamma}), so a \
                  pre-norm hidden state could not be told from a post-norm one"
             );
+            let (head_cfg, head_weights) = real_loop_head(&dir, &cfg);
             let head = RealLoopHead {
-                cfg: real_loop_head_config(&cfg),
-                weights: real_loop_head_weights(&dir, &cfg),
+                cfg: head_cfg,
+                weights: head_weights,
                 embed: weights.logits_weight(),
             };
             let tokenizer = model.tokenizer();
