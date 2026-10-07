@@ -22,7 +22,7 @@ use super::gemma4_ops::{
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, matmul_into};
 use crate::forward::metal_embeddinggemma2::MetalEmbeddingGemma2State;
-use crate::tokenizer::common::Tokenizer;
+use crate::tokenizer::common::{EmbeddingTokenCounts, Tokenizer};
 use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use crate::weights::{SafetensorsFile, TensorSource};
 use std::path::Path;
@@ -109,13 +109,19 @@ impl TextTokenizer {
     /// `[bos] text [eos]`. With `max_tokens = Some(n)` the text is cut so that the whole sequence
     /// is at most `n` tokens, keeping both wrapping tokens.
     fn tokenize(&self, text: &str, max_tokens: Option<usize>) -> Vec<u32> {
+        self.tokenize_counted(text, max_tokens).0
+    }
+
+    /// As [`TextTokenizer::tokenize`], also returning the length the sequence had before
+    /// `max_tokens` was applied. This is the one tokenization body.
+    fn tokenize_counted(&self, text: &str, max_tokens: Option<usize>) -> (Vec<u32>, usize) {
         let encoded = self.inner.tokenize_batch(&[text]).pop();
         let (ids, len) = match &encoded {
             Some(e) => (e.input_ids.as_slice(), e.real_length),
             None => (&[][..], 0),
         };
         let keep = max_tokens.map_or(len, |n| len.min(n.saturating_sub(2)));
-        self.wrap(&ids[..keep])
+        (self.wrap(&ids[..keep]), len + 2)
     }
 
     fn wrap(&self, body: &[u32]) -> Vec<u32> {
@@ -491,6 +497,27 @@ impl EmbeddingGemma2Model {
             InferenceError::Tokenizer("this model was built without a tokenizer".to_string())
         })?;
         Ok(tokenizer.tokenize(text, self.max_tokens))
+    }
+
+    /// As [`EmbeddingGemma2Model::tokenize`], also reporting the sequence length before and
+    /// after the limit. Both counts include the beginning and end tokens, and one tokenization
+    /// yields the ids and both figures.
+    pub fn tokenize_with_counts(
+        &self,
+        text: &str,
+    ) -> Result<(Vec<u32>, EmbeddingTokenCounts), InferenceError> {
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            InferenceError::Tokenizer("this model was built without a tokenizer".to_string())
+        })?;
+        let (ids, before_truncation) = tokenizer.tokenize_counted(text, self.max_tokens);
+        let embedded = ids.len();
+        Ok((
+            ids,
+            EmbeddingTokenCounts {
+                before_truncation,
+                embedded,
+            },
+        ))
     }
 
     /// Embedding of `text`, L2-normalized, truncated to `output_dim` leading dimensions when set

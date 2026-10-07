@@ -223,6 +223,9 @@ pub use crate::pool::BertPooling;
 pub use crate::stop_reason::StopReason;
 /// Byte-level BPE tokenizer used by Qwen-family models. See [`Tokenizer`] and [`TokenizedInput`].
 pub use crate::tokenizer::BpeTokenizer;
+/// Token counts of one embedding input before and after the model's length limit. See
+/// [`BertModel::embedding_token_counts`] and [`QwenModel::embedding_token_counts`].
+pub use crate::tokenizer::EmbeddingTokenCounts;
 /// Additive Gemma-family BPE tokenizer (literal-space `Split` + `▁` metaspace normalizer),
 /// explicitly selected — never reached via [`load_tokenizer`]'s model-type sniffing. See
 /// [`Tokenizer`] and ADR-082 G17.

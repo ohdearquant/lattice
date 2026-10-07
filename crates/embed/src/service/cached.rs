@@ -3,7 +3,9 @@
 //! It preserves caller order across partial cache hits and uses role-aware keys for asymmetric
 //! retrieval. See `docs/service.md` for the lookup and fill algorithm.
 
-use super::{EmbeddingRole, EmbeddingService, ValidatedTextBatch};
+use super::{
+    EmbeddingRole, EmbeddingService, EmbeddingsWithReport, TokenCount, ValidatedTextBatch,
+};
 use crate::error::Result;
 use crate::model::EmbeddingModel;
 use async_trait::async_trait;
@@ -84,6 +86,37 @@ impl<S: EmbeddingService + 'static> EmbeddingService for CachedEmbeddingService<
         role: EmbeddingRole,
     ) -> Result<Vec<Vec<f32>>> {
         self.cache_and_embed(texts, model, role).await
+    }
+
+    /// Forwarded to the wrapped service: token counts do not depend on the vector cache.
+    async fn count_tokens(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<TokenCount>> {
+        self.inner.count_tokens(texts, model, role).await
+    }
+
+    /// Vectors come through the cache exactly as in `embed_with_role`; counts come from the
+    /// wrapped service's `count_tokens`, which tokenizes the batch again. Counts are not
+    /// cached, so even an all-hit request reaches the wrapped service for them.
+    async fn embed_with_report(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<EmbeddingsWithReport> {
+        let token_counts = self.inner.count_tokens(texts, model, role).await?;
+        let embeddings = self.embed_with_role(texts, model, role).await?;
+        if token_counts.len() != embeddings.len() {
+            return Err(crate::error::EmbedError::InferenceFailed(format!(
+                "embedding service returned {} token counts for {} inputs",
+                token_counts.len(),
+                embeddings.len()
+            )));
+        }
+        Ok(EmbeddingsWithReport::new(embeddings, token_counts))
     }
 
     fn supports_model(&self, model: EmbeddingModel) -> bool {
@@ -285,6 +318,175 @@ mod tests {
         fn name(&self) -> &'static str {
             "borrow-probe"
         }
+    }
+
+    /// Stands in for a native service: every byte of the prepared text is one token and the
+    /// model keeps the first `COUNT_PROBE_LIMIT`.
+    const COUNT_PROBE_LIMIT: usize = 8;
+
+    #[derive(Default)]
+    struct CountProbe {
+        embed_calls: AtomicUsize,
+        count_calls: AtomicUsize,
+        drop_a_count: bool,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for CountProbe {
+        async fn embed(&self, texts: &[String], _model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
+            self.embed_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(texts.iter().map(|text| vec![text.len() as f32]).collect())
+        }
+
+        async fn embed_with_role_prevalidated(
+            &self,
+            texts: ValidatedTextBatch<'_>,
+            model: EmbeddingModel,
+            role: EmbeddingRole,
+        ) -> Result<Vec<Vec<f32>>> {
+            self.embed_calls.fetch_add(1, Ordering::Relaxed);
+            let prepared = texts.to_owned_with_prefix(role.instruction(model));
+            Ok(prepared
+                .iter()
+                .map(|text| vec![text.len() as f32])
+                .collect())
+        }
+
+        async fn count_tokens(
+            &self,
+            texts: &[String],
+            model: EmbeddingModel,
+            role: EmbeddingRole,
+        ) -> Result<Vec<crate::service::TokenCount>> {
+            self.count_calls.fetch_add(1, Ordering::Relaxed);
+            let prefix = role.instruction(model).unwrap_or("");
+            let mut counts: Vec<_> = texts
+                .iter()
+                .map(|text| {
+                    let visible = prefix.len() + text.len();
+                    crate::service::TokenCount::new(visible, visible.min(COUNT_PROBE_LIMIT))
+                })
+                .collect();
+            if self.drop_a_count {
+                counts.pop();
+            }
+            Ok(counts)
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "count-probe"
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn count_tokens_forwards_to_the_wrapped_service_and_counts_the_role_instruction() {
+        let inner = Arc::new(CountProbe::default());
+        let service = CachedEmbeddingService::new(inner.clone(), 16);
+        let model = EmbeddingModel::MultilingualE5Small;
+        let texts = vec!["ab".to_string(), "abcdefghij".to_string()];
+
+        let generic = service
+            .count_tokens(&texts, model, EmbeddingRole::Generic)
+            .await
+            .expect("the cached wrapper must not fall through to the default error");
+        assert_eq!(
+            generic,
+            vec![
+                crate::service::TokenCount::new(2, 2),
+                crate::service::TokenCount::new(10, 8)
+            ]
+        );
+        assert!(!generic[0].truncated() && generic[1].truncated());
+
+        let query = service
+            .count_tokens(&texts, model, EmbeddingRole::Query)
+            .await
+            .expect("count_tokens");
+        let prefix = "query: ".len();
+        assert_eq!(query[0].before_truncation, 2 + prefix);
+        assert_eq!(query[0].embedded, COUNT_PROBE_LIMIT);
+        assert_eq!(inner.count_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(inner.embed_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn embed_with_report_matches_embed_with_role_and_keeps_the_vector_cache() {
+        let inner = Arc::new(CountProbe::default());
+        let service = CachedEmbeddingService::new(inner.clone(), 16);
+        let model = EmbeddingModel::MultilingualE5Small;
+        let texts = vec!["ab".to_string(), "abcdefghij".to_string()];
+
+        let report = service
+            .embed_with_report(&texts, model, EmbeddingRole::Query)
+            .await
+            .expect("embed_with_report");
+        let plain = service
+            .embed_with_role(&texts, model, EmbeddingRole::Query)
+            .await
+            .expect("embed_with_role");
+        assert_eq!(report.embeddings, plain);
+        assert_eq!(report.token_counts.len(), texts.len());
+        assert_eq!(
+            report.token_counts[1].before_truncation,
+            10 + "query: ".len()
+        );
+        assert!(report.token_counts[1].truncated());
+        // Vectors were computed once and the second call was served from the cache; the
+        // counts are not cached, so the wrapped service was asked for them each time it was.
+        assert_eq!(inner.embed_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.count_calls.load(Ordering::Relaxed), 1);
+
+        let again = service
+            .embed_with_report(&texts, model, EmbeddingRole::Query)
+            .await
+            .expect("embed_with_report again");
+        assert_eq!(again.embeddings, plain);
+        assert_eq!(again.token_counts, report.token_counts);
+        assert_eq!(inner.embed_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.count_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn embed_with_report_rejects_a_count_per_input_mismatch() {
+        let inner = Arc::new(CountProbe {
+            drop_a_count: true,
+            ..CountProbe::default()
+        });
+        let service = CachedEmbeddingService::new(inner, 16);
+        let texts = vec!["ab".to_string(), "cd".to_string()];
+        let err = service
+            .embed_with_report(
+                &texts,
+                EmbeddingModel::BgeSmallEnV15,
+                EmbeddingRole::Generic,
+            )
+            .await
+            .expect_err("a short count list must not be returned as a report");
+        assert!(matches!(err, EmbedError::InferenceFailed(_)), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_methods_over_a_service_without_overrides_stay_unsupported() {
+        let service = CachedEmbeddingService::new(Arc::new(ProbeService::default()), 16);
+        let texts = vec!["ab".to_string()];
+        let model = EmbeddingModel::BgeSmallEnV15;
+        let err = service
+            .count_tokens(&texts, model, EmbeddingRole::Generic)
+            .await
+            .expect_err("the wrapped service has no counts to forward");
+        assert!(
+            matches!(&err, EmbedError::Unsupported(m) if m.contains("cache-probe")),
+            "got: {err}"
+        );
+        let err = service
+            .embed_with_report(&texts, model, EmbeddingRole::Generic)
+            .await
+            .expect_err("no counts, no report");
+        assert!(matches!(err, EmbedError::Unsupported(_)), "got: {err}");
     }
 
     #[tokio::test(flavor = "current_thread")]

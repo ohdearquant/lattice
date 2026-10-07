@@ -147,6 +147,68 @@ pub(crate) fn validate_texts_bounded<T: AsRef<str>>(texts: &[T], max_bytes: usiz
     Ok(())
 }
 
+/// **Stable**: token counts for one input text, measured on the sequence the model sees.
+///
+/// Special tokens and any role instruction are counted, because they occupy the model's
+/// window. `before_truncation` is the length the sequence would have without a limit and
+/// `embedded` is the length the model actually consumed, so `embedded` never exceeds it.
+/// The limit is the one the loaded model applies, which can differ from
+/// [`EmbeddingModel::max_input_tokens`].
+///
+/// See [`docs/service.md`](../../docs/service.md#token-counts-and-truncation-reports) for how
+/// each native model family produces the counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TokenCount {
+    /// Sequence length before any length limit was applied.
+    pub before_truncation: usize,
+    /// Sequence length the model embedded. At most `before_truncation`.
+    pub embedded: usize,
+}
+
+impl TokenCount {
+    /// **Stable**: builds a count for implementations of
+    /// [`EmbeddingService::count_tokens`] and [`EmbeddingService::embed_with_report`].
+    ///
+    /// `embedded` must not exceed `before_truncation`.
+    #[inline]
+    pub const fn new(before_truncation: usize, embedded: usize) -> Self {
+        Self {
+            before_truncation,
+            embedded,
+        }
+    }
+
+    /// **Stable**: whether the model embedded only a prefix of the input.
+    #[inline]
+    pub const fn truncated(&self) -> bool {
+        self.embedded < self.before_truncation
+    }
+}
+
+/// **Stable**: embeddings returned together with a per-input token report.
+///
+/// See [`EmbeddingService::embed_with_report`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct EmbeddingsWithReport {
+    /// One embedding per input, in input order. Identical to what
+    /// [`EmbeddingService::embed_with_role`] returns for the same request.
+    pub embeddings: Vec<Vec<f32>>,
+    /// One token count per input, in input order, same length as `embeddings`.
+    pub token_counts: Vec<TokenCount>,
+}
+
+impl EmbeddingsWithReport {
+    /// **Stable**: pairs embeddings with their token counts, one count per embedding.
+    pub fn new(embeddings: Vec<Vec<f32>>, token_counts: Vec<TokenCount>) -> Self {
+        Self {
+            embeddings,
+            token_counts,
+        }
+    }
+}
+
 enum ValidatedTextBatchInner<'a> {
     Contiguous(&'a [String]),
     Borrowed(&'a [&'a str]),
@@ -291,6 +353,49 @@ pub trait EmbeddingService: Send + Sync {
         }
         let owned = texts.to_owned_with_prefix(None);
         self.embed_with_role(&owned, model, role).await
+    }
+
+    /// **Stable**: count the tokens each text occupies in `model`, without embedding it.
+    ///
+    /// Validation and the role instruction match [`EmbeddingService::embed_with_role`], so
+    /// the counts describe the sequence that call would embed. [`EmbeddingRole::Generic`]
+    /// adds no instruction and counts the same text [`EmbeddingService::embed`] sees. Use it
+    /// to chunk text before submitting it. The default returns [`EmbedError::Unsupported`].
+    ///
+    /// See [`docs/service.md`](../../docs/service.md#token-counts-and-truncation-reports) for the count definition.
+    async fn count_tokens(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<TokenCount>> {
+        let _ = (texts, model, role);
+        Err(EmbedError::Unsupported(format!(
+            "{} does not implement count_tokens",
+            self.name()
+        )))
+    }
+
+    /// **Stable**: embed texts under a retrieval role and report, per input, how many tokens
+    /// the model saw.
+    ///
+    /// The embeddings are identical to those of [`EmbeddingService::embed_with_role`] for the
+    /// same request. A caller that bounds input by bytes can read
+    /// [`TokenCount::truncated`] to learn that only a prefix was embedded. The default
+    /// returns [`EmbedError::Unsupported`].
+    ///
+    /// See [`docs/service.md`](../../docs/service.md#token-counts-and-truncation-reports) for the count definition.
+    async fn embed_with_report(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<EmbeddingsWithReport> {
+        let _ = (texts, model, role);
+        Err(EmbedError::Unsupported(format!(
+            "{} does not implement embed_with_report",
+            self.name()
+        )))
     }
 
     /// **Stable**: embed query texts after applying the model's query instruction.

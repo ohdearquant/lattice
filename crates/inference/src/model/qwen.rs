@@ -10,7 +10,7 @@ use crate::forward::cpu::{elementwise_mul, matmul_bt, rms_norm, silu_inplace};
 use crate::forward::metal::MetalForwardPass;
 use crate::pool::{l2_normalize, last_token_pool};
 use crate::rope::RopeTable;
-use crate::tokenizer::common::{Tokenizer, load_tokenizer};
+use crate::tokenizer::common::{EmbeddingTokenCounts, TokenizedInput, Tokenizer, load_tokenizer};
 use crate::weights::{QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -674,6 +674,39 @@ fn causal_softmax_row(row: &mut [f32], qi: usize, scale: f32) {
     crate::attention::softmax_row::finalize_row(row, sum);
 }
 
+/// The id sequence `QwenModel` embeds for one tokenizer result, with its token counts.
+///
+/// A tokenizer that already ended the sequence with `eos` is used as is; otherwise the model
+/// appends `eos`, or overwrites the last token with it when the sequence already fills
+/// `max_len`. `embedded` is the length of the ids built here, and `before_truncation` is the
+/// tokenizer's pre-truncation length plus the end token when the model had to supply it.
+fn embedding_sequence(
+    input: &TokenizedInput,
+    max_len: usize,
+    eos: u32,
+) -> (Vec<u32>, EmbeddingTokenCounts) {
+    let mut ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
+
+    // Only append EOS if the tokenizer has not already done so. Qwen3's
+    // tokenizer.json post_processor (TemplateProcessing) appends <|endoftext|>
+    // automatically; a second append would pool from a spurious extra EOS
+    // token instead of the real last-content token, causing embedding divergence.
+    let tokenizer_ended = ids.last() == Some(&eos);
+    if !tokenizer_ended {
+        if ids.len() < max_len {
+            ids.push(eos);
+        } else if let Some(last) = ids.last_mut() {
+            *last = eos;
+        }
+    }
+
+    let counts = EmbeddingTokenCounts {
+        before_truncation: input.pre_truncation_len + usize::from(!tokenizer_ended),
+        embedded: ids.len(),
+    };
+    (ids, counts)
+}
+
 fn effective_context_len(
     config: &QwenConfig,
     inference_config: &ModelInferenceConfig,
@@ -955,21 +988,11 @@ impl QwenModel {
 
     fn tokenize_for_embedding(&self, text: &str) -> Result<(Vec<u32>, usize), InferenceError> {
         let input = self.tokenizer.tokenize(text);
-        let max_len = self.tokenizer.max_seq_len();
-        let mut ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-
-        let eos = self.inference_config.eos_token_id;
-        // Only append EOS if the tokenizer has not already done so. Qwen3's
-        // tokenizer.json post_processor (TemplateProcessing) appends <|endoftext|>
-        // automatically; a second append would pool from a spurious extra EOS
-        // token instead of the real last-content token, causing embedding divergence.
-        if ids.last() != Some(&eos) {
-            if ids.len() < max_len {
-                ids.push(eos);
-            } else if let Some(last) = ids.last_mut() {
-                *last = eos;
-            }
-        }
+        let (ids, _) = embedding_sequence(
+            &input,
+            self.tokenizer.max_seq_len(),
+            self.inference_config.eos_token_id,
+        );
 
         let seq_len = ids.len();
         let rope_capacity = self.rope.max_positions();
@@ -979,6 +1002,21 @@ impl QwenModel {
             )));
         }
         Ok((ids, seq_len))
+    }
+
+    /// **Unstable**: token counts of `text` as `encode` and `encode_batch` consume it.
+    ///
+    /// `before_truncation` comes from the tokenizer's own pre-truncation length, so one
+    /// tokenization yields both figures. Both count the end-of-sequence token every
+    /// embedded sequence carries, whether the tokenizer appends it or the model does.
+    /// The limit is the tokenizer's sequence limit.
+    pub fn embedding_token_counts(&self, text: &str) -> EmbeddingTokenCounts {
+        embedding_sequence(
+            &self.tokenizer.tokenize(text),
+            self.tokenizer.max_seq_len(),
+            self.inference_config.eos_token_id,
+        )
+        .1
     }
 
     /// Encode a single text into an embedding vector.
@@ -2557,6 +2595,108 @@ mod tests {
             "embed dim={}, norm={norm:.4}, cosine_sim={dot:.4}",
             embedding.len()
         );
+    }
+
+    /// The sequence `tokenize_for_embedding` builds from one tokenizer result and its counts,
+    /// restated independently of `embedding_sequence` with one explicit branch per case.
+    fn reference_sequence(
+        real: &[u32],
+        pre_truncation_len: usize,
+        max_len: usize,
+        eos: u32,
+    ) -> (Vec<u32>, EmbeddingTokenCounts) {
+        let (ids, before_truncation) = if real.last() == Some(&eos) {
+            (real.to_vec(), pre_truncation_len)
+        } else if real.len() < max_len {
+            let mut ids = real.to_vec();
+            ids.push(eos);
+            (ids, pre_truncation_len + 1)
+        } else {
+            let mut ids = real[..real.len().saturating_sub(1)].to_vec();
+            ids.push(eos);
+            (ids, pre_truncation_len + 1)
+        };
+        let embedded = ids.len();
+        (
+            ids,
+            EmbeddingTokenCounts {
+                before_truncation,
+                embedded,
+            },
+        )
+    }
+
+    fn tokenized(ids: &[u32], pre_truncation_len: usize) -> TokenizedInput {
+        TokenizedInput {
+            input_ids: ids.to_vec(),
+            attention_mask: vec![1; ids.len()],
+            token_type_ids: vec![0; ids.len()],
+            real_length: ids.len(),
+            pre_truncation_len,
+        }
+    }
+
+    #[test]
+    fn embedding_sequence_builds_the_ids_and_counts_for_both_end_token_sources() {
+        const EOS: u32 = 99;
+        let counts = |before_truncation, embedded| EmbeddingTokenCounts {
+            before_truncation,
+            embedded,
+        };
+        // The tokenizer ends the sequence itself: nothing is added, and a cut that kept the
+        // end token reports the full pre-truncation length.
+        assert_eq!(
+            embedding_sequence(&tokenized(&[1, 2, 3, EOS], 4), 8, EOS),
+            (vec![1, 2, 3, EOS], counts(4, 4))
+        );
+        assert_eq!(
+            embedding_sequence(&tokenized(&[1, 2, 3, EOS], 9), 4, EOS),
+            (vec![1, 2, 3, EOS], counts(9, 4))
+        );
+        // The model appends the end token when there is room.
+        assert_eq!(
+            embedding_sequence(&tokenized(&[1, 2, 3], 3), 8, EOS),
+            (vec![1, 2, 3, EOS], counts(4, 4))
+        );
+        // At the limit the end token overwrites the last token, which counts as lost context.
+        assert_eq!(
+            embedding_sequence(&tokenized(&[1, 2, 3, 4], 4), 4, EOS),
+            (vec![1, 2, 3, EOS], counts(5, 4))
+        );
+        assert_eq!(
+            embedding_sequence(&tokenized(&[1, 2, 3, 4], 10), 4, EOS),
+            (vec![1, 2, 3, EOS], counts(11, 4))
+        );
+    }
+
+    #[test]
+    fn embedding_sequence_matches_an_independent_restatement_of_the_rule() {
+        const EOS: u32 = 99;
+        for max_len in [1usize, 2, 5, 16] {
+            for real_len in 0..=max_len {
+                for ends_with_eos in [false, true] {
+                    if ends_with_eos && real_len == 0 {
+                        continue;
+                    }
+                    let mut real: Vec<u32> = (1..=real_len as u32).collect();
+                    if ends_with_eos && let Some(last) = real.last_mut() {
+                        *last = EOS;
+                    }
+                    for extra_cut in [0usize, 3] {
+                        let pre_truncation_len = real_len + extra_cut;
+                        let (ids, counts) =
+                            embedding_sequence(&tokenized(&real, pre_truncation_len), max_len, EOS);
+                        assert_eq!(
+                            (ids.clone(), counts),
+                            reference_sequence(&real, pre_truncation_len, max_len, EOS),
+                            "max_len={max_len} real_len={real_len} eos={ends_with_eos} cut={extra_cut}"
+                        );
+                        assert_eq!(counts.embedded, ids.len());
+                        assert!(counts.embedded <= counts.before_truncation);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

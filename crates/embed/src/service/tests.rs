@@ -19,6 +19,77 @@ fn test_max_text_chars_deprecated_alias_matches() {
     assert_eq!(MAX_TEXT_CHARS, MAX_TEXT_BYTES);
 }
 
+/// An implementor that overrides only the required methods.
+struct PlainService;
+
+#[async_trait]
+impl EmbeddingService for PlainService {
+    async fn embed(&self, texts: &[String], _model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![0.0]).collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "plain-probe"
+    }
+}
+
+#[tokio::test]
+async fn test_default_token_methods_return_unsupported_naming_service_and_operation() {
+    let service = PlainService;
+    let texts = vec!["hello".to_string()];
+    let model = EmbeddingModel::BgeSmallEnV15;
+
+    let err = service
+        .count_tokens(&texts, model, EmbeddingRole::Generic)
+        .await
+        .expect_err("a service without an override must not invent counts");
+    assert!(matches!(err, EmbedError::Unsupported(_)), "got: {err}");
+    assert_eq!(
+        err.to_string(),
+        "operation not supported: plain-probe does not implement count_tokens"
+    );
+
+    let err = service
+        .embed_with_report(&texts, model, EmbeddingRole::Query)
+        .await
+        .expect_err("a service without an override must not invent a report");
+    assert!(matches!(err, EmbedError::Unsupported(_)), "got: {err}");
+    assert_eq!(
+        err.to_string(),
+        "operation not supported: plain-probe does not implement embed_with_report"
+    );
+
+    // The existing methods are untouched by the new defaults.
+    assert_eq!(
+        service
+            .embed_with_role(&texts, model, EmbeddingRole::Query)
+            .await
+            .expect("embed_with_role still works"),
+        vec![vec![0.0]]
+    );
+}
+
+#[test]
+fn test_token_count_truncated_is_strict_at_the_boundary() {
+    assert!(!TokenCount::new(511, 511).truncated());
+    assert!(!TokenCount::new(512, 512).truncated());
+    assert!(TokenCount::new(513, 512).truncated());
+    assert!(TokenCount::new(8193, 8192).truncated());
+}
+
+#[test]
+fn test_token_count_and_report_expose_their_fields() {
+    let count = TokenCount::new(7, 5);
+    assert_eq!((count.before_truncation, count.embedded), (7, 5));
+    let report = EmbeddingsWithReport::new(vec![vec![1.0, 2.0]], vec![count]);
+    assert_eq!(report.embeddings, vec![vec![1.0, 2.0]]);
+    assert_eq!(report.token_counts, vec![count]);
+}
+
 #[cfg(feature = "native")]
 mod native_tests {
     use super::*;
@@ -337,6 +408,63 @@ mod native_tests {
                 !matches!(e, crate::error::EmbedError::TextTooLong { .. }),
                 "caller text at exactly the cap must not be rejected for length: {e}"
             );
+        }
+    }
+
+    /// The count and report paths reject a request exactly as `embed_with_role` does, before
+    /// any model is loaded: same empty-batch, length and wrong-model errors.
+    #[tokio::test]
+    async fn test_token_report_paths_validate_like_embed_with_role() {
+        let service = NativeEmbeddingService::default();
+        let model = EmbeddingModel::BgeSmallEnV15;
+        let empty: Vec<String> = Vec::new();
+        let too_long = vec!["a".repeat(MAX_TEXT_BYTES + 1)];
+        let fine = vec!["hello".to_string()];
+        let cases = [
+            (&empty, model),
+            (&too_long, model),
+            (&fine, EmbeddingModel::BgeBaseEnV15),
+        ];
+        for (texts, requested) in cases {
+            for role in [EmbeddingRole::Generic, EmbeddingRole::Query] {
+                let expected = service
+                    .embed_with_role(texts, requested, role)
+                    .await
+                    .expect_err("the request is invalid")
+                    .to_string();
+                let counted = service
+                    .count_tokens(texts, requested, role)
+                    .await
+                    .expect_err("count_tokens must reject the same request");
+                let reported = service
+                    .embed_with_report(texts, requested, role)
+                    .await
+                    .expect_err("embed_with_report must reject the same request");
+                assert_eq!(counted.to_string(), expected);
+                assert_eq!(reported.to_string(), expected);
+            }
+        }
+    }
+
+    /// The published cap covers caller text, so text exactly at the cap must clear
+    /// validation on the count and report paths even though the instruction lengthens it.
+    #[tokio::test]
+    async fn test_token_report_paths_validate_caller_text_not_prepared_text() {
+        let model = EmbeddingModel::BgeSmallEnV15;
+        assert!(model.max_instruction_bytes() > 0);
+        let texts = vec!["a".repeat(MAX_TEXT_BYTES)];
+        let service = NativeEmbeddingService::default();
+        if let Err(e) = service
+            .count_tokens(&texts, model, EmbeddingRole::Query)
+            .await
+        {
+            assert!(!matches!(e, EmbedError::TextTooLong { .. }), "got: {e}");
+        }
+        if let Err(e) = service
+            .embed_with_report(&texts, model, EmbeddingRole::Query)
+            .await
+        {
+            assert!(!matches!(e, EmbedError::TextTooLong { .. }), "got: {e}");
         }
     }
 }
