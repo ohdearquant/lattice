@@ -56,11 +56,22 @@ index, or constructing an embedding cache key.
 | `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` |               384 |                               128 | Local     | Mean                |
 | `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   |             1,024 |                             8,192 | Local     | Not a BERT path     |
 | `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     |             2,560 |                             8,192 | Local     | Not a BERT path     |
+| `EmbeddingGemma2`                   | `google/embeddinggemma-2`                                     |               768 |                             8,192 | Local     | Not a BERT path     |
 | `TextEmbedding3Small`               | `text-embedding-3-small`                                      |             1,536 |                             8,191 | Remote    | Not a BERT path     |
 
 The limits are intended for chunking and truncation. They leave room for
 special tokens. In particular, Qwen3-Embedding is capped at 8,192 tokens for
 practical use even though the underlying model supports a longer context.
+
+`EmbeddingGemma2` is a bidirectional encoder. The native service truncates input
+to 8,192 tokens, counting the beginning and end tokens that wrap every input,
+and never rejects long input; the underlying model has no length limit of its own. Its pooled vector is L2-normalized, and a
+configured output dimension keeps the leading dimensions (768, 512, 256 and 128
+are the trained widths) and re-normalizes. Query and passage roles prepend
+`task: search result | query:` and `title: none | text:`, each followed by one
+space. The model loads
+from `LATTICE_EMBEDDINGGEMMA2_MODEL_DIR` or `~/.lattice/models/embeddinggemma-2`
+and runs in f32 on the CPU; f16 activations are not supported.
 
 `is_local()` is true for every variant except `TextEmbedding3Small`;
 `is_remote()` is true only for `TextEmbedding3Small`. Native BERT pooling is
@@ -239,6 +250,7 @@ The model version values currently divide the registry into these families:
 | `v1.5`      | BGE and multilingual E5 variants                        |
 | `v2`        | Both MiniLM variants                                    |
 | `v3`        | Both Qwen3-Embedding variants and `TextEmbedding3Small` |
+| `v1`        | `EmbeddingGemma2`                                       |
 
 Including the model, version, active dimensions, and role prevents the cache
 from crossing known embedding-space boundaries. `compute_key()` is public and

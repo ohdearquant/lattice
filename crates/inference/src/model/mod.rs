@@ -3,6 +3,8 @@ pub mod bert;
 pub mod bitnet_config;
 pub(crate) mod config_file;
 pub mod cross_encoder;
+pub mod embeddinggemma2;
+pub mod embeddinggemma2_config;
 pub mod ernie45;
 pub mod gemma4_cache;
 pub mod gemma4_config;
@@ -21,6 +23,7 @@ pub(crate) mod serving_runtime;
 // Re-export everything from bert (was top-level `model` module)
 pub use self::bert::*;
 pub use self::cross_encoder::CrossEncoderModel;
+pub use self::embeddinggemma2::EmbeddingGemma2Model;
 // Re-export key types from other model modules
 pub use self::gemma4_model::Gemma4Model;
 pub use self::qwen::{LayerTimings, ProfileTimings, QwenConfig, QwenModel};
