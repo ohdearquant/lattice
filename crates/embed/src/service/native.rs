@@ -7,14 +7,19 @@ use super::{EmbeddingRole, EmbeddingService, MAX_TEXT_BYTES, ValidatedTextBatch}
 use crate::error::{EmbedError, Result};
 use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
+use lattice_inference::model::embeddinggemma2::EmbeddingGemma2Model;
 use lattice_inference::{BertModel, QwenModel};
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
-/// Loaded model — either BERT-family (encoder) or Qwen (decoder).
+/// Loaded model: BERT-family (encoder), Qwen (decoder) or EmbeddingGemma 2 (bidirectional Gemma encoder).
 enum LoadedModel {
     Bert(Arc<BertModel>),
     Qwen(Arc<QwenModel>),
+    EmbeddingGemma2 {
+        model: Arc<EmbeddingGemma2Model>,
+        output_dim: Option<usize>,
+    },
 }
 
 // Wrapped model types provide the required thread-safety — see docs/service.md.
@@ -31,6 +36,10 @@ impl LoadedModel {
                 }
                 Ok(results)
             }
+            LoadedModel::EmbeddingGemma2 { model, output_dim } => texts
+                .iter()
+                .map(|text| model.encode(text, *output_dim).map_err(|e| e.to_string()))
+                .collect(),
         }
     }
 
@@ -269,6 +278,7 @@ fn load_model_sync(model_config: ModelConfig) -> std::result::Result<LoadedModel
         EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => {
             load_qwen_model(model_config)
         }
+        EmbeddingModel::EmbeddingGemma2 => load_embeddinggemma2_model(model_config),
         other => Err(format!("unsupported model: {other:?}")),
     }
 }
@@ -300,6 +310,45 @@ fn load_qwen_model(model_config: ModelConfig) -> std::result::Result<LoadedModel
         }
     }
     Ok(LoadedModel::Qwen(Arc::new(model)))
+}
+
+fn load_embeddinggemma2_model(
+    model_config: ModelConfig,
+) -> std::result::Result<LoadedModel, String> {
+    model_config.validate().map_err(|e| e.to_string())?;
+    info!(
+        output_dim = ?model_config.output_dim,
+        "loading EmbeddingGemma 2 embedding model"
+    );
+    let model_dir = embeddinggemma2_model_dir().map_err(|e| e.to_string())?;
+    let model = EmbeddingGemma2Model::from_model_dir(&model_dir).map_err(|e| e.to_string())?;
+    Ok(LoadedModel::EmbeddingGemma2 {
+        model: Arc::new(model),
+        output_dim: model_config.output_dim,
+    })
+}
+
+/// Locate the EmbeddingGemma 2 model directory: `LATTICE_EMBEDDINGGEMMA2_MODEL_DIR`, else
+/// `~/.lattice/models/embeddinggemma-2`.
+fn embeddinggemma2_model_dir() -> Result<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("LATTICE_EMBEDDINGGEMMA2_MODEL_DIR") {
+        return Ok(std::path::PathBuf::from(dir));
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| EmbedError::ModelInitialization("HOME not set".into()))?;
+    let dir = std::path::PathBuf::from(home)
+        .join(".lattice")
+        .join("models")
+        .join("embeddinggemma-2");
+    if dir.join("model.safetensors").exists() {
+        Ok(dir)
+    } else {
+        Err(EmbedError::ModelInitialization(format!(
+            "EmbeddingGemma 2 model not found at {dir}. Download it with:\n  huggingface-cli download {repo} --local-dir {dir}",
+            dir = dir.display(),
+            repo = EmbeddingModel::EmbeddingGemma2.model_id()
+        )))
+    }
 }
 
 /// Path for persistent embedding cache: ~/.lattice/cache/embed_{model}_{dim}d.bin

@@ -98,6 +98,10 @@ pub enum EmbeddingModel {
     #[serde(alias = "Qwen3Embedding4B")]
     Qwen3Embedding4B,
 
+    /// EmbeddingGemma 2 (768 dimensions, MRL-capable) - multilingual, bidirectional Gemma encoder, f32 CPU path.
+    #[serde(alias = "EmbeddingGemma2")]
+    EmbeddingGemma2,
+
     /// all-MiniLM-L6-v2 (384 dimensions) - BERT-class, WordPiece tokenizer, sentence-transformers.
     #[serde(alias = "AllMiniLmL6V2")]
     AllMiniLmL6V2,
@@ -123,7 +127,9 @@ impl EmbeddingModel {
             | EmbeddingModel::MultilingualE5Small
             | EmbeddingModel::AllMiniLmL6V2
             | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => 384,
-            EmbeddingModel::BgeBaseEnV15 | EmbeddingModel::MultilingualE5Base => 768,
+            EmbeddingModel::BgeBaseEnV15
+            | EmbeddingModel::MultilingualE5Base
+            | EmbeddingModel::EmbeddingGemma2 => 768,
             EmbeddingModel::BgeLargeEnV15 | EmbeddingModel::Qwen3Embedding0_6B => 1024,
             EmbeddingModel::Qwen3Embedding4B => 2560,
             EmbeddingModel::TextEmbedding3Small => 1536,
@@ -152,6 +158,7 @@ impl EmbeddingModel {
                 | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2
                 | EmbeddingModel::Qwen3Embedding0_6B
                 | EmbeddingModel::Qwen3Embedding4B
+                | EmbeddingModel::EmbeddingGemma2
         )
     }
 
@@ -177,6 +184,8 @@ impl EmbeddingModel {
             // Conservative cap; see docs/model.md.
             EmbeddingModel::Qwen3Embedding0_6B => 8192,
             EmbeddingModel::Qwen3Embedding4B => 8192,
+            // Default limit of the native service: longer input is truncated, never rejected.
+            EmbeddingModel::EmbeddingGemma2 => 8192,
             EmbeddingModel::TextEmbedding3Small => 8191,
         }
     }
@@ -190,6 +199,7 @@ impl EmbeddingModel {
             EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
                 Some("query: ")
             }
+            EmbeddingModel::EmbeddingGemma2 => Some("task: search result | query: "),
             EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => Some(
                 "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
             ),
@@ -211,6 +221,7 @@ impl EmbeddingModel {
             EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
                 Some("passage: ")
             }
+            EmbeddingModel::EmbeddingGemma2 => Some("title: none | text: "),
             _ => None,
         }
     }
@@ -253,6 +264,7 @@ impl EmbeddingModel {
             }
             EmbeddingModel::Qwen3Embedding0_6B => "Qwen/Qwen3-Embedding-0.6B",
             EmbeddingModel::Qwen3Embedding4B => "Qwen/Qwen3-Embedding-4B",
+            EmbeddingModel::EmbeddingGemma2 => "google/embeddinggemma-2",
             EmbeddingModel::TextEmbedding3Small => "text-embedding-3-small",
         }
     }
@@ -262,7 +274,9 @@ impl EmbeddingModel {
     pub const fn supports_output_dim(&self) -> bool {
         matches!(
             self,
-            EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B
+            EmbeddingModel::Qwen3Embedding0_6B
+                | EmbeddingModel::Qwen3Embedding4B
+                | EmbeddingModel::EmbeddingGemma2
         )
     }
 
@@ -284,6 +298,7 @@ impl EmbeddingModel {
             }
             EmbeddingModel::Qwen3Embedding0_6B
             | EmbeddingModel::Qwen3Embedding4B
+            | EmbeddingModel::EmbeddingGemma2
             | EmbeddingModel::TextEmbedding3Small => None,
         }
     }
@@ -298,6 +313,7 @@ impl EmbeddingModel {
             EmbeddingModel::AllMiniLmL6V2 | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
                 "v2"
             }
+            EmbeddingModel::EmbeddingGemma2 => "v1",
             _ => "v1.5",
         }
     }
@@ -313,6 +329,7 @@ impl std::fmt::Display for EmbeddingModel {
             EmbeddingModel::MultilingualE5Base => write!(f, "multilingual-e5-base"),
             EmbeddingModel::Qwen3Embedding0_6B => write!(f, "qwen3-embedding-0.6b"),
             EmbeddingModel::Qwen3Embedding4B => write!(f, "qwen3-embedding-4b"),
+            EmbeddingModel::EmbeddingGemma2 => write!(f, "embeddinggemma-2"),
             EmbeddingModel::AllMiniLmL6V2 => write!(f, "all-minilm-l6-v2"),
             EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
                 write!(f, "paraphrase-multilingual-minilm-l12-v2")
@@ -354,6 +371,11 @@ impl std::str::FromStr for EmbeddingModel {
             "qwen3-embedding-4b" | "qwen3-4b" | "qwen/qwen3-embedding-4b" => {
                 Ok(EmbeddingModel::Qwen3Embedding4B)
             }
+            "embeddinggemma-2"
+            | "embeddinggemma2"
+            | "embedding-gemma2"
+            | "embedding-gemma-2"
+            | "google/embeddinggemma-2" => Ok(EmbeddingModel::EmbeddingGemma2),
             "all-minilm-l6-v2"
             | "minilm"
             | "all-minilm"
@@ -795,7 +817,7 @@ mod tests {
     /// `ALL_MODELS` constant (checked via `grep -n
     /// "strum\|EnumIter\|VariantArray\|ALL_MODELS" crates/embed/src/model.rs`,
     /// no hits), so `variants` below is still a hand-transcribed list of all
-    /// 10 current variants. But `#[non_exhaustive]` only forces a wildcard
+    /// 11 current variants. But `#[non_exhaustive]` only forces a wildcard
     /// arm in matches written *outside* the declaring crate -- this test
     /// lives inside `lattice-embed` itself, where `EmbeddingModel` is
     /// declared, so a wildcard-free match over it type-checks here. The
@@ -820,6 +842,7 @@ mod tests {
                 | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2
                 | EmbeddingModel::Qwen3Embedding0_6B
                 | EmbeddingModel::Qwen3Embedding4B
+                | EmbeddingModel::EmbeddingGemma2
                 | EmbeddingModel::TextEmbedding3Small => {}
             }
         }
@@ -834,6 +857,7 @@ mod tests {
             EmbeddingModel::ParaphraseMultilingualMiniLmL12V2,
             EmbeddingModel::Qwen3Embedding0_6B,
             EmbeddingModel::Qwen3Embedding4B,
+            EmbeddingModel::EmbeddingGemma2,
             EmbeddingModel::TextEmbedding3Small,
         ];
 
@@ -863,7 +887,7 @@ mod tests {
         }
         // BGE small/base/large + E5 small/base + MiniLM + paraphrase-MiniLM:
         // the 7 variants whose `bert_pooling()` returns `Some(_)` as of this
-        // writing. Qwen3 x2 and TextEmbedding3Small return `None` and are
+        // writing. Qwen3 x2, EmbeddingGemma2 and TextEmbedding3Small return `None` and are
         // skipped above. This catches a variant's `bert_pooling()` gate
         // moving, but -- per the enumeration note above -- a wholly new
         // variant absent from `variants` only surfaces as the compile error
@@ -872,5 +896,40 @@ mod tests {
             bert_family_checked, 7,
             "EmbeddingModel's BERT-family (Some(_) from bert_pooling()) variant count changed"
         );
+    }
+
+    #[test]
+    fn test_embeddinggemma2_registry_entry() {
+        let m = EmbeddingModel::EmbeddingGemma2;
+        assert_eq!(m.native_dimensions(), 768);
+        assert!(m.is_local() && !m.is_remote());
+        assert_eq!(m.max_input_tokens(), 8192);
+        assert_eq!(m.query_instruction(), Some("task: search result | query: "));
+        assert_eq!(m.document_instruction(), Some("title: none | text: "));
+        assert_eq!(m.model_id(), "google/embeddinggemma-2");
+        assert!(m.supports_output_dim());
+        for name in [
+            "embeddinggemma-2",
+            "EmbeddingGemma2",
+            "embedding_gemma2",
+            "google/embeddinggemma-2",
+        ] {
+            assert_eq!(name.parse::<EmbeddingModel>(), Ok(m), "{name}");
+        }
+        assert_eq!(m.to_string().parse::<EmbeddingModel>(), Ok(m));
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, "\"embedding_gemma2\"");
+        assert_eq!(serde_json::from_str::<EmbeddingModel>(&json).unwrap(), m);
+        assert_eq!(
+            serde_json::from_str::<EmbeddingModel>("\"EmbeddingGemma2\"").unwrap(),
+            m
+        );
+
+        for width in [768, 512, 256, 128] {
+            let config = ModelConfig::try_new(m, Some(width)).unwrap();
+            assert_eq!(config.dimensions(), width);
+        }
+        assert!(ModelConfig::try_new(m, Some(769)).is_err());
+        assert!(ModelConfig::try_new(m, Some(MIN_MRL_OUTPUT_DIM - 1)).is_err());
     }
 }
