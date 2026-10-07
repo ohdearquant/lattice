@@ -159,6 +159,70 @@ pub struct MtpConfig {
     pub use_dedicated_embeddings: bool,
 }
 
+impl MtpConfig {
+    /// Build the MTP config for a Qwen3.5 checkpoint from the model's own config.
+    ///
+    /// Every field comes from `cfg` except `draft_length`, which is a runtime choice of the
+    /// caller rather than a property of the checkpoint.
+    ///
+    /// A routed-MoE model maps its expert fields across (`num_experts`, `num_experts_per_tok`,
+    /// `moe_intermediate_size` and `shared_expert_intermediate_size`, with the same fallbacks
+    /// the model config applies). A dense model, whose MTP layer carries a plain SwiGLU MLP,
+    /// is expressed in the same layout as one expert, top-1 routing and a zero-width shared
+    /// expert, with `moe_intermediate_size` set to the dense `intermediate_size`.
+    /// [`MtpWeights::load_from_source`] reads the matching tensors for either shape.
+    ///
+    /// Errors when the model has no MTP layer, or is MoE but leaves the expert count or the
+    /// experts per token unset.
+    pub fn from_qwen35(
+        cfg: &crate::model::qwen35_config::Qwen35Config,
+        draft_length: usize,
+    ) -> Result<Self, crate::error::InferenceError> {
+        use crate::error::InferenceError;
+
+        if cfg.mtp_num_hidden_layers == 0 {
+            return Err(InferenceError::UnsupportedModel(
+                "the model config declares no MTP layer (mtp_num_hidden_layers = 0)".into(),
+            ));
+        }
+        let (experts, per_tok, moe_inter, shared_inter) = if cfg.is_moe() {
+            let experts = cfg.num_experts.ok_or_else(|| {
+                InferenceError::UnsupportedModel("MoE model config does not set num_experts".into())
+            })?;
+            let per_tok = cfg.num_experts_per_tok.ok_or_else(|| {
+                InferenceError::UnsupportedModel(
+                    "MoE model config does not set num_experts_per_tok".into(),
+                )
+            })?;
+            (
+                experts,
+                per_tok,
+                cfg.moe_intermediate_size(),
+                cfg.shared_expert_intermediate_size(),
+            )
+        } else {
+            (1, 1, cfg.intermediate_size, 0)
+        };
+        Ok(Self {
+            draft_length,
+            num_hidden_layers: cfg.mtp_num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            vocab_size: cfg.vocab_size,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            rms_norm_eps: cfg.rms_norm_eps,
+            rope_theta: cfg.rope_theta,
+            partial_rotary_factor: cfg.partial_rotary_factor,
+            num_experts: experts,
+            num_experts_per_tok: per_tok,
+            moe_intermediate_size: moe_inter,
+            shared_expert_intermediate_size: shared_inter,
+            use_dedicated_embeddings: cfg.mtp_use_dedicated_embeddings,
+        })
+    }
+}
+
 impl Default for MtpConfig {
     fn default() -> Self {
         Self {
@@ -264,8 +328,70 @@ pub struct MtpMoeWeights {
     pub shared_expert_gate: Vec<f32>,   // [hidden_size]
 }
 
+/// How one MTP layer's MLP is stored in a checkpoint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MtpMlpLayout {
+    /// `mlp.{gate,up,down}_proj.weight`: a single SwiGLU MLP.
+    Dense,
+    /// `mlp.experts.{gate_up_proj,down_proj}` plus a router and a shared expert.
+    Routed,
+}
+
+impl MtpMlpLayout {
+    /// Decide the layout of layer `layer` from which tensors the source holds.
+    ///
+    /// Exactly one of the two key families must be present; both or neither is an error that
+    /// names the layer and the keys found.
+    fn detect<S: crate::weights::TensorSource>(
+        source: &mut S,
+        layer: usize,
+    ) -> Result<Self, crate::error::InferenceError> {
+        use crate::error::InferenceError;
+
+        const DENSE: [&str; 3] = [
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ];
+        const ROUTED: [&str; 2] = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"];
+        let mut found = |keys: &[&'static str]| -> Result<Vec<&'static str>, InferenceError> {
+            let mut present = Vec::new();
+            for key in keys {
+                if source.has_tensor(&format!("mtp.layers.{layer}.{key}"))? {
+                    present.push(*key);
+                }
+            }
+            Ok(present)
+        };
+        let dense = found(&DENSE)?;
+        let routed = found(&ROUTED)?;
+        match (dense.is_empty(), routed.is_empty()) {
+            (false, true) => Ok(Self::Dense),
+            (true, false) => Ok(Self::Routed),
+            (false, false) => Err(InferenceError::UnsupportedModel(format!(
+                "mtp.layers.{layer}: MLP layout is ambiguous, found dense keys {dense:?} and \
+                 expert keys {routed:?}"
+            ))),
+            (true, true) => Err(InferenceError::UnsupportedModel(format!(
+                "mtp.layers.{layer}: no MLP tensors found, expected dense keys {DENSE:?} or \
+                 expert keys {ROUTED:?}"
+            ))),
+        }
+    }
+}
+
 impl MtpWeights {
     /// Load all MTP weights from a tensor source, validating shapes.
+    ///
+    /// The MLP layout is detected per layer. A routed layer reads the expert, router and
+    /// shared-expert tensors. A dense layer (`mlp.{gate,up,down}_proj.weight`, as in the
+    /// Qwen3.5-0.8B checkpoint) is stored in the same fields as one expert with top-1 routing
+    /// and a zero-width shared expert, which evaluates identically to the plain SwiGLU MLP: the
+    /// router softmax over one expert is exactly 1.0 and the shared expert is not evaluated.
+    /// The config must then say `num_experts = 1`, `num_experts_per_tok = 1` and
+    /// `shared_expert_intermediate_size = 0`, with `moe_intermediate_size` the dense
+    /// intermediate size (which the tensor shapes enforce). [`MtpConfig::from_qwen35`] produces
+    /// such a config for a dense model.
     pub fn load_from_source<S: crate::weights::TensorSource>(
         source: &mut S,
         cfg: &MtpConfig,
@@ -378,58 +504,110 @@ impl MtpWeights {
                 &format!("mtp.layers.{i}.self_attn.k_norm.weight"),
                 &[cfg.head_dim],
             )?;
-            let router_gate = load_checked(
-                source,
-                &format!("mtp.layers.{i}.mlp.gate.weight"),
-                &[num_experts, hidden],
-            )?;
-            let experts_gate_up_proj = load_checked(
-                source,
-                &format!("mtp.layers.{i}.mlp.experts.gate_up_proj"),
-                &[num_experts, 2 * moe_inter, hidden],
-            )?;
-            let experts_down_proj = load_checked(
-                source,
-                &format!("mtp.layers.{i}.mlp.experts.down_proj"),
-                &[num_experts, hidden, moe_inter],
-            )?;
-            let shared_gate_proj = load_checked(
-                source,
-                &format!("mtp.layers.{i}.mlp.shared_expert.gate_proj.weight"),
-                &[shared_inter, hidden],
-            )?;
-            let shared_up_proj = load_checked(
-                source,
-                &format!("mtp.layers.{i}.mlp.shared_expert.up_proj.weight"),
-                &[shared_inter, hidden],
-            )?;
-            let shared_down_proj = load_checked(
-                source,
-                &format!("mtp.layers.{i}.mlp.shared_expert.down_proj.weight"),
-                &[hidden, shared_inter],
-            )?;
-            // shared_expert_gate can be [1, hidden] (flatten to [hidden])
-            let shared_expert_gate = {
-                let name = format!("mtp.layers.{i}.mlp.shared_expert_gate.weight");
-                if let Some(declared) = source.tensor_shape(&name)?
-                    && declared.iter().product::<usize>() != hidden
-                {
-                    return Err(InferenceError::ShapeMismatch {
-                        name,
-                        expected: vec![hidden],
-                        actual: declared,
-                    });
+            let mlp = match MtpMlpLayout::detect(source, i)? {
+                MtpMlpLayout::Routed => {
+                    let router_gate = load_checked(
+                        source,
+                        &format!("mtp.layers.{i}.mlp.gate.weight"),
+                        &[num_experts, hidden],
+                    )?;
+                    let experts_gate_up_proj = load_checked(
+                        source,
+                        &format!("mtp.layers.{i}.mlp.experts.gate_up_proj"),
+                        &[num_experts, 2 * moe_inter, hidden],
+                    )?;
+                    let experts_down_proj = load_checked(
+                        source,
+                        &format!("mtp.layers.{i}.mlp.experts.down_proj"),
+                        &[num_experts, hidden, moe_inter],
+                    )?;
+                    let shared_gate_proj = load_checked(
+                        source,
+                        &format!("mtp.layers.{i}.mlp.shared_expert.gate_proj.weight"),
+                        &[shared_inter, hidden],
+                    )?;
+                    let shared_up_proj = load_checked(
+                        source,
+                        &format!("mtp.layers.{i}.mlp.shared_expert.up_proj.weight"),
+                        &[shared_inter, hidden],
+                    )?;
+                    let shared_down_proj = load_checked(
+                        source,
+                        &format!("mtp.layers.{i}.mlp.shared_expert.down_proj.weight"),
+                        &[hidden, shared_inter],
+                    )?;
+                    // shared_expert_gate can be [1, hidden] (flatten to [hidden])
+                    let shared_expert_gate = {
+                        let name = format!("mtp.layers.{i}.mlp.shared_expert_gate.weight");
+                        if let Some(declared) = source.tensor_shape(&name)?
+                            && declared.iter().product::<usize>() != hidden
+                        {
+                            return Err(InferenceError::ShapeMismatch {
+                                name,
+                                expected: vec![hidden],
+                                actual: declared,
+                            });
+                        }
+                        let (data, shape) = source.get_f32_tensor_owned(&name)?;
+                        let total = shape.iter().product::<usize>();
+                        if total != hidden {
+                            return Err(InferenceError::ShapeMismatch {
+                                name,
+                                expected: vec![hidden],
+                                actual: shape,
+                            });
+                        }
+                        data
+                    };
+
+                    MtpMoeWeights {
+                        router_gate,
+                        experts_gate_up_proj,
+                        experts_down_proj,
+                        shared_gate_proj,
+                        shared_up_proj,
+                        shared_down_proj,
+                        shared_expert_gate,
+                    }
                 }
-                let (data, shape) = source.get_f32_tensor_owned(&name)?;
-                let total = shape.iter().product::<usize>();
-                if total != hidden {
-                    return Err(InferenceError::ShapeMismatch {
-                        name,
-                        expected: vec![hidden],
-                        actual: shape,
-                    });
+                MtpMlpLayout::Dense => {
+                    if num_experts != 1 || cfg.num_experts_per_tok != 1 || shared_inter != 0 {
+                        return Err(InferenceError::Inference(format!(
+                            "mtp.layers.{i} has a dense MLP, which needs num_experts = 1, \
+                             num_experts_per_tok = 1 and shared_expert_intermediate_size = 0, \
+                             but the config has {num_experts}, {} and {shared_inter}",
+                            cfg.num_experts_per_tok
+                        )));
+                    }
+                    let gate = load_checked(
+                        source,
+                        &format!("mtp.layers.{i}.mlp.gate_proj.weight"),
+                        &[moe_inter, hidden],
+                    )?;
+                    let up = load_checked(
+                        source,
+                        &format!("mtp.layers.{i}.mlp.up_proj.weight"),
+                        &[moe_inter, hidden],
+                    )?;
+                    let down = load_checked(
+                        source,
+                        &format!("mtp.layers.{i}.mlp.down_proj.weight"),
+                        &[hidden, moe_inter],
+                    )?;
+                    // `forward_one` reads each expert's `[2 * moe_inter, hidden]` block as the
+                    // gate rows followed by the up rows.
+                    let mut experts_gate_up_proj = gate;
+                    experts_gate_up_proj.extend_from_slice(&up);
+                    MtpMoeWeights {
+                        router_gate: vec![0.0; hidden],
+                        experts_gate_up_proj,
+                        experts_down_proj: down,
+                        shared_gate_proj: Vec::new(),
+                        shared_up_proj: Vec::new(),
+                        shared_down_proj: Vec::new(),
+                        shared_expert_gate: vec![0.0; hidden],
+                    }
                 }
-                data
             };
 
             layers.push(MtpLayerWeights {
@@ -443,15 +621,7 @@ impl MtpWeights {
                     q_norm,
                     k_norm,
                 },
-                mlp: MtpMoeWeights {
-                    router_gate,
-                    experts_gate_up_proj,
-                    experts_down_proj,
-                    shared_gate_proj,
-                    shared_up_proj,
-                    shared_down_proj,
-                    shared_expert_gate,
-                },
+                mlp,
             });
         }
 
@@ -1231,52 +1401,55 @@ impl<'a> MtpVerifier<'a> {
             }
         }
 
-        // Shared expert
-        matmul_bt(
-            &self.scratch.hidden,
-            &layer.mlp.shared_gate_proj,
-            &mut self.scratch.shared_gate[..shared_inter],
-            1,
-            hidden,
-            shared_inter,
-        );
-        matmul_bt(
-            &self.scratch.hidden,
-            &layer.mlp.shared_up_proj,
-            &mut self.scratch.shared_up[..shared_inter],
-            1,
-            hidden,
-            shared_inter,
-        );
+        // Shared expert. A zero-width one (the dense-MLP layout) adds nothing, so it is not
+        // evaluated: that skips zero-sized matmuls whose handling differs by backend.
+        if shared_inter > 0 {
+            matmul_bt(
+                &self.scratch.hidden,
+                &layer.mlp.shared_gate_proj,
+                &mut self.scratch.shared_gate[..shared_inter],
+                1,
+                hidden,
+                shared_inter,
+            );
+            matmul_bt(
+                &self.scratch.hidden,
+                &layer.mlp.shared_up_proj,
+                &mut self.scratch.shared_up[..shared_inter],
+                1,
+                hidden,
+                shared_inter,
+            );
 
-        // SwiGLU on shared expert
-        for j in 0..shared_inter {
-            let gate = self.scratch.shared_gate[j];
-            let silu = gate * (1.0 / (1.0 + (-gate).exp()));
-            self.scratch.shared_silu_up[j] = silu * self.scratch.shared_up[j];
-        }
-
-        let mut shared_out = vec![0.0f32; hidden];
-        matmul_bt(
-            &self.scratch.shared_silu_up[..shared_inter],
-            &layer.mlp.shared_down_proj,
-            &mut shared_out,
-            1,
-            shared_inter,
-            hidden,
-        );
-
-        // Shared expert gate: scalar = sigmoid(dot(hidden, shared_expert_gate))
-        let shared_scalar = {
-            let mut dot = 0.0f32;
-            for j in 0..hidden {
-                dot += self.scratch.hidden[j] * layer.mlp.shared_expert_gate[j];
+            // SwiGLU on shared expert
+            for j in 0..shared_inter {
+                let gate = self.scratch.shared_gate[j];
+                let silu = gate * (1.0 / (1.0 + (-gate).exp()));
+                self.scratch.shared_silu_up[j] = silu * self.scratch.shared_up[j];
             }
-            1.0 / (1.0 + (-dot).exp())
-        };
 
-        for i in 0..hidden {
-            self.scratch.moe_out[i] += shared_scalar * shared_out[i];
+            let mut shared_out = vec![0.0f32; hidden];
+            matmul_bt(
+                &self.scratch.shared_silu_up[..shared_inter],
+                &layer.mlp.shared_down_proj,
+                &mut shared_out,
+                1,
+                shared_inter,
+                hidden,
+            );
+
+            // Shared expert gate: scalar = sigmoid(dot(hidden, shared_expert_gate))
+            let shared_scalar = {
+                let mut dot = 0.0f32;
+                for j in 0..hidden {
+                    dot += self.scratch.hidden[j] * layer.mlp.shared_expert_gate[j];
+                }
+                1.0 / (1.0 + (-dot).exp())
+            };
+
+            for i in 0..hidden {
+                self.scratch.moe_out[i] += shared_scalar * shared_out[i];
+            }
         }
 
         // FFN residual
@@ -5741,6 +5914,531 @@ mod tests {
             !source.materialized.borrow().contains(&mutated_name),
             "the mismatched tensor's data must never be copied"
         );
+    }
+
+    fn dense_mtp_config() -> MtpConfig {
+        MtpConfig {
+            moe_intermediate_size: 3,
+            shared_expert_intermediate_size: 0,
+            ..tiny_mtp_config()
+        }
+    }
+
+    /// The tensor set of a dense-MLP checkpoint: `tiny_mtp_tensor_map` with the routed MLP
+    /// tensors replaced by `mlp.{gate,up,down}_proj.weight`.
+    fn dense_mtp_tensor_map(
+        cfg: &MtpConfig,
+    ) -> std::collections::HashMap<String, (Vec<f32>, Vec<usize>)> {
+        let (h, inter) = (cfg.hidden_size, cfg.moe_intermediate_size);
+        let mut m = tiny_mtp_tensor_map(cfg);
+        for i in 0..cfg.num_hidden_layers {
+            let p = format!("mtp.layers.{i}");
+            for routed in [
+                "mlp.gate.weight",
+                "mlp.experts.gate_up_proj",
+                "mlp.experts.down_proj",
+                "mlp.shared_expert.gate_proj.weight",
+                "mlp.shared_expert.up_proj.weight",
+                "mlp.shared_expert.down_proj.weight",
+                "mlp.shared_expert_gate.weight",
+            ] {
+                m.remove(&format!("{p}.{routed}"));
+            }
+            m.insert(
+                format!("{p}.mlp.gate_proj.weight"),
+                (
+                    (0..inter * h).map(|v| 1.0 + v as f32).collect(),
+                    vec![inter, h],
+                ),
+            );
+            m.insert(
+                format!("{p}.mlp.up_proj.weight"),
+                (
+                    (0..inter * h).map(|v| -1000.0 - v as f32).collect(),
+                    vec![inter, h],
+                ),
+            );
+            m.insert(
+                format!("{p}.mlp.down_proj.weight"),
+                (
+                    (0..h * inter).map(|v| 0.5 + v as f32).collect(),
+                    vec![h, inter],
+                ),
+            );
+        }
+        m
+    }
+
+    fn counting_source(
+        tensors: std::collections::HashMap<String, (Vec<f32>, Vec<usize>)>,
+    ) -> CountingTensorSource {
+        CountingTensorSource {
+            tensors,
+            materialized: std::cell::RefCell::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn load_err(
+        tensors: std::collections::HashMap<String, (Vec<f32>, Vec<usize>)>,
+        cfg: &MtpConfig,
+    ) -> String {
+        match MtpWeights::load_from_source(&mut counting_source(tensors), cfg) {
+            Ok(_) => panic!("the load must fail"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn mtp_dense_layout_loads_into_one_expert_with_gate_rows_first() {
+        let cfg = dense_mtp_config();
+        let tensors = dense_mtp_tensor_map(&cfg);
+        let (h, inter) = (cfg.hidden_size, cfg.moe_intermediate_size);
+        let gate = tensors["mtp.layers.0.mlp.gate_proj.weight"].0.clone();
+        let up = tensors["mtp.layers.0.mlp.up_proj.weight"].0.clone();
+        let down = tensors["mtp.layers.0.mlp.down_proj.weight"].0.clone();
+
+        let w = MtpWeights::load_from_source(&mut counting_source(tensors), &cfg).unwrap();
+        assert_eq!(w.layers.len(), 1);
+        let mlp = &w.layers[0].mlp;
+        let mut want_gate_up = gate;
+        want_gate_up.extend_from_slice(&up);
+        assert_eq!(mlp.experts_gate_up_proj.len(), 2 * inter * h);
+        assert_eq!(mlp.experts_gate_up_proj, want_gate_up);
+        assert_eq!(mlp.experts_down_proj, down);
+        assert_eq!(mlp.router_gate, vec![0.0; h]);
+        assert!(mlp.shared_gate_proj.is_empty());
+        assert!(mlp.shared_up_proj.is_empty());
+        assert!(mlp.shared_down_proj.is_empty());
+        assert_eq!(mlp.shared_expert_gate.len(), h);
+    }
+
+    #[test]
+    fn mtp_routed_layout_still_loads() {
+        for num_experts in [1, 2] {
+            let cfg = MtpConfig {
+                num_experts,
+                ..tiny_mtp_config()
+            };
+            let mut tensors = tiny_mtp_tensor_map(&cfg);
+            let (h, inter) = (cfg.hidden_size, cfg.moe_intermediate_size);
+            let marked: Vec<f32> = (0..num_experts * 2 * inter * h).map(|v| v as f32).collect();
+            tensors.insert(
+                "mtp.layers.0.mlp.experts.gate_up_proj".to_string(),
+                (marked.clone(), vec![num_experts, 2 * inter, h]),
+            );
+            let w = MtpWeights::load_from_source(&mut counting_source(tensors), &cfg).unwrap();
+            let mlp = &w.layers[0].mlp;
+            assert_eq!(mlp.experts_gate_up_proj, marked, "{num_experts} experts");
+            assert_eq!(mlp.router_gate.len(), num_experts * h);
+            assert_eq!(
+                mlp.shared_gate_proj.len(),
+                cfg.shared_expert_intermediate_size * h
+            );
+            assert_eq!(mlp.shared_expert_gate.len(), h);
+        }
+    }
+
+    #[test]
+    fn mtp_mixed_dense_and_routed_layout_errors_naming_the_layer_and_keys() {
+        let cfg = tiny_mtp_config();
+        let mut tensors = tiny_mtp_tensor_map(&cfg);
+        let (h, inter) = (cfg.hidden_size, cfg.moe_intermediate_size);
+        tensors.insert(
+            "mtp.layers.0.mlp.gate_proj.weight".to_string(),
+            (vec![0.0; inter * h], vec![inter, h]),
+        );
+        let err = load_err(tensors, &cfg);
+        assert!(err.contains("mtp.layers.0"), "{err}");
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("mlp.gate_proj.weight"), "{err}");
+        assert!(err.contains("mlp.experts.gate_up_proj"), "{err}");
+    }
+
+    #[test]
+    fn mtp_layer_with_neither_mlp_layout_errors_naming_the_layer() {
+        let cfg = tiny_mtp_config();
+        let mut tensors = tiny_mtp_tensor_map(&cfg);
+        tensors.remove("mtp.layers.0.mlp.experts.gate_up_proj");
+        tensors.remove("mtp.layers.0.mlp.experts.down_proj");
+        let err = load_err(tensors, &cfg);
+        assert!(err.contains("mtp.layers.0"), "{err}");
+        assert!(err.contains("no MLP tensors found"), "{err}");
+    }
+
+    #[test]
+    fn mtp_dense_layout_rejects_a_config_that_is_not_one_expert_without_shared() {
+        let dense = dense_mtp_config();
+        for (what, cfg) in [
+            (
+                "num_experts",
+                MtpConfig {
+                    num_experts: 2,
+                    ..dense.clone()
+                },
+            ),
+            (
+                "num_experts_per_tok",
+                MtpConfig {
+                    num_experts_per_tok: 2,
+                    ..dense.clone()
+                },
+            ),
+            (
+                "shared_expert_intermediate_size",
+                MtpConfig {
+                    shared_expert_intermediate_size: 2,
+                    ..dense.clone()
+                },
+            ),
+        ] {
+            let err = load_err(dense_mtp_tensor_map(&dense), &cfg);
+            assert!(err.contains("mtp.layers.0"), "{what}: {err}");
+            assert!(err.contains("dense MLP"), "{what}: {err}");
+        }
+
+        let wrong_inter = MtpConfig {
+            moe_intermediate_size: dense.moe_intermediate_size + 1,
+            ..dense.clone()
+        };
+        let err = load_err(dense_mtp_tensor_map(&dense), &wrong_inter);
+        assert!(err.contains("mtp.layers.0.mlp.gate_proj.weight"), "{err}");
+
+        let mut partial = dense_mtp_tensor_map(&dense);
+        partial.remove("mtp.layers.0.mlp.up_proj.weight");
+        let err = load_err(partial, &dense);
+        assert!(err.contains("mtp.layers.0.mlp.up_proj.weight"), "{err}");
+    }
+
+    #[test]
+    fn mtp_config_from_qwen35_maps_dense_and_routed_models() {
+        use crate::model::qwen35_config::Qwen35Config;
+
+        let dense_model = Qwen35Config::qwen35_0_8b();
+        let c = MtpConfig::from_qwen35(&dense_model, 3).unwrap();
+        assert_eq!(c.draft_length, 3);
+        assert_eq!(c.num_hidden_layers, dense_model.mtp_num_hidden_layers);
+        assert_eq!(c.hidden_size, dense_model.hidden_size);
+        assert_eq!(c.vocab_size, dense_model.vocab_size);
+        assert_eq!(c.num_attention_heads, dense_model.num_attention_heads);
+        assert_eq!(c.num_key_value_heads, dense_model.num_key_value_heads);
+        assert_eq!(c.head_dim, dense_model.head_dim);
+        assert_eq!(c.rms_norm_eps, dense_model.rms_norm_eps);
+        assert_eq!(c.rope_theta, dense_model.rope_theta);
+        assert_eq!(c.partial_rotary_factor, dense_model.partial_rotary_factor);
+        assert_eq!(
+            (
+                c.num_experts,
+                c.num_experts_per_tok,
+                c.moe_intermediate_size,
+                c.shared_expert_intermediate_size
+            ),
+            (1, 1, dense_model.intermediate_size, 0)
+        );
+        assert!(!c.use_dedicated_embeddings);
+
+        let routed_model = Qwen35Config::qwen36_35b_a3b();
+        let c = MtpConfig::from_qwen35(&routed_model, 2).unwrap();
+        assert_eq!(
+            (
+                c.num_experts,
+                c.num_experts_per_tok,
+                c.moe_intermediate_size,
+                c.shared_expert_intermediate_size
+            ),
+            (256, 8, 512, 512)
+        );
+
+        let no_mtp = Qwen35Config::qwen35_2b();
+        assert_eq!(no_mtp.mtp_num_hidden_layers, 0);
+        let err = MtpConfig::from_qwen35(&no_mtp, 3).unwrap_err().to_string();
+        assert!(err.contains("no MTP layer"), "{err}");
+
+        let mut half_moe = routed_model.clone();
+        half_moe.num_experts_per_tok = None;
+        let err = MtpConfig::from_qwen35(&half_moe, 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("num_experts_per_tok"), "{err}");
+    }
+
+    /// A dense head loaded through `MtpWeights::load_from_source` must produce the logits, the
+    /// output hidden state and the K/V rows of a plain SwiGLU MLP computed by hand.
+    ///
+    /// The reference below evaluates `down(silu(gate x) * (up x))` from the checkpoint's
+    /// gate/up/down tensors directly, in f64, so it does not go through the packed
+    /// `experts_gate_up_proj` layout, the one-expert router or the zero-width shared expert.
+    /// The second step's K/V row is built from the first step's output hidden state, so it
+    /// also depends on the MLP of step one. Errors are measured against the larger of the
+    /// element and the vector's largest magnitude, so a logit that cancels to near zero does
+    /// not turn f32 rounding into a large relative error.
+    #[test]
+    fn mtp_dense_head_matches_a_direct_swiglu_reference() {
+        let cfg = dense_mtp_config();
+        let (h, hd, nh, nkv, inter) = (
+            cfg.hidden_size,
+            cfg.head_dim,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.moe_intermediate_size,
+        );
+        let (q_dim, kv_dim) = (nh * hd, nkv * hd);
+
+        let gen_w = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (i as f32 * 1.7 + salt as f32 * 2.3 + 0.4).sin())
+                .collect()
+        };
+        let gen_norm = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| -0.6 + 0.3 * (i as f32 * 2.1 + salt as f32 * 1.9 + 0.7).sin())
+                .collect()
+        };
+        let mut tensors = std::collections::HashMap::new();
+        let mut put = |name: &str, data: Vec<f32>, shape: &[usize]| {
+            assert_eq!(data.len(), shape.iter().product::<usize>(), "{name}");
+            tensors.insert(name.to_string(), (data, shape.to_vec()));
+        };
+        put("mtp.fc.weight", gen_w(h * 2 * h, 1), &[h, 2 * h]);
+        put("mtp.norm.weight", gen_norm(h, 17), &[h]);
+        put("mtp.pre_fc_norm_embedding.weight", gen_norm(h, 18), &[h]);
+        put("mtp.pre_fc_norm_hidden.weight", gen_norm(h, 19), &[h]);
+        let p = "mtp.layers.0";
+        put(&format!("{p}.input_layernorm.weight"), gen_norm(h, 2), &[h]);
+        put(
+            &format!("{p}.post_attention_layernorm.weight"),
+            gen_norm(h, 3),
+            &[h],
+        );
+        put(
+            &format!("{p}.self_attn.q_proj.weight"),
+            gen_w(2 * q_dim * h, 4),
+            &[2 * q_dim, h],
+        );
+        put(
+            &format!("{p}.self_attn.k_proj.weight"),
+            gen_w(kv_dim * h, 5),
+            &[kv_dim, h],
+        );
+        put(
+            &format!("{p}.self_attn.v_proj.weight"),
+            gen_w(kv_dim * h, 6),
+            &[kv_dim, h],
+        );
+        put(
+            &format!("{p}.self_attn.o_proj.weight"),
+            gen_w(h * q_dim, 7),
+            &[h, q_dim],
+        );
+        put(
+            &format!("{p}.self_attn.q_norm.weight"),
+            gen_norm(hd, 8),
+            &[hd],
+        );
+        put(
+            &format!("{p}.self_attn.k_norm.weight"),
+            gen_norm(hd, 9),
+            &[hd],
+        );
+        put(
+            &format!("{p}.mlp.gate_proj.weight"),
+            gen_w(inter * h, 10),
+            &[inter, h],
+        );
+        put(
+            &format!("{p}.mlp.up_proj.weight"),
+            gen_w(inter * h, 11),
+            &[inter, h],
+        );
+        put(
+            &format!("{p}.mlp.down_proj.weight"),
+            gen_w(h * inter, 12),
+            &[h, inter],
+        );
+        let embed = gen_w(cfg.vocab_size * h, 20);
+        let lm_head = gen_w(cfg.vocab_size * h, 21);
+        let raw = |name: &str| -> Vec<f32> { tensors[name].0.clone() };
+
+        let weights =
+            MtpWeights::load_from_source(&mut counting_source(tensors.clone()), &cfg).unwrap();
+
+        // --- Test-local reference, f64, written from the dense SwiGLU definition. ---
+        let eps = cfg.rms_norm_eps as f64;
+        let norm = |x: &[f64], gamma: &[f32]| -> Vec<f64> {
+            let inv = 1.0 / (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + eps).sqrt();
+            x.iter()
+                .zip(gamma)
+                .map(|(v, g)| v * inv * (1.0 + *g as f64))
+                .collect()
+        };
+        let matvec = |w: &[f32], rows: usize, cols: usize, x: &[f64]| -> Vec<f64> {
+            assert_eq!((w.len(), x.len()), (rows * cols, cols));
+            (0..rows)
+                .map(|r| (0..cols).map(|c| w[r * cols + c] as f64 * x[c]).sum())
+                .collect()
+        };
+        let sigmoid = |v: f64| 1.0 / (1.0 + (-v).exp());
+        let silu = |v: f64| v * sigmoid(v);
+        let rot = (hd as f32 * cfg.partial_rotary_factor) as usize;
+        let rope = |x: &mut [f64], pos: usize| {
+            let half = rot / 2;
+            let orig = x[..rot].to_vec();
+            for i in 0..half {
+                let angle = pos as f64 * cfg.rope_theta.powf(-(2.0 * i as f64) / rot as f64);
+                let (s, c) = angle.sin_cos();
+                x[i] = orig[i] * c - orig[half + i] * s;
+                x[half + i] = orig[half + i] * c + orig[i] * s;
+            }
+        };
+        let f16r = |v: f64| half::f16::from_f32(v as f32).to_f32() as f64;
+        let (fc, norm_w) = (raw("mtp.fc.weight"), raw("mtp.norm.weight"));
+        let (pre_emb, pre_hid) = (
+            raw("mtp.pre_fc_norm_embedding.weight"),
+            raw("mtp.pre_fc_norm_hidden.weight"),
+        );
+        let (iln, paln) = (
+            raw(&format!("{p}.input_layernorm.weight")),
+            raw(&format!("{p}.post_attention_layernorm.weight")),
+        );
+        let (wq, wk, wv, wo) = (
+            raw(&format!("{p}.self_attn.q_proj.weight")),
+            raw(&format!("{p}.self_attn.k_proj.weight")),
+            raw(&format!("{p}.self_attn.v_proj.weight")),
+            raw(&format!("{p}.self_attn.o_proj.weight")),
+        );
+        let (qn, kn) = (
+            raw(&format!("{p}.self_attn.q_norm.weight")),
+            raw(&format!("{p}.self_attn.k_norm.weight")),
+        );
+        let (w_gate, w_up, w_down) = (
+            raw(&format!("{p}.mlp.gate_proj.weight")),
+            raw(&format!("{p}.mlp.up_proj.weight")),
+            raw(&format!("{p}.mlp.down_proj.weight")),
+        );
+        let mut kv_rows: Vec<(Vec<f64>, Vec<f64>)> = Vec::new();
+        let mut ref_step = |token: usize, pos: usize, prev: &[f32]| -> (Vec<f64>, Vec<f64>) {
+            let emb: Vec<f64> = embed[token * h..(token + 1) * h]
+                .iter()
+                .map(|&v| v as f64)
+                .collect();
+            let prev: Vec<f64> = prev.iter().map(|&v| v as f64).collect();
+            let cat = [norm(&emb, &pre_emb), norm(&prev, &pre_hid)].concat();
+            let x = matvec(&fc, h, 2 * h, &cat);
+
+            let a = norm(&x, &iln);
+            let qg = matvec(&wq, 2 * q_dim, h, &a);
+            let mut q = Vec::new();
+            let mut gate = Vec::new();
+            for head in 0..nh {
+                q.extend_from_slice(&qg[head * 2 * hd..head * 2 * hd + hd]);
+                gate.extend_from_slice(&qg[head * 2 * hd + hd..(head + 1) * 2 * hd]);
+            }
+            let mut k = matvec(&wk, kv_dim, h, &a);
+            let v = matvec(&wv, kv_dim, h, &a);
+            for head in 0..nh {
+                let n = norm(&q[head * hd..(head + 1) * hd], &qn);
+                q[head * hd..(head + 1) * hd].copy_from_slice(&n);
+                rope(&mut q[head * hd..(head + 1) * hd], pos);
+            }
+            for head in 0..nkv {
+                let n = norm(&k[head * hd..(head + 1) * hd], &kn);
+                k[head * hd..(head + 1) * hd].copy_from_slice(&n);
+                rope(&mut k[head * hd..(head + 1) * hd], pos);
+            }
+            kv_rows.push((
+                k.iter().map(|&t| f16r(t)).collect(),
+                v.iter().map(|&t| f16r(t)).collect(),
+            ));
+
+            let mut ctx = vec![0.0f64; q_dim];
+            for head in 0..nh {
+                let kvh = head / (nh / nkv);
+                let scores: Vec<f64> = kv_rows
+                    .iter()
+                    .map(|(kr, _)| {
+                        (0..hd)
+                            .map(|d| q[head * hd + d] * kr[kvh * hd + d])
+                            .sum::<f64>()
+                            / (hd as f64).sqrt()
+                    })
+                    .collect();
+                let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let z: f64 = e.iter().sum();
+                for d in 0..hd {
+                    let o: f64 = kv_rows
+                        .iter()
+                        .zip(&e)
+                        .map(|((_, vr), w)| w / z * vr[kvh * hd + d])
+                        .sum();
+                    ctx[head * hd + d] = o * sigmoid(gate[head * hd + d]);
+                }
+            }
+            let attn = matvec(&wo, h, q_dim, &ctx);
+            let x1: Vec<f64> = x.iter().zip(&attn).map(|(r, a)| r + a).collect();
+
+            let m = norm(&x1, &paln);
+            let g = matvec(&w_gate, inter, h, &m);
+            let u = matvec(&w_up, inter, h, &m);
+            let act: Vec<f64> = (0..inter).map(|j| silu(g[j]) * u[j]).collect();
+            let down = matvec(&w_down, h, inter, &act);
+            let x2: Vec<f64> = (0..h).map(|i| x1[i] + down[i]).collect();
+
+            let hidden = norm(&x2, &norm_w);
+            let logits = matvec(&lm_head, cfg.vocab_size, h, &hidden);
+            (logits, hidden)
+        };
+
+        let worst_ratio = |got: &[f32], want: &[f64]| -> f64 {
+            assert_eq!(got.len(), want.len());
+            let scale = want.iter().fold(0.0f64, |m, w| m.max(w.abs()));
+            got.iter()
+                .zip(want)
+                .map(|(g, w)| (*g as f64 - w).abs() / (1e-5 * w.abs().max(scale)))
+                .fold(0.0, f64::max)
+        };
+
+        let mut verifier = MtpVerifier::new(cfg.clone(), &weights, &embed, &lm_head, 8).unwrap();
+        let (tok1, tok2) = (1u32, 2u32);
+        let prev1 = [0.7f32, -1.2, 0.4, 1.6];
+        let out1 = verifier.forward_one(tok1, 0, &prev1).unwrap();
+        let (ref_logits1, ref_hidden1) = ref_step(tok1 as usize, 0, &prev1);
+        let ref_prev2: Vec<f32> = ref_hidden1.iter().map(|&v| v as f32).collect();
+        let out2 = verifier.forward_one(tok2, 1, &out1.hidden).unwrap();
+        let (ref_logits2, ref_hidden2) = ref_step(tok2 as usize, 1, &ref_prev2);
+
+        let mut worst = [
+            ("step 1 logits", worst_ratio(&out1.logits, &ref_logits1)),
+            ("step 1 hidden", worst_ratio(&out1.hidden, &ref_hidden1)),
+            ("step 2 logits", worst_ratio(&out2.logits, &ref_logits2)),
+            ("step 2 hidden", worst_ratio(&out2.hidden, &ref_hidden2)),
+        ]
+        .to_vec();
+        for (row, (ref_k, ref_v)) in kv_rows.iter().enumerate() {
+            let k: Vec<f32> = verifier.cache.k_buffer(0)[row * kv_dim..(row + 1) * kv_dim]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect();
+            let v: Vec<f32> = verifier.cache.v_buffer(0)[row * kv_dim..(row + 1) * kv_dim]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect();
+            worst.push((
+                if row == 0 { "K row 0" } else { "K row 1" },
+                worst_ratio(&k, ref_k),
+            ));
+            worst.push((
+                if row == 0 { "V row 0" } else { "V row 1" },
+                worst_ratio(&v, ref_v),
+            ));
+        }
+        println!("dense-head worst error / 1e-5 tolerance: {worst:?}");
+        for (what, ratio) in &worst {
+            assert!(
+                *ratio <= 1.0,
+                "{what}: the dense head differs from the direct SwiGLU reference by {ratio} \
+                 times the 1e-5 relative tolerance"
+            );
+        }
     }
 
     #[test]
