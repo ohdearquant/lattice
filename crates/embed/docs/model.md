@@ -68,7 +68,8 @@ to 8,192 tokens, counting the beginning and end tokens that wrap every input,
 and never rejects long input; the underlying model has no length limit of its own. Its pooled vector is L2-normalized, and a
 configured output dimension keeps the leading dimensions (768, 512, 256 and 128
 are the trained widths) and re-normalizes. Query and passage roles prepend
-`task: search result | query: ` and `title: none | text: `. The model loads
+`task: search result | query:` and `title: none | text:`, each followed by one
+space. The model loads
 from `LATTICE_EMBEDDINGGEMMA2_MODEL_DIR` or `~/.lattice/models/embeddinggemma-2`
 and runs in f32 on the CPU; f16 activations are not supported.
 
