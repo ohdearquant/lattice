@@ -155,32 +155,20 @@ fn test_layer_norm_simd_matches_scalar() {
 
 #[test]
 fn test_fast_tanh_precision() {
-    // Verify our Padé (7,6) rational approximation against std tanh.
-    // Core region |x| <= 3: error < 4e-5 (Padé convergence is excellent).
-    // Tail region |x| > 3: error < 2e-4 (rational slightly overshoots
-    //   before the |x| >= 10 clamp kicks in). The clamp catches it.
-    let core_values: [f32; 13] = [
-        -3.0, -2.0, -1.5, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 1.5, 2.0, 3.0,
+    // Spot values against std tanh. The dense sweep over the full range lives in
+    // `activation::fast_tanh_tests`.
+    let values: [f32; 17] = [
+        -10.0, -5.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0,
+        10.0,
     ];
-    let tail_values: [f32; 4] = [-10.0, -5.0, 5.0, 10.0];
 
-    for &x in &core_values {
-        let expected = x.tanh();
+    for &x in &values {
+        let expected = f64::from(x).tanh();
         let actual = fast_tanh(x);
-        let abs_err = (actual - expected).abs();
+        let abs_err = (f64::from(actual) - expected).abs();
         assert!(
-            abs_err < 4e-5,
-            "fast_tanh({x}) = {actual}, expected {expected}, abs_err = {abs_err} (exceeds 4e-5 in core)",
-        );
-    }
-
-    for &x in &tail_values {
-        let expected = x.tanh();
-        let actual = fast_tanh(x);
-        let abs_err = (actual - expected).abs();
-        assert!(
-            abs_err < 2e-4,
-            "fast_tanh({x}) = {actual}, expected {expected}, abs_err = {abs_err} (exceeds 2e-4 in tail)",
+            abs_err < 1e-6,
+            "fast_tanh({x}) = {actual}, expected {expected}, abs_err = {abs_err} (exceeds 1e-6)",
         );
     }
 }
