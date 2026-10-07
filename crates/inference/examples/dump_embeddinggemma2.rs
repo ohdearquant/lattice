@@ -86,7 +86,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let text = item["text"]
             .as_str()
             .ok_or("corpus item without a string text")?;
-        let started = std::time::Instant::now();
         let ids = model.tokenize(text)?;
         let embeddings = model.encode_ids_at_widths(&ids, &args.widths)?;
         let emb: serde_json::Map<String, Value> = args
@@ -102,11 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let hidden: Vec<&[f32]> = states.chunks_exact(dim).collect();
             row["hidden"] = json!(hidden);
         }
-        eprintln!(
-            "{id}: {} tokens in {:.2}s",
-            ids.len(),
-            started.elapsed().as_secs_f64()
-        );
+        eprintln!("{id}: {} tokens", ids.len());
         rows.push(row);
     }
     std::fs::write(&args.out, serde_json::to_string(&json!({ "rows": rows }))?)?;
