@@ -27,13 +27,9 @@
 //! grow their caches on demand, and the session keeps that difference rather than unifying
 //! allocation behaviour as a side effect.
 //!
-//! `generate_with_trace` is the entry the wrappers will call: it prepares the generation,
-//! builds the session and runs `driver::run` over it, with no streaming, no cancellation and
-//! no-op detokenizer hooks.
-
-// Nothing outside the tests calls this module until the standalone wrappers route through the
-// shared driver; the allowance is removed in the change that does that.
-#![cfg_attr(not(test), allow(dead_code))]
+//! `generate_with_trace` is the entry the wrappers call: it prepares the generation, builds
+//! the session and runs `driver::run` over it, with no streaming, no cancellation and no-op
+//! detokenizer hooks.
 
 use super::driver::{self, DriverTrace};
 use super::{
@@ -360,6 +356,7 @@ pub(crate) fn generate_with_trace(
 #[cfg(test)]
 pub(crate) mod parity {
     use super::*;
+    use crate::stop_reason::StopReason;
 
     /// The wrapper's own single-token forward step, standing in for the session's dispatch.
     pub(crate) type ReferenceForward<'a> = dyn Fn(
@@ -371,7 +368,8 @@ pub(crate) mod parity {
         ) -> Result<(), InferenceError>
         + 'a;
 
-    pub(crate) type LegacyGenerate<'a> =
+    /// The wrapper's public generate function, bound to its fixture.
+    pub(crate) type PublicGenerate<'a> =
         dyn Fn(&GenerateConfig) -> Result<GenerateOutput, InferenceError> + 'a;
 
     fn plan_for(
@@ -408,15 +406,42 @@ pub(crate) mod parity {
         }
     }
 
-    pub(crate) fn deterministic_cases() -> Vec<(&'static str, GenerateConfig)> {
+    /// The output a wrapper is pinned to for one config over the shared synthetic fixture: the
+    /// values the generation goldens record, plus the two early-return cases they do not.
+    pub(crate) struct Recorded {
+        pub(crate) token_ids: &'static [u32],
+        pub(crate) text: &'static str,
+        pub(crate) stopped: bool,
+        pub(crate) stop_reason: StopReason,
+    }
+
+    /// The prompt every fixture generates from; it spans several prefill positions.
+    pub(crate) const PROMPT_TOKENS: usize = 5;
+
+    pub(crate) fn deterministic_cases() -> Vec<(&'static str, GenerateConfig, Recorded)> {
         let base = greedy_case();
         vec![
-            ("greedy", base.clone()),
+            (
+                "greedy",
+                base.clone(),
+                Recorded {
+                    token_ids: &[36, 80, 112, 62, 103, 86],
+                    text: "aCbkbQa2bHbq",
+                    stopped: false,
+                    stop_reason: StopReason::Length,
+                },
+            ),
             (
                 "stop_token",
                 GenerateConfig {
                     stop_token_ids: vec![80],
                     ..base.clone()
+                },
+                Recorded {
+                    token_ids: &[36],
+                    text: "aC",
+                    stopped: true,
+                    stop_reason: StopReason::Eos,
                 },
             ),
             (
@@ -425,6 +450,12 @@ pub(crate) mod parity {
                     stop_token_ids: vec![36],
                     ..base.clone()
                 },
+                Recorded {
+                    token_ids: &[],
+                    text: "",
+                    stopped: true,
+                    stop_reason: StopReason::Eos,
+                },
             ),
             (
                 "one_token",
@@ -432,12 +463,24 @@ pub(crate) mod parity {
                     max_new_tokens: 1,
                     ..base.clone()
                 },
+                Recorded {
+                    token_ids: &[36],
+                    text: "aC",
+                    stopped: false,
+                    stop_reason: StopReason::Length,
+                },
             ),
             (
                 "zero_tokens",
                 GenerateConfig {
                     max_new_tokens: 0,
                     ..base
+                },
+                Recorded {
+                    token_ids: &[],
+                    text: "",
+                    stopped: false,
+                    stop_reason: StopReason::Length,
                 },
             ),
         ]
@@ -455,10 +498,56 @@ pub(crate) mod parity {
         }
     }
 
-    /// The session-driven result must equal the wrapper's own loop field for field, and the
-    /// ledger counters must show the driver issued every step.
-    pub(crate) fn assert_matches_legacy(
-        legacy: &LegacyGenerate<'_>,
+    /// The seeded config's recorded output over the shared fixture.
+    pub(crate) fn seeded_recorded() -> Recorded {
+        Recorded {
+            token_ids: &[36, 80, 103, 112, 87, 86],
+            text: "aCbkbHbQbrbq",
+            stopped: false,
+            stop_reason: StopReason::Length,
+        }
+    }
+
+    fn assert_output_is_recorded(
+        actual: &GenerateOutput,
+        recorded: &Recorded,
+        name: &str,
+        route: &str,
+    ) {
+        assert_eq!(
+            actual.token_ids, recorded.token_ids,
+            "{name} via {route}: token_ids"
+        );
+        assert_eq!(actual.text, recorded.text, "{name} via {route}: text");
+        assert_eq!(
+            actual.prompt_tokens, PROMPT_TOKENS,
+            "{name} via {route}: prompt_tokens"
+        );
+        assert_eq!(
+            actual.generated_tokens,
+            recorded.token_ids.len(),
+            "{name} via {route}: generated_tokens"
+        );
+        assert_eq!(
+            actual.stopped, recorded.stopped,
+            "{name} via {route}: stopped"
+        );
+        assert_eq!(
+            actual.stop_reason,
+            Some(recorded.stop_reason),
+            "{name} via {route}: stop_reason"
+        );
+        assert!(
+            actual.token_logprobs.is_empty(),
+            "{name} via {route}: token_logprobs"
+        );
+    }
+
+    /// Both the wrapper's public function and the session run directly through the driver must
+    /// reproduce the recorded output field for field, and the ledger counters must show the
+    /// driver issued every step.
+    pub(crate) fn assert_matches_recorded(
+        public: &PublicGenerate<'_>,
         weights: StandaloneWeights<'_>,
         cfg: &Qwen35Config,
         tokenizer: &BpeTokenizer,
@@ -466,31 +555,13 @@ pub(crate) mod parity {
         prompt: &str,
         name: &str,
         gen_cfg: &GenerateConfig,
+        recorded: &Recorded,
     ) {
-        let expected = legacy(gen_cfg).unwrap_or_else(|e| panic!("{name}: legacy loop: {e:?}"));
+        let wrapper = public(gen_cfg).unwrap_or_else(|e| panic!("{name}: wrapper: {e:?}"));
+        assert_output_is_recorded(&wrapper, recorded, name, "the wrapper");
         let (actual, trace) = generate_with_trace(weights, cfg, tokenizer, rope, prompt, gen_cfg)
             .unwrap_or_else(|e| panic!("{name}: session: {e:?}"));
-
-        assert_eq!(actual.token_ids, expected.token_ids, "{name}: token_ids");
-        assert_eq!(actual.text, expected.text, "{name}: text");
-        assert_eq!(
-            actual.prompt_tokens, expected.prompt_tokens,
-            "{name}: prompt_tokens"
-        );
-        assert_eq!(
-            actual.generated_tokens, expected.generated_tokens,
-            "{name}: generated_tokens"
-        );
-        assert_eq!(actual.stopped, expected.stopped, "{name}: stopped");
-        assert_eq!(
-            actual.stop_reason, expected.stop_reason,
-            "{name}: stop_reason"
-        );
-        assert_eq!(
-            actual.token_logprobs.len(),
-            expected.token_logprobs.len(),
-            "{name}: token_logprobs"
-        );
+        assert_output_is_recorded(&actual, recorded, name, "the session");
 
         if gen_cfg.max_new_tokens > 0 {
             assert_eq!(
