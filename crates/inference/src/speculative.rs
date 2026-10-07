@@ -739,17 +739,21 @@ impl<'a> MtpVerifier<'a> {
         Ok(())
     }
 
-    /// Run one MTP transformer forward step.
+    /// Compute this position's MTP K/V row and write it at the cache cursor without advancing
+    /// the cursor.
     ///
-    /// - `input_token_id`: token whose embedding is fed into the MTP module
-    /// - `position`: sequence position (used for RoPE and causal mask)
-    /// - `previous_hidden`: normalized hidden state from the main model at `position`
-    pub fn forward_one(
+    /// Shared by [`Self::forward_one`] and [`Self::append_kv_row`], so a row appended for an
+    /// already-committed token is built by the same code a full step uses: embedding lookup,
+    /// pre-fusion norms, fusion projection, input norm, K and V projections, K norm and partial
+    /// RoPE. On return `scratch.hidden` holds the input-normed hidden state and
+    /// `scratch.residual` the fused hidden state before that norm; `forward_one` continues from
+    /// there.
+    fn stage_kv_row(
         &mut self,
-        input_token_id: u32,
+        token_id: u32,
         position: usize,
         previous_hidden: &[f32],
-    ) -> Result<MtpForwardOutput, crate::error::InferenceError> {
+    ) -> Result<(), crate::error::InferenceError> {
         use crate::error::InferenceError;
         use crate::forward::cpu::matmul_bt;
         use crate::model::qwen35::qwen35_rms_norm;
@@ -762,7 +766,7 @@ impl<'a> MtpVerifier<'a> {
         // `advance_by`'s overflow behaviour.
         if self.cache.is_full() {
             return Err(InferenceError::InvalidInput(format!(
-                "MTP KV cache is full ({} tokens); call rollback_cache_to or reset_cache before forward_one",
+                "MTP KV cache is full ({} tokens); call rollback_cache_to or reset_cache before writing another row",
                 self.cache.seq_len()
             )));
         }
@@ -774,7 +778,7 @@ impl<'a> MtpVerifier<'a> {
         // precomputed table and panics.  Fail closed instead.
         if position >= self.rope.max_positions() {
             return Err(InferenceError::InvalidInput(format!(
-                "MTP forward_one position {position} out of range for RoPE table of {} positions",
+                "MTP position {position} out of range for RoPE table of {} positions",
                 self.rope.max_positions()
             )));
         }
@@ -782,23 +786,16 @@ impl<'a> MtpVerifier<'a> {
         let cfg = &self.config;
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
-        let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
         let head_dim = cfg.head_dim;
-        let num_q_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
-        let groups = num_q_heads / num_kv_heads;
         let rope_dim = (head_dim as f32 * cfg.partial_rotary_factor) as usize;
-        let moe_inter = cfg.moe_intermediate_size;
-        let shared_inter = cfg.shared_expert_intermediate_size;
-        let num_experts = cfg.num_experts;
-        let num_experts_per_tok = cfg.num_experts_per_tok;
         let eps = cfg.rms_norm_eps;
 
         // Validate
-        if input_token_id as usize >= vocab {
+        if token_id as usize >= vocab {
             return Err(InferenceError::Inference(format!(
-                "MTP token_id {input_token_id} >= vocab_size {vocab}"
+                "MTP token_id {token_id} >= vocab_size {vocab}"
             )));
         }
         if previous_hidden.len() != hidden {
@@ -811,7 +808,7 @@ impl<'a> MtpVerifier<'a> {
         let layer = &self.weights.layers[0];
 
         // 1. Embedding lookup
-        let tok = input_token_id as usize;
+        let tok = token_id as usize;
         self.scratch
             .embedding
             .copy_from_slice(&self.embed_tokens[tok * hidden..(tok + 1) * hidden]);
@@ -859,26 +856,6 @@ impl<'a> MtpVerifier<'a> {
             eps,
         );
 
-        // Q projection: output is [2*q_dim] (Q + gate_z interleaved per head)
-        matmul_bt(
-            &self.scratch.hidden,
-            &layer.self_attn.q_proj,
-            &mut self.scratch.q_and_gate[..2 * q_dim],
-            1,
-            hidden,
-            2 * q_dim,
-        );
-
-        // Scatter Q and gate_z per head
-        for h in 0..num_q_heads {
-            let src = h * head_dim * 2;
-            let dst = h * head_dim;
-            self.scratch.q[dst..dst + head_dim]
-                .copy_from_slice(&self.scratch.q_and_gate[src..src + head_dim]);
-            self.scratch.gate_z[dst..dst + head_dim]
-                .copy_from_slice(&self.scratch.q_and_gate[src + head_dim..src + 2 * head_dim]);
-        }
-
         // K projection
         matmul_bt(
             &self.scratch.hidden,
@@ -899,16 +876,7 @@ impl<'a> MtpVerifier<'a> {
             kv_dim,
         );
 
-        // Per-head QK normalization (shifted RMSNorm over each head's head_dim row)
-        for h in 0..num_q_heads {
-            let start = h * head_dim;
-            qwen35_rms_norm(
-                &mut self.scratch.q[start..start + head_dim],
-                &layer.self_attn.q_norm,
-                head_dim,
-                eps,
-            );
-        }
+        // Per-head K normalization (shifted RMSNorm over each head's head_dim row)
         for h in 0..num_kv_heads {
             let start = h * head_dim;
             qwen35_rms_norm(
@@ -920,15 +888,6 @@ impl<'a> MtpVerifier<'a> {
         }
 
         // Partial RoPE (stride-half pairing; see mtp_apply_partial_rope)
-        for h in 0..num_q_heads {
-            let start = h * head_dim;
-            mtp_apply_partial_rope(
-                &mut self.scratch.q[start..start + head_dim],
-                position,
-                &self.rope,
-                rope_dim,
-            );
-        }
         for h in 0..num_kv_heads {
             let start = h * head_dim;
             mtp_apply_partial_rope(
@@ -939,7 +898,7 @@ impl<'a> MtpVerifier<'a> {
             );
         }
 
-        // Append K, V to MTP KV cache at current seq_len position (convert f32→f16 on write).
+        // Write K, V to MTP KV cache at current seq_len position (convert f32→f16 on write).
         let write_pos = self.cache.seq_len();
         {
             let k_buf = self.cache.k_buffer_mut(0);
@@ -955,6 +914,111 @@ impl<'a> MtpVerifier<'a> {
                 v_buf[base + j] = half::f16::from_f32(val);
             }
         }
+        Ok(())
+    }
+
+    /// Append one K/V-only row to the MTP cache for `token_id` at absolute `position`.
+    ///
+    /// `previous_hidden` has the same meaning as in [`Self::forward_one`]: the target's
+    /// post-final-norm hidden state whose output predicted `token_id`. The row is written by the
+    /// same code as a full step up to its cache write and nothing after it runs: a row appended
+    /// for an already-committed token is only ever a future key, so the query, attention, MoE
+    /// FFN and logits are not computed. Advances the cache by one row.
+    pub(crate) fn append_kv_row(
+        &mut self,
+        token_id: u32,
+        position: usize,
+        previous_hidden: &[f32],
+    ) -> Result<(), crate::error::InferenceError> {
+        self.stage_kv_row(token_id, position, previous_hidden)?;
+        self.cache.advance_by(1)?;
+        Ok(())
+    }
+
+    /// Run one MTP transformer forward step.
+    ///
+    /// - `input_token_id`: token whose embedding is fed into the MTP module
+    /// - `position`: sequence position of `input_token_id` (used for RoPE and causal mask)
+    /// - `previous_hidden`: post-final-norm hidden state of the target model whose output
+    ///   (through the output projection) predicted `input_token_id`, i.e. the target's hidden
+    ///   state at `position - 1`. Each cache row therefore pairs a hidden state with the
+    ///   embedding of the token that follows it. [`Self::draft_tokens_with_logits`] feeds the
+    ///   caller's target hidden state to its first step and this head's own output hidden state
+    ///   to the later ones.
+    pub fn forward_one(
+        &mut self,
+        input_token_id: u32,
+        position: usize,
+        previous_hidden: &[f32],
+    ) -> Result<MtpForwardOutput, crate::error::InferenceError> {
+        use crate::forward::cpu::matmul_bt;
+        use crate::model::qwen35::qwen35_rms_norm;
+
+        self.stage_kv_row(input_token_id, position, previous_hidden)?;
+
+        let cfg = &self.config;
+        let hidden = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let q_dim = cfg.num_attention_heads * cfg.head_dim;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let head_dim = cfg.head_dim;
+        let num_q_heads = cfg.num_attention_heads;
+        let num_kv_heads = cfg.num_key_value_heads;
+        let groups = num_q_heads / num_kv_heads;
+        let rope_dim = (head_dim as f32 * cfg.partial_rotary_factor) as usize;
+        let moe_inter = cfg.moe_intermediate_size;
+        let shared_inter = cfg.shared_expert_intermediate_size;
+        let num_experts = cfg.num_experts;
+        let num_experts_per_tok = cfg.num_experts_per_tok;
+        let eps = cfg.rms_norm_eps;
+
+        let layer = &self.weights.layers[0];
+
+        // Q projection: output is [2*q_dim] (Q + gate_z interleaved per head)
+        matmul_bt(
+            &self.scratch.hidden,
+            &layer.self_attn.q_proj,
+            &mut self.scratch.q_and_gate[..2 * q_dim],
+            1,
+            hidden,
+            2 * q_dim,
+        );
+
+        // Scatter Q and gate_z per head
+        for h in 0..num_q_heads {
+            let src = h * head_dim * 2;
+            let dst = h * head_dim;
+            self.scratch.q[dst..dst + head_dim]
+                .copy_from_slice(&self.scratch.q_and_gate[src..src + head_dim]);
+            self.scratch.gate_z[dst..dst + head_dim]
+                .copy_from_slice(&self.scratch.q_and_gate[src + head_dim..src + 2 * head_dim]);
+        }
+
+        // Per-head Q normalization (shifted RMSNorm over each head's head_dim row)
+        for h in 0..num_q_heads {
+            let start = h * head_dim;
+            qwen35_rms_norm(
+                &mut self.scratch.q[start..start + head_dim],
+                &layer.self_attn.q_norm,
+                head_dim,
+                eps,
+            );
+        }
+
+        // Partial RoPE (stride-half pairing; see mtp_apply_partial_rope)
+        for h in 0..num_q_heads {
+            let start = h * head_dim;
+            mtp_apply_partial_rope(
+                &mut self.scratch.q[start..start + head_dim],
+                position,
+                &self.rope,
+                rope_dim,
+            );
+        }
+
+        // This position's K/V row was staged above at the cache cursor; the cursor advances
+        // after attention.
+        let write_pos = self.cache.seq_len();
         let cur_seq_len = write_pos + 1;
 
         // GQA attention: dequantize f16 KV cache to f32 scratch buffers.
@@ -1250,19 +1314,24 @@ impl<'a> MtpVerifier<'a> {
     /// rejection sampling (ADR-050). Use [`Self::draft_tokens`] when only token IDs are
     /// needed (greedy callers that pass `&[]` to `rejection_sample_draft`).
     ///
+    /// `hidden_predicting_current_token` is the target's post-final-norm hidden state whose
+    /// output predicted `current_token_id` (the target's hidden state at
+    /// `current_position - 1`); see [`Self::forward_one`]. It is not the hidden state computed
+    /// after processing `current_token_id` itself.
+    ///
     /// Stops early if `eos_token` is produced.
     #[allow(clippy::explicit_counter_loop)]
     pub fn draft_tokens_with_logits(
         &mut self,
         current_token_id: u32,
         current_position: usize,
-        main_hidden_at_current_position: &[f32],
+        hidden_predicting_current_token: &[f32],
         eos_token: Option<u32>,
     ) -> Result<MtpDraft, crate::error::InferenceError> {
         let mut tokens = Vec::with_capacity(self.config.draft_length);
         let mut logits = Vec::with_capacity(self.config.draft_length);
         let mut next_input = current_token_id;
-        let mut next_hidden: Vec<f32> = main_hidden_at_current_position.to_vec();
+        let mut next_hidden: Vec<f32> = hidden_predicting_current_token.to_vec();
         let mut next_position = current_position;
 
         for _ in 0..self.config.draft_length {
@@ -1283,19 +1352,22 @@ impl<'a> MtpVerifier<'a> {
 
     /// Draft `config.draft_length` candidate tokens using iterative MTP forwards.
     ///
+    /// See [`Self::draft_tokens_with_logits`] for the meaning of
+    /// `hidden_predicting_current_token`.
+    ///
     /// Stops early if `eos_token` is produced.
     pub fn draft_tokens(
         &mut self,
         current_token_id: u32,
         current_position: usize,
-        main_hidden_at_current_position: &[f32],
+        hidden_predicting_current_token: &[f32],
         eos_token: Option<u32>,
     ) -> Result<Vec<u32>, crate::error::InferenceError> {
         Ok(self
             .draft_tokens_with_logits(
                 current_token_id,
                 current_position,
-                main_hidden_at_current_position,
+                hidden_predicting_current_token,
                 eos_token,
             )?
             .tokens)
@@ -1340,6 +1412,40 @@ pub trait MtpTargetVerifier {
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError>;
+
+    /// Post-final-norm hidden state of the most recently processed token: the vector the
+    /// target's output projection read to produce that token's logits.
+    ///
+    /// [`mtp_verify_draft_with_seed`] reads it once, before it calls
+    /// [`Self::verify_tokens_with_hidden`]. At that point the most recently processed token is
+    /// the pending token, so the value is the hidden state that predicted the first draft token.
+    /// The default returns `None`, meaning the implementation cannot supply it. An
+    /// implementation must return `None` rather than a hidden state in any other basis, because
+    /// a wrong vector is worse than a missing one.
+    fn last_hidden(&self) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Same forward as [`Self::verify_tokens`], additionally returning the target's
+    /// post-final-norm hidden states when the implementation can supply them.
+    ///
+    /// The first element is exactly what `verify_tokens` returns. The second is `Some(h)` only
+    /// when `h[i]` is the target's post-final-norm hidden state after processing `tokens[i]`,
+    /// with one row per token and every row `hidden_size` long. `None` means the implementation
+    /// cannot supply every row; it must return `None` rather than a partial, approximated or
+    /// differently normalized set. The default delegates to `verify_tokens` and returns `None`.
+    ///
+    /// [`mtp_verify_draft_with_seed`] uses these rows together with [`Self::last_hidden`] to
+    /// keep the MTP cache aligned with the target. When either is `None` it behaves exactly as
+    /// it did before these methods existed.
+    #[allow(clippy::type_complexity)]
+    fn verify_tokens_with_hidden(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(Vec<Vec<f32>>, Option<Vec<Vec<f32>>>), crate::error::InferenceError> {
+        Ok((self.verify_tokens(tokens, start_pos)?, None))
+    }
 
     /// Snapshot every GDN layer's recurrent state (S matrices + conv buffer). See ADR-052.
     ///
@@ -1392,6 +1498,26 @@ const MTP_VERIFY_DEFAULT_SEED: u64 = 0x853c_49e6_748f_ea9b;
 /// samples from. Must be finite and `> 0`; `rejection_sample_draft` fails closed on
 /// `InvalidInput` otherwise.
 ///
+/// # Hidden-state contract
+///
+/// `hidden_predicting_current_token` is the target's post-final-norm hidden state whose output
+/// predicted `current_token_id` (the hidden state at `current_position - 1`). The target has
+/// already processed `current_token_id`: `initial_target_logits` is its output for that token
+/// and `target.cache_position()` is `current_position + 1`.
+///
+/// Each MTP cache row pairs a target hidden state with the embedding of the token that follows
+/// it. Drafting writes the row for `current_token_id` from the caller's hidden state and the
+/// row for each further draft token from the draft head's own hidden state. When the target
+/// supplies [`MtpTargetVerifier::last_hidden`] and
+/// [`MtpTargetVerifier::verify_tokens_with_hidden`] rows, the rows for the accepted draft tokens
+/// are rewritten from the target's own hidden states instead: the MTP cache is rolled back to
+/// just after the row for `current_token_id`, then one row is appended per accepted draft
+/// token, the first from `last_hidden` and each later one from the verify row of the draft
+/// token before it. The cache then ends at the same logical position as the target's whether
+/// the draft was fully accepted, partly accepted or rejected, and the row for the last
+/// accepted token is no longer missing. Without both inputs the cache is rolled back to the
+/// drafted rows of the accepted prefix, as before.
+///
 /// # Errors
 ///
 /// On `Err`, the verifier and target caches (and GDN state) are restored to their
@@ -1403,7 +1529,7 @@ pub fn mtp_verify_draft_with_seed<T: MtpTargetVerifier>(
     verifier: &mut MtpVerifier<'_>,
     current_token_id: u32,
     current_position: usize,
-    main_hidden_at_current_position: &[f32],
+    hidden_predicting_current_token: &[f32],
     initial_target_logits: &[f32],
     eos_token: Option<u32>,
     target: &mut T,
@@ -1445,7 +1571,7 @@ pub fn mtp_verify_draft_with_seed<T: MtpTargetVerifier>(
     let mtp_draft = match verifier.draft_tokens_with_logits(
         current_token_id,
         current_position,
-        main_hidden_at_current_position,
+        hidden_predicting_current_token,
         eos_token,
     ) {
         Ok(d) => d,
@@ -1486,16 +1612,31 @@ pub fn mtp_verify_draft_with_seed<T: MtpTargetVerifier>(
     // back into when `rollback_cache_to` is called below — even in the full-rejection case.
     // #282: verify_tokens advances the target cache; roll back both caches on error so
     // the caller sees a consistent pre-call state.
-    let target_logits = match target.verify_tokens(&draft, current_position + 1) {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = verifier.rollback_cache_to(mtp_start);
-            let _ = target.rollback_cache_to(target_start);
-            target.restore_gdn_states(&gdn_snap);
-            return Err(e);
-        }
-    };
+    // The hidden state after the pending token must be read before `verify_tokens_with_hidden`
+    // advances the target past it.
+    let last_hidden = target.last_hidden();
+    let (target_logits, hidden_rows) =
+        match target.verify_tokens_with_hidden(&draft, current_position + 1) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = verifier.rollback_cache_to(mtp_start);
+                let _ = target.rollback_cache_to(target_start);
+                target.restore_gdn_states(&gdn_snap);
+                return Err(e);
+            }
+        };
     let target_forwards = 1;
+    if let Some(rows) = hidden_rows.as_deref()
+        && rows.len() != draft_len
+    {
+        let _ = verifier.rollback_cache_to(mtp_start);
+        let _ = target.rollback_cache_to(target_start);
+        target.restore_gdn_states(&gdn_snap);
+        return Err(crate::error::InferenceError::InvalidInput(format!(
+            "verify_tokens_with_hidden returned {} hidden rows for {draft_len} tokens",
+            rows.len()
+        )));
+    }
 
     // Probabilistic rejection sampling (ADR-050): pass draft logits and greedy=false so
     // every draft token is accepted with probability min(1, p(x)/q(x)).
@@ -1552,8 +1693,42 @@ pub fn mtp_verify_draft_with_seed<T: MtpTargetVerifier>(
     // `accepted_count - 1` drafts via the full model). We deliberately do NOT call
     // `restore_gdn_states` on partial accept: that would overwrite the slot-restored GDN
     // with the pre-draft snapshot and leave GDN behind KV by `accepted_count` tokens.
-    verifier.rollback_cache_to(mtp_start + accepted_count)?;
+    // With the target's hidden states the accepted draft rows are rewritten below, so keep only
+    // the row for `current_token_id`, whose hidden state came from the caller.
+    let target_hiddens = last_hidden.as_deref().zip(hidden_rows.as_deref());
+    let mtp_keep = if target_hiddens.is_some() {
+        mtp_start + 1
+    } else {
+        mtp_start + accepted_count
+    };
+    verifier.rollback_cache_to(mtp_keep)?;
     target.rollback_cache_to(target_start + accepted_count)?;
+
+    // Drafting writes one MTP row per draft INPUT (the current token and every draft token but
+    // the last) and takes the hidden state of every row after the first from the draft head
+    // itself. Replace them with rows built from the target's hidden states: draft token `k`
+    // (1-based, at `current_position + k`) pairs with the hidden state that predicted it, which
+    // is `last_hidden` for the first and the verify row of the previous draft token after that.
+    if let Some((first, rows)) = target_hiddens {
+        for k in 1..=accepted_count {
+            let position = current_position + k;
+            if verifier.cache.is_full() || position >= verifier.rope.max_positions() {
+                // No room for the row; the next draft step reports the same condition.
+                break;
+            }
+            let predictor = if k == 1 {
+                first
+            } else {
+                rows[k - 2].as_slice()
+            };
+            if let Err(e) = verifier.append_kv_row(draft[k - 1], position, predictor) {
+                let _ = verifier.rollback_cache_to(mtp_start);
+                let _ = target.rollback_cache_to(target_start);
+                target.restore_gdn_states(&gdn_snap);
+                return Err(e);
+            }
+        }
+    }
 
     // `gdn_snap` is intentionally dropped here. On partial accept the implementor handles
     // GDN sync inside `rollback_cache_to`; on full accept GDN is already at +draft_len.
@@ -1590,6 +1765,9 @@ pub fn mtp_verify_draft_with_seed<T: MtpTargetVerifier>(
 /// `GenerateConfig.temperature` so the acceptance ratio is computed under the same
 /// distribution the target decoder samples from (#388).
 ///
+/// `hidden_predicting_current_token` and the MTP cache alignment are described under
+/// "Hidden-state contract" on [`mtp_verify_draft_with_seed`].
+///
 /// Returns an [`MtpVerifyResult`] with accepted tokens, optional fallback, metrics,
 /// and properly rolled-back caches.
 ///
@@ -1604,7 +1782,7 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     verifier: &mut MtpVerifier<'_>,
     current_token_id: u32,
     current_position: usize,
-    main_hidden_at_current_position: &[f32],
+    hidden_predicting_current_token: &[f32],
     initial_target_logits: &[f32],
     eos_token: Option<u32>,
     target: &mut T,
@@ -1614,7 +1792,7 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
         verifier,
         current_token_id,
         current_position,
-        main_hidden_at_current_position,
+        hidden_predicting_current_token,
         initial_target_logits,
         eos_token,
         target,
@@ -4396,6 +4574,441 @@ mod tests {
             Some(BONUS_TOKEN),
             "full-accept must expose the sampled bonus token as fallback_token"
         );
+    }
+
+    /// Target mock that supplies post-final-norm hidden states. `last` and `rows` stand in for
+    /// `last_hidden` and the second element of `verify_tokens_with_hidden`; `None` behaves like a
+    /// target that cannot supply them.
+    struct HiddenTargetVerifier {
+        inner: MockTargetVerifier,
+        last: Option<Vec<f32>>,
+        rows: Option<Vec<Vec<f32>>>,
+    }
+
+    impl MtpTargetVerifier for HiddenTargetVerifier {
+        fn cache_position(&self) -> usize {
+            self.inner.cache_position()
+        }
+        fn rollback_cache_to(
+            &mut self,
+            seq_len: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            self.inner.rollback_cache_to(seq_len)
+        }
+        fn verify_tokens(
+            &mut self,
+            tokens: &[u32],
+            start_pos: usize,
+        ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
+            self.inner.verify_tokens(tokens, start_pos)
+        }
+        fn last_hidden(&self) -> Option<Vec<f32>> {
+            self.last.clone()
+        }
+        #[allow(clippy::type_complexity)]
+        fn verify_tokens_with_hidden(
+            &mut self,
+            tokens: &[u32],
+            start_pos: usize,
+        ) -> Result<(Vec<Vec<f32>>, Option<Vec<Vec<f32>>>), crate::error::InferenceError> {
+            Ok((
+                self.inner.verify_tokens(tokens, start_pos)?,
+                self.rows.clone(),
+            ))
+        }
+        fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
+            Vec::new()
+        }
+        fn restore_gdn_states(&mut self, _snapshot: &crate::attention::gdn::GdnSnapshot) {}
+    }
+
+    const HS_TOKEN: u32 = 1;
+    const HS_POSITION: usize = 0;
+
+    struct HiddenScenario {
+        cfg: MtpConfig,
+        weights: MtpWeights,
+        embed: Vec<f32>,
+        lm_head: Vec<f32>,
+        hidden_predicting: Vec<f32>,
+        draft: MtpDraft,
+        eos: Option<u32>,
+        max_seq: usize,
+    }
+
+    /// Probe a throwaway verifier for the deterministic draft so target distributions can be
+    /// built bit-identical to it (accept probability exactly 1.0 at every position).
+    /// `stop_after_first` makes the first drafted token the EOS token, so the draft is one token
+    /// long while `draft_length` stays at the minimum the loop accepts.
+    fn hidden_scenario(
+        draft_length: usize,
+        stop_after_first: bool,
+        max_seq: usize,
+    ) -> HiddenScenario {
+        let mut cfg = tiny_mtp_config();
+        cfg.draft_length = draft_length;
+        let weights = tiny_mtp_weights(&cfg);
+        let vocab = cfg.vocab_size;
+        let h = cfg.hidden_size;
+        let embed: Vec<f32> = (0..vocab * h)
+            .map(|i| ((i as f32 + 1.0) * 0.01).sin())
+            .collect();
+        let lm_head: Vec<f32> = (0..vocab * h)
+            .map(|i| ((i as f32 + 2.0) * 0.01).cos())
+            .collect();
+        let hidden_predicting: Vec<f32> = (0..h).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+
+        let probe_draft = |eos: Option<u32>| {
+            let mut probe =
+                MtpVerifier::new(cfg.clone(), &weights, &embed, &lm_head, max_seq).unwrap();
+            probe
+                .draft_tokens_with_logits(HS_TOKEN, HS_POSITION, &hidden_predicting, eos)
+                .unwrap()
+        };
+        let mut draft = probe_draft(None);
+        let mut eos = None;
+        if stop_after_first {
+            eos = Some(draft.tokens[0]);
+            draft = probe_draft(eos);
+            assert_eq!(
+                draft.tokens.len(),
+                1,
+                "an EOS first draft must stop the draft"
+            );
+        } else {
+            assert_eq!(draft.tokens.len(), draft_length);
+        }
+        HiddenScenario {
+            cfg,
+            weights,
+            embed,
+            lm_head,
+            hidden_predicting,
+            draft,
+            eos,
+            max_seq,
+        }
+    }
+
+    fn one_hot_logits(vocab: usize, token: u32) -> Vec<f32> {
+        let mut l = vec![f32::NEG_INFINITY; vocab];
+        l[token as usize] = 0.0;
+        l
+    }
+
+    /// Target logits for the verify call when exactly `accepted` draft tokens agree with the
+    /// target: p == q for every agreeing position, a one-hot disagreement at the first rejected
+    /// one, and a one-hot bonus after the last position.
+    fn hs_step_logits(s: &HiddenScenario, accepted: usize) -> Vec<Vec<f32>> {
+        let vocab = s.cfg.vocab_size;
+        let mut l: Vec<Vec<f32>> = s.draft.logits[1..].to_vec();
+        l.push(one_hot_logits(vocab, 6));
+        if accepted >= 1 && accepted < s.draft.tokens.len() {
+            let mismatch = (s.draft.tokens[accepted] + 1) % vocab as u32;
+            l[accepted - 1] = one_hot_logits(vocab, mismatch);
+        }
+        l
+    }
+
+    /// Target logits for the pending token: they agree with the first draft token unless
+    /// `accepted` is zero.
+    fn hs_initial_logits(s: &HiddenScenario, accepted: usize) -> Vec<f32> {
+        if accepted == 0 {
+            let vocab = s.cfg.vocab_size;
+            one_hot_logits(vocab, (s.draft.tokens[0] + 1) % vocab as u32)
+        } else {
+            s.draft.logits[0].clone()
+        }
+    }
+
+    /// One distinct, non-trivial hidden row per index.
+    fn distinct_hidden_rows(n: usize, hidden: usize) -> Vec<Vec<f32>> {
+        (0..n)
+            .map(|i| {
+                (0..hidden)
+                    .map(|j| ((i * hidden + j) as f32 * 0.7 + 0.3).sin() + 0.5 * i as f32)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn hidden_target(
+        logits_by_step: Vec<Vec<f32>>,
+        last: Option<Vec<f32>>,
+        rows: Option<Vec<Vec<f32>>>,
+    ) -> HiddenTargetVerifier {
+        HiddenTargetVerifier {
+            inner: MockTargetVerifier {
+                cache_pos: HS_POSITION + 1,
+                logits_by_step,
+                calls: vec![],
+            },
+            last,
+            rows,
+        }
+    }
+
+    fn hs_run<'a, T: MtpTargetVerifier>(
+        s: &'a HiddenScenario,
+        initial_target_logits: &[f32],
+        target: &mut T,
+    ) -> Result<(MtpVerifyResult, MtpVerifier<'a>), crate::error::InferenceError> {
+        let mut verifier =
+            MtpVerifier::new(s.cfg.clone(), &s.weights, &s.embed, &s.lm_head, s.max_seq).unwrap();
+        let result = mtp_verify_draft(
+            &mut verifier,
+            HS_TOKEN,
+            HS_POSITION,
+            &s.hidden_predicting,
+            initial_target_logits,
+            s.eos,
+            target,
+            1.0,
+        )?;
+        Ok((result, verifier))
+    }
+
+    fn cache_kv_row(v: &MtpVerifier<'_>, row: usize) -> (Vec<half::f16>, Vec<half::f16>) {
+        let kv_dim = v.config.num_key_value_heads * v.config.head_dim;
+        (
+            v.cache.k_buffer(0)[row * kv_dim..(row + 1) * kv_dim].to_vec(),
+            v.cache.v_buffer(0)[row * kv_dim..(row + 1) * kv_dim].to_vec(),
+        )
+    }
+
+    /// The K/V row a full `forward_one` step writes for (`token`, `hidden`) at `position` on a
+    /// fresh verifier: the independent computation an appended row must equal.
+    fn reference_kv_row(
+        s: &HiddenScenario,
+        token: u32,
+        position: usize,
+        hidden: &[f32],
+    ) -> (Vec<half::f16>, Vec<half::f16>) {
+        let mut v =
+            MtpVerifier::new(s.cfg.clone(), &s.weights, &s.embed, &s.lm_head, s.max_seq).unwrap();
+        v.forward_one(token, position, hidden).unwrap();
+        cache_kv_row(&v, 0)
+    }
+
+    /// The MTP cache holds the row for the current token (built from the caller's hidden state)
+    /// followed by one row per accepted draft token, each built by a fresh `forward_one` from the
+    /// token's own position and the hidden state that predicted it.
+    fn assert_target_hidden_rows(
+        s: &HiddenScenario,
+        v: &MtpVerifier<'_>,
+        accepted: &[u32],
+        last: &[f32],
+        rows: &[Vec<f32>],
+    ) {
+        assert_eq!(
+            v.cache.seq_len(),
+            1 + accepted.len(),
+            "cursor must be the current token's row plus one row per accepted draft token"
+        );
+        assert_eq!(
+            cache_kv_row(v, 0),
+            reference_kv_row(s, HS_TOKEN, HS_POSITION, &s.hidden_predicting),
+            "row for the current token keeps the caller's hidden state"
+        );
+        for (i, &token) in accepted.iter().enumerate() {
+            let k = i + 1;
+            let predictor = if k == 1 { last } else { rows[k - 2].as_slice() };
+            assert_eq!(
+                cache_kv_row(v, k),
+                reference_kv_row(s, token, HS_POSITION + k, predictor),
+                "row for draft token {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn mtp_verify_draft_target_hidden_full_accept_rewrites_rows() {
+        let s = hidden_scenario(3, false, 8);
+        let all = distinct_hidden_rows(4, s.cfg.hidden_size);
+        let rows = all[..3].to_vec();
+        let last = all[3].clone();
+        let mut target = hidden_target(
+            hs_step_logits(&s, 3),
+            Some(last.clone()),
+            Some(rows.clone()),
+        );
+
+        let (result, v) = hs_run(&s, &hs_initial_logits(&s, 3), &mut target).unwrap();
+
+        assert_eq!(result.accepted_count, 3);
+        assert_eq!(target.inner.cache_pos, HS_POSITION + 1 + 3);
+        assert_target_hidden_rows(&s, &v, &s.draft.tokens, &last, &rows);
+
+        // The rewrite is observable: drafting built rows 1 and 2 from the draft head's own
+        // hidden state, which differs from the target's.
+        let mut plain = MockTargetVerifier {
+            cache_pos: HS_POSITION + 1,
+            logits_by_step: hs_step_logits(&s, 3),
+            calls: vec![],
+        };
+        let (_, plain_v) = hs_run(&s, &hs_initial_logits(&s, 3), &mut plain).unwrap();
+        for k in 1..3 {
+            assert_ne!(
+                cache_kv_row(&v, k),
+                cache_kv_row(&plain_v, k),
+                "row {k} must come from the target's hidden state, not the drafted one"
+            );
+        }
+    }
+
+    #[test]
+    fn mtp_verify_draft_target_hidden_partial_accept_rewrites_prefix_rows() {
+        let s = hidden_scenario(3, false, 8);
+        let all = distinct_hidden_rows(4, s.cfg.hidden_size);
+        let rows = all[..3].to_vec();
+        let last = all[3].clone();
+        let mut target = hidden_target(
+            hs_step_logits(&s, 2),
+            Some(last.clone()),
+            Some(rows.clone()),
+        );
+
+        let (result, v) = hs_run(&s, &hs_initial_logits(&s, 2), &mut target).unwrap();
+
+        assert_eq!(result.accepted_count, 2);
+        assert_eq!(target.inner.cache_pos, HS_POSITION + 1 + 2);
+        assert_target_hidden_rows(&s, &v, &s.draft.tokens[..2], &last, &rows);
+    }
+
+    #[test]
+    fn mtp_verify_draft_target_hidden_reject_keeps_current_token_row() {
+        let s = hidden_scenario(3, false, 8);
+        let all = distinct_hidden_rows(4, s.cfg.hidden_size);
+        let rows = all[..3].to_vec();
+        let last = all[3].clone();
+        let mut target = hidden_target(
+            hs_step_logits(&s, 0),
+            Some(last.clone()),
+            Some(rows.clone()),
+        );
+
+        let (result, v) = hs_run(&s, &hs_initial_logits(&s, 0), &mut target).unwrap();
+
+        assert_eq!(result.accepted_count, 0);
+        assert_eq!(target.inner.cache_pos, HS_POSITION + 1);
+        assert_target_hidden_rows(&s, &v, &[], &last, &rows);
+
+        // Before, a reject also discarded the current token's own row.
+        let mut plain = MockTargetVerifier {
+            cache_pos: HS_POSITION + 1,
+            logits_by_step: hs_step_logits(&s, 0),
+            calls: vec![],
+        };
+        let (_, plain_v) = hs_run(&s, &hs_initial_logits(&s, 0), &mut plain).unwrap();
+        assert_eq!(plain_v.cache.seq_len(), 0);
+    }
+
+    #[test]
+    fn mtp_verify_draft_target_hidden_first_draft_row_uses_last_hidden() {
+        // One drafted token: its row cannot come from a verify row (the verify call starts at
+        // that token), so the only correct source is the hidden state after the current token.
+        let s = hidden_scenario(2, true, 8);
+        let all = distinct_hidden_rows(2, s.cfg.hidden_size);
+        let rows = all[..1].to_vec();
+        let last = all[1].clone();
+        let mut target = hidden_target(
+            hs_step_logits(&s, 1),
+            Some(last.clone()),
+            Some(rows.clone()),
+        );
+
+        let (result, v) = hs_run(&s, &hs_initial_logits(&s, 1), &mut target).unwrap();
+
+        assert_eq!(result.accepted_count, 1);
+        assert_target_hidden_rows(&s, &v, &s.draft.tokens[..1], &last, &rows);
+        let token = s.draft.tokens[0];
+        let right = reference_kv_row(&s, token, HS_POSITION + 1, &last);
+        for wrong in [&s.hidden_predicting, &rows[0]] {
+            assert_ne!(
+                right,
+                reference_kv_row(&s, token, HS_POSITION + 1, wrong),
+                "the scenario must make a wrong pairing observable"
+            );
+        }
+    }
+
+    #[test]
+    fn mtp_verify_draft_target_hidden_missing_input_leaves_cache_as_drafted() {
+        let s = hidden_scenario(3, false, 8);
+        let all = distinct_hidden_rows(4, s.cfg.hidden_size);
+        let rows = all[..3].to_vec();
+        let last = all[3].clone();
+
+        for accepted in [3usize, 2, 0] {
+            // The default trait methods: a target that only implements `verify_tokens`.
+            let mut plain = MockTargetVerifier {
+                cache_pos: HS_POSITION + 1,
+                logits_by_step: hs_step_logits(&s, accepted),
+                calls: vec![],
+            };
+            let (plain_r, plain_v) =
+                hs_run(&s, &hs_initial_logits(&s, accepted), &mut plain).unwrap();
+            assert_eq!(plain_r.accepted_count, accepted);
+            assert_eq!(
+                plain_v.cache.seq_len(),
+                accepted,
+                "cursor ends at the drafted rows of the accepted prefix"
+            );
+
+            let arms = [
+                (Some(last.clone()), None),
+                (None, Some(rows.clone())),
+                (None, None),
+            ];
+            for (last_hidden, hidden_rows) in arms {
+                let mut target =
+                    hidden_target(hs_step_logits(&s, accepted), last_hidden, hidden_rows);
+                let (r, v) = hs_run(&s, &hs_initial_logits(&s, accepted), &mut target).unwrap();
+                assert_eq!(r, plain_r, "accepted={accepted}");
+                assert_eq!(v.cache.seq_len(), accepted, "accepted={accepted}");
+                for k in 0..accepted {
+                    assert_eq!(cache_kv_row(&v, k), cache_kv_row(&plain_v, k));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mtp_verify_draft_target_hidden_row_count_mismatch_errs_and_restores_target() {
+        let s = hidden_scenario(3, false, 8);
+        let all = distinct_hidden_rows(3, s.cfg.hidden_size);
+        let mut target = hidden_target(
+            hs_step_logits(&s, 3),
+            Some(all[2].clone()),
+            Some(all[..2].to_vec()),
+        );
+
+        let err = hs_run(&s, &hs_initial_logits(&s, 3), &mut target).err();
+
+        assert!(err.is_some(), "a short row set is a contract violation");
+        assert_eq!(
+            target.inner.cache_pos,
+            HS_POSITION + 1,
+            "target cache restored to its pre-call position"
+        );
+    }
+
+    #[test]
+    fn mtp_verify_draft_target_hidden_full_accept_at_mtp_capacity_keeps_cursor() {
+        // The MTP cache holds exactly the drafted rows, so there is no room for the rewrite's
+        // extra row. The call still succeeds and the cursor stops at capacity.
+        let s = hidden_scenario(3, false, 3);
+        let all = distinct_hidden_rows(4, s.cfg.hidden_size);
+        let mut target = hidden_target(
+            hs_step_logits(&s, 3),
+            Some(all[3].clone()),
+            Some(all[..3].to_vec()),
+        );
+
+        let (result, v) = hs_run(&s, &hs_initial_logits(&s, 3), &mut target).unwrap();
+
+        assert_eq!(result.accepted_count, 3);
+        assert_eq!(v.cache.seq_len(), 3);
     }
 
     /// Rescale `softmax(base_logits)[token]` by `ratio` (renormalised) and return the
