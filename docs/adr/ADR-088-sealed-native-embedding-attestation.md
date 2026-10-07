@@ -442,7 +442,7 @@ Geometry alone is not sufficient. Prepared D4 also validates a closed set of out
 `hidden_act` must be present and exactly `"gelu"`; the effective implementation value recorded in
 the descriptor is `GeluTanhApproxV1`, the tanh-form GELU approximation
 `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`, with Lattice's CPU `fast_tanh`
-kernel (a clamped 13/6 rational, maximum absolute error below 1e-6 over finite f32 inputs). It is
+kernel (a clamped 9/6 rational, maximum absolute error below 1e-6 over finite f32 inputs). It is
 not the erf-exact GELU and is not interchangeable with `relu`,
 `gelu_new`, or another activation name. `position_embedding_type` must be present and exactly
 `"absolute"`; absence is rejected rather than interpreted as an implicit default. The existing
