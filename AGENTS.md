@@ -187,8 +187,8 @@ All local, all load from HuggingFace safetensors. Downloaded on first use to `~/
 | `MultilingualE5Base`                | BERT encoder       | 768        | 512    | SentencePiece |
 | `AllMiniLmL6V2`                     | BERT encoder       | 384        | 256    | WordPiece     |
 | `ParaphraseMultilingualMiniLmL12V2` | BERT encoder       | 384        | 128    | WordPiece     |
-| `Qwen3Embedding0_6B`                | Decoder (GQA+RoPE) | 1024       | 8192   | BPE           |
-| `Qwen3Embedding4B`                  | Decoder (GQA+RoPE) | 2560       | 8192   | BPE           |
+| `Qwen3Embedding0_6B`                | Decoder (GQA+RoPE) | 1024       | 2048   | BPE           |
+| `Qwen3Embedding4B`                  | Decoder (GQA+RoPE) | 2560       | 2048   | BPE           |
 
 E5 models need `"query: "` / `"passage: "` prefixes. Qwen3 needs instruction prefix. Use `EmbeddingModel::query_instruction()` and `document_instruction()`.
 

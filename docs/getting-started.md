@@ -97,7 +97,7 @@ let _ = EmbeddingModel::BgeLargeEnV15;  // 1024d, 512 tokens
 let _ = EmbeddingModel::MultilingualE5Small;  // 384d — prefix "query: " / "passage: "
 let _ = EmbeddingModel::MultilingualE5Base;   // 768d — prefix "query: " / "passage: "
 
-// Decoder-based, long context (8192 tokens)
+// Decoder-based (2048 tokens)
 let _ = EmbeddingModel::Qwen3Embedding0_6B;  // 1024d, MRL-capable
 let _ = EmbeddingModel::Qwen3Embedding4B;    // 2560d, MRL-capable
 

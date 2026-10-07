@@ -54,14 +54,15 @@ index, or constructing an embedding cache key.
 | `MultilingualE5Base`                | `intfloat/multilingual-e5-base`                               |               768 |                               512 | Local     | Mean                |
 | `AllMiniLmL6V2`                     | `sentence-transformers/all-MiniLM-L6-v2`                      |               384 |                               256 | Local     | Mean                |
 | `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` |               384 |                               128 | Local     | Mean                |
-| `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   |             1,024 |                             8,192 | Local     | Not a BERT path     |
-| `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     |             2,560 |                             8,192 | Local     | Not a BERT path     |
+| `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   |             1,024 |                             2,048 | Local     | Not a BERT path     |
+| `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     |             2,560 |                             2,048 | Local     | Not a BERT path     |
 | `EmbeddingGemma2`                   | `google/embeddinggemma-2`                                     |               768 |                             8,192 | Local     | Not a BERT path     |
 | `TextEmbedding3Small`               | `text-embedding-3-small`                                      |             1,536 |                             8,191 | Remote    | Not a BERT path     |
 
 The limits are intended for chunking and truncation. They leave room for
-special tokens. In particular, Qwen3-Embedding is capped at 8,192 tokens for
-practical use even though the underlying model supports a longer context.
+special tokens. In particular, Qwen3-Embedding is capped at 2,048 tokens: the
+native service's tokenizer truncates longer input even though the underlying
+model supports a longer context.
 
 `EmbeddingGemma2` is a bidirectional encoder. The native service truncates input
 to 8,192 tokens, counting the beginning and end tokens that wrap every input,
@@ -357,8 +358,8 @@ width.
 
 `max_input_tokens()` is a conservative chunking limit rather than a tokenizer operation. It
 leaves room for special tokens and currently reports 512 for BGE and E5, 256 for all-MiniLM,
-128 for paraphrase multilingual MiniLM, 8,192 for Qwen3-Embedding, and 8,191 for the remote
-OpenAI variant.
+128 for paraphrase multilingual MiniLM, 2,048 for Qwen3-Embedding (the tokenizer's sequence
+limit), and 8,191 for the remote OpenAI variant.
 
 The query and document instruction accessors return the literal prefix that must be prepended to
 the original text, or `None` for raw text. E5 uses paired `query:` and `passage:` prefixes, each

@@ -124,9 +124,9 @@ tokens a model wraps around a sequence, and any role instruction, are counted.
 `truncated()` is `embedded < before_truncation`, so an input that fills the limit exactly is not
 truncated and one token more is. The limit is the one the loaded model applies and it is not the
 same number for every model: it can differ from `EmbeddingModel::max_input_tokens`, which is a
-conservative figure for chunking. For Qwen3 Embedding the limit applied today is the tokenizer's
-2048 tokens, while `max_input_tokens` reports 8192; that mismatch is tracked in issue #1849. Size
-chunks from `count_tokens`, not from `max_input_tokens`.
+conservative figure for chunking. For Qwen3 Embedding the two agree: the limit applied is the
+tokenizer's 2048 tokens and `max_input_tokens` reports the same. Size chunks from `count_tokens`,
+not from `max_input_tokens`.
 
 Both methods have default bodies that return `EmbedError::Unsupported`, naming the service and the
 operation, so a third-party `EmbeddingService` keeps compiling and gets a typed refusal instead of

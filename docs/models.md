@@ -32,12 +32,12 @@ Qwen3 embedding and Qwen3.5/Qwen3.6 generation paths require local files.
 | `MultilingualE5Base`                | `intfloat/multilingual-e5-base`                               |  768  |    512     |    mean    |       ✓        |    shipped    |
 | `AllMiniLmL6V2`                     | `sentence-transformers/all-MiniLM-L6-v2`                      |  384  |    256     |    mean    |       ✓        |    shipped    |
 | `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` |  384  |    128     |    mean    |       ✓        |    shipped    |
-| `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   | 1024  |   8192†    | last-token | local dir only |    partial    |
-| `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     | 2560‡ |   8192†    | last-token | local dir only |    partial    |
+| `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   | 1024  |   2048†    | last-token | local dir only |    partial    |
+| `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     | 2560‡ |   2048†    | last-token | local dir only |    partial    |
 | `TextEmbedding3Small`               | `text-embedding-3-small` (OpenAI)                             | 1536  |    8191    |     —      |       —        | scaffold-only |
 
-†Model config advertises 32 768 max positions; `EmbeddingModel::max_input_tokens()` caps service
-usage at 8 192.
+†Model config advertises 32 768 max positions; `EmbeddingModel::max_input_tokens()` reports 2 048,
+the tokenizer's sequence limit, and the native service truncates longer input.
 
 ‡`Qwen3Embedding4B` and `Qwen3Embedding0_6B` both support MRL (Matryoshka Representation
 Learning): the output dimension can be truncated to any value ≥ 32 via
