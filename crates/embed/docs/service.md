@@ -116,10 +116,10 @@ and counts the text `embed` sees.
 A `TokenCount` has two fields, measured on the sequence the model consumes. The beginning and end
 tokens a model wraps around a sequence, and any role instruction, are counted.
 
-| Field               | Meaning                                                                      |
-| ------------------- | ---------------------------------------------------------------------------- |
-| `before_truncation` | Length of the sequence had no limit applied                                  |
-| `embedded`          | Length of the sequence the model embedded; never above `before_truncation`   |
+| Field               | Meaning                                                                    |
+| ------------------- | -------------------------------------------------------------------------- |
+| `before_truncation` | Length of the sequence with no limit applied                               |
+| `embedded`          | Length of the sequence the model embedded; never above `before_truncation` |
 
 `truncated()` is `embedded < before_truncation`, so an input that fills the limit exactly is not
 truncated and one token more is. The limit is the one the loaded model applies and it is not the
@@ -137,11 +137,11 @@ them.
 `NativeEmbeddingService` produces the counts from the tokenizers' own pre-truncation length, so
 counting costs one tokenization per text:
 
-| Family                   | `before_truncation`                              | `embedded`                                               |
-| ------------------------ | ------------------------------------------------ | -------------------------------------------------------- |
-| BERT family (BGE, E5, MiniLM) | Tokenizer length with `[CLS]`/`[SEP]` or `<s>`/`</s>` | That length capped by the tokenizer's sequence limit and the model's position table |
-| Qwen3 Embedding          | Tokenizer length, plus the end token when the model has to append it | Length of the sequence the model embeds, capped at the tokenizer's 2048: the end token is appended, or replaces the last token when the limit is full |
-| EmbeddingGemma 2         | Text tokens plus the beginning and end tokens    | Capped at 8192 including both wrapping tokens             |
+| Family                        | `before_truncation`                                                  | `embedded`                                                                                                                                            |
+| ----------------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| BERT family (BGE, E5, MiniLM) | Tokenizer length with `[CLS]`/`[SEP]` or `<s>`/`</s>`                | That length capped by the tokenizer's sequence limit and the model's position table                                                                   |
+| Qwen3 Embedding               | Tokenizer length, plus the end token when the model has to append it | Length of the sequence the model embeds, capped at the tokenizer's 2048: the end token is appended, or replaces the last token when the limit is full |
+| EmbeddingGemma 2              | Text tokens plus the beginning and end tokens                        | Capped at 8192 including both wrapping tokens                                                                                                         |
 
 The count paths load the model, because the tokenizer lives with it. `embed_with_report` on
 EmbeddingGemma 2 tokenizes once and embeds those ids. On the BERT and Qwen paths the model's
