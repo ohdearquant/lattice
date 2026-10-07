@@ -23,7 +23,7 @@ pub(super) fn metal_device_present() -> bool {
 /// The id the fixture vocabulary gives one character: lowercase letters are
 /// ids 0..26 and `A`.. continue from 26. Written out here so the expected
 /// sequences do not pass through the tokenizer under test.
-fn id_of(c: char) -> u32 {
+pub(super) fn id_of(c: char) -> u32 {
     match c {
         'a'..='z' => c as u32 - 'a' as u32,
         'A'..='F' => 26 + c as u32 - 'A' as u32,
@@ -31,7 +31,7 @@ fn id_of(c: char) -> u32 {
     }
 }
 
-fn ids_of(text: &str) -> Vec<u32> {
+pub(super) fn ids_of(text: &str) -> Vec<u32> {
     text.chars().map(id_of).collect()
 }
 
@@ -166,6 +166,72 @@ fn thinking_fixture(
         logprobs: None,
     };
     (tokenizer, gen_cfg)
+}
+
+/// The single-character vocabulary with id 1 decoding to the lone byte 0xE4,
+/// which the detokenizer holds until the final flush renders it as U+FFFD,
+/// though a grammar reads it as `b`; and id 30 spelled `</think>`. Returns the
+/// tokenizer and the bytes the grammar engine reads each id as.
+pub(super) fn lone_byte_vocabulary() -> (BpeTokenizer, Vec<Vec<u8>>) {
+    use std::collections::HashMap;
+
+    let mut grammar_bytes = single_char_vocab_bytes();
+    grammar_bytes[30] = b"</think>".to_vec();
+    let mut vocab: HashMap<String, u32> = grammar_bytes
+        .iter()
+        .zip(0u32..)
+        .map(|(bytes, id)| (String::from_utf8_lossy(bytes).into_owned(), id))
+        .collect();
+    vocab.remove("b");
+    vocab.insert("\u{e4}".to_string(), 1);
+    let tokenizer =
+        BpeTokenizer::from_vocab_and_merges(vocab, Vec::new()).expect("lone-byte tokenizer");
+    (tokenizer, grammar_bytes)
+}
+
+/// A greedy request over the lone-byte vocabulary whose grammar fixes the
+/// generated ids. A reasoning budget turns thinking on.
+fn lone_byte_cfg(
+    gbnf: &str,
+    max_new_tokens: usize,
+    stop_token_ids: &[u32],
+    stop_strings: &[&str],
+    reasoning_budget: Option<usize>,
+) -> GenerateConfig {
+    use crate::grammar::{GrammarEngine, GrammarSpec};
+
+    let (_, grammar_bytes) = lone_byte_vocabulary();
+    let engine = GrammarEngine::new(&GrammarSpec::Gbnf(gbnf.to_string()), grammar_bytes)
+        .expect("grammar engine builds over the lone-byte vocabulary");
+    GenerateConfig {
+        grammar: Some(std::sync::Arc::new(engine)),
+        stop_token_ids: stop_token_ids.to_vec(),
+        stop_strings: stop_strings.iter().map(ToString::to_string).collect(),
+        enable_thinking: reasoning_budget.is_some(),
+        reasoning_budget,
+        ..cross_turn_test_gen_cfg(1, max_new_tokens)
+    }
+}
+
+/// Runs one request with the prompt "ac" over the lone-byte vocabulary on a
+/// fresh state, and returns the state with the request's output.
+fn run_lone_byte_request(
+    gen_cfg: &GenerateConfig,
+) -> (MetalQwen35State, crate::generation::GenerateOutput) {
+    let (tokenizer, _) = lone_byte_vocabulary();
+    let (mut cfg, weights) = tiny_hybrid_fixture();
+    cfg.eos_token_id = u32::MAX;
+    let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+    let turn = state
+        .generate_streaming_with_prefix_cache(
+            CrossTurnSlotId::DEFAULT,
+            "ac",
+            &tokenizer,
+            gen_cfg,
+            |_, _| true,
+        )
+        .expect("a lone-byte request must not error");
+    (state, turn.output)
 }
 
 #[test]
@@ -787,4 +853,221 @@ fn zero_token_budget_leaves_the_warm_slot_untouched() {
     assert_eq!(turn2.cache.reused_tokens, 0);
     // A zero-budget request returns before touching any state, warm entry included.
     assert_saved_boundary(&state, slot_id, &warm_boundary);
+}
+
+#[test]
+fn stop_string_spanning_two_tokens_leaves_the_slot_empty() {
+    let _gpu_guard = gpu_test_lock();
+    if !metal_device_present() {
+        return;
+    }
+    let tokenizer = single_char_vocab_tokenizer();
+    let (cfg, weights) = tiny_hybrid_fixture();
+    let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+    let slot_id = CrossTurnSlotId::DEFAULT;
+    // The grammar forces "a", "b", "c" in order and the stop string "bc" is only
+    // complete once the third token is pushed.
+    let mut gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"b\" \"c\"\n", 5);
+    gen_cfg.stop_strings = vec!["bc".to_string()];
+
+    let turn = state
+        .generate_streaming_with_prefix_cache(slot_id, "a", &tokenizer, &gen_cfg, |_, _| true)
+        .expect("a stop string spanning two tokens must not error");
+    assert!(turn.output.stopped);
+    assert_eq!(turn.output.stop_reason, Some(StopReason::Eos));
+    assert_eq!(turn.output.token_ids, vec![0, 1, 2]);
+    assert_eq!(turn.output.text, "a");
+    assert_slot_empty(
+        &state,
+        slot_id,
+        "tokens behind a stop-string match must never be saved",
+    );
+}
+
+#[test]
+fn stop_string_held_back_and_never_matched_saves_every_generated_token() {
+    let _gpu_guard = gpu_test_lock();
+    if !metal_device_present() {
+        return;
+    }
+    let tokenizer = single_char_vocab_tokenizer();
+    let (mut cfg, weights) = tiny_hybrid_fixture();
+    cfg.eos_token_id = u32::MAX;
+    let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+    let slot_id = CrossTurnSlotId::DEFAULT;
+    // The grammar forces "a" .. "e" and the cap stops the request after "c". The
+    // stop string "cde" holds the "c" back, and the final flush releases it
+    // without a match.
+    let mut gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"b\" \"c\" \"d\" \"e\"\n", 3);
+    gen_cfg.stop_strings = vec!["cde".to_string()];
+
+    let turn = state
+        .generate_streaming_with_prefix_cache(slot_id, "a", &tokenizer, &gen_cfg, |_, _| true)
+        .expect("a held-back stop string must not error");
+    assert!(!turn.output.stopped);
+    assert_eq!(turn.output.stop_reason, Some(StopReason::Length));
+    assert_eq!(turn.output.token_ids, vec![0, 1, 2]);
+    assert_eq!(turn.output.text, "abc");
+
+    // The silent final step forwards the last token, so the boundary is the
+    // prompt and all three generated ids.
+    assert_saved_boundary(&state, slot_id, &[0, 0, 1, 2]);
+}
+
+#[test]
+fn lone_byte_request_that_hits_the_cap_saves_every_generated_token() {
+    let _gpu_guard = gpu_test_lock();
+    if !metal_device_present() {
+        return;
+    }
+    let gen_cfg = lone_byte_cfg("root ::= \"a\" \"b\" \"b\" \"b\"\n", 2, &[], &[], None);
+
+    let (state, output) = run_lone_byte_request(&gen_cfg);
+    assert!(!output.stopped);
+    assert_eq!(output.stop_reason, Some(StopReason::Length));
+    assert_eq!(output.token_ids, vec![0, 1]);
+    assert_eq!(output.text, "a\u{fffd}");
+
+    let mut expected = ids_of("ac");
+    expected.extend([0, 1]);
+    assert_saved_boundary(&state, CrossTurnSlotId::DEFAULT, &expected);
+}
+
+#[test]
+fn lone_byte_flush_completing_a_stop_string_after_the_cap_leaves_the_slot_empty() {
+    let _gpu_guard = gpu_test_lock();
+    if !metal_device_present() {
+        return;
+    }
+    let gen_cfg = lone_byte_cfg(
+        "root ::= \"a\" \"b\" \"b\" \"b\"\n",
+        2,
+        &[],
+        &["\u{fffd}"],
+        None,
+    );
+
+    let (state, output) = run_lone_byte_request(&gen_cfg);
+    assert!(output.stopped);
+    assert_eq!(output.stop_reason, Some(StopReason::Eos));
+    assert_eq!(output.token_ids, vec![0, 1]);
+    assert_eq!(
+        output.text, "a",
+        "the stop string must have been completed by the flush of the held byte"
+    );
+    assert_slot_empty(
+        &state,
+        CrossTurnSlotId::DEFAULT,
+        "a stop string completed by the final flush must not save the tokens behind it",
+    );
+}
+
+#[test]
+fn lone_byte_stop_token_saves_the_tokens_it_forwarded() {
+    let _gpu_guard = gpu_test_lock();
+    if !metal_device_present() {
+        return;
+    }
+    let gen_cfg = lone_byte_cfg("root ::= \"a\" \"b\" \"c\"\n", 5, &[2], &[], None);
+
+    let (state, output) = run_lone_byte_request(&gen_cfg);
+    assert!(output.stopped);
+    assert_eq!(output.stop_reason, Some(StopReason::Eos));
+    assert_eq!(output.token_ids, vec![0, 1]);
+    assert_eq!(output.text, "a\u{fffd}");
+
+    let mut expected = ids_of("ac");
+    expected.extend([0, 1]);
+    assert_saved_boundary(&state, CrossTurnSlotId::DEFAULT, &expected);
+}
+
+#[test]
+fn lone_byte_stop_token_then_flush_completed_stop_string_leaves_the_slot_empty() {
+    let _gpu_guard = gpu_test_lock();
+    if !metal_device_present() {
+        return;
+    }
+    // The stop token ends the request on an opened prediction that is never
+    // pushed, and the stop string is completed only afterwards, by the flush of
+    // the byte the detokenizer was holding.
+    let gen_cfg = lone_byte_cfg("root ::= \"a\" \"b\" \"c\"\n", 5, &[2], &["\u{fffd}"], None);
+
+    let (state, output) = run_lone_byte_request(&gen_cfg);
+    assert!(output.stopped);
+    assert_eq!(output.stop_reason, Some(StopReason::Eos));
+    assert_eq!(output.token_ids, vec![0, 1]);
+    assert_eq!(
+        output.text, "a",
+        "the stop string must have been completed by the flush of the held byte"
+    );
+    assert_slot_empty(
+        &state,
+        CrossTurnSlotId::DEFAULT,
+        "a stop string completed by the final flush after a stop token must not save the \
+         tokens behind it",
+    );
+}
+
+#[test]
+fn lone_byte_grammar_completed_by_the_first_sample_saves_the_prompt_only_boundary() {
+    let _gpu_guard = gpu_test_lock();
+    if !metal_device_present() {
+        return;
+    }
+    let gen_cfg = lone_byte_cfg("root ::= \"b\"\n", 4, &[], &[], None);
+
+    let (state, output) = run_lone_byte_request(&gen_cfg);
+    assert!(output.stopped);
+    assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+    assert_eq!(output.token_ids, vec![1]);
+    assert_eq!(output.text, "\u{fffd}");
+
+    // The completing token was never forwarded, so it stays out of the boundary.
+    assert_saved_boundary(&state, CrossTurnSlotId::DEFAULT, &ids_of("ac"));
+}
+
+#[test]
+fn budget_rejection_after_a_held_byte_saves_the_forwarded_boundary() {
+    let _gpu_guard = gpu_test_lock();
+    if !metal_device_present() {
+        return;
+    }
+    // The grammar forces the lone-byte token first. With a reasoning budget of
+    // one, the first decode iteration forwards it and then overrides the sampled
+    // token with `</think>`, which the grammar rejects before it is pushed.
+    let gen_cfg = lone_byte_cfg("root ::= \"b\" \"b\"\n", 4, &[], &[], Some(1));
+
+    let (state, output) = run_lone_byte_request(&gen_cfg);
+    assert!(!output.stopped);
+    assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+    assert_eq!(output.token_ids, vec![1]);
+    assert_eq!(output.text, "\u{fffd}");
+
+    let mut expected = ids_of("ac");
+    expected.push(1);
+    assert_saved_boundary(&state, CrossTurnSlotId::DEFAULT, &expected);
+}
+
+#[test]
+fn budget_rejection_after_a_held_byte_then_flush_completed_stop_string_leaves_the_slot_empty() {
+    let _gpu_guard = gpu_test_lock();
+    if !metal_device_present() {
+        return;
+    }
+    let gen_cfg = lone_byte_cfg("root ::= \"b\" \"b\"\n", 4, &[], &["\u{fffd}"], Some(1));
+
+    let (state, output) = run_lone_byte_request(&gen_cfg);
+    assert!(output.stopped);
+    assert_eq!(output.stop_reason, Some(StopReason::Eos));
+    assert_eq!(output.token_ids, vec![1]);
+    assert_eq!(
+        output.text, "",
+        "the stop string must have been completed by the flush of the held byte"
+    );
+    assert_slot_empty(
+        &state,
+        CrossTurnSlotId::DEFAULT,
+        "a stop string completed by the final flush after a grammar rejection must not save the \
+         tokens behind it",
+    );
 }

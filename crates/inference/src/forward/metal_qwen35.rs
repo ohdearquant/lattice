@@ -573,8 +573,6 @@ mod inner {
     };
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
-    #[cfg(test)]
-    use crate::generation::TokenLogprob;
     use crate::generation::{GenerateConfig, GenerateOutput};
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{
@@ -10011,29 +10009,9 @@ mod inner {
             )
         }
 
-        #[cfg(test)]
-        fn configure_sampling_route(
-            &mut self,
-            gen_cfg: &GenerateConfig,
-            history_is_empty: bool,
-        ) -> bool {
-            let plan = plan_sampling_route(
-                gen_cfg,
-                history_is_empty,
-                SamplingRouteEnvironment::current(),
-            );
-            apply_sampling_route_plan(
-                plan,
-                &mut self.session.compact_route,
-                &mut self.session.compact_topk,
-                &mut self.session.compact_result,
-            )
-        }
-
-        /// Disengage the compact sampling route engaged by
         /// The teardown for a compact sampling route engaged by
-        /// [`Self::configure_sampling_route`], whether generation completed, was
-        /// cancelled, or failed at prefill.
+        /// [`crate::decoder::qwen_metal::QwenMetalSession`], whether generation
+        /// completed, was cancelled, or failed at prefill.
         pub(crate) fn disengage_compact_route(&mut self) {
             self.session.compact_topk = 0;
             self.session.compact_route = GpuTopkRoute::CpuFallback;
@@ -14420,749 +14398,6 @@ mod inner {
             ))
         }
 
-        /// The prefix-cache entry as it ran before it was routed through the
-        /// driver: the same preflights and recovery arm around the legacy loop.
-        /// A differential oracle only.
-        #[cfg(test)]
-        fn generate_streaming_with_prefix_cache_and_cancel_legacy<F, C>(
-            &mut self,
-            slot_id: crate::kv_cache::CrossTurnSlotId,
-            prompt: &str,
-            tokenizer: &BpeTokenizer,
-            gen_cfg: &GenerateConfig,
-            on_token: F,
-            should_cancel: C,
-        ) -> Result<CachedGenerateOutput, crate::error::InferenceError>
-        where
-            F: FnMut(&str, u32) -> bool,
-            C: FnMut() -> bool,
-        {
-            let prompt_prep = crate::model::qwen35::prepare_generation(
-                tokenizer,
-                prompt,
-                gen_cfg,
-                self.engine.config.vocab_size,
-                self.max_context(),
-                crate::model::qwen35::GenerationEntryContract::MetalPrefixCacheStreaming,
-            )?;
-            let (prompt_ids, rng_state) = match prompt_prep {
-                crate::model::qwen35::GenerationPreparation::Complete(output) => {
-                    return Ok(CachedGenerateOutput {
-                        cache: CrossTurnCacheStats {
-                            slot_id,
-                            prompt_tokens: output.prompt_tokens,
-                            reused_tokens: 0,
-                            prefetched_tokens: 0,
-                            mode: crate::kv_cache::PrefixReuseMode::FullRefill,
-                        },
-                        output,
-                    });
-                }
-                crate::model::qwen35::GenerationPreparation::Ready(plan) => {
-                    (plan.prompt_ids, plan.rng_state)
-                }
-            };
-
-            let metadata = self.cross_turn_metadata(tokenizer);
-            let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
-            self.plan_prefix_request(&prompt_ids, &plan)?;
-
-            if gen_cfg.max_new_tokens > 0 {
-                crate::model::qwen35::resolve_reasoning_close_token(
-                    tokenizer,
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.enable_thinking,
-                    self.engine.config.vocab_size,
-                )?;
-            }
-
-            match self.generate_streaming_with_prefix_cache_and_cancel_legacy_inner(
-                slot_id,
-                prompt_ids,
-                rng_state,
-                tokenizer,
-                gen_cfg,
-                on_token,
-                should_cancel,
-            ) {
-                Ok(out) => Ok(out),
-                Err(e) => {
-                    self.reset_state();
-                    self.cross_turn_prefix_cache.remove(slot_id);
-                    Err(e)
-                }
-            }
-        }
-
-        #[cfg(test)]
-        fn generate_streaming_with_prefix_cache_and_cancel_legacy_inner<F, C>(
-            &mut self,
-            slot_id: crate::kv_cache::CrossTurnSlotId,
-            prompt_ids: Vec<u32>,
-            mut rng_state: u64,
-            tokenizer: &BpeTokenizer,
-            gen_cfg: &GenerateConfig,
-            mut on_token: F,
-            mut should_cancel: C,
-        ) -> Result<CachedGenerateOutput, crate::error::InferenceError>
-        where
-            F: FnMut(&str, u32) -> bool,
-            C: FnMut() -> bool,
-        {
-            use crate::error::InferenceError;
-            use crate::kv_cache::PrefixReuseMode;
-
-            // The `logprobs` / `enable_mtp` / empty-prompt config preflight
-            // checks (PR #787, #856), the shared-preparation `rng_state`
-            // normalization and zero-budget short-circuit (#827), and the
-            // suffix-content preflight below (#835), live in the public
-            // wrapper `generate_streaming_with_prefix_cache_and_cancel`, not
-            // here: that wrapper's error-recovery path unconditionally
-            // evicts the cache slot on any `Err` from this function, so a
-            // preflight-only rejection must never reach `_inner` in the first
-            // place, or a valid pre-existing cross-turn entry this call never
-            // touched would be destroyed alongside it. `prompt_ids` and
-            // `rng_state` arrive already computed by the wrapper's
-            // `prepare_generation` call (which needs `prompt_ids` to run that
-            // preflight) so this function never re-tokenizes `prompt` and
-            // never re-derives the seed, and both are therefore guaranteed
-            // non-empty / normalized by the time they reach this function --
-            // unlike `logprobs`/`enable_mtp`/suffix-content, empty-prompt and
-            // zero-budget have no cheap "run it again here as defense in
-            // depth" form: any duplicate check inside `_inner` would have to
-            // return `Err`, and an `Err` from `_inner` is exactly what the
-            // wrapper's blanket eviction match treats as cache-invalidating.
-            // `plan_cross_turn_reuse`/`plan_prefix_request` are still run
-            // again below, cheaply, as defense in depth (this function's own
-            // safety invariant should not depend solely on its one caller
-            // getting the guard conditions right).
-
-            let cfg = self.engine.config.clone();
-
-            let prompt_len = prompt_ids.len();
-            debug_assert!(
-                prompt_len > 0,
-                "the wrapper's check_prompt_not_empty (#856) must reject an \
-                 empty prompt before calling _inner"
-            );
-            debug_assert!(
-                gen_cfg.max_new_tokens > 0,
-                "the wrapper's prepare_generation zero-budget short-circuit \
-                 (#827) must return before calling _inner"
-            );
-
-            let metadata = self.cross_turn_metadata(tokenizer);
-            let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
-
-            // #835: validate the suffix the plan selected BEFORE the match
-            // below runs `restore_cross_turn_prefix` (which `take()`s the
-            // cache slot's entry) or `reset_state()`. An out-of-vocab token,
-            // empty suffix, or start+len overflow is rejected here, before
-            // any live state or cache entry is touched, instead of after
-            // `restore_cross_turn_prefix` has already consumed the slot.
-            // Defense in depth: the public wrapper above already ran this
-            // exact check (on the identical `prompt_ids`/`plan` inputs,
-            // since nothing mutates `self.cross_turn_prefix_cache` between
-            // the two calls) so a rejection here should never actually
-            // trigger via that entry point -- this call exists so `_inner`'s
-            // own ordering invariant does not depend solely on its one
-            // caller getting the wrapper's guard conditions right.
-            self.plan_prefix_request(&prompt_ids, &plan)?;
-
-            // Budget forcing: resolve the </think> token id BEFORE the match
-            // below runs `restore_cross_turn_prefix` (which `take()`s the
-            // cache slot's entry) or `reset_state()` -- same reasoning as
-            // the suffix validation immediately above (#835), extended to
-            // this check: a missing or out-of-range </think> token must be
-            // rejected before any live state or cache entry is touched, or
-            // a rejected request would destroy a valid pre-existing prefix
-            // cache it never used. This also keeps the property that its `?`
-            // propagates before the should_cancel check below, so a
-            // cancelled-but-invalid-budget request is rejected instead of
-            // returning Ok(Interrupt).
-            let think_close_id = crate::model::qwen35::resolve_reasoning_close_token(
-                tokenizer,
-                gen_cfg.reasoning_budget,
-                gen_cfg.enable_thinking,
-                cfg.vocab_size,
-            )?;
-
-            // The consumed entry (ExactAppend / ReplayFromCheckpoint) is
-            // carried to the end-of-generation save so its checkpoint ring
-            // and boundary snapshot survive across turns (#590).
-            let mut consumed_entry = match plan.mode {
-                PrefixReuseMode::ExactAppend | PrefixReuseMode::ReplayFromCheckpoint { .. } => {
-                    self.restore_cross_turn_prefix(slot_id, &plan)?
-                }
-                PrefixReuseMode::FullRefill => {
-                    self.reset_state();
-                    None
-                }
-            };
-
-            // Checked independently of `on_token`, mirroring the equivalent
-            // check in `generate_streaming_with_cancel` right after
-            // `reset_state` and before the (potentially large,
-            // uninterruptible once started) suffix prefill matmul below. The
-            // restore/reset above already leaves the cache fail-closed for
-            // this slot (ExactAppend `take`s the entry; FullRefill clears the
-            // whole map via `reset_state`), so bailing here never re-saves a
-            // partial entry — it simply skips paying for the prefill.
-            if should_cancel() {
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text: String::new(),
-                        token_ids: vec![],
-                        prompt_tokens: prompt_len,
-                        generated_tokens: 0,
-                        stopped: false,
-                        stop_reason: Some(StopReason::Interrupt),
-                        token_logprobs: vec![],
-                    },
-                    cache: CrossTurnCacheStats {
-                        slot_id,
-                        prompt_tokens: prompt_len,
-                        reused_tokens: 0,
-                        prefetched_tokens: 0,
-                        mode: plan.mode,
-                    },
-                });
-            }
-
-            let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
-            let mut all_ids = prompt_ids.clone();
-
-            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
-
-            let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
-
-            // The one line that differs structurally from `generate_streaming`:
-            // prefill only the divergent suffix, at its true absolute position.
-            let suffix = &prompt_ids[plan.suffix_start..];
-            let mut prefill_logits =
-                match self.forward_prefill_from(suffix, plan.suffix_start, false) {
-                    Ok(logits) => logits,
-                    Err(error) => {
-                        if use_compact {
-                            self.disengage_compact_route();
-                        }
-                        return Err(error);
-                    }
-                };
-
-            // The suffix prefill itself cannot be interrupted mid-flight (one
-            // GPU dispatch), so this is the earliest point a disconnect that
-            // happened *during* it can be observed — before paying for
-            // sampling or decode-loop work on its output. The cache is
-            // already fail-closed for this slot at this point (see the
-            // should_cancel check above), so bailing here is safe: it just
-            // means the suffix prefill's cost was spent without being reused.
-            if should_cancel() {
-                if use_compact {
-                    self.disengage_compact_route();
-                }
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text: String::new(),
-                        token_ids: vec![],
-                        prompt_tokens: prompt_len,
-                        generated_tokens: 0,
-                        stopped: false,
-                        stop_reason: Some(StopReason::Interrupt),
-                        token_logprobs: vec![],
-                    },
-                    cache: CrossTurnCacheStats {
-                        slot_id,
-                        prompt_tokens: prompt_len,
-                        reused_tokens: plan.reusable_len,
-                        prefetched_tokens: plan.suffix_len,
-                        mode: plan.mode,
-                    },
-                });
-            }
-
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits)?;
-                // If the grammar blocked every token the sampler's non-finite-max
-                // short-circuit would silently return the first candidate's token
-                // id. An accepting state with no legal continuation is a completed
-                // generation, not a failure; otherwise fail closed, matching the
-                // CPU contract (#611, generation.rs step-0 sites).
-                if !super::has_finite_logit(&prefill_logits) {
-                    if engine.is_complete_without_continuation(gs) {
-                        return Ok(CachedGenerateOutput {
-                            output: GenerateOutput {
-                                text: String::new(),
-                                token_ids: vec![],
-                                prompt_tokens: prompt_len,
-                                generated_tokens: 0,
-                                stopped: true,
-                                stop_reason: Some(StopReason::Grammar),
-                                token_logprobs: vec![],
-                            },
-                            cache: CrossTurnCacheStats {
-                                slot_id,
-                                prompt_tokens: prompt_len,
-                                reused_tokens: plan.reusable_len,
-                                prefetched_tokens: plan.suffix_len,
-                                mode: plan.mode,
-                            },
-                        });
-                    }
-                    return Err(InferenceError::GrammarConstraintBlocked(
-                        "grammar constraint blocked every token at step 0; \
-                         no legal first token exists in the current grammar state"
-                            .into(),
-                    ));
-                }
-            }
-
-            let next_id = if use_compact {
-                sample_from_candidates(
-                    &self.session.compact_result,
-                    gen_cfg,
-                    &all_ids,
-                    &mut rng_state,
-                )
-            } else {
-                sample_token(&prefill_logits, gen_cfg, &all_ids, &mut rng_state)
-            };
-
-            let cache_stats = |mode, reused, prefetched| CrossTurnCacheStats {
-                slot_id,
-                prompt_tokens: prompt_len,
-                reused_tokens: reused,
-                prefetched_tokens: prefetched,
-                mode,
-            };
-
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                && !engine.advance(gs, next_id)?
-            {
-                let text = decode_tokens(tokenizer, &generated_ids);
-                self.save_cross_turn_prefix_or_clear(
-                    slot_id,
-                    metadata.clone(),
-                    prompt_ids.clone(),
-                    consumed_entry.take(),
-                );
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text,
-                        token_ids: generated_ids.clone(),
-                        prompt_tokens: prompt_len,
-                        generated_tokens: generated_ids.len(),
-                        stopped: false,
-                        stop_reason: Some(StopReason::Grammar),
-                        token_logprobs: vec![],
-                    },
-                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                });
-            }
-
-            let is_stop = |id: u32| -> bool {
-                id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id)
-            };
-
-            if is_stop(next_id) {
-                if use_compact {
-                    self.disengage_compact_route();
-                }
-                self.save_cross_turn_prefix_or_clear(
-                    slot_id,
-                    metadata.clone(),
-                    prompt_ids.clone(),
-                    consumed_entry.take(),
-                );
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text: String::new(),
-                        token_ids: vec![],
-                        prompt_tokens: prompt_len,
-                        generated_tokens: 0,
-                        stopped: true,
-                        stop_reason: Some(StopReason::Eos),
-                        token_logprobs: vec![],
-                    },
-                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                });
-            }
-
-            let mut detok = IncrementalDetokenizer::new();
-            generated_ids.push(next_id);
-            all_ids.push(next_id);
-            // Backend-neutral reasoning-budget policy (ADR-080 C3), shared with
-            // `generate_streaming` above and the CPU `model::qwen35::generation`
-            // loops, driven through the one atomic `DecodePolicy::transition`
-            // (PR #787). `token_logprobs` below is a
-            // throwaway sink: this path does not wire per-token logprobs
-            // capture, and the `check_logprobs_not_set` guard above already
-            // rejects any request that would need it, so `gen_cfg.logprobs`
-            // is always `None` here and `DecodePolicy::init` / `transition`'s
-            // logprob recording is always a no-op -- passed through uniformly
-            // rather than special-cased,
-            // so this site is structurally indistinguishable from the other
-            // five at the `DecodePolicy::init` / `transition` call sites.
-            let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
-            // `streaming: true` selects `StopMode::Streaming`'s incremental
-            // byte-holdback for a non-empty `gen_cfg.stop_strings` -- `policy.stop_mode`
-            // now owns the `StopStringMatcher` this call site used to
-            // construct and drive by hand.
-            let mut policy = crate::model::qwen35::DecodePolicy::init(
-                gen_cfg,
-                think_close_id,
-                &mut token_logprobs,
-                next_id,
-                &prefill_logits,
-                gen_cfg.temperature,
-                generated_ids.len(),
-                true,
-            );
-            let mut last_pushed_id = next_id;
-            // `text` is the caller-owned full output — the detokenizer itself only
-            // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
-            let mut text = String::new();
-            let mut throwaway_offsets: Vec<usize> = Vec::new();
-            // Set when a stop string matches: CPU-identical semantics can retain
-            // token ids whose text was truncated, so the tokens behind a
-            // string-stop match must never be saved into the cross-turn cache —
-            // that would represent text the caller never received.
-            let mut stopped_by_stop_string = false;
-            let delta = detok.push(tokenizer, next_id);
-            let initial_outcome = policy.check_initial_stop(
-                &mut token_logprobs,
-                &mut text,
-                &mut throwaway_offsets,
-                &delta,
-                |s| on_token(s, next_id),
-            );
-            if matches!(
-                initial_outcome,
-                crate::model::qwen35::StopCheckOutcome::Interrupted
-            ) {
-                if use_compact {
-                    self.disengage_compact_route();
-                }
-                // The caller cut the stream on the prefill-derived first token.
-                // That token is pushed but not forwarded: its forward step is
-                // the first thing the decode loop below does, and the loop
-                // never runs here. Live state therefore holds only the prompt.
-                // The consumed entry was already taken, so returning without a
-                // save leaves the slot empty.
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text,
-                        token_ids: generated_ids.clone(),
-                        prompt_tokens: prompt_len,
-                        generated_tokens: generated_ids.len(),
-                        stopped: false,
-                        stop_reason: Some(StopReason::Interrupt),
-                        token_logprobs: vec![],
-                    },
-                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                });
-            }
-            if matches!(
-                initial_outcome,
-                crate::model::qwen35::StopCheckOutcome::Stopped
-            ) {
-                if use_compact {
-                    self.disengage_compact_route();
-                }
-                self.cross_turn_prefix_cache.remove(slot_id);
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text,
-                        token_ids: generated_ids.clone(),
-                        prompt_tokens: prompt_len,
-                        generated_tokens: generated_ids.len(),
-                        stopped: true,
-                        stop_reason: Some(StopReason::Eos),
-                        token_logprobs: vec![],
-                    },
-                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                });
-            }
-            let mut stopped = false;
-            let mut stopped_by_caller = false;
-            // A token the grammar rejects (a budget-forced `</think>` it forbids)
-            // leaves `stopped` false, as the streaming entry reports it, but the
-            // step that sampled it already forwarded the last pushed token at the
-            // loop top, so the silent step below must not forward it again.
-            let mut stopped_by_grammar_rejection = false;
-            let mut stop_reason = StopReason::Length;
-            // A grammar completed by the prefill-derived first token with no
-            // legal continuation is a successful stop, mirroring the CPU
-            // `grammar_complete` early return. Recorded here — immediately
-            // after the initial advance — rather than probed at the loop top,
-            // so a zero-iteration decode loop (effective cap 1) cannot fall
-            // through to Length (#1064 follow-up). The completing token was
-            // never forwarded (`stopped` skips the silent step below), so the
-            // saved cross-turn prefix stays consistent with live KV state.
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
-                && engine.is_complete_without_continuation(gs)
-            {
-                stopped = true;
-                stop_reason = StopReason::Grammar;
-            }
-
-            let cap = policy.cap();
-            for _ in 1..cap {
-                // Initial-token grammar completion (recorded above) terminates
-                // decode before any per-step GPU work: past this point
-                // mask_logits would block every token and the all-blocked
-                // guard below would misreport the completed generation as
-                // GrammarConstraintBlocked (#1064).
-                if stopped {
-                    break;
-                }
-                // Checked before any per-step GPU work, independent of whether
-                // this iteration's delta ends up non-empty — mirrors
-                // `generate_streaming_with_cancel`'s decode-loop check and
-                // closes the same UTF-8-boundary gap `on_token`-only
-                // cancellation has. At a loop top every pushed token except the
-                // most recent one has been forwarded; the most recent one is
-                // forwarded by this iteration's `forward_step_decode`, which a
-                // cancel here skips. At the first loop top that means nothing
-                // has been forwarded past the prompt. The exit sets
-                // `stopped_by_caller`, the same flag an on_token rejection
-                // sets, so the silent step below is skipped and the boundary
-                // saved is the forwarded prefix.
-                if should_cancel() {
-                    stopped_by_caller = true;
-                    stop_reason = StopReason::Interrupt;
-                    break;
-                }
-                if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
-                    stop_reason = StopReason::KvFull;
-                    break;
-                }
-                let pos = self.session.kv_cache.seq_len;
-                let last_token = *all_ids
-                    .last()
-                    .expect("invariant: prompt or previous sample populated all_ids");
-                let mut step_logits = self.forward_step_decode(last_token, pos);
-
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    let _signpost_grammar = crate::forward::signpost::interval(
-                        crate::forward::signpost::Label::DecodeGrammarMask,
-                    );
-                    engine.mask_logits(gs, &mut step_logits)?;
-                    // Fail closed if the grammar blocked every continuation,
-                    // matching the CPU contract (#611).
-                    if !super::has_finite_logit(&step_logits) {
-                        return Err(InferenceError::GrammarConstraintBlocked(
-                            "grammar constraint blocked every token; \
-                             no legal continuation exists in the current grammar state"
-                                .into(),
-                        ));
-                    }
-                }
-
-                let sampled_id = {
-                    sample_decode_traced(
-                        use_compact.then_some(self.session.compact_result.as_slice()),
-                        &step_logits,
-                        gen_cfg,
-                        &all_ids,
-                        &mut rng_state,
-                    )
-                };
-
-                // `policy.stop_mode` (fixed to `StopMode::Streaming` or
-                // `Disabled` at construction) now owns this path's byte-
-                // holdback stop check itself -- this call site supplies only
-                // `decode_delta` (this loop's own detokenizer) and the
-                // shared `text`/`throwaway_offsets` buffers.
-                let generated_len_before = generated_ids.len();
-                let outcome = policy.transition(
-                    &mut token_logprobs,
-                    sampled_id,
-                    &step_logits,
-                    gen_cfg.temperature,
-                    generated_len_before,
-                    |next_id| {
-                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                            Ok(engine.advance(gs, next_id)?)
-                        } else {
-                            Ok(true)
-                        }
-                    },
-                    &is_stop,
-                    |next_id| {
-                        generated_ids.push(next_id);
-                        all_ids.push(next_id);
-                    },
-                    |next_id| detok.push(tokenizer, next_id),
-                    &mut text,
-                    &mut throwaway_offsets,
-                    |s, next_id| on_token(s, next_id),
-                )?;
-
-                let (next_id, answer_budget_exhausted) = match outcome {
-                    crate::model::qwen35::StepOutcome::GrammarStop => {
-                        stopped_by_grammar_rejection = true;
-                        stop_reason = StopReason::Grammar;
-                        break;
-                    }
-                    crate::model::qwen35::StepOutcome::Eos => {
-                        stopped = true;
-                        stop_reason = StopReason::Eos;
-                        break;
-                    }
-                    crate::model::qwen35::StepOutcome::Stopped => {
-                        stopped = true;
-                        stopped_by_stop_string = true;
-                        stop_reason = StopReason::Eos;
-                        break;
-                    }
-                    crate::model::qwen35::StepOutcome::Interrupted => {
-                        stopped_by_caller = true;
-                        stop_reason = StopReason::Interrupt;
-                        break;
-                    }
-                    crate::model::qwen35::StepOutcome::Emitted {
-                        token_id,
-                        answer_budget_exhausted,
-                    } => (token_id, answer_budget_exhausted),
-                };
-                last_pushed_id = next_id;
-                // Post-advance completion check, mirroring the CPU
-                // `grammar_complete_without_continuation` check after every
-                // emitted token: the final loop iteration has no following
-                // loop top, so a grammar completed by the last allowed token
-                // would otherwise misreport as Length (#1064 follow-up).
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
-                    && engine.is_complete_without_continuation(gs)
-                {
-                    stopped = true;
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-                if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
-                    stop_reason = StopReason::KvFull;
-                    break;
-                }
-                if answer_budget_exhausted {
-                    break;
-                }
-            }
-
-            if use_compact {
-                self.disengage_compact_route();
-            }
-
-            // Tail flush runs before the cache-save decision: a stop string can
-            // still complete in the final detokenizer tail, and that late match
-            // must also suppress caching the truncated generation (see below).
-            let mut tail_rejected = false;
-            if !stopped_by_caller {
-                let tail = detok.finish();
-                match policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id)) {
-                    crate::generation::StopCheckOutcome::Interrupted => {
-                        stopped = false;
-                        tail_rejected = true;
-                        stop_reason = StopReason::Interrupt;
-                    }
-                    crate::generation::StopCheckOutcome::Stopped => {
-                        stopped_by_stop_string = true;
-                        if !stopped {
-                            stopped = true;
-                            stop_reason = StopReason::Eos;
-                        }
-                    }
-                    crate::generation::StopCheckOutcome::Continue => {}
-                }
-            }
-
-            if stopped_by_stop_string || tail_rejected {
-                // CPU semantics can retain token ids whose text was truncated by
-                // the stop-string match; caching those hidden states would
-                // represent text the caller never received, so drop the cache
-                // entry for this slot entirely instead of saving a prefix.
-                //
-                // A rejected tail flush is the same hazard: the rejected text
-                // can belong to tokens already forwarded into KV (the last
-                // token after an EOS break, or earlier tokens whose bytes the
-                // stop matcher held back), and skipping the silent step below
-                // would not exclude those, so no prefix is saved.
-                self.cross_turn_prefix_cache.remove(slot_id);
-            } else {
-                // Every exit above leaves the last *pushed* generated token
-                // un-forwarded EXCEPT the `is_stop` break and a grammar
-                // rejection, where the stop or rejected token itself was never
-                // pushed and every element of `generated_ids` was already
-                // forwarded by the following iteration's `forward_step` call.
-                // Run one silent step so the next turn can
-                // reuse through the full assistant output (design.md step 8,
-                // "Better v1"). This must not sample or emit anything.
-                //
-                // `stopped_by_caller` is excluded from this silent step
-                // deliberately. Two exits set it, and they leave
-                // `last_pushed_id` in different states:
-                //
-                // - `should_cancel()` at a decode-loop top: `last_pushed_id`
-                //   is the latest delivered token and has not been forwarded
-                //   yet, because forwarding it is the step this iteration
-                //   never reached. The silent step would forward it and
-                //   persist a boundary past the point the cancelled turn
-                //   reached; skipping it saves the forwarded prefix and the
-                //   next turn replays that token as part of its suffix.
-                // - `on_token` returning false inside the step (the caller
-                //   rejected delivery of, or disconnected on, the new token):
-                //   this iteration already forwarded the prior token, and the
-                //   exit comes before `last_pushed_id = next_id`, so
-                //   `last_pushed_id` still names that already-forwarded
-                //   token. The silent step would forward it a second time,
-                //   advancing `kv_cache.seq_len` by a position that holds no
-                //   new generated token. The rejected token itself sits in
-                //   `generated_ids` unforwarded and must stay out of the
-                //   saved boundary, since it is text the caller never
-                //   received.
-                //
-                // Leaving `kv_cache.seq_len` where it is keeps both cases
-                // consistent with `represented_len` below.
-                if !generated_ids.is_empty()
-                    && !stopped
-                    && !stopped_by_caller
-                    && !stopped_by_grammar_rejection
-                {
-                    let seq_len = self.session.kv_cache.seq_len;
-                    if seq_len < self.session.kv_cache.max_cache_len {
-                        let _ = self.forward_step_decode(last_pushed_id, seq_len);
-                    }
-                    // else: KV is already full; the cache boundary stays one
-                    // token short of `generated_ids` — still consistent, since
-                    // KV/GDN and `represented_len` all agree at that boundary.
-                }
-
-                let represented_len = self.session.kv_cache.seq_len;
-                debug_assert!(represented_len >= prompt_len);
-                let generated_represented = represented_len - prompt_len;
-                let mut represented_token_ids = prompt_ids.clone();
-                represented_token_ids.extend_from_slice(&generated_ids[..generated_represented]);
-                self.save_cross_turn_prefix_or_clear(
-                    slot_id,
-                    metadata.clone(),
-                    represented_token_ids,
-                    consumed_entry.take(),
-                );
-            }
-
-            Ok(CachedGenerateOutput {
-                output: GenerateOutput {
-                    text,
-                    token_ids: generated_ids.clone(),
-                    prompt_tokens: prompt_len,
-                    generated_tokens: generated_ids.len(),
-                    stopped,
-                    stop_reason: Some(stop_reason),
-                    token_logprobs: vec![],
-                },
-                cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-            })
-        }
-
         /// Cache-aware sibling of [`Self::chat_completion_streaming`]: same
         /// ChatML formatting and `<|im_end|>` stop-token handling, routed
         /// through [`Self::generate_streaming_with_prefix_cache`] instead of
@@ -17945,15 +17180,39 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .split_once("    // Tests\n")
                 .expect("inner test section marker must exist")
                 .0;
-            // Streaming generation plans its route in the Metal decoder session's
-            // constructor, from the same planner and applier the configurator wraps.
-            // Direct generation plans it once to choose between its speculative routes
-            // and that session, then applies that plan itself on a speculative route
-            // or hands its environment to the session; `generate` is checked below.
+            // Streaming and prefix-cache generation plan their route in the Metal
+            // decoder session's constructor, so neither entry calls the planner or
+            // applier itself. Direct generation plans it once to choose between its
+            // speculative routes and that session, then applies that plan itself on a
+            // speculative route or hands its environment to the session; `generate`
+            // is checked below.
             assert_eq!(
-                production.matches("self.configure_sampling_route(").count(),
+                production.matches("configure_sampling_route").count(),
+                0,
+                "no entry may keep a route configurator beside the decoder session"
+            );
+            let prefix_cache = production
+                .split_once(
+                    "        fn generate_streaming_with_prefix_cache_and_cancel_inner<F, C>(\n",
+                )
+                .expect("prefix-cache generation must exist")
+                .1;
+            let prefix_cache = &prefix_cache[..prefix_cache
+                .find("\n        }\n")
+                .expect("prefix-cache generation must close")];
+            for shared in ["plan_sampling_route(", "apply_sampling_route_plan("] {
+                assert_eq!(
+                    prefix_cache.matches(shared).count(),
+                    0,
+                    "prefix-cache generation must leave {shared} to the decoder session"
+                );
+            }
+            assert_eq!(
+                prefix_cache
+                    .matches("QwenMetalSession::over_restored_state(")
+                    .count(),
                 1,
-                "prefix-cache generation must use the configurator"
+                "prefix-cache generation must plan its route through the decoder session"
             );
             let generate = production
                 .split_once("        pub fn generate(\n")
@@ -17997,8 +17256,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `prepare_direct_generation`'s shared `GenerationEntryContract::MetalDirect`
         /// capability check, strictly before either of the two paths that mutate
         /// `InferenceSession::compact_route` / `compact_topk` /
-        /// `compact_result` can run: `reset_state()` and
-        /// `configure_sampling_route`. `generate()` propagates that `Err` via
+        /// `compact_result` can run: `reset_state()` and route planning
+        /// (`plan_sampling_route`). `generate()` propagates that `Err` via
         /// `?` immediately after the `prepare_direct_generation` call, so a rejected
         /// request must leave route state untouched.
         ///
@@ -18026,7 +17285,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// read as if this test covered it.
         ///
         /// Mutation sensitivity: reordering `generate()` to call
-        /// `configure_sampling_route` before applying `prepare_direct_generation`'s
+        /// `plan_sampling_route` before applying `prepare_direct_generation`'s
         /// `?` -- even while keeping the *textual* prepare-before-configure
         /// ordering -- lets this rejected request mutate `compact_route` /
         /// `compact_topk` / `compact_result` before the error is returned, so
@@ -18050,7 +17309,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             // Sentinel values `plan_sampling_route` would never produce for
             // this (rejected) request: a real route/topk pair, and a
-            // non-empty result buffer. If `configure_sampling_route` runs at
+            // non-empty result buffer. If route planning runs at
             // all, `apply_sampling_route_plan` unconditionally overwrites
             // `compact_route`/`compact_topk` from its plan and clears
             // `compact_result` whenever `use_compact` is false -- which it
@@ -18093,7 +17352,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_eq!(
                 state.session.compact_route, sentinel_route,
                 "a rejected logprobs request must not mutate compact_route -- \
-                 configure_sampling_route must be unreachable once the \
+                 route planning must be unreachable once the \
                  preflight guard errors"
             );
             assert_eq!(
@@ -32182,8 +31441,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             });
         }
 
-        /// Regression (#1448 follow-up): a prefill that fails after
-        /// `configure_sampling_route` engaged the compact route must not leave that
+        /// Regression (#1448 follow-up): a prefill that fails after the decoder
+        /// session engaged the compact route must not leave that
         /// route on the session — a raw `forward_step` afterward would take the
         /// compact branch and return empty logits. Engages the route by direct field
         /// assignment (the #171 pattern: route *selection* is env-keyed and

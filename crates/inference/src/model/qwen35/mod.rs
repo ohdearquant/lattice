@@ -80,19 +80,6 @@ pub(crate) use generation::check_prompt_ids_in_vocab;
 // `generation.rs` uses `check_context_budget` directly within its own module.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::check_context_budget;
-// Shared backend-neutral decode-policy struct (reasoning-budget accounting +
-// logprobs formatting), consumed by the Metal streaming loops in
-// `crate::forward::metal_qwen35` so the same bookkeeping isn't re-duplicated
-// across the CPU/Metal boundary (ADR-080 C3). Only the Metal (`mod inner`,
-// gated identically) consumer needs the re-export; `generation.rs` itself
-// uses `DecodePolicy` directly within its own module.
-// `DecodePolicy`, `StepOutcome` and `StopCheckOutcome` now live in the neutral
-// `crate::generation` module (ADR-090 rollout row R02). They are re-exported
-// from here unchanged so `crate::model::qwen35::DecodePolicy` and its siblings
-// keep resolving for the Metal consumer, which is what R02's "old exports"
-// means for these three: they are `pub(crate)`, so no external path is at stake.
-#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
-pub(crate) use crate::generation::{DecodePolicy, StepOutcome, StopCheckOutcome};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::{REASONING_CLOSE_MARKER, resolve_reasoning_close_token};
 pub(crate) use norm::qwen35_rms_norm;
