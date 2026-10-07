@@ -53,11 +53,11 @@ pub fn gemma4_rms_norm(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
 /// `ACT2FN["gelu_pytorch_tanh"]` to f32-tanh rounding.
 ///
 /// Deliberately **not** `crate::forward::cpu::gelu`: that kernel's
-/// `fast_tanh` is a Padé(7,6) rational approximation of tanh with max error
-/// ~4e-5 (see its doc comment), which alone exceeds this stage's
-/// predeclared 1e-5 max-abs-diff tolerance for `geglu_mlp` before any
-/// matmul propagation. This uses `f32::tanh` (libm, correctly rounded to a
-/// few ULPs) instead -- same GELU formula, exact tanh.
+/// `fast_tanh` is a rational approximation of tanh (see its doc comment for
+/// the measured bound), while this stage is checked against HF with a
+/// predeclared 1e-5 max-abs-diff tolerance for `geglu_mlp`. This uses
+/// `f32::tanh` (libm, correctly rounded to a few ULPs) instead -- same GELU
+/// formula, exact tanh.
 fn gelu_tanh_exact(x: f32) -> f32 {
     const SQRT_2_OVER_PI: f32 = 0.797_884_6;
     const COEFF: f32 = 0.044_715;
