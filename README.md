@@ -423,8 +423,8 @@ The command bar (cmd-K) runs everything from a single keyboard shortcut:
 | `MultilingualE5Base`                | `intfloat/multilingual-e5-base`                               | 768   | 512        | yes            |
 | `AllMiniLmL6V2`                     | `sentence-transformers/all-MiniLM-L6-v2`                      | 384   | 256        | yes            |
 | `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 384   | 128        | yes            |
-| `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   | 1024  | 8192       | local dir only |
-| `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     | 2560* | 8192       | local dir only |
+| `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   | 1024  | 2048       | local dir only |
+| `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     | 2560* | 2048       | local dir only |
 
 *Qwen3-Embedding-4B and 0.6B support MRL truncation to any dimension >= 32.
 BGE v1.5 uses CLS pooling. E5 and MiniLM use mean pooling.
@@ -461,8 +461,8 @@ let model = EmbeddingModel::BgeLargeEnV15;   // 1024-dim, auto-download
 // Multilingual retrieval
 let model = EmbeddingModel::MultilingualE5Base;  // 768-dim, 100+ languages
 
-// Long context + multilingual (local files required)
-let model = EmbeddingModel::Qwen3Embedding0_6B;  // 1024-dim, 8K context
+// Decoder-based, multilingual (local files required)
+let model = EmbeddingModel::Qwen3Embedding0_6B;  // 1024-dim, 2K context
 
 // MRL: variable output dimension
 use lattice_embed::ModelConfig;

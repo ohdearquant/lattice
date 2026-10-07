@@ -223,8 +223,11 @@ pub(crate) fn infer_model_max_seq_len(model_dir: &Path, default_value: usize) ->
                 && value > 0
             {
                 // Cap at 2048 for embedding workloads. Models like Qwen3 advertise
-                // 32K positions but practical embedding inference uses ≤2K tokens.
-                // The GPU activation buffers are pre-allocated for this limit.
+                // 32K positions, but the tokenizer truncates input to this limit, so
+                // the model embeds at most 2048 tokens however large the config value.
+                // This is a fixed limit, not a buffer size: the Metal buffers follow
+                // `ModelInferenceConfig::gpu_max_seq_len`, and a longer Metal forward
+                // falls back to the CPU path.
                 let capped = (value as usize).min(2048);
                 return capped;
             }

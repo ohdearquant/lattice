@@ -65,8 +65,8 @@ Runtime configuration pairing a model with an optional MRL truncation dimension.
 | `BgeLargeEnV15`                | `bge-large-en-v1.5`      | `BAAI/bge-large-en-v1.5`         | 1024        | 512        | yes    | no   | BERT encoder                           |
 | `MultilingualE5Small`          | `multilingual-e5-small`  | `intfloat/multilingual-e5-small` | 384         | 512        | yes    | no   | BERT encoder                           |
 | `MultilingualE5Base`           | `multilingual-e5-base`   | `intfloat/multilingual-e5-base`  | 768         | 512        | yes    | no   | BERT encoder                           |
-| `Qwen3Embedding0_6B`           | `qwen3-embedding-0.6b`   | `Qwen/Qwen3-Embedding-0.6B`      | 1024        | 8192       | yes    | yes  | Qwen3 decoder                          |
-| `Qwen3Embedding4B`             | `qwen3-embedding-4b`     | `Qwen/Qwen3-Embedding-4B`        | 2560        | 8192       | yes    | yes  | Qwen3 decoder                          |
+| `Qwen3Embedding0_6B`           | `qwen3-embedding-0.6b`   | `Qwen/Qwen3-Embedding-0.6B`      | 1024        | 2048       | yes    | yes  | Qwen3 decoder                          |
+| `Qwen3Embedding4B`             | `qwen3-embedding-4b`     | `Qwen/Qwen3-Embedding-4B`        | 2560        | 2048       | yes    | yes  | Qwen3 decoder                          |
 | `TextEmbedding3Small`          | `text-embedding-3-small` | `text-embedding-3-small`         | 1536        | 8191       | **no** | —    | Remote identifier; no provider service |
 
 ### Key Methods
@@ -176,10 +176,10 @@ Sharded LRU cache for computed embeddings. Keys are SHA-256 hashes of the input 
 
 **Source**: `foundation/embed/src/service/mod.rs`
 
-| Constant                 | Value   | Source              | Why                                                                                                                                                                                        |
-| ------------------------ | ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `DEFAULT_MAX_BATCH_SIZE` | `1000`  | `service/mod.rs:25` | Prevents OOM from unbounded batch requests. 1000 × 512 tokens × 384 dims ≈ 750 MB peak memory — acceptable on modern hardware                                                              |
-| `MAX_TEXT_BYTES`         | `32768` | `service/mod.rs:31` | UTF-8 byte length (`str::len()`), ~8K tokens at 4 bytes/token. Inputs beyond this are rejected (return `EmbedError`). Covers Qwen3's 8192-token limit with margin for instruction prefixes |
+| Constant                 | Value   | Source              | Why                                                                                                                                                                                                   |
+| ------------------------ | ------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DEFAULT_MAX_BATCH_SIZE` | `1000`  | `service/mod.rs:25` | Prevents OOM from unbounded batch requests. 1000 × 512 tokens × 384 dims ≈ 750 MB peak memory — acceptable on modern hardware                                                                         |
+| `MAX_TEXT_BYTES`         | `32768` | `service/mod.rs:31` | UTF-8 byte length (`str::len()`), ~8K tokens at 4 bytes/token. Inputs beyond this are rejected (return `EmbedError`). Covers EmbeddingGemma 2's 8192-token limit with margin for instruction prefixes |
 
 Both are enforced in `NativeEmbeddingService::embed()` and `CachedEmbeddingService::embed()`.
 

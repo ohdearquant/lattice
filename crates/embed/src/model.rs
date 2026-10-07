@@ -181,9 +181,9 @@ impl EmbeddingModel {
             EmbeddingModel::MultilingualE5Base => 512,
             EmbeddingModel::AllMiniLmL6V2 => 256,
             EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => 128,
-            // Conservative cap; see docs/model.md.
-            EmbeddingModel::Qwen3Embedding0_6B => 8192,
-            EmbeddingModel::Qwen3Embedding4B => 8192,
+            // Tokenizer limit of the native service: longer input is truncated, never rejected.
+            EmbeddingModel::Qwen3Embedding0_6B => 2048,
+            EmbeddingModel::Qwen3Embedding4B => 2048,
             // Default limit of the native service: longer input is truncated, never rejected.
             EmbeddingModel::EmbeddingGemma2 => 8192,
             EmbeddingModel::TextEmbedding3Small => 8191,
@@ -654,6 +654,38 @@ mod tests {
         assert_eq!(EmbeddingModel::BgeSmallEnV15.max_input_tokens(), 512);
         assert_eq!(EmbeddingModel::BgeBaseEnV15.max_input_tokens(), 512);
         assert_eq!(EmbeddingModel::BgeLargeEnV15.max_input_tokens(), 512);
+        assert_eq!(EmbeddingModel::Qwen3Embedding0_6B.max_input_tokens(), 2048);
+        assert_eq!(EmbeddingModel::Qwen3Embedding4B.max_input_tokens(), 2048);
+    }
+
+    /// The table follows the limit the tokenizer applies when a Qwen3 Embedding directory
+    /// is loaded. The directory is synthetic, with context lengths well above the cap, so no
+    /// checkpoint is needed; it checks the table against the cap, not a real checkpoint's files.
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_qwen3_max_input_tokens_matches_loaded_tokenizer_limit() {
+        use lattice_inference::load_tokenizer;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, body: &str| {
+            std::fs::write(dir.path().join(name), body).expect("write fixture file");
+        };
+        write("vocab.json", r#"{"a": 0, "<|endoftext|>": 1}"#);
+        write("merges.txt", "#version: 0.2\n");
+        write("config.json", r#"{"max_position_embeddings": 32768}"#);
+        write("tokenizer_config.json", r#"{"model_max_length": 131072}"#);
+
+        let tokenizer = load_tokenizer(dir.path()).expect("tokenizer loads");
+        for model in [
+            EmbeddingModel::Qwen3Embedding0_6B,
+            EmbeddingModel::Qwen3Embedding4B,
+        ] {
+            assert_eq!(
+                tokenizer.max_seq_len(),
+                model.max_input_tokens(),
+                "{model:?}: max_input_tokens() must equal the tokenizer's sequence limit"
+            );
+        }
     }
 
     #[test]

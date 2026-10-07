@@ -11,8 +11,8 @@
 | `BgeLargeEnV15`                | BERT encoder  | 1024        | 512        | no  | English-only                            |
 | `MultilingualE5Small`          | BERT encoder  | 384         | 512        | no  | Recommended production default          |
 | `MultilingualE5Base`           | BERT encoder  | 768         | 512        | no  | Multilingual                            |
-| `Qwen3Embedding0_6B`           | Qwen3 decoder | 1024        | 8192       | yes | Last-token pooling, instruction prefix  |
-| `Qwen3Embedding4B`             | Qwen3 decoder | 2560        | 8192       | yes | Sharded safetensors, instruction prefix |
+| `Qwen3Embedding0_6B`           | Qwen3 decoder | 1024        | 2048       | yes | Last-token pooling, instruction prefix  |
+| `Qwen3Embedding4B`             | Qwen3 decoder | 2560        | 2048       | yes | Sharded safetensors, instruction prefix |
 | `TextEmbedding3Small`          | OpenAI API    | 1536        | 8191       | no  | Remote only, no local weights           |
 
 `ModelConfig` (`model.rs:381`) pairs a model variant with optional `output_dim` for MRL truncation. `validate()` enforces bounds. `EmbeddingKey` (`types.rs:119`) identifies an embedding space, but `ModelConfig` builds no `EmbeddingKey` itself -- callers construct one directly (`EmbeddingKey::new`, `types.rs:136`). Dimension separation is enforced downstream instead: different `output_dim` values change `dimensions()` (`model.rs:447-456`), which feeds `EmbeddingCache::compute_key()`'s hashed input, keeping differently-dimensioned embeddings in separate cache entries. Production default is `multilingual-e5-small` via application config, not the enum default (`BgeSmallEnV15`). The enum default serves code paths without application config (tests, standalone usage). Qwen3 models require instruction prefix for queries (`model.rs:227-234`): `"Instruct: Given a web search query, retrieve relevant passages...\nQuery: "`. Documents get no prefix (`document_instruction()` returns `None`).
