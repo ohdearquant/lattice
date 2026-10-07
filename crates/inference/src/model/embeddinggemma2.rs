@@ -21,6 +21,7 @@ use super::gemma4_ops::{
 };
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, matmul_into};
+use crate::forward::metal_embeddinggemma2::MetalEmbeddingGemma2State;
 use crate::tokenizer::common::Tokenizer;
 use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use crate::weights::{SafetensorsFile, TensorSource};
@@ -130,33 +131,33 @@ impl TextTokenizer {
 // Weights
 // ---------------------------------------------------------------------------
 
-struct LayerWeights {
-    input_layernorm: Vec<f32>,
-    post_attention_layernorm: Vec<f32>,
-    pre_feedforward_layernorm: Vec<f32>,
-    post_feedforward_layernorm: Vec<f32>,
-    q_proj: Vec<f32>,
-    k_proj: Vec<f32>,
-    v_proj: Vec<f32>,
-    o_proj: Vec<f32>,
-    q_norm: Vec<f32>,
-    k_norm: Vec<f32>,
-    gate_proj: Vec<f32>,
-    up_proj: Vec<f32>,
-    down_proj: Vec<f32>,
-    per_layer_input_gate: Vec<f32>,
-    per_layer_projection: Vec<f32>,
-    post_per_layer_input_norm: Vec<f32>,
-    layer_scalar: f32,
+pub(crate) struct LayerWeights {
+    pub(crate) input_layernorm: Vec<f32>,
+    pub(crate) post_attention_layernorm: Vec<f32>,
+    pub(crate) pre_feedforward_layernorm: Vec<f32>,
+    pub(crate) post_feedforward_layernorm: Vec<f32>,
+    pub(crate) q_proj: Vec<f32>,
+    pub(crate) k_proj: Vec<f32>,
+    pub(crate) v_proj: Vec<f32>,
+    pub(crate) o_proj: Vec<f32>,
+    pub(crate) q_norm: Vec<f32>,
+    pub(crate) k_norm: Vec<f32>,
+    pub(crate) gate_proj: Vec<f32>,
+    pub(crate) up_proj: Vec<f32>,
+    pub(crate) down_proj: Vec<f32>,
+    pub(crate) per_layer_input_gate: Vec<f32>,
+    pub(crate) per_layer_projection: Vec<f32>,
+    pub(crate) post_per_layer_input_norm: Vec<f32>,
+    pub(crate) layer_scalar: f32,
 }
 
-struct Weights {
-    embed_tokens: Vec<f32>,
-    per_layer_model_projection: Vec<f32>,
-    per_layer_projection_norm: Vec<f32>,
-    layers: Vec<LayerWeights>,
-    norm: Vec<f32>,
-    embedding_projection: Vec<f32>,
+pub(crate) struct Weights {
+    pub(crate) embed_tokens: Vec<f32>,
+    pub(crate) per_layer_model_projection: Vec<f32>,
+    pub(crate) per_layer_projection_norm: Vec<f32>,
+    pub(crate) layers: Vec<LayerWeights>,
+    pub(crate) norm: Vec<f32>,
+    pub(crate) embedding_projection: Vec<f32>,
 }
 
 fn load_tensor<T: TensorSource + ?Sized>(
@@ -327,7 +328,7 @@ fn softmax_in_place(row: &mut [f32]) {
 /// `|i - j| <= w`; with `None` it attends to every key. Query heads share key/value heads
 /// in contiguous groups (`kv = head / (heads / kv_heads)`).
 #[allow(clippy::too_many_arguments)]
-fn bidirectional_attention(
+pub(crate) fn bidirectional_attention(
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -529,6 +530,12 @@ impl EmbeddingGemma2Model {
         ids: &[u32],
         widths: &[usize],
     ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        self.check_widths(widths)?;
+        let states = self.token_states(ids)?;
+        self.pool_widths(&states, ids.len(), widths)
+    }
+
+    fn check_widths(&self, widths: &[usize]) -> Result<(), InferenceError> {
         for &width in widths {
             if width == 0 || width > self.cfg.embedding_dim {
                 return Err(InferenceError::InvalidInput(format!(
@@ -537,8 +544,18 @@ impl EmbeddingGemma2Model {
                 )));
             }
         }
-        let states = self.token_states(ids)?;
-        let pooled = mean_pool(&states, ids.len(), self.cfg.embedding_dim);
+        Ok(())
+    }
+
+    /// Mean-pools `[tokens, embedding_dim]` states and returns the L2-normalized leading
+    /// `width` dimensions for each entry of `widths`.
+    fn pool_widths(
+        &self,
+        states: &[f32],
+        tokens: usize,
+        widths: &[usize],
+    ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        let pooled = mean_pool(states, tokens, self.cfg.embedding_dim);
         widths
             .iter()
             .map(|&width| {
@@ -555,29 +572,9 @@ impl EmbeddingGemma2Model {
         let cfg = &self.cfg;
         let w = &self.weights;
         let t = ids.len();
-        if t == 0 {
-            return Err(InferenceError::InvalidInput(
-                "cannot embed an empty token sequence".to_string(),
-            ));
-        }
         let hidden = cfg.hidden_size;
 
-        let mut h = vec![0f32; t * hidden];
-        for (row, &id) in h.chunks_exact_mut(hidden).zip(ids) {
-            let id = id as usize;
-            if id >= cfg.vocab_size {
-                return Err(InferenceError::InvalidInput(format!(
-                    "token id {id} is outside the {} entry vocabulary",
-                    cfg.vocab_size
-                )));
-            }
-            for (o, &e) in row
-                .iter_mut()
-                .zip(&w.embed_tokens[id * hidden..(id + 1) * hidden])
-            {
-                *o = e * cfg.embed_scale;
-            }
-        }
+        let mut h = self.scaled_embeddings(ids)?;
         let embeddings = h.clone();
 
         let mut rope: [Option<(Vec<f32>, Vec<f32>)>; 2] = [None, None];
@@ -605,6 +602,70 @@ impl EmbeddingGemma2Model {
             cfg.embedding_dim,
         );
         Ok(states)
+    }
+
+    /// Per-token states as [`EmbeddingGemma2Model::token_states`], computed on the GPU in f32
+    /// through `state`, which must have been built from this model with
+    /// [`MetalEmbeddingGemma2State::new`]. Requires macOS and the `metal-gpu` feature; the CPU
+    /// path stays the default.
+    ///
+    /// The caller holds the machine GPU lock for the whole call when measuring or testing.
+    pub fn token_states_metal(
+        &self,
+        state: &mut MetalEmbeddingGemma2State,
+        ids: &[u32],
+    ) -> Result<Vec<f32>, InferenceError> {
+        state.check_model(self)?;
+        let embeddings = self.scaled_embeddings(ids)?;
+        state.forward(&embeddings, ids.len())
+    }
+
+    /// As [`EmbeddingGemma2Model::encode_ids_at_widths`], with the forward pass on the GPU.
+    /// Mean pooling and normalization run on the host over the `[tokens, embedding_dim]` states
+    /// read back from the GPU.
+    pub fn encode_ids_at_widths_metal(
+        &self,
+        state: &mut MetalEmbeddingGemma2State,
+        ids: &[u32],
+        widths: &[usize],
+    ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        self.check_widths(widths)?;
+        let states = self.token_states_metal(state, ids)?;
+        self.pool_widths(&states, ids.len(), widths)
+    }
+
+    /// Token embeddings times `embed_scale`, row-major `[ids.len(), hidden_size]`. Rejects an
+    /// empty sequence and ids outside the vocabulary.
+    pub(crate) fn scaled_embeddings(&self, ids: &[u32]) -> Result<Vec<f32>, InferenceError> {
+        let cfg = &self.cfg;
+        let hidden = cfg.hidden_size;
+        if ids.is_empty() {
+            return Err(InferenceError::InvalidInput(
+                "cannot embed an empty token sequence".to_string(),
+            ));
+        }
+        let mut h = vec![0f32; ids.len() * hidden];
+        for (row, &id) in h.chunks_exact_mut(hidden).zip(ids) {
+            let id = id as usize;
+            if id >= cfg.vocab_size {
+                return Err(InferenceError::InvalidInput(format!(
+                    "token id {id} is outside the {} entry vocabulary",
+                    cfg.vocab_size
+                )));
+            }
+            for (o, &e) in row
+                .iter_mut()
+                .zip(&self.weights.embed_tokens[id * hidden..(id + 1) * hidden])
+            {
+                *o = e * cfg.embed_scale;
+            }
+        }
+        Ok(h)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub(crate) fn weights(&self) -> &Weights {
+        &self.weights
     }
 
     /// RoPE cosine and sine tables for the first `t` positions of layer `l`'s type.
