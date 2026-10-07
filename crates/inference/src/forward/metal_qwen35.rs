@@ -13532,13 +13532,13 @@ mod inner {
     // `MtpTargetVerifier` is a public trait and this impl's
     // mutating methods (`rollback_cache_to`, `verify_tokens`,
     // `verify_tokens_with_hidden`) advance live KV/GDN state exactly like
-    // `forward_step`/`forward_prefill` — they are not wired into any live Metal
+    // `forward_step`/`forward_prefill`. They are not wired into any live Metal
     // generate loop (Metal MTP decode uses `mtp_greedy_round`, a self-contained
-    // mechanism) and nothing else in the repository calls `mtp_verify_draft`
-    // outside the unit tests in `speculative.rs`, but a consumer holding a
-    // `&mut MetalQwen35State` and `use`-ing this trait can call them directly,
-    // so they are part of the public raw-forward boundary and must clear the
-    // retained cross-turn entry before mutating, same as the inherent methods.
+    // mechanism) and only tests call `mtp_verify_draft` in this repository, but
+    // a consumer holding a `&mut MetalQwen35State` and `use`-ing this trait can
+    // call them directly, so they are part of the public raw-forward boundary
+    // and must clear the retained cross-turn entry before mutating, same as the
+    // inherent methods.
     impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
         fn cache_position(&self) -> usize {
             self.session.kv_cache.seq_len
