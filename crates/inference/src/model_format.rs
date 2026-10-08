@@ -73,6 +73,66 @@ pub fn detect_format(dir: &Path) -> ModelFormat {
     }
 }
 
+/// The model family a serving binary routes a checkpoint directory to.
+///
+/// Decided from the directory's `config.json`, not from tensor files: a Gemma
+/// 4 checkpoint and a Qwen3.5 checkpoint are both `model.safetensors`
+/// directories, so [`detect_format`] cannot tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ModelFamily {
+    /// Qwen3.5. Also the family of every directory that is not positively
+    /// identified as another one, which is what `lattice serve` has always
+    /// done: the Qwen loader reports whatever is wrong with such a directory.
+    Qwen35,
+    /// Gemma 4, positively identified by a top-level `model_type` of
+    /// `gemma4` in `config.json`. Whether the checkpoint is a supported
+    /// Gemma 4 configuration is the Gemma loader's decision, not this one's.
+    Gemma4,
+}
+
+impl ModelFamily {
+    /// The spelling used in route markers and log lines.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Qwen35 => "qwen35",
+            Self::Gemma4 => "gemma4",
+        }
+    }
+}
+
+/// Top-level `config.json` `model_type` that identifies a Gemma 4 checkpoint.
+/// The nested `text_config`, `audio_config` and `vision_config` objects carry
+/// their own `model_type` values, which are not read here.
+const GEMMA4_MODEL_TYPE: &str = "gemma4";
+
+/// Decide which family `dir` belongs to from its `config.json`.
+///
+/// Returns [`ModelFamily::Gemma4`] only when the file is readable JSON whose
+/// top-level `model_type` is `gemma4`. A missing, unreadable, oversized or
+/// malformed `config.json`, and any other `model_type`, resolve to
+/// [`ModelFamily::Qwen35`], so a directory the Gemma route does not claim is
+/// handled exactly as it was before this detector existed.
+pub fn detect_family(dir: &Path) -> ModelFamily {
+    let is_gemma4 = crate::model::config_file::read_config_json_bounded(
+        &dir.join("config.json"),
+        "config.json",
+    )
+    .ok()
+    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    .and_then(|root| {
+        root.get("model_type")
+            .and_then(serde_json::Value::as_str)
+            .map(|model_type| model_type == GEMMA4_MODEL_TYPE)
+    })
+    .unwrap_or(false);
+    if is_gemma4 {
+        ModelFamily::Gemma4
+    } else {
+        ModelFamily::Qwen35
+    }
+}
+
 /// Error message shown when a Q4 directory is passed to a binary that was
 /// built without the `metal-gpu` feature. Q4 inference only runs on the
 /// Metal GPU forward pass; there is no CPU fallback for `.q4` tensors, so
@@ -211,6 +271,53 @@ mod tests {
         let msg = unrecognized_format_message(Path::new("/tmp/bogus"));
         assert!(msg.contains("model.safetensors"));
         assert!(msg.contains(".q4"));
+    }
+
+    #[test]
+    fn detect_family_names_gemma4_only_from_the_top_level_model_type() {
+        let dir = tempdir("family-gemma4");
+        fs::write(
+            dir.join("config.json"),
+            br#"{"model_type": "gemma4", "text_config": {"model_type": "gemma4_text"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_family(&dir), ModelFamily::Gemma4);
+        assert_eq!(ModelFamily::Gemma4.name(), "gemma4");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_family_ignores_nested_model_type_values() {
+        // A Qwen3.5 vision-language config nests other `model_type` values;
+        // only the top-level key decides.
+        let dir = tempdir("family-nested");
+        fs::write(
+            dir.join("config.json"),
+            br#"{"model_type": "qwen3_5", "text_config": {"model_type": "gemma4"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_family(&dir), ModelFamily::Qwen35);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_family_falls_back_to_qwen35_for_anything_unclaimed() {
+        let missing = tempdir("family-missing");
+        assert_eq!(detect_family(&missing), ModelFamily::Qwen35);
+        let malformed = tempdir("family-malformed");
+        fs::write(malformed.join("config.json"), b"{not json").unwrap();
+        assert_eq!(detect_family(&malformed), ModelFamily::Qwen35);
+        let other = tempdir("family-other");
+        fs::write(other.join("config.json"), br#"{"model_type": 4}"#).unwrap();
+        assert_eq!(detect_family(&other), ModelFamily::Qwen35);
+        let absent = std::env::temp_dir().join(format!(
+            "lattice-model-format-test-family-absent-{}",
+            std::process::id()
+        ));
+        assert_eq!(detect_family(&absent), ModelFamily::Qwen35);
+        for dir in [missing, malformed, other] {
+            fs::remove_dir_all(&dir).ok();
+        }
     }
 
     // Fail-closed without metal-gpu: a Q4 directory must never silently

@@ -56,11 +56,17 @@
 //!                              at the client timeout, about 2 s later; the
 //!                              connect itself is capped at 10 s or this
 //!                              value, whichever is smaller
-//!   BENCH_STDERR_MARKER        substring to count in the server's stderr
+//!   BENCH_STDERR_MARKER        substring to count in the server's stderr;
+//!                              `lattice serve` writes one `[route] served ...`
+//!                              line per request it answers on a CPU route,
+//!                              naming the family, backend, mode and the
+//!                              shared decoder driver's counters, so a pattern
+//!                              such as `driver=shared` counts the requests
+//!                              that went through the driver
 //!
 //! Output:
 //!   ROUTE binary=<path> binary_bytes=<n> binary_sha256=<hex> model_dir=<dir>
-//!     format=<safetensors|q4>
+//!     format=<safetensors|q4> family=<qwen35|gemma4>
 //!   STARTUP startup_ms=<f>
 //!   RESULT case=<short|long> mode=<nonstream|stream> run=<n>
 //!     prompt_tokens=<n|na> completion_tokens=<n|na> deltas=<n|na>
@@ -81,7 +87,7 @@
 //! caller's to hold for the whole window: `scripts/bench-command.sh --durable`
 //! takes it.
 
-use lattice_inference::model_format::{ModelFormat, detect_format};
+use lattice_inference::model_format::{ModelFormat, detect_family, detect_format};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read};
@@ -944,10 +950,11 @@ fn run(cfg: &Config) -> Result<(), Refusal> {
     let (binary_bytes, binary_sha256) = binary_identity(&cfg.bin)?;
     println!(
         "ROUTE binary={} binary_bytes={binary_bytes} binary_sha256={binary_sha256} \
-         model_dir={} format={}",
+         model_dir={} format={} family={}",
         cfg.bin.display(),
         cfg.model_dir.display(),
-        format_name(format)
+        format_name(format),
+        detect_family(&cfg.model_dir).name()
     );
     let port = free_loopback_port()?;
     let addr = format!("127.0.0.1:{port}");

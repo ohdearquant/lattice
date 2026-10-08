@@ -115,6 +115,10 @@ pub mod metrics;
 pub mod prepare;
 /// Per-family chat prompt adapters used by request preparation.
 mod prompt_adapter;
+/// Family and backend selection for `lattice serve`, and the per-request route
+/// markers. Not a stable API.
+#[doc(hidden)]
+pub mod route;
 /// Gate-free routing facade for the serving path (ADR-094 decision 2).
 pub mod routing;
 

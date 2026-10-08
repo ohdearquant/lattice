@@ -63,6 +63,19 @@ directory is rejected with a clear error rather than silently falling back to CP
 lets you set the identifier clients must send back in `"model"`; if omitted, it's derived from the
 model directory's basename (`qwen3.5-0.8b`, `qwen3.5-0.8b-q4-quarot`, etc.).
 
+The model family is read from the top-level `model_type` in the directory's `config.json`. A Gemma 4
+E2B text checkpoint (`model_type` `gemma4`, safetensors) is served on the CPU backend, streaming and
+non-streaming, with the checkpoint's own chat template; `logprobs`, `stop` strings, a positive
+`reasoning_budget`, images and typed content parts are refused, and runtime LoRA adapters are not
+available. Gemma 4 has no Metal
+backend: a Gemma 4 checkpoint in the Q4 format is refused at startup with
+`gemma_metal_unsupported`, and the server does not start. Every other directory is routed as Qwen3.5.
+
+The server writes route markers to stderr: `[route] selected family=... backend=... format=...` once at
+startup, and for each request answered on a CPU route one `[route] served family=... backend=cpu
+mode=... driver=shared opened=N consumed=M` line. `driver=shared` is printed only when the shared decoder
+driver opened at least one prediction for that request.
+
 Startup output:
 
 ```
