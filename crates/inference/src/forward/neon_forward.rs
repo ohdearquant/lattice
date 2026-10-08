@@ -18,19 +18,17 @@ use crate::attention::gdn::{
     GatedDeltaNetState, GatedDeltaNetWeights, gated_rms_norm, l2_normalize_vec, sigmoid, softplus,
 };
 use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
+use crate::decoder::standalone_cpu::{StandaloneWeights, generate_with_trace};
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, silu_inplace};
 use crate::forward::neon::{matmul_q8_neon_into, pack_weights_q8};
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, FeedForwardWeights, ForwardScratch,
-    FullAttentionLayerWeights, GenerationEntryContract, GenerationPlan, GenerationPreparation,
-    KvCache, ModelWeights, decode_tokens, prepare_generation, qwen35_rms_norm, resize,
-    sample_token, should_stop_token,
+    FullAttentionLayerWeights, KvCache, ModelWeights, qwen35_rms_norm, resize,
 };
 use crate::model::qwen35_config::Qwen35Config;
 use crate::rope::RopeTable;
-use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::weights::ingress::{IngestedTensor, validate_ingested_tensor};
 use crate::weights::q8_weights::{validate_cfg_len, validate_gdn_shapes};
@@ -946,8 +944,8 @@ pub(crate) fn forward_step_q8_neon(
 ///
 /// Generate text from a prompt using Q8_0 NEON weight matrices.
 ///
-/// Equivalent to `Qwen35Model::generate` but calls `forward_step_q8_neon`
-/// for all forward passes.
+/// Equivalent to `Qwen35Model::generate` but runs the shared decoder driver over a
+/// standalone CPU session whose forward step is `forward_step_q8_neon`.
 pub fn generate_q8_neon(
     model: &Q8NeonModel,
     cfg: &Qwen35Config,
@@ -956,133 +954,15 @@ pub fn generate_q8_neon(
     prompt: &str,
     gen_cfg: &GenerateConfig,
 ) -> Result<GenerateOutput, crate::error::InferenceError> {
-    let plan = match prepare_generation(
+    generate_with_trace(
+        StandaloneWeights::Q8Neon(model),
+        cfg,
         tokenizer,
+        rope,
         prompt,
         gen_cfg,
-        cfg.vocab_size,
-        rope.max_positions(),
-        GenerationEntryContract::StandaloneCpu,
-    )? {
-        GenerationPreparation::Ready(plan) => plan,
-        GenerationPreparation::Complete(output) => return Ok(output),
-    };
-    let GenerationPlan {
-        mut rng_state,
-        prompt_ids,
-        prompt_len,
-        required_capacity: max_seq_len,
-    } = plan;
-
-    // Initialize states
-    let num_linear = cfg.num_linear_attention_layers();
-    let num_full = cfg.num_full_attention_layers();
-    let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-        .map(|_| GatedDeltaNetState::new(cfg))
-        .collect();
-    let mut kv_cache = KvCache::new(num_full);
-    let mut scratch = ForwardScratch::new();
-    kv_cache.reserve(max_seq_len, cfg.full_kv_dim());
-    scratch.ensure_capacity(cfg, max_seq_len);
-
-    let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
-    let mut all_ids = prompt_ids.clone();
-
-    // Prefill: process prompt tokens one at a time
-    for (pos, &token_id) in prompt_ids.iter().enumerate() {
-        forward_step_q8_neon(
-            model,
-            cfg,
-            rope,
-            token_id,
-            pos,
-            &mut gdn_states,
-            &mut kv_cache,
-            &mut scratch,
-        );
-        if pos < prompt_len - 1 {
-            kv_cache.seq_len += 1;
-        }
-    }
-    kv_cache.seq_len = prompt_len;
-
-    // Sample from last prefill logits
-    let next_id = sample_token(
-        &scratch.logits[..cfg.vocab_size],
-        gen_cfg,
-        &all_ids,
-        &mut rng_state,
-    );
-
-    if should_stop_token(cfg, gen_cfg, next_id) {
-        return Ok(GenerateOutput {
-            text: String::new(),
-            token_ids: vec![],
-            prompt_tokens: prompt_len,
-            generated_tokens: 0,
-            stopped: true,
-            stop_reason: Some(StopReason::Eos),
-            token_logprobs: vec![],
-        });
-    }
-
-    generated_ids.push(next_id);
-    all_ids.push(next_id);
-
-    let mut stopped = false;
-    let mut stop_reason = StopReason::Length;
-    // Autoregressive decode
-    for _ in 1..gen_cfg.max_new_tokens {
-        let pos = kv_cache.seq_len;
-        #[expect(
-            clippy::expect_used,
-            reason = "all_ids is seeded with the prompt before the loop and appended to on every iteration"
-        )]
-        let last_token = *all_ids
-            .last()
-            .expect("invariant: prompt or previous sample populated all_ids");
-
-        forward_step_q8_neon(
-            model,
-            cfg,
-            rope,
-            last_token,
-            pos,
-            &mut gdn_states,
-            &mut kv_cache,
-            &mut scratch,
-        );
-        kv_cache.seq_len += 1;
-
-        let next_id = sample_token(
-            &scratch.logits[..cfg.vocab_size],
-            gen_cfg,
-            &all_ids,
-            &mut rng_state,
-        );
-
-        if should_stop_token(cfg, gen_cfg, next_id) {
-            stopped = true;
-            stop_reason = StopReason::Eos;
-            break;
-        }
-
-        generated_ids.push(next_id);
-        all_ids.push(next_id);
-    }
-
-    // Detokenize
-    let text = decode_tokens(tokenizer, &generated_ids);
-
-    Ok(GenerateOutput {
-        text,
-        token_ids: generated_ids.clone(),
-        prompt_tokens: prompt_len,
-        generated_tokens: generated_ids.len(),
-        stopped,
-        stop_reason: Some(stop_reason),
-        token_logprobs: vec![],
-    })
+    )
+    .map(|(output, _trace)| output)
 }
 
 // -----------------------------------------------------------------------
@@ -1478,8 +1358,9 @@ pub mod bench_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoder::standalone_cpu::{StandaloneWeights, parity};
+    use crate::decoder::standalone_cpu::parity;
     use crate::model::qwen35_config::LayerType;
+    use crate::stop_reason::StopReason;
 
     /// Helper: create a zero Q8_0 packed weight buffer for [n, k].
     fn zero_packed(n: usize, k: usize) -> Vec<u8> {
@@ -3104,7 +2985,7 @@ mod tests {
             StandaloneWeights::Q8Neon(&self.model)
         }
 
-        fn legacy(&self, gen_cfg: &GenerateConfig) -> Result<GenerateOutput, InferenceError> {
+        fn public(&self, gen_cfg: &GenerateConfig) -> Result<GenerateOutput, InferenceError> {
             generate_q8_neon(
                 &self.model,
                 &self.cfg,
@@ -3138,11 +3019,11 @@ mod tests {
     }
 
     #[test]
-    fn standalone_session_matches_legacy_loop_deterministic_cases() {
+    fn standalone_session_matches_recorded_outputs_deterministic_cases() {
         let f = SessionFixture::new();
-        for (name, gen_cfg) in parity::deterministic_cases() {
-            parity::assert_matches_legacy(
-                &|c| f.legacy(c),
+        for (name, gen_cfg, recorded) in parity::deterministic_cases() {
+            parity::assert_matches_recorded(
+                &|c| f.public(c),
                 f.standalone(),
                 &f.cfg,
                 &f.tokenizer,
@@ -3150,15 +3031,16 @@ mod tests {
                 "world",
                 name,
                 &gen_cfg,
+                &recorded,
             );
         }
     }
 
     #[test]
-    fn standalone_session_matches_legacy_loop_seeded() {
+    fn standalone_session_matches_recorded_outputs_seeded() {
         let f = SessionFixture::new();
-        parity::assert_matches_legacy(
-            &|c| f.legacy(c),
+        parity::assert_matches_recorded(
+            &|c| f.public(c),
             f.standalone(),
             &f.cfg,
             &f.tokenizer,
@@ -3166,6 +3048,7 @@ mod tests {
             "world",
             "seeded",
             &parity::seeded_case(),
+            &parity::seeded_recorded(),
         );
     }
 

@@ -13,16 +13,13 @@ use crate::attention::gdn_fused::{
     GatedDeltaNetFusedScratch, conv1d_silu_fused, simd_decay_and_rank1_update, simd_gated_rms_norm,
     simd_l2_normalize, simd_matvec_transpose,
 };
+use crate::decoder::standalone_cpu::{StandaloneWeights, generate_with_trace};
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::Qwen35Model;
-use crate::model::qwen35::{
-    ForwardScratch, GenerationEntryContract, GenerationPlan, GenerationPreparation, KvCache,
-    decode_tokens, prepare_generation, qwen35_rms_norm, resize, sample_token, should_stop_token,
-};
+use crate::model::qwen35::{ForwardScratch, KvCache, qwen35_rms_norm, resize};
 use crate::model::qwen35_config::Qwen35Config;
 use crate::rope::RopeTable;
-use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::weights::q8_weights::{
     Q8AttentionWeights, Q8CommonLayerWeights, Q8FullAttentionLayerWeights, Q8GatedDeltaNetWeights,
@@ -679,10 +676,10 @@ fn cache_idx_of(full_idx: usize) -> usize {
 ///
 /// Generate text from a prompt using Q8 weight matrices.
 ///
-/// Equivalent to `Qwen35Model::generate` but calls `forward_step_q8` for all
-/// forward passes. The tokenizer, RoPE table, and generate config are passed
-/// explicitly since we operate as standalone functions rather than methods on
-/// the model struct.
+/// Equivalent to `Qwen35Model::generate` but runs the shared decoder driver over a
+/// standalone CPU session whose forward step is `forward_step_q8`. The tokenizer,
+/// RoPE table, and generate config are passed explicitly since we operate as
+/// standalone functions rather than methods on the model struct.
 pub fn generate_q8(
     weights: &Q8ModelWeights,
     cfg: &Qwen35Config,
@@ -691,133 +688,15 @@ pub fn generate_q8(
     prompt: &str,
     gen_cfg: &GenerateConfig,
 ) -> Result<GenerateOutput, crate::error::InferenceError> {
-    let plan = match prepare_generation(
+    generate_with_trace(
+        StandaloneWeights::Q8(weights),
+        cfg,
         tokenizer,
+        rope,
         prompt,
         gen_cfg,
-        cfg.vocab_size,
-        rope.max_positions(),
-        GenerationEntryContract::StandaloneCpu,
-    )? {
-        GenerationPreparation::Ready(plan) => plan,
-        GenerationPreparation::Complete(output) => return Ok(output),
-    };
-    let GenerationPlan {
-        mut rng_state,
-        prompt_ids,
-        prompt_len,
-        ..
-    } = plan;
-
-    // Initialize states
-    let num_linear = cfg.num_linear_attention_layers();
-    let num_full = cfg.num_full_attention_layers();
-    let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-        .map(|_| GatedDeltaNetState::new(cfg))
-        .collect();
-    let mut kv_cache = KvCache::new(num_full);
-    let mut scratch = ForwardScratch::new();
-
-    let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
-    let mut all_ids = prompt_ids.clone();
-
-    // Prefill: process prompt tokens one at a time through the recurrence
-    for (pos, &token_id) in prompt_ids.iter().enumerate() {
-        forward_step_q8(
-            weights,
-            cfg,
-            rope,
-            token_id,
-            pos,
-            &mut gdn_states,
-            &mut kv_cache,
-            &mut scratch,
-        );
-        if pos < prompt_len - 1 {
-            kv_cache.seq_len += 1;
-        }
-    }
-    kv_cache.seq_len = prompt_len;
-
-    // Sample from last prefill logits
-    let next_id = sample_token(
-        &scratch.logits[..cfg.vocab_size],
-        gen_cfg,
-        &all_ids,
-        &mut rng_state,
-    );
-
-    if should_stop_token(cfg, gen_cfg, next_id) {
-        return Ok(GenerateOutput {
-            text: String::new(),
-            token_ids: vec![],
-            prompt_tokens: prompt_len,
-            generated_tokens: 0,
-            stopped: true,
-            stop_reason: Some(StopReason::Eos),
-            token_logprobs: vec![],
-        });
-    }
-
-    generated_ids.push(next_id);
-    all_ids.push(next_id);
-
-    let mut stopped = false;
-    let mut stop_reason = StopReason::Length;
-    // Autoregressive decode
-    for _ in 1..gen_cfg.max_new_tokens {
-        let pos = kv_cache.seq_len;
-        // all_ids is seeded by the prompt before the loop, and the decode loop
-        // only continues when the previous sample pushed a new id, so the
-        // invariant `all_ids.is_empty() == false` should always hold here.
-        // Return an error rather than panicking so library callers can handle it.
-        let Some(&last_token) = all_ids.last() else {
-            return Err(crate::error::InferenceError::Inference(
-                "empty generation state".into(),
-            ));
-        };
-
-        forward_step_q8(
-            weights,
-            cfg,
-            rope,
-            last_token,
-            pos,
-            &mut gdn_states,
-            &mut kv_cache,
-            &mut scratch,
-        );
-        kv_cache.seq_len += 1;
-
-        let next_id = sample_token(
-            &scratch.logits[..cfg.vocab_size],
-            gen_cfg,
-            &all_ids,
-            &mut rng_state,
-        );
-
-        if should_stop_token(cfg, gen_cfg, next_id) {
-            stopped = true;
-            stop_reason = StopReason::Eos;
-            break;
-        }
-
-        generated_ids.push(next_id);
-        all_ids.push(next_id);
-    }
-
-    // Detokenize
-    let text = decode_tokens(tokenizer, &generated_ids);
-
-    Ok(GenerateOutput {
-        text,
-        token_ids: generated_ids.clone(),
-        prompt_tokens: prompt_len,
-        generated_tokens: generated_ids.len(),
-        stopped,
-        token_logprobs: vec![],
-        stop_reason: Some(stop_reason),
-    })
+    )
+    .map(|(output, _trace)| output)
 }
 
 // ---------------------------------------------------------------------------
@@ -827,7 +706,7 @@ pub fn generate_q8(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoder::standalone_cpu::{StandaloneWeights, parity};
+    use crate::decoder::standalone_cpu::parity;
 
     /// Regression test for #392: cpu Q8 RoPE must use stride-half pairing (i, half+i), not
     /// interleaved (2i, 2i+1).
@@ -1864,7 +1743,7 @@ mod tests {
             StandaloneWeights::Q8(&self.weights)
         }
 
-        fn legacy(
+        fn public(
             &self,
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
@@ -1901,11 +1780,11 @@ mod tests {
     }
 
     #[test]
-    fn standalone_session_matches_legacy_loop_deterministic_cases() {
+    fn standalone_session_matches_recorded_outputs_deterministic_cases() {
         let f = SessionFixture::new();
-        for (name, gen_cfg) in parity::deterministic_cases() {
-            parity::assert_matches_legacy(
-                &|c| f.legacy(c),
+        for (name, gen_cfg, recorded) in parity::deterministic_cases() {
+            parity::assert_matches_recorded(
+                &|c| f.public(c),
                 f.standalone(),
                 &f.cfg,
                 &f.tokenizer,
@@ -1913,15 +1792,16 @@ mod tests {
                 "world",
                 name,
                 &gen_cfg,
+                &recorded,
             );
         }
     }
 
     #[test]
-    fn standalone_session_matches_legacy_loop_seeded() {
+    fn standalone_session_matches_recorded_outputs_seeded() {
         let f = SessionFixture::new();
-        parity::assert_matches_legacy(
-            &|c| f.legacy(c),
+        parity::assert_matches_recorded(
+            &|c| f.public(c),
             f.standalone(),
             &f.cfg,
             &f.tokenizer,
@@ -1929,6 +1809,7 @@ mod tests {
             "world",
             "seeded",
             &parity::seeded_case(),
+            &parity::seeded_recorded(),
         );
     }
 
