@@ -486,6 +486,18 @@ impl DecodePolicy {
         Ok(policy)
     }
 
+    /// The policy for a driver that offers every token to [`Self::transition_with_metadata`],
+    /// the prefill-derived first token included: a speculative route publishes that token
+    /// inside its first verified span rather than before its first round, so there is no
+    /// already-pushed first token to seed from. Only valid for a request with no reasoning
+    /// budget and no think-close token, which the speculative driver's capability check
+    /// enforces: with neither, the seed the other constructors derive from the first token
+    /// is always "not closed".
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+    pub(crate) fn for_verified_stream(gen_cfg: &GenerateConfig, streaming: bool) -> Self {
+        Self::construct(gen_cfg, None, 0, 0, streaming)
+    }
+
     /// Shared construction, factored out of [`Self::init`] so [`Self::init_with_metadata`]
     /// can build the identical policy state without also reproducing `init`'s
     /// `compute_step_logprobs`-specific first-token recording.
