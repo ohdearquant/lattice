@@ -177,6 +177,12 @@ required-features = ["download", "f16", "metal-gpu", "serve"]
 name = "serve_lora_e2e_test"
 required-features = ["download", "f16", "metal-gpu", "serve"]
 
+# ADR-090 R09: spawns the standalone `lattice_serve` binary, which is built only
+# under these features.
+[[test]]
+name = "serve_standalone_route"
+required-features = ["f16", "metal-gpu", "serve"]
+
 # ADR-090 R03. Excluded from `cargo test`'s default target set on purpose: this
 # gate enforces by default (a missing checkpoint or a missing `f16` feature is a
 # panic, never a skip line), and the 1.6 GiB bf16 checkpoint it replays is not on

@@ -254,6 +254,10 @@ pub struct WorkerJob {
     messages: Vec<ChatMessage>,
     cfg: GenerateConfig,
     lora: Vec<LoraSelection>,
+    /// Whether the submitting HTTP request is streamed. Generation does not
+    /// depend on it; a runtime that records its route per request names the
+    /// mode there.
+    stream: bool,
     tx: mpsc::UnboundedSender<WorkerEvent>,
     cancel: watch::Receiver<bool>,
     /// Admission slot for this job (issue #932), held from
@@ -578,6 +582,20 @@ impl MetalWorkerClient {
         cancel: watch::Receiver<bool>,
         lora: Vec<LoraSelection>,
     ) -> Result<mpsc::UnboundedReceiver<WorkerEvent>, ApiError> {
+        self.submit_with_lora_mode(messages, gen_cfg, cancel, lora, false)
+    }
+
+    /// [`Self::submit_with_lora`] for a caller that knows whether the HTTP
+    /// response it will build is streamed. The worker hands the flag to the
+    /// runtime, which names the mode in its per-request route line.
+    pub fn submit_with_lora_mode(
+        &self,
+        messages: Vec<ChatMessage>,
+        gen_cfg: GenerateConfig,
+        cancel: watch::Receiver<bool>,
+        lora: Vec<LoraSelection>,
+        stream: bool,
+    ) -> Result<mpsc::UnboundedReceiver<WorkerEvent>, ApiError> {
         self.validate_lora(&lora)?;
         let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
             ApiError::ServiceUnavailable {
@@ -591,6 +609,7 @@ impl MetalWorkerClient {
             messages,
             cfg: gen_cfg,
             lora,
+            stream,
             tx,
             cancel,
             _admission_permit: permit,
@@ -883,7 +902,9 @@ fn run_worker_loop_with_control(
 ) {
     run_worker_loop_with_lora(
         msg_rx,
-        move |messages, cfg, _lora, on_token, cancel| generate(messages, cfg, on_token, cancel),
+        move |messages, cfg, _lora, _stream, on_token, cancel| {
+            generate(messages, cfg, on_token, cancel)
+        },
         control,
     );
 }
@@ -894,6 +915,7 @@ fn run_worker_loop_with_lora(
         &[ChatMessage],
         &GenerateConfig,
         &[LoraSelection],
+        bool,
         &mut dyn FnMut(&str, u32) -> bool,
         &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>,
@@ -953,6 +975,7 @@ fn run_worker_loop_with_lora(
             &job.messages,
             &job.cfg,
             &job.lora,
+            job.stream,
             &mut on_token,
             &mut should_cancel,
         ) {
@@ -1489,11 +1512,12 @@ impl MetalWorker {
                     let runtime = RefCell::new(runtime);
                     run_worker_loop_with_lora(
                         job_rx,
-                        |messages, cfg, lora, on_token, should_cancel| {
+                        |messages, cfg, lora, stream, on_token, should_cancel| {
                             runtime.borrow_mut().generate(
                                 messages,
                                 cfg,
                                 lora,
+                                stream,
                                 on_token,
                                 should_cancel,
                             )
@@ -1545,6 +1569,12 @@ impl WorkerJob {
     /// Selection received by this queued job, for HTTP-to-worker contract tests.
     pub fn lora_selection(&self) -> &[LoraSelection] {
         &self.lora
+    }
+
+    /// Whether the submitting request was marked streamed, for
+    /// HTTP-to-worker contract tests.
+    pub fn is_streamed(&self) -> bool {
+        self.stream
     }
 
     /// Reply to this job with one event, exactly as the production worker
@@ -2671,6 +2701,7 @@ mod tests {
             messages: vec![ChatMessage::user("hi")],
             cfg: GenerateConfig::default(),
             lora: Vec::new(),
+            stream: false,
             tx,
             cancel: cancel_rx,
             _admission_permit: permit,
@@ -3033,6 +3064,7 @@ mod tests {
             messages: vec![ChatMessage::user("hi")],
             cfg: GenerateConfig::default(),
             lora: Vec::new(),
+            stream: false,
             tx,
             cancel: cancel_rx,
             _admission_permit: permit,

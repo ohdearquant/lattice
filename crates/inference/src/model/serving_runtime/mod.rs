@@ -1,7 +1,9 @@
 //! Worker-local execution for model serving.
 
+mod gemma_cpu;
 mod qwen_metal;
 
+pub(crate) use gemma_cpu::GemmaCpuRuntime;
 pub(crate) use qwen_metal::QwenMetalRuntime;
 
 use crate::forward::metal_qwen35::ChatMessage;
@@ -16,11 +18,15 @@ use std::sync::{Arc, RwLock};
 
 /// The execution state stays on the thread that built it.
 pub(crate) trait ServingRuntime {
+    /// `stream` is whether the HTTP response is streamed. It does not change
+    /// what is generated; a runtime that reports its route per request
+    /// (`serve::route`) names it there.
     fn generate(
         &mut self,
         messages: &[ChatMessage],
         cfg: &GenerateConfig,
         lora: &[LoraSelection],
+        stream: bool,
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>;

@@ -114,7 +114,7 @@ pub mod metrics;
 /// Chat-request preparation shared by the serving binaries.
 pub mod prepare;
 /// Per-family chat prompt adapters used by request preparation.
-mod prompt_adapter;
+pub(crate) mod prompt_adapter;
 /// Family and backend selection for `lattice serve`, and the per-request route
 /// markers. Not a stable API.
 #[doc(hidden)]

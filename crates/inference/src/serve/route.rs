@@ -7,6 +7,11 @@
 //! route only, so a Gemma 4 checkpoint in the Q4 format is refused rather than
 //! handed to the Metal loader or to the CPU one.
 //!
+//! [`select_standalone_route`] is the same table for the standalone
+//! `lattice_serve` binary, whose Qwen3.5 checkpoints run on the Metal worker in
+//! both formats. Only the backend of a Qwen3.5 safetensors directory differs;
+//! the family decision and the Gemma 4 rows are the one table.
+//!
 //! The markers are lines on the server's stderr. A selection line is written
 //! once at startup and a request line once per CPU-served request. The request
 //! line reports the shared decoder driver's own ledger counters, so
@@ -130,7 +135,35 @@ impl RouteRefusal {
 /// Gemma 4 directory in the Q4 format, and that is refused here, before any
 /// loader runs and whatever features the binary was built with.
 pub fn select_route(format: ModelFormat, family: ModelFamily) -> Result<ServedRoute, RouteRefusal> {
+    route_table(format, family, ServedBackend::Cpu)
+}
+
+/// Pick the route for the standalone `lattice_serve` binary.
+///
+/// That binary runs every Qwen3.5 checkpoint on its Metal worker, a
+/// safetensors directory included, so a Qwen3.5 directory selects the Metal
+/// backend in both formats. Gemma 4 is as in [`select_route`]: safetensors on
+/// the CPU, and the Q4 format refused.
+pub fn select_standalone_route(
+    format: ModelFormat,
+    family: ModelFamily,
+) -> Result<ServedRoute, RouteRefusal> {
+    route_table(format, family, ServedBackend::Metal)
+}
+
+/// The one route table. `qwen35_safetensors` is the only cell the two
+/// binaries fill differently: the backend a Qwen3.5 safetensors directory runs
+/// on.
+fn route_table(
+    format: ModelFormat,
+    family: ModelFamily,
+    qwen35_safetensors: ServedBackend,
+) -> Result<ServedRoute, RouteRefusal> {
     match (format, family) {
+        (ModelFormat::Safetensors, ModelFamily::Qwen35) => Ok(ServedRoute {
+            family: ModelFamily::Qwen35,
+            backend: qwen35_safetensors,
+        }),
         (ModelFormat::Safetensors, family) => Ok(ServedRoute {
             family,
             backend: ServedBackend::Cpu,
@@ -189,6 +222,57 @@ mod tests {
                 family: ModelFamily::Qwen35,
                 backend: ServedBackend::Metal
             })
+        );
+    }
+
+    #[test]
+    fn the_standalone_table_runs_qwen_on_metal_in_both_formats() {
+        for format in [ModelFormat::Safetensors, ModelFormat::Q4] {
+            assert_eq!(
+                select_standalone_route(format, ModelFamily::Qwen35),
+                Ok(ServedRoute {
+                    family: ModelFamily::Qwen35,
+                    backend: ServedBackend::Metal
+                }),
+                "{format:?}"
+            );
+        }
+        assert_eq!(
+            select_standalone_route(ModelFormat::Safetensors, ModelFamily::Gemma4),
+            Ok(ServedRoute::GEMMA4_CPU)
+        );
+    }
+
+    #[test]
+    fn the_two_tables_differ_only_in_the_qwen_safetensors_backend() {
+        let formats = [
+            ModelFormat::Safetensors,
+            ModelFormat::Q4,
+            ModelFormat::Unknown,
+        ];
+        let families = [ModelFamily::Qwen35, ModelFamily::Gemma4];
+        for format in formats {
+            for family in families {
+                let cli = select_route(format, family);
+                let standalone = select_standalone_route(format, family);
+                if (format, family) == (ModelFormat::Safetensors, ModelFamily::Qwen35) {
+                    assert_ne!(cli, standalone);
+                } else {
+                    assert_eq!(cli, standalone, "{format:?} {family:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_standalone_table_refuses_gemma_in_the_metal_format() {
+        assert_eq!(
+            select_standalone_route(ModelFormat::Q4, ModelFamily::Gemma4),
+            Err(RouteRefusal::GemmaMetalUnsupported)
+        );
+        assert_eq!(
+            select_standalone_route(ModelFormat::Unknown, ModelFamily::Qwen35),
+            Err(RouteRefusal::UnrecognizedFormat)
         );
     }
 

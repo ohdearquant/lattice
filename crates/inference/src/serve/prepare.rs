@@ -25,6 +25,7 @@ use crate::serve::contract::{
 };
 use crate::serve::into_engine_chat_messages;
 use crate::serve::prompt_adapter::{PromptAdapter as _, QwenPromptAdapter};
+use crate::serving_cpu::GemmaCpuServing;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::sync::Arc;
@@ -38,22 +39,48 @@ type ValidatedChatRequest = ContractValidatedChatRequest;
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct PreparationHandle {
-    tokenizer: Arc<BpeTokenizer>,
-    model_max_context: usize,
+    model: PreparedModel,
+}
+
+// Both variants are built only by the Metal worker's factory (and by tests), so
+// a build without the `metal-gpu` feature never constructs either.
+#[cfg_attr(
+    not(any(test, all(target_os = "macos", feature = "metal-gpu"))),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone)]
+enum PreparedModel {
+    Qwen {
+        tokenizer: Arc<BpeTokenizer>,
+        model_max_context: usize,
+    },
+    Gemma(Arc<GemmaCpuServing>),
 }
 
 impl PreparationHandle {
     #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
     pub(crate) fn qwen(tokenizer: Arc<BpeTokenizer>, model_max_context: usize) -> Self {
         Self {
-            tokenizer,
-            model_max_context,
+            model: PreparedModel::Qwen {
+                tokenizer,
+                model_max_context,
+            },
+        }
+    }
+
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+    pub(crate) fn gemma(serving: Arc<GemmaCpuServing>) -> Self {
+        Self {
+            model: PreparedModel::Gemma(serving),
         }
     }
 
     /// Tokenize with the same tokenizer used by worker execution.
     pub fn tokenize_len(&self, prompt: &str) -> usize {
-        self.tokenizer.tokenize(prompt).pre_truncation_len
+        match &self.model {
+            PreparedModel::Qwen { tokenizer, .. } => tokenizer.tokenize(prompt).pre_truncation_len,
+            PreparedModel::Gemma(gemma) => gemma.tokenize_len(prompt),
+        }
     }
 
     /// Run the CLI's render, tokenize and context check before stop parsing.
@@ -65,15 +92,22 @@ impl PreparationHandle {
         max_tokens_cap: usize,
         vision_supported: bool,
     ) -> Result<PreparedChatRequest, ApiError> {
-        prepare_chat_request(
-            req,
-            model_id,
-            default_max_tokens,
-            max_tokens_cap,
-            vision_supported,
-            |prompt| self.tokenize_len(prompt),
-            || self.model_max_context,
-        )
+        match &self.model {
+            PreparedModel::Qwen {
+                model_max_context, ..
+            } => prepare_chat_request(
+                req,
+                model_id,
+                default_max_tokens,
+                max_tokens_cap,
+                vision_supported,
+                |prompt| self.tokenize_len(prompt),
+                || *model_max_context,
+            ),
+            PreparedModel::Gemma(gemma) => gemma
+                .prepare(req, model_id, default_max_tokens, max_tokens_cap)
+                .map(|(prepared, _)| prepared),
+        }
     }
 
     /// Apply the standalone server's existing normalization profile.
@@ -84,17 +118,25 @@ impl PreparationHandle {
         model_id: &str,
         vision_supported: bool,
     ) -> Result<ValidatedChatRequest, ApiError> {
-        normalize_request(
-            req,
-            defaults,
-            ServeProfile::lattice_serve(model_id, self.model_max_context)
-                .with_vision_support(vision_supported),
-        )
+        match &self.model {
+            PreparedModel::Qwen {
+                model_max_context, ..
+            } => normalize_request(
+                req,
+                defaults,
+                ServeProfile::lattice_serve(model_id, *model_max_context)
+                    .with_vision_support(vision_supported),
+            ),
+            PreparedModel::Gemma(gemma) => gemma.normalize_standalone(req, defaults, model_id),
+        }
     }
 
     /// Map validated standalone options through the model's prompt adapter.
     pub fn standalone_generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig {
-        QwenPromptAdapter.generate_config(req)
+        match &self.model {
+            PreparedModel::Qwen { .. } => QwenPromptAdapter.generate_config(req),
+            PreparedModel::Gemma(gemma) => gemma.standalone_generate_config(req),
+        }
     }
 
     /// Map prepared CLI sampling options through the model's prompt adapter.
@@ -109,15 +151,83 @@ impl PreparationHandle {
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
     ) -> GenerateConfig {
-        lattice_gen_cfg(
-            max_tokens,
-            temperature,
-            top_p,
-            seed,
-            stop_strings,
-            reasoning_budget,
-            logprobs,
-        )
+        match &self.model {
+            PreparedModel::Qwen { .. } => lattice_gen_cfg(
+                max_tokens,
+                temperature,
+                top_p,
+                seed,
+                stop_strings,
+                reasoning_budget,
+                logprobs,
+            ),
+            PreparedModel::Gemma(gemma) => gemma.lattice_generate_config(
+                max_tokens,
+                temperature,
+                top_p,
+                seed,
+                stop_strings,
+                reasoning_budget,
+                logprobs,
+            ),
+        }
+    }
+
+    /// Refuse the standalone-server features this model cannot serve.
+    ///
+    /// Qwen3.5 serves all of them, so it never refuses here. Gemma 4 text on
+    /// the CPU has no adapter support and no grammar-constrained decoding:
+    /// a request that selects a LoRA adapter is refused with
+    /// `lora_unsupported_backend`, the code `lattice serve` answers with on a
+    /// backend without adapters, and a `response_format` of type
+    /// `json_schema` with `unsupported_feature`. Image content, stop strings,
+    /// `logprobs`, a reasoning budget and typed content parts are refused by
+    /// [`Self::normalize_standalone`].
+    pub fn refuse_standalone_unsupported(
+        &self,
+        req: &ChatCompletionRequest,
+    ) -> Result<(), ApiError> {
+        match &self.model {
+            PreparedModel::Qwen { .. } => Ok(()),
+            PreparedModel::Gemma(_) => {
+                if req
+                    .lora
+                    .as_ref()
+                    .is_some_and(|selection| !selection.is_empty())
+                {
+                    return Err(lora_unsupported_backend());
+                }
+                if req
+                    .response_format
+                    .as_ref()
+                    .is_some_and(|format| format.r#type == "json_schema")
+                {
+                    return Err(ApiError::BadRequest {
+                        message: "response_format.type 'json_schema' is not supported for this \
+                                  model; use 'text'"
+                            .to_string(),
+                        code: "unsupported_feature",
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether this model accepts runtime LoRA adapters.
+    pub fn supports_adapters(&self) -> bool {
+        matches!(self.model, PreparedModel::Qwen { .. })
+    }
+}
+
+/// The refusal a model without runtime LoRA adapters owes every adapter
+/// request. The code is the one `lattice serve` answers with on a backend
+/// that cannot take an adapter.
+#[doc(hidden)]
+pub fn lora_unsupported_backend() -> ApiError {
+    ApiError::BadRequest {
+        message: "runtime LoRA adapters are not supported for this model".to_string(),
+        code: "lora_unsupported_backend",
     }
 }
 
@@ -301,7 +411,7 @@ pub fn prepare_gemma_chat_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionRequest, PreparationHandle};
+    use super::{ChatCompletionRequest, GenerationDefaults, PreparationHandle};
     use crate::serve::ApiError;
     use crate::tokenizer::bpe::BpeTokenizer;
     use std::collections::HashMap;
@@ -324,6 +434,130 @@ mod tests {
             "stop": stop,
         }))
         .expect("chat request body")
+    }
+
+    fn gemma_handle() -> PreparationHandle {
+        PreparationHandle::gemma(Arc::new(crate::serving_cpu::tiny_zero_serving()))
+    }
+
+    fn gemma_request(extra: serde_json::Value) -> ChatCompletionRequest {
+        let mut body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 5,
+        });
+        if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            body.extend(extra.clone());
+        }
+        serde_json::from_value(body).expect("chat request body")
+    }
+
+    fn refusal_code(error: ApiError) -> &'static str {
+        match error {
+            ApiError::BadRequest { code, .. } => code,
+            other => panic!("expected a BadRequest refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_gemma_handle_refuses_adapters_and_grammar_by_name() {
+        let handle = gemma_handle();
+        assert!(!handle.supports_adapters());
+        for (extra, code) in [
+            (
+                serde_json::json!({"lora": [{"id": 1, "scale": 1.0}]}),
+                "lora_unsupported_backend",
+            ),
+            (
+                serde_json::json!({"response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "object"}}}}),
+                "unsupported_feature",
+            ),
+        ] {
+            let error = handle
+                .refuse_standalone_unsupported(&gemma_request(extra.clone()))
+                .expect_err("Gemma cannot serve this");
+            assert_eq!(refusal_code(error), code, "{extra}");
+        }
+        for admitted in [
+            serde_json::json!({}),
+            serde_json::json!({"lora": []}),
+            serde_json::json!({"response_format": {"type": "text"}}),
+        ] {
+            handle
+                .refuse_standalone_unsupported(&gemma_request(admitted.clone()))
+                .unwrap_or_else(|error| panic!("{admitted}: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn the_qwen_handle_refuses_nothing_standalone() {
+        let handle = handle(64);
+        assert!(handle.supports_adapters());
+        let request = gemma_request(serde_json::json!({
+            "lora": [{"id": 1, "scale": 1.0}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "object"}}},
+        }));
+        handle
+            .refuse_standalone_unsupported(&request)
+            .expect("Qwen serves adapters and grammar");
+    }
+
+    #[test]
+    fn the_gemma_handle_normalizes_a_plain_request_and_builds_the_gemma_config() {
+        let handle = gemma_handle();
+        let validated = handle
+            .normalize_standalone(
+                &gemma_request(serde_json::json!({})),
+                GenerationDefaults::standard(64),
+                "served-model",
+                false,
+            )
+            .expect("a plain chat request is admitted");
+        assert_eq!(validated.max_tokens, 5);
+        let cfg = handle.standalone_generate_config(&validated);
+        assert!(
+            cfg.stop_token_ids.contains(&106),
+            "the checkpoint's end-of-turn id stops the turn: {:?}",
+            cfg.stop_token_ids
+        );
+        assert!(!cfg.enable_thinking);
+        assert!(cfg.grammar.is_none());
+    }
+
+    #[test]
+    fn the_gemma_handle_refuses_the_controls_gemma_cannot_serve_with_stable_codes() {
+        let handle = gemma_handle();
+        let image = "data:image/png;base64,iVBORw0KGgo=";
+        for (extra, code) in [
+            (serde_json::json!({"stop": ["x"]}), "unsupported_feature"),
+            (
+                serde_json::json!({"reasoning_budget": 8}),
+                "unsupported_feature",
+            ),
+            (
+                serde_json::json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}),
+                "unsupported_feature",
+            ),
+            (
+                serde_json::json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image}}]}]}),
+                "vision_unsupported",
+            ),
+        ] {
+            let error = handle
+                .normalize_standalone(
+                    &gemma_request(extra.clone()),
+                    GenerationDefaults::standard(64),
+                    "served-model",
+                    false,
+                )
+                .expect_err("Gemma cannot serve this");
+            assert_eq!(refusal_code(error), code, "{extra}");
+        }
+    }
+
+    #[test]
+    fn the_gemma_handle_counts_tokens_with_the_gemma_tokenizer() {
+        let handle = gemma_handle();
+        assert!(handle.tokenize_len("hello world") > 0);
     }
 
     #[test]

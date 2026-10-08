@@ -3,6 +3,9 @@
 //! Exposes the Metal GPU engine over the same `/v1/chat/completions` API that
 //! ollama, llama.cpp's server, and most LLM benchmark harnesses already speak,
 //! so any OpenAI-compatible client can point at lattice with zero adapter code.
+//! A Gemma 4 E2B safetensors text checkpoint is served on the CPU through the
+//! same worker queue; the family and backend come from the route table
+//! `lattice serve` uses (`lattice_inference::serve::route`).
 //!
 //! # Usage
 //!
@@ -101,7 +104,7 @@ mod imp {
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::model_format::{self, ModelFormat};
+    use lattice_inference::model_format::{self, ModelFamily, ModelFormat};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatReq, GenerationDefaults, ServeProfile, is_message_flood_error,
         message_flood_text, normalize_request,
@@ -123,6 +126,7 @@ mod imp {
     };
     use lattice_inference::serve::metrics::ServeMetrics;
     use lattice_inference::serve::prepare::build_cfg;
+    use lattice_inference::serve::route::{RouteRefusal, select_standalone_route};
     use lattice_inference::serving_factory::ServingFactory;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::{BertModel, BertPooling};
@@ -2072,6 +2076,25 @@ mod imp {
                 return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
+        // Features the loaded model cannot serve are refused by name before
+        // any other work. A model that serves them all (Qwen3.5) never
+        // refuses here.
+        if let Some(preparation) = s.jobs.preparation()
+            && let Err(err) = preparation.refuse_standalone_unsupported(&req)
+        {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                "/v1/chat/completions",
+                400,
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
         // Same resolver as the other binary, for the same reason: these two read
         // the raw field differently today, and this binary had no request-boundary
         // `validate_scales` at all — a non-finite scale reached the worker and was
@@ -2210,29 +2233,31 @@ mod imp {
         // first-event peek (`rx.recv()` returning `None`) and report
         // identically to this binary's prior up-front `jobs.send(..).is_err()`
         // check.
-        let mut rx =
-            match s
-                .jobs
-                .submit_with_lora(messages, cfg, cancel_rx, requested.selection().to_vec())
-            {
-                Ok(rx) => rx,
-                Err(api_err) => {
-                    let code = api_err.code();
-                    let response = api_err.into_response();
-                    emit_serve_event(
-                        &s.metrics,
-                        "POST",
-                        "/v1/chat/completions",
-                        response.status().as_u16(),
-                        None,
-                        None,
-                        timer.elapsed().as_secs_f64() * 1000.0,
-                        false,
-                        Some(code),
-                    );
-                    return response;
-                }
-            };
+        let mut rx = match s.jobs.submit_with_lora_mode(
+            messages,
+            cfg,
+            cancel_rx,
+            requested.selection().to_vec(),
+            streaming,
+        ) {
+            Ok(rx) => rx,
+            Err(api_err) => {
+                let code = api_err.code();
+                let response = api_err.into_response();
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    "/v1/chat/completions",
+                    response.status().as_u16(),
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some(code),
+                );
+                return response;
+            }
+        };
         // Dropped when nobody cares about the response anymore: at the end of
         // this SSE stream (moved in below) or at the end of this function for
         // the non-streaming branch. Either way that's the client disconnect
@@ -3341,7 +3366,10 @@ mod imp {
     /// `--host` this route lets anyone who can reach the port make the server open a
     /// file of their choosing. The startup warning covers it; an allow-root is the
     /// obvious next control and is deliberately not invented here.
-    async fn lora_list(State(s): State<AppState>) -> Json<Value> {
+    async fn lora_list(State(s): State<AppState>) -> Response {
+        if !adapters_supported(&s) {
+            return lattice_inference::serve::prepare::lora_unsupported_backend().into_response();
+        }
         // Assembled by the shared helper so this binary and `lattice serve`
         // cannot answer the same route with different shapes. They already
         // did: this returned the bare residency snapshot while the other had
@@ -3356,6 +3384,15 @@ mod imp {
             &s.jobs.adapter_index(),
             None,
         ))
+        .into_response()
+    }
+
+    /// Whether the loaded model takes runtime LoRA adapters. A worker with no
+    /// model-bound preparation is the Qwen3.5 test worker, which does.
+    fn adapters_supported(s: &AppState) -> bool {
+        s.jobs
+            .preparation()
+            .is_none_or(lattice_inference::serve::prepare::PreparationHandle::supports_adapters)
     }
 
     /// Repeated exact `(name, path)` identities share one resident id and lifetime:
@@ -3382,6 +3419,9 @@ mod imp {
             );
             response
         };
+        if !adapters_supported(&s) {
+            return fail(lattice_inference::serve::prepare::lora_unsupported_backend());
+        }
         if let Err(err) = lattice_inference::serve::require_json_content_type(&headers) {
             return fail(err);
         }
@@ -3466,6 +3506,9 @@ mod imp {
             );
             response
         };
+        if !adapters_supported(&s) {
+            return fail(lattice_inference::serve::prepare::lora_unsupported_backend());
+        }
         if let Err(err) = lattice_inference::serve::require_json_content_type(&headers) {
             return fail(err);
         }
@@ -3510,6 +3553,35 @@ mod imp {
         }
     }
 
+    /// Startup options that configure a Qwen3.5 Metal worker feature a Gemma
+    /// 4 text server does not have. Honoring none of them silently would
+    /// leave an operator believing a limit or a preload is in force, so each
+    /// ends startup by name.
+    fn refuse_flags_gemma_cannot_honor(
+        args: &[String],
+        reasoning_budget: Option<usize>,
+    ) -> Result<(), String> {
+        let unsupported = |what: &str| {
+            Err(format!(
+                "unsupported_feature: {what} is not supported for Gemma 4 checkpoints"
+            ))
+        };
+        for flag in [
+            "--preload-vision",
+            "--tokenizer-dir",
+            "--max-resident-adapters",
+            "--max-resident-adapter-bytes",
+        ] {
+            if args.iter().any(|arg| arg == flag) {
+                return unsupported(flag);
+            }
+        }
+        if reasoning_budget.is_some() {
+            return unsupported("--reasoning-budget");
+        }
+        Ok(())
+    }
+
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args: Vec<String> = std::env::args().collect();
 
@@ -3521,6 +3593,17 @@ mod imp {
             return Err(format!("model directory not found: {}", model_dir.display()).into());
         }
         let format = model_format::detect_format(&model_dir);
+        // The family and backend come from the table `lattice serve` uses, with
+        // this binary's Metal worker for Qwen3.5. Only a refusal the table
+        // owns outright (Gemma 4 in the Q4 format) ends startup here: a
+        // directory with no recognized format keeps the loader errors this
+        // binary has always reported for it, in their order.
+        let route = match select_standalone_route(format, model_format::detect_family(&model_dir)) {
+            Ok(route) => Some(route),
+            Err(RouteRefusal::UnrecognizedFormat) => None,
+            Err(refusal) => return Err(refusal.message(&model_dir).into()),
+        };
+        let gemma = route.is_some_and(|route| route.family == ModelFamily::Gemma4);
         let tokenizer_path = parse_arg(&args, "--tokenizer-dir")
             .map(|d| std::path::Path::new(&d).join("tokenizer.json"))
             .unwrap_or_else(|| model_dir.join("tokenizer.json"));
@@ -3584,10 +3667,17 @@ mod imp {
         // startup-time/memory tradeoff this trades away.
         let preload_vision = parse_flag(&args, "--preload-vision");
 
+        if gemma {
+            refuse_flags_gemma_cannot_honor(&args, defaults.reasoning_budget)?;
+        }
+        if let Some(route) = route {
+            eprintln!("{}", route.selection_marker(format));
+        }
         eprintln!(
             "[lattice_serve] loading model from {} ({}) ...",
             model_dir.display(),
             match format {
+                _ if gemma => "safetensors",
                 ModelFormat::Q4 => "q4",
                 ModelFormat::Safetensors => "bf16",
                 ModelFormat::Unknown => "unknown",
@@ -3602,26 +3692,19 @@ mod imp {
         // did.
         let model_dir_for_loader = model_dir.clone();
         let tokenizer_path_for_vocab = tokenizer_path.clone();
-        let vision_config = Qwen35Config::from_model_dir(&model_dir)
-            .map_err(|e| format!("config.json load failed: {e}"))?;
-        let mut vision_runtime =
-            VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
-        if preload_vision && let Err(err) = vision_runtime.preload() {
-            eprintln!(
-                "[lattice_serve] WARNING: --preload-vision failed, falling back to lazy \
+        let factory = if gemma {
+            ServingFactory::gemma_cpu(model_dir.clone())
+        } else {
+            let vision_config = Qwen35Config::from_model_dir(&model_dir)
+                .map_err(|e| format!("config.json load failed: {e}"))?;
+            let mut vision_runtime =
+                VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
+            if preload_vision && let Err(err) = vision_runtime.preload() {
+                eprintln!(
+                    "[lattice_serve] WARNING: --preload-vision failed, falling back to lazy \
                      vision loading: {err}"
-            );
-        }
-        let (
-            owner,
-            jobs,
-            WorkerMetadata {
-                format: fmt,
-                model_max_context,
-                ..
-            },
-            _preparation,
-        ) = match MetalWorker::spawn_with_vision(
+                );
+            }
             ServingFactory::qwen_metal(
                 move || {
                     let LoadedModel {
@@ -3642,10 +3725,18 @@ mod imp {
                     ))
                 },
                 vision_runtime,
-            ),
-            max_pending,
-            residency_limits,
-        ) {
+            )
+        };
+        let (
+            owner,
+            jobs,
+            WorkerMetadata {
+                format: fmt,
+                model_max_context,
+                ..
+            },
+            _preparation,
+        ) = match MetalWorker::spawn_with_vision(factory, max_pending, residency_limits) {
             Ok(triple) => triple,
             Err(StartupError::Load(e)) => return Err(e.into()),
             // Preserves this binary's exact prior wording (distinct from
@@ -3699,7 +3790,11 @@ mod imp {
         // tokenizer/config load happens. Removing the second load would
         // require restructuring `load_model`'s ownership across that
         // thread boundary, out of stage 2's cache-placement scope.
-        let vocab_bytes: Arc<Vec<Vec<u8>>> = {
+        let vocab_bytes: Arc<Vec<Vec<u8>>> = if gemma {
+            // Grammar-constrained output is refused for Gemma 4 before this
+            // table is read.
+            Arc::new(Vec::new())
+        } else {
             let tokenizer_for_vocab = BpeTokenizer::from_tokenizer_json(&tokenizer_path_for_vocab)
                 .map_err(|e| {
                     format!(
@@ -6710,11 +6805,84 @@ mod imp {
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn lora_list_reads_confirmed_index() {
-            let Json(value) = lora_list(State(test_app_state())).await;
+            let response = lora_list(State(test_app_state())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
                 value,
                 serde_json::json!({"adapters":[],"applied":[],"router":{"enabled":false}})
             );
+        }
+
+        /// The worker's runtime names the mode of each request it routes, so
+        /// the handler must tell the worker whether the response is streamed.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn streaming_flag_reaches_worker() {
+            for stream in [false, true] {
+                let (state, mut jobs_rx) = test_app_state_with_jobs();
+                let worker = tokio::spawn(async move {
+                    let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await else {
+                        panic!("missing generation")
+                    };
+                    let streamed = job.is_streamed();
+                    job.reply(WorkerEvent::Complete(GenerateOutput {
+                        text: "ok".into(),
+                        token_ids: vec![0],
+                        prompt_tokens: 1,
+                        generated_tokens: 1,
+                        stopped: true,
+                        stop_reason: None,
+                        token_logprobs: vec![],
+                    }));
+                    streamed
+                });
+                let body = Body::from(
+                    serde_json::json!({"messages":[{"role":"user","content":"hi"}],"stream":stream})
+                        .to_string(),
+                );
+                let response = chat_completions(State(state), test_json_headers(), body).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(worker.await.unwrap(), stream);
+            }
+        }
+
+        #[test]
+        fn gemma_startup_refuses_options_it_cannot_honor_by_name() {
+            let args = |extra: &[&str]| -> Vec<String> {
+                ["lattice_serve", "--model", "m"]
+                    .into_iter()
+                    .chain(extra.iter().copied())
+                    .map(String::from)
+                    .collect()
+            };
+            assert_eq!(refuse_flags_gemma_cannot_honor(&args(&[]), None), Ok(()));
+            assert_eq!(
+                refuse_flags_gemma_cannot_honor(
+                    &args(&["--port", "1", "--max-pending", "4"]),
+                    None
+                ),
+                Ok(())
+            );
+            for flag in [
+                "--preload-vision",
+                "--tokenizer-dir",
+                "--max-resident-adapters",
+                "--max-resident-adapter-bytes",
+            ] {
+                let error = refuse_flags_gemma_cannot_honor(&args(&[flag, "1"]), None)
+                    .expect_err("an option with no Gemma meaning ends startup");
+                assert_eq!(
+                    error,
+                    format!("unsupported_feature: {flag} is not supported for Gemma 4 checkpoints")
+                );
+            }
+            let error =
+                refuse_flags_gemma_cannot_honor(&args(&["--reasoning-budget", "8"]), Some(8))
+                    .expect_err("a server reasoning budget cannot be applied to Gemma");
+            assert!(error.contains("--reasoning-budget"), "{error}");
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

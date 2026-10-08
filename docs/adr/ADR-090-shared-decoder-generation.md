@@ -325,7 +325,22 @@ binary was built with. The route and its evidence are two stderr line families w
 `[route] served family=<f> backend=cpu mode=<stream|nonstream> driver=<shared|bypassed> opened=<n> consumed=<n>` per
 CPU-served request, where `driver` is derived from the shared driver's own prediction counters (`opened > 0`), not
 asserted. Metal-served Qwen requests keep their existing behavior and write the startup line only. The standalone
-server remains R09.
+server is the next amendment.
+
+#### Amendment, 2026-10-08: the standalone server serves Gemma E2B text through the worker factory
+
+`lattice_serve` decides the family with the same `detect_family` and the backend with the same route table, through
+`route::select_standalone_route`. The table differs from `lattice serve`'s in one cell: the standalone server runs
+every Qwen3.5 checkpoint on its Metal worker, a safetensors directory included, so Qwen3.5 selects `backend=metal` in
+both formats. A Gemma 4 safetensors directory selects the CPU and is built by `ServingFactory::gemma_cpu` into a
+worker-local `GemmaCpuRuntime` that runs `serving_cpu::GemmaCpuServing` under the shared driver, on the same worker
+queue as Qwen, so admission, FIFO order, disconnect cancellation and `/metrics` are the existing ones. The runtime
+writes the same `[route] served` line as `lattice serve`; the worker hands it whether the response is streamed
+(`submit_with_lora_mode`). A Gemma 4 checkpoint in the Q4 format is refused at startup with `gemma_metal_unsupported`
+before any loader runs, and a directory with no recognized format keeps the loader errors it always reported. Qwen3.5
+request handling, response bodies, error codes and the binary's feature set are unchanged. What Gemma 4 cannot serve
+(`stop`, a reasoning budget, typed content parts, images, grammar-constrained output, runtime adapters and the startup
+options that configure them) is refused by a stable code, documented in `docs/serve-http-api.md`.
 
 ### D4. Reconcile existing decisions without weakening their tests
 
