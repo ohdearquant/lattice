@@ -271,8 +271,11 @@ fn vocab_size_per_layer_input_mismatch_is_rejected_naming_the_field() {
 ///
 /// A second negative arm covers the role check (a drafter/assistant
 /// `architectures` value), so a role refusal is also shown to happen
-/// before weight I/O, not only the mode refusal. Both negative arms share
-/// the one positive control above them.
+/// before weight I/O, not only the mode refusal. A third negative arm covers
+/// the per-layer-embedding width (`hidden_size_per_layer_input: 0`), so a
+/// changed PLE is also refused through the loader before any weight access,
+/// not only at config-parse level. All three negative arms share the one
+/// positive control above them.
 #[test]
 fn rejection_happens_before_any_weight_access() {
     let mode_dir = tempfile::tempdir().expect("create temp dir for the negative arm");
@@ -309,6 +312,24 @@ fn rejection_happens_before_any_weight_access() {
     assert!(
         !role_msg.contains("model.safetensors"),
         "an admission rejection must not read as a missing-weights error: {role_msg}"
+    );
+
+    let ple_dir = tempfile::tempdir().expect("create temp dir for the PLE negative arm");
+    let mut ple_json = pinned_config_value();
+    ple_json["text_config"]["hidden_size_per_layer_input"] = serde_json::json!(0);
+    std::fs::write(ple_dir.path().join("config.json"), ple_json.to_string())
+        .expect("write mutated config.json");
+    let Err(ple_err) = Gemma4Model::from_safetensors(ple_dir.path()) else {
+        panic!("a zero hidden_size_per_layer_input must be rejected before weight I/O");
+    };
+    let ple_msg = ple_err.to_string();
+    assert!(
+        ple_msg.contains("hidden_size_per_layer_input"),
+        "must name hidden_size_per_layer_input: {ple_msg}"
+    );
+    assert!(
+        !ple_msg.contains("model.safetensors"),
+        "an admission rejection must not read as a missing-weights error: {ple_msg}"
     );
 
     let control_dir = tempfile::tempdir().expect("create temp dir for the positive control");
