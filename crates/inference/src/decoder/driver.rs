@@ -1401,7 +1401,7 @@ mod speculative_tests {
         first: u32,
         rounds: VecDeque<VerifiedRound>,
         first_reads: usize,
-        pendings: Vec<u32>,
+        seen_pending: Vec<u32>,
         rooms: Vec<usize>,
         finished: bool,
     }
@@ -1419,7 +1419,7 @@ mod speculative_tests {
             first,
             rounds: rounds.into(),
             first_reads: 0,
-            pendings: Vec::new(),
+            seen_pending: Vec::new(),
             rooms: Vec::new(),
             finished: false,
         }
@@ -1437,7 +1437,7 @@ mod speculative_tests {
             room: usize,
             _is_stop: &dyn Fn(u32) -> bool,
         ) -> Result<VerifiedRound, InferenceError> {
-            self.pendings.push(pending);
+            self.seen_pending.push(pending);
             self.rooms.push(room);
             self.rounds
                 .pop_front()
@@ -1486,7 +1486,7 @@ mod speculative_tests {
         assert_eq!(result.generated_ids, vec![1, 2, 3]);
         assert!(!result.stopped);
         assert_eq!(result.stop_reason, StopReason::Length);
-        assert_eq!(session.pendings, vec![1, 3]);
+        assert_eq!(session.seen_pending, vec![1, 3]);
         assert_eq!(session.rooms, vec![3, 1]);
         assert_eq!(
             result.trace,
@@ -1506,7 +1506,7 @@ mod speculative_tests {
         assert!(!result.stopped);
         assert_eq!(result.stop_reason, StopReason::Length);
         assert_eq!(session.first_reads, 0);
-        assert!(session.pendings.is_empty());
+        assert!(session.seen_pending.is_empty());
     }
 
     #[test]
@@ -1516,7 +1516,7 @@ mod speculative_tests {
         assert!(result.generated_ids.is_empty());
         assert!(result.stopped);
         assert_eq!(result.stop_reason, StopReason::Eos);
-        assert!(session.pendings.is_empty());
+        assert!(session.seen_pending.is_empty());
     }
 
     #[test]
@@ -1528,7 +1528,7 @@ mod speculative_tests {
         assert_eq!(result.generated_ids, vec![1, 2]);
         assert!(result.stopped);
         assert_eq!(result.stop_reason, StopReason::Eos);
-        assert_eq!(session.pendings, vec![1], "no round past the stop");
+        assert_eq!(session.seen_pending, vec![1], "no round past the stop");
     }
 
     #[test]
@@ -1604,7 +1604,11 @@ mod speculative_tests {
         assert_eq!(result.generated_ids, vec![1]);
         assert!(!result.stopped);
         assert_eq!(result.stop_reason, StopReason::Interrupt);
-        assert_eq!(session.pendings, vec![1], "the cancelled round never ran");
+        assert_eq!(
+            session.seen_pending,
+            vec![1],
+            "the cancelled round never ran"
+        );
         assert!(session.finished);
     }
 
