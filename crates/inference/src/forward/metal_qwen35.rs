@@ -15037,14 +15037,16 @@ mod inner {
                 .find("    mod tests {")
                 .expect("mod tests must exist in this file");
             let production_src = &src[..production_end];
-            // One definition + three call sites in this file. The other two loops, the
-            // direct and streaming entries', decode through the Metal decoder session,
-            // whose `select` samples every decode step (dense and compact readback)
-            // through the same function; it is counted in that file below.
+            // One definition + two call sites in this file: the loops of
+            // `generate_multimodal` and `generate_multimodal_vision_impl`. The other three
+            // loops, the direct, streaming and prefix-cache streaming entries', decode
+            // through the Metal decoder session, whose `select` samples every decode step
+            // (dense and compact readback) through the same function; it is counted in
+            // that file below.
             let count = production_src.matches("sample_decode_traced(").count();
             assert_eq!(
-                count, 4,
-                "expected sample_decode_traced's definition plus exactly 3 decode-loop \
+                count, 3,
+                "expected sample_decode_traced's definition plus exactly 2 decode-loop \
                  call sites; got {count} instead -- a decode loop likely reverted to \
                  calling sample_token/sample_from_candidates directly, the exact drift \
                  round 3's review caught in the two multimodal decode loops"
