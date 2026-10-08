@@ -1,4 +1,5 @@
-//! HTTP serving cost against a real `lattice serve` process.
+//! HTTP serving cost against a real `lattice serve` process, or against the
+//! standalone `lattice_serve` binary when `BENCH_BIN` names it.
 //!
 //! Spawns the `lattice` binary as `lattice serve` on an ephemeral loopback
 //! port, waits for its `Listening on` line, then drives
@@ -13,6 +14,13 @@
 //! example from the same profile; `BENCH_BIN` names a binary explicitly. The
 //! sha256 of the binary that served the run is printed, so two arms that ran
 //! the same executable are visible as such.
+//!
+//! A `BENCH_BIN` whose file name is `lattice_serve` is the standalone server
+//! (`cargo build --release -p lattice-inference --bin lattice_serve --features
+//! f16,metal-gpu,serve`). It takes no `serve` subcommand and no `--model-id`,
+//! announces its address on its `OpenAI-compatible API on` line, and names the
+//! model after the checkpoint directory, so that is the name the requests carry.
+//! Everything else, the requests and the certification, is the same.
 //!
 //! Certification. A run is refused (nonzero exit) rather than reported when
 //! the model directory holds no checkpoint, when the server exits before it
@@ -40,7 +48,8 @@
 //!                              $HOME/.lattice/models/qwen3.5-0.8b; HOME must
 //!                              be set when LATTICE_MODEL_DIR is not)
 //!   BENCH_BIN                  `lattice` binary (default: next to this
-//!                              example's profile directory)
+//!                              example's profile directory), or the
+//!                              `lattice_serve` binary
 //!   BENCH_RUNS                 measured runs per case and mode, after one
 //!                              untimed warmup (default 5)
 //!   BENCH_MAX_TOKENS           `max_tokens` per request, 1..=4096 (default 32)
@@ -58,7 +67,9 @@
 //!                              value, whichever is smaller
 //!   BENCH_STDERR_MARKER        substring to count in the server's stderr;
 //!                              `lattice serve` writes one `[route] served ...`
-//!                              line per request it answers on a CPU route,
+//!                              line per request it answers on a CPU route
+//!                              (`lattice_serve` writes one for each request
+//!                              its Gemma CPU runtime answers),
 //!                              naming the family, backend, mode and the
 //!                              shared decoder driver's counters, so a pattern
 //!                              such as `driver=shared` counts the requests
@@ -100,6 +111,9 @@ use std::time::{Duration, Instant};
 
 const MODEL_ID: &str = "bench-model";
 const LISTENING_PREFIX: &str = "Listening on ";
+// The standalone server's own announcement, `<prefix>ADDR/v1`.
+const STANDALONE_LISTENING_PREFIX: &str = "[lattice_serve] OpenAI-compatible API on http://";
+const STANDALONE_BINARY: &str = "lattice_serve";
 const SERVER_MAX_TOKENS_CAP: usize = 4096;
 const STDERR_TAIL_LINES: usize = 20;
 const POLL: Duration = Duration::from_millis(25);
@@ -367,6 +381,17 @@ impl Drop for Server {
     }
 }
 
+/// The address a server's stderr line announces, if it is an announcement:
+/// `lattice serve` writes `Listening on ADDR  (model: ...)` and `lattice_serve`
+/// writes `[lattice_serve] OpenAI-compatible API on http://ADDR/v1`.
+fn announced_address(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix(LISTENING_PREFIX) {
+        return Some(rest.split_whitespace().next().unwrap_or("").to_string());
+    }
+    line.strip_prefix(STANDALONE_LISTENING_PREFIX)
+        .map(|rest| rest.split('/').next().unwrap_or("").to_string())
+}
+
 fn read_stderr(
     stderr: impl Read,
     lines: &Mutex<Vec<String>>,
@@ -388,8 +413,7 @@ fn read_stderr(
         let address = if announced {
             None
         } else {
-            line.strip_prefix(LISTENING_PREFIX)
-                .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
+            announced_address(&line)
         };
         lines
             .lock()
@@ -482,8 +506,37 @@ fn free_loopback_port() -> Result<u16, Refusal> {
         .map_err(|e| Refusal::Spawn(e.to_string()))
 }
 
+fn is_standalone(bin: &Path) -> bool {
+    bin.file_stem()
+        .is_some_and(|stem| stem == STANDALONE_BINARY)
+}
+
+/// The model name a request carries: `lattice serve` is started with
+/// `--model-id`, the standalone server names its model after the directory.
+fn served_model_name(cfg: &Config) -> String {
+    if is_standalone(&cfg.bin) {
+        cfg.model_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("lattice")
+            .to_string()
+    } else {
+        MODEL_ID.to_string()
+    }
+}
+
 fn serve_command(cfg: &Config, port: u16) -> Command {
     let mut command = Command::new(&cfg.bin);
+    if is_standalone(&cfg.bin) {
+        command
+            .arg("--model")
+            .arg(&cfg.model_dir)
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string());
+        return command;
+    }
     command
         .arg("serve")
         .arg("--model")
@@ -871,7 +924,7 @@ impl Case {
 
 fn request_body(case: Case, run: usize, stream: bool, cfg: &Config) -> Value {
     json!({
-        "model": MODEL_ID,
+        "model": served_model_name(cfg),
         "messages": [{
             "role": "user",
             "content": format!("Request {run}. {}", case.prompt(cfg)),
@@ -1103,6 +1156,86 @@ mod tests {
             }
             assert_eq!(refusal.exit_code(), 1, "{name}");
         }
+    }
+
+    fn args_of(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_lattice_binary_keeps_its_serve_command_line() {
+        let cfg = test_config(PathBuf::from("/x/lattice"), PathBuf::from("/m/qwen"));
+        assert_eq!(
+            args_of(&serve_command(&cfg, 4000)),
+            [
+                "serve",
+                "--model",
+                "/m/qwen",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "4000",
+                "--model-id",
+                MODEL_ID
+            ]
+        );
+        assert_eq!(served_model_name(&cfg), MODEL_ID);
+    }
+
+    #[test]
+    fn the_standalone_binary_is_started_without_a_subcommand_or_model_id() {
+        let cfg = test_config(
+            PathBuf::from("/x/release/lattice_serve"),
+            PathBuf::from("/m/gemma-4-e2b-it"),
+        );
+        assert_eq!(
+            args_of(&serve_command(&cfg, 4000)),
+            [
+                "--model",
+                "/m/gemma-4-e2b-it",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "4000"
+            ]
+        );
+        assert_eq!(served_model_name(&cfg), "gemma-4-e2b-it");
+        let body = request_body(Case::Short, 1, false, &cfg);
+        assert_eq!(body["model"], "gemma-4-e2b-it");
+    }
+
+    #[test]
+    fn each_servers_announcement_yields_its_address() {
+        assert_eq!(
+            announced_address("Listening on 127.0.0.1:4000  (model: m)").as_deref(),
+            Some("127.0.0.1:4000")
+        );
+        assert_eq!(
+            announced_address("[lattice_serve] OpenAI-compatible API on http://127.0.0.1:4000/v1")
+                .as_deref(),
+            Some("127.0.0.1:4000")
+        );
+        assert_eq!(announced_address("[lattice_serve] loading model ..."), None);
+        assert_eq!(
+            announced_address("[route] selected family=gemma4 backend=cpu format=safetensors"),
+            None
+        );
+    }
+
+    #[test]
+    fn standalone_server_that_announces_its_api_line_is_admitted() {
+        let scratch = tempfile::tempdir().unwrap();
+        let bin = fake_binary(
+            scratch.path(),
+            "lattice_serve",
+            "echo '[lattice_serve] OpenAI-compatible API on http://127.0.0.1:1/v1' >&2\nexec sleep 37",
+        );
+        let (server, _) = start_server(Command::new(bin), Duration::from_secs(10), "127.0.0.1:1")
+            .unwrap_or_else(|refusal| panic!("{refusal}"));
+        assert_eq!(server.stderr_lines().len(), 1);
     }
 
     #[test]

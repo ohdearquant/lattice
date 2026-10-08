@@ -13,19 +13,31 @@
 //! session under the shared decoder driver, returning the driver's ledger
 //! counters beside the output so the caller can record that it did.
 //!
+//! The standalone `lattice_serve` binary reaches the same type through its
+//! worker: the preparation entries below (`normalize_standalone`,
+//! `standalone_generate_config`, `render_within_window`) are the
+//! per-request steps the worker-local Gemma runtime and the standalone
+//! handler take, and the checkpoint is loaded by the same [`GemmaCpuServing::load`].
+//!
 //! [`qwen_generate_traced`] and [`qwen_generate_streaming_traced`] run the
 //! Qwen3.5 CPU entries and return the same counters.
 //!
 //! Not a stable API: `#[doc(hidden)]` is a convention, not a semver guarantee.
 
 use crate::error::InferenceError;
+use crate::forward::metal_qwen35::{ChatMessage, ChatRole};
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::gemma4_config::Gemma4Config;
 use crate::model::gemma4_model::Gemma4Model;
 use crate::model::qwen35::Qwen35Model;
 use crate::serve::ApiError;
-use crate::serve::contract::ChatRequest;
+use crate::serve::contract::{
+    ChatRequest, GenerationDefaults, MessageContent, NormalizedChatMessage, NormalizedChatRole,
+    ServeProfile, ValidatedChatRequest, normalize_requested_options,
+    validate_context_window_with_budget,
+};
 use crate::serve::prepare::{GemmaPromptAdapter, PreparedChatRequest, prepare_gemma_chat_request};
+use crate::serve::prompt_adapter::PromptAdapter as _;
 use crate::serve::route::DriverEvidence;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
@@ -38,6 +50,14 @@ pub struct GemmaCpuServing {
     tokenizer: GemmaBpeTokenizer,
     adapter: GemmaPromptAdapter,
     max_context: usize,
+}
+
+impl std::fmt::Debug for GemmaCpuServing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GemmaCpuServing")
+            .field("max_context", &self.max_context)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GemmaCpuServing {
@@ -125,6 +145,120 @@ impl GemmaCpuServing {
             },
             gen_cfg,
         ))
+    }
+
+    /// Validate `req` under the standalone `lattice_serve` profile and apply
+    /// the Gemma defaults step, refusing every control Gemma cannot serve.
+    ///
+    /// The refusals and their order are those of [`Self::prepare`]: the
+    /// profile's own validation first (image content included), then typed
+    /// content parts, then the adapter's refusals of `logprobs`, stop
+    /// strings and a reasoning budget. The context window is checked by the
+    /// worker-local runtime on the rendered prompt, as it is for Qwen.
+    ///
+    /// # Errors
+    /// The contract's refusal for a malformed request or an unsupported
+    /// control.
+    pub fn normalize_standalone(
+        &self,
+        req: &ChatRequest,
+        defaults: GenerationDefaults,
+        model_id: &str,
+    ) -> Result<ValidatedChatRequest, ApiError> {
+        let options = normalize_requested_options(
+            req,
+            ServeProfile::lattice_serve(model_id, self.max_context).with_vision_support(false),
+        )?;
+        if req
+            .messages
+            .iter()
+            .any(|message| matches!(message.content, MessageContent::Parts(_)))
+        {
+            return Err(ApiError::BadRequest {
+                message: "typed content parts are not supported for this model; send message \
+                          content as a string"
+                    .to_string(),
+                code: "unsupported_feature",
+            });
+        }
+        self.adapter.apply_defaults(defaults, options)
+    }
+
+    /// The `GenerateConfig` for a request [`Self::normalize_standalone`]
+    /// admitted.
+    pub fn standalone_generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig {
+        self.adapter.generate_config(req)
+    }
+
+    /// The `GenerateConfig` for sampling fields a `lattice serve` request
+    /// has already prepared, with the checkpoint's stop ids and no thinking
+    /// switch, as the Gemma adapter builds it.
+    pub fn lattice_generate_config(
+        &self,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        seed: Option<u64>,
+        stop_strings: Vec<String>,
+        reasoning_budget: Option<usize>,
+        logprobs: Option<usize>,
+    ) -> GenerateConfig {
+        GenerateConfig {
+            max_new_tokens: max_tokens,
+            temperature,
+            top_p,
+            seed,
+            stop_token_ids: self.adapter.stop_token_ids().to_vec(),
+            enable_thinking: false,
+            stop_strings,
+            reasoning_budget,
+            logprobs,
+            ..GenerateConfig::default()
+        }
+    }
+
+    /// Render engine chat `messages` with the checkpoint's chat template and
+    /// admit the prompt against the context window, returning the prompt and
+    /// its token count before any truncation.
+    ///
+    /// # Errors
+    /// `context_length_exceeded` when the prompt plus the generation budget
+    /// does not fit, and `vision_unsupported` for a message that carries an
+    /// image.
+    pub fn render_within_window(
+        &self,
+        messages: &[ChatMessage],
+        cfg: &GenerateConfig,
+    ) -> Result<(String, usize), ApiError> {
+        let normalized = messages
+            .iter()
+            .map(|message| {
+                if message.image.is_some() {
+                    return Err(ApiError::BadRequest {
+                        message: "image input requires a vision-capable model".to_owned(),
+                        code: "vision_unsupported",
+                    });
+                }
+                Ok(NormalizedChatMessage {
+                    role: match message.role {
+                        ChatRole::System => NormalizedChatRole::System,
+                        ChatRole::User => NormalizedChatRole::User,
+                        ChatRole::Assistant => NormalizedChatRole::Assistant,
+                    },
+                    content: message.content.clone(),
+                    image: None,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let prompt = self.adapter.render(&normalized);
+        let prompt_len = self.tokenize_len(&prompt);
+        validate_context_window_with_budget(
+            prompt_len,
+            cfg.max_new_tokens,
+            cfg.reasoning_budget,
+            self.max_context,
+        )?;
+        Ok((prompt, prompt_len))
     }
 
     /// Prompt token ids for a rendered prompt, refusing one the tokenizer
@@ -232,63 +366,68 @@ where
 }
 
 #[cfg(test)]
+fn fixtures() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("gemma4")
+}
+
+/// The committed tokenizer and chat-template fixtures around a tiny
+/// zero-weight model: real prompt rendering, a model small enough to run
+/// without a checkpoint.
+#[cfg(test)]
+pub(crate) fn tiny_zero_serving() -> GemmaCpuServing {
+    let matrix: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixtures().join("chat_template_matrix.json"))
+            .expect("committed chat template matrix"),
+    )
+    .expect("matrix is JSON");
+    let dir = tempfile::tempdir().expect("temp checkpoint dir");
+    std::fs::copy(
+        fixtures().join("e2b_config.json"),
+        dir.path().join("config.json"),
+    )
+    .expect("copy config.json");
+    std::fs::copy(
+        fixtures().join("tokenizer").join("tokenizer_config.json"),
+        dir.path().join("tokenizer_config.json"),
+    )
+    .expect("copy tokenizer_config.json");
+    std::fs::write(
+        dir.path().join("generation_config.json"),
+        matrix["generation_config_json"]
+            .as_str()
+            .expect("recorded generation_config.json"),
+    )
+    .expect("write generation_config.json");
+
+    // The vocabulary of the committed tokenizer, so a rendered prompt's ids
+    // are all in range.
+    let model = crate::model::gemma4_model::tiny_zero_model_with_vocab(262_144);
+    let max_context = model.config.max_position_embeddings;
+    let tokenizer = GemmaBpeTokenizer::from_tokenizer_json(
+        &fixtures().join("tokenizer").join("tokenizer.json"),
+    )
+    .expect("committed Gemma tokenizer")
+    .with_max_seq_len(max_context);
+    let adapter =
+        GemmaPromptAdapter::from_model_dir(dir.path(), &tokenizer).expect("Gemma adapter");
+    GemmaCpuServing {
+        model,
+        tokenizer,
+        adapter,
+        max_context,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::gemma4_model::tiny_zero_model;
-    use crate::serve::contract::ChatRequest;
     use serde_json::json;
-    use std::path::PathBuf;
 
-    fn fixtures() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join("gemma4")
-    }
-
-    /// The committed tokenizer and chat-template fixtures around the tiny
-    /// zero-weight model: real prompt rendering, a model small enough to run
-    /// without a checkpoint.
     fn serving() -> GemmaCpuServing {
-        let matrix: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(fixtures().join("chat_template_matrix.json"))
-                .expect("committed chat template matrix"),
-        )
-        .expect("matrix is JSON");
-        let dir = tempfile::tempdir().expect("temp checkpoint dir");
-        std::fs::copy(
-            fixtures().join("e2b_config.json"),
-            dir.path().join("config.json"),
-        )
-        .expect("copy config.json");
-        std::fs::copy(
-            fixtures().join("tokenizer").join("tokenizer_config.json"),
-            dir.path().join("tokenizer_config.json"),
-        )
-        .expect("copy tokenizer_config.json");
-        std::fs::write(
-            dir.path().join("generation_config.json"),
-            matrix["generation_config_json"]
-                .as_str()
-                .expect("recorded generation_config.json"),
-        )
-        .expect("write generation_config.json");
-
-        let model = tiny_zero_model();
-        let max_context = model.config.max_position_embeddings;
-        let tokenizer = GemmaBpeTokenizer::from_tokenizer_json(
-            &fixtures().join("tokenizer").join("tokenizer.json"),
-        )
-        .expect("committed Gemma tokenizer")
-        .with_max_seq_len(max_context);
-        let adapter =
-            GemmaPromptAdapter::from_model_dir(dir.path(), &tokenizer).expect("Gemma adapter");
-        GemmaCpuServing {
-            model,
-            tokenizer,
-            adapter,
-            max_context,
-        }
+        tiny_zero_serving()
     }
 
     fn request(extra: serde_json::Value) -> ChatRequest {

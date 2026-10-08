@@ -877,6 +877,23 @@ jobs:
             exit "$lattice_status"
           fi
           check_test_utils_modules_ran lattice_test.log lattice
+      # The standalone server's startup routing, Gemma refusals and unchanged
+      # startup errors run against the shipped `lattice_serve` binary with stub
+      # model directories. The two real-checkpoint cases report
+      # `LATTICE_SERVE_STANDALONE_SKIPPED` and pass when no checkpoint is
+      # present on the runner; the exact count keeps a renamed or deleted test
+      # from turning this step into a no-op.
+      - name: inference - standalone server routing and startup refusals (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/serve-standalone-route.log"
+          if ! cargo test -p lattice-inference --features f16,metal-gpu,serve,test-utils --test serve_standalone_route -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -Eq '^test result: ok\. 10 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # The metal-gpu surface was BUILT and linted above but never RUN, so Metal
       # correctness tests (e.g. the Q4 decode dispatch-geometry regression #384)
       # were local-only — a green CI here verified compilation, not behavior.

@@ -50,6 +50,7 @@ impl ServingRuntime for QwenMetalRuntime {
         messages: &[ChatMessage],
         cfg: &GenerateConfig,
         lora: &[LoraSelection],
+        _stream: bool,
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure> {

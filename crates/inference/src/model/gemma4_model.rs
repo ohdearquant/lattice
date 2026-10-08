@@ -1165,6 +1165,16 @@ fn argmax(logits: &[f32]) -> u32 {
 /// this module's `tests` module below.
 #[cfg(test)]
 pub(crate) fn tiny_zero_model() -> Gemma4Model {
+    tiny_zero_model_with_vocab(16)
+}
+
+/// [`tiny_zero_model`] with a caller-chosen `vocab_size`: the same
+/// single-layer zero-weight model, whose embedding tables grow with the
+/// vocabulary. A test that feeds it prompts rendered and tokenized with the
+/// committed tokenizer needs a vocabulary at least as large as that
+/// tokenizer's.
+#[cfg(test)]
+pub(crate) fn tiny_zero_model_with_vocab(vocab_size: usize) -> Gemma4Model {
     use super::gemma4_config::Gemma4LayerType;
     use super::gemma4_weights::{Gemma4LayerWeights, per_layer_embeddings_from_bits};
 
@@ -1172,7 +1182,6 @@ pub(crate) fn tiny_zero_model() -> Gemma4Model {
     let head_w = 8;
     let per_layer_dim = 4;
     let mlp_dim = 8;
-    let vocab_size = 16;
 
     let config = Gemma4Config {
         hidden_size,

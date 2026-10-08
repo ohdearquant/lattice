@@ -36,6 +36,22 @@ This codebase has **two** separately built HTTP servers with confusingly similar
   `--embedding-model` `BertModel` -- see [`docs/capability-matrix.md`](capability-matrix.md) for
   both request/response shapes and error codes, since both are out of scope for this document.
 
+`lattice_serve` reads the model family and writes the route markers described below the same way
+`lattice serve` does (`model_type` in `config.json`, `[route] selected ...` at startup), with one
+difference in the table: its Qwen3.5 checkpoints always run on the Metal worker, a safetensors
+directory included, so the selection line reads `backend=metal` for both formats. A Gemma 4 E2B
+safetensors text checkpoint runs on the CPU through the same worker queue as Qwen, so `--max-pending`,
+disconnect cancellation and `GET /metrics` behave as they do for Qwen, and each request leaves one
+`[route] served family=gemma4 backend=cpu mode=<stream|nonstream> driver=shared ...` line. What Gemma 4
+cannot serve is refused by name and never falls back: `stop` strings, a positive `reasoning_budget`
+and typed content parts answer `400 unsupported_feature`; image content answers `400 vision_unsupported`;
+`response_format` of type `json_schema` answers `400 unsupported_feature`; a `lora` selection on a chat
+request and every `/v1/lora` route answer `400 lora_unsupported_backend`. `POST /v1/embeddings` is
+unchanged, because it is served by the separately loaded `--embedding-model`. A Gemma 4 checkpoint in the
+Q4 format ends startup with `gemma_metal_unsupported`, and the options that configure Qwen-only features
+(`--preload-vision`, `--tokenizer-dir`, `--max-resident-adapters`, `--max-resident-adapter-bytes` and a
+positive `--reasoning-budget`) end startup with an `unsupported_feature:` error on a Gemma 4 checkpoint.
+
 If you arrived here from an issue or note that points at `lattice_serve.rs` specifically: the
 README's actual HTTP API example — the thing that issue was asking to be expanded — targets
 `lattice serve` (the CLI subcommand), not the standalone `lattice_serve` binary. This document
