@@ -5,8 +5,10 @@
 //! `MetalQwen35State::generate_streaming_with_cancel` (the streaming entry)
 //! each did in their own decode loop. The streaming entry runs its requests
 //! through this session and [`run_streaming`]; the direct entry runs its
-//! ordinary requests through it and [`run_direct`], and keeps its MTP and
-//! GDN-first self-speculative routes, which this session refuses.
+//! ordinary requests through it and [`run_direct`]. The direct entry's MTP and
+//! GDN-first self-speculative routes are refused by this session and run through
+//! [`QwenMetalSpeculativeSession`] and [`run_speculative_direct`] instead; the
+//! batch-GEMM MTP verifier keeps its own legacy loop.
 //! [`MetalEntryProfile::PrefixCacheStreaming`] is the prefix-cache entry's
 //! session: [`QwenMetalSession::over_restored_state`] builds it over a state the
 //! caller restored to a reusable boundary, and it prefills only the suffix.
@@ -66,11 +68,12 @@ use super::{
     MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectOutcome,
     SelectionCandidate, SelectionRequest, StepStamp, TokenMetadata,
 };
+use super::{SpeculativeSession, SpeculativeTrace, VerifiedRound};
 use crate::error::InferenceError;
 use crate::forward::metal_qwen35::{
     GpuTopkRoute, MetalQwen35State, SamplingRouteEnvironment, SamplingRoutePlan,
-    apply_sampling_route_plan, mtp_route_active, plan_sampling_route, sample_decode_traced,
-    sample_from_candidates, sample_token, self_spec_route_active,
+    SpeculativeMetrics, apply_sampling_route_plan, mtp_route_active, plan_sampling_route,
+    sample_decode_traced, sample_from_candidates, sample_token, self_spec_route_active,
 };
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::stop_strings::earliest_stop_match;
@@ -1010,6 +1013,102 @@ pub(crate) fn run_direct(
         stopped: result.stopped && !grammar_rejection,
         stop_reason: Some(result.stop_reason),
         token_logprobs: result.token_logprobs,
+    })
+}
+
+/// The direct entry's MTP and GDN-first self-speculative routes as a
+/// [`SpeculativeSession`] (ADR-090 D6): the session owns the forward passes, the
+/// draft and the rollback, and hands the driver verified rounds. It borrows the
+/// caller's state for its whole life, like [`QwenMetalSession`].
+///
+/// The batch-GEMM MTP verifier is not a session: it keeps the legacy loop in the
+/// state and is reported as excluded.
+pub(crate) struct QwenMetalSpeculativeSession<'state> {
+    state: &'state mut MetalQwen35State,
+    metrics: SpeculativeMetrics,
+    first_candidate: u32,
+    /// Keeps the session on the thread that created it (not `Send`, not `Sync`).
+    thread_bound: PhantomData<*const ()>,
+}
+
+impl<'state> QwenMetalSpeculativeSession<'state> {
+    /// Wraps a state that has already been reset and prefilled for this request.
+    /// `prefill_logits` are the dense logits of the prompt's last position; their
+    /// first-wins argmax is the first candidate.
+    pub(crate) fn new(
+        state: &'state mut MetalQwen35State,
+        metrics: SpeculativeMetrics,
+        prefill_logits: &[f32],
+    ) -> Self {
+        Self {
+            state,
+            metrics,
+            first_candidate: crate::sampling::argmax_f32_first_wins(prefill_logits),
+            thread_bound: PhantomData,
+        }
+    }
+}
+
+impl SpeculativeSession for QwenMetalSpeculativeSession<'_> {
+    fn first_candidate(&mut self) -> u32 {
+        self.first_candidate
+    }
+
+    fn advance(
+        &mut self,
+        pending: u32,
+        room: usize,
+        is_stop: &dyn Fn(u32) -> bool,
+    ) -> Result<VerifiedRound, InferenceError> {
+        Ok(self
+            .state
+            .speculative_round(&mut self.metrics, pending, room, is_stop))
+    }
+
+    fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
+        self.state.finish_speculative(&self.metrics);
+        Ok(())
+    }
+}
+
+/// Drives a [`QwenMetalSpeculativeSession`] through the shared speculative driver and
+/// assembles the direct entry's output: the text is decoded from the committed ids in
+/// one pass, as the loops this replaces did. The route is recorded on the state whether
+/// the request completes or fails.
+pub(crate) fn run_speculative_direct(
+    session: &mut QwenMetalSpeculativeSession<'_>,
+    gen_cfg: &GenerateConfig,
+    prompt_len: usize,
+    eos_token_id: u32,
+    tokenizer: &BpeTokenizer,
+) -> Result<GenerateOutput, InferenceError> {
+    let mut text = String::new();
+    let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
+    let never_cancel = || false;
+    let result = driver::run_speculative(
+        session,
+        gen_cfg,
+        eos_token_id,
+        &never_cancel,
+        |_| String::new(),
+        &mut text,
+        &mut token_logprob_end_offsets,
+        |_, _| true,
+    );
+    let trace = result
+        .as_ref()
+        .map_or_else(|_| SpeculativeTrace::default(), |r| r.trace);
+    let route = session.metrics.route();
+    session.state.record_speculative_route(route, trace);
+    let result = result?;
+    Ok(GenerateOutput {
+        text: decode_tokens(tokenizer, &result.generated_ids),
+        prompt_tokens: prompt_len,
+        generated_tokens: result.generated_ids.len(),
+        token_ids: result.generated_ids,
+        stopped: result.stopped,
+        stop_reason: Some(result.stop_reason),
+        token_logprobs: Vec::new(),
     })
 }
 

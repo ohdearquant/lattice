@@ -155,7 +155,7 @@ struct Fixture {
 
 /// Deterministic, roughly uniform values with the given root mean square and no
 /// structure shared between seeds or positions.
-fn scrambled(len: usize, seed: u64, rms: f32) -> Vec<f32> {
+pub(super) fn scrambled(len: usize, seed: u64, rms: f32) -> Vec<f32> {
     (0..len as u64)
         .map(|i| {
             let mut x = seed
@@ -172,7 +172,7 @@ fn scrambled(len: usize, seed: u64, rms: f32) -> Vec<f32> {
 
 /// A projection whose outputs have about `gain` times the root mean square of an
 /// input of `fan_in` unit-scale values.
-fn projection(len: usize, seed: u64, fan_in: usize, gain: f32) -> Vec<f32> {
+pub(super) fn projection(len: usize, seed: u64, fan_in: usize, gain: f32) -> Vec<f32> {
     scrambled(len, seed, gain / (fan_in as f32).sqrt())
 }
 
@@ -181,7 +181,7 @@ fn projection(len: usize, seed: u64, fan_in: usize, gain: f32) -> Vec<f32> {
 /// everywhere, so the recurrent state and the key/value rows a request leaves
 /// behind are nonzero and reach the logits. The shape comes from
 /// `tiny_hybrid_fixture` unchanged; only the weights are replaced.
-fn patterned_model() -> (Qwen35Config, ModelWeights) {
+pub(super) fn patterned_model() -> (Qwen35Config, ModelWeights) {
     let (mut cfg, mut weights) = tiny_hybrid_fixture();
     cfg.eos_token_id = u32::MAX;
     let hidden = cfg.hidden_size;

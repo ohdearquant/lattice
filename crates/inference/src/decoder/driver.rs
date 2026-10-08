@@ -64,7 +64,11 @@ use super::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
     GrammarMaskFn, MetadataRequest, SelectOutcome, SelectionRequest,
 };
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+use super::{SpeculativeSession, SpeculativeTrace};
 use crate::error::InferenceError;
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+use crate::generation::TopLogprob;
 use crate::generation::{
     DecodePolicy, GenerateConfig, StepOutcome, StopCheckOutcome, TokenLogprob,
 };
@@ -698,6 +702,202 @@ pub(crate) fn run(
     })
 }
 
+/// Everything [`run_speculative`] produces. Logprobs and stop-string text are not
+/// carried: the speculative routes refuse both, so the driver's own buffers for them stay
+/// empty and the caller decodes the published ids.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) struct SpeculativeResult {
+    pub(crate) generated_ids: Vec<u32>,
+    pub(crate) stopped: bool,
+    pub(crate) stop_reason: StopReason,
+    pub(crate) trace: SpeculativeTrace,
+}
+
+/// A speculative route verifies draft tokens by argmax, so it admits only the greedy
+/// configuration its route predicate already selects it for. Refused here as well, in every
+/// build, for the reason [`check_capabilities`] is a hard error: a driver that accepted any
+/// configuration would let a caller believe sampling or a repetition penalty was applied.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn check_greedy(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
+    if gen_cfg.temperature > 0.0 || gen_cfg.top_k > 1 || gen_cfg.repetition_penalty != 1.0 {
+        return Err(InferenceError::InvalidInput(
+            "a speculative route verifies draft tokens by argmax and admits only a greedy \
+             request with no repetition penalty"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The speculative sibling of [`run`] (ADR-090 D2, D6): one loop over a
+/// [`SpeculativeSession`] that applies the same [`DecodePolicy`] to the tokens a round
+/// verified and committed, and to nothing else.
+///
+/// **What the policy sees.** The session returns, per round, the tokens it evaluated and
+/// the target's prediction that follows them. Each committed token goes through
+/// [`DecodePolicy::transition_with_metadata`], in order, exactly once; a stop token is
+/// refused there and ends the request, and the length limit is checked before each offer,
+/// so a token past the limit is never published. The prediction that follows the span is
+/// checked against the same stop predicate before it becomes the next pending token, and
+/// not at all when the span has already filled the limit. A draft token the target
+/// rejected is never in a span, so the policy never sees one.
+///
+/// **Rounds are the session's, not the policy's.** The loop runs a round whenever the limit
+/// leaves room for the pending token, as the loops this replaces did, so a request whose
+/// last token is the pending one still runs the round that evaluates it. That keeps the
+/// forward passes, the end state and the stop reason at the cache boundary identical to
+/// those loops; the ordinary driver's one-token-at-a-time shape would not.
+///
+/// **Controls.** The four optional controls ([`ExecutionCapabilities`]) are refused, since
+/// a speculative route wires none of them, and so is a non-greedy request. Cancellation is
+/// polled at the top of every round, the point where the ordinary driver polls before a
+/// decode step; the prefill ran before this call, so there is no earlier point to poll.
+///
+/// `decode_delta`, `text`, `token_logprob_end_offsets` and `emit_confirmed` are the raw
+/// I/O primitives [`run`] takes, handed to the same policy call; a text sink that refuses a
+/// delta ends the request with [`StopReason::Interrupt`].
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_speculative(
+    session: &mut dyn SpeculativeSession,
+    gen_cfg: &GenerateConfig,
+    eos_token_id: u32,
+    cancel: &dyn Cancellation,
+    mut decode_delta: impl FnMut(u32) -> String,
+    text: &mut String,
+    token_logprob_end_offsets: &mut Vec<usize>,
+    mut emit_confirmed: impl FnMut(&str, u32) -> bool,
+) -> Result<SpeculativeResult, InferenceError> {
+    check_capabilities(ExecutionCapabilities::default(), gen_cfg)?;
+    check_greedy(gen_cfg)?;
+
+    let mut trace = SpeculativeTrace::default();
+    let mut generated_ids: Vec<u32> = Vec::new();
+    let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
+    let is_stop = |id: u32| id == eos_token_id || gen_cfg.stop_token_ids.contains(&id);
+
+    // A zero budget generates nothing, before any token is read (the loops this replaces
+    // returned here too, ahead of the prefill-derived candidate and its stop check).
+    if gen_cfg.max_new_tokens == 0 {
+        return Ok(SpeculativeResult {
+            generated_ids,
+            stopped: false,
+            stop_reason: StopReason::Length,
+            trace,
+        });
+    }
+
+    let first = session.first_candidate();
+    if is_stop(first) {
+        return Ok(SpeculativeResult {
+            generated_ids,
+            stopped: true,
+            stop_reason: StopReason::Eos,
+            trace,
+        });
+    }
+
+    // Capabilities leave no reasoning budget, so the cap is the plain token limit.
+    let cap = decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
+    generated_ids.reserve(cap);
+    let mut policy = DecodePolicy::for_verified_stream(gen_cfg, false);
+    let mut pending = first;
+    let mut stopped = false;
+    let mut stop_reason = StopReason::Length;
+
+    'rounds: while generated_ids.len() < cap {
+        if cancel.is_cancelled() {
+            stop_reason = StopReason::Interrupt;
+            break;
+        }
+        let round = session.advance(pending, cap - generated_ids.len(), &is_stop)?;
+        trace.rounds += 1;
+
+        for &token in &round.committed {
+            if generated_ids.len() >= cap {
+                break 'rounds;
+            }
+            trace.offered += 1;
+            let generated_len_before = generated_ids.len();
+            let outcome = policy.transition_with_metadata(
+                &mut token_logprobs,
+                token,
+                generated_len_before,
+                |_| Ok(true),
+                &is_stop,
+                |next_id| generated_ids.push(next_id),
+                |_, _| -> Result<(f32, Vec<TopLogprob>), InferenceError> {
+                    Err(InferenceError::Inference(
+                        "a speculative route records no token metadata".into(),
+                    ))
+                },
+                &mut decode_delta,
+                text,
+                token_logprob_end_offsets,
+                |s, id| emit_confirmed(s, id),
+            )?;
+            match outcome {
+                StepOutcome::GrammarStop => {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break 'rounds;
+                }
+                StepOutcome::Eos => {
+                    stopped = true;
+                    stop_reason = StopReason::Eos;
+                    break 'rounds;
+                }
+                StepOutcome::Stopped => {
+                    stopped = true;
+                    stop_reason = StopReason::Eos;
+                    break 'rounds;
+                }
+                StepOutcome::Interrupted => {
+                    stop_reason = StopReason::Interrupt;
+                    break 'rounds;
+                }
+                StepOutcome::Emitted {
+                    answer_budget_exhausted,
+                    ..
+                } => {
+                    if answer_budget_exhausted {
+                        break 'rounds;
+                    }
+                }
+            }
+        }
+
+        // The cache boundary outranks the length limit, as in the loops this replaces: a
+        // request whose pending token fills the limit exactly still reports the full cache.
+        if round.cache_full {
+            stop_reason = StopReason::KvFull;
+            break;
+        }
+        if generated_ids.len() >= cap {
+            break;
+        }
+        let Some(next) = round.next else {
+            return Err(InferenceError::Inference(
+                "a speculative round ended without a continuation and without a full cache".into(),
+            ));
+        };
+        if is_stop(next) {
+            stopped = true;
+            stop_reason = StopReason::Eos;
+            break;
+        }
+        pending = next;
+    }
+
+    session.finish(FinishDisposition::Reusable)?;
+    Ok(SpeculativeResult {
+        generated_ids,
+        stopped,
+        stop_reason,
+        trace,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1184,5 +1384,253 @@ mod tests {
         assert_eq!(emitted.len(), 2, "the rejected call must be the tail flush");
         assert_eq!(result.stop_reason, StopReason::Interrupt);
         assert!(!result.stopped, "Interrupt always reports stopped: false");
+    }
+}
+
+#[cfg(test)]
+mod speculative_tests {
+    use super::*;
+    use crate::decoder::VerifiedRound;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+
+    const EOS: u32 = 999;
+
+    /// Replays prepared rounds and records what the driver asked of it.
+    struct ScriptedSession {
+        first: u32,
+        rounds: VecDeque<VerifiedRound>,
+        first_reads: usize,
+        seen_pending: Vec<u32>,
+        rooms: Vec<usize>,
+        finished: bool,
+    }
+
+    fn round(committed: &[u32], next: u32) -> VerifiedRound {
+        VerifiedRound {
+            committed: committed.to_vec(),
+            next: Some(next),
+            cache_full: false,
+        }
+    }
+
+    fn scripted(first: u32, rounds: Vec<VerifiedRound>) -> ScriptedSession {
+        ScriptedSession {
+            first,
+            rounds: rounds.into(),
+            first_reads: 0,
+            seen_pending: Vec::new(),
+            rooms: Vec::new(),
+            finished: false,
+        }
+    }
+
+    impl SpeculativeSession for ScriptedSession {
+        fn first_candidate(&mut self) -> u32 {
+            self.first_reads += 1;
+            self.first
+        }
+
+        fn advance(
+            &mut self,
+            pending: u32,
+            room: usize,
+            _is_stop: &dyn Fn(u32) -> bool,
+        ) -> Result<VerifiedRound, InferenceError> {
+            self.seen_pending.push(pending);
+            self.rooms.push(room);
+            self.rounds
+                .pop_front()
+                .ok_or_else(|| InferenceError::Inference("script exhausted".into()))
+        }
+
+        fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
+            self.finished = true;
+            Ok(())
+        }
+    }
+
+    fn drive(
+        session: &mut ScriptedSession,
+        gen_cfg: &GenerateConfig,
+        cancel: &dyn Cancellation,
+    ) -> Result<SpeculativeResult, InferenceError> {
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        run_speculative(
+            session,
+            gen_cfg,
+            EOS,
+            cancel,
+            |_| String::new(),
+            &mut text,
+            &mut offsets,
+            |_, _| true,
+        )
+    }
+
+    fn cfg(max_new_tokens: usize) -> GenerateConfig {
+        GenerateConfig {
+            max_new_tokens,
+            temperature: 0.0,
+            top_k: 1,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn commits_in_order_and_continues_from_the_reported_continuation() {
+        let mut session = scripted(1, vec![round(&[1, 2], 3), round(&[3], 4)]);
+        let result = drive(&mut session, &cfg(3), &|| false).expect("run");
+        assert_eq!(result.generated_ids, vec![1, 2, 3]);
+        assert!(!result.stopped);
+        assert_eq!(result.stop_reason, StopReason::Length);
+        assert_eq!(session.seen_pending, vec![1, 3]);
+        assert_eq!(session.rooms, vec![3, 1]);
+        assert_eq!(
+            result.trace,
+            SpeculativeTrace {
+                rounds: 2,
+                offered: 3
+            }
+        );
+        assert!(session.finished);
+    }
+
+    #[test]
+    fn a_zero_budget_reads_nothing() {
+        let mut session = scripted(1, vec![]);
+        let result = drive(&mut session, &cfg(0), &|| false).expect("run");
+        assert!(result.generated_ids.is_empty());
+        assert!(!result.stopped);
+        assert_eq!(result.stop_reason, StopReason::Length);
+        assert_eq!(session.first_reads, 0);
+        assert!(session.seen_pending.is_empty());
+    }
+
+    #[test]
+    fn a_stop_token_as_the_first_candidate_ends_the_request_empty() {
+        let mut session = scripted(EOS, vec![]);
+        let result = drive(&mut session, &cfg(4), &|| false).expect("run");
+        assert!(result.generated_ids.is_empty());
+        assert!(result.stopped);
+        assert_eq!(result.stop_reason, StopReason::Eos);
+        assert!(session.seen_pending.is_empty());
+    }
+
+    #[test]
+    fn a_continuation_that_is_a_stop_token_ends_the_request_without_being_committed() {
+        let mut session = scripted(1, vec![round(&[1, 2], 7)]);
+        let mut gen_cfg = cfg(8);
+        gen_cfg.stop_token_ids = vec![7];
+        let result = drive(&mut session, &gen_cfg, &|| false).expect("run");
+        assert_eq!(result.generated_ids, vec![1, 2]);
+        assert!(result.stopped);
+        assert_eq!(result.stop_reason, StopReason::Eos);
+        assert_eq!(session.seen_pending, vec![1], "no round past the stop");
+    }
+
+    #[test]
+    fn a_stop_the_limit_cannot_reach_is_a_length_stop() {
+        let mut session = scripted(1, vec![round(&[1, 2], EOS)]);
+        let result = drive(&mut session, &cfg(2), &|| false).expect("run");
+        assert_eq!(result.generated_ids, vec![1, 2]);
+        assert!(!result.stopped, "the stop would land past the limit");
+        assert_eq!(result.stop_reason, StopReason::Length);
+    }
+
+    #[test]
+    fn the_policy_refuses_a_stop_token_inside_a_committed_span() {
+        let mut session = scripted(1, vec![round(&[1, EOS, 5], 6)]);
+        let result = drive(&mut session, &cfg(8), &|| false).expect("run");
+        assert_eq!(result.generated_ids, vec![1]);
+        assert!(result.stopped);
+        assert_eq!(result.stop_reason, StopReason::Eos);
+        assert_eq!(
+            result.trace.offered, 2,
+            "the stop token is offered, the token after it is not"
+        );
+    }
+
+    #[test]
+    fn a_span_longer_than_the_limit_is_cut_at_the_limit() {
+        let mut session = scripted(1, vec![round(&[1, 2, 3], 4)]);
+        let result = drive(&mut session, &cfg(2), &|| false).expect("run");
+        assert_eq!(result.generated_ids, vec![1, 2]);
+        assert_eq!(result.stop_reason, StopReason::Length);
+        assert_eq!(result.trace.offered, 2);
+    }
+
+    #[test]
+    fn a_full_cache_outranks_the_length_limit() {
+        let mut session = scripted(
+            1,
+            vec![VerifiedRound {
+                committed: vec![1],
+                next: None,
+                cache_full: true,
+            }],
+        );
+        let result = drive(&mut session, &cfg(1), &|| false).expect("run");
+        assert_eq!(result.generated_ids, vec![1]);
+        assert!(!result.stopped);
+        assert_eq!(result.stop_reason, StopReason::KvFull);
+        assert!(session.finished);
+    }
+
+    #[test]
+    fn a_round_without_a_continuation_or_a_full_cache_is_an_error() {
+        let mut session = scripted(
+            1,
+            vec![VerifiedRound {
+                committed: vec![1],
+                next: None,
+                cache_full: false,
+            }],
+        );
+        assert!(drive(&mut session, &cfg(4), &|| false).is_err());
+    }
+
+    #[test]
+    fn cancellation_is_polled_before_each_round() {
+        let polls = Cell::new(0usize);
+        let cancel = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        };
+        let mut session = scripted(1, vec![round(&[1], 2), round(&[2], 3)]);
+        let result = drive(&mut session, &cfg(8), &cancel).expect("run");
+        assert_eq!(result.generated_ids, vec![1]);
+        assert!(!result.stopped);
+        assert_eq!(result.stop_reason, StopReason::Interrupt);
+        assert_eq!(
+            session.seen_pending,
+            vec![1],
+            "the cancelled round never ran"
+        );
+        assert!(session.finished);
+    }
+
+    #[test]
+    fn controls_a_speculative_route_does_not_wire_are_refused_before_any_read() {
+        let mut sampled = cfg(4);
+        sampled.temperature = 0.8;
+        let mut logprobs = cfg(4);
+        logprobs.logprobs = Some(2);
+        let mut stop_strings = cfg(4);
+        stop_strings.stop_strings = vec!["x".into()];
+        let mut penalised = cfg(4);
+        penalised.repetition_penalty = 1.1;
+        for gen_cfg in [sampled, logprobs, stop_strings, penalised] {
+            let mut session = scripted(1, vec![round(&[1], 2)]);
+            let err = drive(&mut session, &gen_cfg, &|| false).err();
+            assert!(
+                matches!(err, Some(InferenceError::InvalidInput(_))),
+                "got {err:?}"
+            );
+            assert_eq!(session.first_reads, 0);
+            assert!(!session.finished);
+        }
     }
 }
