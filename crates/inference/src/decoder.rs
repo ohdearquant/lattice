@@ -32,6 +32,10 @@ pub(crate) mod gemma_cpu;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod qwen_metal;
 
+/// Measurement-only seams for the per-token allocation instrument (ADR-090 D7, row R01).
+#[cfg(feature = "bench-internals")]
+pub mod bench_support;
+
 /// The autoregressive driver (ADR-090 row C): one loop over `&mut dyn DecoderSession`
 /// that drives [`DecodePolicy`](crate::generation::DecodePolicy) unchanged.
 pub(crate) mod driver;

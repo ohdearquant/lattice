@@ -138,6 +138,13 @@ impl<'model> QwenCpuSession<'model> {
             ledger: PredictionLedger::new(),
         }
     }
+
+    /// Capacity, in `f32` elements, of layer 0's key cache. A measurement seam for the
+    /// allocation instrument's initial-cache-capacity column; absent from default builds.
+    #[cfg(feature = "bench-internals")]
+    pub(crate) fn first_layer_key_capacity(&self) -> Option<usize> {
+        self.kv_cache.k.first().map(Vec::capacity)
+    }
 }
 
 impl<'model> DecoderSession for QwenCpuSession<'model> {

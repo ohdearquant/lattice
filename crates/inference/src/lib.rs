@@ -70,6 +70,11 @@ pub mod router_state;
 // module is reachable under the plain lib build and the blanket dead-code
 // allow above it is no longer warranted.
 pub(crate) mod decoder;
+/// Measurement-only seams for the per-token allocation instrument (ADR-090 D7, row R01).
+/// Compiled only with `bench-internals`; not part of the supported API.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub use decoder::bench_support as decoder_bench_support;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
 /// Crate error taxonomy; see [`InferenceError`].
