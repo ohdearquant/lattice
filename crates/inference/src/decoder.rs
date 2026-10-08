@@ -455,6 +455,77 @@ pub(crate) trait DecoderSession {
     fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError>;
 }
 
+// ---------------------------------------------------------------------------
+// SpeculativeSession / VerifiedRound / SpeculativeTrace
+// ---------------------------------------------------------------------------
+
+/// What one speculative round hands the driver (ADR-090 D2, D6): the tokens the round
+/// evaluated and committed, in order, and the target's own prediction that follows them.
+///
+/// Every token in `committed` is the target's greedy successor of the one before it, and
+/// was evaluated by the target in this round: the pending token itself, then each draft
+/// token the target agreed with. A draft token the target rejected never appears here; the
+/// round has already restored the session to the state after the committed span. `next` is
+/// the target's prediction for the position after the span. It has not been evaluated and
+/// is not yet published: the driver applies the stop policy to it, then offers it as the
+/// next round's pending token.
+///
+/// `committed` may end in a token the stop policy will refuse (an accepted draft that is a
+/// stop token): the driver, not the session, decides what is published, so the session
+/// reports it and stops there. `next` is `None` exactly when the round ends the request
+/// itself, that is when `cache_full` is set or when the last committed token is such a
+/// stop token.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedRound {
+    pub(crate) committed: Vec<u32>,
+    pub(crate) next: Option<u32>,
+    /// The cache had no room for another round; `committed` holds the pending token alone.
+    pub(crate) cache_full: bool,
+}
+
+/// The typed speculative extension of the execution boundary (ADR-090 D2, D6): a session
+/// that verifies draft tokens against the target and returns verified spans, with its own
+/// snapshot and rollback. It is a separate trait rather than optional methods on
+/// [`DecoderSession`]: only the Qwen Metal routes have it, and a session without it cannot
+/// be asked to speculate. The driver applies the shared decode policy to what it returns
+/// (`driver::run_speculative`); the session never publishes a token.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) trait SpeculativeSession {
+    /// The target's greedy prediction for the first output position, read from the prefill
+    /// the caller already ran.
+    fn first_candidate(&mut self) -> u32;
+
+    /// Evaluates `pending` and verifies draft tokens after it, restoring the session to
+    /// the committed span's end before it returns. `room` is the most tokens the driver
+    /// can still publish, including `pending`: a session uses it only to avoid verifying
+    /// past the length limit. `is_stop` is the driver's own stop predicate: a session uses
+    /// it only to cut a draft chain short at a token the driver will refuse, never to
+    /// decide what is committed.
+    fn advance(
+        &mut self,
+        pending: u32,
+        room: usize,
+        is_stop: &dyn Fn(u32) -> bool,
+    ) -> Result<VerifiedRound, InferenceError>;
+
+    /// Ends the request. Called once, after the last round the driver ran.
+    fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError>;
+}
+
+/// Ledger-transition counters for the speculative driver, the bypass detector the
+/// per-token [`driver::DriverTrace`] is for the ordinary loop: `offered` counts the tokens
+/// the shared policy saw. A request whose output did not pass through the policy leaves
+/// `offered` below the number of tokens it published.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SpeculativeTrace {
+    /// Rounds the session ran.
+    pub(crate) rounds: usize,
+    /// Committed tokens offered to the shared decode policy, published or refused.
+    pub(crate) offered: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
