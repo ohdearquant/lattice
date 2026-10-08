@@ -29,9 +29,9 @@
 //!                  (validate, the Gemma prompt adapter's defaults, render
 //!                  with the checkpoint's chat template, tokenize, context
 //!                  check) plus the prompt ids. First token:
-//!                  `Gemma4Model::generate_streaming_with_cancel`. No serving
-//!                  binary routes Gemma yet, so this route measures the
-//!                  preparation entry the servers will call.
+//!                  `Gemma4Model::generate_streaming_with_cancel`. This route
+//!                  measures the preparation entry `lattice serve` calls for
+//!                  Gemma (`serving_cpu`) without the HTTP layer.
 //!
 //! The two Metal routes share one preparation path after the handler: both
 //! submit to `MetalWorkerClient::submit_with_lora`, whose admission gate

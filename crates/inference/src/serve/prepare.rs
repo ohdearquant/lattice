@@ -11,8 +11,8 @@
 //! Family chat conventions (rendering, stop tokens, defaults) come from the
 //! model's prompt adapter in `serve::prompt_adapter`; nothing here supplies a
 //! family default. [`prepare_gemma_chat_request`] is the Gemma E2B text
-//! preparation entry, used by tests and the measurement example until the
-//! serving binaries route Gemma.
+//! preparation entry, called by `serving_cpu` for `lattice serve` and by
+//! tests and the measurement example.
 
 use crate::forward::metal_qwen35::ChatMessage;
 use crate::generation::GenerateConfig;

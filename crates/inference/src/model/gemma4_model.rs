@@ -980,7 +980,7 @@ impl Gemma4Model {
     /// context-budget bound, session construction); see this method's own
     /// doc comment on `generate_streaming_with_cancel` for the UTF-8-boundary
     /// -safe delta contract [`IncrementalByteFallbackDetokenizer`] provides.
-    fn generate_streaming_via_driver<F, C>(
+    pub(crate) fn generate_streaming_via_driver<F, C>(
         &self,
         prompt_ids: &[u32],
         gen_cfg: &GenerateConfig,
