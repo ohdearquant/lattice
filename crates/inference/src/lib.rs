@@ -137,6 +137,11 @@ pub mod sampling;
 /// Requires the `serve` feature (axum/tokio/futures).
 #[cfg(feature = "serve")]
 pub mod serve;
+/// CPU serving runtimes for `lattice serve`: Gemma 4 E2B text and the traced
+/// Qwen3.5 CPU entries. Not a stable API.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_cpu;
 /// Builds the Metal serving worker's runtime and request preparation for a
 /// loaded model. Not a stable API.
 #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]

@@ -249,6 +249,7 @@ async fn main() {
             embedding_model: embedding_model_dir,
             embedding_model_id,
         } => {
+            use lattice_inference::serve::route::ServedBackend;
             use std::path::Path;
             use std::sync::Arc;
             use std::sync::atomic::AtomicU64;
@@ -266,10 +267,22 @@ async fn main() {
 
             let model_path = Path::new(&model);
             let format = backend::detect_format(model_path);
+            let family = backend::detect_family(model_path);
 
             eprintln!("Loading model from {model}...");
-            let model_backend: serve::ModelBackend = match format {
-                backend::ModelFormat::Safetensors => {
+            // The format picks the backend and `config.json` picks the family.
+            // A Gemma 4 checkpoint in the Q4 format has no route and is refused
+            // here, before any loader runs.
+            let route = match lattice_inference::serve::route::select_route(format, family) {
+                Ok(route) => route,
+                Err(refusal) => {
+                    eprintln!("Error: {}", refusal.message(model_path));
+                    std::process::exit(1);
+                }
+            };
+            eprintln!("{}", route.selection_marker(format));
+            let model_backend: serve::ModelBackend = match (route.family, route.backend) {
+                (backend::ModelFamily::Qwen35, ServedBackend::Cpu) => {
                     match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(
                         model_path,
                     ) {
@@ -280,7 +293,16 @@ async fn main() {
                         }
                     }
                 }
-                backend::ModelFormat::Q4 => {
+                (backend::ModelFamily::Gemma4, ServedBackend::Cpu) => {
+                    match lattice_inference::serving_cpu::GemmaCpuServing::load(model_path) {
+                        Ok(gemma) => serve::ModelBackend::GemmaCpu(Arc::new(gemma)),
+                        Err(e) => {
+                            eprintln!("Error: failed to load Gemma 4 model: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                (backend::ModelFamily::Qwen35, ServedBackend::Metal) => {
                     #[cfg(feature = "metal-gpu")]
                     {
                         let tokenizer_dir_path =
@@ -315,16 +337,9 @@ async fn main() {
                         std::process::exit(1);
                     }
                 }
-                backend::ModelFormat::Unknown => {
-                    eprintln!(
-                        "Error: {}",
-                        backend::unrecognized_format_message(model_path)
-                    );
-                    std::process::exit(1);
-                }
-                // Any format this binary doesn't yet know how to serve is
-                // handled the same way as `Unknown`: report it and exit,
-                // rather than silently guessing a backend.
+                // Any route this binary doesn't yet know how to serve is
+                // reported and refused, rather than silently guessing a
+                // backend.
                 _ => {
                     eprintln!(
                         "Error: {}",
@@ -347,7 +362,16 @@ async fn main() {
             // best-effort policy described above, since a chat-only
             // checkpoint having no embedder is ordinary and expected.
             let embedding_source = embedding_model_dir.as_deref().unwrap_or(&model);
-            let embedding_model =
+            // The embedder is a Qwen3.5 vision-language loader; a Gemma 4
+            // directory is never one, so the implicit attempt is skipped
+            // rather than reporting a Qwen config error about a Gemma file.
+            // An explicitly named `--embedding-model` is still honored.
+            let embedding_model = if route.family == backend::ModelFamily::Gemma4
+                && embedding_model_dir.is_none()
+            {
+                eprintln!("Embeddings disabled ({model}): not available for Gemma 4 checkpoints.");
+                None
+            } else {
                 match lattice_inference::serve::embeddings::EmbeddingModel::from_directory(
                     Path::new(embedding_source),
                 ) {
@@ -372,7 +396,8 @@ async fn main() {
                         eprintln!("Embeddings disabled ({model}): {err}");
                         None
                     }
-                };
+                }
+            };
 
             // Fail closed: a configured router that will not load stops the
             // startup. Degrading to no-router would serve base-model output

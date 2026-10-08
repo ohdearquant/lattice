@@ -312,6 +312,21 @@ type are `pub` and `#[doc(hidden)]` only because the measurement example calls t
 same no-semver-guarantee status and the same R07 disposition as `RequestedChatOptions`. Routing Gemma
 through the serving binaries remains R08/R09.
 
+#### Amendment, 2026-10-07: `lattice serve` routes Gemma E2B text on the CPU
+
+`lattice serve` decides the backend from the checkpoint format, as before, and the family from the top-level
+`model_type` of `config.json` (`model_format::detect_family`; any directory not positively identified as Gemma 4
+is routed as Qwen3.5, which is what it was before). A Gemma 4 safetensors directory is served on the CPU through
+`serving_cpu::GemmaCpuServing`: the Gemma prompt adapter prepares the request and the Gemma CPU session runs
+under the shared driver, streaming and non-streaming. A Gemma 4 checkpoint in the Q4 format has no Metal route and
+is refused at startup with the stable code `gemma_metal_unsupported`, before any loader runs and whatever features the
+binary was built with. The route and its evidence are two stderr line families written by `serve::route`:
+`[route] selected family=<f> backend=<b> format=<fmt>` once at startup, and
+`[route] served family=<f> backend=cpu mode=<stream|nonstream> driver=<shared|bypassed> opened=<n> consumed=<n>` per
+CPU-served request, where `driver` is derived from the shared driver's own prediction counters (`opened > 0`), not
+asserted. Metal-served Qwen requests keep their existing behavior and write the startup line only. The standalone
+server remains R09.
+
 ### D4. Reconcile existing decisions without weakening their tests
 
 | Decision          | Remains binding                                                                                                                                 | Narrow delta / inherited acceptance                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
