@@ -524,6 +524,30 @@ fn assert_answers_chat(server: &Server) {
     );
 }
 
+fn assert_shared_route_markers(stderr: &str, family: &str, backend: &str) {
+    for mode in ["nonstream", "stream"] {
+        let prefix = format!(
+            "[route] served family={family} backend={backend} mode={mode} driver=shared opened="
+        );
+        let marker = stderr
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("missing {mode} shared-route marker:\n{stderr}"));
+        let fields = marker.split_whitespace().collect::<Vec<_>>();
+        let opened = fields
+            .iter()
+            .find_map(|field| field.strip_prefix("opened="))
+            .and_then(|value| value.parse::<usize>().ok());
+        let consumed = fields
+            .iter()
+            .find_map(|field| field.strip_prefix("consumed="))
+            .and_then(|value| value.parse::<usize>().ok());
+        assert!(opened.is_some_and(|count| count > 0), "{marker}");
+        assert!(consumed.is_some_and(|count| count > 0), "{marker}");
+        eprintln!("R13-MARKER {marker}");
+    }
+}
+
 #[test]
 fn dechunk_joins_chunks_and_stops_at_the_terminator() {
     assert_eq!(
@@ -553,14 +577,7 @@ fn gemma_e2b_is_served_on_the_cpu_by_the_standalone_server() {
 
     assert_answers_chat(&server);
     let seen = server.stderr_with("mode=stream driver=shared");
-    for mode in ["nonstream", "stream"] {
-        assert!(
-            seen.lines().any(|line| line.starts_with(&format!(
-                "[route] served family=gemma4 backend=cpu mode={mode} driver=shared opened="
-            ))),
-            "a {mode} request leaves a shared-driver line: {seen}"
-        );
-    }
+    assert_shared_route_markers(&seen, "gemma4", "cpu");
 
     for (extra, code) in [
         (json!({"stop": ["x"]}), "unsupported_feature"),
@@ -629,11 +646,8 @@ fn qwen_is_served_on_the_metal_worker_by_the_standalone_server() {
     );
 
     assert_answers_chat(&server);
-    assert!(
-        !server.diagnostics().contains("[route] served"),
-        "the Metal worker leaves no per-request route line: {}",
-        server.diagnostics()
-    );
+    let seen = server.stderr_with("mode=stream driver=shared");
+    assert_shared_route_markers(&seen, "qwen35", "metal");
     // Qwen keeps the features Gemma refuses: a stop string is admitted.
     let (status, body) = server.chat(json!({"stop": ["\n\n"]}));
     assert_eq!(status, 200, "{body}");

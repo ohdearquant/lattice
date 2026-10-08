@@ -66,10 +66,10 @@
 //!                              connect itself is capped at 10 s or this
 //!                              value, whichever is smaller
 //!   BENCH_STDERR_MARKER        substring to count in the server's stderr;
-//!                              `lattice serve` writes one `[route] served ...`
-//!                              line per request it answers on a CPU route
-//!                              (`lattice_serve` writes one for each request
-//!                              its Gemma CPU runtime answers),
+//!                              both servers write one `[route] served ...`
+//!                              line for each Qwen Metal or Gemma CPU request;
+//!                              `lattice serve` also writes one for each Qwen
+//!                              CPU request,
 //!                              naming the family, backend, mode and the
 //!                              shared decoder driver's counters, so a pattern
 //!                              such as `driver=shared` counts the requests

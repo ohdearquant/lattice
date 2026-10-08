@@ -1417,11 +1417,12 @@ async fn chat_completions_with_request(
                 // `ApiError::ServiceUnavailable` (503) before this
                 // handler ever returns `Sse::new(...)`. Only draining the
                 // already-admitted job happens in the detached task.
-                let mut rx = handle.client.submit_with_lora(
+                let mut rx = handle.client.submit_with_lora_mode(
                     chat_messages,
                     gen_cfg,
                     cancel_rx,
                     requested.selection().to_vec(),
+                    true,
                 )?;
                 // An unload queued ahead of this job can invalidate the HTTP
                 // snapshot. Resolve the worker's rejection before committing SSE.
