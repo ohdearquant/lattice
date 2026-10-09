@@ -554,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_format_matches_each_entrys_legacy_route_behavior() {
+    fn unknown_format_matches_the_legacy_route_behavior_on_each_entry() {
         for config in [None, Some(br#"{"model_type":"gemma4"}"#.as_slice())] {
             let temp = tempfile::tempdir().expect("create checkpoint tempdir");
             if let Some(config) = config {
