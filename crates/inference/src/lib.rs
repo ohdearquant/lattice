@@ -147,6 +147,11 @@ pub mod serving_cpu;
 #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
 #[doc(hidden)]
 pub mod serving_factory;
+/// Selects serving providers from bounded checkpoint metadata.
+/// Requires the `serve` feature.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_provider;
 #[cfg(feature = "serve")]
 pub(crate) mod serving_runtime_contract;
 /// N-gram prompt lookup speculative decoding. See [`sampling`] and [`model`].

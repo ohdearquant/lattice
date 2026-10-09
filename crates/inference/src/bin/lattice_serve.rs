@@ -126,8 +126,8 @@ mod imp {
     };
     use lattice_inference::serve::metrics::ServeMetrics;
     use lattice_inference::serve::prepare::build_cfg;
-    use lattice_inference::serve::route::{RouteRefusal, select_standalone_route};
     use lattice_inference::serving_factory::ServingFactory;
+    use lattice_inference::serving_provider::{self, ServingEntry};
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::{BertModel, BertPooling};
     use serde_json::{Value, json};
@@ -3592,17 +3592,18 @@ mod imp {
         if !model_dir.exists() {
             return Err(format!("model directory not found: {}", model_dir.display()).into());
         }
-        let format = model_format::detect_format(&model_dir);
+        let evidence = serving_provider::inspect_checkpoint(&model_dir);
+        let format = evidence.format();
         // The family and backend come from the table `lattice serve` uses, with
         // this binary's Metal worker for Qwen3.5. Only a refusal the table
         // owns outright (Gemma 4 in the Q4 format) ends startup here: a
         // directory with no recognized format keeps the loader errors this
         // binary has always reported for it, in their order.
-        let route = match select_standalone_route(format, model_format::detect_family(&model_dir)) {
-            Ok(route) => Some(route),
-            Err(RouteRefusal::UnrecognizedFormat) => None,
-            Err(refusal) => return Err(refusal.message(&model_dir).into()),
+        let selected = match serving_provider::select(evidence, ServingEntry::Standalone) {
+            Ok(selected) => selected,
+            Err(error) => return Err(error.message().into()),
         };
+        let route = selected.legacy_route();
         let gemma = route.is_some_and(|route| route.family == ModelFamily::Gemma4);
         let tokenizer_path = parse_arg(&args, "--tokenizer-dir")
             .map(|d| std::path::Path::new(&d).join("tokenizer.json"))
