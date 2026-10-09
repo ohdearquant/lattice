@@ -1590,15 +1590,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned cargo-deny 0.20.2
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz"
+          extract_dir="$RUNNER_TEMP/cargo-deny-extract"
+          bin_dir="$RUNNER_TEMP/cargo-deny-bin"
+          checksum_file="$RUNNER_TEMP/cargo-deny.sha256"
+          mkdir -p "$extract_dir" "$bin_dir"
+          curl --fail --location --silent --show-error \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' \
+            '9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f' \
+            "$archive" > "$checksum_file"
+          sha256sum --check "$checksum_file"
+          tar -xzf "$archive" --directory "$extract_dir"
+          binary_path=$(find "$extract_dir" -type f -name cargo-deny -print -quit)
+          if [ -z "$binary_path" ]; then
+            echo "::error::cargo-deny binary not found in the verified release archive"
+            exit 1
+          fi
+          install -m 0755 "$binary_path" "$bin_dir/cargo-deny"
+          echo "$bin_dir" >> "$GITHUB_PATH"
       - name: licenses + bans + sources (required)
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check licenses bans sources
+        run: cargo-deny --log-level warn --manifest-path ./Cargo.toml --all-features check licenses bans sources
       - name: advisories (informational)
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         continue-on-error: true
-        with:
-          command: check advisories
+        run: cargo-deny --log-level warn --manifest-path ./Cargo.toml --all-features check advisories
 
   # Observation job: rustdoc build and intra-doc link lint.
   # NON-BLOCKING. The lint STEP carries continue-on-error: true, so the job

@@ -1,6 +1,6 @@
 # cargo-deny configuration — supply-chain gate for the lattice workspace.
 # Enforced in CI by `.github/workflows/ci.yml` (job `cargo-deny`) via
-# EmbarkStudios/cargo-deny-action@v2.
+# the pinned cargo-deny release binary.
 #
 # Split of concern (deliberate — keeps the merge gate smooth, never wedges):
 #   - licenses / bans / sources  → REQUIRED (deterministic; a green main cannot
