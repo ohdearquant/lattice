@@ -2,9 +2,17 @@
 
 use crate::error::InferenceError;
 use crate::model_format::ModelFamily;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::model_format::ModelFormat;
 use crate::serve::route::{RouteRefusal, ServedRoute, select_route, select_standalone_route};
 use crate::serving_cpu::GemmaCpuServing;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_factory::ServingFactory;
 use crate::serving_provider::{CheckpointEvidence, ServingEntry, ServingProvider};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_provider::{
+    StandaloneLoadOptions, StandaloneOptionPresence, StandaloneQwenLoader,
+};
 use std::path::Path;
 
 pub(in crate::serving_provider) struct GemmaProvider;
@@ -32,6 +40,54 @@ impl ServingProvider for GemmaProvider {
                     Err(refusal) => Err(refusal),
                 }
             }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn validate_standalone_options(
+        &self,
+        entry: ServingEntry,
+        route: Option<ServedRoute>,
+        presence: &StandaloneOptionPresence,
+    ) -> Result<(), String> {
+        if entry != ServingEntry::Standalone
+            || route.is_none_or(|route| route.family != ModelFamily::Gemma4)
+        {
+            return Ok(());
+        }
+
+        for (present, flag) in [
+            (presence.preload_vision, "--preload-vision"),
+            (presence.tokenizer_dir, "--tokenizer-dir"),
+            (presence.resident_count, "--max-resident-adapters"),
+            (presence.resident_bytes, "--max-resident-adapter-bytes"),
+        ] {
+            if present {
+                return Err(format!(
+                    "unsupported_feature: {flag} is not supported for Gemma 4 checkpoints"
+                ));
+            }
+        }
+        if presence.positive_reasoning_budget {
+            return Err(
+                "unsupported_feature: --reasoning-budget is not supported for Gemma 4 checkpoints"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_factory(
+        &self,
+        evidence: CheckpointEvidence,
+        options: StandaloneLoadOptions,
+        qwen_loader: StandaloneQwenLoader,
+    ) -> Result<ServingFactory, String> {
+        if evidence.format == ModelFormat::Safetensors {
+            Ok(ServingFactory::gemma_cpu(evidence.directory))
+        } else {
+            super::qwen::qwen_standalone_factory(evidence, options, qwen_loader)
         }
     }
 }
