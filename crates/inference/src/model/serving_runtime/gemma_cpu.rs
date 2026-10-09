@@ -1,11 +1,14 @@
 //! Gemma 4 E2B text on the CPU, confined to one serving worker.
 
-use super::ServingRuntime;
+use super::{ServingRuntime, WorkerFailure, cancelled_output};
 use crate::forward::metal_qwen35::ChatMessage;
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::serve::ApiError;
-use crate::serve::lora::{AdapterControlError, AdapterControlResult, LoraSelection};
-use crate::serve::metal_worker::{AdapterCommand, WorkerFailure, cancelled_output};
+use crate::serve::lora::LoraSelection;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serve::lora::{AdapterControlError, AdapterControlResult};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serve::metal_worker::AdapterCommand;
 use crate::serve::prepare::lora_unsupported_backend;
 use crate::serve::route::ServedRoute;
 use crate::serving_cpu::GemmaCpuServing;
@@ -17,12 +20,16 @@ use std::sync::atomic::AtomicBool;
 ///
 /// Gemma 4 text has no adapter, vision or grammar path, so each of those is
 /// refused by name before any generation work starts.
+// The serving factory creates this CPU runtime for the worker.
+#[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
 pub(crate) struct GemmaCpuRuntime {
     serving: Arc<GemmaCpuServing>,
     vision: Arc<AtomicBool>,
 }
 
 impl GemmaCpuRuntime {
+    // The serving factory uses this constructor when it builds the runtime.
+    #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
     pub(crate) fn new(serving: Arc<GemmaCpuServing>) -> Self {
         Self {
             serving,
@@ -70,6 +77,7 @@ impl ServingRuntime for GemmaCpuRuntime {
         Ok(output)
     }
 
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn control(
         &mut self,
         _command: AdapterCommand,
@@ -208,6 +216,7 @@ mod tests {
         assert_eq!(output.stop_reason, Some(crate::StopReason::Interrupt));
     }
 
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     #[test]
     fn adapter_commands_are_refused() {
         let mut runtime = runtime();
