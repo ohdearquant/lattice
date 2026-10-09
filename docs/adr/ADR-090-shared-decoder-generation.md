@@ -767,6 +767,45 @@ lexical. That is a larger change than this ADR decides, it interacts with the cr
 recorded elsewhere, and it is not a prerequisite for the execution arm above. Recording it keeps the
 option visible for a later decision rather than leaving the grep looking like the ceiling.
 
+#### Amendment, 2026-10-09: admission by an inert provider entry, and what each platform must execute
+
+False negative 2 above rejects a central family decision: a match that has to be edited to admit a
+family. It does not reject every explicit composition point. This ADR already prefers a small private
+loader registry to public model enums (see Alternatives considered), and the acceptance freezes the
+serving surface and the serving binaries, not every file in the crate. The reading that the execution
+arm is held to:
+
+> A family may be admitted by adding its implementation and an inert provider-registration entry
+> outside the serving surface. No existing family-selection, admission, preparation or construction
+> algorithm may require modification to admit it.
+
+"Inert" is a property of the source, checked by reading it. The registration is a list, never a table
+of rules: an entry carries no family-conditional code, no capability or backend table, and no
+constructor choice, and the order of entries must not change which provider owns a checkpoint. A
+registration that accretes any of these is the family match of false negative 2, spelled in a
+different file, and fails the acceptance.
+
+The "worker factory" in the acceptance is one provider-selection and construction pipeline with two
+execution hosts: a shared CPU host, which shares only immutable loaded resources and builds each
+request's mutable runtime inside its own blocking task, and a thread-affine worker, which builds and
+drops its runtime on the thread that runs it. Neither host puts `Send` on a model runtime or moves
+Metal state across threads. The frontends reach both through the same facade and do not match on the
+host.
+
+The acceptance is measured as an extension diff. Revision A is the tree after the generic migration.
+Revision B adds only the new family's own subtree, its assets and tests, and the registration entry. A
+CI check records both revisions and rejects any added, changed, deleted or renamed path under
+`crates/inference/src/serve/` or anywhere under `crates/inference/src/bin/` between them. The factory
+algorithms, hosts, contracts, existing providers, manifests, lockfile and build scripts are frozen as
+well. The only hunk allowed outside the new subtree is the registration entry, and it is read as
+source to confirm it is inert, not counted as a permitted line. The name search above stays a
+reported diagnostic beside this check and is never promoted to it.
+
+Both serving surfaces must execute the added family in configurations where those surfaces are
+supported. The portable `lattice serve` CPU configuration must also execute it without Metal. The
+factory must not require Metal for a CPU route. Unsupported platform/backend cells must retain their
+established refusal and must not count as successful execution evidence.
+
 ## Alternatives considered
 
 | Alternative                                      | Rejection / retained use                                                                                                                             |
