@@ -266,26 +266,35 @@ async fn main() {
             });
 
             let model_path = Path::new(&model);
-            let format = backend::detect_format(model_path);
-            let family = backend::detect_family(model_path);
+            let evidence = lattice_inference::serving_provider::inspect_checkpoint(model_path);
+            let format = evidence.format();
 
             eprintln!("Loading model from {model}...");
             // The format picks the backend and `config.json` picks the family.
             // A Gemma 4 checkpoint in the Q4 format has no route and is refused
             // here, before any loader runs.
-            let route = match lattice_inference::serve::route::select_route(format, family) {
-                Ok(route) => route,
-                Err(refusal) => {
-                    eprintln!("Error: {}", refusal.message(model_path));
+            let selected = match lattice_inference::serving_provider::select(
+                evidence,
+                lattice_inference::serving_provider::ServingEntry::Lattice,
+            ) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    eprintln!("Error: {}", error.message());
                     std::process::exit(1);
                 }
+            };
+            let Some(route) = selected.legacy_route() else {
+                eprintln!(
+                    "Error: {}",
+                    backend::unrecognized_format_message(model_path)
+                );
+                std::process::exit(1);
             };
             eprintln!("{}", route.selection_marker(format));
             let model_backend: serve::ModelBackend = match (route.family, route.backend) {
                 (backend::ModelFamily::Qwen35, ServedBackend::Cpu) => {
-                    match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(
-                        model_path,
-                    ) {
+                    match lattice_inference::serving_provider::providers::qwen::load_cpu(model_path)
+                    {
                         Ok(m) => cpu_serving_backend(m),
                         Err(e) => {
                             eprintln!("Error: failed to load model: {e}");
@@ -294,7 +303,9 @@ async fn main() {
                     }
                 }
                 (backend::ModelFamily::Gemma4, ServedBackend::Cpu) => {
-                    match lattice_inference::serving_cpu::GemmaCpuServing::load(model_path) {
+                    match lattice_inference::serving_provider::providers::gemma::load_cpu(
+                        model_path,
+                    ) {
                         Ok(gemma) => serve::ModelBackend::GemmaCpu(Arc::new(gemma)),
                         Err(e) => {
                             eprintln!("Error: failed to load Gemma 4 model: {e}");
