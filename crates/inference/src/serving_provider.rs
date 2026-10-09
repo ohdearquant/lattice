@@ -1,7 +1,15 @@
 //! Directory-aware provider selection for serving entry points.
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::forward::metal_qwen35::MetalQwen35State;
 use crate::model_format::ModelFormat;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serve::metal_worker::WorkerMetadata;
 use crate::serve::route::{RouteRefusal, ServedRoute};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_factory::ServingFactory;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::tokenizer::bpe::BpeTokenizer;
 use std::path::{Path, PathBuf};
 
 pub mod providers;
@@ -18,6 +26,7 @@ pub enum ServingEntry {
 
 /// Checkpoint facts collected at the serving startup inspection stage.
 #[doc(hidden)]
+#[derive(Clone)]
 pub struct CheckpointEvidence {
     directory: PathBuf,
     format: ModelFormat,
@@ -91,10 +100,53 @@ impl SelectionError {
     }
 }
 
+/// Presence of standalone flags that a provider may reject.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub struct StandaloneOptionPresence {
+    /// Whether `--preload-vision` appeared as a separate argument.
+    pub preload_vision: bool,
+    /// Whether `--tokenizer-dir` appeared as a separate argument.
+    pub tokenizer_dir: bool,
+    /// Whether `--max-resident-adapters` appeared as a separate argument.
+    pub resident_count: bool,
+    /// Whether `--max-resident-adapter-bytes` appeared as a separate argument.
+    pub resident_bytes: bool,
+    /// Whether the parsed reasoning budget is positive.
+    pub positive_reasoning_budget: bool,
+}
+
+/// Options needed to construct the standalone serving factory.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub struct StandaloneLoadOptions {
+    /// Tokenizer file used by the existing Qwen worker loader.
+    pub tokenizer_path: PathBuf,
+    /// Whether Qwen vision weights should be loaded before worker startup.
+    pub preload_vision: bool,
+}
+
+/// Binary-owned worker loader builder retained at the standalone call site.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub type StandaloneQwenLoader = Box<
+    dyn FnOnce(
+            PathBuf,
+            PathBuf,
+            ModelFormat,
+        ) -> Box<
+            dyn FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
+                + Send
+                + 'static,
+        > + Send
+        + 'static,
+>;
+
 /// The provider selected for one checkpoint and its existing route projection.
 #[doc(hidden)]
 pub struct SelectedProvider<'a> {
-    _provider: &'a dyn ServingProvider,
+    #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
+    provider: &'a dyn ServingProvider,
     legacy_route: Option<ServedRoute>,
 }
 
@@ -102,6 +154,33 @@ impl SelectedProvider<'_> {
     /// The route the entry has historically exposed, if the entry defers it.
     pub fn legacy_route(&self) -> Option<ServedRoute> {
         self.legacy_route
+    }
+
+    /// Validate standalone flag presence through the selected provider.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub fn validate_standalone_options(
+        &self,
+        entry: ServingEntry,
+        presence: &StandaloneOptionPresence,
+    ) -> Result<(), String> {
+        self.provider
+            .validate_standalone_options(entry, self.legacy_route, presence)
+    }
+
+    /// Build the standalone worker factory through the selected provider.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub fn into_standalone_factory(
+        self,
+        entry: ServingEntry,
+        evidence: CheckpointEvidence,
+        options: StandaloneLoadOptions,
+        qwen_loader: StandaloneQwenLoader,
+    ) -> Result<ServingFactory, String> {
+        if entry != ServingEntry::Standalone {
+            return Err("standalone factory requested for a non-standalone entry".to_owned());
+        }
+        self.provider
+            .standalone_factory(evidence, options, qwen_loader)
     }
 }
 
@@ -113,6 +192,22 @@ pub(crate) trait ServingProvider: Sync {
         evidence: &CheckpointEvidence,
         entry: ServingEntry,
     ) -> Result<Option<ServedRoute>, RouteRefusal>;
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn validate_standalone_options(
+        &self,
+        entry: ServingEntry,
+        route: Option<ServedRoute>,
+        presence: &StandaloneOptionPresence,
+    ) -> Result<(), String>;
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_factory(
+        &self,
+        evidence: CheckpointEvidence,
+        options: StandaloneLoadOptions,
+        qwen_loader: StandaloneQwenLoader,
+    ) -> Result<ServingFactory, String>;
 }
 
 pub(crate) struct ProviderRegistry<'a> {
@@ -173,7 +268,7 @@ pub(crate) fn select_with_registry<'a>(
             })?;
 
     Ok(SelectedProvider {
-        _provider: provider,
+        provider,
         legacy_route,
     })
 }
@@ -341,7 +436,7 @@ mod tests {
                 );
                 match select(evidence, ServingEntry::Standalone) {
                     Ok(selected) => assert_eq!(
-                        selected._provider.name(),
+                        selected.provider.name(),
                         metadata_fixture.expected_provider(),
                         "format fixture {format_fixture:?}, metadata fixture {metadata_fixture:?}"
                     ),
@@ -369,7 +464,7 @@ mod tests {
         assert_eq!(evidence.model_type, None);
         let selected = select(evidence, ServingEntry::Standalone)
             .expect("missing directory preserves standalone no-route path");
-        assert_eq!(selected._provider.name(), "qwen");
+        assert_eq!(selected.provider.name(), "qwen");
         assert_eq!(selected.legacy_route(), None);
     }
 
@@ -385,7 +480,7 @@ mod tests {
             fs::write(temp.path().join("config.json"), config).expect("write Gemma config");
             let selected = select(inspect_checkpoint(temp.path()), ServingEntry::Lattice)
                 .expect("identity claim does not validate the Gemma profile");
-            assert_eq!(selected._provider.name(), "gemma");
+            assert_eq!(selected.provider.name(), "gemma");
             assert_eq!(selected.legacy_route(), Some(ServedRoute::GEMMA4_CPU));
         }
     }
@@ -548,7 +643,7 @@ mod tests {
         )
         .expect("zero claims binds the registered legacy provider");
 
-        assert_eq!(selected._provider.name(), "legacy");
+        assert_eq!(selected.provider.name(), "legacy");
         assert_eq!(nonclaimant.route_calls.load(Ordering::SeqCst), 0);
         assert_eq!(legacy.route_calls.load(Ordering::SeqCst), 1);
     }
@@ -576,6 +671,163 @@ mod tests {
                 .expect("standalone keeps its old loader error path");
             assert_eq!(standalone.legacy_route(), None);
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    #[test]
+    fn gemma_standalone_refuses_present_options_in_legacy_order() {
+        let cases = [
+            (
+                StandaloneOptionPresence {
+                    preload_vision: true,
+                    tokenizer_dir: false,
+                    resident_count: false,
+                    resident_bytes: false,
+                    positive_reasoning_budget: false,
+                },
+                "--preload-vision",
+            ),
+            (
+                StandaloneOptionPresence {
+                    preload_vision: false,
+                    tokenizer_dir: true,
+                    resident_count: false,
+                    resident_bytes: false,
+                    positive_reasoning_budget: false,
+                },
+                "--tokenizer-dir",
+            ),
+            (
+                StandaloneOptionPresence {
+                    preload_vision: false,
+                    tokenizer_dir: false,
+                    resident_count: true,
+                    resident_bytes: false,
+                    positive_reasoning_budget: false,
+                },
+                "--max-resident-adapters",
+            ),
+            (
+                StandaloneOptionPresence {
+                    preload_vision: false,
+                    tokenizer_dir: false,
+                    resident_count: false,
+                    resident_bytes: true,
+                    positive_reasoning_budget: false,
+                },
+                "--max-resident-adapter-bytes",
+            ),
+            (
+                StandaloneOptionPresence {
+                    preload_vision: false,
+                    tokenizer_dir: false,
+                    resident_count: false,
+                    resident_bytes: false,
+                    positive_reasoning_budget: true,
+                },
+                "--reasoning-budget",
+            ),
+        ];
+
+        for (presence, flag) in cases {
+            let selected = select(
+                CheckpointEvidence {
+                    directory: PathBuf::new(),
+                    format: ModelFormat::Safetensors,
+                    model_type: Some("gemma4".to_owned()),
+                },
+                ServingEntry::Standalone,
+            )
+            .expect("Gemma safetensors selects its standalone provider");
+            assert_eq!(
+                selected.validate_standalone_options(ServingEntry::Standalone, &presence),
+                Err(format!(
+                    "unsupported_feature: {flag} is not supported for Gemma 4 checkpoints"
+                )),
+                "option {flag}"
+            );
+        }
+
+        let selected = select(
+            CheckpointEvidence {
+                directory: PathBuf::new(),
+                format: ModelFormat::Safetensors,
+                model_type: Some("gemma4".to_owned()),
+            },
+            ServingEntry::Standalone,
+        )
+        .expect("Gemma safetensors selects its standalone provider");
+        assert_eq!(
+            selected.validate_standalone_options(
+                ServingEntry::Standalone,
+                &StandaloneOptionPresence {
+                    preload_vision: true,
+                    tokenizer_dir: true,
+                    resident_count: true,
+                    resident_bytes: true,
+                    positive_reasoning_budget: true,
+                }
+            ),
+            Err(
+                "unsupported_feature: --preload-vision is not supported for Gemma 4 checkpoints"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    #[test]
+    fn qwen_standalone_accepts_all_present_options() {
+        let selected = select(
+            CheckpointEvidence {
+                directory: PathBuf::new(),
+                format: ModelFormat::Safetensors,
+                model_type: Some("qwen3_5".to_owned()),
+            },
+            ServingEntry::Standalone,
+        )
+        .expect("Qwen safetensors selects its standalone provider");
+        assert_eq!(
+            selected.validate_standalone_options(
+                ServingEntry::Standalone,
+                &StandaloneOptionPresence {
+                    preload_vision: true,
+                    tokenizer_dir: true,
+                    resident_count: true,
+                    resident_bytes: true,
+                    positive_reasoning_budget: true,
+                }
+            ),
+            Ok(())
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    #[test]
+    fn unknown_gemma_standalone_skips_option_refusals() {
+        let selected = select(
+            CheckpointEvidence {
+                directory: PathBuf::new(),
+                format: ModelFormat::Unknown,
+                model_type: Some("gemma4".to_owned()),
+            },
+            ServingEntry::Standalone,
+        )
+        .expect("Unknown format defers standalone failure to its legacy loader path");
+        assert_eq!(selected.legacy_route(), None);
+        assert_eq!(
+            selected.validate_standalone_options(
+                ServingEntry::Standalone,
+                &StandaloneOptionPresence {
+                    preload_vision: true,
+                    tokenizer_dir: true,
+                    resident_count: true,
+                    resident_bytes: true,
+                    positive_reasoning_budget: true,
+                }
+            ),
+            Ok(())
+        );
     }
 
     fn empty_evidence() -> CheckpointEvidence {
@@ -624,6 +876,26 @@ mod tests {
         ) -> Result<Option<ServedRoute>, RouteRefusal> {
             self.route_calls.fetch_add(1, Ordering::SeqCst);
             self.route
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        fn validate_standalone_options(
+            &self,
+            _entry: ServingEntry,
+            _route: Option<ServedRoute>,
+            _presence: &StandaloneOptionPresence,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        fn standalone_factory(
+            &self,
+            _evidence: CheckpointEvidence,
+            _options: StandaloneLoadOptions,
+            _qwen_loader: StandaloneQwenLoader,
+        ) -> Result<ServingFactory, String> {
+            Err("test provider does not build a factory".to_owned())
         }
     }
 }

@@ -121,13 +121,14 @@ mod imp {
     };
     use lattice_inference::serve::into_engine_chat_messages;
     use lattice_inference::serve::metal_worker::{
-        ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, VisionRuntime,
-        WorkerEvent, WorkerMetadata,
+        ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, WorkerEvent,
+        WorkerMetadata,
     };
     use lattice_inference::serve::metrics::ServeMetrics;
     use lattice_inference::serve::prepare::build_cfg;
-    use lattice_inference::serving_factory::ServingFactory;
-    use lattice_inference::serving_provider::{self, ServingEntry};
+    use lattice_inference::serving_provider::{
+        self, ServingEntry, StandaloneLoadOptions, StandaloneOptionPresence, StandaloneQwenLoader,
+    };
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::{BertModel, BertPooling};
     use serde_json::{Value, json};
@@ -3553,35 +3554,6 @@ mod imp {
         }
     }
 
-    /// Startup options that configure a Qwen3.5 Metal worker feature a Gemma
-    /// 4 text server does not have. Honoring none of them silently would
-    /// leave an operator believing a limit or a preload is in force, so each
-    /// ends startup by name.
-    fn refuse_flags_gemma_cannot_honor(
-        args: &[String],
-        reasoning_budget: Option<usize>,
-    ) -> Result<(), String> {
-        let unsupported = |what: &str| {
-            Err(format!(
-                "unsupported_feature: {what} is not supported for Gemma 4 checkpoints"
-            ))
-        };
-        for flag in [
-            "--preload-vision",
-            "--tokenizer-dir",
-            "--max-resident-adapters",
-            "--max-resident-adapter-bytes",
-        ] {
-            if args.iter().any(|arg| arg == flag) {
-                return unsupported(flag);
-            }
-        }
-        if reasoning_budget.is_some() {
-            return unsupported("--reasoning-budget");
-        }
-        Ok(())
-    }
-
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args: Vec<String> = std::env::args().collect();
 
@@ -3594,6 +3566,7 @@ mod imp {
         }
         let evidence = serving_provider::inspect_checkpoint(&model_dir);
         let format = evidence.format();
+        let factory_evidence = evidence.clone();
         // The family and backend come from the table `lattice serve` uses, with
         // this binary's Metal worker for Qwen3.5. Only a refusal the table
         // owns outright (Gemma 4 in the Q4 format) ends startup here: a
@@ -3668,9 +3641,16 @@ mod imp {
         // startup-time/memory tradeoff this trades away.
         let preload_vision = parse_flag(&args, "--preload-vision");
 
-        if gemma {
-            refuse_flags_gemma_cannot_honor(&args, defaults.reasoning_budget)?;
-        }
+        selected.validate_standalone_options(
+            ServingEntry::Standalone,
+            &StandaloneOptionPresence {
+                preload_vision,
+                tokenizer_dir: args.iter().any(|arg| arg == "--tokenizer-dir"),
+                resident_count: args.iter().any(|arg| arg == "--max-resident-adapters"),
+                resident_bytes: args.iter().any(|arg| arg == "--max-resident-adapter-bytes"),
+                positive_reasoning_budget: defaults.reasoning_budget.is_some(),
+            },
+        )?;
         if let Some(route) = route {
             eprintln!("{}", route.selection_marker(format));
         }
@@ -3691,43 +3671,35 @@ mod imp {
         // boundary. Blocks here until loading finishes (or fails), exactly
         // like this binary's prior `spawn_worker` + separate `ready` channel
         // did.
-        let model_dir_for_loader = model_dir.clone();
         let tokenizer_path_for_vocab = tokenizer_path.clone();
-        let factory = if gemma {
-            ServingFactory::gemma_cpu(model_dir.clone())
-        } else {
-            let vision_config = Qwen35Config::from_model_dir(&model_dir)
-                .map_err(|e| format!("config.json load failed: {e}"))?;
-            let mut vision_runtime =
-                VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
-            if preload_vision && let Err(err) = vision_runtime.preload() {
-                eprintln!(
-                    "[lattice_serve] WARNING: --preload-vision failed, falling back to lazy \
-                     vision loading: {err}"
-                );
-            }
-            ServingFactory::qwen_metal(
-                move || {
-                    let LoadedModel {
-                        metal,
-                        tokenizer,
+        let qwen_loader: StandaloneQwenLoader = Box::new(|model_dir, tokenizer_path, format| {
+            Box::new(move || {
+                let LoadedModel {
+                    metal,
+                    tokenizer,
+                    format,
+                    model_max_context,
+                } = load_model(&model_dir, &tokenizer_path, format)?;
+                Ok((
+                    metal,
+                    tokenizer,
+                    WorkerMetadata {
                         format,
                         model_max_context,
-                    } = load_model(&model_dir_for_loader, &tokenizer_path, format)?;
-                    Ok((
-                        metal,
-                        tokenizer,
-                        WorkerMetadata {
-                            format,
-                            model_max_context,
-                            context_window_policy:
-                                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-                        },
-                    ))
-                },
-                vision_runtime,
-            )
-        };
+                        context_window_policy: ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                    },
+                ))
+            })
+        });
+        let factory = selected.into_standalone_factory(
+            ServingEntry::Standalone,
+            factory_evidence,
+            StandaloneLoadOptions {
+                tokenizer_path,
+                preload_vision,
+            },
+            qwen_loader,
+        )?;
         let (
             owner,
             jobs,
@@ -6852,19 +6824,28 @@ mod imp {
 
         #[test]
         fn gemma_startup_refuses_options_it_cannot_honor_by_name() {
-            let args = |extra: &[&str]| -> Vec<String> {
-                ["lattice_serve", "--model", "m"]
-                    .into_iter()
-                    .chain(extra.iter().copied())
-                    .map(String::from)
-                    .collect()
+            let directory = tempfile::tempdir().expect("create Gemma checkpoint directory");
+            std::fs::write(directory.path().join("model.safetensors"), b"fixture")
+                .expect("write safetensors sentinel");
+            std::fs::write(
+                directory.path().join("config.json"),
+                br#"{"model_type":"gemma4"}"#,
+            )
+            .expect("write Gemma config");
+            let selected = serving_provider::select(
+                serving_provider::inspect_checkpoint(directory.path()),
+                ServingEntry::Standalone,
+            )
+            .expect("Gemma safetensors selects its standalone provider");
+            let presence = |flag: Option<&str>| StandaloneOptionPresence {
+                preload_vision: flag == Some("--preload-vision"),
+                tokenizer_dir: flag == Some("--tokenizer-dir"),
+                resident_count: flag == Some("--max-resident-adapters"),
+                resident_bytes: flag == Some("--max-resident-adapter-bytes"),
+                positive_reasoning_budget: flag == Some("--reasoning-budget"),
             };
-            assert_eq!(refuse_flags_gemma_cannot_honor(&args(&[]), None), Ok(()));
             assert_eq!(
-                refuse_flags_gemma_cannot_honor(
-                    &args(&["--port", "1", "--max-pending", "4"]),
-                    None
-                ),
+                selected.validate_standalone_options(ServingEntry::Standalone, &presence(None)),
                 Ok(())
             );
             for flag in [
@@ -6872,18 +6853,16 @@ mod imp {
                 "--tokenizer-dir",
                 "--max-resident-adapters",
                 "--max-resident-adapter-bytes",
+                "--reasoning-budget",
             ] {
-                let error = refuse_flags_gemma_cannot_honor(&args(&[flag, "1"]), None)
+                let error = selected
+                    .validate_standalone_options(ServingEntry::Standalone, &presence(Some(flag)))
                     .expect_err("an option with no Gemma meaning ends startup");
                 assert_eq!(
                     error,
                     format!("unsupported_feature: {flag} is not supported for Gemma 4 checkpoints")
                 );
             }
-            let error =
-                refuse_flags_gemma_cannot_honor(&args(&["--reasoning-budget", "8"]), Some(8))
-                    .expect_err("a server reasoning budget cannot be applied to Gemma");
-            assert!(error.contains("--reasoning-budget"), "{error}");
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
