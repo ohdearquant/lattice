@@ -13,6 +13,7 @@ use crate::serve::metal_worker::{
     build_vision_request, cancelled_output, check_prompt_fits_window, classify_job,
     render_text_prompt_within_window,
 };
+use crate::serve::route::{DriverEvidence, ServedRoute};
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
@@ -23,6 +24,14 @@ pub(crate) struct QwenMetalRuntime {
     vision: VisionRuntime,
     registry: ResidencyRegistry,
     metadata: WorkerMetadata,
+}
+
+fn vision_request_marker(stream: bool) -> String {
+    ServedRoute::QWEN35_METAL.request_marker(stream, DriverEvidence::default())
+}
+
+fn text_request_marker(stream: bool, trace: crate::decoder::driver::DriverTrace) -> String {
+    ServedRoute::QWEN35_METAL.request_marker(stream, DriverEvidence::from_trace(trace))
 }
 
 impl QwenMetalRuntime {
@@ -50,7 +59,7 @@ impl ServingRuntime for QwenMetalRuntime {
         messages: &[ChatMessage],
         cfg: &GenerateConfig,
         lora: &[LoraSelection],
-        _stream: bool,
+        stream: bool,
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure> {
@@ -104,6 +113,7 @@ impl ServingRuntime for QwenMetalRuntime {
             let output = state
                 .generate_multimodal_vision_with_cancel(&request, tokenizer, cfg, should_cancel)
                 .map_err(WorkerFailure::from)?;
+            eprintln!("{}", vision_request_marker(stream));
             if !output.text.is_empty() {
                 let _ = on_token(&output.text, 0);
             }
@@ -152,25 +162,26 @@ impl ServingRuntime for QwenMetalRuntime {
         registry
             .apply(lora, state)
             .map_err(WorkerFailure::Rejected)?;
-        let cached = state.generate_streaming_with_prefix_cache_and_cancel(
-            CrossTurnSlotId::DEFAULT,
-            &prompt,
-            tokenizer,
-            cfg,
-            on_token,
-            should_cancel,
+        let (cached, trace) = state
+            .generate_streaming_with_prefix_cache_with_trace(
+                CrossTurnSlotId::DEFAULT,
+                &prompt,
+                tokenizer,
+                cfg,
+                on_token,
+                should_cancel,
+            )
+            .map_err(WorkerFailure::from)?;
+        eprintln!(
+            "[metal-worker] cross-turn cache: mode={:?} reused={} \
+             prefetched={} prompt={}",
+            cached.cache.mode,
+            cached.cache.reused_tokens,
+            cached.cache.prefetched_tokens,
+            cached.cache.prompt_tokens,
         );
-        if let Ok(c) = &cached {
-            eprintln!(
-                "[metal-worker] cross-turn cache: mode={:?} reused={} \
-                 prefetched={} prompt={}",
-                c.cache.mode,
-                c.cache.reused_tokens,
-                c.cache.prefetched_tokens,
-                c.cache.prompt_tokens,
-            );
-        }
-        cached.map(|c| c.output).map_err(WorkerFailure::from)
+        eprintln!("{}", text_request_marker(stream, trace));
+        Ok(cached.output)
     }
 
     fn control(
@@ -196,5 +207,44 @@ impl ServingRuntime for QwenMetalRuntime {
 
     fn vision_supported(&self) -> Arc<AtomicBool> {
         self.vision.shared_capability()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{text_request_marker, vision_request_marker};
+
+    #[test]
+    fn text_requests_report_the_prefix_cache_driver_trace() {
+        let trace = crate::decoder::driver::DriverTrace {
+            opened: 3,
+            consumed: 2,
+        };
+        assert_eq!(
+            text_request_marker(true, trace),
+            "[route] served family=qwen35 backend=metal mode=stream driver=shared opened=3 consumed=2"
+        );
+    }
+
+    #[test]
+    fn vision_requests_report_a_bypassed_route() {
+        assert_eq!(
+            vision_request_marker(true),
+            "[route] served family=qwen35 backend=metal mode=stream driver=bypassed opened=0 consumed=0"
+        );
+        assert_eq!(
+            vision_request_marker(false),
+            "[route] served family=qwen35 backend=metal mode=nonstream driver=bypassed opened=0 consumed=0"
+        );
+        let source = include_str!("qwen_metal.rs");
+        let vision_branch = source
+            .split_once("if let JobRoute::Vision")
+            .and_then(|(_, rest)| rest.split_once("// Render").map(|(branch, _)| branch))
+            .expect("the runtime has a vision branch before text generation");
+        assert!(
+            vision_branch.contains("generate_multimodal_vision_with_cancel")
+                && vision_branch.contains("vision_request_marker(stream)"),
+            "the vision branch reports its own bypass marker"
+        );
     }
 }

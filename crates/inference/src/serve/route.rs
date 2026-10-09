@@ -13,7 +13,7 @@
 //! the family decision and the Gemma 4 rows are the one table.
 //!
 //! The markers are lines on the server's stderr. A selection line is written
-//! once at startup and a request line once per CPU-served request. The request
+//! once at startup and a request line once per generated request. The request
 //! line reports the shared decoder driver's own ledger counters, so
 //! `driver=shared` is derived from a run that opened predictions, not asserted
 //! by the code that prints it.
@@ -59,6 +59,12 @@ impl ServedRoute {
     pub const QWEN35_CPU: Self = Self {
         family: ModelFamily::Qwen35,
         backend: ServedBackend::Cpu,
+    };
+
+    /// Qwen3.5 on the Metal backend.
+    pub const QWEN35_METAL: Self = Self {
+        family: ModelFamily::Qwen35,
+        backend: ServedBackend::Metal,
     };
 
     /// Gemma 4 on the CPU safetensors backend.

@@ -75,7 +75,19 @@ use crate::generation::{
 use crate::grammar::{GrammarEngine, pda::GrammarState};
 use crate::model::qwen35_config::decode_cap;
 use crate::stop_reason::StopReason;
+#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+use std::cell::Cell;
 use std::cell::RefCell;
+
+#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+thread_local! {
+    static TEST_DRIVER_RUN_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+pub(crate) fn test_driver_run_count() -> usize {
+    TEST_DRIVER_RUN_COUNT.with(Cell::get)
+}
 
 /// Ledger-transition counters the driver maintains as it runs: one prediction
 /// is opened per `select` call, one is consumed per `decode` call. ADR-090
@@ -199,6 +211,9 @@ pub(crate) fn run(
     mut on_prefill_end: impl FnMut(),
     finish_tail: impl FnOnce() -> String,
 ) -> Result<DriverResult, InferenceError> {
+    #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+    TEST_DRIVER_RUN_COUNT.with(|count| count.set(count.get() + 1));
+
     // D3: capabilities are negotiated per session, and "one driver over many sessions" (D1)
     // means a session that does not declare a control this call actually uses is a caller
     // bug -- a hard error in every build, not this driver's problem to route around silently.

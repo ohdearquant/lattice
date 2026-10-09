@@ -431,9 +431,11 @@ to ordinary or sequential verification and count as shared-driver coverage. R13'
 that route and reports the exclusion. This is a deliberate compatibility exception for review, not
 completion of its migration. No new public cross-model batch-verifier method is added.
 
-At the inspected ref, `var_os("LATTICE_MTP_BATCH").is_some()` selects that route: unset versus set
-is the existing rule, including empty or `0`. Preserve that rule on the retained legacy path. Source
-contains a cursor-rejection test for the batch method, so an absolute “never tested” claim is false.
+At the inspected ref, `crate::env_switch_enabled("LATTICE_MTP_BATCH")` selects that route by the
+variable's value, not by `var_os(...).is_some()`. Unset, empty or whitespace-only, `0`, and
+case-insensitive `false`, `no`, or `off` disable it; other values enable it. Preserve this value-based
+rule on the retained legacy path. Source contains a cursor-rejection test for the batch method, so an
+absolute “never tested” claim is false.
 The method still panics on MoE after earlier state work; this is not a safe unsupported-input
 contract. The separate disposition must address pre-mutation MoE refusal and restoration on errors
 before any new shared-runtime admission of this path. R12 must not convert that panic to a generic
@@ -559,10 +561,17 @@ The rollout table makes R03 and R04 the first live milestone: each must generate
 through the shared driver on its named checkpoint before any R14–R18 work or the D9 population/probe
 rebuild lands. R01 may prepare generation instruments before R03; it does not front-load this
 rebuild. The derived-population checker is an acceptance condition for extraction rows R14–R17, not
-a prerequisite for R03/R04. The later R13 serving milestone still requires real Qwen CPU, Qwen Metal
-and Gemma E2B CPU execution through both serving surfaces, with supported
-prefix/default-MTP/self-spec policy routed as declared and D6's experimental exclusion explicit.
-Fake sessions are useful for policy tests but do not prove this milestone.
+a prerequisite for R03/R04. R13's serving milestone requires real `lattice serve` execution for Qwen
+CPU, Qwen Metal Q4, and Gemma E2B CPU, plus real `lattice_serve` execution for Qwen Metal and Gemma
+E2B CPU. `lattice_serve` routes Qwen safetensors and Q4 to Metal by design, so it has no Qwen CPU
+cell. Qwen text requests on both servers use the prefix-cache entry, which refuses default MTP and
+self-speculation. The batch-GEMM verifier remains excluded under D6. Qwen Metal vision requests and
+the public `generate_multimodal` text-plus-patch entry remain deliberate driver bypasses, pinned by
+`vision_requests_report_a_bypassed_route`,
+`generate_multimodal_vision_keeps_its_declared_driver_bypass`, and
+`generate_multimodal_text_patch_keeps_its_declared_driver_bypass`. They are not migrated by R13.
+At this base no ordinary generation loop is superseded, so R13 removes no generation loop. Fake
+sessions are useful for policy tests but do not prove this milestone.
 
 Afterward retain public compatibility façades while grouping Gemma modules and continuing the
 existing Metal submodule decomposition. At the pinned ref,
@@ -688,6 +697,12 @@ must match before an absence on the serving surface is allowed to mean anything.
 `FAIL 134 concrete-type occurrences on the serving surface`, which is the expected reading today:
 the execution arm above has not landed, so the tripwire should be red. A green reading before that
 work exists would itself be the defect.
+
+At `fb93807d29361809e533c3438c75b944b40ef8c5`, the three separately run grep arms read population
+36, control 606, and `FAIL 142 concrete-type occurrences on the serving surface`. The serving-binary
+arms rose from 115 to 126 occurrences, including the new `bench_gemma4_driver_pair` target, while
+`crates/inference/src/serve/` fell from 19 occurrences to 16. This is a tripwire count, not
+route-execution evidence.
 
 Its false negatives are written here rather than left to be rediscovered, because a tripwire that
 looks like a gate is how the weaker check replaces the stronger one:

@@ -1281,6 +1281,85 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference - real route marker rejects a bypassing adapter
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/shared-route-rejects-bypass.log"
+          if cargo test -p lattice-inference --features test-utils --lib \
+            'serving_cpu::tests::supported_route_marker_rejects_a_test_bypassing_adapter' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference - Qwen Metal text marker reads its driver trace (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/qwen-metal-text-route-marker.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'model::serving_runtime::qwen_metal::tests::text_requests_report_the_prefix_cache_driver_trace' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference - Qwen Metal vision marker declares its bypass (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/qwen-metal-vision-route-marker.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'model::serving_runtime::qwen_metal::tests::vision_requests_report_a_bypassed_route' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference - Metal vision generation remains outside shared driver (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-vision-driver-bypass.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::speculative_route::generate_multimodal_vision_keeps_its_declared_driver_bypass' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference - Metal text-plus-patch generation remains outside shared driver (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-text-patch-driver-bypass.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::speculative_route::generate_multimodal_text_patch_keeps_its_declared_driver_bypass' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # #611: Metal generation paths applied grammar masks via `mask_logits`
       # but never checked for a surviving finite logit before sampling — a
       # grammar that blocked every token silently emitted token 0 instead of

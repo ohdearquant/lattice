@@ -829,3 +829,94 @@ fn speculative_route_real_checkpoint_follows_the_declared_selectors() {
     }
     eprintln!("REAL-ROUTE baseline_tokens={}", baseline.token_ids.len());
 }
+
+#[test]
+fn generate_multimodal_vision_keeps_its_declared_driver_bypass() {
+    let _gpu = gpu_test_lock();
+    if Device::system_default().is_none() {
+        assert!(
+            std::env::var("LATTICE_METAL_TEST_ENFORCE").as_deref() != Ok("1"),
+            "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device is present"
+        );
+        eprintln!("SKIP vision driver-bypass sentinel: no Metal device");
+        return;
+    }
+
+    let (cfg, weights) = tiny_metal_qwen35_vision_fixture();
+    let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny vision state");
+    let request = crate::vision::multimodal::Qwen35VisionRequest {
+        input_ids: vec![7, 5, 8, 1],
+        image_grids: vec![crate::vision::qwen35_vit::GridThw { t: 1, h: 2, w: 2 }],
+        post_merger_rows: vec![0.125; cfg.hidden_size],
+        image_token_id: 5,
+        spatial_merge_size: 2,
+        decoder_hidden_size: cfg.hidden_size,
+    };
+    let tokenizer = single_char_vocab_tokenizer();
+    let gen_cfg = greedy_cfg(1, &[], false);
+    let before = crate::decoder::driver::test_driver_run_count();
+    let output = state
+        .generate_multimodal_vision_with_cancel(&request, &tokenizer, &gen_cfg, || false)
+        .expect("the vision entry generates");
+    assert_eq!(output.generated_tokens, 1);
+    assert_eq!(
+        crate::decoder::driver::test_driver_run_count(),
+        before,
+        "the vision entry stays outside the shared driver"
+    );
+
+    let before_text_generation = crate::decoder::driver::test_driver_run_count();
+    let text_output = state
+        .generate("a", &tokenizer, &gen_cfg)
+        .expect("ordinary text generation completes");
+    assert_eq!(text_output.generated_tokens, 1);
+    assert!(
+        crate::decoder::driver::test_driver_run_count() > before_text_generation,
+        "ordinary text generation reaches the shared driver"
+    );
+}
+
+#[test]
+fn generate_multimodal_text_patch_keeps_its_declared_driver_bypass() {
+    let _gpu = gpu_test_lock();
+    if Device::system_default().is_none() {
+        assert!(
+            std::env::var("LATTICE_METAL_TEST_ENFORCE").as_deref() != Ok("1"),
+            "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device is present"
+        );
+        eprintln!("SKIP text-plus-patch driver-bypass sentinel: no Metal device");
+        return;
+    }
+
+    let (cfg, weights) = tiny_metal_qwen35_fixture();
+    let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny Metal state");
+    let input = crate::vision::MultimodalInput {
+        patch_embeddings: vec![0.125; cfg.hidden_size],
+        raw_patches: 4,
+        visual_tokens: 1,
+        d_model: cfg.hidden_size,
+        text_tokens: vec![1],
+    };
+    let tokenizer = single_char_vocab_tokenizer();
+    let gen_cfg = greedy_cfg(1, &[], false);
+    let before = crate::decoder::driver::test_driver_run_count();
+    let output = state
+        .generate_multimodal(input, &tokenizer, &gen_cfg)
+        .expect("the text-plus-patch entry generates");
+    assert_eq!(output.generated_tokens, 1);
+    assert_eq!(
+        crate::decoder::driver::test_driver_run_count(),
+        before,
+        "the text-plus-patch entry stays outside the shared driver"
+    );
+
+    let before_text_generation = crate::decoder::driver::test_driver_run_count();
+    let text_output = state
+        .generate("a", &tokenizer, &gen_cfg)
+        .expect("ordinary text generation completes");
+    assert_eq!(text_output.generated_tokens, 1);
+    assert!(
+        crate::decoder::driver::test_driver_run_count() > before_text_generation,
+        "ordinary text generation reaches the shared driver"
+    );
+}
