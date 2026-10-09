@@ -17,219 +17,17 @@
 use crate::forward::metal_qwen35::ChatMessage;
 use crate::generation::GenerateConfig;
 use crate::serve::ApiError;
+#[cfg(test)]
+use crate::serve::contract::GenerationDefaults;
 use crate::serve::contract::{
-    ChatRequest as ChatCompletionRequest, GenerationDefaults, MessageContent, ServeProfile,
-    ValidatedChatRequest as ContractValidatedChatRequest, normalize_request,
-    normalize_request_with_context_and_budget, normalize_requested_options,
-    validate_context_window_with_budget,
+    ChatRequest as ChatCompletionRequest, ValidatedChatRequest as ContractValidatedChatRequest,
 };
-use crate::serve::into_engine_chat_messages;
-use crate::serve::prompt_adapter::{PromptAdapter as _, QwenPromptAdapter};
-use crate::serving_cpu::GemmaCpuServing;
-use crate::tokenizer::Tokenizer as _;
-use crate::tokenizer::bpe::BpeTokenizer;
-use std::sync::Arc;
 
 pub use crate::serve::prompt_adapter::GemmaPromptAdapter;
+pub use crate::serving_preparation::PreparationHandle;
 
 /// The `lattice_serve` handler's name for the validated request type.
 type ValidatedChatRequest = ContractValidatedChatRequest;
-
-/// Opaque, model-bound preparation for the serving binaries.
-#[doc(hidden)]
-#[derive(Debug, Clone)]
-pub struct PreparationHandle {
-    model: PreparedModel,
-}
-
-// Both variants are built only by the Metal worker's factory (and by tests), so
-// a build without the `metal-gpu` feature never constructs either.
-#[cfg_attr(
-    not(any(test, all(target_os = "macos", feature = "metal-gpu"))),
-    allow(dead_code)
-)]
-#[derive(Debug, Clone)]
-enum PreparedModel {
-    Qwen {
-        tokenizer: Arc<BpeTokenizer>,
-        model_max_context: usize,
-    },
-    Gemma(Arc<GemmaCpuServing>),
-}
-
-impl PreparationHandle {
-    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-    pub(crate) fn qwen(tokenizer: Arc<BpeTokenizer>, model_max_context: usize) -> Self {
-        Self {
-            model: PreparedModel::Qwen {
-                tokenizer,
-                model_max_context,
-            },
-        }
-    }
-
-    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-    pub(crate) fn gemma(serving: Arc<GemmaCpuServing>) -> Self {
-        Self {
-            model: PreparedModel::Gemma(serving),
-        }
-    }
-
-    /// Tokenize with the same tokenizer used by worker execution.
-    pub fn tokenize_len(&self, prompt: &str) -> usize {
-        match &self.model {
-            PreparedModel::Qwen { tokenizer, .. } => tokenizer.tokenize(prompt).pre_truncation_len,
-            PreparedModel::Gemma(gemma) => gemma.tokenize_len(prompt),
-        }
-    }
-
-    /// Run the CLI's render, tokenize and context check before stop parsing.
-    pub fn prepare_lattice(
-        &self,
-        req: &ChatCompletionRequest,
-        model_id: &str,
-        default_max_tokens: usize,
-        max_tokens_cap: usize,
-        vision_supported: bool,
-    ) -> Result<PreparedChatRequest, ApiError> {
-        match &self.model {
-            PreparedModel::Qwen {
-                model_max_context, ..
-            } => prepare_chat_request(
-                req,
-                model_id,
-                default_max_tokens,
-                max_tokens_cap,
-                vision_supported,
-                |prompt| self.tokenize_len(prompt),
-                || *model_max_context,
-            ),
-            PreparedModel::Gemma(gemma) => gemma
-                .prepare(req, model_id, default_max_tokens, max_tokens_cap)
-                .map(|(prepared, _)| prepared),
-        }
-    }
-
-    /// Apply the standalone server's existing normalization profile.
-    pub fn normalize_standalone(
-        &self,
-        req: &ChatCompletionRequest,
-        defaults: GenerationDefaults,
-        model_id: &str,
-        vision_supported: bool,
-    ) -> Result<ValidatedChatRequest, ApiError> {
-        match &self.model {
-            PreparedModel::Qwen {
-                model_max_context, ..
-            } => normalize_request(
-                req,
-                defaults,
-                ServeProfile::lattice_serve(model_id, *model_max_context)
-                    .with_vision_support(vision_supported),
-            ),
-            PreparedModel::Gemma(gemma) => gemma.normalize_standalone(req, defaults, model_id),
-        }
-    }
-
-    /// Map validated standalone options through the model's prompt adapter.
-    pub fn standalone_generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig {
-        match &self.model {
-            PreparedModel::Qwen { .. } => QwenPromptAdapter.generate_config(req),
-            PreparedModel::Gemma(gemma) => gemma.standalone_generate_config(req),
-        }
-    }
-
-    /// Map prepared CLI sampling options through the model's prompt adapter.
-    #[allow(clippy::too_many_arguments)]
-    pub fn lattice_generate_config(
-        &self,
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        seed: Option<u64>,
-        stop_strings: Vec<String>,
-        reasoning_budget: Option<usize>,
-        logprobs: Option<usize>,
-    ) -> GenerateConfig {
-        match &self.model {
-            PreparedModel::Qwen { .. } => lattice_gen_cfg(
-                max_tokens,
-                temperature,
-                top_p,
-                seed,
-                stop_strings,
-                reasoning_budget,
-                logprobs,
-            ),
-            PreparedModel::Gemma(gemma) => gemma.lattice_generate_config(
-                max_tokens,
-                temperature,
-                top_p,
-                seed,
-                stop_strings,
-                reasoning_budget,
-                logprobs,
-            ),
-        }
-    }
-
-    /// Refuse the standalone-server features this model cannot serve.
-    ///
-    /// Qwen3.5 serves all of them, so it never refuses here. Gemma 4 text on
-    /// the CPU has no adapter support and no grammar-constrained decoding:
-    /// a request that selects a LoRA adapter is refused with
-    /// `lora_unsupported_backend`, the code `lattice serve` answers with on a
-    /// backend without adapters, and a `response_format` of type
-    /// `json_schema` with `unsupported_feature`. Image content, stop strings,
-    /// `logprobs`, a reasoning budget and typed content parts are refused by
-    /// [`Self::normalize_standalone`].
-    pub fn refuse_standalone_unsupported(
-        &self,
-        req: &ChatCompletionRequest,
-    ) -> Result<(), ApiError> {
-        match &self.model {
-            PreparedModel::Qwen { .. } => Ok(()),
-            PreparedModel::Gemma(_) => {
-                if req
-                    .lora
-                    .as_ref()
-                    .is_some_and(|selection| !selection.is_empty())
-                {
-                    return Err(lora_unsupported_backend());
-                }
-                if req
-                    .response_format
-                    .as_ref()
-                    .is_some_and(|format| format.r#type == "json_schema")
-                {
-                    return Err(ApiError::BadRequest {
-                        message: "response_format.type 'json_schema' is not supported for this \
-                                  model; use 'text'"
-                            .to_string(),
-                        code: "unsupported_feature",
-                    });
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// Whether this model accepts runtime LoRA adapters.
-    pub fn supports_adapters(&self) -> bool {
-        matches!(self.model, PreparedModel::Qwen { .. })
-    }
-}
-
-/// The refusal a model without runtime LoRA adapters owes every adapter
-/// request. The code is the one `lattice serve` answers with on a backend
-/// that cannot take an adapter.
-#[doc(hidden)]
-pub fn lora_unsupported_backend() -> ApiError {
-    ApiError::BadRequest {
-        message: "runtime LoRA adapters are not supported for this model".to_string(),
-        code: "lora_unsupported_backend",
-    }
-}
 
 /// Output of the full pre-generation validation cascade, ready for
 /// `gen_cfg` construction.
@@ -277,48 +75,15 @@ pub fn prepare_chat_request(
     tokenize_len: impl FnOnce(&str) -> usize,
     max_context: impl FnOnce() -> usize,
 ) -> Result<PreparedChatRequest, ApiError> {
-    let (validated, prompt) = normalize_request_with_context_and_budget(
+    crate::serving_provider::providers::qwen::prepare_chat_request(
         req,
-        GenerationDefaults::standard(default_max_tokens),
-        ServeProfile::lattice(model_id, max_tokens_cap).with_vision_support(vision_supported),
-        |messages, max_tokens, reasoning_budget| {
-            let prompt = QwenPromptAdapter.render(messages);
-            let prompt_token_count = tokenize_len(&prompt);
-            validate_context_window_with_budget(
-                prompt_token_count,
-                max_tokens,
-                reasoning_budget,
-                max_context(),
-            )?;
-            Ok(prompt)
-        },
-    )?;
-    let ContractValidatedChatRequest {
-        messages,
-        max_tokens,
-        temperature,
-        top_p,
-        logprobs,
-        stop_strings,
-        reasoning_budget,
-        seed,
-        stream,
-        ..
-    } = validated;
-    let messages = into_engine_chat_messages(messages)?;
-
-    Ok(PreparedChatRequest {
-        messages,
-        max_tokens,
-        temperature,
-        top_p,
-        logprobs,
-        prompt,
-        stop_strings,
-        reasoning_budget,
-        seed,
-        stream,
-    })
+        model_id,
+        default_max_tokens,
+        max_tokens_cap,
+        vision_supported,
+        tokenize_len,
+        max_context,
+    )
 }
 
 /// The `lattice serve` chat handler's mapping from a prepared request's
@@ -333,7 +98,7 @@ pub fn lattice_gen_cfg(
     reasoning_budget: Option<usize>,
     logprobs: Option<usize>,
 ) -> GenerateConfig {
-    QwenPromptAdapter.lattice_generate_config(
+    crate::serving_provider::providers::qwen::lattice_gen_cfg(
         max_tokens,
         temperature,
         top_p,
@@ -346,7 +111,7 @@ pub fn lattice_gen_cfg(
 
 #[doc(hidden)]
 pub fn build_cfg(req: &ValidatedChatRequest) -> GenerateConfig {
-    QwenPromptAdapter.generate_config(req)
+    crate::serving_provider::providers::qwen::build_cfg(req)
 }
 
 /// Output of [`prepare_gemma_chat_request`]: the rendered prompt and the
@@ -379,34 +144,23 @@ pub fn prepare_gemma_chat_request(
     tokenize_len: impl FnOnce(&str) -> usize,
     max_context: impl FnOnce() -> usize,
 ) -> Result<PreparedGemmaChatRequest, ApiError> {
-    let options =
-        normalize_requested_options(req, ServeProfile::lattice(model_id, max_tokens_cap))?;
-    if req
-        .messages
-        .iter()
-        .any(|message| matches!(message.content, MessageContent::Parts(_)))
-    {
-        return Err(ApiError::BadRequest {
-            message: "typed content parts are not supported for this model; send message \
-                      content as a string"
-                .to_string(),
-            code: "unsupported_feature",
-        });
-    }
-    let validated =
-        adapter.apply_defaults(GenerationDefaults::standard(default_max_tokens), options)?;
-    let prompt = adapter.render(&validated.messages);
-    validate_context_window_with_budget(
-        tokenize_len(&prompt),
-        validated.max_tokens,
-        validated.reasoning_budget,
-        max_context(),
-    )?;
-    Ok(PreparedGemmaChatRequest {
-        gen_cfg: adapter.generate_config(&validated),
-        stream: validated.stream,
-        prompt,
-    })
+    crate::serving_provider::providers::gemma::prepare_gemma_chat_request(
+        adapter,
+        req,
+        model_id,
+        default_max_tokens,
+        max_tokens_cap,
+        tokenize_len,
+        max_context,
+    )
+}
+
+/// The refusal a model without runtime LoRA adapters owes every adapter
+/// request. The code is the one `lattice serve` answers with on a backend
+/// that cannot take an adapter.
+#[doc(hidden)]
+pub fn lora_unsupported_backend() -> ApiError {
+    crate::serving_provider::providers::gemma::lora_unsupported_backend()
 }
 
 #[cfg(test)]
