@@ -62,6 +62,8 @@ use crate::model::qwen35_config::{Qwen35Config, VisionModelConfig};
 use crate::serve::ApiError;
 use crate::serve::prepare::PreparationHandle;
 use crate::serving_factory::ServingFactory;
+pub use crate::serving_runtime_contract::{ContextWindowPolicy, WorkerMetadata};
+pub(crate) use crate::serving_runtime_contract::{WorkerFailure, cancelled_output};
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::vision::VisionError;
@@ -104,28 +106,6 @@ enum WorkerShutdown {
     ReaperUnavailable,
 }
 
-/// Selects the context-window formula enforced before Metal generation.
-/// Each serve adapter supplies the policy matching its pre-worker contract.
-#[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub enum ContextWindowPolicy {
-    /// Enforce `prompt_tokens + max_new_tokens <= model_max_context`.
-    PromptAndMaxTokens,
-    /// Enforce `prompt_tokens + max_new_tokens + reasoning_budget + 1
-    /// <= model_max_context`.
-    PromptAndDecodeWithDelimiter,
-}
-
-/// Everything a successful [`MetalWorker::spawn`] resolves to describe the
-/// loaded model, beyond the client handle itself: the format string, the
-/// actual KV context the loader allocated, and the adapter's window policy.
-#[derive(Debug, Clone)]
-pub struct WorkerMetadata {
-    pub format: String,
-    pub model_max_context: usize,
-    pub context_window_policy: ContextWindowPolicy,
-}
-
 /// One token-stream event from the worker back to a request handler.
 /// Replaces `lattice.rs`'s oneshot-reply `MetalJob` contract and
 /// `lattice_serve.rs`'s private `Ev` enum with a single shared shape.
@@ -163,38 +143,6 @@ pub enum WorkerEvent {
     /// binary's prior ad hoc behavior (an empty interrupted `GenerateOutput`
     /// reply vs. total silence) survives independently.
     Cancelled,
-}
-
-/// Failure classification internal to [`run_worker_loop`]'s injected
-/// `generate` closure -- never exposed outside this module. Keeps the
-/// `Rejected` vs. `Failed` distinction (#656 vs. #611) at the type level
-/// instead of `lattice_serve.rs`'s prior string-prefix-sniffing convention
-/// (`PROMPT_EXCEEDS_WINDOW_PREFIX`).
-#[derive(Debug)]
-pub(crate) enum WorkerFailure {
-    Rejected(ApiError),
-    Failed(String),
-    /// Mirrors [`WorkerEvent::ConstraintBlocked`] -- see that variant's doc
-    /// comment. Kept distinct from `Failed` from the moment the generation
-    /// call returns, all the way to the `WorkerEvent` sent back to the
-    /// caller, so no stage in between has to sniff the message text.
-    ConstraintBlocked(String),
-}
-
-impl From<crate::error::InferenceError> for WorkerFailure {
-    /// Classifies a generation-time [`InferenceError`](crate::error::InferenceError)
-    /// into the worker's own failure shape. `GrammarConstraintBlocked` is
-    /// the one variant with a dedicated `WorkerEvent`; every other variant
-    /// (including `InvalidInput`'s many unrelated uses) stays a generic
-    /// `Failed` exactly as before this change.
-    fn from(err: crate::error::InferenceError) -> Self {
-        match err {
-            crate::error::InferenceError::GrammarConstraintBlocked(message) => {
-                WorkerFailure::ConstraintBlocked(message)
-            }
-            other => WorkerFailure::Failed(other.to_string()),
-        }
-    }
 }
 
 /// Worker startup failure: either the `loader` itself returned `Err`
@@ -1377,18 +1325,6 @@ pub(crate) fn build_vision_request(
         metal_dispatches: vit_output.metal_dispatches,
         gemm_calls: vit_output.gemm_calls,
     })
-}
-
-pub(crate) fn cancelled_output() -> GenerateOutput {
-    GenerateOutput {
-        text: String::new(),
-        token_ids: Vec::new(),
-        prompt_tokens: 0,
-        generated_tokens: 0,
-        stopped: false,
-        stop_reason: Some(crate::StopReason::Interrupt),
-        token_logprobs: Vec::new(),
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

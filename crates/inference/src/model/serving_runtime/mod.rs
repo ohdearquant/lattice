@@ -1,17 +1,23 @@
 //! Worker-local execution for model serving.
 
 mod gemma_cpu;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod qwen_metal;
 
+use crate::serving_runtime_contract::WorkerMetadata;
+pub(crate) use crate::serving_runtime_contract::{WorkerFailure, cancelled_output};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use gemma_cpu::GemmaCpuRuntime;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use qwen_metal::QwenMetalRuntime;
 
 use crate::forward::metal_qwen35::ChatMessage;
 use crate::generation::{GenerateConfig, GenerateOutput};
-use crate::serve::lora::{
-    AdapterControlError, AdapterControlResult, AdapterIndex, LoraSelection, ResidencyLimits,
-};
-use crate::serve::metal_worker::{AdapterCommand, WorkerFailure, WorkerMetadata};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serve::lora::{AdapterControlError, AdapterControlResult};
+use crate::serve::lora::{AdapterIndex, LoraSelection, ResidencyLimits};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serve::metal_worker::AdapterCommand;
 use crate::serve::prepare::PreparationHandle;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
@@ -21,6 +27,8 @@ pub(crate) trait ServingRuntime {
     /// `stream` is whether the HTTP response is streamed. It does not change
     /// what is generated; a runtime that reports its route per request
     /// (`serve::route`) names it there.
+    // The Metal worker invokes this method after its factory builds the runtime.
+    #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
     fn generate(
         &mut self,
         messages: &[ChatMessage],
@@ -31,15 +39,20 @@ pub(crate) trait ServingRuntime {
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>;
 
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn control(
         &mut self,
         command: AdapterCommand,
     ) -> Result<AdapterControlResult, AdapterControlError>;
 
+    // The Metal worker reads this flag after its factory builds the runtime.
+    #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
     fn vision_supported(&self) -> Arc<AtomicBool>;
 }
 
 /// A one-shot builder moved into the worker before any Metal state exists.
+// The Metal worker calls this factory to create its runtime.
+#[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
 pub(crate) trait RuntimeFactory: Send + 'static {
     fn build(
         self: Box<Self>,
