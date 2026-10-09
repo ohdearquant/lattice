@@ -15,6 +15,12 @@ use crate::serving_provider::{
 };
 use std::path::Path;
 
+mod preparation;
+
+#[cfg(test)]
+pub(crate) use preparation::template_trim;
+pub(crate) use preparation::{lora_unsupported_backend, prepare_gemma_chat_request};
+
 pub(in crate::serving_provider) struct GemmaProvider;
 
 impl ServingProvider for GemmaProvider {

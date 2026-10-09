@@ -17,6 +17,10 @@ use crate::serving_provider::{
 };
 use std::path::Path;
 
+mod preparation;
+
+pub(crate) use preparation::{QwenChatDefaults, build_cfg, lattice_gen_cfg, prepare_chat_request};
+
 pub(in crate::serving_provider) struct QwenProvider;
 
 impl ServingProvider for QwenProvider {

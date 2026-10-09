@@ -147,6 +147,8 @@ pub mod serving_cpu;
 #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
 #[doc(hidden)]
 pub mod serving_factory;
+#[cfg(feature = "serve")]
+mod serving_preparation;
 /// Selects serving providers from bounded checkpoint metadata.
 /// Requires the `serve` feature.
 #[cfg(feature = "serve")]
