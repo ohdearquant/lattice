@@ -904,7 +904,7 @@ jobs:
             exit 1
           fi
           cat "$log"
-          grep -Eq '^test result: ok\. 32 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          grep -Eq '^test result: ok\. 61 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # These checkpoint targets are test = false, so --all-targets does not
       # compile them. Lint each target by name with the features it requires.
       - name: inference - serving checkpoint target lint (macOS only)
