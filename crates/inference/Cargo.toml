@@ -183,6 +183,28 @@ required-features = ["download", "f16", "metal-gpu", "serve"]
 name = "serve_standalone_route"
 required-features = ["f16", "metal-gpu", "serve"]
 
+[[test]]
+name = "serve_startup_golden"
+required-features = ["f16", "metal-gpu", "serve"]
+
+# The serving checkpoint targets stay out of `cargo test`'s default target set
+# and run only when selected with `--test <name>`. Set
+# `LATTICE_SERVE_CHARACTERIZATION_GATE_ENFORCE=1` to fail when a checkpoint is
+# missing. The path variables are `LATTICE_SERVE_STANDALONE_QWEN_DIR`,
+# `LATTICE_SERVE_STANDALONE_GEMMA_DIR`, and
+# `LATTICE_SERVE_CHARACTERIZATION_QWEN_Q4_DIR`. Their default checkpoint names
+# are `qwen3.5-0.8b`, `gemma-4-e2b-it`, and `qwen3.5-0.8b-q4`, respectively.
+[[test]]
+name = "serve_request_refusals"
+test = false
+required-features = ["f16", "metal-gpu", "serve"]
+
+# These targets load real checkpoints, which take minutes each on the CPU.
+[[test]]
+name = "serve_cpu_isolation"
+test = false
+required-features = ["serve"]
+
 # ADR-090 R03. Excluded from `cargo test`'s default target set on purpose: this
 # gate enforces by default (a missing checkpoint or a missing `f16` feature is a
 # panic, never a skip line), and the 1.6 GiB bf16 checkpoint it replays is not on
