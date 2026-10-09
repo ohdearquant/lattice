@@ -1287,7 +1287,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/shared-route-rejects-bypass.log"
           if cargo test -p lattice-inference --features test-utils --lib \
-            'serve::route::tests::supported_route_marker_rejects_a_test_bypassing_adapter' \
+            'serving_cpu::tests::supported_route_marker_rejects_a_test_bypassing_adapter' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else

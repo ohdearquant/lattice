@@ -424,6 +424,7 @@ pub(crate) fn tiny_zero_serving() -> GemmaCpuServing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::route::ServedRoute;
     use serde_json::json;
 
     fn serving() -> GemmaCpuServing {
@@ -572,5 +573,47 @@ mod tests {
         assert!(evidence.went_through_driver(), "{evidence:?}");
         assert_eq!(evidence.consumed + 1, evidence.opened, "{evidence:?}");
         assert!(deltas <= output.generated_tokens);
+    }
+
+    fn shared_route_assertion(marker: &str) -> Result<(), &'static str> {
+        if marker.contains(" driver=shared ") {
+            Ok(())
+        } else if marker.contains(" driver=bypassed ") {
+            Err("driver=bypassed")
+        } else {
+            Err("missing driver disposition")
+        }
+    }
+
+    #[test]
+    fn supported_route_marker_rejects_a_test_bypassing_adapter() {
+        let model = crate::model::qwen35::test_support::tiny_zero_model();
+        let cfg = crate::generation::GenerateConfig {
+            max_new_tokens: 2,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let (output, evidence) =
+            qwen_generate_traced(&model, "a", &cfg).expect("the supported CPU route generates");
+        assert!(output.generated_tokens > 0);
+        let supported = ServedRoute::QWEN35_CPU.request_marker(false, evidence);
+        assert_eq!(shared_route_assertion(&supported), Ok(()), "{supported}");
+        eprintln!("R00-CONTROL supported marker accepted: {supported}");
+
+        struct BypassingAdapter;
+
+        impl BypassingAdapter {
+            fn request_marker(&self) -> String {
+                ServedRoute::QWEN35_CPU.request_marker(false, DriverEvidence::default())
+            }
+        }
+
+        let bypassed = BypassingAdapter.request_marker();
+        eprintln!("R00-CONTROL bypass adapter rejected as driver=bypassed: {bypassed}");
+        assert_eq!(
+            shared_route_assertion(&bypassed),
+            Err("driver=bypassed"),
+            "{bypassed}"
+        );
     }
 }
