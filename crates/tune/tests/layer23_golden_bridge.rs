@@ -262,6 +262,7 @@ fn compatibility_shim_matches_layer23_golden() {
         probe: 1,
         fd_eps: 4e-3,
         save_path: None,
+        load_path: None,
         a_init_amp: Some(0.02),
         // `All`, not the default, and deliberately: pin the gradient check to
         // every GDN projection so its comparison subject stays fixed. If layer
