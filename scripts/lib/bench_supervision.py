@@ -336,6 +336,21 @@ def run_supervised(
     if not command:
         raise SupervisionError("no measurement command supplied")
 
+    for tree in (REPO / "target", REPO / ".cache"):
+        try:
+            guard = subprocess.run(
+                ["/bin/bash", str(REPO / "scripts/lib/ensure-noindex-marker.sh"), str(tree)],
+                check=False,
+            )
+        except OSError as exc:
+            print(
+                f"bench-supervision: cannot protect {tree}: {exc}; refusing to measure",
+                file=sys.stderr,
+            )
+            return REFUSAL_EXIT
+        if guard.returncode != 0:
+            return REFUSAL_EXIT
+
     if STATUS_ENV not in os.environ:
         status = _status_path(label)
         try:

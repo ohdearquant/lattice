@@ -2678,6 +2678,7 @@ class GpuHandoffShippingCommand(unittest.TestCase):
             lib = root / "scripts/lib"
             lib.mkdir(parents=True)
             for name in ("bench_admission.py", "bench_handoff.py", "bench_supervision.py",
+                         "ensure-noindex-marker.sh",
                          "bench-locks.py", "bench-python.sh", "quiet-probe.py"):
                 shutil.copy2(LIB / name, lib / name)
             shutil.copy2(REPO / "scripts/bench-command.sh", root / "scripts/bench-command.sh")
