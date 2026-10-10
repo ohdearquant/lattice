@@ -79,6 +79,7 @@ impl RequestPreparation for QwenCpuPreparation {
         stop_strings: Vec<String>,
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
+        enable_thinking: bool,
     ) -> GenerateConfig {
         lattice_gen_cfg(
             max_tokens,
@@ -88,6 +89,7 @@ impl RequestPreparation for QwenCpuPreparation {
             stop_strings,
             reasoning_budget,
             logprobs,
+            enable_thinking,
         )
     }
 

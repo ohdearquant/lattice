@@ -158,6 +158,11 @@ impl PromptAdapter for GemmaPromptAdapter {
         generation: GenerationDefaults,
         options: RequestedChatOptions,
     ) -> Result<ValidatedChatRequest, ApiError> {
+        if options.enable_thinking == Some(true) {
+            return Err(unsupported(
+                "enable_thinking is not supported for this model",
+            ));
+        }
         if options
             .messages
             .iter()
@@ -200,6 +205,7 @@ impl PromptAdapter for GemmaPromptAdapter {
             stream: options.stream.unwrap_or(false),
             stop_strings: options.stop_strings,
             reasoning_budget: None,
+            enable_thinking: false,
             logprobs: None,
         })
     }
@@ -297,6 +303,7 @@ impl RequestPreparation for GemmaPreparation {
         stop_strings: Vec<String>,
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
+        _enable_thinking: bool,
     ) -> GenerateConfig {
         self.serving.lattice_generate_config(
             max_tokens,

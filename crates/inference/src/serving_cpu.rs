@@ -140,6 +140,7 @@ impl GemmaCpuServing {
                 prompt: prepared.prompt,
                 stop_strings: gen_cfg.stop_strings.clone(),
                 reasoning_budget: gen_cfg.reasoning_budget,
+                enable_thinking: gen_cfg.enable_thinking,
                 seed: gen_cfg.seed,
                 stream: prepared.stream,
             },

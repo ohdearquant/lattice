@@ -136,6 +136,10 @@ pub struct ChatRequest {
     /// a raw [`RawValue`].
     #[serde(default)]
     pub reasoning_budget: Option<Box<RawValue>>,
+    /// Template options remain raw so shape refusals use the shared API error
+    /// before model preparation. Only boolean `enable_thinking` is accepted.
+    #[serde(default, deserialize_with = "deserialize_chat_template_kwargs")]
+    pub chat_template_kwargs: Option<Box<RawValue>>,
     /// Response-format constraint.
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
@@ -450,6 +454,8 @@ pub struct ValidatedChatRequest {
     pub stop_strings: Vec<String>,
     /// Effective reasoning-token budget.
     pub reasoning_budget: Option<usize>,
+    /// Effective thinking mode after model defaults and capability checks.
+    pub enable_thinking: bool,
     /// Number of alternative log probabilities to capture when enabled.
     pub logprobs: Option<usize>,
 }
@@ -458,14 +464,14 @@ pub struct ValidatedChatRequest {
 /// model's defaults are applied.
 ///
 /// Every option a request may omit is `None` when it was omitted (or sent as
-/// JSON `null`), so an omitted option stays distinguishable from one sent
-/// with the same value a default would have supplied. Values are kept as
+/// JSON `null` where accepted), so an omitted option stays distinguishable
+/// from one sent with the same value a default would have supplied. Values are kept as
 /// sent: `max_tokens` is not yet clamped by the profile, and a
 /// `reasoning_budget` of `0` is kept as `Some(0)`. Options a profile accepts
 /// but ignores (`top_k` and `repetition_penalty` on the `lattice` profile)
-/// are `None`. The request has no field for the thinking switch or the
-/// model's stop tokens, so neither appears here; the model's defaults step
-/// supplies them.
+/// are `None`. An explicit template thinking switch stays distinguishable
+/// from the model's default. The model's stop tokens are supplied by its
+/// defaults step.
 ///
 /// Not a stable API. `#[doc(hidden)]` is a convention, not a semver
 /// guarantee: this type may be reshaped, or folded into the worker-local
@@ -494,6 +500,8 @@ pub struct RequestedChatOptions {
     pub stop_strings: Vec<String>,
     /// Reasoning-token budget, when the profile applies it.
     pub reasoning_budget: Option<usize>,
+    /// Explicit `chat_template_kwargs.enable_thinking`, when supplied.
+    pub enable_thinking: Option<bool>,
     /// Whether log probabilities were requested.
     pub logprobs: Option<bool>,
     /// Number of alternative log probabilities, validated at most 20.
@@ -516,7 +524,7 @@ pub fn normalize_requested_options(
     profile: ServeProfile<'_>,
 ) -> Result<RequestedChatOptions, ApiError> {
     type NoContextCheck =
-        fn(&[NormalizedChatMessage], usize, Option<usize>) -> Result<(), ApiError>;
+        fn(&[NormalizedChatMessage], usize, Option<usize>, bool) -> Result<(), ApiError>;
     requested_options_inner::<(), NoContextCheck>(req, profile, None).map(|(options, _)| options)
 }
 
@@ -526,7 +534,7 @@ pub fn normalize_request(
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
 ) -> Result<ValidatedChatRequest, ApiError> {
-    normalize_request_inner(req, defaults, profile, |_, _, _| Ok(()))
+    normalize_request_inner(req, defaults, profile, |_, _, _, _| Ok(()))
         .map(|(validated, ())| validated)
 }
 
@@ -548,6 +556,23 @@ pub fn normalize_request_with_context_and_budget(
         &[NormalizedChatMessage],
         usize,
         Option<usize>,
+    ) -> Result<String, ApiError>,
+) -> Result<(ValidatedChatRequest, String), ApiError> {
+    normalize_request_inner(req, defaults, profile, |messages, max_tokens, budget, _| {
+        check_context(messages, max_tokens, budget)
+    })
+}
+
+/// Keep prompt rendering and context accounting on the same effective template mode.
+pub(crate) fn normalize_request_with_context_and_thinking(
+    req: &ChatRequest,
+    defaults: GenerationDefaults,
+    profile: ServeProfile<'_>,
+    check_context: impl FnOnce(
+        &[NormalizedChatMessage],
+        usize,
+        Option<usize>,
+        bool,
     ) -> Result<String, ApiError>,
 ) -> Result<(ValidatedChatRequest, String), ApiError> {
     normalize_request_inner(req, defaults, profile, check_context)
@@ -575,7 +600,12 @@ fn normalize_request_inner<C>(
     req: &ChatRequest,
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
-    check_context: impl FnOnce(&[NormalizedChatMessage], usize, Option<usize>) -> Result<C, ApiError>,
+    check_context: impl FnOnce(
+        &[NormalizedChatMessage],
+        usize,
+        Option<usize>,
+        bool,
+    ) -> Result<C, ApiError>,
 ) -> Result<(ValidatedChatRequest, C), ApiError> {
     let step = QwenChatDefaults::new(defaults);
     let (options, context) = requested_options_inner(req, profile, Some((&step, check_context)))?;
@@ -599,9 +629,10 @@ fn requested_options_inner<C, F>(
     step: Option<(&QwenChatDefaults, F)>,
 ) -> Result<(RequestedChatOptions, Option<C>), ApiError>
 where
-    F: FnOnce(&[NormalizedChatMessage], usize, Option<usize>) -> Result<C, ApiError>,
+    F: FnOnce(&[NormalizedChatMessage], usize, Option<usize>, bool) -> Result<C, ApiError>,
 {
     reject_unsupported(req, profile)?;
+    let enable_thinking = parse_chat_template_kwargs(&req.chat_template_kwargs)?;
     validate_model_name(req.model.as_deref(), profile.model_name)?;
 
     if req.messages.is_empty() {
@@ -668,11 +699,13 @@ where
 
     let context = match (step, effective_max_tokens) {
         (Some((defaults, check_context)), Some(effective_max_tokens)) => {
+            let effective_enable_thinking = defaults.enable_thinking(enable_thinking);
             let effective_reasoning_budget = defaults.reasoning_budget(
                 reasoning_budget,
                 profile.reasoning_budget_supported,
                 profile.max_tokens,
                 effective_max_tokens,
+                effective_enable_thinking,
             );
             if has_image && effective_reasoning_budget.is_some() {
                 image_unsupported_combination(
@@ -683,6 +716,7 @@ where
                 &messages,
                 effective_max_tokens,
                 effective_reasoning_budget,
+                effective_enable_thinking,
             )?)
         }
         _ => None,
@@ -716,6 +750,7 @@ where
             stream: req.stream,
             stop_strings,
             reasoning_budget,
+            enable_thinking,
             logprobs: req.logprobs,
             top_logprobs: req.top_logprobs,
             max_tokens_policy: profile.max_tokens,
@@ -904,6 +939,57 @@ fn content_byte_len(content: &MessageContent) -> usize {
             })
             .sum(),
     }
+}
+
+fn deserialize_chat_template_kwargs<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<RawValue>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Preserve a present null for strict object validation instead of treating it as omitted.
+    Box::<RawValue>::deserialize(deserializer).map(Some)
+}
+
+fn parse_chat_template_kwargs(value: &Option<Box<RawValue>>) -> Result<Option<bool>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    struct Visitor;
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Option<bool>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object containing only boolean field 'enable_thinking'")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut enable_thinking = None;
+            while let Some(key) = map.next_key::<String>()? {
+                if key != "enable_thinking" {
+                    return Err(serde::de::Error::unknown_field(&key, &["enable_thinking"]));
+                }
+                if enable_thinking.is_some() {
+                    return Err(serde::de::Error::duplicate_field("enable_thinking"));
+                }
+                enable_thinking = Some(map.next_value::<bool>()?);
+            }
+            Ok(enable_thinking)
+        }
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(value.get());
+    serde::Deserializer::deserialize_map(&mut deserializer, Visitor)
+        .and_then(|option| {
+            deserializer.end()?;
+            Ok(option)
+        })
+        .map_err(|err| ApiError::BadRequest {
+            message: format!("chat_template_kwargs is invalid: {err}"),
+            code: "invalid_request_body",
+        })
 }
 
 /// Parse a raw, unparsed [`RawValue`]-typed field that is only honored on
@@ -2412,6 +2498,7 @@ mod tests {
         assert_eq!(absent_options.seed, None);
         assert_eq!(absent_options.stream, None);
         assert_eq!(absent_options.reasoning_budget, None);
+        assert_eq!(absent_options.enable_thinking, None);
         assert_eq!(absent_options.logprobs, None);
         assert_eq!(absent_options.top_logprobs, None);
 
@@ -2419,7 +2506,7 @@ mod tests {
         // the requested options keep it, and the defaults step resolves the
         // explicit and the omitted form to the same effective request.
         type IsExplicit = fn(&RequestedChatOptions) -> bool;
-        let cases: [(&str, IsExplicit); 9] = [
+        let cases: [(&str, IsExplicit); 10] = [
             (r#""max_tokens":512"#, |o| o.max_tokens == Some(512)),
             (r#""max_completion_tokens":512"#, |o| {
                 o.max_tokens == Some(512)
@@ -2432,6 +2519,9 @@ mod tests {
             }),
             (r#""stream":false"#, |o| o.stream == Some(false)),
             (r#""reasoning_budget":0"#, |o| o.reasoning_budget == Some(0)),
+            (r#""chat_template_kwargs":{"enable_thinking":true}"#, |o| {
+                o.enable_thinking == Some(true)
+            }),
             (r#""logprobs":false"#, |o| o.logprobs == Some(false)),
         ];
         let absent_effective = effective(absent, defaults);
@@ -2522,5 +2612,191 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn chat_template_thinking_options_preserve_absence_true_false() {
+        for profile in [
+            ServeProfile::lattice("model", 100),
+            ServeProfile::lattice_serve("model", 100),
+        ] {
+            for (field, expected) in [
+                ("", None),
+                (r#", "chat_template_kwargs":{}"#, None),
+                (
+                    r#", "chat_template_kwargs":{"enable_thinking":true}"#,
+                    Some(true),
+                ),
+                (
+                    r#", "chat_template_kwargs":{"enable_thinking":false}"#,
+                    Some(false),
+                ),
+            ] {
+                let body = format!(
+                    r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}]{field}}}"#
+                );
+                let options = requested(&body, profile);
+                assert_eq!(options.enable_thinking, expected, "field={field}");
+            }
+        }
+    }
+
+    #[test]
+    fn chat_template_thinking_defaults_preserve_qwen_default() {
+        for profile in [
+            ServeProfile::lattice("model", 100),
+            ServeProfile::lattice_serve("model", 100),
+        ] {
+            for (field, expected) in [
+                ("", true),
+                (r#", "chat_template_kwargs":{}"#, true),
+                (r#", "chat_template_kwargs":{"enable_thinking":true}"#, true),
+                (
+                    r#", "chat_template_kwargs":{"enable_thinking":false}"#,
+                    false,
+                ),
+            ] {
+                let body = format!(
+                    r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}]{field}}}"#
+                );
+                let validated = normalize_request(&request(&body), defaults(), profile).unwrap();
+                assert_eq!(validated.enable_thinking, expected, "field={field}");
+            }
+        }
+    }
+
+    #[test]
+    fn chat_template_kwargs_reject_unknown_keys() {
+        for kwargs in [
+            r#"{"unknown":true}"#,
+            r#"{"enable_thinking":false,"unknown":[1,2,3]}"#,
+        ] {
+            let req = request(&format!(
+                r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"chat_template_kwargs":{kwargs}}}"#
+            ));
+            for profile in [
+                ServeProfile::lattice("model", 100),
+                ServeProfile::lattice_serve("model", 100),
+            ] {
+                let error = normalize_requested_options(&req, profile).unwrap_err();
+                assert_eq!(error.code(), "invalid_request_body");
+                assert!(error.message().contains("unknown field"));
+                assert!(error.message().contains("unknown"));
+            }
+        }
+    }
+
+    #[test]
+    fn chat_template_kwargs_reject_non_object_values() {
+        for kwargs in ["null", "true", "false", "0", r#""false""#, "[]", "[false]"] {
+            let req = request(&format!(
+                r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"chat_template_kwargs":{kwargs}}}"#
+            ));
+            for profile in [
+                ServeProfile::lattice("model", 100),
+                ServeProfile::lattice_serve("model", 100),
+            ] {
+                let error = normalize_requested_options(&req, profile).unwrap_err();
+                assert_eq!(error.code(), "invalid_request_body", "kwargs={kwargs}");
+                assert!(error.message().contains("chat_template_kwargs"));
+            }
+        }
+    }
+
+    #[test]
+    fn chat_template_thinking_reject_non_boolean_values() {
+        for value in ["null", "0", "1", r#""false""#, "[]", "{}", "[false]"] {
+            let req = request(&format!(
+                r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"chat_template_kwargs":{{"enable_thinking":{value}}}}}"#
+            ));
+            for profile in [
+                ServeProfile::lattice("model", 100),
+                ServeProfile::lattice_serve("model", 100),
+            ] {
+                let error = normalize_requested_options(&req, profile).unwrap_err();
+                assert_eq!(error.code(), "invalid_request_body", "value={value}");
+                assert!(error.message().contains("expected a boolean"));
+            }
+        }
+    }
+
+    #[test]
+    fn chat_template_thinking_reject_duplicate_keys() {
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":false,"enable_thinking":true}}"#,
+        );
+        for profile in [
+            ServeProfile::lattice("model", 100),
+            ServeProfile::lattice_serve("model", 100),
+        ] {
+            let error = normalize_requested_options(&req, profile).unwrap_err();
+            assert_eq!(error.code(), "invalid_request_body");
+            assert!(error.message().contains("duplicate field"));
+        }
+    }
+
+    #[test]
+    fn requested_thinking_option_is_model_family_neutral() {
+        for model in ["qwen", "gemma"] {
+            for enabled in [true, false] {
+                let body = format!(
+                    r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"chat_template_kwargs":{{"enable_thinking":{enabled}}}}}"#
+                );
+                let options = requested(&body, ServeProfile::lattice(model, 100));
+                assert_eq!(options.enable_thinking, Some(enabled));
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_off_makes_reasoning_budget_inert_in_context_callback() {
+        for budget in [
+            "",
+            r#", "reasoning_budget":0"#,
+            r#", "reasoning_budget":40"#,
+        ] {
+            let req = request(&format!(
+                r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"chat_template_kwargs":{{"enable_thinking":false}}{budget}}}"#
+            ));
+            let generation = GenerationDefaults {
+                reasoning_budget: Some(20),
+                ..defaults()
+            };
+            let (validated, prompt) = normalize_request_with_context_and_thinking(
+                &req,
+                generation,
+                ServeProfile::lattice("model", 100),
+                |_, max_tokens, effective_budget, enabled| {
+                    assert!(!enabled);
+                    assert_eq!(effective_budget, None);
+                    validate_context_window_with_budget(1, max_tokens, effective_budget, 18)?;
+                    Ok("prepared".to_owned())
+                },
+            )
+            .unwrap();
+            assert!(!validated.enable_thinking);
+            assert_eq!(validated.reasoning_budget, None);
+            assert_eq!(prompt, "prepared");
+        }
+    }
+
+    #[test]
+    fn legacy_context_callbacks_remain_compatible_when_thinking_is_off() {
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":false},"reasoning_budget":40}"#,
+        );
+        let profile = ServeProfile::lattice("model", 100);
+        let (validated, _) =
+            normalize_request_with_context_and_budget(&req, defaults(), profile, |_, _, budget| {
+                assert_eq!(budget, None);
+                Ok("three arguments".to_owned())
+            })
+            .unwrap();
+        assert!(!validated.enable_thinking);
+        let (validated, _) = normalize_request_with_context(&req, defaults(), profile, |_, _| {
+            Ok("two arguments".to_owned())
+        })
+        .unwrap();
+        assert!(!validated.enable_thinking);
     }
 }

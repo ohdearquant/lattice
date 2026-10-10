@@ -31,7 +31,7 @@ use lattice_inference::serve::contract::{
 use lattice_inference::serve::into_engine_chat_messages;
 #[cfg(any(feature = "metal-gpu", test))]
 use lattice_inference::serve::prepare::prepare_chat_request;
-use lattice_inference::serve::prepare::{PreparedChatRequest, lattice_gen_cfg};
+use lattice_inference::serve::prepare::{PreparedChatRequest, lattice_gen_cfg_with_thinking};
 use lattice_inference::{GenerateOutput, TokenLogprob};
 use serde::Serialize;
 use serde_json::Value;
@@ -192,12 +192,13 @@ impl ModelBackend {
         stop_strings: Vec<String>,
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
+        enable_thinking: bool,
     ) -> lattice_inference::GenerateConfig {
         #[cfg(feature = "metal-gpu")]
         if let ModelBackend::Metal { handle, .. } = self
             && let Some(preparation) = handle.client.preparation()
         {
-            return preparation.lattice_generate_config(
+            return preparation.lattice_generate_config_with_thinking(
                 max_tokens,
                 temperature,
                 top_p,
@@ -205,9 +206,10 @@ impl ModelBackend {
                 stop_strings,
                 reasoning_budget,
                 logprobs,
+                enable_thinking,
             );
         }
-        lattice_gen_cfg(
+        lattice_gen_cfg_with_thinking(
             max_tokens,
             temperature,
             top_p,
@@ -215,6 +217,7 @@ impl ModelBackend {
             stop_strings,
             reasoning_budget,
             logprobs,
+            enable_thinking,
         )
     }
 
@@ -1122,6 +1125,7 @@ async fn chat_completions_with_request(
             prompt,
             stop_strings,
             reasoning_budget,
+            enable_thinking,
             seed,
             stream,
         },
@@ -1142,6 +1146,7 @@ async fn chat_completions_with_request(
             stop_strings,
             reasoning_budget,
             logprobs,
+            enable_thinking,
         )
     });
 
@@ -5415,6 +5420,18 @@ mod tests {
         /// the observation genuinely mirrors what the seam returned rather
         /// than an independent hardcoded literal.
         const OBSERVATION_GOLDEN_REQUEST_BODY: &str = r#"{"model":"test-model","messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#;
+        const OBSERVATION_GOLDEN_NO_THINK_CHATML: &str =
+            "<|im_start|>user\nhi there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+        fn thinking_request_body(enable_thinking: bool, reasoning_budget: Option<usize>) -> String {
+            let mut body: serde_json::Value = serde_json::from_str(OBSERVATION_GOLDEN_REQUEST_BODY)
+                .expect("fixture request JSON");
+            body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": enable_thinking});
+            if let Some(budget) = reasoning_budget {
+                body["reasoning_budget"] = serde_json::json!(budget);
+            }
+            body.to_string()
+        }
 
         async fn run_observed(stopped: bool, body: &str) -> ProductionAdapterObservation {
             let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
@@ -5569,6 +5586,55 @@ mod tests {
                 obs.gen_cfg.reasoning_budget,
                 Some(5),
                 "reasoning_budget from the request must reach the real GenerateConfig"
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_non_streaming_observation_captures_real_enable_thinking() {
+            let body = thinking_request_body(false, None);
+            let obs = run_observed(true, &body).await;
+            let mut expected = expected_gen_cfg();
+            expected.enable_thinking = false;
+            let prompt_tokens = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .tokenize(OBSERVATION_GOLDEN_NO_THINK_CHATML)
+                .real_length;
+            assert_observation_matches(
+                &obs,
+                &ExpectedObservation {
+                    gen_cfg: expected,
+                    rendered_prompt: Some(OBSERVATION_GOLDEN_NO_THINK_CHATML),
+                    messages: None,
+                    prompt_tokens,
+                    stopped: true,
+                },
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_non_streaming_observation_preserves_thinking_default() {
+            let explicit = thinking_request_body(true, None);
+            for body in [OBSERVATION_GOLDEN_REQUEST_BODY, explicit.as_str()] {
+                let obs = run_observed(true, body).await;
+                assert_eq!(obs.gen_cfg, expected_gen_cfg());
+                assert_eq!(
+                    obs.rendered_prompt.as_deref(),
+                    Some(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn chat_completions_non_streaming_observation_keeps_no_think_budget_inert() {
+            // Exceeding the fixture's context makes a mistakenly active budget refuse admission.
+            let body = thinking_request_body(false, Some(4096));
+            let obs = run_observed(true, &body).await;
+            assert!(!obs.gen_cfg.enable_thinking);
+            assert_eq!(obs.gen_cfg.reasoning_budget, None);
+            assert_eq!(obs.gen_cfg.max_new_tokens, 9);
+            assert_eq!(
+                obs.rendered_prompt.as_deref(),
+                Some(OBSERVATION_GOLDEN_NO_THINK_CHATML)
             );
         }
     }
