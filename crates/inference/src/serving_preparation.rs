@@ -47,6 +47,7 @@ pub(crate) trait RequestPreparation: Send + Sync {
             stop_strings,
             prepared.reasoning_budget,
             prepared.logprobs,
+            prepared.enable_thinking,
         );
         Ok(PreparedCpuChat { prepared, config })
     }
@@ -79,6 +80,7 @@ pub(crate) trait RequestPreparation: Send + Sync {
         stop_strings: Vec<String>,
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
+        enable_thinking: bool,
     ) -> GenerateConfig;
 
     fn refuse_standalone_unsupported(&self, req: &ChatRequest) -> Result<(), ApiError>;
@@ -166,6 +168,32 @@ impl PreparationHandle {
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
     ) -> GenerateConfig {
+        self.lattice_generate_config_with_thinking(
+            max_tokens,
+            temperature,
+            top_p,
+            seed,
+            stop_strings,
+            reasoning_budget,
+            logprobs,
+            true,
+        )
+    }
+
+    /// Map prepared CLI options using the request's effective thinking mode.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn lattice_generate_config_with_thinking(
+        &self,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        seed: Option<u64>,
+        stop_strings: Vec<String>,
+        reasoning_budget: Option<usize>,
+        logprobs: Option<usize>,
+        enable_thinking: bool,
+    ) -> GenerateConfig {
         self.inner.lattice_generate_config(
             max_tokens,
             temperature,
@@ -174,6 +202,7 @@ impl PreparationHandle {
             stop_strings,
             reasoning_budget,
             logprobs,
+            enable_thinking,
         )
     }
 

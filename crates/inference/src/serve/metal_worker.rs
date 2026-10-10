@@ -61,6 +61,7 @@ use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35_config::{Qwen35Config, VisionModelConfig};
 use crate::serve::ApiError;
 use crate::serve::prepare::PreparationHandle;
+use crate::serve::prompt_adapter::apply_qwen_thinking_mode;
 use crate::serving_factory::ServingFactory;
 pub use crate::serving_runtime_contract::{ContextWindowPolicy, WorkerMetadata};
 pub(crate) use crate::serving_runtime_contract::{WorkerFailure, cancelled_output};
@@ -737,7 +738,8 @@ pub(crate) fn render_text_prompt_within_window(
     model_max_context: usize,
     cfg: &GenerateConfig,
 ) -> Result<(String, usize), ApiError> {
-    let prompt = format_chat_template(messages);
+    let mut prompt = format_chat_template(messages);
+    apply_qwen_thinking_mode(&mut prompt, cfg.enable_thinking);
     let prompt_len = tokenizer.tokenize(&prompt).pre_truncation_len;
     check_prompt_fits_window(policy, model_max_context, prompt_len, cfg)?;
     Ok((prompt, prompt_len))
@@ -1110,6 +1112,7 @@ fn tokenize_text(tokenizer: &BpeTokenizer, text: &str) -> Vec<u32> {
 fn build_vision_prompt_text(
     messages: &[ChatMessage],
     image_message_index: usize,
+    enable_thinking: bool,
 ) -> Result<(String, String), WorkerFailure> {
     let image_message = &messages[image_message_index];
     let image = image_message
@@ -1142,6 +1145,7 @@ fn build_vision_prompt_text(
         push_chat_turn_close(&mut after);
     }
     push_chat_generation_open(&mut after);
+    apply_qwen_thinking_mode(&mut after, enable_thinking);
 
     Ok((before, after))
 }
@@ -1155,8 +1159,9 @@ fn build_vision_prompt_ids(
     vision_end_token_id: u32,
     image_token_id: u32,
     image_pad_count: usize,
+    enable_thinking: bool,
 ) -> Result<Vec<u32>, WorkerFailure> {
-    let (before, after) = build_vision_prompt_text(messages, image_message_index)?;
+    let (before, after) = build_vision_prompt_text(messages, image_message_index, enable_thinking)?;
 
     let mut inserted_ids = Vec::with_capacity(image_pad_count.saturating_add(2));
     inserted_ids.push(vision_start_token_id);
@@ -1189,6 +1194,7 @@ pub(crate) fn build_vision_request(
     tokenizer: &BpeTokenizer,
     messages: &[ChatMessage],
     image_message_index: usize,
+    enable_thinking: bool,
     should_cancel: &mut dyn FnMut() -> bool,
     window_preflight: impl FnOnce(usize) -> Result<(), ApiError>,
 ) -> Result<VisionRequestBuild, WorkerFailure> {
@@ -1254,6 +1260,7 @@ pub(crate) fn build_vision_request(
         vision_end_token_id,
         image_token_id,
         image_pad_count,
+        enable_thinking,
     )?;
     if should_cancel() {
         return Ok(VisionRequestBuild::Cancelled);
@@ -1799,6 +1806,152 @@ mod tests {
         }
     }
 
+    fn thinking_tokenizer() -> BpeTokenizer {
+        BpeTokenizer::from_vocab_and_merges(
+            "abeforthink"
+                .chars()
+                .enumerate()
+                .map(|(id, ch)| (ch.to_string(), u32::try_from(id).expect("tiny vocabulary")))
+                .collect(),
+            Vec::new(),
+        )
+        .expect("thinking tokenizer")
+    }
+
+    #[test]
+    fn text_worker_renders_closed_thinking_before_tokenization_and_admission() {
+        let messages = [ChatMessage::user("hello")];
+        let tokenizer = thinking_tokenizer();
+        let plain = format_chat_template(&messages);
+        let expected =
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let prompt_tokens = tokenizer.tokenize(expected).pre_truncation_len;
+        let cfg = GenerateConfig {
+            enable_thinking: false,
+            reasoning_budget: Some(4096),
+            max_new_tokens: 9,
+            ..GenerateConfig::default()
+        };
+        let context = prompt_tokens + 9 + 1;
+        let (prompt, count) = render_text_prompt_within_window(
+            &tokenizer,
+            &messages,
+            ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+            context,
+            &cfg,
+        )
+        .expect("disabled budget consumes no window");
+        assert_eq!(prompt, expected);
+        assert_eq!(count, prompt_tokens);
+        let enabled = GenerateConfig {
+            enable_thinking: true,
+            reasoning_budget: None,
+            ..cfg.clone()
+        };
+        let (prompt, _) = render_text_prompt_within_window(
+            &tokenizer,
+            &messages,
+            ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+            context,
+            &enabled,
+        )
+        .expect("legacy true prompt");
+        assert_eq!(prompt, plain);
+        let enabled_budget = GenerateConfig {
+            enable_thinking: true,
+            ..cfg
+        };
+        assert!(matches!(
+            render_text_prompt_within_window(
+                &tokenizer,
+                &messages,
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                context,
+                &enabled_budget,
+            ),
+            Err(ApiError::BadRequest {
+                code: "context_length_exceeded",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn vision_worker_renders_and_tokenizes_the_closed_thinking_tail() {
+        let messages = [ChatMessage::user_with_image(
+            "beforeafter",
+            vec![1],
+            "before".len(),
+        )];
+        let tokenizer = thinking_tokenizer();
+        let (before, after) = build_vision_prompt_text(&messages, 0, false).expect("vision text");
+        assert_eq!(before, "<|im_start|>user\nbefore");
+        assert_eq!(
+            after,
+            "after<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        let ids = build_vision_prompt_ids(&messages, 0, &tokenizer, 90, 91, 92, 3, false)
+            .expect("closed vision prompt");
+        let expected = tokenizer.tokenize_fragments_with_inserted_ids(
+            "<|im_start|>user\nbefore",
+            &[90, 92, 92, 92, 91],
+            "after<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        );
+        assert_eq!(ids, expected);
+        let (_, enabled_after) =
+            build_vision_prompt_text(&messages, 0, true).expect("legacy vision text");
+        assert_eq!(enabled_after, "after<|im_end|>\n<|im_start|>assistant\n");
+        assert_ne!(
+            ids,
+            build_vision_prompt_ids(&messages, 0, &tokenizer, 90, 91, 92, 3, true)
+                .expect("legacy vision prompt")
+        );
+    }
+
+    #[test]
+    fn vision_thinking_mode_reaches_exact_token_window_preflight() {
+        let mut runtime = VisionRuntime::unsupported();
+        let config = vision_build_config();
+        let tokenizer = thinking_tokenizer();
+        let messages = [ChatMessage::user_with_image(
+            "beforeafter",
+            make_test_png(8, 8),
+            "before".len(),
+        )];
+        let mut counts = Vec::new();
+        for enabled in [true, false] {
+            let error = build_vision_request(
+                &mut runtime,
+                &config,
+                &tokenizer,
+                &messages,
+                0,
+                enabled,
+                &mut || false,
+                |count| {
+                    counts.push(count);
+                    Err(ApiError::BadRequest {
+                        message: "test window refusal before lazy weights".to_owned(),
+                        code: "context_length_exceeded",
+                    })
+                },
+            )
+            .expect_err("test refuses before checkpoint loading or Metal dispatch");
+            assert!(matches!(
+                error,
+                WorkerFailure::Rejected(ApiError::BadRequest {
+                    code: "context_length_exceeded",
+                    ..
+                })
+            ));
+        }
+        assert_eq!(counts.len(), 2);
+        assert!(
+            counts[1] > counts[0],
+            "closed tail must be counted: {counts:?}"
+        );
+    }
+
     fn make_test_png(width: u32, height: u32) -> Vec<u8> {
         let mut image = image::RgbImage::new(width, height);
         for y in 0..height {
@@ -1861,7 +2014,7 @@ mod tests {
             ChatMessage::user_with_image("beforeafter", vec![1], "before".len()),
             ChatMessage::assistant("prior"),
         ];
-        let actual = build_vision_prompt_ids(&messages, 1, &tokenizer, 90, 91, 92, 3)
+        let actual = build_vision_prompt_ids(&messages, 1, &tokenizer, 90, 91, 92, 3, true)
             .expect("vision prompt");
 
         let before = "<|im_start|>system\npolicy<|im_end|>\n<|im_start|>user\nbefore";
@@ -1880,7 +2033,7 @@ mod tests {
             ChatMessage::user_with_image("beforeafter", vec![1], "before".len()),
             ChatMessage::assistant("prior"),
         ];
-        let (before, after) = build_vision_prompt_text(&messages, 1).expect("vision text");
+        let (before, after) = build_vision_prompt_text(&messages, 1, true).expect("vision text");
         let plain = format_chat_template(&messages);
         assert_eq!(
             before.clone() + &after,
@@ -1899,9 +2052,9 @@ mod tests {
             vec![1],
             before.len(),
         )];
-        let actual = build_vision_prompt_ids(&messages, 0, &capped, 90, 91, 92, 3)
+        let actual = build_vision_prompt_ids(&messages, 0, &capped, 90, 91, 92, 3, true)
             .expect("capped tokenizer must not truncate prompt fragments");
-        let expected = build_vision_prompt_ids(&messages, 0, &unbounded, 90, 91, 92, 3)
+        let expected = build_vision_prompt_ids(&messages, 0, &unbounded, 90, 91, 92, 3, true)
             .expect("unbounded tokenizer");
         assert_eq!(actual, expected);
         assert!(actual.len() > 4);
@@ -1932,6 +2085,7 @@ mod tests {
             &tiny_tokenizer(),
             &messages,
             0,
+            true,
             &mut || {
                 polls += 1;
                 true
@@ -1960,6 +2114,7 @@ mod tests {
             &tiny_tokenizer(),
             &messages,
             0,
+            true,
             &mut || {
                 polls += 1;
                 polls == 3
@@ -1992,6 +2147,7 @@ mod tests {
             &tiny_tokenizer(),
             &messages,
             0,
+            true,
             &mut || {
                 polls += 1;
                 polls == 4
@@ -2063,6 +2219,7 @@ mod tests {
             &tiny_tokenizer(),
             &messages,
             0,
+            true,
             &mut || false,
             |_| Ok(()),
         )
@@ -2099,6 +2256,7 @@ mod tests {
             &tiny_tokenizer(),
             &messages,
             0,
+            true,
             &mut || false,
             |_| Ok(()),
         )
@@ -2155,6 +2313,7 @@ mod tests {
             &tiny_tokenizer(),
             &messages,
             0,
+            true,
             &mut || false,
             |_| Ok(()),
         )

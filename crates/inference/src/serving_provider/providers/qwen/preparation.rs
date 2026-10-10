@@ -6,13 +6,13 @@ use crate::serve::contract::normalize_request;
 use crate::serve::contract::{
     ChatRequest, GenerationDefaults, MaxTokensPolicy, NormalizedChatMessage, RequestedChatOptions,
     ServeProfile, ValidatedChatRequest, apply_max_tokens_policy,
-    normalize_request_with_context_and_budget, validate_context_window_with_budget,
+    normalize_request_with_context_and_thinking, validate_context_window_with_budget,
     validate_temperature, validate_top_p,
 };
 use crate::serve::format_normalized_chat_template;
 use crate::serve::into_engine_chat_messages;
 use crate::serve::prepare::PreparedChatRequest;
-use crate::serve::prompt_adapter::PromptAdapter;
+use crate::serve::prompt_adapter::{PromptAdapter, apply_qwen_thinking_mode};
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use crate::serving_preparation::{PreparationHandle, RequestPreparation};
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
@@ -38,6 +38,7 @@ impl QwenPromptAdapter {
         stop_strings: Vec<String>,
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
+        enable_thinking: bool,
     ) -> GenerateConfig {
         let mut cfg = self.generate_config_base();
         cfg.max_new_tokens = max_tokens;
@@ -45,7 +46,8 @@ impl QwenPromptAdapter {
         cfg.top_p = top_p;
         cfg.seed = seed;
         cfg.stop_strings = stop_strings;
-        cfg.reasoning_budget = reasoning_budget;
+        cfg.enable_thinking = enable_thinking;
+        cfg.reasoning_budget = reasoning_budget.filter(|_| enable_thinking);
         cfg.logprobs = logprobs;
         cfg
     }
@@ -62,6 +64,16 @@ impl QwenPromptAdapter {
 impl PromptAdapter for QwenPromptAdapter {
     fn render(&self, messages: &[NormalizedChatMessage]) -> String {
         format_normalized_chat_template(messages)
+    }
+
+    fn render_with_thinking(
+        &self,
+        messages: &[NormalizedChatMessage],
+        enable_thinking: bool,
+    ) -> String {
+        let mut prompt = self.render(messages);
+        apply_qwen_thinking_mode(&mut prompt, enable_thinking);
+        prompt
     }
 
     fn stop_token_ids(&self) -> &[u32] {
@@ -88,7 +100,8 @@ impl PromptAdapter for QwenPromptAdapter {
         cfg.enable_mtp = None;
         cfg.grammar = None;
         cfg.stop_strings = req.stop_strings.clone();
-        cfg.reasoning_budget = req.reasoning_budget;
+        cfg.enable_thinking = req.enable_thinking;
+        cfg.reasoning_budget = req.reasoning_budget.filter(|_| req.enable_thinking);
         cfg.logprobs = req.logprobs;
         cfg
     }
@@ -120,14 +133,19 @@ impl QwenChatDefaults {
         validate_top_p(requested.unwrap_or(self.generation.top_p))
     }
 
+    pub(crate) fn enable_thinking(&self, requested: Option<bool>) -> bool {
+        requested.unwrap_or(true)
+    }
+
     pub(crate) fn reasoning_budget(
         &self,
         requested: Option<usize>,
         supported: bool,
         policy: MaxTokensPolicy,
         max_tokens: usize,
+        enable_thinking: bool,
     ) -> Option<usize> {
-        let mut reasoning_budget = if supported {
+        let mut reasoning_budget = if supported && enable_thinking {
             requested
                 .filter(|&value| value > 0)
                 .or(self.generation.reasoning_budget)
@@ -148,11 +166,13 @@ impl QwenChatDefaults {
         options: RequestedChatOptions,
     ) -> Result<ValidatedChatRequest, ApiError> {
         let max_tokens = self.max_tokens(options.max_tokens, options.max_tokens_policy)?;
+        let enable_thinking = self.enable_thinking(options.enable_thinking);
         let reasoning_budget = self.reasoning_budget(
             options.reasoning_budget,
             options.reasoning_budget_supported,
             options.max_tokens_policy,
             max_tokens,
+            enable_thinking,
         );
         let logprobs = if options.logprobs.unwrap_or(false) {
             Some(options.top_logprobs.unwrap_or(0))
@@ -172,6 +192,7 @@ impl QwenChatDefaults {
             stream: options.stream.unwrap_or(false),
             stop_strings: options.stop_strings,
             reasoning_budget,
+            enable_thinking,
             logprobs,
         })
     }
@@ -244,6 +265,7 @@ impl RequestPreparation for QwenPreparation {
         stop_strings: Vec<String>,
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
+        enable_thinking: bool,
     ) -> GenerateConfig {
         lattice_gen_cfg(
             max_tokens,
@@ -253,6 +275,7 @@ impl RequestPreparation for QwenPreparation {
             stop_strings,
             reasoning_budget,
             logprobs,
+            enable_thinking,
         )
     }
 
@@ -284,12 +307,12 @@ pub(crate) fn prepare_chat_request(
     tokenize_len: impl FnOnce(&str) -> usize,
     max_context: impl FnOnce() -> usize,
 ) -> Result<PreparedChatRequest, ApiError> {
-    let (validated, prompt) = normalize_request_with_context_and_budget(
+    let (validated, prompt) = normalize_request_with_context_and_thinking(
         req,
         GenerationDefaults::standard(default_max_tokens),
         ServeProfile::lattice(model_id, max_tokens_cap).with_vision_support(vision_supported),
-        |messages, max_tokens, reasoning_budget| {
-            let prompt = QwenPromptAdapter.render(messages);
+        |messages, max_tokens, reasoning_budget, enable_thinking| {
+            let prompt = QwenPromptAdapter.render_with_thinking(messages, enable_thinking);
             let prompt_token_count = tokenize_len(&prompt);
             validate_context_window_with_budget(
                 prompt_token_count,
@@ -308,6 +331,7 @@ pub(crate) fn prepare_chat_request(
         logprobs,
         stop_strings,
         reasoning_budget,
+        enable_thinking,
         seed,
         stream,
         ..
@@ -323,6 +347,7 @@ pub(crate) fn prepare_chat_request(
         prompt,
         stop_strings,
         reasoning_budget,
+        enable_thinking,
         seed,
         stream,
     })
@@ -336,6 +361,7 @@ pub(crate) fn lattice_gen_cfg(
     stop_strings: Vec<String>,
     reasoning_budget: Option<usize>,
     logprobs: Option<usize>,
+    enable_thinking: bool,
 ) -> GenerateConfig {
     QwenPromptAdapter.lattice_generate_config(
         max_tokens,
@@ -345,6 +371,7 @@ pub(crate) fn lattice_gen_cfg(
         stop_strings,
         reasoning_budget,
         logprobs,
+        enable_thinking,
     )
 }
 
