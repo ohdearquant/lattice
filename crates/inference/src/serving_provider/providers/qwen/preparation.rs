@@ -189,6 +189,14 @@ impl RequestPreparation for QwenPreparation {
         self.tokenizer.tokenize(prompt).pre_truncation_len
     }
 
+    fn max_context(&self) -> usize {
+        self.model_max_context
+    }
+
+    fn tokenizer(&self) -> Option<&BpeTokenizer> {
+        Some(&self.tokenizer)
+    }
+
     fn prepare_lattice(
         &self,
         req: &ChatRequest,

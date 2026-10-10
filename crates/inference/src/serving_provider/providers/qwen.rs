@@ -17,6 +17,7 @@ use crate::serving_provider::{
 };
 use std::path::Path;
 
+pub(crate) mod cpu;
 mod preparation;
 
 pub(crate) use preparation::{QwenChatDefaults, build_cfg, lattice_gen_cfg, prepare_chat_request};
@@ -50,6 +51,13 @@ impl ServingProvider for QwenProvider {
                 }
             }
         }
+    }
+
+    fn load_lattice_cpu(
+        &self,
+        evidence: &CheckpointEvidence,
+    ) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
+        cpu::load(evidence)
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
