@@ -251,12 +251,8 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         })
     }
 
-    /// `Poisoned` invalidates whatever prediction is still live; `Reusable` is
-    /// a no-op. Same rationale as `QwenCpuSession::finish`.
-    fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError> {
-        if disposition == FinishDisposition::Poisoned {
-            self.ledger.invalidate();
-        }
+    fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
+        self.ledger.invalidate();
         Ok(())
     }
 }
@@ -273,6 +269,38 @@ mod tests {
 
     fn cancel_true() -> impl Fn() -> bool {
         || true
+    }
+
+    #[test]
+    fn finish_invalidates_the_prediction_for_every_disposition() {
+        let model = tiny_zero_model();
+        let prompt_ids = vec![2, 3];
+        let config = GenerateConfig {
+            temperature: 0.0,
+            max_new_tokens: 2,
+            ..Default::default()
+        };
+        for disposition in [FinishDisposition::Reusable, FinishDisposition::Poisoned] {
+            let mut session = GemmaCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), 16)
+                .expect("session");
+            session.prefill(&cancel_false()).expect("prefill");
+            let outcome = session
+                .select(&SelectionRequest {
+                    config: &config,
+                    history: &prompt_ids,
+                    grammar_mask: None,
+                })
+                .expect("selection");
+            let SelectOutcome::Candidate(candidate) = outcome else {
+                panic!("unconstrained selection must yield a candidate")
+            };
+            assert!(session.ledger.is_live(candidate.prediction));
+            session.finish(disposition).expect("finish");
+            assert!(
+                !session.ledger.is_live(candidate.prediction),
+                "{disposition:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

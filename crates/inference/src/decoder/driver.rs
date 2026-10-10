@@ -203,6 +203,54 @@ pub(crate) fn run(
     eos_token_id: u32,
     streaming: bool,
     cancel: &dyn Cancellation,
+    on_push: impl FnMut(usize),
+    decode_delta: impl FnMut(u32) -> String,
+    text: &mut String,
+    token_logprob_end_offsets: &mut Vec<usize>,
+    emit_confirmed: impl FnMut(&str, u32) -> bool,
+    on_prefill_end: impl FnMut(),
+    finish_tail: impl FnOnce() -> String,
+) -> Result<DriverResult, InferenceError> {
+    #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+    TEST_DRIVER_RUN_COUNT.with(|count| count.set(count.get() + 1));
+
+    check_capabilities(*session.capabilities(), gen_cfg)?;
+    let mut prefill_started = false;
+    let result = run_inner(
+        session,
+        gen_cfg,
+        think_close_id,
+        prompt_ids,
+        eos_token_id,
+        streaming,
+        cancel,
+        on_push,
+        decode_delta,
+        text,
+        token_logprob_end_offsets,
+        emit_confirmed,
+        on_prefill_end,
+        finish_tail,
+        &mut prefill_started,
+    );
+    let interrupted = matches!(&result, Ok(result) if result.stop_reason == StopReason::Interrupt);
+    let disposition = if prefill_started && (result.is_err() || interrupted) {
+        FinishDisposition::Poisoned
+    } else {
+        FinishDisposition::Reusable
+    };
+    let finished = session.finish(disposition);
+    result.and_then(|result| finished.map(|()| result))
+}
+
+fn run_inner(
+    session: &mut dyn DecoderSession,
+    gen_cfg: &GenerateConfig,
+    think_close_id: Option<u32>,
+    prompt_ids: &[u32],
+    eos_token_id: u32,
+    streaming: bool,
+    cancel: &dyn Cancellation,
     mut on_push: impl FnMut(usize),
     mut decode_delta: impl FnMut(u32) -> String,
     text: &mut String,
@@ -210,16 +258,8 @@ pub(crate) fn run(
     mut emit_confirmed: impl FnMut(&str, u32) -> bool,
     mut on_prefill_end: impl FnMut(),
     finish_tail: impl FnOnce() -> String,
+    prefill_started: &mut bool,
 ) -> Result<DriverResult, InferenceError> {
-    #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
-    TEST_DRIVER_RUN_COUNT.with(|count| count.set(count.get() + 1));
-
-    // D3: capabilities are negotiated per session, and "one driver over many sessions" (D1)
-    // means a session that does not declare a control this call actually uses is a caller
-    // bug -- a hard error in every build, not this driver's problem to route around silently.
-    let caps = *session.capabilities();
-    check_capabilities(caps, gen_cfg)?;
-
     // Driver-owned grammar engine + state (ADR-090 D1; moved off the session by this row's
     // rework -- see this module's doc comment). `grammar_state` needs interior mutability:
     // `GrammarEngine::mask_logits`/`advance` take `&mut GrammarState`, but the mask closure
@@ -268,7 +308,7 @@ pub(crate) fn run(
     };
 
     // `RefCell<&mut dyn DecoderSession>`: `record_metadata` below and the surrounding
-    // `select`/`decode`/`finish` calls all need mutable session access from different
+    // `select`/`decode` calls all need mutable session access from different
     // closures and call sites within this same function body -- two simultaneous `&mut
     // session` captures the borrow checker rejects outright, even though they are only ever
     // called sequentially, never concurrently. (`grammar_advance` above needs no session
@@ -297,6 +337,7 @@ pub(crate) fn run(
         });
     }
     let cancel_never = || false;
+    *prefill_started = true;
     session.borrow_mut().prefill(&cancel_never)?;
     on_prefill_end();
 
@@ -355,7 +396,6 @@ pub(crate) fn run(
                         .into(),
                 ));
             }
-            session.borrow_mut().finish(FinishDisposition::Reusable)?;
             return Ok(DriverResult {
                 generated_ids: Vec::new(),
                 token_logprobs: Vec::new(),
@@ -381,7 +421,6 @@ pub(crate) fn run(
     // mirrors: a rejected candidate at step 0 is `stopped: false` (no completed grammar,
     // nothing to answer with) -- distinct from the exhaustion-before-sampling case above.
     if !grammar_advance(candidate0.candidate_id)? {
-        session.borrow_mut().finish(FinishDisposition::Reusable)?;
         return Ok(DriverResult {
             generated_ids: Vec::new(),
             token_logprobs: Vec::new(),
@@ -394,7 +433,6 @@ pub(crate) fn run(
     let grammar_complete_at_step0 = grammar_complete();
 
     if is_eos(candidate0.candidate_id) {
-        session.borrow_mut().finish(FinishDisposition::Reusable)?;
         return Ok(DriverResult {
             generated_ids: Vec::new(),
             token_logprobs: Vec::new(),
@@ -447,7 +485,6 @@ pub(crate) fn run(
         |s| emit_confirmed(s, candidate0.candidate_id),
     ) {
         StopCheckOutcome::Stopped => {
-            session.borrow_mut().finish(FinishDisposition::Reusable)?;
             return Ok(DriverResult {
                 generated_ids,
                 token_logprobs,
@@ -458,7 +495,6 @@ pub(crate) fn run(
             });
         }
         StopCheckOutcome::Interrupted => {
-            session.borrow_mut().finish(FinishDisposition::Reusable)?;
             return Ok(DriverResult {
                 generated_ids,
                 token_logprobs,
@@ -705,8 +741,6 @@ pub(crate) fn run(
         }
     }
 
-    session.borrow_mut().finish(FinishDisposition::Reusable)?;
-
     Ok(DriverResult {
         generated_ids,
         token_logprobs,
@@ -778,14 +812,42 @@ pub(crate) fn run_speculative(
     gen_cfg: &GenerateConfig,
     eos_token_id: u32,
     cancel: &dyn Cancellation,
+    decode_delta: impl FnMut(u32) -> String,
+    text: &mut String,
+    token_logprob_end_offsets: &mut Vec<usize>,
+    emit_confirmed: impl FnMut(&str, u32) -> bool,
+) -> Result<SpeculativeResult, InferenceError> {
+    check_capabilities(ExecutionCapabilities::default(), gen_cfg)?;
+    check_greedy(gen_cfg)?;
+    let result = run_speculative_inner(
+        session,
+        gen_cfg,
+        eos_token_id,
+        cancel,
+        decode_delta,
+        text,
+        token_logprob_end_offsets,
+        emit_confirmed,
+    );
+    let disposition = match &result {
+        Ok(result) if result.stop_reason != StopReason::Interrupt => FinishDisposition::Reusable,
+        _ => FinishDisposition::Poisoned,
+    };
+    let finished = session.finish(disposition);
+    result.and_then(|result| finished.map(|()| result))
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn run_speculative_inner(
+    session: &mut dyn SpeculativeSession,
+    gen_cfg: &GenerateConfig,
+    eos_token_id: u32,
+    cancel: &dyn Cancellation,
     mut decode_delta: impl FnMut(u32) -> String,
     text: &mut String,
     token_logprob_end_offsets: &mut Vec<usize>,
     mut emit_confirmed: impl FnMut(&str, u32) -> bool,
 ) -> Result<SpeculativeResult, InferenceError> {
-    check_capabilities(ExecutionCapabilities::default(), gen_cfg)?;
-    check_greedy(gen_cfg)?;
-
     let mut trace = SpeculativeTrace::default();
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
@@ -904,7 +966,6 @@ pub(crate) fn run_speculative(
         pending = next;
     }
 
-    session.finish(FinishDisposition::Reusable)?;
     Ok(SpeculativeResult {
         generated_ids,
         stopped,
@@ -981,7 +1042,7 @@ mod tests {
         }
 
         fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
-            unreachable!("FakeSession::prefill always errors before finish is reached")
+            Ok(())
         }
     }
 
@@ -1419,6 +1480,7 @@ mod speculative_tests {
         seen_pending: Vec<u32>,
         rooms: Vec<usize>,
         finished: bool,
+        finishes: Vec<FinishDisposition>,
     }
 
     fn round(committed: &[u32], next: u32) -> VerifiedRound {
@@ -1437,6 +1499,7 @@ mod speculative_tests {
             seen_pending: Vec::new(),
             rooms: Vec::new(),
             finished: false,
+            finishes: Vec::new(),
         }
     }
 
@@ -1459,8 +1522,9 @@ mod speculative_tests {
                 .ok_or_else(|| InferenceError::Inference("script exhausted".into()))
         }
 
-        fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
+        fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError> {
             self.finished = true;
+            self.finishes.push(disposition);
             Ok(())
         }
     }
@@ -1647,5 +1711,239 @@ mod speculative_tests {
             assert_eq!(session.first_reads, 0);
             assert!(!session.finished);
         }
+    }
+
+    #[test]
+    fn speculative_early_completion_finishes_once() {
+        for (first, budget) in [(EOS, 4), (1, 0)] {
+            let mut session = scripted(first, Vec::new());
+            drive(&mut session, &cfg(budget), &|| false).expect("early completion");
+            assert_eq!(session.finishes, [FinishDisposition::Reusable]);
+            assert!(session.seen_pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn speculative_advance_failure_finishes_poisoned_once() {
+        let mut session = scripted(1, Vec::new());
+        let result = drive(&mut session, &cfg(4), &|| false);
+        assert!(
+            matches!(result, Err(InferenceError::Inference(message)) if message == "script exhausted")
+        );
+        assert_eq!(session.finishes, [FinishDisposition::Poisoned]);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::decoder::{
+        PredictionId, PredictionLedger, SelectionCandidate, StepStamp, TokenMetadata,
+    };
+    use std::cell::Cell;
+
+    struct RecordingSession {
+        caps: ExecutionCapabilities,
+        ledger: PredictionLedger,
+        prediction: Option<PredictionId>,
+        calls: Vec<&'static str>,
+        finishes: Vec<FinishDisposition>,
+        failure: Option<&'static str>,
+        finish_error: bool,
+    }
+
+    impl RecordingSession {
+        fn new(failure: Option<&'static str>) -> Self {
+            Self {
+                caps: ExecutionCapabilities {
+                    grammar: true,
+                    logprobs: true,
+                    stop_strings: true,
+                    reasoning_budget: true,
+                },
+                ledger: PredictionLedger::new(),
+                prediction: None,
+                calls: Vec::new(),
+                finishes: Vec::new(),
+                failure,
+                finish_error: false,
+            }
+        }
+
+        fn record(&mut self, call: &'static str) -> Result<(), InferenceError> {
+            self.calls.push(call);
+            if self.failure == Some(call) {
+                return Err(InferenceError::Inference(call.into()));
+            }
+            Ok(())
+        }
+    }
+
+    impl DecoderSession for RecordingSession {
+        fn capabilities(&self) -> &ExecutionCapabilities {
+            &self.caps
+        }
+
+        fn prefill(&mut self, _cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
+            self.record("prefill")?;
+            Ok(StepStamp {
+                evaluated_len: 1,
+                prediction: None,
+            })
+        }
+
+        fn decode(
+            &mut self,
+            accepted: &AcceptedToken,
+            _cancel: &dyn Cancellation,
+        ) -> Result<StepStamp, InferenceError> {
+            self.record("decode")?;
+            self.ledger.consume(accepted.prediction)?;
+            Ok(StepStamp {
+                evaluated_len: 2,
+                prediction: None,
+            })
+        }
+
+        fn select(
+            &mut self,
+            _request: &SelectionRequest<'_>,
+        ) -> Result<SelectOutcome, InferenceError> {
+            self.record("select")?;
+            if self.failure == Some("grammar") {
+                return Ok(SelectOutcome::GrammarExhausted);
+            }
+            let prediction = self.ledger.open();
+            self.prediction = Some(prediction);
+            Ok(SelectOutcome::Candidate(SelectionCandidate {
+                candidate_id: 1,
+                prediction,
+            }))
+        }
+
+        fn metadata(
+            &mut self,
+            prediction: PredictionId,
+            final_token: u32,
+            _request: &MetadataRequest,
+        ) -> Result<TokenMetadata, InferenceError> {
+            self.record("metadata")?;
+            Ok(TokenMetadata {
+                prediction,
+                final_token_id: final_token,
+                final_logprob: 0.0,
+                top: Vec::new(),
+            })
+        }
+
+        fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError> {
+            self.finishes.push(disposition);
+            self.ledger.invalidate();
+            self.record("finish")?;
+            if self.finish_error {
+                return Err(InferenceError::Inference("finish failed".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn drive(
+        session: &mut RecordingSession,
+        cancel: &dyn Cancellation,
+    ) -> Result<DriverResult, InferenceError> {
+        let config = GenerateConfig {
+            max_new_tokens: 2,
+            logprobs: Some(0),
+            ..Default::default()
+        };
+        run(
+            session,
+            &config,
+            None,
+            &[0],
+            99,
+            true,
+            cancel,
+            |_| {},
+            |_| "a".into(),
+            &mut String::new(),
+            &mut Vec::new(),
+            |_, _| true,
+            || {},
+            String::new,
+        )
+    }
+
+    #[test]
+    fn ordinary_completion_and_every_cancel_checkpoint_finish_once() {
+        for cancel_at in [None, Some(0), Some(1), Some(2)] {
+            let mut session = RecordingSession::new(None);
+            let polls = Cell::new(0);
+            let cancel = || {
+                let at = polls.get();
+                polls.set(at + 1);
+                cancel_at == Some(at)
+            };
+            let result = drive(&mut session, &cancel).expect("driver result");
+            assert_eq!(
+                result.stop_reason,
+                if cancel_at.is_some() {
+                    StopReason::Interrupt
+                } else {
+                    StopReason::Length
+                }
+            );
+            let expected = if matches!(cancel_at, Some(1 | 2)) {
+                FinishDisposition::Poisoned
+            } else {
+                FinishDisposition::Reusable
+            };
+            assert_eq!(
+                session.finishes,
+                [expected],
+                "cancel checkpoint {cancel_at:?}"
+            );
+            if let Some(prediction) = session.prediction {
+                assert!(!session.ledger.is_live(prediction));
+            }
+            if cancel_at == Some(0) {
+                assert_eq!(session.calls, ["finish"]);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_execution_errors_finish_poisoned_once() {
+        for failure in ["prefill", "select", "decode", "metadata", "grammar"] {
+            let mut session = RecordingSession::new(Some(failure));
+            let result = drive(&mut session, &|| false);
+            assert!(result.is_err(), "{failure}");
+            assert!(session.calls.contains(&if failure == "grammar" {
+                "select"
+            } else {
+                failure
+            }));
+            assert_eq!(session.finishes, [FinishDisposition::Poisoned], "{failure}");
+            if let Some(prediction) = session.prediction {
+                assert!(!session.ledger.is_live(prediction));
+            }
+        }
+    }
+
+    #[test]
+    fn finish_errors_preserve_the_primary_execution_error() {
+        let mut session = RecordingSession::new(Some("prefill"));
+        session.finish_error = true;
+        let result = drive(&mut session, &|| false);
+        assert!(matches!(result, Err(InferenceError::Inference(message)) if message == "prefill"));
+        assert_eq!(session.finishes, [FinishDisposition::Poisoned]);
+
+        let mut session = RecordingSession::new(None);
+        session.finish_error = true;
+        let result = drive(&mut session, &|| false);
+        assert!(
+            matches!(result, Err(InferenceError::Inference(message)) if message == "finish failed")
+        );
+        assert_eq!(session.finishes, [FinishDisposition::Reusable]);
     }
 }
