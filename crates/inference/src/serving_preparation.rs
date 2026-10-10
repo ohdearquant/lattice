@@ -4,6 +4,16 @@ use crate::generation::GenerateConfig;
 use crate::serve::ApiError;
 use crate::serve::contract::{ChatRequest, GenerationDefaults, ValidatedChatRequest};
 use crate::serve::prepare::PreparedChatRequest;
+use crate::tokenizer::bpe::BpeTokenizer;
+
+/// Prepared CPU request data and the selected provider's generation config.
+#[doc(hidden)]
+pub struct PreparedCpuChat {
+    /// The validated request consumed by the HTTP response path.
+    pub prepared: PreparedChatRequest,
+    /// The full config produced during provider preparation.
+    pub config: GenerateConfig,
+}
 
 /// Opaque, model-bound preparation for the serving binaries.
 #[doc(hidden)]
@@ -14,6 +24,32 @@ pub struct PreparationHandle {
 
 pub(crate) trait RequestPreparation: Send + Sync {
     fn tokenize_len(&self, prompt: &str) -> usize;
+
+    fn max_context(&self) -> usize;
+
+    fn tokenizer(&self) -> Option<&BpeTokenizer>;
+
+    fn prepare_cpu(
+        &self,
+        req: &ChatRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+    ) -> Result<PreparedCpuChat, ApiError> {
+        let mut prepared =
+            self.prepare_lattice(req, model_id, default_max_tokens, max_tokens_cap, false)?;
+        let stop_strings = std::mem::take(&mut prepared.stop_strings);
+        let config = self.lattice_generate_config(
+            prepared.max_tokens,
+            prepared.temperature,
+            prepared.top_p,
+            prepared.seed,
+            stop_strings,
+            prepared.reasoning_budget,
+            prepared.logprobs,
+        );
+        Ok(PreparedCpuChat { prepared, config })
+    }
 
     fn prepare_lattice(
         &self,
@@ -57,7 +93,6 @@ impl std::fmt::Debug for PreparationHandle {
 }
 
 impl PreparationHandle {
-    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
     pub(crate) fn new(inner: Arc<dyn RequestPreparation>) -> Self {
         Self { inner }
     }
@@ -65,6 +100,23 @@ impl PreparationHandle {
     /// Tokenize with the same tokenizer used by worker execution.
     pub fn tokenize_len(&self, prompt: &str) -> usize {
         self.inner.tokenize_len(prompt)
+    }
+
+    /// The loaded model tokenizer used for token display, when available.
+    pub fn tokenizer(&self) -> Option<&BpeTokenizer> {
+        self.inner.tokenizer()
+    }
+
+    /// Prepare a request for the selected CPU route and retain its full config.
+    pub fn prepare_cpu(
+        &self,
+        req: &ChatRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+    ) -> Result<PreparedCpuChat, ApiError> {
+        self.inner
+            .prepare_cpu(req, model_id, default_max_tokens, max_tokens_cap)
     }
 
     /// Run the CLI's render, tokenize and context check before stop parsing.

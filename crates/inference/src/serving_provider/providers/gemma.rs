@@ -15,6 +15,7 @@ use crate::serving_provider::{
 };
 use std::path::Path;
 
+pub(crate) mod cpu;
 mod preparation;
 
 #[cfg(test)]
@@ -47,6 +48,13 @@ impl ServingProvider for GemmaProvider {
                 }
             }
         }
+    }
+
+    fn load_lattice_cpu(
+        &self,
+        evidence: &CheckpointEvidence,
+    ) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
+        cpu::load(evidence)
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]

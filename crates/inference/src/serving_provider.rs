@@ -5,7 +5,7 @@ use crate::forward::metal_qwen35::MetalQwen35State;
 use crate::model_format::ModelFormat;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serve::metal_worker::WorkerMetadata;
-use crate::serve::route::{RouteRefusal, ServedRoute};
+use crate::serve::route::{RouteRefusal, ServedBackend, ServedRoute};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -147,6 +147,8 @@ pub type StandaloneQwenLoader = Box<
 pub struct SelectedProvider<'a> {
     #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
     provider: &'a dyn ServingProvider,
+    evidence: CheckpointEvidence,
+    entry: ServingEntry,
     legacy_route: Option<ServedRoute>,
 }
 
@@ -154,6 +156,20 @@ impl SelectedProvider<'_> {
     /// The route the entry has historically exposed, if the entry defers it.
     pub fn legacy_route(&self) -> Option<ServedRoute> {
         self.legacy_route
+    }
+
+    /// Load the selected provider's CPU route for `lattice serve`.
+    pub fn load_lattice_cpu(&self) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
+        if self.entry != ServingEntry::Lattice {
+            return Err("CPU loading requested for a non-lattice entry".to_owned());
+        }
+        if self
+            .legacy_route
+            .is_none_or(|route| route.backend != ServedBackend::Cpu)
+        {
+            return Err("CPU loading requested for a non-CPU route".to_owned());
+        }
+        self.provider.load_lattice_cpu(&self.evidence)
     }
 
     /// Validate standalone flag presence through the selected provider.
@@ -192,6 +208,13 @@ pub(crate) trait ServingProvider: Sync {
         evidence: &CheckpointEvidence,
         entry: ServingEntry,
     ) -> Result<Option<ServedRoute>, RouteRefusal>;
+
+    fn load_lattice_cpu(
+        &self,
+        _evidence: &CheckpointEvidence,
+    ) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
+        Err("selected provider does not load a lattice CPU route".to_owned())
+    }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn validate_standalone_options(
@@ -269,6 +292,8 @@ pub(crate) fn select_with_registry<'a>(
 
     Ok(SelectedProvider {
         provider,
+        evidence,
+        entry,
         legacy_route,
     })
 }

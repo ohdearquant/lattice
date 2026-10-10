@@ -142,6 +142,11 @@ pub mod serve;
 #[cfg(feature = "serve")]
 #[doc(hidden)]
 pub mod serving_cpu;
+/// Shared request-local execution host for CPU-backed `lattice serve` routes.
+/// Not a stable API.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_cpu_host;
 /// Builds the Metal serving worker's runtime and request preparation for a
 /// loaded model. Not a stable API.
 #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]

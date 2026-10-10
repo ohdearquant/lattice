@@ -291,29 +291,15 @@ async fn main() {
                 std::process::exit(1);
             };
             eprintln!("{}", route.selection_marker(format));
-            let model_backend: serve::ModelBackend = match (route.family, route.backend) {
-                (backend::ModelFamily::Qwen35, ServedBackend::Cpu) => {
-                    match lattice_inference::serving_provider::providers::qwen::load_cpu(model_path)
-                    {
-                        Ok(m) => cpu_serving_backend(m),
-                        Err(e) => {
-                            eprintln!("Error: failed to load model: {e}");
-                            std::process::exit(1);
-                        }
+            let model_backend: serve::ModelBackend = match route.backend {
+                ServedBackend::Cpu => match selected.load_lattice_cpu() {
+                    Ok(cpu) => serve::ModelBackend::Cpu(cpu),
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        std::process::exit(1);
                     }
-                }
-                (backend::ModelFamily::Gemma4, ServedBackend::Cpu) => {
-                    match lattice_inference::serving_provider::providers::gemma::load_cpu(
-                        model_path,
-                    ) {
-                        Ok(gemma) => serve::ModelBackend::GemmaCpu(Arc::new(gemma)),
-                        Err(e) => {
-                            eprintln!("Error: failed to load Gemma 4 model: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                (backend::ModelFamily::Qwen35, ServedBackend::Metal) => {
+                },
+                ServedBackend::Metal => {
                     #[cfg(feature = "metal-gpu")]
                     {
                         let tokenizer_dir_path =
@@ -347,16 +333,6 @@ async fn main() {
                         eprintln!("Error: {}", backend::metal_gpu_required_message(model_path));
                         std::process::exit(1);
                     }
-                }
-                // Any route this binary doesn't yet know how to serve is
-                // reported and refused, rather than silently guessing a
-                // backend.
-                _ => {
-                    eprintln!(
-                        "Error: {}",
-                        backend::unrecognized_format_message(model_path)
-                    );
-                    std::process::exit(1);
                 }
             };
             eprintln!("Model loaded. Serving as '{served_model_id}'.");
@@ -594,17 +570,8 @@ async fn main() {
     }
 }
 
-fn cpu_serving_backend(
-    mut model: lattice_inference::model::qwen35::Qwen35Model,
-) -> serve::ModelBackend {
-    model.ensure_tokenizer_max_seq_len(model.max_context());
-    serve::ModelBackend::Cpu(std::sync::Arc::new(model))
-}
-
 #[cfg(test)]
 mod cpu_serve_prompt_tests {
-    #[cfg(feature = "test-utils")]
-    use super::*;
     #[cfg(feature = "test-utils")]
     use lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context;
     #[cfg(feature = "test-utils")]
@@ -612,30 +579,59 @@ mod cpu_serve_prompt_tests {
 
     #[test]
     fn cpu_serve_load_keeps_tokenizer_initialization() {
-        // The server's non-returning main cannot be called by a unit test.
-        // Keep its load wired to the initialization exercised below.
         let startup = include_str!("main.rs")
-            .split("fn cpu_serving_backend(")
-            .next()
+            .split("Command::Serve {")
+            .nth(1)
             .unwrap();
-        assert!(startup.contains("Ok(m) => cpu_serving_backend(m),"));
+        assert!(startup.contains("selected.load_lattice_cpu()"));
+        let provider = include_str!("../../serving_provider/providers/qwen/cpu.rs");
+        let loader = provider
+            .split_once("pub(super) fn load(")
+            .map(|(_, loader)| loader)
+            .expect("the Qwen CPU provider exposes its selected loader");
+        let loader_body = loader
+            .split_once("\n}\n\npub(crate) fn from_model")
+            .map(|(body, _)| body)
+            .expect("the Qwen CPU loader body ends before from_model");
+        assert!(
+            loader_body.contains("Ok(from_model(model))"),
+            "the production loader must use the tokenizer-initializing constructor"
+        );
+        let initialization = provider
+            .find("model.ensure_tokenizer_max_seq_len(model.max_context());")
+            .expect("the Qwen CPU provider initializes tokenizer capacity");
+        let sharing = provider
+            .find("let model = Arc::new(model);")
+            .expect("the Qwen CPU provider shares the initialized model");
+        assert!(initialization < sharing);
     }
 
     #[cfg(feature = "test-utils")]
-    #[test]
-    fn serving_model_keeps_long_prompts_after_generation_tokenization() {
+    #[tokio::test]
+    async fn serving_model_keeps_long_prompts_after_generation_tokenization() {
         let model = tiny_zero_model_with_context(8192);
+        let context = model.max_context();
         assert_eq!(model.tokenizer().max_seq_len(), 4096);
-        let backend = cpu_serving_backend(model);
-        let serve::ModelBackend::Cpu(model) = backend else {
-            panic!("expected CPU serving backend");
-        };
-        let mut cfg = GenerateConfig::default();
-        cfg.max_new_tokens = 0;
-        for n in [4097, model.max_context()] {
+        let host =
+            lattice_inference::serving_cpu_host::SharedCpuHandle::from_qwen_model_for_test(model);
+        assert_eq!(host.preparation().tokenizer().unwrap().max_seq_len(), 8192);
+        for n in [4097, context] {
             let prompt = "a".repeat(n);
-            assert_eq!(model.tokenizer().tokenize(&prompt).real_length, n);
-            let output = model.generate(&prompt, &cfg).unwrap();
+            assert_eq!(
+                host.preparation()
+                    .tokenizer()
+                    .unwrap()
+                    .tokenize(&prompt)
+                    .real_length,
+                n
+            );
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 0;
+            let output = host
+                .spawn_completion(prompt, config)
+                .await
+                .expect("completion task joins")
+                .expect("completion succeeds");
             assert_eq!(output.prompt_tokens, n);
         }
     }

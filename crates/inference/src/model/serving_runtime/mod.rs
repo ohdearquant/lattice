@@ -1,13 +1,16 @@
 //! Worker-local execution for model serving.
 
 mod gemma_cpu;
+mod qwen_cpu;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod qwen_metal;
 
-use crate::serving_runtime_contract::WorkerMetadata;
+use crate::serving_runtime_contract::{RuntimeInput, WorkerMetadata};
 pub(crate) use crate::serving_runtime_contract::{WorkerFailure, cancelled_output};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use gemma_cpu::GemmaCpuRuntime;
+pub(crate) use gemma_cpu::GemmaPreparedCpuRuntime;
+pub(crate) use qwen_cpu::QwenCpuRuntime;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use qwen_metal::QwenMetalRuntime;
 
@@ -35,6 +38,23 @@ pub(crate) trait ServingRuntime {
         cfg: &GenerateConfig,
         lora: &[LoraSelection],
         stream: bool,
+        on_token: &mut dyn FnMut(&str, u32) -> bool,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, WorkerFailure> {
+        self.execute(
+            RuntimeInput::ChatMessages { messages, lora },
+            cfg,
+            stream,
+            on_token,
+            should_cancel,
+        )
+    }
+
+    fn execute(
+        &mut self,
+        input: RuntimeInput<'_>,
+        cfg: &GenerateConfig,
+        http_stream: bool,
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>;

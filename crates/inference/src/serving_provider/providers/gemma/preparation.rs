@@ -7,18 +7,15 @@ use crate::serve::contract::{
     RequestedChatOptions, ServeProfile, ValidatedChatRequest, normalize_requested_options,
     validate_context_window_with_budget,
 };
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use crate::serve::prepare::PreparedChatRequest;
 use crate::serve::prepare::PreparedGemmaChatRequest;
 use crate::serve::prompt_adapter::{GemmaPromptAdapter, PromptAdapter};
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use crate::serving_cpu::GemmaCpuServing;
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-use crate::serving_preparation::{PreparationHandle, RequestPreparation};
+use crate::serving_preparation::{PreparationHandle, PreparedCpuChat, RequestPreparation};
 use crate::tokenizer::Tokenizer;
+use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use std::path::Path;
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use std::sync::Arc;
 
 const GEMMA_TURN_OPEN: &str = "<|turn>";
@@ -234,15 +231,34 @@ fn unsupported(message: &str) -> ApiError {
     }
 }
 
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 struct GemmaPreparation {
     serving: Arc<GemmaCpuServing>,
 }
 
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 impl RequestPreparation for GemmaPreparation {
     fn tokenize_len(&self, prompt: &str) -> usize {
         self.serving.tokenize_len(prompt)
+    }
+
+    fn max_context(&self) -> usize {
+        self.serving.max_context()
+    }
+
+    fn tokenizer(&self) -> Option<&BpeTokenizer> {
+        None
+    }
+
+    fn prepare_cpu(
+        &self,
+        req: &ChatRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+    ) -> Result<PreparedCpuChat, ApiError> {
+        let (prepared, config) =
+            self.serving
+                .prepare(req, model_id, default_max_tokens, max_tokens_cap)?;
+        Ok(PreparedCpuChat { prepared, config })
     }
 
     fn prepare_lattice(
@@ -321,7 +337,6 @@ impl RequestPreparation for GemmaPreparation {
     }
 }
 
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 impl PreparationHandle {
     pub(crate) fn gemma(serving: Arc<GemmaCpuServing>) -> Self {
         Self::new(Arc::new(GemmaPreparation { serving }))

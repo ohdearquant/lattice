@@ -1,11 +1,11 @@
 //! Qwen Metal state and adapter residency confined to one serving worker.
 
 use super::ServingRuntime;
-use crate::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
+use crate::forward::metal_qwen35::MetalQwen35State;
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::kv_cache::CrossTurnSlotId;
 use crate::serve::lora::{
-    AdapterControlError, AdapterControlResult, AdapterIndex, LoraSelection, ResidencyLimits,
+    AdapterControlError, AdapterControlResult, AdapterIndex, ResidencyLimits,
 };
 use crate::serve::lora_registry::ResidencyRegistry;
 use crate::serve::metal_worker::{
@@ -14,6 +14,7 @@ use crate::serve::metal_worker::{
     render_text_prompt_within_window,
 };
 use crate::serve::route::{DriverEvidence, ServedRoute};
+use crate::serving_runtime_contract::RuntimeInput;
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
@@ -54,15 +55,19 @@ impl QwenMetalRuntime {
 }
 
 impl ServingRuntime for QwenMetalRuntime {
-    fn generate(
+    fn execute(
         &mut self,
-        messages: &[ChatMessage],
+        input: RuntimeInput<'_>,
         cfg: &GenerateConfig,
-        lora: &[LoraSelection],
-        stream: bool,
+        http_stream: bool,
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure> {
+        let RuntimeInput::ChatMessages { messages, lora } = input else {
+            return Err(WorkerFailure::Failed(
+                "prepared text is not supported by the Metal runtime".to_owned(),
+            ));
+        };
         let state = &mut self.state;
         let tokenizer = self.tokenizer.as_ref();
         let vision_runtime = &mut self.vision;
@@ -113,7 +118,7 @@ impl ServingRuntime for QwenMetalRuntime {
             let output = state
                 .generate_multimodal_vision_with_cancel(&request, tokenizer, cfg, should_cancel)
                 .map_err(WorkerFailure::from)?;
-            eprintln!("{}", vision_request_marker(stream));
+            eprintln!("{}", vision_request_marker(http_stream));
             if !output.text.is_empty() {
                 let _ = on_token(&output.text, 0);
             }
@@ -180,7 +185,7 @@ impl ServingRuntime for QwenMetalRuntime {
             cached.cache.prefetched_tokens,
             cached.cache.prompt_tokens,
         );
-        eprintln!("{}", text_request_marker(stream, trace));
+        eprintln!("{}", text_request_marker(http_stream, trace));
         Ok(cached.output)
     }
 
@@ -243,7 +248,7 @@ mod tests {
             .expect("the runtime has a vision branch before text generation");
         assert!(
             vision_branch.contains("generate_multimodal_vision_with_cancel")
-                && vision_branch.contains("vision_request_marker(stream)"),
+                && vision_branch.contains("vision_request_marker(http_stream)"),
             "the vision branch reports its own bypass marker"
         );
     }

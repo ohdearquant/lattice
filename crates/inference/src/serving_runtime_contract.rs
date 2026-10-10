@@ -1,5 +1,26 @@
+use crate::forward::metal_qwen35::ChatMessage;
 use crate::generation::GenerateOutput;
 use crate::serve::ApiError;
+use crate::serve::lora::LoraSelection;
+
+/// Which retained CPU generation operation a prepared prompt uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextGenerationEntry {
+    Complete,
+    StreamingWithCancel,
+}
+
+/// Input accepted by one serving runtime execution.
+pub(crate) enum RuntimeInput<'a> {
+    PreparedText {
+        prompt: &'a str,
+        entry: TextGenerationEntry,
+    },
+    ChatMessages {
+        messages: &'a [ChatMessage],
+        lora: &'a [LoraSelection],
+    },
+}
 
 /// Selects the context-window formula enforced before Metal generation.
 /// Each serve adapter supplies the policy matching its pre-worker contract.
