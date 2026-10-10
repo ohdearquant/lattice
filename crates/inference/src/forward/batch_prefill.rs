@@ -8,8 +8,8 @@
 //!
 //! LoRA adapters are applied per-token in all projection steps, matching the
 //! decode path. Each `matmul_bt` over the `[seq_len, dim]` batch is followed by
-//! per-row `lora.apply()` calls so the adapter delta is added to every token's
-//! projection output before downstream processing.
+//! `apply_lora_rows` so active adapter deltas reach every token's projection
+//! output before downstream processing, while inactive projections skip the row loop.
 
 use crate::attention::flash::{TiledAttentionBuffers, TiledAttentionConfig};
 use crate::attention::gdn::{
@@ -17,6 +17,7 @@ use crate::attention::gdn::{
 };
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
+use crate::lora_hook::apply_lora_rows;
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
     FullAttentionLayerWeights, KvCache, Qwen35Model, qwen35_rms_norm, resize,
@@ -286,16 +287,13 @@ impl Qwen35Model {
             }
         }
 
-        // Final RMSNorm on all prompt tokens.
+        let last_hidden = &mut scratch.hidden[(seq_len - 1) * hidden..token_hidden];
         qwen35_rms_norm(
-            &mut scratch.hidden[..token_hidden],
+            last_hidden,
             &self.weights.final_norm,
             hidden,
             cfg.rms_norm_eps,
         );
-
-        // Logits only for the final prompt token.
-        let last_hidden = &scratch.hidden[(seq_len - 1) * hidden..seq_len * hidden];
         matmul_bt(
             last_hidden,
             self.weights.logits_weight(),
@@ -381,14 +379,15 @@ impl Qwen35Model {
             hidden,
             q_proj_dim,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "q_proj",
-                &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.q_batch[t * q_proj_dim..(t + 1) * q_proj_dim],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "q_proj",
+            &scratch.hidden[..seq_len * hidden],
+            &mut scratch.q_batch[..seq_len * q_proj_dim],
+            hidden,
+            q_proj_dim,
+        );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.k_proj,
@@ -397,14 +396,15 @@ impl Qwen35Model {
             hidden,
             kv_dim,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "k_proj",
-                &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.k_batch[t * kv_dim..(t + 1) * kv_dim],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "k_proj",
+            &scratch.hidden[..seq_len * hidden],
+            &mut scratch.k_batch[..seq_len * kv_dim],
+            hidden,
+            kv_dim,
+        );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.v_proj,
@@ -413,14 +413,15 @@ impl Qwen35Model {
             hidden,
             kv_dim,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "v_proj",
-                &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.v_batch[t * kv_dim..(t + 1) * kv_dim],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "v_proj",
+            &scratch.hidden[..seq_len * hidden],
+            &mut scratch.v_batch[..seq_len * kv_dim],
+            hidden,
+            kv_dim,
+        );
 
         // Unpack interleaved [Q_h, gate_h] blocks into compact Q rows plus a
         // separate gate buffer, matching the decode path exactly.
@@ -512,14 +513,15 @@ impl Qwen35Model {
             q_dim,
             hidden,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "o_proj",
-                &scratch.context_batch[t * q_dim..(t + 1) * q_dim],
-                &mut scratch.attn_out[t * hidden..(t + 1) * hidden],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "o_proj",
+            &scratch.context_batch[..seq_len * q_dim],
+            &mut scratch.attn_out[..seq_len * hidden],
+            q_dim,
+            hidden,
+        );
     }
 
     /// Run one GatedDeltaNet layer with batched projections and a sequential
@@ -558,14 +560,15 @@ impl Qwen35Model {
             hidden,
             qkv_dim,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "in_proj_qkv",
-                &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.gdn_qkv_batch[t * qkv_dim..(t + 1) * qkv_dim],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "in_proj_qkv",
+            &scratch.hidden[..seq_len * hidden],
+            &mut scratch.gdn_qkv_batch[..seq_len * qkv_dim],
+            hidden,
+            qkv_dim,
+        );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_z,
@@ -574,14 +577,15 @@ impl Qwen35Model {
             hidden,
             output_dim,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "in_proj_z",
-                &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.gdn_z_batch[t * output_dim..(t + 1) * output_dim],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "in_proj_z",
+            &scratch.hidden[..seq_len * hidden],
+            &mut scratch.gdn_z_batch[..seq_len * output_dim],
+            hidden,
+            output_dim,
+        );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_b,
@@ -590,14 +594,15 @@ impl Qwen35Model {
             hidden,
             value_heads,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "in_proj_b",
-                &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.gdn_beta_batch[t * value_heads..(t + 1) * value_heads],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "in_proj_b",
+            &scratch.hidden[..seq_len * hidden],
+            &mut scratch.gdn_beta_batch[..seq_len * value_heads],
+            hidden,
+            value_heads,
+        );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_a,
@@ -606,14 +611,15 @@ impl Qwen35Model {
             hidden,
             value_heads,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "in_proj_a",
-                &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.gdn_alpha_batch[t * value_heads..(t + 1) * value_heads],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "in_proj_a",
+            &scratch.hidden[..seq_len * hidden],
+            &mut scratch.gdn_alpha_batch[..seq_len * value_heads],
+            hidden,
+            value_heads,
+        );
 
         // Sigmoid(beta) exactly as in the decode path.
         for beta in &mut scratch.gdn_beta_batch[..seq_len * value_heads] {
@@ -733,14 +739,15 @@ impl Qwen35Model {
             output_dim,
             hidden,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "out_proj",
-                &scratch.gdn_out_batch[t * output_dim..(t + 1) * output_dim],
-                &mut scratch.attn_out[t * hidden..(t + 1) * hidden],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "out_proj",
+            &scratch.gdn_out_batch[..seq_len * output_dim],
+            &mut scratch.attn_out[..seq_len * hidden],
+            output_dim,
+            hidden,
+        );
     }
 
     /// Batched SwiGLU MLP for all prompt positions in a layer.
@@ -784,14 +791,15 @@ impl Qwen35Model {
             hidden,
             inter,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "gate_proj",
-                &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.gate_batch[t * inter..(t + 1) * inter],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "gate_proj",
+            &scratch.hidden[..seq_len * hidden],
+            &mut scratch.gate_batch[..seq_len * inter],
+            hidden,
+            inter,
+        );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &dense.up_proj,
@@ -800,14 +808,15 @@ impl Qwen35Model {
             hidden,
             inter,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "up_proj",
-                &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.up_batch[t * inter..(t + 1) * inter],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "up_proj",
+            &scratch.hidden[..seq_len * hidden],
+            &mut scratch.up_batch[..seq_len * inter],
+            hidden,
+            inter,
+        );
 
         silu_inplace(&mut scratch.gate_batch[..seq_len * inter]);
         elementwise_mul(
@@ -823,14 +832,15 @@ impl Qwen35Model {
             inter,
             hidden,
         );
-        for t in 0..seq_len {
-            lora.apply(
-                layer_idx,
-                "down_proj",
-                &scratch.gate_batch[t * inter..(t + 1) * inter],
-                &mut scratch.ffn_batch[t * hidden..(t + 1) * hidden],
-            );
-        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "down_proj",
+            &scratch.gate_batch[..seq_len * inter],
+            &mut scratch.ffn_batch[..seq_len * hidden],
+            inter,
+            hidden,
+        );
     }
 }
 
@@ -1117,6 +1127,87 @@ mod tests {
         target_layer: usize,
         target_module: &'static str,
         delta: f32,
+    }
+
+    struct InactiveLoraHook;
+
+    impl LoraHook for InactiveLoraHook {
+        fn apply(&self, _layer_idx: usize, _module: &str, _x: &[f32], _output: &mut [f32]) {
+            panic!("inactive projection must not call apply")
+        }
+
+        fn is_active(&self, _layer_idx: usize, _module: &str) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn inactive_lora_projections_skip_every_row() {
+        let cfg = tiny_test_config();
+        let mut model = build_random_model(cfg, 0xdead_beef_cafe_4321);
+        let prompt_ids = [1, 7, 3, 9, 4];
+        let (expected, _, _) = run_batched_prefill(&model, &prompt_ids);
+        model.lora = Box::new(InactiveLoraHook);
+        let (actual, _, _) = run_batched_prefill(&model, &prompt_ids);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn final_norm_only_changes_the_last_prompt_row() {
+        let cfg = tiny_test_config();
+        let mut model = build_random_model(cfg.clone(), 0xdead_beef_cafe_5678);
+        for (attention, common) in &mut model.weights.layers {
+            match attention {
+                AttentionWeights::Linear(weights) => weights.out_proj.fill(0.0),
+                AttentionWeights::Full(weights) => weights.o_proj.fill(0.0),
+            }
+            let FeedForwardWeights::Dense(weights) = &mut common.ffn else {
+                panic!("fixture uses dense FFNs")
+            };
+            weights.down_proj.fill(0.0);
+        }
+        let prompt_ids = [1, 7, 3, 9, 4];
+        let hidden = cfg.hidden_size;
+        let expected: Vec<f32> = prompt_ids
+            .iter()
+            .flat_map(|&id| {
+                let start = id as usize * hidden;
+                model.weights.embed_tokens[start..start + hidden]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let last_start = (prompt_ids.len() - 1) * hidden;
+        let mut normalized = expected.clone();
+        qwen35_rms_norm(
+            &mut normalized,
+            &model.weights.final_norm,
+            hidden,
+            cfg.rms_norm_eps,
+        );
+        assert_ne!(&normalized[..last_start], &expected[..last_start]);
+        let mut gdn_states: Vec<_> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::new(&cfg))
+            .collect();
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        kv_cache.reserve(prompt_ids.len(), cfg.full_kv_dim());
+        let mut scratch = PrefillScratch::new(&cfg);
+        model
+            .prefill_prompt(
+                &prompt_ids,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+                model.lora.as_ref(),
+            )
+            .expect("prefill");
+        assert_eq!(&scratch.hidden[..last_start], &expected[..last_start]);
+        assert_allclose(
+            "final normalized row",
+            &scratch.hidden[last_start..prompt_ids.len() * hidden],
+            &normalized[last_start..],
+            1e-7,
+        );
     }
 
     impl crate::lora_hook::LoraHook for FixedDeltaLoraHook {
