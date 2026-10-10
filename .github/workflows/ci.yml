@@ -1075,7 +1075,7 @@ jobs:
           fi
           summary=$(grep -E '^test result: ' "$log" | tail -n 1)
           printf '%s\n' "$summary"
-          printf '%s\n' "$summary" | grep -Eq '^test result: ok\. 28 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$'
+          printf '%s\n' "$summary" | grep -Eq '^test result: ok\. 29 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$'
       # #1583 / PR #1652: the Metal GDN Q/K L2 normalisation had no epsilon while the
       # CPU reference computes 1/sqrt(sum_sq + 1e-6). These two tests are the regression
       # guard, and neither runs under any other step here: `--lib forward::metal::` does
