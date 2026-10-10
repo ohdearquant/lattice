@@ -6,8 +6,10 @@
 //! sequence (prompt ids written out from the fixture vocabulary, generated ids
 //! fixed by a grammar or taken from a no-cache reference run), never against
 //! the turn's own output, and its lengths are checked against the live KV
-//! cursor. The checks do not read KV or GDN contents.
+//! cursor. Its GDN snapshot and represented KV rows must also match a fresh
+//! prefill on the same patterned model, whose reference state must be nonzero.
 
+use super::prefix_cache_route::{assert_saved_state_follows_a_prefill, patterned_model};
 use super::*;
 use crate::kv_cache::{CrossTurnSlotId, PrefixReuseMode};
 
@@ -64,7 +66,13 @@ fn reference_generated_ids(
 
 /// A saved entry must hold exactly `expected` as its token ids, its GDN
 /// snapshot must sit at that length, and the live KV cursor must be there too.
-fn assert_saved_boundary(state: &MetalQwen35State, slot_id: CrossTurnSlotId, expected: &[u32]) {
+fn assert_saved_boundary(
+    state: &MetalQwen35State,
+    weights: &ModelWeights,
+    cfg: &Qwen35Config,
+    slot_id: CrossTurnSlotId,
+    expected: &[u32],
+) {
     let entry = state
         .cross_turn_prefix_cache
         .get(slot_id)
@@ -89,6 +97,7 @@ fn assert_saved_boundary(state: &MetalQwen35State, slot_id: CrossTurnSlotId, exp
         expected.len(),
         "live KV must sit exactly at a saved entry's represented length"
     );
+    assert_saved_state_follows_a_prefill("saved boundary", state, slot_id, weights, cfg);
 }
 
 fn assert_slot_empty(state: &MetalQwen35State, slot_id: CrossTurnSlotId, why: &str) {
@@ -121,7 +130,7 @@ fn warm_the_slot_with_a_first_turn(
         5,
         "precondition: two prompt ids, three generated"
     );
-    assert_saved_boundary(state, slot_id, &expected);
+    assert_saved_boundary(state, weights, cfg, slot_id, &expected);
     expected
 }
 
@@ -217,9 +226,14 @@ fn lone_byte_cfg(
 /// fresh state, and returns the state with the request's output.
 fn run_lone_byte_request(
     gen_cfg: &GenerateConfig,
-) -> (MetalQwen35State, crate::generation::GenerateOutput) {
+) -> (
+    Qwen35Config,
+    ModelWeights,
+    MetalQwen35State,
+    crate::generation::GenerateOutput,
+) {
     let (tokenizer, _) = lone_byte_vocabulary();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let turn = state
@@ -231,7 +245,58 @@ fn run_lone_byte_request(
             |_, _| true,
         )
         .expect("a lone-byte request must not error");
-    (state, turn.output)
+    (cfg, weights, state, turn.output)
+}
+
+#[test]
+fn prefix_cache_saved_state_check_rejects_a_zero_weight_fixture() {
+    let _gpu_guard = gpu_test_lock();
+    if !metal_device_present() {
+        return;
+    }
+    let tokenizer = single_char_vocab_tokenizer();
+    let (mut cfg, weights) = tiny_hybrid_fixture();
+    cfg.eos_token_id = u32::MAX;
+    let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("zero-weight fixture");
+    let slot_id = CrossTurnSlotId::DEFAULT;
+    state
+        .generate_streaming_with_prefix_cache(
+            slot_id,
+            "ab",
+            &tokenizer,
+            &cross_turn_test_gen_cfg(7, 3),
+            |_, _| true,
+        )
+        .expect("a zero-weight request must save a boundary");
+    assert_eq!(
+        state
+            .cross_turn_prefix_cache
+            .get(slot_id)
+            .expect("the zero-weight request saved a slot")
+            .generic
+            .represented_len,
+        5
+    );
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_saved_state_follows_a_prefill(
+            "zero-weight fixture",
+            &state,
+            slot_id,
+            &weights,
+            &cfg,
+        );
+    }))
+    .expect_err("a fixture with zero recurrent state must fail the saved-state check");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("the reference recurrent state must be nonzero"),
+        "unexpected saved-state failure: {message}"
+    );
 }
 
 #[test]
@@ -241,7 +306,7 @@ fn fresh_request_that_hits_the_cap_saves_the_prompt_and_every_generated_token() 
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -262,7 +327,7 @@ fn fresh_request_that_hits_the_cap_saves_the_prompt_and_every_generated_token() 
         &weights, &cfg, &tokenizer, "ab", &gen_cfg,
     ));
     assert_eq!(expected.len(), 5);
-    assert_saved_boundary(&state, slot_id, &expected);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &expected);
 }
 
 #[test]
@@ -272,7 +337,7 @@ fn exact_append_request_that_hits_the_cap_saves_the_extended_boundary() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -296,7 +361,7 @@ fn exact_append_request_that_hits_the_cap_saves_the_extended_boundary() {
         &weights, &cfg, &tokenizer, &prompt2, &gen_cfg2,
     ));
     assert_eq!(expected.len(), first_boundary.len() + 1 + 2);
-    assert_saved_boundary(&state, slot_id, &expected);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &expected);
 }
 
 #[test]
@@ -306,7 +371,7 @@ fn request_over_a_mismatching_entry_replaces_it_with_a_fresh_boundary() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -327,7 +392,7 @@ fn request_over_a_mismatching_entry_replaces_it_with_a_fresh_boundary() {
         &weights, &cfg, &tokenizer, "xyz", &gen_cfg2,
     ));
     assert_eq!(expected.len(), 5);
-    assert_saved_boundary(&state, slot_id, &expected);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &expected);
 }
 
 #[test]
@@ -337,7 +402,7 @@ fn cancel_before_prefill_over_an_exact_append_plan_leaves_the_slot_empty() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -377,7 +442,7 @@ fn cancel_before_prefill_over_a_mismatching_entry_leaves_the_slot_empty() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -412,7 +477,7 @@ fn cancel_after_prefill_leaves_the_slot_empty() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -462,7 +527,7 @@ fn caller_rejecting_the_first_token_leaves_the_slot_empty() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -494,7 +559,7 @@ fn cancel_at_the_top_of_the_first_decode_iteration_saves_the_prompt_only_boundar
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -527,7 +592,7 @@ fn cancel_at_the_top_of_the_first_decode_iteration_saves_the_prompt_only_boundar
     assert!(!turn.output.stopped);
     assert_eq!(turn.output.token_ids.len(), 1);
 
-    assert_saved_boundary(&state, slot_id, &ids_of("ab"));
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &ids_of("ab"));
 }
 
 #[test]
@@ -537,7 +602,7 @@ fn cancel_at_the_top_of_a_later_decode_iteration_saves_the_forwarded_boundary() 
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -569,7 +634,7 @@ fn cancel_at_the_top_of_a_later_decode_iteration_saves_the_forwarded_boundary() 
     let generated = reference_generated_ids(&weights, &cfg, &tokenizer, "ab", &gen_cfg);
     let mut expected = ids_of("ab");
     expected.push(generated[0]);
-    assert_saved_boundary(&state, slot_id, &expected);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &expected);
 }
 
 #[test]
@@ -579,7 +644,7 @@ fn caller_rejecting_a_decode_token_saves_the_boundary_before_it() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -604,7 +669,7 @@ fn caller_rejecting_a_decode_token_saves_the_boundary_before_it() {
     let generated = reference_generated_ids(&weights, &cfg, &tokenizer, "ab", &gen_cfg);
     let mut expected = ids_of("ab");
     expected.extend_from_slice(&generated[..2]);
-    assert_saved_boundary(&state, slot_id, &expected);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &expected);
 }
 
 #[test]
@@ -614,7 +679,7 @@ fn stop_token_on_the_first_sample_saves_the_prompt_only_boundary() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (cfg, weights) = tiny_hybrid_fixture();
+    let (cfg, weights) = patterned_model();
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
     // The grammar forces the first sample to be id 0, which is also a stop token.
@@ -628,7 +693,7 @@ fn stop_token_on_the_first_sample_saves_the_prompt_only_boundary() {
     assert_eq!(turn.output.stop_reason, Some(StopReason::Eos));
     assert!(turn.output.token_ids.is_empty());
 
-    assert_saved_boundary(&state, slot_id, &ids_of("a"));
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &ids_of("a"));
 }
 
 #[test]
@@ -638,7 +703,7 @@ fn stop_token_inside_the_decode_loop_saves_every_generated_token() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (cfg, weights) = tiny_hybrid_fixture();
+    let (cfg, weights) = patterned_model();
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
     // The grammar forces "a", "b", "c" in order and id 2 ("c") is a stop token, so the
@@ -655,7 +720,7 @@ fn stop_token_inside_the_decode_loop_saves_every_generated_token() {
     assert_eq!(turn.output.text, "ab");
 
     // Every generated token was forwarded before the stop token was sampled.
-    assert_saved_boundary(&state, slot_id, &[0, 0, 1]);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &[0, 0, 1]);
 }
 
 #[test]
@@ -665,7 +730,7 @@ fn grammar_completed_by_the_first_sample_saves_the_prompt_only_boundary() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (cfg, weights) = tiny_hybrid_fixture();
+    let (cfg, weights) = patterned_model();
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
     let gen_cfg = single_char_grammar_cfg("root ::= \"a\"\n", 4);
@@ -678,7 +743,7 @@ fn grammar_completed_by_the_first_sample_saves_the_prompt_only_boundary() {
     assert_eq!(turn.output.token_ids, vec![0]);
 
     // The completing token was never forwarded, so it stays out of the boundary.
-    assert_saved_boundary(&state, slot_id, &[0]);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &[0]);
 }
 
 #[test]
@@ -688,7 +753,7 @@ fn grammar_completed_inside_the_decode_loop_saves_the_boundary_one_token_short()
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (cfg, weights) = tiny_hybrid_fixture();
+    let (cfg, weights) = patterned_model();
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
     let gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"a\"\n", 4);
@@ -702,7 +767,7 @@ fn grammar_completed_inside_the_decode_loop_saves_the_boundary_one_token_short()
     assert_eq!(turn.output.text, "aa");
 
     // The completing token was never forwarded, so the boundary stops one token short.
-    assert_saved_boundary(&state, slot_id, &[0, 0]);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &[0, 0]);
 }
 
 #[test]
@@ -712,7 +777,7 @@ fn grammar_rejecting_a_budget_forced_close_saves_the_boundary_without_forwarding
         return;
     }
     let (tokenizer, gen_cfg) = thinking_fixture("root ::= \"a\" \"a\"\n", 1, 4);
-    let (cfg, weights) = tiny_hybrid_fixture();
+    let (cfg, weights) = patterned_model();
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
 
@@ -730,7 +795,7 @@ fn grammar_rejecting_a_budget_forced_close_saves_the_boundary_without_forwarding
     );
     assert_eq!(turn.output.token_ids, vec![0]);
 
-    assert_saved_boundary(&state, slot_id, &[0, 0]);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &[0, 0]);
 }
 
 #[test]
@@ -749,7 +814,7 @@ fn answer_budget_exhausted_before_the_cap_saves_every_generated_token() {
         3,
         2,
     );
-    let (cfg, weights) = tiny_hybrid_fixture();
+    let (cfg, weights) = patterned_model();
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
 
@@ -766,7 +831,7 @@ fn answer_budget_exhausted_before_the_cap_saves_every_generated_token() {
 
     // The iteration that pushed the third token forwarded the second, and the
     // silent final step forwards the third: prompt "a" (0) plus all three.
-    assert_saved_boundary(&state, slot_id, &[0, 30, 0, 0]);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &[0, 30, 0, 0]);
 }
 
 #[test]
@@ -776,7 +841,7 @@ fn stop_string_on_the_first_sample_leaves_the_slot_empty() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (cfg, weights) = tiny_hybrid_fixture();
+    let (cfg, weights) = patterned_model();
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
     // The grammar forces the first sample to "a", which the stop string matches.
@@ -803,7 +868,7 @@ fn stop_string_inside_the_decode_loop_leaves_the_slot_empty() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (cfg, weights) = tiny_hybrid_fixture();
+    let (cfg, weights) = patterned_model();
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
     // The grammar forces "a", "b", "c" in order and the stop string matches the
@@ -831,7 +896,7 @@ fn zero_token_budget_leaves_the_warm_slot_untouched() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -852,7 +917,7 @@ fn zero_token_budget_leaves_the_warm_slot_untouched() {
     assert_eq!(turn2.cache.mode, PrefixReuseMode::FullRefill);
     assert_eq!(turn2.cache.reused_tokens, 0);
     // A zero-budget request returns before touching any state, warm entry included.
-    assert_saved_boundary(&state, slot_id, &warm_boundary);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &warm_boundary);
 }
 
 #[test]
@@ -862,7 +927,7 @@ fn stop_string_spanning_two_tokens_leaves_the_slot_empty() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (cfg, weights) = tiny_hybrid_fixture();
+    let (cfg, weights) = patterned_model();
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
     // The grammar forces "a", "b", "c" in order and the stop string "bc" is only
@@ -891,7 +956,7 @@ fn stop_string_held_back_and_never_matched_saves_every_generated_token() {
         return;
     }
     let tokenizer = single_char_vocab_tokenizer();
-    let (mut cfg, weights) = tiny_hybrid_fixture();
+    let (mut cfg, weights) = patterned_model();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
@@ -911,7 +976,7 @@ fn stop_string_held_back_and_never_matched_saves_every_generated_token() {
 
     // The silent final step forwards the last token, so the boundary is the
     // prompt and all three generated ids.
-    assert_saved_boundary(&state, slot_id, &[0, 0, 1, 2]);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &[0, 0, 1, 2]);
 }
 
 #[test]
@@ -922,7 +987,7 @@ fn lone_byte_request_that_hits_the_cap_saves_every_generated_token() {
     }
     let gen_cfg = lone_byte_cfg("root ::= \"a\" \"b\" \"b\" \"b\"\n", 2, &[], &[], None);
 
-    let (state, output) = run_lone_byte_request(&gen_cfg);
+    let (cfg, weights, state, output) = run_lone_byte_request(&gen_cfg);
     assert!(!output.stopped);
     assert_eq!(output.stop_reason, Some(StopReason::Length));
     assert_eq!(output.token_ids, vec![0, 1]);
@@ -930,7 +995,7 @@ fn lone_byte_request_that_hits_the_cap_saves_every_generated_token() {
 
     let mut expected = ids_of("ac");
     expected.extend([0, 1]);
-    assert_saved_boundary(&state, CrossTurnSlotId::DEFAULT, &expected);
+    assert_saved_boundary(&state, &weights, &cfg, CrossTurnSlotId::DEFAULT, &expected);
 }
 
 #[test]
@@ -947,7 +1012,7 @@ fn lone_byte_flush_completing_a_stop_string_after_the_cap_leaves_the_slot_empty(
         None,
     );
 
-    let (state, output) = run_lone_byte_request(&gen_cfg);
+    let (_, _, state, output) = run_lone_byte_request(&gen_cfg);
     assert!(output.stopped);
     assert_eq!(output.stop_reason, Some(StopReason::Eos));
     assert_eq!(output.token_ids, vec![0, 1]);
@@ -970,7 +1035,7 @@ fn lone_byte_stop_token_saves_the_tokens_it_forwarded() {
     }
     let gen_cfg = lone_byte_cfg("root ::= \"a\" \"b\" \"c\"\n", 5, &[2], &[], None);
 
-    let (state, output) = run_lone_byte_request(&gen_cfg);
+    let (cfg, weights, state, output) = run_lone_byte_request(&gen_cfg);
     assert!(output.stopped);
     assert_eq!(output.stop_reason, Some(StopReason::Eos));
     assert_eq!(output.token_ids, vec![0, 1]);
@@ -978,7 +1043,7 @@ fn lone_byte_stop_token_saves_the_tokens_it_forwarded() {
 
     let mut expected = ids_of("ac");
     expected.extend([0, 1]);
-    assert_saved_boundary(&state, CrossTurnSlotId::DEFAULT, &expected);
+    assert_saved_boundary(&state, &weights, &cfg, CrossTurnSlotId::DEFAULT, &expected);
 }
 
 #[test]
@@ -992,7 +1057,7 @@ fn lone_byte_stop_token_then_flush_completed_stop_string_leaves_the_slot_empty()
     // the byte the detokenizer was holding.
     let gen_cfg = lone_byte_cfg("root ::= \"a\" \"b\" \"c\"\n", 5, &[2], &["\u{fffd}"], None);
 
-    let (state, output) = run_lone_byte_request(&gen_cfg);
+    let (_, _, state, output) = run_lone_byte_request(&gen_cfg);
     assert!(output.stopped);
     assert_eq!(output.stop_reason, Some(StopReason::Eos));
     assert_eq!(output.token_ids, vec![0, 1]);
@@ -1016,14 +1081,20 @@ fn lone_byte_grammar_completed_by_the_first_sample_saves_the_prompt_only_boundar
     }
     let gen_cfg = lone_byte_cfg("root ::= \"b\"\n", 4, &[], &[], None);
 
-    let (state, output) = run_lone_byte_request(&gen_cfg);
+    let (cfg, weights, state, output) = run_lone_byte_request(&gen_cfg);
     assert!(output.stopped);
     assert_eq!(output.stop_reason, Some(StopReason::Grammar));
     assert_eq!(output.token_ids, vec![1]);
     assert_eq!(output.text, "\u{fffd}");
 
     // The completing token was never forwarded, so it stays out of the boundary.
-    assert_saved_boundary(&state, CrossTurnSlotId::DEFAULT, &ids_of("ac"));
+    assert_saved_boundary(
+        &state,
+        &weights,
+        &cfg,
+        CrossTurnSlotId::DEFAULT,
+        &ids_of("ac"),
+    );
 }
 
 #[test]
@@ -1037,7 +1108,7 @@ fn budget_rejection_after_a_held_byte_saves_the_forwarded_boundary() {
     // token with `</think>`, which the grammar rejects before it is pushed.
     let gen_cfg = lone_byte_cfg("root ::= \"b\" \"b\"\n", 4, &[], &[], Some(1));
 
-    let (state, output) = run_lone_byte_request(&gen_cfg);
+    let (cfg, weights, state, output) = run_lone_byte_request(&gen_cfg);
     assert!(!output.stopped);
     assert_eq!(output.stop_reason, Some(StopReason::Grammar));
     assert_eq!(output.token_ids, vec![1]);
@@ -1045,7 +1116,7 @@ fn budget_rejection_after_a_held_byte_saves_the_forwarded_boundary() {
 
     let mut expected = ids_of("ac");
     expected.push(1);
-    assert_saved_boundary(&state, CrossTurnSlotId::DEFAULT, &expected);
+    assert_saved_boundary(&state, &weights, &cfg, CrossTurnSlotId::DEFAULT, &expected);
 }
 
 #[test]
@@ -1056,7 +1127,7 @@ fn budget_rejection_after_a_held_byte_then_flush_completed_stop_string_leaves_th
     }
     let gen_cfg = lone_byte_cfg("root ::= \"b\" \"b\"\n", 4, &[], &["\u{fffd}"], Some(1));
 
-    let (state, output) = run_lone_byte_request(&gen_cfg);
+    let (_, _, state, output) = run_lone_byte_request(&gen_cfg);
     assert!(output.stopped);
     assert_eq!(output.stop_reason, Some(StopReason::Eos));
     assert_eq!(output.token_ids, vec![1]);
