@@ -1584,22 +1584,32 @@ class InventoryContract(unittest.TestCase):
                 )
 
     def test_every_measurement_entry_has_a_live_guard(self):
-        """Mutation-sensitive: deleting any entry-point guard fails this scan."""
+        """Every inventoried measurement or supervisor enters the shared backend."""
 
         for path, entry in manifest_entries().items():
-            if entry["role"] != "measurement":
+            if entry["role"] not in {"measurement", "supervisor"}:
                 continue
             source_path = REPO / path
             source = source_path.read_text()
             with self.subTest(path=path):
                 if entry["supervision"].startswith("gpu-handoff-child"):
                     self.assert_gpu_handoff_child(path, source, entry["supervision"])
-                elif path == "scripts/bench-compare.sh":
+                elif entry["role"] == "supervisor" or path == "scripts/bench-compare.sh":
                     commands = _shell_commands(source)
+                    backend_variables = {
+                        tokens[0].split("=", 1)[0]
+                        for _, tokens in commands
+                        if "=" in tokens[0]
+                        and tokens[0].split("=", 1)[1].endswith("/scripts/lib/bench_supervision.py")
+                    }
                     self.assertTrue(
                         any(
                             tokens[0] == "exec"
-                            and any("bench_supervision.py" in token for token in tokens)
+                            and any(
+                                "bench_supervision.py" in token
+                                or token in {f"${name}" for name in backend_variables}
+                                for token in tokens
+                            )
                             for _, tokens in commands
                         )
                     )
@@ -1631,6 +1641,23 @@ class InventoryContract(unittest.TestCase):
                             for _, tokens in commands
                         )
                     )
+
+    def test_new_supervisor_cannot_skip_the_shared_backend(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            relative = "scripts/bench_new_supervisor.sh"
+            path = root / relative
+            path.parent.mkdir(parents=True)
+            path.write_text("#!/bin/bash\nexec python3 measurement.py\n")
+            entries = {relative: {"role": "supervisor", "supervision": "both-locks"}}
+            with mock.patch(__name__ + ".REPO", root), mock.patch(
+                __name__ + ".manifest_entries", return_value=entries
+            ):
+                result = unittest.TestResult()
+                InventoryContract("test_every_measurement_entry_has_a_live_guard").run(result)
+            self.assertEqual(result.errors, [])
+            self.assertEqual(len(result.failures), 1)
+            self.assertIn(relative, result.failures[0][0].id())
 
     def test_make_delegates_whole_durable_recipes(self):
         """The lock must cover the recipe, not one command inside Make quoting."""
@@ -1775,6 +1802,7 @@ class _SupervisorSandbox:
             "bench-locks.py",
             "quiet-probe.py",
             "bench-python.sh",
+            "ensure-noindex-marker.sh",
         ):
             shutil.copy2(REPO / "scripts" / "lib" / name, lib / name)
         shutil.copy2(
@@ -1894,6 +1922,10 @@ def _run_wasm_fixture(*, prerequisites: bool) -> subprocess.CompletedProcess[str
         bindir = Path(sb.tmp.name) / "bin"
         bindir.mkdir()
         (bindir / "python3").symlink_to(sys.executable)
+        for name in ("mkdir", "rm"):
+            executable = shutil.which(name)
+            assert executable is not None
+            (bindir / name).symlink_to(executable)
         if prerequisites:
             for name, body in {
                 "cargo": (
@@ -1974,6 +2006,55 @@ def _run_wasm_fixture(*, prerequisites: bool) -> subprocess.CompletedProcess[str
 
 
 class RuntimeContract(unittest.TestCase):
+    def test_bench_command_protects_build_trees_before_each_command(self):
+        for durable in (False, True):
+            with self.subTest(durable=durable), _SupervisorSandbox() as sb:
+                wrapper = sb.root / "scripts/bench-command.sh"
+                shutil.copy2(REPO / "scripts/bench-command.sh", wrapper)
+                (sb.helper.parent / "quiet-probe.py").write_text("print('fixture quiet')\n")
+                markers = [sb.root / tree / ".metadata_never_index" for tree in ("target", ".cache")]
+                observed = Path(sb.tmp.name) / "observed"
+                code = (
+                    "from pathlib import Path; "
+                    f"markers = {list(map(str, markers))!r}; "
+                    "assert all(Path(p).is_file() and not Path(p).is_symlink() for p in markers); "
+                    f"Path({str(observed)!r}).touch()"
+                )
+                argv = ["bash", str(wrapper), "--label", "fixture"]
+                if durable:
+                    argv.append("--durable")
+                argv += ["--", sys.executable, "-c", code]
+                env = dict(os.environ)
+                for name in ("LATTICE_BENCH_LOCK_STATUS", "LATTICE_BENCH_LOCK_FDS", "LATTICE_BENCH_SUPERVISOR_FD"):
+                    env.pop(name, None)
+                for _ in range(2):
+                    result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertTrue(observed.is_file())
+                    observed.unlink()
+                    for marker in markers:
+                        shutil.rmtree(marker.parent)
+
+    def test_bench_command_refuses_unprotected_build_trees(self):
+        for tree in ("target", ".cache"):
+            with self.subTest(tree=tree), _SupervisorSandbox() as sb:
+                wrapper = sb.root / "scripts/bench-command.sh"
+                shutil.copy2(REPO / "scripts/bench-command.sh", wrapper)
+                blocker = sb.root / tree / ".metadata_never_index" / "occupied"
+                blocker.mkdir(parents=True)
+                observed = Path(sb.tmp.name) / "observed"
+                env = dict(os.environ)
+                for name in ("LATTICE_BENCH_LOCK_STATUS", "LATTICE_BENCH_LOCK_FDS", "LATTICE_BENCH_SUPERVISOR_FD"):
+                    env.pop(name, None)
+                result = subprocess.run(
+                    ["bash", str(wrapper), "--label", "fixture", "--", sys.executable,
+                     "-c", f"from pathlib import Path; Path({str(observed)!r}).touch()"],
+                    env=env, capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("[noindex] FATAL", result.stderr)
+                self.assertFalse(observed.exists())
+
     def test_first_failed_bench_ci_target_refuses_before_later_targets(self):
         result, calls = _run_bench_ci_fixture(fail_first=True)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

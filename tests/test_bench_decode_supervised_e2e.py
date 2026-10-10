@@ -134,6 +134,7 @@ class DecodeSupervisorFixture:
             "scripts/bench_decode_adapters_q4_apples.py",
             "scripts/lib/bench-python.sh",
             "scripts/lib/bench_supervision.py",
+            "scripts/lib/ensure-noindex-marker.sh",
             "scripts/lib/bench_admission.py",
             "scripts/lib/bench_handoff.py",
             "scripts/lib/bench-locks.py",
