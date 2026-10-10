@@ -422,10 +422,16 @@ const KV_FLOOR: f32 = 0.5;
 /// equal those of a fresh state of the same model prefilled with the slot's token
 /// ids, within a relative tolerance. The reference state must be nonzero, so a
 /// model whose state is zero fails the check instead of passing it.
-fn assert_saved_state_follows_a_prefill(label: &str, state: &MetalQwen35State, fixture: &Fixture) {
+pub(super) fn assert_saved_state_follows_a_prefill(
+    label: &str,
+    state: &MetalQwen35State,
+    slot_id: CrossTurnSlotId,
+    weights: &ModelWeights,
+    cfg: &Qwen35Config,
+) {
     use crate::speculative::MtpTargetVerifier as _;
 
-    let Some(entry) = state.cross_turn_prefix_cache.get(SLOT) else {
+    let Some(entry) = state.cross_turn_prefix_cache.get(slot_id) else {
         return;
     };
     let ids = entry.generic.token_ids.clone();
@@ -434,7 +440,8 @@ fn assert_saved_state_follows_a_prefill(label: &str, state: &MetalQwen35State, f
         ids.len(),
         "{label}: a saved slot's recurrent snapshot must sit at its represented length"
     );
-    let mut reference = fresh_state(fixture);
+    let mut reference =
+        MetalQwen35State::new(weights, cfg, state.max_context()).expect("reference fixture");
     reference.use_gdn_chunked = state.use_gdn_chunked;
     assert_eq!(reference.use_kv_f16, state.use_kv_f16);
     reference
@@ -516,7 +523,13 @@ impl<'t> Conversation<'t> {
         let prompt_ids = (self.prompt_ids)(self.tokenizer, prompt);
         assert_slot_follows_the_request(label, &observed, &prompt_ids);
         if let Some(fixture) = self.fixture {
-            assert_saved_state_follows_a_prefill(label, &self.state, fixture);
+            assert_saved_state_follows_a_prefill(
+                label,
+                &self.state,
+                SLOT,
+                &fixture.weights,
+                &fixture.cfg,
+            );
         }
         observed
     }
