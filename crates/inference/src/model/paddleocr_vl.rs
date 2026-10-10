@@ -407,19 +407,11 @@ impl PaddleOcrVlModel {
             return Ok(Vec::new());
         }
         let hidden = self.decoder_cfg.hidden_size;
-        let (prefill, mut last_logits) = self.greedy_prefill(tokenizer, rgb, h, w, text)?;
+        let (prefill, last_logits) = self.greedy_prefill(tokenizer, rgb, h, w, text)?;
 
         let mut embeds = prefill.spliced_embeds;
         let mut positions = prefill.positions;
-        let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
-
-        for _ in 0..max_new_tokens {
-            let next = argmax_u32(&last_logits);
-            generated.push(next);
-            if next == EOS_ID {
-                break;
-            }
-            // Extend the sequence by one text token and re-forward.
+        greedy_tokens(last_logits, max_new_tokens, |next| {
             let embed_len = embeds.len();
             embeds.resize(embed_len + hidden, 0.0);
             embeds[embed_len..]
@@ -429,11 +421,8 @@ impl PaddleOcrVlModel {
                 .fold(0u32, |m, r| m.max(r[0]).max(r[1]).max(r[2]))
                 + 1;
             positions.push([p, p, p]);
-            last_logits = self
-                .decoder
-                .forward_embeds_last_logits(&embeds, &positions)?;
-        }
-        Ok(generated)
+            self.decoder.forward_embeds_last_logits(&embeds, &positions)
+        })
     }
 
     /// Greedy decode over `max_new_tokens` steps with a KV cache: the
@@ -476,10 +465,9 @@ impl PaddleOcrVlModel {
             self.decoder_cfg.kv_dim()?,
             capacity,
         )?;
-        let mut last_logits =
+        let last_logits =
             self.decoder
                 .kv_prefill(&assembly.spliced_embeds, &assembly.positions, &mut cache)?;
-        let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
 
         // The new text tokens' positions continue the text-after rule:
         // (max position so far) + 1 on all three rows. The max over the
@@ -490,18 +478,12 @@ impl PaddleOcrVlModel {
             .positions
             .iter()
             .fold(0u32, |m, r| m.max(r[0]).max(r[1]).max(r[2]));
-        for _ in 0..max_new_tokens {
-            let next = argmax_u32(&last_logits);
-            generated.push(next);
-            if next == EOS_ID {
-                break;
-            }
+        greedy_tokens(last_logits, max_new_tokens, |next| {
             max_pos += 1;
             let position = [max_pos, max_pos, max_pos];
             let embed = &self.decoder.embed_tokens()[next as usize * hidden..][..hidden];
-            last_logits = self.decoder.kv_decode_step(embed, position, &mut cache)?;
-        }
-        Ok(generated)
+            self.decoder.kv_decode_step(embed, position, &mut cache)
+        })
     }
 
     pub fn config(&self) -> &Ernie45Config {
@@ -511,6 +493,23 @@ impl PaddleOcrVlModel {
     pub fn processor_config(&self) -> &PaddleOcrImageProcessorConfig {
         &self.processor_cfg
     }
+}
+
+fn greedy_tokens(
+    mut last_logits: Vec<f32>,
+    max_new_tokens: usize,
+    mut decode: impl FnMut(u32) -> Result<Vec<f32>, InferenceError>,
+) -> Result<Vec<u32>, InferenceError> {
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    for _ in 0..max_new_tokens {
+        let next = argmax_u32(&last_logits);
+        generated.push(next);
+        if next == EOS_ID || generated.len() == max_new_tokens {
+            break;
+        }
+        last_logits = decode(next)?;
+    }
+    Ok(generated)
 }
 
 /// Plain argmax; ties break to the lowest id (the reference's
@@ -547,6 +546,50 @@ mod tests {
     }
 
     const MERGE: usize = 2;
+
+    #[test]
+    fn greedy_budget_only_decodes_between_emitted_tokens() {
+        for budget in [2usize, 0, 1, 5] {
+            let mut decode_calls = 0;
+            let generated = greedy_tokens(vec![0.0, 1.0, 0.0], budget, |token| {
+                assert_eq!(token, 1);
+                decode_calls += 1;
+                Ok(vec![0.0, 1.0, 0.0])
+            })
+            .expect("budget-limited decode");
+            assert_eq!(generated, vec![1; budget]);
+            assert_eq!(decode_calls, budget.saturating_sub(1), "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn greedy_eos_is_emitted_without_forwarding_it() {
+        let generated = greedy_tokens(vec![0.0, 0.0, 1.0], 5, |_| {
+            panic!("EOS must not be decoded")
+        })
+        .expect("EOS from prefill");
+        assert_eq!(generated, [EOS_ID]);
+
+        let mut decode_calls = 0;
+        let generated = greedy_tokens(vec![0.0, 1.0, 0.0], 5, |token| {
+            assert_eq!(token, 1);
+            decode_calls += 1;
+            Ok(vec![0.0, 0.0, 1.0])
+        })
+        .expect("EOS from decode");
+        assert_eq!(generated, [1, EOS_ID]);
+        assert_eq!(decode_calls, 1);
+    }
+
+    #[test]
+    fn greedy_propagates_errors_from_required_decode_steps() {
+        let result = greedy_tokens(vec![0.0, 1.0, 0.0], 2, |_| {
+            Err(InferenceError::Inference("decode failed".into()))
+        });
+        assert!(
+            matches!(result, Err(InferenceError::Inference(message)) if message == "decode failed")
+        );
+    }
 
     /// A minimal model standing in for `load` (no checkpoint needed): only
     /// the tokenizer and merge kernel are exercised by these tests.
