@@ -135,8 +135,8 @@ pub(crate) fn run_chat(
     max_tokens: usize,
     temperature: f32,
     tokenizer_dir: Option<&str>,
+    prompt: Option<&str>,
 ) {
-    use std::io::{BufRead, Write};
     use std::path::Path;
 
     let path = Path::new(model_path);
@@ -187,20 +187,51 @@ pub(crate) fn run_chat(
             std::process::exit(1);
         }
     };
-    eprintln!("Model loaded. Type 'exit' or 'quit' to stop.\n");
-
     let mut gen_cfg = lattice_inference::GenerateConfig::default();
     gen_cfg.max_new_tokens = max_tokens;
     gen_cfg.temperature = temperature;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
+    let mut stderr = std::io::stderr();
+    if let Err(error) = run_chat_io(prompt, stdin.lock(), &mut stdout, &mut stderr, |text| {
+        model.generate_chat_line(text, &gen_cfg)
+    }) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
 
-    for line in stdin.lock().lines() {
+fn run_chat_io(
+    prompt: Option<&str>,
+    input: impl std::io::BufRead,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+    mut generate: impl FnMut(
+        &str,
+    ) -> Result<
+        lattice_inference::GenerateOutput,
+        lattice_inference::InferenceError,
+    >,
+) -> Result<(), String> {
+    if let Some(prompt) = prompt {
+        let output = generate(prompt).map_err(|e| format!("Generation error: {e}"))?;
+        writeln!(stdout, "{}", output.text).map_err(|e| format!("Error writing output: {e}"))?;
+        stdout
+            .flush()
+            .map_err(|e| format!("Error flushing output: {e}"))?;
+        return Ok(());
+    }
+
+    writeln!(stderr, "Model loaded. Type 'exit' or 'quit' to stop.\n")
+        .map_err(|e| format!("Error writing diagnostics: {e}"))?;
+
+    for line in input.lines() {
         let prompt = match line {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Error reading input: {e}");
+                writeln!(stderr, "Error reading input: {e}")
+                    .map_err(|e| format!("Error writing diagnostics: {e}"))?;
                 break;
             }
         };
@@ -212,7 +243,7 @@ pub(crate) fn run_chat(
             break;
         }
 
-        match model.generate_chat_line(trimmed, &gen_cfg) {
+        match generate(trimmed) {
             Ok(output) => {
                 let _ = writeln!(stdout, "{}", output.text);
                 let _ = writeln!(
@@ -222,10 +253,12 @@ pub(crate) fn run_chat(
                 );
             }
             Err(e) => {
-                eprintln!("Generation error: {e}");
+                writeln!(stderr, "Generation error: {e}")
+                    .map_err(|e| format!("Error writing diagnostics: {e}"))?;
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "test-utils"))]
@@ -248,7 +281,9 @@ mod tests {
             .next()
             .unwrap();
         assert!(source.contains("Ok(m) => Backend::cpu(m),"));
-        assert!(source.contains("model.generate_chat_line(trimmed, &gen_cfg)"));
+        assert!(source.contains("if let Err(error) = run_chat_io("));
+        assert!(source.contains("model.generate_chat_line(text, &gen_cfg)"));
+        assert!(source.contains("eprintln!(\"{error}\");\n        std::process::exit(1);"));
     }
 
     #[test]
@@ -326,5 +361,244 @@ mod tests {
         assert!(source.contains("generate_checked(tokenizer, state.max_context(), prompt, ||"));
         assert!(source.contains("state.generate(prompt, tokenizer, gen_cfg)"));
         assert_eq!(MetalChatBackend::MAX_CACHE_LEN, 4096);
+    }
+}
+
+#[cfg(test)]
+mod io_tests {
+    use super::run_chat_io;
+    use lattice_inference::{GenerateOutput, InferenceError};
+    use std::io::{self, BufRead, Cursor, Read, Write};
+
+    struct NoInput;
+
+    impl Read for NoInput {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            panic!("one-shot chat must not read stdin");
+        }
+    }
+
+    impl BufRead for NoInput {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            panic!("one-shot chat must not buffer stdin");
+        }
+
+        fn consume(&mut self, _amount: usize) {
+            panic!("one-shot chat must not consume stdin");
+        }
+    }
+
+    fn output(text: &str) -> GenerateOutput {
+        GenerateOutput {
+            text: text.into(),
+            token_ids: vec![],
+            prompt_tokens: 4,
+            generated_tokens: 2,
+            stopped: false,
+            stop_reason: None,
+            token_logprobs: vec![],
+        }
+    }
+
+    #[test]
+    fn oneshot_uses_literal_prompt_once_without_reading_stdin() {
+        for prompt in ["  literal\nline  ", "exit", "QUIT", "", " \t\n "] {
+            let mut calls = 0;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            run_chat_io(Some(prompt), NoInput, &mut stdout, &mut stderr, |text| {
+                calls += 1;
+                assert_eq!(text, prompt);
+                Ok(output("  generated\ntext  "))
+            })
+            .unwrap();
+            assert_eq!(calls, 1, "prompt {prompt:?}");
+            assert_eq!(stdout, b"  generated\ntext  \n");
+            assert!(
+                stderr.is_empty(),
+                "one-shot chat must not print a REPL banner"
+            );
+        }
+    }
+
+    #[test]
+    fn oneshot_generation_failure_returns_error_without_output() {
+        let mut calls = 0;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let error = run_chat_io(Some("prompt"), NoInput, &mut stdout, &mut stderr, |_| {
+            calls += 1;
+            Err(InferenceError::InvalidInput("generation refused".into()))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(error.starts_with("Generation error:"), "{error}");
+        assert!(error.contains("generation refused"), "{error}");
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    struct FailingOutput {
+        fail_write: bool,
+        written: Vec<u8>,
+    }
+
+    impl Write for FailingOutput {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "write failed"));
+            }
+            self.written.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
+        }
+    }
+
+    #[test]
+    fn oneshot_output_failures_are_reported() {
+        for fail_write in [true, false] {
+            let mut stdout = FailingOutput {
+                fail_write,
+                written: Vec::new(),
+            };
+            let mut stderr = Vec::new();
+            let mut calls = 0;
+            let error = run_chat_io(Some("prompt"), NoInput, &mut stdout, &mut stderr, |_| {
+                calls += 1;
+                Ok(output("generated"))
+            })
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert_eq!(
+                error,
+                if fail_write {
+                    "Error writing output: write failed"
+                } else {
+                    "Error flushing output: flush failed"
+                }
+            );
+            assert_eq!(
+                stdout.written,
+                if fail_write {
+                    &b""[..]
+                } else {
+                    &b"generated\n"[..]
+                }
+            );
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn interactive_keeps_trimming_stats_and_error_recovery() {
+        for stop in ["ExIt", "qUiT"] {
+            let input = format!("\n \t\n  first  \n fail \n\tsecond\t\n {stop} \nnever\n");
+            let mut prompts = Vec::new();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            run_chat_io(None, Cursor::new(input), &mut stdout, &mut stderr, |text| {
+                prompts.push(text.to_string());
+                if text == "fail" {
+                    Err(InferenceError::InvalidInput("retry next line".into()))
+                } else {
+                    Ok(output(text))
+                }
+            })
+            .unwrap();
+            assert_eq!(prompts, ["first", "fail", "second"]);
+            assert_eq!(
+                stdout,
+                b"first\n[4 prompt tokens, 2 generated]\nsecond\n[4 prompt tokens, 2 generated]\n"
+            );
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert!(stderr.starts_with("Model loaded. Type 'exit' or 'quit' to stop.\n\n"));
+            assert_eq!(stderr.matches("Generation error:").count(), 1);
+            assert!(stderr.contains("retry next line"));
+        }
+    }
+
+    struct FailingInput;
+
+    impl Read for FailingInput {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("input failed"))
+        }
+    }
+
+    impl BufRead for FailingInput {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::other("input failed"))
+        }
+
+        fn consume(&mut self, _amount: usize) {
+            panic!("failed input has no bytes to consume");
+        }
+    }
+
+    #[test]
+    fn interactive_reports_input_error_and_stops() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run_chat_io(None, FailingInput, &mut stdout, &mut stderr, |_| {
+            panic!("failed input must not reach generation");
+        })
+        .unwrap();
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .ends_with("Error reading input: input failed\n")
+        );
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn oneshot_uses_checked_cpu_backend() {
+        use super::Backend;
+        use lattice_inference::GenerateConfig;
+        use lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context;
+
+        let mut backend = Backend::cpu(tiny_zero_model_with_context(32));
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut calls = 0;
+        let error = run_chat_io(
+            Some(&"a".repeat(33)),
+            NoInput,
+            &mut stdout,
+            &mut stderr,
+            |text| {
+                calls += 1;
+                backend.generate_chat_line(text, &config)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(error.contains("prompt (33 tokens) exceeds model context window (32)"));
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+
+        run_chat_io(
+            Some(&"a".repeat(32)),
+            NoInput,
+            &mut stdout,
+            &mut stderr,
+            |text| {
+                calls += 1;
+                let output = backend.generate_chat_line(text, &config)?;
+                assert_eq!(output.prompt_tokens, 32);
+                assert_eq!(output.generated_tokens, 0);
+                Ok(output)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(stdout, b"\n");
+        assert!(stderr.is_empty());
     }
 }

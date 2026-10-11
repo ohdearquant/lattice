@@ -3,7 +3,7 @@
 //! # Usage
 //!
 //! ```text
-//! lattice chat --model /path/to/model [--max-tokens 256] [--temperature 0.7]
+//! lattice chat --model /path/to/model [--prompt "Hello"] [--max-tokens 256] [--temperature 0.7]
 //! lattice serve --model /path/to/model [--host 127.0.0.1] [--port 8080] [--max-tokens 256]
 //! lattice doctor --model /path/to/model [--context 4096]
 //! lattice prune-score --q4-dir /path/to/model-q4 --tokenizer-dir /path/to/model \
@@ -27,12 +27,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Interactive chat with a model
+    /// Chat interactively or generate one response to --prompt
     Chat {
         /// Path to model directory (SafeTensors, or a native Q4 quantized
         /// directory produced by `quantize_q4`)
         #[arg(long)]
         model: String,
+        /// Generate one response to this literal prompt and exit without reading stdin
+        #[arg(short = 'p', long)]
+        prompt: Option<String>,
         /// Maximum tokens to generate per response
         #[arg(long, default_value = "256")]
         max_tokens: usize,
@@ -227,11 +230,18 @@ async fn main() {
     match cli.command {
         Command::Chat {
             model,
+            prompt,
             max_tokens,
             temperature,
             tokenizer_dir,
         } => {
-            chat::run_chat(&model, max_tokens, temperature, tokenizer_dir.as_deref());
+            chat::run_chat(
+                &model,
+                max_tokens,
+                temperature,
+                tokenizer_dir.as_deref(),
+                prompt.as_deref(),
+            );
         }
         Command::Serve {
             model,
@@ -567,6 +577,103 @@ async fn main() {
                 std::process::exit(1);
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod chat_prompt_cli_tests {
+    use super::*;
+
+    fn parse_chat(args: &[&str]) -> Result<Command, clap::Error> {
+        let mut full = vec!["lattice", "chat", "--model", "/models/example"];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(full).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn omitted_prompt_keeps_interactive_defaults() {
+        let Command::Chat {
+            model,
+            prompt,
+            max_tokens,
+            temperature,
+            tokenizer_dir,
+        } = parse_chat(&[]).unwrap()
+        else {
+            panic!("expected chat command");
+        };
+        assert_eq!(model, "/models/example");
+        assert!(prompt.is_none());
+        assert_eq!(max_tokens, 256);
+        assert_eq!(temperature, 0.7);
+        assert!(tokenizer_dir.is_none());
+    }
+
+    #[test]
+    fn short_and_long_prompt_flags_preserve_literal_text() {
+        for flag in ["-p", "--prompt"] {
+            for value in ["  hello\nworld  ", "exit", "quit", ""] {
+                let Command::Chat { prompt, .. } = parse_chat(&[flag, value]).unwrap() else {
+                    panic!("expected chat command");
+                };
+                assert_eq!(prompt.as_deref(), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_preserves_generation_options() {
+        let Command::Chat {
+            prompt,
+            max_tokens,
+            temperature,
+            tokenizer_dir,
+            ..
+        } = parse_chat(&[
+            "--prompt",
+            "hello",
+            "--max-tokens",
+            "17",
+            "--temperature",
+            "0",
+            "--tokenizer-dir",
+            "/models/tokenizer",
+        ])
+        .unwrap()
+        else {
+            panic!("expected chat command");
+        };
+        assert_eq!(prompt.as_deref(), Some("hello"));
+        assert_eq!(max_tokens, 17);
+        assert_eq!(temperature, 0.0);
+        assert_eq!(tokenizer_dir.as_deref(), Some("/models/tokenizer"));
+    }
+
+    #[test]
+    fn prompt_flag_requires_a_value() {
+        for flag in ["-p", "--prompt"] {
+            assert!(
+                parse_chat(&[flag]).is_err(),
+                "{flag} accepted without a prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn parsed_prompt_reaches_the_chat_runner() {
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let chat = source
+            .split_once("Command::Chat {")
+            .unwrap()
+            .1
+            .split_once("Command::Serve {")
+            .unwrap()
+            .0;
+        assert!(chat.contains("chat::run_chat("));
+        assert!(chat.contains("prompt.as_deref(),"));
     }
 }
 

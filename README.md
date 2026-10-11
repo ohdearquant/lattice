@@ -249,9 +249,17 @@ cargo build --release -p lattice-inference --bin lattice --features f16
 # Interactive chat
 ./target/release/lattice chat --model ~/.lattice/models/qwen3.5-0.8b
 
+# Generate one response and exit
+./target/release/lattice chat --model ~/.lattice/models/qwen3.5-0.8b -p "Hello"
+
 # OpenAI-compatible HTTP server
 ./target/release/lattice serve --model ~/.lattice/models/qwen3.5-0.8b --port 8080
 ```
+
+`chat -p` (or `--prompt`) uses the supplied text literally, including whitespace
+and newlines, and never reads stdin. It writes the response to stdout; loading
+messages and errors go to stderr. Generation or output errors return a nonzero
+exit status. Omit the flag for the interactive loop.
 
 With Metal GPU (macOS only):
 
