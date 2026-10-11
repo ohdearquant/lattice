@@ -530,6 +530,8 @@ jobs:
       # divergence — locally-green, CI-green, and still rotting — cannot recur.
       - name: inference — default-feature clippy, isolated (no workspace unification)
         run: cargo clippy -p lattice-inference --all-targets -- -D warnings
+      - name: inference — bench-internals clippy without f16
+        run: cargo clippy -p lattice-inference --all-targets --features bench-internals -- -D warnings
       # The R03 golden gate (`crates/inference/tests/cpu_pre_migration_greedy_golden.rs`)
       # and the row D allocation arm (`crates/inference/tests/decoder_allocation_arm.rs`)
       # are both declared `test = false`, which keeps them out of
