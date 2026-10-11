@@ -16,10 +16,25 @@ use crate::serve::contract::{
 pub(crate) use crate::serving_provider::providers::gemma::template_trim;
 pub(crate) use crate::serving_provider::providers::qwen::QwenChatDefaults;
 
+pub(crate) fn apply_qwen_thinking_mode(prompt: &mut String, enable_thinking: bool) {
+    if !enable_thinking {
+        prompt.push_str("<think>\n\n</think>\n\n");
+    }
+}
+
 /// One model family's chat conventions.
 pub(crate) trait PromptAdapter {
     /// The prompt text for `messages`, ending with the open generation turn.
     fn render(&self, messages: &[NormalizedChatMessage]) -> String;
+
+    /// Render with the effective thinking mode for this request.
+    fn render_with_thinking(
+        &self,
+        messages: &[NormalizedChatMessage],
+        _enable_thinking: bool,
+    ) -> String {
+        self.render(messages)
+    }
 
     /// Token ids that end the model's turn.
     fn stop_token_ids(&self) -> &[u32];

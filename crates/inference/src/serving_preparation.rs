@@ -36,8 +36,13 @@ pub(crate) trait RequestPreparation: Send + Sync {
         default_max_tokens: usize,
         max_tokens_cap: usize,
     ) -> Result<PreparedCpuChat, ApiError> {
-        let mut prepared =
-            self.prepare_lattice(req, model_id, default_max_tokens, max_tokens_cap, false)?;
+        let (mut prepared, enable_thinking) = self.prepare_lattice_with_thinking(
+            req,
+            model_id,
+            default_max_tokens,
+            max_tokens_cap,
+            false,
+        )?;
         let stop_strings = std::mem::take(&mut prepared.stop_strings);
         let config = self.lattice_generate_config(
             prepared.max_tokens,
@@ -47,18 +52,48 @@ pub(crate) trait RequestPreparation: Send + Sync {
             stop_strings,
             prepared.reasoning_budget,
             prepared.logprobs,
+            enable_thinking,
         );
         Ok(PreparedCpuChat { prepared, config })
     }
 
-    fn prepare_lattice(
+    fn prepare_lattice_with_thinking(
         &self,
         req: &ChatRequest,
         model_id: &str,
         default_max_tokens: usize,
         max_tokens_cap: usize,
         vision_supported: bool,
-    ) -> Result<PreparedChatRequest, ApiError>;
+    ) -> Result<(PreparedChatRequest, bool), ApiError>;
+
+    fn prepare_lattice_with_config(
+        &self,
+        req: &ChatRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+        vision_supported: bool,
+    ) -> Result<PreparedCpuChat, ApiError> {
+        let (mut prepared, enable_thinking) = self.prepare_lattice_with_thinking(
+            req,
+            model_id,
+            default_max_tokens,
+            max_tokens_cap,
+            vision_supported,
+        )?;
+        let stop_strings = std::mem::take(&mut prepared.stop_strings);
+        let config = self.lattice_generate_config(
+            prepared.max_tokens,
+            prepared.temperature,
+            prepared.top_p,
+            prepared.seed,
+            stop_strings,
+            prepared.reasoning_budget,
+            prepared.logprobs,
+            enable_thinking,
+        );
+        Ok(PreparedCpuChat { prepared, config })
+    }
 
     fn normalize_standalone(
         &self,
@@ -70,6 +105,18 @@ pub(crate) trait RequestPreparation: Send + Sync {
 
     fn standalone_generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig;
 
+    fn prepare_standalone(
+        &self,
+        req: &ChatRequest,
+        defaults: GenerationDefaults,
+        model_id: &str,
+        vision_supported: bool,
+    ) -> Result<(ValidatedChatRequest, GenerateConfig), ApiError> {
+        let validated = self.normalize_standalone(req, defaults, model_id, vision_supported)?;
+        let config = self.standalone_generate_config(&validated);
+        Ok((validated, config))
+    }
+
     fn lattice_generate_config(
         &self,
         max_tokens: usize,
@@ -79,6 +126,7 @@ pub(crate) trait RequestPreparation: Send + Sync {
         stop_strings: Vec<String>,
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
+        enable_thinking: bool,
     ) -> GenerateConfig;
 
     fn refuse_standalone_unsupported(&self, req: &ChatRequest) -> Result<(), ApiError>;
@@ -128,7 +176,28 @@ impl PreparationHandle {
         max_tokens_cap: usize,
         vision_supported: bool,
     ) -> Result<PreparedChatRequest, ApiError> {
-        self.inner.prepare_lattice(
+        self.inner
+            .prepare_lattice_with_thinking(
+                req,
+                model_id,
+                default_max_tokens,
+                max_tokens_cap,
+                vision_supported,
+            )
+            .map(|(prepared, _)| prepared)
+    }
+
+    /// Retain the provider's effective template mode in its generation config.
+    #[doc(hidden)]
+    pub fn prepare_lattice_with_config(
+        &self,
+        req: &ChatRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+        vision_supported: bool,
+    ) -> Result<PreparedCpuChat, ApiError> {
+        self.inner.prepare_lattice_with_config(
             req,
             model_id,
             default_max_tokens,
@@ -154,6 +223,19 @@ impl PreparationHandle {
         self.inner.standalone_generate_config(req)
     }
 
+    /// Keep wire template options and the selected model's config in one preparation step.
+    #[doc(hidden)]
+    pub fn prepare_standalone(
+        &self,
+        req: &ChatRequest,
+        defaults: GenerationDefaults,
+        model_id: &str,
+        vision_supported: bool,
+    ) -> Result<(ValidatedChatRequest, GenerateConfig), ApiError> {
+        self.inner
+            .prepare_standalone(req, defaults, model_id, vision_supported)
+    }
+
     /// Map prepared CLI sampling options through the model's prompt adapter.
     #[allow(clippy::too_many_arguments)]
     pub fn lattice_generate_config(
@@ -166,6 +248,32 @@ impl PreparationHandle {
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
     ) -> GenerateConfig {
+        self.lattice_generate_config_with_thinking(
+            max_tokens,
+            temperature,
+            top_p,
+            seed,
+            stop_strings,
+            reasoning_budget,
+            logprobs,
+            true,
+        )
+    }
+
+    /// Map prepared CLI options using the request's effective thinking mode.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn lattice_generate_config_with_thinking(
+        &self,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        seed: Option<u64>,
+        stop_strings: Vec<String>,
+        reasoning_budget: Option<usize>,
+        logprobs: Option<usize>,
+        enable_thinking: bool,
+    ) -> GenerateConfig {
         self.inner.lattice_generate_config(
             max_tokens,
             temperature,
@@ -174,6 +282,7 @@ impl PreparationHandle {
             stop_strings,
             reasoning_budget,
             logprobs,
+            enable_thinking,
         )
     }
 

@@ -20,7 +20,10 @@ use std::path::Path;
 pub(crate) mod cpu;
 mod preparation;
 
-pub(crate) use preparation::{QwenChatDefaults, build_cfg, lattice_gen_cfg, prepare_chat_request};
+pub(crate) use preparation::{
+    QwenChatDefaults, build_cfg, lattice_gen_cfg, prepare_chat_request,
+    prepare_standalone_chat_request,
+};
 
 pub(in crate::serving_provider) struct QwenProvider;
 

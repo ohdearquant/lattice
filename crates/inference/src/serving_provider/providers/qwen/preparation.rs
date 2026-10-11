@@ -6,13 +6,13 @@ use crate::serve::contract::normalize_request;
 use crate::serve::contract::{
     ChatRequest, GenerationDefaults, MaxTokensPolicy, NormalizedChatMessage, RequestedChatOptions,
     ServeProfile, ValidatedChatRequest, apply_max_tokens_policy,
-    normalize_request_with_context_and_budget, validate_context_window_with_budget,
+    normalize_request_with_context_and_thinking, validate_context_window_with_budget,
     validate_temperature, validate_top_p,
 };
 use crate::serve::format_normalized_chat_template;
 use crate::serve::into_engine_chat_messages;
 use crate::serve::prepare::PreparedChatRequest;
-use crate::serve::prompt_adapter::PromptAdapter;
+use crate::serve::prompt_adapter::{PromptAdapter, apply_qwen_thinking_mode};
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use crate::serving_preparation::{PreparationHandle, RequestPreparation};
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
@@ -38,6 +38,7 @@ impl QwenPromptAdapter {
         stop_strings: Vec<String>,
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
+        enable_thinking: bool,
     ) -> GenerateConfig {
         let mut cfg = self.generate_config_base();
         cfg.max_new_tokens = max_tokens;
@@ -45,7 +46,8 @@ impl QwenPromptAdapter {
         cfg.top_p = top_p;
         cfg.seed = seed;
         cfg.stop_strings = stop_strings;
-        cfg.reasoning_budget = reasoning_budget;
+        cfg.enable_thinking = enable_thinking;
+        cfg.reasoning_budget = reasoning_budget.filter(|_| enable_thinking);
         cfg.logprobs = logprobs;
         cfg
     }
@@ -62,6 +64,16 @@ impl QwenPromptAdapter {
 impl PromptAdapter for QwenPromptAdapter {
     fn render(&self, messages: &[NormalizedChatMessage]) -> String {
         format_normalized_chat_template(messages)
+    }
+
+    fn render_with_thinking(
+        &self,
+        messages: &[NormalizedChatMessage],
+        enable_thinking: bool,
+    ) -> String {
+        let mut prompt = self.render(messages);
+        apply_qwen_thinking_mode(&mut prompt, enable_thinking);
+        prompt
     }
 
     fn stop_token_ids(&self) -> &[u32] {
@@ -120,14 +132,19 @@ impl QwenChatDefaults {
         validate_top_p(requested.unwrap_or(self.generation.top_p))
     }
 
+    pub(crate) fn enable_thinking(&self, requested: Option<bool>) -> bool {
+        requested.unwrap_or(true)
+    }
+
     pub(crate) fn reasoning_budget(
         &self,
         requested: Option<usize>,
         supported: bool,
         policy: MaxTokensPolicy,
         max_tokens: usize,
+        enable_thinking: bool,
     ) -> Option<usize> {
-        let mut reasoning_budget = if supported {
+        let mut reasoning_budget = if supported && enable_thinking {
             requested
                 .filter(|&value| value > 0)
                 .or(self.generation.reasoning_budget)
@@ -148,11 +165,13 @@ impl QwenChatDefaults {
         options: RequestedChatOptions,
     ) -> Result<ValidatedChatRequest, ApiError> {
         let max_tokens = self.max_tokens(options.max_tokens, options.max_tokens_policy)?;
+        let enable_thinking = self.enable_thinking(options.enable_thinking);
         let reasoning_budget = self.reasoning_budget(
             options.reasoning_budget,
             options.reasoning_budget_supported,
             options.max_tokens_policy,
             max_tokens,
+            enable_thinking,
         );
         let logprobs = if options.logprobs.unwrap_or(false) {
             Some(options.top_logprobs.unwrap_or(0))
@@ -197,14 +216,14 @@ impl RequestPreparation for QwenPreparation {
         Some(&self.tokenizer)
     }
 
-    fn prepare_lattice(
+    fn prepare_lattice_with_thinking(
         &self,
         req: &ChatRequest,
         model_id: &str,
         default_max_tokens: usize,
         max_tokens_cap: usize,
         vision_supported: bool,
-    ) -> Result<PreparedChatRequest, ApiError> {
+    ) -> Result<(PreparedChatRequest, bool), ApiError> {
         prepare_chat_request(
             req,
             model_id,
@@ -235,6 +254,21 @@ impl RequestPreparation for QwenPreparation {
         build_cfg(req)
     }
 
+    fn prepare_standalone(
+        &self,
+        req: &ChatRequest,
+        defaults: GenerationDefaults,
+        model_id: &str,
+        vision_supported: bool,
+    ) -> Result<(ValidatedChatRequest, GenerateConfig), ApiError> {
+        prepare_standalone_chat_request(
+            req,
+            defaults,
+            ServeProfile::lattice_serve(model_id, self.model_max_context)
+                .with_vision_support(vision_supported),
+        )
+    }
+
     fn lattice_generate_config(
         &self,
         max_tokens: usize,
@@ -244,6 +278,7 @@ impl RequestPreparation for QwenPreparation {
         stop_strings: Vec<String>,
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
+        enable_thinking: bool,
     ) -> GenerateConfig {
         lattice_gen_cfg(
             max_tokens,
@@ -253,6 +288,7 @@ impl RequestPreparation for QwenPreparation {
             stop_strings,
             reasoning_budget,
             logprobs,
+            enable_thinking,
         )
     }
 
@@ -283,13 +319,13 @@ pub(crate) fn prepare_chat_request(
     vision_supported: bool,
     tokenize_len: impl FnOnce(&str) -> usize,
     max_context: impl FnOnce() -> usize,
-) -> Result<PreparedChatRequest, ApiError> {
-    let (validated, prompt) = normalize_request_with_context_and_budget(
+) -> Result<(PreparedChatRequest, bool), ApiError> {
+    let (validated, prompt, enable_thinking) = normalize_request_with_context_and_thinking(
         req,
         GenerationDefaults::standard(default_max_tokens),
         ServeProfile::lattice(model_id, max_tokens_cap).with_vision_support(vision_supported),
-        |messages, max_tokens, reasoning_budget| {
-            let prompt = QwenPromptAdapter.render(messages);
+        |messages, max_tokens, reasoning_budget, enable_thinking| {
+            let prompt = QwenPromptAdapter.render_with_thinking(messages, enable_thinking);
             let prompt_token_count = tokenize_len(&prompt);
             validate_context_window_with_budget(
                 prompt_token_count,
@@ -314,18 +350,21 @@ pub(crate) fn prepare_chat_request(
     } = validated;
     let messages = into_engine_chat_messages(messages)?;
 
-    Ok(PreparedChatRequest {
-        messages,
-        max_tokens,
-        temperature,
-        top_p,
-        logprobs,
-        prompt,
-        stop_strings,
-        reasoning_budget,
-        seed,
-        stream,
-    })
+    Ok((
+        PreparedChatRequest {
+            messages,
+            max_tokens,
+            temperature,
+            top_p,
+            logprobs,
+            prompt,
+            stop_strings,
+            reasoning_budget,
+            seed,
+            stream,
+        },
+        enable_thinking,
+    ))
 }
 
 pub(crate) fn lattice_gen_cfg(
@@ -336,6 +375,7 @@ pub(crate) fn lattice_gen_cfg(
     stop_strings: Vec<String>,
     reasoning_budget: Option<usize>,
     logprobs: Option<usize>,
+    enable_thinking: bool,
 ) -> GenerateConfig {
     QwenPromptAdapter.lattice_generate_config(
         max_tokens,
@@ -345,9 +385,25 @@ pub(crate) fn lattice_gen_cfg(
         stop_strings,
         reasoning_budget,
         logprobs,
+        enable_thinking,
     )
 }
 
 pub(crate) fn build_cfg(req: &ValidatedChatRequest) -> GenerateConfig {
     QwenPromptAdapter.generate_config(req)
+}
+
+pub(crate) fn prepare_standalone_chat_request(
+    req: &ChatRequest,
+    defaults: GenerationDefaults,
+    profile: ServeProfile<'_>,
+) -> Result<(ValidatedChatRequest, GenerateConfig), ApiError> {
+    let (validated, _, enable_thinking) =
+        normalize_request_with_context_and_thinking(req, defaults, profile, |_, _, _, _| {
+            Ok(String::new())
+        })?;
+    let mut config = build_cfg(&validated);
+    config.enable_thinking = enable_thinking;
+    config.reasoning_budget = config.reasoning_budget.filter(|_| enable_thinking);
+    Ok((validated, config))
 }

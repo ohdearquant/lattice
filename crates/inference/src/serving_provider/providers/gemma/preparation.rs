@@ -158,6 +158,11 @@ impl PromptAdapter for GemmaPromptAdapter {
         generation: GenerationDefaults,
         options: RequestedChatOptions,
     ) -> Result<ValidatedChatRequest, ApiError> {
+        if options.enable_thinking == Some(true) {
+            return Err(unsupported(
+                "enable_thinking is not supported for this model",
+            ));
+        }
         if options
             .messages
             .iter()
@@ -261,17 +266,17 @@ impl RequestPreparation for GemmaPreparation {
         Ok(PreparedCpuChat { prepared, config })
     }
 
-    fn prepare_lattice(
+    fn prepare_lattice_with_thinking(
         &self,
         req: &ChatRequest,
         model_id: &str,
         default_max_tokens: usize,
         max_tokens_cap: usize,
         _vision_supported: bool,
-    ) -> Result<PreparedChatRequest, ApiError> {
+    ) -> Result<(PreparedChatRequest, bool), ApiError> {
         self.serving
             .prepare(req, model_id, default_max_tokens, max_tokens_cap)
-            .map(|(prepared, _)| prepared)
+            .map(|(prepared, config)| (prepared, config.enable_thinking))
     }
 
     fn normalize_standalone(
@@ -297,6 +302,7 @@ impl RequestPreparation for GemmaPreparation {
         stop_strings: Vec<String>,
         reasoning_budget: Option<usize>,
         logprobs: Option<usize>,
+        _enable_thinking: bool,
     ) -> GenerateConfig {
         self.serving.lattice_generate_config(
             max_tokens,

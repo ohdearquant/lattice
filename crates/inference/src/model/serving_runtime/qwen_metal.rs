@@ -87,6 +87,7 @@ impl ServingRuntime for QwenMetalRuntime {
                 tokenizer,
                 messages,
                 image_message_index,
+                cfg.enable_thinking,
                 should_cancel,
                 |prompt_len| {
                     check_prompt_fits_window(

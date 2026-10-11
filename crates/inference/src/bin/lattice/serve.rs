@@ -29,9 +29,11 @@ use lattice_inference::serve::contract::{
 };
 #[cfg(test)]
 use lattice_inference::serve::into_engine_chat_messages;
-#[cfg(any(feature = "metal-gpu", test))]
+use lattice_inference::serve::prepare::PreparedChatRequest;
+#[cfg(test)]
 use lattice_inference::serve::prepare::prepare_chat_request;
-use lattice_inference::serve::prepare::{PreparedChatRequest, lattice_gen_cfg};
+#[cfg(feature = "metal-gpu")]
+use lattice_inference::serve::prepare::prepare_chat_request_with_config;
 use lattice_inference::{GenerateOutput, TokenLogprob};
 use serde::Serialize;
 use serde_json::Value;
@@ -182,62 +184,19 @@ pub enum ModelBackend {
 }
 
 impl ModelBackend {
-    #[allow(clippy::too_many_arguments)]
-    fn generation_config(
-        &self,
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        seed: Option<u64>,
-        stop_strings: Vec<String>,
-        reasoning_budget: Option<usize>,
-        logprobs: Option<usize>,
-    ) -> lattice_inference::GenerateConfig {
-        #[cfg(feature = "metal-gpu")]
-        if let ModelBackend::Metal { handle, .. } = self
-            && let Some(preparation) = handle.client.preparation()
-        {
-            return preparation.lattice_generate_config(
-                max_tokens,
-                temperature,
-                top_p,
-                seed,
-                stop_strings,
-                reasoning_budget,
-                logprobs,
-            );
-        }
-        lattice_gen_cfg(
-            max_tokens,
-            temperature,
-            top_p,
-            seed,
-            stop_strings,
-            reasoning_budget,
-            logprobs,
-        )
-    }
-
-    /// The prepared request and its config when provider preparation supplies one.
-    /// `None` leaves `generation_config` to build it from the prepared fields.
+    /// Prepare the prompt and provider config together before worker submission.
     fn prepare_chat_request(
         &self,
         req: &ChatCompletionRequest,
         model_id: &str,
         default_max_tokens: usize,
         max_tokens_cap: usize,
-    ) -> Result<
-        (
-            PreparedChatRequest,
-            Option<lattice_inference::GenerateConfig>,
-        ),
-        ApiError,
-    > {
+    ) -> Result<(PreparedChatRequest, lattice_inference::GenerateConfig), ApiError> {
         #[cfg(not(feature = "metal-gpu"))]
         {
             let ModelBackend::Cpu(cpu) = self;
             let prepared = cpu.prepare(req, model_id, default_max_tokens, max_tokens_cap)?;
-            Ok((prepared.prepared, Some(prepared.config)))
+            Ok((prepared.prepared, prepared.config))
         }
         #[cfg(feature = "metal-gpu")]
         {
@@ -245,7 +204,7 @@ impl ModelBackend {
                 ModelBackend::Cpu(cpu) => {
                     let prepared =
                         cpu.prepare(req, model_id, default_max_tokens, max_tokens_cap)?;
-                    Ok((prepared.prepared, Some(prepared.config)))
+                    Ok((prepared.prepared, prepared.config))
                 }
                 ModelBackend::Metal {
                     handle,
@@ -254,16 +213,16 @@ impl ModelBackend {
                 } => {
                     if let Some(preparation) = handle.client.preparation() {
                         return preparation
-                            .prepare_lattice(
+                            .prepare_lattice_with_config(
                                 req,
                                 model_id,
                                 default_max_tokens,
                                 max_tokens_cap,
                                 self.supports_vision(),
                             )
-                            .map(|prepared| (prepared, None));
+                            .map(|prepared| (prepared.prepared, prepared.config));
                     }
-                    prepare_chat_request(
+                    prepare_chat_request_with_config(
                         req,
                         model_id,
                         default_max_tokens,
@@ -272,7 +231,7 @@ impl ModelBackend {
                         |prompt| self.tokenize_len(prompt),
                         || *max_context,
                     )
-                    .map(|prepared| (prepared, None))
+                    .map(|prepared| (prepared.prepared, prepared.config))
                 }
             }
         }
@@ -1116,34 +1075,19 @@ async fn chat_completions_with_request(
         PreparedChatRequest {
             messages: _normalized_messages,
             max_tokens,
-            temperature,
-            top_p,
             logprobs,
             prompt,
-            stop_strings,
             reasoning_budget,
-            seed,
             stream,
+            ..
         },
-        prepared_cfg,
+        gen_cfg,
     ) = state.model.prepare_chat_request(
         &req,
         &state.model_id,
         state.default_max_tokens,
         state.max_tokens_cap,
     )?;
-
-    let gen_cfg = prepared_cfg.unwrap_or_else(|| {
-        state.model.generation_config(
-            max_tokens,
-            temperature,
-            top_p,
-            seed,
-            stop_strings,
-            reasoning_budget,
-            logprobs,
-        )
-    });
 
     // Metal-only: reuse the exact messages normalized alongside the CPU
     // prompt, so role/content validation and allocation happen once.
@@ -5415,6 +5359,18 @@ mod tests {
         /// the observation genuinely mirrors what the seam returned rather
         /// than an independent hardcoded literal.
         const OBSERVATION_GOLDEN_REQUEST_BODY: &str = r#"{"model":"test-model","messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#;
+        const OBSERVATION_GOLDEN_NO_THINK_CHATML: &str =
+            "<|im_start|>user\nhi there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+        fn thinking_request_body(enable_thinking: bool, reasoning_budget: Option<usize>) -> String {
+            let mut body: serde_json::Value = serde_json::from_str(OBSERVATION_GOLDEN_REQUEST_BODY)
+                .expect("fixture request JSON");
+            body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": enable_thinking});
+            if let Some(budget) = reasoning_budget {
+                body["reasoning_budget"] = serde_json::json!(budget);
+            }
+            body.to_string()
+        }
 
         async fn run_observed(stopped: bool, body: &str) -> ProductionAdapterObservation {
             let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
@@ -5569,6 +5525,55 @@ mod tests {
                 obs.gen_cfg.reasoning_budget,
                 Some(5),
                 "reasoning_budget from the request must reach the real GenerateConfig"
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_non_streaming_observation_captures_real_enable_thinking() {
+            let body = thinking_request_body(false, None);
+            let obs = run_observed(true, &body).await;
+            let mut expected = expected_gen_cfg();
+            expected.enable_thinking = false;
+            let prompt_tokens = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .tokenize(OBSERVATION_GOLDEN_NO_THINK_CHATML)
+                .real_length;
+            assert_observation_matches(
+                &obs,
+                &ExpectedObservation {
+                    gen_cfg: expected,
+                    rendered_prompt: Some(OBSERVATION_GOLDEN_NO_THINK_CHATML),
+                    messages: None,
+                    prompt_tokens,
+                    stopped: true,
+                },
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_non_streaming_observation_preserves_thinking_default() {
+            let explicit = thinking_request_body(true, None);
+            for body in [OBSERVATION_GOLDEN_REQUEST_BODY, explicit.as_str()] {
+                let obs = run_observed(true, body).await;
+                assert_eq!(obs.gen_cfg, expected_gen_cfg());
+                assert_eq!(
+                    obs.rendered_prompt.as_deref(),
+                    Some(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn chat_completions_non_streaming_observation_keeps_no_think_budget_inert() {
+            // Exceeding the fixture's context makes a mistakenly active budget refuse admission.
+            let body = thinking_request_body(false, Some(4096));
+            let obs = run_observed(true, &body).await;
+            assert!(!obs.gen_cfg.enable_thinking);
+            assert_eq!(obs.gen_cfg.reasoning_budget, None);
+            assert_eq!(obs.gen_cfg.max_new_tokens, 9);
+            assert_eq!(
+                obs.rendered_prompt.as_deref(),
+                Some(OBSERVATION_GOLDEN_NO_THINK_CHATML)
             );
         }
     }
