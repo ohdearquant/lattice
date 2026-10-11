@@ -49,6 +49,13 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
     if log_every == 0 {
         return Err("--log-every must be >= 1".to_string());
     }
+    if argv.flag("--gradcheck") {
+        for flag in ["--load", "--save"] {
+            if argv.flag(flag) {
+                return Err(format!("--gradcheck cannot be combined with {flag}"));
+            }
+        }
+    }
     // An unrecognised value is refused rather than silently defaulted. The whole
     // point of the flag is that the wrong module set is invisible until load, and
     // a typo that quietly selects the default would be exactly that failure with
@@ -194,7 +201,6 @@ mod tests {
             "42",
             "--log-every",
             "3",
-            "--gradcheck",
             "--probe",
             "2",
             "--fd-eps",
@@ -217,11 +223,52 @@ mod tests {
         assert_eq!(cfg.seed, 42);
         assert_eq!(cfg.max_valid, 0);
         assert_eq!(cfg.log_every, 3);
-        assert!(cfg.gradcheck);
+        assert!(!cfg.gradcheck);
         assert_eq!(cfg.probe, 2);
         assert_eq!(cfg.fd_eps, 1e-3);
         assert_eq!(cfg.save_path, Some("/tmp/out.safetensors".to_string()));
         assert_eq!(cfg.load_path, Some("/tmp/in.safetensors".to_string()));
+    }
+
+    #[test]
+    fn gradcheck_rejects_load() {
+        let values = args(&["--gradcheck", "--load", "adapter.safetensors"]);
+        let err = parse_config(&ArgView::new(&values)).unwrap_err();
+        assert!(err.contains("--gradcheck"));
+        assert!(err.contains("--load"));
+    }
+
+    #[test]
+    fn gradcheck_rejects_save() {
+        let values = args(&["--gradcheck", "--save", "adapter.safetensors"]);
+        let err = parse_config(&ArgView::new(&values)).unwrap_err();
+        assert!(err.contains("--gradcheck"));
+        assert!(err.contains("--save"));
+    }
+
+    #[test]
+    fn gradcheck_alone_is_accepted() {
+        let values = args(&["--gradcheck"]);
+        let cfg = parse_config(&ArgView::new(&values)).unwrap();
+        assert!(cfg.gradcheck);
+        assert_eq!(cfg.load_path, None);
+        assert_eq!(cfg.save_path, None);
+    }
+
+    #[test]
+    fn load_without_gradcheck_is_accepted() {
+        let values = args(&["--load", "adapter.safetensors"]);
+        let cfg = parse_config(&ArgView::new(&values)).unwrap();
+        assert!(!cfg.gradcheck);
+        assert_eq!(cfg.load_path.as_deref(), Some("adapter.safetensors"));
+    }
+
+    #[test]
+    fn save_without_gradcheck_is_accepted() {
+        let values = args(&["--save", "adapter.safetensors"]);
+        let cfg = parse_config(&ArgView::new(&values)).unwrap();
+        assert!(!cfg.gradcheck);
+        assert_eq!(cfg.save_path.as_deref(), Some("adapter.safetensors"));
     }
 
     #[test]
