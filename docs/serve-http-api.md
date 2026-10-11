@@ -329,8 +329,8 @@ predict which error you'll get when more than one thing is wrong with a request:
 
 1. JSON body parses and is under the 1 MiB limit.
 2. `reject_unsupported`: `tools`/`tool_choice` present, `n > 1`, `response_format.type != "text"`,
-   and `stream: true` combined with `logprobs: true` (bare `logprobs: true` without streaming is
-   no longer rejected here — see "logprobs" below).
+   and `stream: true` combined with `logprobs: true`. The Metal/Q4 backend also refuses
+   `logprobs: true` or any `top_logprobs` here — see "logprobs" below.
 3. `model` matches the server's loaded model ID.
 4. `messages` is non-empty.
 5. The **last** message has role `"user"` (a Qwen ChatML constraint — the conversation must end on
@@ -415,12 +415,11 @@ Metal worker now uses for every text Metal-backed request, streaming or not — 
 a separate `generate_multimodal_vision_with_cancel` path that never reaches it, see
 [`docs/cross-turn-cache.md`](cross-turn-cache.md)
 (`check_logprobs_not_set` in `crates/inference/src/model/qwen35/generation.rs` fails closed on it).
-In practice: `logprobs: true` against a CPU (safetensors) server works as documented above; the
-same request against a Metal/Q4-backed server currently fails with a generic HTTP 500
-`internal_error` (`"inference failed"`) rather than either a clean result or a specific
-`unsupported_feature` rejection — the request is accepted by validation and only fails once
-generation starts. Verify current behavior against `reject_unsupported` and `check_logprobs_not_set`
-directly rather than trusting this paragraph if it looks like it's changed.
+`logprobs: true` against a Qwen CPU (safetensors) server works as documented above. The Metal/Q4
+provider refuses `logprobs: true` or any `top_logprobs` during request preparation, before
+prompt tokenization or worker submission, with HTTP 400 `unsupported_feature` and the message
+`"logprobs/top_logprobs are not supported by this server"`. Requests with absent or false
+`logprobs` and no `top_logprobs` continue normally.
 
 ## `POST /v1/chat/completions` — streaming (SSE)
 
@@ -830,10 +829,10 @@ message content. There is no requirement to strip reasoning blocks between turns
 - Every error is the OpenAI error envelope shape (`error.message`/`type`/`code`/`param`), with
   `code` distinguishing specific failure reasons; malformed-JSON parser detail and internal
   generation failures are logged server-side only, never returned to the client.
-- `logprobs` is supported non-streaming-only (PR #620); on the CPU backend it returns real
-  per-token log probabilities, but on the Metal/Q4 backend it currently fails with a generic 500
-  because the shared cross-turn-cache-aware generation path doesn't implement it — see "logprobs"
-  above.
+- `logprobs` is supported non-streaming-only (PR #620); the Qwen CPU backend returns real
+  per-token log probabilities. The Metal/Q4 backend returns HTTP 400 `unsupported_feature` before
+  worker submission because its cross-turn-cache-aware generation path does not implement it —
+  see "logprobs" above.
 - `max_tokens` is hard-capped at 4096 server-wide; the Metal/Q4 backend additionally caps total
   context at 4096 regardless of the model's own configured maximum.
 - The Metal/Q4 backend has cross-turn KV/GDN prefix caching and a bounded pending-job admission
