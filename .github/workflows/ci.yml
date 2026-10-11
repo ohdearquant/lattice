@@ -314,6 +314,22 @@ jobs:
         run: cargo test -p lattice-tune --features train-backward --no-run
       - name: tune — train-backward (run lib tests)
         run: cargo test -p lattice-tune --features train-backward --lib
+      - name: tune — train_grad_full argument tests
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/train-grad-full-argument-tests.log"
+          if cargo test --locked -p lattice-tune --features train-backward \
+            --bin train_grad_full >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -Fxq 'test tests::defaults_match_documented_table ... ok' "$log"
+          grep -Fxq 'test tests::explicit_flags_override_defaults ... ok' "$log"
+          grep -Fxq 'test tests::log_every_zero_is_rejected ... ok' "$log"
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;' "$log"
       # The lib-test step above now runs this whole surface, closing
       # the gap that left the GDN module-selection guards added in #1516
       # unenforced: `crates/tune/src/lora/mod.rs` declares `pub mod train_core;`
