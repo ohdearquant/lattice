@@ -800,7 +800,13 @@ impl ModuleGraph<'_> {
             return Ok(());
         }
         self.sources.insert(canonical.clone(), file_cfg.clone());
-        self.walk_items(&syntax.items, &canonical, module_dir, file_cfg)?;
+        self.walk_items(
+            &syntax.items,
+            &canonical,
+            module_dir,
+            path.parent().unwrap_or(module_dir),
+            file_cfg,
+        )?;
         self.visiting.remove(&canonical);
         Ok(())
     }
@@ -810,6 +816,7 @@ impl ModuleGraph<'_> {
         items: &[syn::Item],
         source_path: &Path,
         module_dir: &Path,
+        path_attribute_dir: &Path,
         inherited_cfg: CfgFormula,
     ) -> Result<(), String> {
         let context = source_path
@@ -837,17 +844,13 @@ impl ModuleGraph<'_> {
                         module.ident
                     ));
                 }
-                self.walk_items(
-                    contents,
-                    source_path,
-                    &module_dir.join(&module_name),
-                    module_cfg,
-                )?;
+                let inline_dir = module_dir.join(&module_name);
+                self.walk_items(contents, source_path, &inline_dir, &inline_dir, module_cfg)?;
                 continue;
             }
             let direct_path = literal_module_path(&module.attrs, &context)?;
-            let target = if let Some(relative) = direct_path {
-                module_dir.join(relative)
+            let target = if let Some(relative) = &direct_path {
+                path_attribute_dir.join(relative)
             } else {
                 let flat = module_dir.join(format!("{module_name}.rs"));
                 let nested = module_dir.join(&module_name).join("mod.rs");
@@ -868,7 +871,9 @@ impl ModuleGraph<'_> {
                     }
                 }
             };
-            let child_module_dir = if target.file_name().is_some_and(|name| name == "mod.rs") {
+            let child_module_dir = if direct_path.is_some()
+                || target.file_name().is_some_and(|name| name == "mod.rs")
+            {
                 target.parent().unwrap_or(module_dir).to_path_buf()
             } else {
                 target.parent().unwrap_or(module_dir).join(&module_name)
