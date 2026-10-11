@@ -11,10 +11,14 @@
 //! Everything runs in f32 from bf16 checkpoint weights. f16 activations are
 //! not supported: the model card reports that they overflow.
 //!
-//! Only the text tower is loaded. Vision and audio tensors in the checkpoint
-//! are never read.
+//! Text calls load only the text tower. Vision weights have a separate deferred
+//! loader; audio tensors are never read.
 
-use super::embeddinggemma2_config::{EmbeddingGemma2Config, EmbeddingGemma2LayerKind};
+use super::embeddinggemma2_config::{
+    EmbeddingGemma2Config, EmbeddingGemma2LayerKind, ImagePartsConfig, image_parts_config,
+};
+use super::embeddinggemma2_image::{EmbeddingGemma2Rgb8Image, prepare_image};
+use super::embeddinggemma2_vision::{LazyVision, VisionStages, VisionWeights};
 use super::gemma4_ops::{
     gemma4_apply_rope, gemma4_geglu_mlp, gemma4_gelu_tanh, gemma4_qk_norm_v_unscaled,
     gemma4_rms_norm, gemma4_rope_cos_sin, gemma4_rope_inv_freq,
@@ -22,10 +26,12 @@ use super::gemma4_ops::{
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, matmul_into};
 use crate::forward::metal_embeddinggemma2::MetalEmbeddingGemma2State;
+use crate::model::config_file::read_config_json_bounded;
 use crate::tokenizer::common::{EmbeddingTokenCounts, Tokenizer};
 use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use crate::weights::{SafetensorsFile, TensorSource};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Default token limit applied by [`EmbeddingGemma2Model::tokenize`]. Longer text is truncated,
 /// never rejected. The model itself has no length limit; see
@@ -298,6 +304,133 @@ fn load_weights<T: TensorSource + ?Sized>(
 }
 
 // ---------------------------------------------------------------------------
+// Image parts
+// ---------------------------------------------------------------------------
+
+fn image_error(message: impl Into<String>) -> InferenceError {
+    InferenceError::InvalidInput(format!("EmbeddingGemma 2 image: {}", message.into()))
+}
+
+fn no_image_layout() -> InferenceError {
+    InferenceError::UnsupportedModel(
+        "this EmbeddingGemma 2 checkpoint declares no image token layout".to_string(),
+    )
+}
+
+/// One ordered entry of a multimodal [`EmbeddingGemma2Model::encode_parts_at_widths`] input:
+/// either text or a decoded RGB8 image.
+#[derive(Clone, Debug)]
+pub enum EmbeddingGemma2Part {
+    /// Literal text, tokenized with the model's beginning and end tokens.
+    Text(String),
+    /// A decoded RGB8 image.
+    Image(EmbeddingGemma2Rgb8Image),
+}
+
+/// Counts reported alongside a multimodal embedding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmbeddingGemma2PartCounts {
+    /// Length of the combined token sequence.
+    pub sequence_length: usize,
+    /// Number of valid image patches across every image part.
+    pub valid_patches: usize,
+    /// Number of image soft rows across every image part.
+    pub image_rows: usize,
+}
+
+/// Result of [`EmbeddingGemma2Model::encode_parts_at_widths`].
+#[derive(Clone, Debug)]
+pub struct EmbeddingGemma2PartsEncoding {
+    /// One embedding per requested width, L2-normalized, in the requested order.
+    pub embeddings: Vec<Vec<f32>>,
+    /// The combined token ids actually run through the text encoder.
+    pub input_ids: Vec<u32>,
+    /// Layout counts for the combined sequence.
+    pub counts: EmbeddingGemma2PartCounts,
+    /// Image soft rows after the bridge, row-major `[image_rows, text_hidden]`.
+    pub image_rows: Vec<f32>,
+    /// Per-image stage tensors, in part order.
+    pub image_stages: Vec<EmbeddingGemma2ImageStages>,
+    /// Tokens by the native embedding width after the final norm and projection, before
+    /// pooling, row-major `[sequence_length, embedding_dim]`.
+    pub token_states: Vec<f32>,
+    /// Mean over every valid row, before the per-width normalization.
+    pub pre_normalization: Vec<f32>,
+}
+
+/// Stage tensors of one image part, at the boundaries a reference capture uses.
+///
+/// Widths come from the checkpoint's vision config; the values are the valid rows only,
+/// so a comparison against a padded reference capture takes its valid prefix.
+#[derive(Clone, Debug)]
+pub struct EmbeddingGemma2ImageStages {
+    /// Patch embedding: the centered, projected patches plus learned positions.
+    pub patch: Vec<f32>,
+    /// Tower state after encoder layers 0, 8 and 15.
+    pub layer_0: Vec<f32>,
+    /// See [`EmbeddingGemma2ImageStages::layer_0`].
+    pub layer_8: Vec<f32>,
+    /// See [`EmbeddingGemma2ImageStages::layer_0`].
+    pub layer_15: Vec<f32>,
+    /// Tower state after the last encoder layer.
+    pub encoder: Vec<f32>,
+    /// Coordinate pooling values, scaled by `sqrt(vision hidden)`.
+    pub pooler_values: Vec<f32>,
+    /// One flag per pooled cell; every entry is `true` because only valid patches exist.
+    pub pooler_occupancy: Vec<bool>,
+    /// The tower output after stripping, equal to [`EmbeddingGemma2ImageStages::pooler_values`].
+    pub valid: Vec<f32>,
+    /// Bridge output, row-major `[soft_rows, text_hidden]`.
+    pub projected: Vec<f32>,
+    /// Layer-0 queries after the Q norm, before RoPE, row-major `[valid_patches, heads, head]`.
+    pub layer_0_q_normed: Vec<f32>,
+    /// Layer-0 keys after the K norm, before RoPE.
+    pub layer_0_k_normed: Vec<f32>,
+    /// Layer-0 queries after RoPE.
+    pub layer_0_q_rotated: Vec<f32>,
+    /// Layer-0 keys after RoPE.
+    pub layer_0_k_rotated: Vec<f32>,
+    /// Valid patch count for this image.
+    pub valid_patches: usize,
+    /// Soft rows for this image.
+    pub soft_rows: usize,
+    /// Tower hidden width.
+    pub hidden_size: usize,
+    /// Bridge output width (the text tower's hidden width).
+    pub text_hidden: usize,
+    /// Vision attention head count.
+    pub heads: usize,
+    /// Vision attention head width.
+    pub head_dim: usize,
+}
+
+impl EmbeddingGemma2ImageStages {
+    fn from_parts(valid_patches: usize, soft_rows: usize, stages: VisionStages) -> Self {
+        Self {
+            patch: stages.patch,
+            layer_0: stages.layer_0,
+            layer_8: stages.layer_8,
+            layer_15: stages.layer_15,
+            encoder: stages.encoder,
+            pooler_values: stages.pooler_values,
+            pooler_occupancy: stages.pooler_occupancy,
+            valid: stages.valid,
+            projected: stages.projected,
+            layer_0_q_normed: stages.layer_0_q_normed,
+            layer_0_k_normed: stages.layer_0_k_normed,
+            layer_0_q_rotated: stages.layer_0_q_rotated,
+            layer_0_k_rotated: stages.layer_0_k_rotated,
+            valid_patches,
+            soft_rows,
+            hidden_size: stages.hidden_size,
+            text_hidden: stages.text_hidden,
+            heads: stages.heads,
+            head_dim: stages.head_dim,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Attention
 // ---------------------------------------------------------------------------
 
@@ -425,6 +558,8 @@ pub struct EmbeddingGemma2Model {
     weights: Weights,
     tokenizer: Option<TextTokenizer>,
     max_tokens: Option<usize>,
+    vision: LazyVision,
+    image_parts: Option<ImagePartsConfig>,
 }
 
 impl EmbeddingGemma2Model {
@@ -432,7 +567,15 @@ impl EmbeddingGemma2Model {
     ///
     /// Only text-tower tensors are read; vision and audio tensors in the same file are ignored.
     pub fn from_model_dir(dir: &Path) -> Result<Self, InferenceError> {
-        let cfg = EmbeddingGemma2Config::from_model_dir(dir)?;
+        let config_path = dir.join("config.json");
+        if !config_path.exists() {
+            return Err(InferenceError::ModelNotFound(format!(
+                "missing config.json in {}",
+                dir.display()
+            )));
+        }
+        let config_json = read_config_json_bounded(&config_path, "config.json")?;
+        let cfg = EmbeddingGemma2Config::from_config_json_str(&config_json)?;
         let weights_path = dir.join("model.safetensors");
         if !weights_path.exists() {
             return Err(InferenceError::ModelNotFound(format!(
@@ -447,17 +590,35 @@ impl EmbeddingGemma2Model {
                 dir.display()
             )));
         }
-        let mut file = SafetensorsFile::open(&weights_path)?;
-        let weights = load_weights(&mut file, &cfg)?;
+        let checkpoint = crate::weights::mmap_trust::open_regular_file_no_hang(&weights_path)
+            .map_err(InferenceError::InvalidSafetensors)?;
+        let vision_file = checkpoint.try_clone().map_err(InferenceError::Io)?;
+        let weights = {
+            let mut file = SafetensorsFile::from_open_file(checkpoint, &weights_path)?;
+            load_weights(&mut file, &cfg)?
+        };
         let text = std::fs::read_to_string(&tokenizer_path).map_err(InferenceError::Io)?;
         let tokenizer =
             TextTokenizer::from_tokenizer_json_str(&text, cfg.bos_token_id, cfg.eos_token_id)?;
+        let image_parts = image_parts_config(&config_json, cfg.vocab_size);
+        let vision =
+            LazyVision::from_checkpoint(config_json, vision_file, weights_path, cfg.hidden_size);
         Ok(Self {
             cfg,
             weights,
             tokenizer: Some(tokenizer),
             max_tokens: Some(EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS),
+            vision,
+            image_parts,
         })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the image forward path consumes this internal cache separately"
+    )]
+    pub(crate) fn vision_weights(&self) -> Result<Arc<VisionWeights>, InferenceError> {
+        self.vision.get()
     }
 
     /// Sets the longest token sequence [`EmbeddingGemma2Model::tokenize`] produces, or removes the
@@ -562,6 +723,110 @@ impl EmbeddingGemma2Model {
         self.pool_widths(&states, ids.len(), widths)
     }
 
+    /// Builds the combined token layout from the ordered parts.
+    ///
+    /// The tokenizer wraps each text part on its own (`beginning, text, end`), so the
+    /// interior tokens are the body between the two wrapping tokens; the outer wrap comes
+    /// from the sequence itself. An image part expands to begin-image, its soft-row count
+    /// of image markers and end-image. Returns the ids and the marker-slot indices where
+    /// the image rows land, in part order.
+    fn assemble_ids(
+        &self,
+        parts: &[EmbeddingGemma2Part],
+        soft_rows_per_part: &[usize],
+    ) -> Result<(Vec<u32>, Vec<usize>), InferenceError> {
+        if soft_rows_per_part.len() != parts.len() {
+            return Err(image_error("soft-row counts must align with the parts"));
+        }
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            InferenceError::Tokenizer("this model was built without a tokenizer".to_string())
+        })?;
+        let has_image = parts
+            .iter()
+            .any(|part| matches!(part, EmbeddingGemma2Part::Image(_)));
+        let images = match (has_image, self.image_parts) {
+            (false, _) => None,
+            (true, Some(layout)) => Some(layout),
+            (true, None) => return Err(no_image_layout()),
+        };
+        let mut ids = Vec::new();
+        ids.push(tokenizer.bos);
+        let mut slots = Vec::new();
+        let mut marker_total = 0usize;
+        for (index, part) in parts.iter().enumerate() {
+            match part {
+                EmbeddingGemma2Part::Text(text) => {
+                    let part_ids = tokenizer.tokenize(text, self.max_tokens);
+                    if part_ids.len() < 2 {
+                        return Err(image_error("a text part tokenized to fewer than two ids"));
+                    }
+                    ids.extend_from_slice(&part_ids[1..part_ids.len() - 1]);
+                }
+                EmbeddingGemma2Part::Image(_) => {
+                    let Some(images) = images else {
+                        return Err(no_image_layout());
+                    };
+                    let soft = soft_rows_per_part[index];
+                    ids.push(images.boi_token_id);
+                    marker_total = marker_total
+                        .checked_add(soft)
+                        .ok_or_else(|| image_error("image marker count overflow"))?;
+                    for _ in 0..soft {
+                        slots.push(ids.len());
+                        ids.push(images.image_token_id);
+                    }
+                    ids.push(images.eoi_token_id);
+                }
+            }
+        }
+        ids.push(tokenizer.eos);
+        if slots.len() != marker_total {
+            return Err(image_error(
+                "the image marker slots do not match the soft-row counts",
+            ));
+        }
+        Ok((ids, slots))
+    }
+
+    /// Materializes the combined rows: hard-token embeddings with the image markers read
+    /// as padding, then the bridged image rows scattered into the marker slots with the
+    /// text embedding scale restored to one.
+    fn combine_rows(
+        &self,
+        input_ids: &[u32],
+        image_slots: &[usize],
+        image_rows: &[f32],
+    ) -> Result<Vec<f32>, InferenceError> {
+        let hidden = self.cfg.hidden_size;
+        let mut gather: Vec<u32> = input_ids.to_vec();
+        if let Some(images) = self.image_parts {
+            for id in &mut gather {
+                if *id == images.image_token_id {
+                    *id = 0;
+                }
+            }
+        }
+        let mut combined = self.scaled_embeddings(&gather)?;
+        if !image_slots.is_empty() {
+            if image_rows.len() != image_slots.len() * hidden {
+                return Err(image_error(format!(
+                    "image rows must hold {} values, got {}",
+                    image_slots.len() * hidden,
+                    image_rows.len()
+                )));
+            }
+            for (row, &slot) in image_slots.iter().enumerate() {
+                if slot >= combined.len() / hidden {
+                    return Err(image_error("an image marker slot is outside the sequence"));
+                }
+                let source = &image_rows[row * hidden..(row + 1) * hidden];
+                let target = &mut combined[slot * hidden..(slot + 1) * hidden];
+                target.copy_from_slice(source);
+            }
+        }
+        Ok(combined)
+    }
+
     fn check_widths(&self, widths: &[usize]) -> Result<(), InferenceError> {
         for &width in widths {
             if width == 0 || width > self.cfg.embedding_dim {
@@ -593,38 +858,166 @@ impl EmbeddingGemma2Model {
             .collect()
     }
 
+    /// Embeds ordered text and image parts at each requested width, from one forward pass.
+    ///
+    /// The parts are laid out as the model's processor does: the beginning token,
+    /// then each part in order, then the end token. A text part contributes its
+    /// tokens verbatim; an image part contributes a begin-image marker, its soft-row
+    /// count of image marker tokens and an end-image marker. The image soft rows carry
+    /// no text embedding scale. Positions are one-dimensional over the whole sequence,
+    /// and both the initial hidden state and the per-layer signal are derived from the
+    /// same combined rows.
+    ///
+    /// Text-only calls reproduce [`EmbeddingGemma2Model::encode_ids_at_widths`] on the
+    /// identical token sequence and never load the vision weights. An image part returns
+    /// a typed error when the checkpoint has no image token layout. `should_cancel` is
+    /// polled between preparation, the patch embed, each vision layer and the text
+    /// encoder; a predicate that reports cancellation stops the call before the text
+    /// encoder runs.
+    pub fn encode_parts_at_widths(
+        &self,
+        parts: &[EmbeddingGemma2Part],
+        widths: &[usize],
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<EmbeddingGemma2PartsEncoding, InferenceError> {
+        self.check_widths(widths)?;
+        if parts.is_empty() {
+            return Err(InferenceError::InvalidInput(
+                "cannot embed an empty part list".to_string(),
+            ));
+        }
+        if parts
+            .iter()
+            .any(|part| matches!(part, EmbeddingGemma2Part::Image(_)))
+            && self.image_parts.is_none()
+        {
+            return Err(no_image_layout());
+        }
+        if should_cancel() {
+            return Err(InferenceError::Inference(
+                "cancelled before embedding preparations".to_string(),
+            ));
+        }
+        let mut image_rows: Vec<f32> = Vec::new();
+        let mut image_stages: Vec<EmbeddingGemma2ImageStages> = Vec::new();
+        let mut soft_rows_per_part = vec![0usize; parts.len()];
+        let mut image_row_count = 0usize;
+        let mut valid_patches = 0usize;
+        for (index, part) in parts.iter().enumerate() {
+            let EmbeddingGemma2Part::Image(image) = part else {
+                continue;
+            };
+            let prepared = prepare_image(image)?;
+            soft_rows_per_part[index] = prepared.soft_rows();
+            valid_patches = valid_patches
+                .checked_add(prepared.valid_count())
+                .ok_or_else(|| image_error("valid patch count overflow"))?;
+            image_row_count = image_row_count
+                .checked_add(prepared.soft_rows())
+                .ok_or_else(|| image_error("image row count overflow"))?;
+            let weights = self.vision.get()?;
+            let encoding = weights.encode(&prepared, should_cancel)?;
+            image_rows.extend_from_slice(&encoding.stages.projected);
+            image_stages.push(EmbeddingGemma2ImageStages::from_parts(
+                prepared.valid_count(),
+                prepared.soft_rows(),
+                encoding.stages,
+            ));
+            if should_cancel() {
+                return Err(InferenceError::Inference(
+                    "cancelled before assembling the combined sequence".to_string(),
+                ));
+            }
+        }
+        let (input_ids, image_slots) = self.assemble_ids(parts, &soft_rows_per_part)?;
+        let combined = self.combine_rows(&input_ids, &image_slots, &image_rows)?;
+        let tokens = input_ids.len();
+        let mut hidden = combined.clone();
+        self.run_text_encoder(&mut hidden, &combined, tokens, should_cancel)?;
+        let states = self.project_states(&hidden, tokens)?;
+        let embeddings = self.pool_widths(&states, tokens, widths)?;
+        let pre_normalization = mean_pool(&states, tokens, self.cfg.embedding_dim);
+        Ok(EmbeddingGemma2PartsEncoding {
+            embeddings,
+            input_ids,
+            counts: EmbeddingGemma2PartCounts {
+                sequence_length: tokens,
+                valid_patches,
+                image_rows: image_row_count,
+            },
+            image_rows,
+            image_stages,
+            token_states: states,
+            pre_normalization,
+        })
+    }
+
     /// Per-token states after the final norm and the `hidden -> embedding_dim` projection,
     /// row-major `[ids.len(), embedding_dim]`.
     pub fn token_states(&self, ids: &[u32]) -> Result<Vec<f32>, InferenceError> {
-        let cfg = &self.cfg;
-        let w = &self.weights;
-        let t = ids.len();
-        let hidden = cfg.hidden_size;
-
         let mut h = self.scaled_embeddings(ids)?;
-        let embeddings = h.clone();
+        let rows = h.clone();
+        self.run_text_encoder(&mut h, &rows, ids.len(), &mut || false)?;
+        self.project_states(&h, ids.len())
+    }
 
+    /// Runs the encoder layers over `h` in place, then the final norm. `rows` is the matrix
+    /// the per-layer signal is derived from: for a text call the scaled token embeddings, and
+    /// for a mixed text-and-image call the combined rows. `should_cancel` is polled once
+    /// before the loop and between layers.
+    fn run_text_encoder(
+        &self,
+        h: &mut [f32],
+        rows: &[f32],
+        tokens: usize,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<(), InferenceError> {
+        let cfg = &self.cfg;
+        if should_cancel() {
+            return Err(InferenceError::Inference(
+                "cancelled before the text encoder".to_string(),
+            ));
+        }
         let mut rope: [Option<(Vec<f32>, Vec<f32>)>; 2] = [None, None];
         for l in 0..cfg.num_hidden_layers {
+            if should_cancel() {
+                return Err(InferenceError::Inference(format!(
+                    "cancelled before text layer {l}"
+                )));
+            }
             let slot = usize::from(cfg.layer_types[l] == EmbeddingGemma2LayerKind::Full);
             if rope[slot].is_none() {
-                rope[slot] = Some(self.rope_table(l, t));
+                rope[slot] = Some(self.rope_table(l, tokens));
             }
             let Some((cos, sin)) = rope[slot].as_ref() else {
                 return Err(InferenceError::Inference(
                     "rope table missing after construction".to_string(),
                 ));
             };
-            self.run_layer(l, &mut h, &embeddings, cos, sin);
+            self.run_layer(l, h, rows, cos, sin);
         }
+        gemma4_rms_norm(h, &self.weights.norm, cfg.hidden_size, cfg.rms_norm_eps);
+        Ok(())
+    }
 
-        gemma4_rms_norm(&mut h, &w.norm, hidden, cfg.rms_norm_eps);
-        let mut states = vec![0f32; t * cfg.embedding_dim];
+    /// Per-token `hidden -> embedding_dim` projection over states that already carry the
+    /// final norm, row-major `[tokens, embedding_dim]`.
+    fn project_states(&self, h: &[f32], tokens: usize) -> Result<Vec<f32>, InferenceError> {
+        let cfg = &self.cfg;
+        let hidden = cfg.hidden_size;
+        if h.len() != tokens * hidden {
+            return Err(InferenceError::Inference(format!(
+                "text states must hold {} values, got {}",
+                tokens * hidden,
+                h.len()
+            )));
+        }
+        let mut states = vec![0f32; tokens * cfg.embedding_dim];
         matmul_bt(
-            &h,
-            &w.embedding_projection,
+            h,
+            &self.weights.embedding_projection,
             &mut states,
-            t,
+            tokens,
             hidden,
             cfg.embedding_dim,
         );
@@ -706,8 +1099,9 @@ impl EmbeddingGemma2Model {
         gemma4_rope_cos_sin(&inv_freq, &positions)
     }
 
-    /// One encoder layer applied in place to `h` (`[t, hidden]`). `embeddings` is the scaled
-    /// token-embedding matrix the per-layer signal is derived from.
+    /// One encoder layer applied in place to `h` (`[t, hidden]`). `embeddings` is the row
+    /// matrix the per-layer signal is derived from: the scaled token embeddings for a text
+    /// call, and the combined rows for a mixed image call.
     fn run_layer(&self, l: usize, h: &mut [f32], embeddings: &[f32], cos: &[f32], sin: &[f32]) {
         let cfg = &self.cfg;
         let w = &self.weights;
