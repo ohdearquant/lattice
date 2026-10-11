@@ -335,6 +335,42 @@ mod tests {
     }
 
     #[test]
+    fn qwen_preparation_handle_preserves_the_requested_thinking_mode() {
+        let handle = handle(4096);
+        let omitted = handle
+            .prepare_lattice_with_config(
+                &gemma_request(serde_json::json!({"model": "served-model"})),
+                "served-model",
+                64,
+                4096,
+                false,
+            )
+            .expect("default thinking request");
+        assert!(omitted.config.enable_thinking);
+        for enabled in [true, false] {
+            let prepared = handle
+                .prepare_lattice_with_config(
+                    &gemma_request(serde_json::json!({
+                        "model": "served-model",
+                        "chat_template_kwargs": {"enable_thinking": enabled},
+                    })),
+                    "served-model",
+                    64,
+                    4096,
+                    false,
+                )
+                .expect("explicit thinking switch");
+            assert_eq!(prepared.config.enable_thinking, enabled);
+            let expected = if enabled {
+                omitted.prepared.prompt.clone()
+            } else {
+                format!("{}<think>\n\n</think>\n\n", omitted.prepared.prompt)
+            };
+            assert_eq!(prepared.prepared.prompt, expected);
+        }
+    }
+
+    #[test]
     fn qwen_disabled_thinking_budget_is_inert_before_context_admission() {
         let without_budget = gemma_request(serde_json::json!({
             "model": "served-model",
