@@ -3851,6 +3851,107 @@ fn raw_dispatch() {
     );
 }
 
+fn assert_module_path_fixture(files: &[(&str, &str)]) {
+    let fixture = tempfile::tempdir().expect("create module path fixture");
+    for (relative, source) in files {
+        let path = fixture.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("fixture source parent"))
+            .expect("create fixture source directory");
+        std::fs::write(path, source).expect("write fixture source");
+    }
+    let sources = module_source_closure(fixture.path(), &fixture.path().join("src/lib.rs"), true)
+        .expect("resolve compiler-selected module closure");
+    let actual = sources
+        .into_iter()
+        .map(|source| source.path)
+        .collect::<BTreeSet<_>>();
+    let expected = files
+        .iter()
+        .map(|(relative, _)| {
+            std::fs::canonicalize(fixture.path().join(relative))
+                .expect("canonicalize fixture source")
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn module_path_attribute_in_non_mod_rs_uses_source_directory() {
+    assert_module_path_fixture(&[
+        ("src/lib.rs", "mod a;"),
+        ("src/a.rs", "#[path = \"a/t.rs\"] mod t;"),
+        ("src/a/t.rs", ""),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_in_crate_root_uses_source_directory() {
+    assert_module_path_fixture(&[
+        ("src/lib.rs", "#[path = \"nested/t.rs\"] mod t;"),
+        ("src/nested/t.rs", ""),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_in_mod_rs_uses_source_directory() {
+    assert_module_path_fixture(&[
+        ("src/lib.rs", "mod a;"),
+        ("src/a/mod.rs", "#[path = \"t.rs\"] mod t;"),
+        ("src/a/t.rs", ""),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_file_children_use_containing_directory() {
+    assert_module_path_fixture(&[
+        (
+            "src/lib.rs",
+            "#[path = \"nested/alternate.rs\"] mod renamed;",
+        ),
+        ("src/nested/alternate.rs", "mod child;"),
+        ("src/nested/child.rs", "mod grandchild;"),
+        ("src/nested/child/grandchild.rs", ""),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_inside_non_mod_rs_inline_uses_module_directory() {
+    assert_module_path_fixture(&[
+        ("src/lib.rs", "mod a;"),
+        (
+            "src/a.rs",
+            "mod inline { #[path = \"other.rs\"] mod inner; }",
+        ),
+        ("src/a/inline/other.rs", ""),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_inside_root_inline_uses_module_directory() {
+    assert_module_path_fixture(&[
+        (
+            "src/lib.rs",
+            "mod inline { #[path = \"other.rs\"] mod inner; }",
+        ),
+        ("src/inline/other.rs", ""),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_file_inline_children_use_containing_directory() {
+    assert_module_path_fixture(&[
+        (
+            "src/lib.rs",
+            "#[path = \"nested/alternate.rs\"] mod renamed;",
+        ),
+        (
+            "src/nested/alternate.rs",
+            "mod inline { #[path = \"other.rs\"] mod inner; }",
+        ),
+        ("src/nested/inline/other.rs", ""),
+    ]);
+}
+
 #[test]
 fn cfg_attr_generated_module_path_fails_closed() {
     let fixture = tempfile::tempdir().expect("create cfg_attr path fixture");
