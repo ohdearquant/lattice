@@ -186,6 +186,12 @@ def acquire(path: str, name: str) -> tuple[int, str]:
     """
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
     try:
+        # Keep the open inode recent while waiting for the existing lock holder.
+        os.utime(fd, None)
+    except OSError:
+        os.close(fd)
+        raise
+    try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fd, "acquired immediately (uncontended)"
     except OSError:

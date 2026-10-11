@@ -14,14 +14,14 @@
 //! the returned guard owns both for its full lifetime.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, FileTimes, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
 const GPU_MACHINE_LOCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -40,6 +40,9 @@ const HANDOFF_ENV: [&str; 3] = [
     "LATTICE_GPU_HANDOFF_CONTROL",
     "LATTICE_GPU_HANDOFF_TOKEN",
 ];
+
+#[cfg(test)]
+mod lock_file_refresh_tests;
 
 static GPU_LOCK: Mutex<()> = Mutex::new(());
 
@@ -149,6 +152,8 @@ fn accept_handoff(config: &HandoffConfig, lock_path: &Path) -> Result<File, Stri
         .map_err(|error| format!("cannot duplicate GPU handoff descriptor: {error}"))?;
     let file = File::from(descriptor);
     verify_handoff_lock(&file, lock_path)?;
+    refresh_lock_file(&file)
+        .map_err(|error| format!("cannot refresh GPU handoff lock timestamps: {error}"))?;
     wait_for_handoff_ready(config, HANDOFF_TIMEOUT)?;
     verify_handoff_lock(&file, lock_path)?;
     Ok(file)
@@ -337,6 +342,11 @@ fn live_supervisor_pid(marker: Option<&OsStr>) -> Option<libc::pid_t> {
     (unsafe { libc::kill(pid, 0) } == 0).then_some(pid)
 }
 
+fn refresh_lock_file(file: &File) -> std::io::Result<()> {
+    let now = SystemTime::now();
+    file.set_times(FileTimes::new().set_accessed(now).set_modified(now))
+}
+
 fn acquire_machine_lock(
     lock_path: &Path,
     timeout: Duration,
@@ -349,6 +359,14 @@ fn acquire_machine_lock(
         .truncate(false)
         .open(lock_path)
         .unwrap_or_else(|e| panic!("gpu_test_lock: cannot open {}: {e}", lock_path.display()));
+    // Refresh the opened inode even while another process holds it; do not
+    // replace the path and split contenders across different lock files.
+    refresh_lock_file(&file).unwrap_or_else(|e| {
+        panic!(
+            "gpu_test_lock: cannot refresh timestamps for {}: {e}",
+            lock_path.display()
+        )
+    });
     match file.try_lock() {
         Ok(()) => return file,
         Err(std::fs::TryLockError::WouldBlock) => {
