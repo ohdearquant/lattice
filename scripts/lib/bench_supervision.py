@@ -135,6 +135,7 @@ def _verify_inherited_fds(paths: tuple[Path, Path]) -> tuple[int, int]:
     for fd, path in zip(fds, paths, strict=True):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.utime(fd, None)
             os.set_inheritable(fd, False)
         except OSError as exc:
             raise SupervisionError(
