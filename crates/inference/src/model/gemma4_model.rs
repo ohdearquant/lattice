@@ -946,9 +946,8 @@ impl Gemma4Model {
     /// cancellation -- mirrors `Qwen35Model::generate_streaming_with_cancel`'s
     /// signature shape (`on_token: impl FnMut(&str) -> bool`,
     /// `should_cancel: impl FnMut() -> bool`). `should_cancel` is polled
-    /// before the prefill pass starts, immediately after it returns, and at
-    /// the top of every decode iteration (`driver::run`'s own three
-    /// checkpoints); `on_token` itself also stops generation the moment it
+    /// before prefill, before each prompt token's forward pass, after prefill, and at
+    /// the top of every decode iteration; `on_token` itself also stops generation the moment it
     /// returns `false`. Both stopping paths report `stopped: false,
     /// stop_reason: Some(StopReason::Interrupt)`, matching the Qwen CPU/Metal
     /// contract.
@@ -1687,6 +1686,40 @@ mod tests {
         assert_eq!(output.generated_tokens, 0);
         assert!(output.stopped);
         assert_eq!(output.stop_reason, Some(StopReason::Eos));
+    }
+
+    #[test]
+    fn generate_streaming_interrupts_during_gemma_prefill_without_output() {
+        let model = tiny_zero_model();
+        let config = GenerateConfig {
+            max_new_tokens: 2,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let polls = std::cell::Cell::new(0);
+        let mut emitted = 0;
+        let output = model
+            .generate_streaming_with_cancel(
+                &[2, 3, 4, 5],
+                &config,
+                |_delta| {
+                    emitted += 1;
+                    true
+                },
+                || {
+                    let poll = polls.get();
+                    polls.set(poll + 1);
+                    poll >= 3
+                },
+            )
+            .unwrap();
+        assert!(output.token_ids.is_empty());
+        assert_eq!(output.generated_tokens, 0);
+        assert_eq!(output.stop_reason, Some(StopReason::Interrupt));
+        assert!(!output.stopped);
+        assert_eq!(emitted, 0);
+        assert_eq!(polls.get(), 4);
     }
 
     /// `prompt_len + effective decode cap > max_position_embeddings` must be refused before any
