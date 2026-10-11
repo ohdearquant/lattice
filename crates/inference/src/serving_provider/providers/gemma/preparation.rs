@@ -205,7 +205,6 @@ impl PromptAdapter for GemmaPromptAdapter {
             stream: options.stream.unwrap_or(false),
             stop_strings: options.stop_strings,
             reasoning_budget: None,
-            enable_thinking: false,
             logprobs: None,
         })
     }
@@ -267,17 +266,17 @@ impl RequestPreparation for GemmaPreparation {
         Ok(PreparedCpuChat { prepared, config })
     }
 
-    fn prepare_lattice(
+    fn prepare_lattice_with_thinking(
         &self,
         req: &ChatRequest,
         model_id: &str,
         default_max_tokens: usize,
         max_tokens_cap: usize,
         _vision_supported: bool,
-    ) -> Result<PreparedChatRequest, ApiError> {
+    ) -> Result<(PreparedChatRequest, bool), ApiError> {
         self.serving
             .prepare(req, model_id, default_max_tokens, max_tokens_cap)
-            .map(|(prepared, _)| prepared)
+            .map(|(prepared, config)| (prepared, config.enable_thinking))
     }
 
     fn normalize_standalone(

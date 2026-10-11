@@ -107,12 +107,12 @@ mod imp {
     use lattice_inference::model_format::{self, ModelFamily, ModelFormat};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatReq, GenerationDefaults, ServeProfile, is_message_flood_error,
-        message_flood_text, normalize_request,
+        message_flood_text,
     };
     #[cfg(test)]
     use lattice_inference::serve::contract::{
         ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, ValidatedChatRequest,
-        normalize_messages,
+        normalize_messages, normalize_request,
     };
     use lattice_inference::serve::embeddings::{
         TextEmbeddingsRequest, build_embeddings_response, check_embeddings_item_fits_window,
@@ -125,7 +125,7 @@ mod imp {
         WorkerMetadata,
     };
     use lattice_inference::serve::metrics::ServeMetrics;
-    use lattice_inference::serve::prepare::build_cfg;
+    use lattice_inference::serve::prepare::prepare_standalone_chat_request;
     use lattice_inference::serving_provider::{
         self, ServingEntry, StandaloneLoadOptions, StandaloneOptionPresence, StandaloneQwenLoader,
     };
@@ -2131,21 +2131,21 @@ mod imp {
             return err.into_response();
         }
         let normalized = match s.jobs.preparation() {
-            Some(preparation) => preparation.normalize_standalone(
+            Some(preparation) => preparation.prepare_standalone(
                 &req,
                 s.defaults,
                 s.model_id.as_ref(),
                 s.jobs.supports_vision(),
             ),
-            None => normalize_request(
+            None => prepare_standalone_chat_request(
                 &req,
                 s.defaults,
                 ServeProfile::lattice_serve(s.model_id.as_ref(), s.model_max_context)
                     .with_vision_support(s.jobs.supports_vision()),
             ),
         };
-        let validated = match normalized {
-            Ok(validated) => validated,
+        let (validated, mut cfg) = match normalized {
+            Ok(prepared) => prepared,
             Err(err) => {
                 emit_serve_event(
                     &s.metrics,
@@ -2187,10 +2187,6 @@ mod imp {
                 );
                 return err_response(err.status(), err.message(), err.code());
             }
-        };
-        let mut cfg = match s.jobs.preparation() {
-            Some(preparation) => preparation.standalone_generate_config(&validated),
-            None => build_cfg(&validated),
         };
         // Wire the compiled grammar into the worker config (design note
         // §"End-to-end execution", step 4) and force `enable_thinking` off
@@ -3919,6 +3915,7 @@ mod imp {
         use lattice_inference::serve::metal_worker::{
             WorkerMessage, spawn_fake, spawn_fake_with_vision, test_client_and_jobs,
         };
+        use lattice_inference::serve::prepare::build_cfg;
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use std::sync::Arc;
 

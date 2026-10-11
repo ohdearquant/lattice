@@ -20,11 +20,13 @@ use crate::serve::ApiError;
 #[cfg(test)]
 use crate::serve::contract::GenerationDefaults;
 use crate::serve::contract::{
-    ChatRequest as ChatCompletionRequest, ValidatedChatRequest as ContractValidatedChatRequest,
+    ChatRequest as ChatCompletionRequest, ServeProfile,
+    ValidatedChatRequest as ContractValidatedChatRequest,
 };
 
 pub use crate::serve::prompt_adapter::GemmaPromptAdapter;
 pub use crate::serving_preparation::PreparationHandle;
+use crate::serving_preparation::PreparedCpuChat;
 
 /// The `lattice_serve` handler's name for the validated request type.
 type ValidatedChatRequest = ContractValidatedChatRequest;
@@ -42,7 +44,6 @@ pub struct PreparedChatRequest {
     pub prompt: String,
     pub stop_strings: Vec<String>,
     pub reasoning_budget: Option<usize>,
-    pub enable_thinking: bool,
     pub seed: Option<u64>,
     pub stream: bool,
 }
@@ -84,6 +85,53 @@ pub fn prepare_chat_request(
         vision_supported,
         tokenize_len,
         max_context,
+    )
+    .map(|(prepared, _)| prepared)
+}
+
+/// Retain the effective template mode beside the prepared prompt in its config.
+#[doc(hidden)]
+pub fn prepare_chat_request_with_config(
+    req: &ChatCompletionRequest,
+    model_id: &str,
+    default_max_tokens: usize,
+    max_tokens_cap: usize,
+    vision_supported: bool,
+    tokenize_len: impl FnOnce(&str) -> usize,
+    max_context: impl FnOnce() -> usize,
+) -> Result<PreparedCpuChat, ApiError> {
+    let (prepared, enable_thinking) =
+        crate::serving_provider::providers::qwen::prepare_chat_request(
+            req,
+            model_id,
+            default_max_tokens,
+            max_tokens_cap,
+            vision_supported,
+            tokenize_len,
+            max_context,
+        )?;
+    let config = lattice_gen_cfg_with_thinking(
+        prepared.max_tokens,
+        prepared.temperature,
+        prepared.top_p,
+        prepared.seed,
+        prepared.stop_strings.clone(),
+        prepared.reasoning_budget,
+        prepared.logprobs,
+        enable_thinking,
+    );
+    Ok(PreparedCpuChat { prepared, config })
+}
+
+/// Keep the standalone Qwen wire options and config in one preparation step.
+#[doc(hidden)]
+pub fn prepare_standalone_chat_request(
+    req: &ChatCompletionRequest,
+    defaults: crate::serve::contract::GenerationDefaults,
+    profile: ServeProfile<'_>,
+) -> Result<(ValidatedChatRequest, GenerateConfig), ApiError> {
+    crate::serving_provider::providers::qwen::prepare_standalone_chat_request(
+        req, defaults, profile,
     )
 }
 
@@ -192,8 +240,9 @@ pub fn lora_unsupported_backend() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatCompletionRequest, GenerationDefaults, PreparationHandle, build_cfg, lattice_gen_cfg,
-        lattice_gen_cfg_with_thinking, prepare_chat_request,
+        ChatCompletionRequest, GenerationDefaults, PreparationHandle, lattice_gen_cfg,
+        lattice_gen_cfg_with_thinking, prepare_chat_request, prepare_chat_request_with_config,
+        prepare_standalone_chat_request,
     };
     use crate::serve::ApiError;
     use crate::tokenizer::bpe::BpeTokenizer;
@@ -244,59 +293,44 @@ mod tests {
     #[test]
     fn qwen_thinking_switch_renders_the_checkpoint_closed_prefix() {
         let base = gemma_request(serde_json::json!({"model": "served-model"}));
-        let default =
-            prepare_chat_request(&base, "served-model", 64, 4096, false, str::len, || 4096)
-                .expect("default thinking request");
+        let default = prepare_chat_request_with_config(
+            &base,
+            "served-model",
+            64,
+            4096,
+            false,
+            str::len,
+            || 4096,
+        )
+        .expect("default thinking request");
         assert_eq!(
-            default.prompt,
+            default.prepared.prompt,
             "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
         );
-        assert!(default.enable_thinking);
-        let cpu = crate::serving_provider::providers::qwen::cpu::from_model(
-            crate::model::qwen35::test_support::tiny_zero_model_with_context(4096),
-        );
-        let cpu_default = cpu
-            .prepare(&base, "served-model", 64, 4096)
-            .expect("CPU provider default thinking request");
-        assert_eq!(cpu_default.prepared.prompt, default.prompt);
-        assert!(cpu_default.prepared.enable_thinking);
-        assert!(cpu_default.config.enable_thinking);
+        assert!(default.config.enable_thinking);
         for enabled in [true, false] {
             let req = gemma_request(serde_json::json!({
                 "model": "served-model",
                 "chat_template_kwargs": {"enable_thinking": enabled},
             }));
-            let prepared =
-                prepare_chat_request(&req, "served-model", 64, 4096, false, str::len, || 4096)
-                    .expect("explicit thinking switch");
+            let prepared = prepare_chat_request_with_config(
+                &req,
+                "served-model",
+                64,
+                4096,
+                false,
+                str::len,
+                || 4096,
+            )
+            .expect("explicit thinking switch");
             let expected = if enabled {
-                default.prompt.clone()
+                default.prepared.prompt.clone()
             } else {
                 "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
                     .to_string()
             };
-            assert_eq!(prepared.prompt, expected);
-            assert_eq!(prepared.enable_thinking, enabled);
-            let cfg = lattice_gen_cfg_with_thinking(
-                prepared.max_tokens,
-                prepared.temperature,
-                prepared.top_p,
-                prepared.seed,
-                prepared.stop_strings,
-                prepared.reasoning_budget,
-                prepared.logprobs,
-                prepared.enable_thinking,
-            );
-            assert_eq!(cfg.enable_thinking, enabled);
-            let cpu_prepared = cpu
-                .prepare(&req, "served-model", 64, 4096)
-                .expect("CPU provider explicit thinking switch");
-            assert_eq!(cpu_prepared.prepared.prompt, expected);
-            assert_eq!(cpu_prepared.prepared.enable_thinking, enabled);
-            assert_eq!(
-                crate::serve::GenerateConfigSnapshot::from(&cpu_prepared.config),
-                crate::serve::GenerateConfigSnapshot::from(&cfg),
-            );
+            assert_eq!(prepared.prepared.prompt, expected);
+            assert_eq!(prepared.config.enable_thinking, enabled);
         }
     }
 
@@ -307,7 +341,7 @@ mod tests {
             "max_tokens": 9,
             "chat_template_kwargs": {"enable_thinking": false},
         }));
-        let baseline = prepare_chat_request(
+        let baseline = prepare_chat_request_with_config(
             &without_budget,
             "served-model",
             64,
@@ -317,14 +351,14 @@ mod tests {
             || 4096,
         )
         .expect("no-budget request");
-        let context = baseline.prompt.len() + 9 + 1;
+        let context = baseline.prepared.prompt.len() + 9 + 1;
         let with_budget = gemma_request(serde_json::json!({
             "model": "served-model",
             "max_tokens": 9,
             "reasoning_budget": 4096,
             "chat_template_kwargs": {"enable_thinking": false},
         }));
-        let prepared = prepare_chat_request(
+        let prepared = prepare_chat_request_with_config(
             &with_budget,
             "served-model",
             64,
@@ -334,10 +368,10 @@ mod tests {
             || context,
         )
         .expect("disabled reasoning budget consumes no context");
-        assert_eq!(prepared.prompt, baseline.prompt);
-        assert_eq!(prepared.max_tokens, 9);
-        assert!(!prepared.enable_thinking);
-        assert_eq!(prepared.reasoning_budget, None);
+        assert_eq!(prepared.prepared.prompt, baseline.prepared.prompt);
+        assert_eq!(prepared.prepared.max_tokens, 9);
+        assert!(!prepared.config.enable_thinking);
+        assert_eq!(prepared.prepared.reasoning_budget, None);
         let cfg =
             lattice_gen_cfg_with_thinking(9, 0.0, 1.0, None, Vec::new(), Some(4096), None, false);
         assert!(!cfg.enable_thinking);
@@ -387,19 +421,26 @@ mod tests {
                 body["reasoning_budget"] = serde_json::json!(4096);
             }
             let req = serde_json::from_value(body).expect("image request");
-            let prepared =
-                prepare_chat_request(&req, "served-model", 64, 4096, true, str::len, || 4096)
-                    .expect("vision-capable preparation");
+            let prepared = prepare_chat_request_with_config(
+                &req,
+                "served-model",
+                64,
+                4096,
+                true,
+                str::len,
+                || 4096,
+            )
+            .expect("vision-capable preparation");
             let effective = enabled.unwrap_or(true);
-            assert_eq!(prepared.enable_thinking, effective);
-            assert_eq!(prepared.reasoning_budget, None);
+            assert_eq!(prepared.config.enable_thinking, effective);
+            assert_eq!(prepared.prepared.reasoning_budget, None);
             let expected = if effective {
                 plain.to_owned()
             } else {
                 "<|im_start|>user\nbeforeafter<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".to_owned()
             };
-            assert_eq!(prepared.prompt, expected);
-            let image = prepared.messages[0]
+            assert_eq!(prepared.prepared.prompt, expected);
+            let image = prepared.prepared.messages[0]
                 .image
                 .as_ref()
                 .expect("image survived normalization");
@@ -416,26 +457,26 @@ mod tests {
             ..GenerationDefaults::standard(64)
         };
         for enabled in [false, true] {
-            let validated = handle
-                .normalize_standalone(
-                    &gemma_request(serde_json::json!({
-                        "max_tokens": 9,
-                        "chat_template_kwargs": {"enable_thinking": enabled},
-                    })),
-                    defaults,
-                    "served-model",
-                    false,
-                )
+            let request = gemma_request(serde_json::json!({
+                "max_tokens": 9,
+                "chat_template_kwargs": {"enable_thinking": enabled},
+            }));
+            let (validated, cfg) = handle
+                .prepare_standalone(&request, defaults, "served-model", false)
                 .expect("standalone request");
-            assert_eq!(validated.enable_thinking, enabled);
             let expected_budget = if enabled { Some(4086) } else { None };
             assert_eq!(validated.reasoning_budget, expected_budget);
-            let cfg = handle.standalone_generate_config(&validated);
             assert_eq!(cfg.enable_thinking, enabled);
             assert_eq!(cfg.reasoning_budget, expected_budget);
+            let (_, free_cfg) = prepare_standalone_chat_request(
+                &request,
+                defaults,
+                crate::serve::contract::ServeProfile::lattice_serve("served-model", 4096),
+            )
+            .expect("standalone free preparation");
             assert_eq!(
                 crate::serve::GenerateConfigSnapshot::from(&cfg),
-                crate::serve::GenerateConfigSnapshot::from(&build_cfg(&validated)),
+                crate::serve::GenerateConfigSnapshot::from(&free_cfg),
             );
         }
     }
@@ -478,7 +519,7 @@ mod tests {
     fn gemma_thinking_true_is_refused_and_false_is_a_noop() {
         let handle = gemma_handle();
         let base = handle
-            .prepare_lattice(
+            .prepare_lattice_with_config(
                 &gemma_request(serde_json::json!({"model": "served-model"})),
                 "served-model",
                 64,
@@ -487,7 +528,7 @@ mod tests {
             )
             .expect("plain Gemma request");
         let disabled = handle
-            .prepare_lattice(
+            .prepare_lattice_with_config(
                 &gemma_request(
                     serde_json::json!({"model": "served-model", "chat_template_kwargs": {"enable_thinking": false}}),
                 ),
@@ -497,9 +538,12 @@ mod tests {
                 false,
             )
             .expect("Gemma false is a no-op");
-        assert_eq!(disabled.prompt, base.prompt);
-        assert!(!disabled.enable_thinking);
-        assert_eq!(disabled.reasoning_budget, base.reasoning_budget);
+        assert_eq!(disabled.prepared.prompt, base.prepared.prompt);
+        assert!(!disabled.config.enable_thinking);
+        assert_eq!(
+            disabled.prepared.reasoning_budget,
+            base.prepared.reasoning_budget
+        );
         let base_validated = handle
             .normalize_standalone(
                 &gemma_request(serde_json::json!({})),
@@ -518,7 +562,11 @@ mod tests {
                 false,
             )
             .expect("standalone Gemma false is a no-op");
-        assert!(!disabled_validated.enable_thinking);
+        assert!(
+            !handle
+                .standalone_generate_config(&disabled_validated)
+                .enable_thinking
+        );
         assert_eq!(
             crate::serve::GenerateConfigSnapshot::from(
                 &handle.standalone_generate_config(&base_validated)

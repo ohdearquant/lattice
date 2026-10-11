@@ -29,9 +29,11 @@ use lattice_inference::serve::contract::{
 };
 #[cfg(test)]
 use lattice_inference::serve::into_engine_chat_messages;
-#[cfg(any(feature = "metal-gpu", test))]
+use lattice_inference::serve::prepare::PreparedChatRequest;
+#[cfg(test)]
 use lattice_inference::serve::prepare::prepare_chat_request;
-use lattice_inference::serve::prepare::{PreparedChatRequest, lattice_gen_cfg_with_thinking};
+#[cfg(feature = "metal-gpu")]
+use lattice_inference::serve::prepare::prepare_chat_request_with_config;
 use lattice_inference::{GenerateOutput, TokenLogprob};
 use serde::Serialize;
 use serde_json::Value;
@@ -182,65 +184,19 @@ pub enum ModelBackend {
 }
 
 impl ModelBackend {
-    #[allow(clippy::too_many_arguments)]
-    fn generation_config(
-        &self,
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        seed: Option<u64>,
-        stop_strings: Vec<String>,
-        reasoning_budget: Option<usize>,
-        logprobs: Option<usize>,
-        enable_thinking: bool,
-    ) -> lattice_inference::GenerateConfig {
-        #[cfg(feature = "metal-gpu")]
-        if let ModelBackend::Metal { handle, .. } = self
-            && let Some(preparation) = handle.client.preparation()
-        {
-            return preparation.lattice_generate_config_with_thinking(
-                max_tokens,
-                temperature,
-                top_p,
-                seed,
-                stop_strings,
-                reasoning_budget,
-                logprobs,
-                enable_thinking,
-            );
-        }
-        lattice_gen_cfg_with_thinking(
-            max_tokens,
-            temperature,
-            top_p,
-            seed,
-            stop_strings,
-            reasoning_budget,
-            logprobs,
-            enable_thinking,
-        )
-    }
-
-    /// The prepared request and its config when provider preparation supplies one.
-    /// `None` leaves `generation_config` to build it from the prepared fields.
+    /// Prepare the prompt and provider config together before worker submission.
     fn prepare_chat_request(
         &self,
         req: &ChatCompletionRequest,
         model_id: &str,
         default_max_tokens: usize,
         max_tokens_cap: usize,
-    ) -> Result<
-        (
-            PreparedChatRequest,
-            Option<lattice_inference::GenerateConfig>,
-        ),
-        ApiError,
-    > {
+    ) -> Result<(PreparedChatRequest, lattice_inference::GenerateConfig), ApiError> {
         #[cfg(not(feature = "metal-gpu"))]
         {
             let ModelBackend::Cpu(cpu) = self;
             let prepared = cpu.prepare(req, model_id, default_max_tokens, max_tokens_cap)?;
-            Ok((prepared.prepared, Some(prepared.config)))
+            Ok((prepared.prepared, prepared.config))
         }
         #[cfg(feature = "metal-gpu")]
         {
@@ -248,7 +204,7 @@ impl ModelBackend {
                 ModelBackend::Cpu(cpu) => {
                     let prepared =
                         cpu.prepare(req, model_id, default_max_tokens, max_tokens_cap)?;
-                    Ok((prepared.prepared, Some(prepared.config)))
+                    Ok((prepared.prepared, prepared.config))
                 }
                 ModelBackend::Metal {
                     handle,
@@ -257,16 +213,16 @@ impl ModelBackend {
                 } => {
                     if let Some(preparation) = handle.client.preparation() {
                         return preparation
-                            .prepare_lattice(
+                            .prepare_lattice_with_config(
                                 req,
                                 model_id,
                                 default_max_tokens,
                                 max_tokens_cap,
                                 self.supports_vision(),
                             )
-                            .map(|prepared| (prepared, None));
+                            .map(|prepared| (prepared.prepared, prepared.config));
                     }
-                    prepare_chat_request(
+                    prepare_chat_request_with_config(
                         req,
                         model_id,
                         default_max_tokens,
@@ -275,7 +231,7 @@ impl ModelBackend {
                         |prompt| self.tokenize_len(prompt),
                         || *max_context,
                     )
-                    .map(|prepared| (prepared, None))
+                    .map(|prepared| (prepared.prepared, prepared.config))
                 }
             }
         }
@@ -1119,36 +1075,19 @@ async fn chat_completions_with_request(
         PreparedChatRequest {
             messages: _normalized_messages,
             max_tokens,
-            temperature,
-            top_p,
             logprobs,
             prompt,
-            stop_strings,
             reasoning_budget,
-            enable_thinking,
-            seed,
             stream,
+            ..
         },
-        prepared_cfg,
+        gen_cfg,
     ) = state.model.prepare_chat_request(
         &req,
         &state.model_id,
         state.default_max_tokens,
         state.max_tokens_cap,
     )?;
-
-    let gen_cfg = prepared_cfg.unwrap_or_else(|| {
-        state.model.generation_config(
-            max_tokens,
-            temperature,
-            top_p,
-            seed,
-            stop_strings,
-            reasoning_budget,
-            logprobs,
-            enable_thinking,
-        )
-    });
 
     // Metal-only: reuse the exact messages normalized alongside the CPU
     // prompt, so role/content validation and allocation happen once.

@@ -100,8 +100,7 @@ impl PromptAdapter for QwenPromptAdapter {
         cfg.enable_mtp = None;
         cfg.grammar = None;
         cfg.stop_strings = req.stop_strings.clone();
-        cfg.enable_thinking = req.enable_thinking;
-        cfg.reasoning_budget = req.reasoning_budget.filter(|_| req.enable_thinking);
+        cfg.reasoning_budget = req.reasoning_budget;
         cfg.logprobs = req.logprobs;
         cfg
     }
@@ -192,7 +191,6 @@ impl QwenChatDefaults {
             stream: options.stream.unwrap_or(false),
             stop_strings: options.stop_strings,
             reasoning_budget,
-            enable_thinking,
             logprobs,
         })
     }
@@ -218,14 +216,14 @@ impl RequestPreparation for QwenPreparation {
         Some(&self.tokenizer)
     }
 
-    fn prepare_lattice(
+    fn prepare_lattice_with_thinking(
         &self,
         req: &ChatRequest,
         model_id: &str,
         default_max_tokens: usize,
         max_tokens_cap: usize,
         vision_supported: bool,
-    ) -> Result<PreparedChatRequest, ApiError> {
+    ) -> Result<(PreparedChatRequest, bool), ApiError> {
         prepare_chat_request(
             req,
             model_id,
@@ -254,6 +252,21 @@ impl RequestPreparation for QwenPreparation {
 
     fn standalone_generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig {
         build_cfg(req)
+    }
+
+    fn prepare_standalone(
+        &self,
+        req: &ChatRequest,
+        defaults: GenerationDefaults,
+        model_id: &str,
+        vision_supported: bool,
+    ) -> Result<(ValidatedChatRequest, GenerateConfig), ApiError> {
+        prepare_standalone_chat_request(
+            req,
+            defaults,
+            ServeProfile::lattice_serve(model_id, self.model_max_context)
+                .with_vision_support(vision_supported),
+        )
     }
 
     fn lattice_generate_config(
@@ -306,8 +319,8 @@ pub(crate) fn prepare_chat_request(
     vision_supported: bool,
     tokenize_len: impl FnOnce(&str) -> usize,
     max_context: impl FnOnce() -> usize,
-) -> Result<PreparedChatRequest, ApiError> {
-    let (validated, prompt) = normalize_request_with_context_and_thinking(
+) -> Result<(PreparedChatRequest, bool), ApiError> {
+    let (validated, prompt, enable_thinking) = normalize_request_with_context_and_thinking(
         req,
         GenerationDefaults::standard(default_max_tokens),
         ServeProfile::lattice(model_id, max_tokens_cap).with_vision_support(vision_supported),
@@ -331,26 +344,27 @@ pub(crate) fn prepare_chat_request(
         logprobs,
         stop_strings,
         reasoning_budget,
-        enable_thinking,
         seed,
         stream,
         ..
     } = validated;
     let messages = into_engine_chat_messages(messages)?;
 
-    Ok(PreparedChatRequest {
-        messages,
-        max_tokens,
-        temperature,
-        top_p,
-        logprobs,
-        prompt,
-        stop_strings,
-        reasoning_budget,
+    Ok((
+        PreparedChatRequest {
+            messages,
+            max_tokens,
+            temperature,
+            top_p,
+            logprobs,
+            prompt,
+            stop_strings,
+            reasoning_budget,
+            seed,
+            stream,
+        },
         enable_thinking,
-        seed,
-        stream,
-    })
+    ))
 }
 
 pub(crate) fn lattice_gen_cfg(
@@ -377,4 +391,19 @@ pub(crate) fn lattice_gen_cfg(
 
 pub(crate) fn build_cfg(req: &ValidatedChatRequest) -> GenerateConfig {
     QwenPromptAdapter.generate_config(req)
+}
+
+pub(crate) fn prepare_standalone_chat_request(
+    req: &ChatRequest,
+    defaults: GenerationDefaults,
+    profile: ServeProfile<'_>,
+) -> Result<(ValidatedChatRequest, GenerateConfig), ApiError> {
+    let (validated, _, enable_thinking) =
+        normalize_request_with_context_and_thinking(req, defaults, profile, |_, _, _, _| {
+            Ok(String::new())
+        })?;
+    let mut config = build_cfg(&validated);
+    config.enable_thinking = enable_thinking;
+    config.reasoning_budget = config.reasoning_budget.filter(|_| enable_thinking);
+    Ok((validated, config))
 }

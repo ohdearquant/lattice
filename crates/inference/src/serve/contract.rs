@@ -454,8 +454,6 @@ pub struct ValidatedChatRequest {
     pub stop_strings: Vec<String>,
     /// Effective reasoning-token budget.
     pub reasoning_budget: Option<usize>,
-    /// Effective thinking mode after model defaults and capability checks.
-    pub enable_thinking: bool,
     /// Number of alternative log probabilities to capture when enabled.
     pub logprobs: Option<usize>,
 }
@@ -535,7 +533,7 @@ pub fn normalize_request(
     profile: ServeProfile<'_>,
 ) -> Result<ValidatedChatRequest, ApiError> {
     normalize_request_inner(req, defaults, profile, |_, _, _, _| Ok(()))
-        .map(|(validated, ())| validated)
+        .map(|(validated, (), _)| validated)
 }
 
 /// Normalize a request while preserving the unified server's context-check precedence.
@@ -561,6 +559,7 @@ pub fn normalize_request_with_context_and_budget(
     normalize_request_inner(req, defaults, profile, |messages, max_tokens, budget, _| {
         check_context(messages, max_tokens, budget)
     })
+    .map(|(validated, prompt, _)| (validated, prompt))
 }
 
 /// Keep prompt rendering and context accounting on the same effective template mode.
@@ -574,7 +573,7 @@ pub(crate) fn normalize_request_with_context_and_thinking(
         Option<usize>,
         bool,
     ) -> Result<String, ApiError>,
-) -> Result<(ValidatedChatRequest, String), ApiError> {
+) -> Result<(ValidatedChatRequest, String, bool), ApiError> {
     normalize_request_inner(req, defaults, profile, check_context)
 }
 
@@ -606,12 +605,13 @@ fn normalize_request_inner<C>(
         Option<usize>,
         bool,
     ) -> Result<C, ApiError>,
-) -> Result<(ValidatedChatRequest, C), ApiError> {
+) -> Result<(ValidatedChatRequest, C, bool), ApiError> {
     let step = QwenChatDefaults::new(defaults);
     let (options, context) = requested_options_inner(req, profile, Some((&step, check_context)))?;
+    let enable_thinking = step.enable_thinking(options.enable_thinking);
     let validated = step.apply(options)?;
     match context {
-        Some(context) => Ok((validated, context)),
+        Some(context) => Ok((validated, context, enable_thinking)),
         None => Err(ApiError::Internal {
             message: "chat request preparation skipped its context check".to_string(),
         }),
@@ -2659,8 +2659,14 @@ mod tests {
                 let body = format!(
                     r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}]{field}}}"#
                 );
-                let validated = normalize_request(&request(&body), defaults(), profile).unwrap();
-                assert_eq!(validated.enable_thinking, expected, "field={field}");
+                let (_, _, enable_thinking) = normalize_request_with_context_and_thinking(
+                    &request(&body),
+                    defaults(),
+                    profile,
+                    |_, _, _, _| Ok(String::new()),
+                )
+                .unwrap();
+                assert_eq!(enable_thinking, expected, "field={field}");
             }
         }
     }
@@ -2762,7 +2768,7 @@ mod tests {
                 reasoning_budget: Some(20),
                 ..defaults()
             };
-            let (validated, prompt) = normalize_request_with_context_and_thinking(
+            let (validated, prompt, enable_thinking) = normalize_request_with_context_and_thinking(
                 &req,
                 generation,
                 ServeProfile::lattice("model", 100),
@@ -2774,7 +2780,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert!(!validated.enable_thinking);
+            assert!(!enable_thinking);
             assert_eq!(validated.reasoning_budget, None);
             assert_eq!(prompt, "prepared");
         }
@@ -2792,11 +2798,11 @@ mod tests {
                 Ok("three arguments".to_owned())
             })
             .unwrap();
-        assert!(!validated.enable_thinking);
+        assert_eq!(validated.reasoning_budget, None);
         let (validated, _) = normalize_request_with_context(&req, defaults(), profile, |_, _| {
             Ok("two arguments".to_owned())
         })
         .unwrap();
-        assert!(!validated.enable_thinking);
+        assert_eq!(validated.reasoning_budget, None);
     }
 }

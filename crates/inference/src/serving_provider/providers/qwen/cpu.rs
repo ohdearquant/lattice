@@ -11,7 +11,7 @@ use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::sync::Arc;
 
-use super::{build_cfg, lattice_gen_cfg, prepare_chat_request};
+use super::{build_cfg, lattice_gen_cfg, prepare_chat_request, prepare_standalone_chat_request};
 use crate::model::serving_runtime::{QwenCpuRuntime, ServingRuntime};
 use crate::serving_provider::CheckpointEvidence;
 
@@ -32,14 +32,14 @@ impl RequestPreparation for QwenCpuPreparation {
         Some(self.model.tokenizer())
     }
 
-    fn prepare_lattice(
+    fn prepare_lattice_with_thinking(
         &self,
         req: &ChatRequest,
         model_id: &str,
         default_max_tokens: usize,
         max_tokens_cap: usize,
         _vision_supported: bool,
-    ) -> Result<PreparedChatRequest, ApiError> {
+    ) -> Result<(PreparedChatRequest, bool), ApiError> {
         prepare_chat_request(
             req,
             model_id,
@@ -68,6 +68,21 @@ impl RequestPreparation for QwenCpuPreparation {
 
     fn standalone_generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig {
         build_cfg(req)
+    }
+
+    fn prepare_standalone(
+        &self,
+        req: &ChatRequest,
+        defaults: GenerationDefaults,
+        model_id: &str,
+        vision_supported: bool,
+    ) -> Result<(ValidatedChatRequest, GenerateConfig), ApiError> {
+        prepare_standalone_chat_request(
+            req,
+            defaults,
+            ServeProfile::lattice_serve(model_id, self.model.max_context())
+                .with_vision_support(vision_supported),
+        )
     }
 
     fn lattice_generate_config(
@@ -142,10 +157,59 @@ mod tests {
 
     #[test]
     fn cpu_source_holds_shared_model_and_preparation_resources() {
-        let model = crate::model::qwen35::test_support::tiny_zero_model_with_context(64);
-        assert_eq!(model.max_context(), 64);
+        let model = crate::model::qwen35::test_support::tiny_zero_model_with_context(4096);
+        assert_eq!(model.max_context(), 4096);
         let host = from_model(model);
         assert!(host.preparation().tokenizer().is_some());
         let _clone = host.clone();
+        let base: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "served-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 5,
+        }))
+        .expect("default request");
+        let default = crate::serve::prepare::prepare_chat_request_with_config(
+            &base,
+            "served-model",
+            64,
+            4096,
+            false,
+            str::len,
+            || 4096,
+        )
+        .expect("default preparation");
+        let cpu_default = host
+            .prepare(&base, "served-model", 64, 4096)
+            .expect("CPU provider default thinking request");
+        assert_eq!(cpu_default.prepared.prompt, default.prepared.prompt);
+        assert!(cpu_default.config.enable_thinking);
+        for enabled in [true, false] {
+            let req: ChatRequest = serde_json::from_value(serde_json::json!({
+                "model": "served-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 5,
+                "chat_template_kwargs": {"enable_thinking": enabled},
+            }))
+            .expect("explicit request");
+            let prepared = crate::serve::prepare::prepare_chat_request_with_config(
+                &req,
+                "served-model",
+                64,
+                4096,
+                false,
+                str::len,
+                || 4096,
+            )
+            .expect("explicit preparation");
+            let cpu_prepared = host
+                .prepare(&req, "served-model", 64, 4096)
+                .expect("CPU provider explicit thinking switch");
+            assert_eq!(cpu_prepared.prepared.prompt, prepared.prepared.prompt);
+            assert_eq!(cpu_prepared.config.enable_thinking, enabled);
+            assert_eq!(
+                crate::serve::GenerateConfigSnapshot::from(&cpu_prepared.config),
+                crate::serve::GenerateConfigSnapshot::from(&prepared.config),
+            );
+        }
     }
 }
