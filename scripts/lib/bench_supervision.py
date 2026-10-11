@@ -37,6 +37,7 @@ if sys.version_info < _MIN_PYTHON:
 
 import argparse
 import fcntl
+import json
 import os
 import re
 import runpy
@@ -53,6 +54,7 @@ STATUS_ENV = "LATTICE_BENCH_LOCK_STATUS"
 FDS_ENV = "LATTICE_BENCH_LOCK_FDS"
 SUPERVISOR_FD_ENV = "LATTICE_BENCH_SUPERVISOR_FD"
 QUIET_ENV = "LATTICE_BENCH_QUIET_SUPERVISION"
+TARGET_PROTECTION_ENV = "LATTICE_BENCH_CARGO_TARGET_PROTECTION"
 # Same name as bench-locks.py's own constant (#1643): once this process has
 # verified the inherited descriptors below, it is the one holding GPU_LOCK,
 # so its own non-handoff launch of `command` must name itself, not
@@ -323,6 +325,85 @@ def _handoff_quiet(label: str, mode: str) -> tuple[bool, str]:
     return True, "".join(output)
 
 
+def _cargo_target_directory(command: list[str]) -> Path:
+    metadata_args: list[str] = []
+    cargo = "cargo"
+    toolchain: list[str] = []
+    target_arg: str | None = None
+    if command and Path(command[0]).name == "cargo":
+        cargo = command[0]
+        remaining = command[1:]
+        if remaining and remaining[0].startswith("+"):
+            toolchain = [remaining[0]]
+            remaining = remaining[1:]
+        args = iter(remaining)
+        for arg in args:
+            if arg == "--":
+                break
+            if arg in ("--target-dir", "--manifest-path", "--config"):
+                value = next(args, None)
+                if not value:
+                    raise SupervisionError(f"{arg} has no value")
+                if arg == "--target-dir":
+                    target_arg = value
+                else:
+                    metadata_args.extend((arg, value))
+            elif arg.startswith("--target-dir="):
+                target_arg = arg.split("=", 1)[1]
+            elif arg.startswith(("--manifest-path=", "--config=")):
+                metadata_args.append(arg)
+    if target_arg is not None:
+        if not target_arg:
+            raise SupervisionError("--target-dir has no value")
+        return Path(target_arg).resolve()
+    if (
+        "CARGO_TARGET_DIR" in os.environ
+        and "CARGO_BUILD_TARGET_DIR" not in os.environ
+        and not any(arg == "--config" or arg.startswith("--config=") for arg in metadata_args)
+    ):
+        value = os.environ["CARGO_TARGET_DIR"]
+        if not value:
+            raise SupervisionError("CARGO_TARGET_DIR is empty")
+        return Path(value).resolve()
+
+    try:
+        result = subprocess.run(
+            [cargo, *toolchain, "metadata", "--format-version", "1", "--no-deps",
+             "--locked", "--offline", *metadata_args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SupervisionError(f"cannot resolve Cargo target directory: {exc}") from exc
+    if result.returncode != 0:
+        reason = result.stderr.strip() or f"cargo metadata exited {result.returncode}"
+        raise SupervisionError(f"cannot resolve Cargo target directory: {reason}")
+    try:
+        value = json.loads(result.stdout)["target_directory"]
+        if not isinstance(value, str) or not value or not Path(value).is_absolute():
+            raise ValueError("target_directory must be a nonempty absolute path")
+        return Path(value).resolve()
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        raise SupervisionError(f"invalid Cargo target directory metadata: {exc}") from exc
+
+
+def _protect_build_tree(tree: Path) -> bool:
+    try:
+        guard = subprocess.run(
+            ["/bin/bash", str(REPO / "scripts/lib/ensure-noindex-marker.sh"), str(tree)],
+            check=False,
+        )
+    except OSError as exc:
+        print(
+            f"bench-supervision: cannot protect {tree}: {exc}; refusing to measure",
+            file=sys.stderr,
+        )
+        return False
+    return guard.returncode == 0
+
+
 def run_supervised(
     label: str,
     command: list[str],
@@ -336,19 +417,16 @@ def run_supervised(
     if not command:
         raise SupervisionError("no measurement command supplied")
 
-    for tree in (REPO / "target", REPO / ".cache"):
-        try:
-            guard = subprocess.run(
-                ["/bin/bash", str(REPO / "scripts/lib/ensure-noindex-marker.sh"), str(tree)],
-                check=False,
-            )
-        except OSError as exc:
-            print(
-                f"bench-supervision: cannot protect {tree}: {exc}; refusing to measure",
-                file=sys.stderr,
-            )
-            return REFUSAL_EXIT
-        if guard.returncode != 0:
+    try:
+        trees = ((REPO / "target").resolve(), (REPO / ".cache").resolve())
+    except (OSError, RuntimeError) as exc:
+        print(
+            f"bench-supervision: cannot resolve build trees: {exc}; refusing to measure",
+            file=sys.stderr,
+        )
+        return REFUSAL_EXIT
+    for tree in trees:
+        if not _protect_build_tree(tree):
             return REFUSAL_EXIT
 
     if STATUS_ENV not in os.environ:
@@ -412,6 +490,18 @@ def run_supervised(
         os.execvpe(sys.executable, argv, env)
 
     _, inherited_fds, paths = verify_supervision()
+    try:
+        target = _cargo_target_directory(command)
+    except (SupervisionError, OSError, RuntimeError) as exc:
+        target_protection = json.dumps({"status": "unresolved", "reason": str(exc)})
+    else:
+        if target not in trees and not _protect_build_tree(target):
+            return REFUSAL_EXIT
+        target_protection = json.dumps({"status": "marked", "directory": str(target)})
+    print(
+        f"[bench-supervision] Run conditions: cargo target protection {target_protection}",
+        flush=True,
+    )
     plan = None
     if gpu_handoff is not None:
         try:
@@ -429,6 +519,7 @@ def run_supervised(
         return REFUSAL_EXIT
 
     child_env = os.environ.copy()
+    child_env[TARGET_PROTECTION_ENV] = target_protection
     child_env.pop(FDS_ENV, None)
     child_env.pop(SUPERVISOR_FD_ENV, None)
     if plan is not None:
