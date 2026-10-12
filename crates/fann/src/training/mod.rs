@@ -19,7 +19,10 @@ pub use backprop::BackpropTrainer;
 pub use ewc::DiagonalFisher;
 pub use gradient::GradientGuardStrategy;
 #[cfg(feature = "online-router")]
-pub use rloo::{RlooConfig, RlooTrainer};
+pub use rloo::{
+    BatchRefitOutcome, ExploredAction, MixtureSample, RlooConfig, RlooTrainer,
+    leave_one_out_advantages,
+};
 
 use crate::error::FannResult;
 use crate::network::Network;

@@ -10,6 +10,9 @@
 - [`RlooTrainer`](#reinforce-with-leave-one-out-rloo) (`training::rloo`, feature
   `online-router`) — a REINFORCE policy-gradient trainer for selector-gate networks
   (e.g. adapter/expert routers), with an optional leave-one-out variance reducer.
+- the explored-mixture entry points on `RlooTrainer` (`step_with_explored_action`,
+  `step_batch_with_explored_actions`) — the whole-served-mixture action of ADR-096
+  decision 3, where the scored density is that of the served logits.
 
 Backprop and RLOO operate directly on `Network`/`Layer` buffers — there is no
 separate training-graph representation. Their gradients are computed by
@@ -436,6 +439,41 @@ returns zero. Both batch helpers reject a frequency vector whose width does not
 match the probability vector, rather than defaulting it to uniform.
 For nonempty logits, the internal softmax and log-sum-exp routines subtract the
 maximum logit before exponentiating to avoid overflow.
+
+### Explored mixture action (`step_with_explored_action`)
+
+The entries above take a single `action_idx`. A completion produced by a
+weighted mixture does not identify such an index, so the whole-mixture path is a
+separate entry rather than a wrapper that picks the largest weight. Under
+explicitly enabled learning the gate's raw logits gain Gaussian noise at a
+recorded scale `s`, independent per output: the served logits are `z' = z + e`
+with `e ~ N(0, s^2 I)`.
+
+`step_with_explored_action` scores the density of `z'` (ADR-096 decision 3,
+amended 2026-09-21), not of the weights. The applied mixture is
+`floor(softmax(z'))`, and the floor clamps a set of coordinates before
+renormalising, so the distribution of the weights has positive mass on a
+lower-dimensional face and no density with respect to Lebesgue measure;
+`z' | z` is a proper Gaussian density everywhere and is what the server already
+records. The output-layer term is therefore
+
+```text
+g[j] = reward · (z[j] − z'[j]) / s^2                                (policy)
+     + aux_coeff · (1/tau) · (load-balance gradient at w_full)       (load-balance)
+     + z_coeff   · 2 · LSE · p[j]                                    (z-loss)
+```
+
+with no derivative taken through the softmax or the floor: both sit downstream
+of the sampled action and affect only the reward earned. `w_full` and `tau` feed
+the load-balance term and the traffic mass exactly as in
+`step_with_learned_weights`. The returned scalar is the reward-weighted negative
+log density without its constant, `reward · ‖z' − z‖² / (2 s^2)`.
+
+The batch entry `step_batch_with_explored_actions` takes a round of recorded
+actions and a leave-one-out baseline over the round. Every sample's gradient is
+taken at the gate that produced the actions, every sample is validated before any
+is applied, and a round whose rewards are all equal is a byte-for-byte no-op,
+including a round of one.
 
 ### Phase 2: multi-sample RLOO (`rloo_step`, not the default path)
 
