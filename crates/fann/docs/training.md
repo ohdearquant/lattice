@@ -468,11 +468,13 @@ sit downstream of the sampled action and affect only the reward earned. The
 **z-loss** term is an ordinary function of the gate's own logits and
 probabilities. The **load-balance** term in this path takes the recorded
 mixture `w_full` as its probability input (not the gate's own softmax) and is
-scaled by `1/tau`; the gate's own logits enter the applied update only through
-the backward pass that carries the output-layer delta to the weights. `w_full`
-and `tau` feed the load-balance term and the traffic mass exactly as in
-`step_with_learned_weights`. The returned scalar is the reward-weighted negative
-log density without its constant, `reward · ‖z' − z‖² / (2 s^2)`.
+scaled by `1/tau`. The load-balance term is the only one that reads `w_full`
+instead of the gate's own logits: the gate's logits enter the policy and z-loss
+terms when the output-layer delta is formed, and the backward pass then carries
+that delta to the weights. `w_full` and `tau` feed the load-balance term and the
+traffic mass exactly as in `step_with_learned_weights`. The returned scalar is
+the reward-weighted negative log density without its constant,
+`reward · ‖z' − z‖² / (2 s^2)`.
 
 The batch entry `step_batch_with_explored_actions` takes a round of recorded
 actions and a leave-one-out baseline over the round. Every sample's gradient is
@@ -487,11 +489,18 @@ least one non-zero advantage the update is the mean over **all** `n` samples,
 as ADR-096 decision 3 writes it. Averaging over `n` rather than over the
 contributors keeps the policy term continuous in the rewards — a reward a hair
 off a tie cannot move a sample between denominators and rescale the whole step —
-and averages each regulariser over the round it belongs to. A round whose every
-advantage is zero is the exception: the **gate** is left byte-for-byte
-unchanged, its weights and its biases, including a round of one, because there
-is no policy update for the regularisers to shape. The frequency EMA still folds
-every validated sample either way.
+and averages each regulariser over the round it belongs to. The load-balance and
+z-loss terms are averaged over all `n` samples of the round; that is the
+intended reading. ADR-096 decision 3
+(`docs/adr/ADR-096-producing-a-router-artifact.md`) writes the policy term as a
+mean over events `i = 1..n` and does not fix the regularisers' denominator. A
+round whose every advantage is zero is the exception: the **gate** is left
+byte-for-byte unchanged, its weights and its biases, including a round of one,
+because there is no policy update for the regularisers to shape. Exactly equal
+rewards therefore change nothing, while rewards that differ by any amount apply
+the load-balance and z-loss terms over all `n` samples: a round moves from no
+update at all to a regulariser update as soon as its rewards stop being exactly
+equal. The frequency EMA still folds every validated sample either way.
 
 Before anything is written, the guard on every update checks that every
 gradient entry and every candidate `w − lr·g` / `b − lr·g` is finite; a finite

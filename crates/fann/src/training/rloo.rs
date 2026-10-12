@@ -319,18 +319,19 @@ fn validate_weighted_aux(label: &str, gate: &Network, w_full: &[f32], tau: f32) 
 /// recorded decision rather than about the update, and because a batch has
 /// to check both for every sample before applying any of them.
 ///
-/// The up-front checks here refuse a non-finite `context` entry, `sampled_logits`
-/// entry or `w_full` entry, and the listed domain errors (a negative or
-/// non-finite `exploration_scale`, a `tau` that is not finite and strictly
-/// positive, and a `tau` whose `1 / tau` is not finite), before any work; each
-/// refusal names the field and the value it saw. `w_full` and `tau` go through
-/// [`validate_weighted_aux`], which is also what
-/// [`RlooTrainer::step_with_learned_weights`] uses, so the two paths cannot
-/// drift about what a usable weight vector is. The scale is checked here as
-/// well as through the reciprocal the update path takes, because `1.0 / 0.0`
-/// is infinite rather than zero: a scale of `0.0` would arrive there as `inf`,
-/// which the finite check catches while naming a number the caller never
-/// supplied.
+/// This function refuses a non-finite `sampled_logits` entry or `w_full` entry
+/// and the listed domain errors (a negative or non-finite `exploration_scale`,
+/// a `tau` that is not finite and strictly positive, and a `tau` whose `1 / tau`
+/// is not finite), before any work; each refusal names the field and the value
+/// it saw. A non-finite `context` entry is not a fact about the recorded action,
+/// so it is refused by [`validate_action`] instead, which every caller runs
+/// before this one. `w_full` and `tau` go through [`validate_weighted_aux`],
+/// which is also what [`RlooTrainer::step_with_learned_weights`] uses, so the
+/// two paths cannot drift about what a usable weight vector is. The scale is
+/// checked here as well as through the reciprocal the update path takes,
+/// because `1.0 / 0.0` is infinite rather than zero: a scale of `0.0` would
+/// arrive there as `inf`, which the finite check catches while naming a number
+/// the caller never supplied.
 ///
 /// These checks do not make the whole call finite-input-safe: a finite input
 /// can still overflow the update arithmetic (the policy and load-balance
@@ -480,11 +481,12 @@ impl RlooTrainer {
     /// [`Self::step_with_learned_weights`].
     ///
     /// A non-finite context entry or a non-finite reward is refused before
-    /// anything is applied, and a finite input whose update would still
-    /// overflow is refused at the apply, before anything is written. Those are
-    /// the only inputs whose result changes: for every other input this call is
-    /// bit-identical to its previous form, and the newly refused inputs are
-    /// exactly the ones that previously wrote a non-finite value into the gate.
+    /// anything is applied, exactly as before. The one change in behaviour is
+    /// the refusal of a finite input whose update would still overflow: that is
+    /// now refused at the apply, before anything is written, and the inputs it
+    /// newly refuses are exactly the ones that previously wrote a non-finite
+    /// value into the gate. Every other input is bit-identical to its previous
+    /// form.
     pub fn step(
         &mut self,
         gate: &mut Network,
@@ -527,13 +529,14 @@ impl RlooTrainer {
     /// that the update path's `1 / tau` factor be finite, and does not
     /// reimplement that floor.
     ///
-    /// A non-finite context entry, a non-finite reward, or a non-finite
-    /// `w_full` entry is refused before anything is applied, and a finite input
-    /// whose update would still overflow is refused at the apply, before
-    /// anything is written. Those are the only inputs whose result changes: for
-    /// every other input this call is bit-identical to its previous form, and
-    /// the newly refused inputs are exactly the ones that previously wrote a
-    /// non-finite value into the gate.
+    /// A non-finite context entry, a non-finite reward, a non-finite `w_full`
+    /// entry, a `tau` that is not finite and strictly positive, and a `tau`
+    /// whose `1 / tau` is not finite are refused before anything is applied,
+    /// exactly as before. The one change in behaviour is the refusal of a
+    /// finite input whose update would still overflow: that is now refused at
+    /// the apply, before anything is written, and the inputs it newly refuses
+    /// are exactly the ones that previously wrote a non-finite value into the
+    /// gate. Every other input is bit-identical to its previous form.
     pub fn step_with_learned_weights(
         &mut self,
         gate: &mut Network,
@@ -975,7 +978,9 @@ impl RlooTrainer {
     /// Runs a Gumbel-top-`k` RLOO update with a leave-one-out baseline.
     ///
     /// Pair its positive events with [`Self::step`] negative feedback; a positive-only stream is invalid.
-    /// Returns the mean sampled reward or a validation error.
+    /// Returns the mean sampled reward or a validation error. A finite update
+    /// whose arithmetic would still overflow is refused at the apply, before
+    /// anything is written, and returns that error in place of the reward.
     /// See [`docs/training.md`](../../docs/training.md#phase-2-multi-sample-rloo-rloo_step-not-the-default-path) for sampling and update details.
     pub fn rloo_step(
         &mut self,
@@ -1123,28 +1128,40 @@ impl RlooTrainer {
         Ok(reward_sum / m_samples as f32)
     }
 
-    /// The routing-frequency EMA, sized to `k` and initialised uniform on first use.
+    /// The routing-frequency EMA, sized to `k` and initialised uniform on first
+    /// use.
     ///
     /// Uniform initialisation is what makes the guard silent on a fresh trainer:
     /// at `f_i = 1/k` for every `i` the load-balance gradient is identically zero
     /// regardless of how sharp the gate is, so the term contributes nothing until
     /// observed routing actually drifts away from balance. That is the intended
     /// semantics, not an accident of initialisation.
-    fn route_freqs_or_uniform(&mut self, k: usize) -> Vec<f32> {
+    ///
+    /// Reads only: it returns the uniform vector for an unsized field without
+    /// storing it. The field is sized by [`Self::observe_routing`] when the
+    /// first decision is actually folded, so an update refused before it
+    /// applies leaves the field exactly as it found it — an uninitialised
+    /// trainer included.
+    fn route_freqs_or_uniform(&self, k: usize) -> Vec<f32> {
         if self.route_freqs.len() != k {
-            self.route_freqs = vec![1.0 / k as f32; k];
+            vec![1.0 / k as f32; k]
+        } else {
+            self.route_freqs.clone()
         }
-        self.route_freqs.clone()
     }
 
-    /// Fold one routing decision into the frequency EMA.
+    /// Fold one routing decision into the frequency EMA, sizing it uniform on
+    /// first use (or after a width change) before the fold.
     ///
     /// `mass` is the share of this decision attributed to each expert and sums to
     /// one: a one-hot vector for the single-sample path, and the empirical
     /// selection frequency across the sampled subsets for the multi-sample path.
+    /// This is the only writer of the field, so it is reached only by a call
+    /// whose update was applied (or, for an all-equal round, deliberately
+    /// skipped); a refusal never gets here.
     fn observe_routing(&mut self, mass: &[f32]) {
         if self.route_freqs.len() != mass.len() {
-            return;
+            self.route_freqs = vec![1.0 / mass.len() as f32; mass.len()];
         }
         for (f, &m) in self.route_freqs.iter_mut().zip(mass.iter()) {
             *f = (1.0 - ROUTE_FREQ_DECAY) * *f + ROUTE_FREQ_DECAY * m;
@@ -2981,8 +2998,11 @@ mod tests {
     ///
     /// `w_full = [3e38, 0, 0, 0]` is finite of the right width and its `tau = 1`
     /// inverts, so the up-front validation accepts it; but the load-balance
-    /// gradient `k * p * (f - f.p)` is infinite at index 0 once `f.p` is of
-    /// order `1e38`. Fails if the apply writes a non-finite candidate.
+    /// gradient `k * p * (f - f.p)` overflows at index 0 in the `k * p` product
+    /// alone: `4 * 3e38 = 1.2e39` is past `f32::MAX`, whatever `f - f.p` is.
+    /// The product is evaluated left to right, so the gradient is non-finite
+    /// before the difference is even reached. Fails if the apply writes a
+    /// non-finite candidate.
     #[test]
     fn a_finite_w_full_entry_that_overflows_the_load_balance_term_is_refused() {
         let w_full = [3e38_f32, 0.0, 0.0, 0.0];
@@ -3117,6 +3137,241 @@ mod tests {
         assert!(
             err.to_string().contains("layer"),
             "the refusal must name the layer: {err}"
+        );
+        assert_eq!(
+            (gate.to_bytes(), trainer.route_freqs.clone()),
+            before,
+            "the refused update wrote something"
+        );
+    }
+
+    /// A finite gradient whose SGD step still overflows is refused, with the
+    /// gate and the traffic EMA left unchanged.
+    ///
+    /// The output-layer delta is finite here — `reward = 1e38` against a
+    /// one-unit logit difference — and so is every gradient: this fixture is a
+    /// single Linear layer whose weights the context shrinks (every
+    /// `|context_j| < 0.5`) and whose bias gradients are the delta itself,
+    /// `-1e38`. The gradient check therefore passes while
+    /// `learning_rate * gradient` is past `f32::MAX`: at `learning_rate = 4`
+    /// the candidate `w - lr * g` is `inf`. This is the case the candidate arm
+    /// exists for, so removing that arm makes the write succeed and this
+    /// `unwrap_err` panic. Fails if the apply writes a non-finite candidate.
+    #[test]
+    fn a_finite_gradient_whose_step_overflows_is_refused() {
+        let w_full = [0.5_f32, 0.0, 0.5, 0.0];
+        let config = RlooConfig {
+            learning_rate: 4.0,
+            aux_loss_coeff: 0.0,
+            z_loss_coeff: 0.0,
+        };
+        let lr = config.learning_rate;
+        let base = linear_gate();
+        let (mut gate, mut trainer) = drifted_off_uniform(&base, config);
+        let z = gate.forward(&CTX).unwrap().to_vec();
+        let served: Vec<f32> = z.iter().map(|zj| zj + 1.0).collect();
+
+        // Fixture: every gradient is finite and the candidate is not. The
+        // gradients are `delta_i * context_j` for the weights and `delta_i` for
+        // the biases, and the context entries are all below 0.5 in magnitude.
+        let reward = 1e38_f32;
+        assert!(reward.is_finite(), "fixture: the reward must be finite");
+        let delta: Vec<f32> = z
+            .iter()
+            .zip(served.iter())
+            .map(|(zj, sj)| reward * (zj - sj) * (1.0 / (1.0 * 1.0)))
+            .collect();
+        assert!(
+            delta.iter().all(|d| d.is_finite()),
+            "fixture: every output delta must be finite, got {delta:?}"
+        );
+        assert!(
+            CTX.iter().all(|x| x.abs() < 0.5),
+            "fixture: every context entry must shrink the weight gradient"
+        );
+        assert!(
+            delta.iter().any(|d| !(lr * d).is_finite()),
+            "fixture: some lr * delta must overflow, got {:?}",
+            delta.iter().map(|d| lr * d).collect::<Vec<_>>()
+        );
+
+        let before = (gate.to_bytes(), trainer.route_freqs.clone());
+        let err = trainer
+            .step_with_explored_action(
+                &mut gate,
+                &CTX,
+                &ExploredAction {
+                    sampled_logits: &served,
+                    exploration_scale: 1.0,
+                    w_full: &w_full,
+                    tau: 1.0,
+                },
+                reward,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("layer"),
+            "the refusal must name the layer: {err}"
+        );
+        assert_eq!(
+            (gate.to_bytes(), trainer.route_freqs.clone()),
+            before,
+            "the refused update wrote something"
+        );
+    }
+
+    /// A non-finite `learning_rate` is refused at the write and leaves the gate
+    /// unchanged, rather than writing NaN into every parameter.
+    ///
+    /// The config fields are `pub` and unvalidated, so a NaN rate is a
+    /// caller's to supply; what the learner guarantees is that the refusal
+    /// happens before anything is written, on the single-step entry as well as
+    /// the batch. Fails if the write happens without the candidate check.
+    #[test]
+    fn a_non_finite_learning_rate_is_refused_at_the_write() {
+        let config = RlooConfig {
+            learning_rate: f32::NAN,
+            aux_loss_coeff: 0.01,
+            z_loss_coeff: 0.001,
+        };
+        let mut gate = test_gate();
+        let mut trainer = RlooTrainer::with_seed(config, 1);
+
+        let before = (gate.to_bytes(), trainer.route_freqs.clone());
+        let err = trainer.step(&mut gate, &CTX, 0, 1.0).unwrap_err();
+        assert!(
+            err.to_string().contains("layer"),
+            "the refusal must name the layer: {err}"
+        );
+        assert_eq!(
+            (gate.to_bytes(), trainer.route_freqs.clone()),
+            before,
+            "the refused update wrote something"
+        );
+    }
+
+    /// A refused update leaves an uninitialised trainer's traffic estimate
+    /// exactly as it was: empty, not filled with the uniform vector the next
+    /// successful call would start from.
+    ///
+    /// The uniform fill happens when a decision is folded, and a refused
+    /// update never folds one, so the first call being refused leaves the
+    /// field unset. Fails if the fill moves back ahead of the apply.
+    #[test]
+    fn a_refused_first_update_leaves_the_traffic_estimate_unset() {
+        let config = RlooConfig {
+            learning_rate: 4.0,
+            aux_loss_coeff: 0.0,
+            z_loss_coeff: 0.0,
+        };
+        let mut gate = linear_gate();
+        let mut trainer = RlooTrainer::with_seed(config, 1);
+        assert!(
+            trainer.route_freqs.is_empty(),
+            "fixture: a fresh trainer must have no traffic estimate"
+        );
+
+        let z = gate.forward(&CTX).unwrap().to_vec();
+        let served: Vec<f32> = z.iter().map(|zj| zj + 1.0).collect();
+        let reward = 1e38_f32;
+
+        let before = (gate.to_bytes(), trainer.route_freqs.clone());
+        let err = trainer
+            .step_with_explored_action(
+                &mut gate,
+                &CTX,
+                &ExploredAction {
+                    sampled_logits: &served,
+                    exploration_scale: 1.0,
+                    w_full: &[0.5_f32, 0.0, 0.5, 0.0],
+                    tau: 1.0,
+                },
+                reward,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("layer"),
+            "the refusal must name the layer: {err}"
+        );
+        assert!(
+            trainer.route_freqs.is_empty(),
+            "the refused update sized the traffic estimate: {:?}",
+            trainer.route_freqs
+        );
+        assert_eq!((gate.to_bytes(), trainer.route_freqs.clone()), before);
+    }
+
+    /// A round whose first candidate is finite but a later one is not is
+    /// refused as a whole: the finite candidate is not written on the way to
+    /// discovering the non-finite one.
+    ///
+    /// The output layer is `Linear`, so its weight gradients are
+    /// `delta_i * context_j` and its bias gradients are `delta_i`. Every
+    /// `delta_i` is `-1e38`, so the bias gradients are finite and their step
+    /// `lr * delta_i` is `-4e38`, past `f32::MAX`; the weight gradients shrink
+    /// by `|context_j| < 0.5` and their step stays finite. The apply visits
+    /// layer 0's weights (all 16 finite) before layer 0's biases, so
+    /// `bias[0]` is the first non-finite candidate and every candidate before
+    /// it is finite. Fails if the apply writes each candidate as it is checked:
+    /// the finite weight candidates would then already be in the gate.
+    #[test]
+    fn a_round_with_a_finite_candidate_before_a_non_finite_one_writes_nothing() {
+        // A single Linear layer: 4 inputs, 4 outputs, no hidden layer.
+        let config = RlooConfig {
+            learning_rate: 4.0,
+            aux_loss_coeff: 0.0,
+            z_loss_coeff: 0.0,
+        };
+        let lr = config.learning_rate;
+        let base = linear_gate();
+        let (mut gate, mut trainer) = drifted_off_uniform(&base, config);
+        let z = gate.forward(&CTX).unwrap().to_vec();
+        // The delta is `reward * (z - z')`; `z' - z` is exactly one for every
+        // index, so all four entries are `-reward`.
+        let served: Vec<f32> = z.iter().map(|zj| zj + 1.0).collect();
+        let reward = 1e38_f32;
+
+        let delta: Vec<f32> = z
+            .iter()
+            .zip(served.iter())
+            .map(|(zj, sj)| reward * (zj - sj) * (1.0 / (1.0 * 1.0)))
+            .collect();
+        assert!(
+            delta.iter().all(|d| d.is_finite()),
+            "fixture: every delta must be finite, got {delta:?}"
+        );
+        // The weight gradient is `delta * context_j`; every `|context_j|` is
+        // below 0.5, so the first weight candidate is finite. The apply forms
+        // the step as `lr * (delta * context)`, not `(lr * delta) * context`.
+        let first_weight_step = lr * (delta[0] * CTX[0]);
+        assert!(
+            first_weight_step.is_finite(),
+            "fixture: the first weight step must be finite, got {first_weight_step}"
+        );
+        // The bias gradient is the delta itself; the step from it overflows.
+        assert!(
+            !(lr * delta[3]).is_finite(),
+            "fixture: the bias step must overflow, got {}",
+            lr * delta[3]
+        );
+
+        let before = (gate.to_bytes(), trainer.route_freqs.clone());
+        let err = trainer
+            .step_with_explored_action(
+                &mut gate,
+                &CTX,
+                &ExploredAction {
+                    sampled_logits: &served,
+                    exploration_scale: 1.0,
+                    w_full: &[0.5_f32, 0.0, 0.5, 0.0],
+                    tau: 1.0,
+                },
+                reward,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("bias") || err.to_string().contains("weight"),
+            "the refusal must name the parameter: {err}"
         );
         assert_eq!(
             (gate.to_bytes(), trainer.route_freqs.clone()),
@@ -4036,9 +4291,11 @@ mod tests {
     /// round whose rewards are all equal has every advantage zero and applies
     /// nothing, while a round a hair off the tie has a non-zero advantage, so
     /// the regularisers (aux and z-loss) enter and the step moves by their mean
-    /// over the round. That step is the ADR-096 rule for a round with nothing
-    /// to compare, and it is a step in the applied update, not in the policy
-    /// term.
+    /// over the round. That discontinuity comes from ADR-096's no-op rule for a
+    /// round with nothing to compare; it is a step in the applied update, not in
+    /// the policy term. This test zeroes both regularisers, so what it measures
+    /// is the policy term alone: the continuity the `1 / n` divisor buys when
+    /// the contributor count changes.
     ///
     /// Rewards `[1, 2, 3]` give advantages `[-1.5, 0, 1.5]` — two contributors
     /// out of three — and rewards `[1, 2, 3.001]` give three non-zero
