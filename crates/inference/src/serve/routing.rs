@@ -848,6 +848,7 @@ mod tests {
                 adapter_names: vec!["technical".into()],
                 representation: rep,
                 gate_bytes: gate(),
+                provenance: crate::router_state::RouterProvenance::Legacy,
             },
             pinned: false,
         };
@@ -894,6 +895,7 @@ mod tests {
             adapter_names: names.iter().map(|n| (*n).to_string()).collect(),
             representation: representation(4),
             gate_bytes: vec![0],
+            provenance: crate::router_state::RouterProvenance::Legacy,
         }
     }
 
@@ -1247,6 +1249,7 @@ mod tests {
                 adapter_names: vec!["technical".into()],
                 representation: representation(4),
                 gate_bytes: gate_bytes.clone(),
+                provenance: crate::router_state::RouterProvenance::Legacy,
             })
             .is_ok(),
             "a truthful artifact must construct, or the refusal proves nothing"
@@ -1257,6 +1260,7 @@ mod tests {
             adapter_names: vec!["technical".into()],
             representation: representation(1024),
             gate_bytes,
+            provenance: crate::router_state::RouterProvenance::Legacy,
         }) {
             Err(err) => {
                 let m = err.message();
@@ -1296,6 +1300,7 @@ mod tests {
             adapter_names: vec!["technical".into(), "legal".into()],
             representation: representation(4),
             gate_bytes: gate(2),
+            provenance: crate::router_state::RouterProvenance::Legacy,
         };
         assert!(
             ServingRouter::new(ok).is_ok(),
@@ -1308,6 +1313,7 @@ mod tests {
                 adapter_names: (0..names).map(|i| format!("a{i}")).collect(),
                 representation: representation(4),
                 gate_bytes: gate(outputs),
+                provenance: crate::router_state::RouterProvenance::Legacy,
             };
             match ServingRouter::new(artifact) {
                 Err(err) => {
