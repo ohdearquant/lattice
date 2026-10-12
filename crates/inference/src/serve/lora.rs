@@ -516,6 +516,7 @@ mod tests {
             max_consecutive_collapsed: 0,
             training_state: training_state.into(),
             objective_version: None,
+            exploration_scale: None,
         };
         let lineage = RouterLineage {
             schema_id: "schema-1".into(),

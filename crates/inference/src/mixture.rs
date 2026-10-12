@@ -143,6 +143,49 @@ pub enum RouterError {
     /// the round: there is nothing to measure entropy over.
     #[error("refit round has no weight vectors to measure entropy over")]
     EmptyRefitRound,
+
+    /// The exploration scale was not usable: it must be finite and strictly
+    /// positive. The draw is Gaussian on the raw logits, `z' = z + e` with
+    /// `e ~ N(0, s^2 I)`, so a zero scale is no perturbation at all while
+    /// claiming to record one, a negative scale is a distribution with the
+    /// same density (the square removes the sign) that reads as a different
+    /// policy, and a non-finite scale has no density to score.
+    #[error("exploration scale must be finite and > 0.0, got {scale}")]
+    InvalidExplorationScale {
+        /// The offending scale.
+        scale: f32,
+    },
+
+    /// The exploration scale was finite and strictly positive (so it passed
+    /// the basic validity check) but fell below [`MIN_EXPLORATION_SCALE`].
+    #[error("exploration scale {scale} is below the minimum {floor}")]
+    ExplorationScaleBelowFloor {
+        /// The offending (too-small but otherwise valid) scale.
+        scale: f32,
+        /// The minimum it fell below. Widened to the artifact's own type so
+        /// the router and the file it loads compare the same number.
+        floor: f64,
+    },
+
+    /// A draw was requested in a configuration where it cannot reach the
+    /// action: [`WeightPolicy::Uniform`] over every candidate the gate scores.
+    ///
+    /// The selected set is then all of them whatever the perturbation does,
+    /// and every weight is `1/k` whatever the scores are, so the served
+    /// mixture is the same for any gate and any seed. The draw would still
+    /// record a scale, a seed and a set of sampled logits -- known variation
+    /// in the event log that the action never had.
+    #[error(
+        "a draw cannot change this decision: the uniform policy over all {candidates} scored \
+         candidate(s) with k={k} selects the whole set and weights it 1/k regardless of the \
+         gate's scores; narrow k, or name a policy that reads the scores"
+    )]
+    ExplorationCannotChangeTheAction {
+        /// The requested top-k, equal to `candidates`.
+        k: usize,
+        /// The number of candidates the gate can score.
+        candidates: usize,
+    },
 }
 
 /// Named mixture weight policy for [`AdapterRouter::route`] (ADR-091).
@@ -178,6 +221,37 @@ pub struct FloorOutcome {
     /// Adapters that were present before the floor and removed for falling
     /// below `epsilon`.
     pub dropped: Vec<AdapterId>,
+}
+
+/// Everything a routing decision was made from, returned by
+/// [`AdapterRouter::route_detailed`] and [`AdapterRouter::route_explored`].
+///
+/// [`AdapterRouter::route`] returns only [`RouteOutcome::weights`]; this
+/// carries the sampled logits, the pre-floor weights and the exploration draw
+/// so a learner reading a decision can see what the policy proposed as well as
+/// what was served. The floor can drop an adapter entirely, so the applied
+/// weights alone cannot say what the policy proposed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteOutcome {
+    /// The weights the request ran with, after the floor and renormalisation.
+    pub weights: Vec<(AdapterId, f32)>,
+    /// The weights the policy produced, before the floor.
+    pub pre_floor_weights: Vec<(AdapterId, f32)>,
+    /// The gate scores `z` of the selected columns, in selection order.
+    pub selected_scores: Vec<(AdapterId, f32)>,
+    /// The logits the selection and the weight policy actually consumed, for
+    /// the selected columns, in selection order: `z` on the deterministic
+    /// path and `z'` under a draw.
+    pub sampled_scores: Vec<(AdapterId, f32)>,
+    /// Adapters the floor removed. Also readable from
+    /// [`AdapterRouter::last_dropped`], which this does not replace.
+    pub dropped: Vec<AdapterId>,
+    /// The exploration draw that produced this decision, or `None` when the
+    /// decision was the gate's deterministic one. `selected_scores` holds the
+    /// gate's own scores either way, so a learner reading an outcome can tell
+    /// what the policy computed from what the draw served without having to
+    /// know which mode the request ran in.
+    pub exploration: Option<ExplorationOutcome>,
 }
 
 /// Default floor on the softmax temperature `tau` (ADR-091 Decision 3,
@@ -221,6 +295,59 @@ pub const DEFAULT_ENTROPY_FLOOR: f32 = 0.1;
 /// small, bounded number of refit cycles. Policy, not derivation; see
 /// [`DEFAULT_ENTROPY_FLOOR`].
 pub const DEFAULT_MAX_CONSECUTIVE_COLLAPSED: usize = 3;
+
+/// Smallest exploration scale [`AdapterRouter::route_explored`] accepts.
+///
+/// Re-exported rather than defined here, because the artifact validates
+/// against the same number and two constants with one meaning drift: see
+/// [`crate::router_state::MIN_EXPLORATION_SCALE`] for what the value is and
+/// why it refuses instead of clamping.
+pub use crate::router_state::MIN_EXPLORATION_SCALE;
+
+/// A request to draw the routing decision instead of computing it
+/// (ADR-096 decision 3).
+///
+/// Exploration is per-call rather than router state on purpose: the scale is
+/// recorded on every event it produced, so a learner can weight an event by
+/// the scale that actually drew it. A scale held on the router would be a
+/// second place for the served configuration to live, and the recorded events
+/// would be the copy that drifts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Exploration {
+    /// Standard deviation of the Gaussian perturbation added to the gate's
+    /// raw logits. Must be finite, strictly positive, and at least
+    /// [`MIN_EXPLORATION_SCALE`].
+    pub scale: f32,
+    /// Seed for this decision's draw. The caller owns seed derivation, so a
+    /// server can tie the seed to the completion id and reproduce the exact
+    /// mixture a request ran with from the recorded event alone.
+    pub seed: u64,
+}
+
+/// What an exploration draw did, recorded beside the decision it produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplorationOutcome {
+    /// The scale the draw used.
+    pub scale: f32,
+    /// The seed the draw used.
+    pub seed: u64,
+    /// The sampled logits `z'` the selection and the weight policy consumed:
+    /// one value per gate output, in gate column order, including outputs the
+    /// selection or the floor removed. These are what the density below is
+    /// scored against; [`RouteOutcome::selected_scores`] holds the
+    /// deterministic gate scores `z` of the selected adapters, and
+    /// [`RouteOutcome::sampled_scores`] holds `z'` for those same adapters.
+    pub sampled_logits: Vec<f32>,
+    /// The density of `z'` given `z` under `N(z, s^2 I)`, as a natural log:
+    /// `-||z' - z||^2 / (2 s^2) - (n / 2) ln(2 pi s^2)`, with `n` the number
+    /// of gate outputs. This is the quantity the ADR scores, chosen over the
+    /// density of the applied weights because ADR-091's floor puts the
+    /// weight distribution on a lower-dimensional face with no Lebesgue
+    /// density. Recorded for audit; a learner takes its gradient,
+    /// `(z' - z) / s^2`, which needs no derivative of the floor or the
+    /// softmax.
+    pub log_density: f64,
+}
 
 /// Routes a context vector to a top-k subset of available adapters and
 /// assigns each a mixture weight under the router's [`WeightPolicy`].
@@ -415,6 +542,77 @@ impl AdapterRouter {
         available: &[AdapterId],
         k: usize,
     ) -> Result<Vec<(AdapterId, f32)>, RouterError> {
+        self.route_detailed(context_vector, available, k)
+            .map(|outcome| outcome.weights)
+    }
+
+    /// Route, and return everything the decision was made from.
+    ///
+    /// The same computation as [`route`](Self::route), which is a wrapper over
+    /// this. One implementation, deliberately: a second body that produced the
+    /// weights alongside their provenance would be a copy of the routing rule,
+    /// and the copy that drifts is the one the audit trail is built on -- so
+    /// the recorded logits would stop being the logits that were served
+    /// without anything failing.
+    ///
+    /// ADR-096 decision 3 requires a feedback event to carry the sampled
+    /// logits and the pre-floor weights alongside the applied ones. The floor
+    /// can drop an adapter entirely, so the applied weights alone cannot say
+    /// what the policy proposed, and a learner reading only them would credit
+    /// a mixture that was never formed.
+    pub fn route_detailed(
+        &mut self,
+        context_vector: &[f32],
+        available: &[AdapterId],
+        k: usize,
+    ) -> Result<RouteOutcome, RouterError> {
+        self.route_explored(context_vector, available, k, None)
+    }
+
+    /// Route, optionally drawing the decision instead of computing it.
+    ///
+    /// The single routing body: [`route`](Self::route) and
+    /// [`route_detailed`](Self::route_detailed) are both wrappers over this,
+    /// and `exploration: None` reproduces them exactly, bit for bit. ADR-096
+    /// decision 3 requires the served mixture to be the learned action, which
+    /// means the exploration has to happen inside the decision rather than
+    /// beside it -- a sampler that picked a mixture and then asked the router
+    /// to weight it would record logits the request never ran with.
+    ///
+    /// # Exploration
+    ///
+    /// Under `Some(exploration)` the gate's raw logits `z` gain independent
+    /// Gaussian noise at the given scale, `z' = z + e` with `e ~ N(0, s^2 I)`,
+    /// and the top-`k` selection and the weight policy both consume `z'`
+    /// exactly as the deterministic path consumes `z`, followed by the same
+    /// floor. This is an explicit amendment to ADR-091 decision 1, stated in
+    /// ADR-096 decision 3: during enabled learning the logits are not solely
+    /// the deterministic scores the gate computes. The argument is
+    /// identifiability -- one scalar judgement of one deterministic mixture
+    /// contains neither a target column nor any observation of an alternative
+    /// mixture, and recorded randomisation supplies known variation without
+    /// inventing either.
+    ///
+    /// What is scored later is the density of `z'` given `z`, recorded here as
+    /// [`ExplorationOutcome::log_density`], not the density of the applied
+    /// weights: ADR-091's floor clamps a set of coordinates and renormalises
+    /// the rest, so the weight distribution has no density with respect to
+    /// Lebesgue measure in exactly the region the floor produces.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`route`](Self::route) returns, plus
+    /// [`RouterError::InvalidExplorationScale`] and
+    /// [`RouterError::ExplorationScaleBelowFloor`] for an unusable scale, and
+    /// [`RouterError::ExplorationCannotChangeTheAction`] for a draw over a
+    /// decision the perturbation cannot move.
+    pub fn route_explored(
+        &mut self,
+        context_vector: &[f32],
+        available: &[AdapterId],
+        k: usize,
+        exploration: Option<Exploration>,
+    ) -> Result<RouteOutcome, RouterError> {
         if k == 0 {
             return Err(RouterError::InvalidK { k });
         }
@@ -424,6 +622,31 @@ impl AdapterRouter {
                 available: available.len(),
             });
         }
+
+        // Validate the draw with the other arguments, before the gate runs: an
+        // unusable scale is a caller error of the same class as `k == 0`, and
+        // it is the pair this function carries forward, so validating here is
+        // also what lets the sampling path below hold a plain `(f32, u64)`
+        // rather than re-checking an option it already proved.
+        let draw = match exploration {
+            None => None,
+            Some(Exploration { scale, seed }) => {
+                if !scale.is_finite() || scale <= 0.0 {
+                    return Err(RouterError::InvalidExplorationScale { scale });
+                }
+                // Checked after the finite/positive check, never before it: a
+                // NaN scale must fail InvalidExplorationScale rather than
+                // silently skip this floor, since NaN compares false against
+                // `<` as it does against everything else.
+                if f64::from(scale) < MIN_EXPLORATION_SCALE {
+                    return Err(RouterError::ExplorationScaleBelowFloor {
+                        scale,
+                        floor: MIN_EXPLORATION_SCALE,
+                    });
+                }
+                Some((scale, seed))
+            }
+        };
 
         // Reject duplicate IDs before running the gate: a duplicate would cause
         // one adapter to be selected and weighted twice (fail-open).
@@ -467,7 +690,39 @@ impl AdapterRouter {
             return Err(RouterError::GateTooNarrow { k, usable: n });
         }
 
-        let mut indexed: Vec<(usize, f32)> = scores[..n].iter().copied().enumerate().collect();
+        // Refused here rather than at the caller, because this is the only
+        // place both halves are visible: the policy is router state and `k`
+        // is per-call. ADR-096 decision 4 makes the point for the serving
+        // path -- evidence that a learned policy works has to show the request
+        // coefficients change -- and a draw over a decision whose coefficients
+        // cannot change is that failure with a randomiser attached.
+        //
+        // Uniform over every candidate gives `1/k` whatever the scores are, so
+        // a draw over it records variation the action never had. A SINGLE
+        // candidate is the other door into the same defect: it takes weight
+        // 1.0 under every policy, softmax included, so the draw would describe
+        // a decision that had exactly one outcome. `n == 1` implies `k == 1`
+        // implies `k == n`, so it needs no `k` term of its own.
+        if draw.is_some() && (n == 1 || (k == n && self.weight_policy == WeightPolicy::Uniform)) {
+            return Err(RouterError::ExplorationCannotChangeTheAction { k, candidates: n });
+        }
+
+        // What the selection and the weight policy consume: the gate's own
+        // logits, or those logits perturbed by this request's draw. `scores`
+        // itself is left alone -- the deterministic values are what
+        // `selected_scores` reports, and a learner needs both.
+        let effective: Vec<f32> = match draw {
+            None => scores[..n].to_vec(),
+            Some((scale, seed)) => {
+                let mut state = seed;
+                scores[..n]
+                    .iter()
+                    .map(|score| score + scale * normal_from(&mut state) as f32)
+                    .collect()
+            }
+        };
+
+        let mut indexed: Vec<(usize, f32)> = effective.iter().copied().enumerate().collect();
         // Partial-sort in O(n) average: top-k elements land in indexed[..k].
         indexed.select_nth_unstable_by(k - 1, |a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
@@ -522,9 +777,55 @@ impl AdapterRouter {
             }
         };
 
+        // The gate's own scores for the selected adapters, and the logits the
+        // decision actually consumed. Under exploration these are two
+        // different claims, and the deterministic column is the one that is a
+        // function of the input alone.
+        let selected_scores: Vec<(AdapterId, f32)> = indexed[..k]
+            .iter()
+            .map(|(idx, _)| (available[*idx].clone(), scores[*idx]))
+            .collect();
+        let sampled_scores: Vec<(AdapterId, f32)> = indexed[..k]
+            .iter()
+            .map(|(idx, logit)| (available[*idx].clone(), *logit))
+            .collect();
+        let pre_floor_weights = raw_weights.clone();
+
+        let exploration_outcome = draw.map(|(scale, seed)| {
+            // The draw is `z' = z + e`; `effective` holds `z'` for the first
+            // `n` columns, so the difference recovers `e` and the density is a
+            // closed form over all gate outputs, including any the selection
+            // or the floor removed.
+            let squared: f64 = effective
+                .iter()
+                .zip(scores[..n].iter())
+                .map(|(drawn, own)| {
+                    let difference = f64::from(*drawn) - f64::from(*own);
+                    difference * difference
+                })
+                .sum();
+            let scale64 = f64::from(scale);
+            let n64 = n as f64;
+            let log_density = -squared / (2.0 * scale64 * scale64)
+                - (n64 / 2.0) * (2.0 * std::f64::consts::PI * scale64 * scale64).ln();
+            ExplorationOutcome {
+                scale,
+                seed,
+                sampled_logits: effective.clone(),
+                log_density,
+            }
+        });
+
         let FloorOutcome { weights, dropped } = floor_and_renormalize(raw_weights, self.epsilon);
-        self.last_dropped = dropped;
-        Ok(weights)
+        self.last_dropped = dropped.clone();
+        Ok(RouteOutcome {
+            weights,
+            pre_floor_weights,
+            selected_scores,
+            sampled_scores,
+            dropped,
+            exploration: exploration_outcome,
+        })
     }
 
     /// Return the number of inputs the gate network expects.
@@ -635,6 +936,56 @@ pub enum RefitOutcome {
         /// The consecutive-collapsed-round count that triggered rejection.
         consecutive_collapsed_rounds: usize,
     },
+}
+
+/// Advance `state` and return one 64-bit value: the SplitMix64 finalizer.
+///
+/// A recorded seed exists to reproduce a draw from a stored event, possibly
+/// across dependency bumps, so the generator has to be a fixed integer
+/// recurrence rather than a crate's default RNG: a stream free to change
+/// between minor releases cannot carry a reproducibility contract. The
+/// constants are SplitMix64's own.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Draw one standard normal `N(0, 1)` variate, advancing `state`.
+///
+/// Box-Muller from two uniforms. The generator is SplitMix64 with the
+/// dependency-free style the routing module already uses for recorded seeds,
+/// because a recorded seed exists to reproduce a draw from a stored event,
+/// possibly across dependency bumps, and a crate that documents its generators
+/// as not value-stable between minor releases cannot carry that contract.
+///
+/// The uniform is drawn from `(0, 1]`, never `[0, 1)`: `ln(u)` is the first
+/// step, and `u == 0.0` sends it to `-inf`. Drawing 53 random bits and adding
+/// one before scaling puts `u` at `1.0` for the all-ones draw and at `2^-53`
+/// for the all-zeros one, both strictly inside `(0, 1]`, so `ln(u)` is finite
+/// and `sqrt(-2 ln(u))` is finite. The magnitude is therefore bounded by the
+/// largest finite `sqrt(-2 ln u)` at `u = 2^-53`, roughly `8.6`, and the
+/// result is finite for every reachable `u`. The second uniform is
+/// `cos(2 pi v)` with `v` in `(0, 1]`, which is finite for every draw as well,
+/// so no reachable draw can produce a non-finite variate.
+fn normal_from(state: &mut u64) -> f64 {
+    let u = uniform_from(state);
+    let v = uniform_from(state);
+    (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+}
+
+/// Draw one uniform from `(0, 1]`, advancing `state`.
+///
+/// The `+ 1` before scaling is what keeps `u` off `0.0`: a plain
+/// `bits / 2^53` reaches `0.0` with probability `2^-53`, which is the one value
+/// `ln` cannot take. The scale is `2^-53`, so the reachable values are the
+/// `2^53` points `k * 2^-53` for `k` in `1..=2^53`, of which the largest is
+/// exactly `1.0`.
+fn uniform_from(state: &mut u64) -> f64 {
+    let bits = splitmix64(state) >> 11;
+    (bits as f64 + 1.0) * (1.0 / 9_007_199_254_740_992.0)
 }
 
 /// Shannon entropy, in nats, of a weight vector: `-Σ wᵢ · ln(wᵢ)`.
@@ -1455,6 +1806,468 @@ mod tests {
         assert_ne!(
             before, after,
             "an accepted refit must actually reload the gate"
+        );
+    }
+
+    /// The deterministic path is bit-identical: `exploration: None` reproduces
+    /// `route_detailed`, and the outcome carries no draw. The existing `route`
+    /// tests pin the weights; this pins that the wrapper and the explicit
+    /// `None` agree on the whole outcome.
+    ///
+    /// Would fail if `route_explored` perturbed anything when `draw` is `None`,
+    /// or if `route_detailed` stopped being the `None` arm.
+    #[test]
+    fn exploration_off_reproduces_the_deterministic_decision() {
+        let mut router = AdapterRouter::new(scored_gate(2, &[0.9, 0.4, 0.1]));
+        let pool: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let context = [1.0, 0.5];
+        let detailed = router.route_detailed(&context, &pool, 2).unwrap();
+        let explicit = router.route_explored(&context, &pool, 2, None).unwrap();
+        assert_eq!(detailed, explicit);
+        assert!(detailed.exploration.is_none());
+        assert_eq!(detailed.selected_scores, detailed.sampled_scores);
+        assert_eq!(router.route(&context, &pool, 2).unwrap(), detailed.weights);
+    }
+
+    /// Same seed, same inputs: identical `z'`, weights and `log_density`.
+    /// A different seed moves `z'`.
+    ///
+    /// Would fail if the generator stopped being a pure function of the seed,
+    /// or if the seed were ignored (the second half).
+    #[test]
+    fn a_draw_is_reproducible_from_its_recorded_seed() {
+        let mut router = AdapterRouter::new(scored_gate(2, &[0.9, 0.8, 0.7]));
+        let pool: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let context = [1.0, 0.5];
+        let draw = Some(Exploration {
+            scale: 0.5,
+            seed: 12_345,
+        });
+        let first = router.route_explored(&context, &pool, 2, draw).unwrap();
+        let second = router.route_explored(&context, &pool, 2, draw).unwrap();
+        assert_eq!(first, second, "the same seed must replay the same decision");
+
+        let other = router
+            .route_explored(
+                &context,
+                &pool,
+                2,
+                Some(Exploration {
+                    scale: 0.5,
+                    seed: 12_346,
+                }),
+            )
+            .unwrap();
+        let a = first.exploration.as_ref().unwrap();
+        let b = other.exploration.as_ref().unwrap();
+        assert_ne!(a.sampled_logits, b.sampled_logits, "a new seed must redraw");
+        assert_ne!(a.log_density, b.log_density);
+    }
+
+    /// Over a fixed seed and 20,000 draws on one context, the per-output mean
+    /// of `z' - z` is within 4 standard errors of 0 and the per-output variance
+    /// is within a stated tolerance of `s^2`, for two scales.
+    ///
+    /// The tolerance: the sample variance of a normal is itself random, with
+    /// relative standard error `sqrt(2 / (N - 1))`. At `N = 20,000` that is
+    /// about `1.0%`, so a 5% band is five standard errors of the estimator and
+    /// a real bias in the scale would have to be larger than 5% to hide. The
+    /// mean band is four standard errors of the mean, `4 * s / sqrt(N)`.
+    ///
+    /// Would fail if the draw dropped the `s` factor (variance collapses to 1
+    /// and the two scales agree), if it added the noise before scaling, or if
+    /// the generator were biased.
+    #[test]
+    fn the_draw_is_gaussian_with_the_recorded_scale() {
+        let context = [1.0, 0.5];
+        let pool: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let rounds = 20_000u64;
+        for scale in [0.5_f32, 2.0_f32] {
+            let mut router = AdapterRouter::new(scored_gate(2, &[0.3, 0.2, 0.1]));
+            // f32 constants converted exactly as the gate's own scores are,
+            // so the mean tests the draw and not the literal's precision.
+            let gate_scores = [0.3_f32, 0.2, 0.1];
+            let mut sums = [0.0_f64; 3];
+            let mut squares = [0.0_f64; 3];
+            for seed in 0..rounds {
+                let outcome = router
+                    .route_explored(&context, &pool, 2, Some(Exploration { scale, seed }))
+                    .unwrap();
+                let logits = &outcome.exploration.as_ref().unwrap().sampled_logits;
+                assert_eq!(logits.len(), 3, "one value per gate output");
+                for (i, drawn) in logits.iter().enumerate() {
+                    let difference = f64::from(*drawn) - f64::from(gate_scores[i]);
+                    sums[i] += difference;
+                    squares[i] += difference * difference;
+                }
+            }
+            let n = rounds as f64;
+            for i in 0..3 {
+                let mean = sums[i] / n;
+                let variance = squares[i] / n - mean * mean;
+                let standard_error = f64::from(scale) / n.sqrt();
+                assert!(
+                    mean.abs() < 4.0 * standard_error,
+                    "scale {scale}: output {i} mean {mean} outside 4 standard errors"
+                );
+                let expected = f64::from(scale) * f64::from(scale);
+                assert!(
+                    (variance - expected).abs() / expected < 0.05,
+                    "scale {scale}: output {i} variance {variance} is not within 5% of {expected}"
+                );
+            }
+        }
+    }
+
+    /// `log_density` equals the closed form computed independently in the test
+    /// from the recorded sampled logits and the deterministic gate scores.
+    ///
+    /// Would fail if the density were computed from the selected subset rather
+    /// than all gate outputs, if the `n` in the normalising term were the
+    /// selected width rather than the output count, or if the sign of the
+    /// quadratic term were flipped.
+    #[test]
+    fn the_log_density_matches_the_closed_form() {
+        let mut router = AdapterRouter::new(scored_gate(2, &[0.3, 0.2, 0.1]));
+        let pool: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let context = [1.0, 0.5];
+        // The gate's own f32 scores, converted the way the source converts
+        // them, so the closed form is compared bit for bit.
+        let gate_scores = [0.3_f32, 0.2, 0.1];
+        let scale = 0.75_f32;
+        let outcome = router
+            .route_explored(&context, &pool, 2, Some(Exploration { scale, seed: 99 }))
+            .unwrap();
+        let recorded = outcome.exploration.as_ref().unwrap();
+
+        let squared: f64 = recorded
+            .sampled_logits
+            .iter()
+            .zip(gate_scores.iter())
+            .map(|(drawn, own)| {
+                let difference = f64::from(*drawn) - f64::from(*own);
+                difference * difference
+            })
+            .sum();
+        let scale64 = f64::from(scale);
+        let n = gate_scores.len() as f64;
+        let expected = -squared / (2.0 * scale64 * scale64)
+            - (n / 2.0) * (2.0 * std::f64::consts::PI * scale64 * scale64).ln();
+        assert!(
+            (recorded.log_density - expected).abs() < 1e-12,
+            "recorded {} against closed form {expected}",
+            recorded.log_density
+        );
+        // The density is of `z'` given `z`, so a zero perturbation would give
+        // the density's maximum. The drawn value must be below it, and finite.
+        assert!(recorded.log_density.is_finite());
+        assert!(recorded.log_density < 0.0);
+    }
+
+    /// Every drawn value is finite over the same 20,000 draws, and the normal
+    /// sampler is driven directly with the boundary uniform value 1.0 and the
+    /// smallest value the generator can produce.
+    ///
+    /// Would fail if the uniform reached `0.0` (the `ln` of it is `-inf`) or if
+    /// the half-ulp offset were removed, which is the one change that lets the
+    /// all-zeros draw reach `0.0`.
+    #[test]
+    fn every_drawn_variate_is_finite() {
+        let mut state = 0u64;
+        for _ in 0..200_000 {
+            let variate = normal_from(&mut state);
+            assert!(variate.is_finite(), "{variate}");
+        }
+
+        // The generator's own range, checked directly: every value is in
+        // `(0, 1]`, so `ln` never sees `0.0`. This is what the `+ 1` before
+        // scaling buys, and removing it is the mutation that reaches `0.0`.
+        let mut range_state = 0u64;
+        for _ in 0..200_000 {
+            let u = uniform_from(&mut range_state);
+            assert!(u > 0.0 && u <= 1.0, "uniform out of (0, 1]: {u}");
+        }
+
+        // The boundary uniforms, fed straight in: the generator's largest and
+        // smallest reachable values, and 0.0, which the `+ 1` must make
+        // unreachable. `uniform_from` maps the all-ones bits to exactly 1.0
+        // and the all-zeros bits to the smallest positive it can produce; both
+        // must keep the normal finite.
+        for u in [1.0_f64, f64::MIN_POSITIVE, 1.0 / 9_007_199_254_740_992.0] {
+            let magnitude = (-2.0 * u.ln()).sqrt();
+            assert!(
+                magnitude.is_finite(),
+                "u = {u} gave a non-finite magnitude {magnitude}"
+            );
+            for v in [0.0_f64, 1.0] {
+                let variate = magnitude * (2.0 * std::f64::consts::PI * v).cos();
+                assert!(variate.is_finite(), "u = {u}, v = {v} gave {variate}");
+            }
+        }
+    }
+
+    /// Selection and weights are computed from `z'`: with `k` smaller than the
+    /// output count and a large `s`, the selected set differs from the
+    /// deterministic top-`k` for some seed; and with the same `z'` injected,
+    /// the draw's weights equal `route`'s weights on `z'`.
+    ///
+    /// Would fail if the perturbation were applied after the selection, or if
+    /// the weight policy read the deterministic scores instead of `z'`.
+    #[test]
+    fn selection_and_weights_are_computed_from_the_sampled_logits() {
+        let pool: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let context = [1.0, 0.5];
+        // Near-tied scores and a large scale: the deterministic top-1 is "a",
+        // and a draw has to be able to pick another column.
+        let mut router = AdapterRouter::new(scored_gate(2, &[0.30, 0.29, 0.28]));
+        let deterministic = router.route_detailed(&context, &pool, 1).unwrap();
+        let deterministic_choice = deterministic.weights[0].0.clone();
+        let mut seen_different = false;
+        for seed in 0..200u64 {
+            let outcome = router
+                .route_explored(&context, &pool, 1, Some(Exploration { scale: 3.0, seed }))
+                .unwrap();
+            if outcome.weights[0].0 != deterministic_choice {
+                seen_different = true;
+                break;
+            }
+        }
+        assert!(
+            seen_different,
+            "a large-scale draw over near-tied scores never changed the top-1"
+        );
+
+        // With the same `z'` injected, the draw's weights equal the
+        // deterministic route's weights on `z'`. A softmax router makes this a
+        // real comparison rather than `1/k` on both sides.
+        let mut drawn = AdapterRouter::new(scored_gate(2, &[0.30, 0.29, 0.28]));
+        drawn.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        let outcome = drawn
+            .route_explored(
+                &context,
+                &pool,
+                2,
+                Some(Exploration {
+                    scale: 1.0,
+                    seed: 4,
+                }),
+            )
+            .unwrap();
+        let logits = outcome.exploration.as_ref().unwrap().sampled_logits.clone();
+
+        // A gate that serves exactly `z'` deterministically: the bias vector
+        // is `z'`, so `route` on it consumes the same logits.
+        let mut injected = AdapterRouter::new(scored_gate(2, &logits));
+        injected.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        let direct = injected.route(&context, &pool, 2).unwrap();
+        assert_eq!(
+            outcome.weights, direct,
+            "the draw's weights must equal route's weights on the sampled logits"
+        );
+    }
+
+    /// A draw over a decision the perturbation cannot move is refused, naming
+    /// both escapes. Uniform with a narrower `k` is allowed, and a policy that
+    /// reads the scores is allowed.
+    ///
+    /// Would fail if the refusal were dropped, if it fired for a narrower `k`,
+    /// or if it fired for a softmax policy.
+    #[test]
+    fn a_draw_that_cannot_change_the_action_is_refused() {
+        let mut router = AdapterRouter::new(scored_gate(2, &[0.3, 0.2, 0.1]));
+        let pool: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let context = [1.0, 0.5];
+        let draw = Some(Exploration {
+            scale: 1.0,
+            seed: 1,
+        });
+
+        let error = router.route_explored(&context, &pool, 3, draw).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(
+                error,
+                RouterError::ExplorationCannotChangeTheAction {
+                    k: 3,
+                    candidates: 3
+                }
+            ),
+            "got {error}"
+        );
+        // Both escapes are named, so the refusal points at a fork rather than a
+        // dead end.
+        assert!(message.contains("narrow k"), "{message}");
+        assert!(message.contains("reads the scores"), "{message}");
+
+        // The deterministic path over the same shape is untouched: uniform
+        // over everything is a legitimate way to serve, it is only a
+        // dishonest way to explore.
+        assert!(router.route_detailed(&context, &pool, 3).is_ok());
+
+        // Both escapes, exercised: a narrower k lets the draw move the selected
+        // set, and a policy that reads the scores lets it move the weights.
+        assert!(router.route_explored(&context, &pool, 2, draw).is_ok());
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        assert!(router.route_explored(&context, &pool, 3, draw).is_ok());
+
+        // The second door into the same defect: ONE candidate. Softmax is an
+        // escape from the uniform case and not from this one, because a lone
+        // column takes weight 1.0 under every policy there is.
+        let mut single = AdapterRouter::new(scored_gate(2, &[0.3]));
+        let one: Vec<AdapterId> = vec!["a".into()];
+        single.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        let error = single.route_explored(&context, &one, 1, draw).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RouterError::ExplorationCannotChangeTheAction {
+                    k: 1,
+                    candidates: 1
+                }
+            ),
+            "got {error}"
+        );
+        // And the control: the same single-column router serves fine without a
+        // draw, so the refusal is about exploring it, not about routing it.
+        assert!(single.route_detailed(&context, &one, 1).is_ok());
+    }
+
+    /// An unusable scale is refused, and the floor itself is admissible.
+    ///
+    /// Would fail if a non-finite or non-positive scale fell through the
+    /// validity check, or if the floor refused the boundary value.
+    #[test]
+    fn an_unusable_exploration_scale_is_refused() {
+        let mut router = AdapterRouter::new(scored_gate(2, &[0.9, 0.4]));
+        let pool: Vec<AdapterId> = vec!["a".into(), "b".into()];
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let error = router
+                .route_explored(&[1.0, 0.5], &pool, 1, Some(Exploration { scale, seed: 1 }))
+                .unwrap_err();
+            assert!(
+                matches!(error, RouterError::InvalidExplorationScale { .. }),
+                "scale {scale} must fail the validity check, not fall through it: {error}"
+            );
+        }
+
+        let error = router
+            .route_explored(
+                &[1.0, 0.5],
+                &pool,
+                1,
+                Some(Exploration {
+                    scale: (MIN_EXPLORATION_SCALE / 2.0) as f32,
+                    seed: 1,
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RouterError::ExplorationScaleBelowFloor { floor, .. } if floor == MIN_EXPLORATION_SCALE
+        ));
+        // The floor itself is admissible: refusing at the boundary would make
+        // the documented minimum a value nothing can use.
+        assert!(
+            router
+                .route_explored(
+                    &[1.0, 0.5],
+                    &pool,
+                    1,
+                    Some(Exploration {
+                        scale: MIN_EXPLORATION_SCALE as f32,
+                        seed: 1,
+                    }),
+                )
+                .is_ok()
+        );
+    }
+
+    /// The gate's own scores survive the draw, the sampled logits are the
+    /// perturbed ones, and the dropped set is reported as `route` reports it.
+    ///
+    /// Would fail if `selected_scores` reported the perturbed values, or if the
+    /// draw recorded `z` instead of `z'`.
+    #[test]
+    fn the_gate_scores_survive_the_draw() {
+        let mut router = AdapterRouter::new(scored_gate(2, &[0.3, 0.2, 0.1]));
+        let pool: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let context = [1.0, 0.5];
+        // The deterministic arm takes every column so each adapter's gate score
+        // is available to compare against, whichever two the draw picks; the
+        // drawn arm takes two, because a uniform draw over the whole set cannot
+        // reach the action and is refused.
+        let deterministic = router.route_detailed(&context, &pool, 3).unwrap();
+        let drawn = router
+            .route_explored(
+                &context,
+                &pool,
+                2,
+                Some(Exploration {
+                    scale: 1.0,
+                    seed: 7,
+                }),
+            )
+            .unwrap();
+        let recorded = drawn.exploration.as_ref().unwrap();
+        for (id, score) in &drawn.selected_scores {
+            let expected = deterministic
+                .selected_scores
+                .iter()
+                .find(|(other, _)| other == id)
+                .map(|(_, score)| *score)
+                .unwrap();
+            assert_eq!(
+                *score, expected,
+                "selected_scores must stay the gate's own scores for {id}"
+            );
+        }
+        // The full sampled logits are the perturbed values, not the gate's
+        // own: compared against the deterministic arm's three scores.
+        let gate_vector: Vec<f32> = deterministic
+            .selected_scores
+            .iter()
+            .map(|(_, score)| *score)
+            .collect();
+        assert_eq!(gate_vector.len(), 3);
+        assert_ne!(
+            recorded.sampled_logits, gate_vector,
+            "the recorded sampled logits must be the perturbed ones"
+        );
+        assert_eq!(recorded.scale, 1.0);
+        assert_eq!(recorded.seed, 7);
+        assert_eq!(recorded.sampled_logits.len(), 3, "all gate outputs");
+        // `sampled_scores` is `z'` for the selected adapters, a slice of the
+        // full `z'`.
+        for (id, logit) in &drawn.sampled_scores {
+            let index = pool.iter().position(|p| p == id).unwrap();
+            assert_eq!(*logit, recorded.sampled_logits[index]);
+        }
+    }
+
+    /// A draw is not a policy change: the epoch and the router's own state are
+    /// untouched by drawing.
+    ///
+    /// Would fail if `route_explored` mutated the router's policy fields.
+    #[test]
+    fn a_draw_is_not_a_policy_change() {
+        let mut router = AdapterRouter::new(scored_gate(2, &[0.3, 0.2, 0.1]));
+        let pool: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let before = router.route_detailed(&[1.0, 0.5], &pool, 2).unwrap();
+        router
+            .route_explored(
+                &[1.0, 0.5],
+                &pool,
+                2,
+                Some(Exploration {
+                    scale: 1.0,
+                    seed: 3,
+                }),
+            )
+            .unwrap();
+        let after = router.route_detailed(&[1.0, 0.5], &pool, 2).unwrap();
+        assert_eq!(
+            before, after,
+            "drawing must not change the deterministic decision"
         );
     }
 
