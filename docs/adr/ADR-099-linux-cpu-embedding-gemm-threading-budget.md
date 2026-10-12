@@ -5,6 +5,7 @@
 **Crates**: lattice-inference, lattice-embed\
 **Scope**: f32 CPU embedding on Linux x86_64 and aarch64; shared CPU serving admission\
 **Requirements**: fast CPU embedding on Linux cloud hosts such as Fly and Hetzner, AMD x86_64
+first; speed first, so the fastest measured path that passes the correctness gates ships
 first; use multiple cores where that pays, within CPU and memory limits that protect the host;
 keep Apple silicon and edge devices (Linux ARM boards such as the Raspberry Pi 5) supported,
 each qualified on its own hardware\
@@ -118,32 +119,47 @@ the value of fast packed GEMM, but does not authorize shipping that substitution
 
 ## Decision
 
-### F1: own a narrow packed f32 core; use the dependencies as references
+### F1: ship stock `gemm` first under a bounded allocation exception
 
-Select **F1-A**, scoped to the measured f32 work. Integrate a Lattice-owned packed
-outer-product implementation with reusable, explicitly charged scratch. Audit and adapt
-permitted upstream Rust code where that reduces work; preserve its license and source
-provenance. Vendoring transfers maintenance and unsafe review to Lattice. It is not a
-correctness proof or a reason to copy an entire multi-dtype GEMM package.
+Select **F1-B**, speed first. Integrate stock `gemm` 0.18.2, pinned, on the Linux x86_64
+`Auto` path behind an internal workspace-aware entry. H1 measured this substitution end to
+end on the Fly host, its per-call allocation included: 2.95x single-thread and 1.64x at
+eight threads for BGE-small at batch 32. An owned packed core gated at 80% of the faster
+reference would ship slower than this even when it succeeds, after considerably more
+unsafe code and maintenance.
 
-Start with scalar correctness and x86 AVX2/FMA packing and panel reuse. Choose `mc`,
-`kc`, `nc` and microtiles by measurement. The proposed 6 by 16 AVX2, 8 by 32 AVX-512,
-and 8 by 12 NEON shapes are experiment candidates, not mandated geometry. Add AVX-512
-only after an incremental gain over the packed AVX2 implementation passes its gate.
-Linux NEON follows the separate F4 qualification. Preserve small-M and scalar fallbacks.
+**Allocation exception, with its falsifier.** `gemm` allocates its packing storage inside
+each call. This decision admits exactly one such allocation per GEMM call, no other. Its
+size is computed from `(m, n, k)` before the call and charged to the F3 memory envelope.
+An allocation-count test over repeated calls passes on exactly one allocation per call and
+fails on two or more. This narrows the preallocation rule for this call site only; every
+other hot-path loop stays allocation-free.
 
-Keep the public `matmul_bt` signature and release-active shape checks. An internal
-workspace-aware entry carries the execution policy and leased scratch from model
-orchestration. BERT single and packed forwards adopt that entry. A low-level caller
-without a workspace keeps the existing allocation-free kernel; the compatibility wrapper
-must not allocate secretly. Decoder adoption requires its own path-proven greedy gate.
+**Scope.** Linux x86_64 `Auto` execution only. macOS (Accelerate), wasm, Linux aarch64 and
+decoder callers keep their current kernels; decoder adoption requires its own path-proven
+greedy gate. No nightly feature, so AVX-512 inside `gemm` stays off until a release exposes
+it on stable and it passes its own incremental gate. The same drift and parity gates apply
+before default dispatch, and follow-up issue 1's current-baseline reproduction comes first.
 
-| Alternative                                   | Disposition and rationale                                                                                                                                                                                                                             |
-| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| B: stock `gemm`                               | Reject the inspected 0.18.2 and 0.19.0 integration under the existing allocation rule. Keep 0.18.2 as the measured reference. Current-pool Rayon coupling is usable, but it does not solve scratch ownership.                                         |
-| C: stock `matrixmultiply`                     | Retain as an independent timing reference. Its comparable recorded single-thread rates warrant attention, but do not establish superior end-to-end behavior or allocation compliance. Do not enable its independent threading inside the shared pool. |
-| D: dependency for `Auto`, owned kernels later | Reject as written: `Auto` is not exempt from preallocation. Reopen only for an audited release exposing reusable workspace, or an explicit amendment permitting bounded hot-path allocation. Either changes this decision's premises.                 |
-| Keep the present kernel                       | Keep as fallback and control, not the ingestion performance strategy; H1 provides a material measured opportunity.                                                                                                                                    |
+Keep the public `matmul_bt` signature and release-active shape checks. The internal entry
+carries the execution policy and the envelope charge from model orchestration. BERT single
+and packed forwards adopt that entry; small-M shapes stay on the existing kernel where it is
+faster. A low-level caller without a workspace keeps the existing allocation-free kernel;
+the compatibility wrapper must not allocate secretly.
+
+**Owned kernel later.** A Lattice-owned packed f32 core moves to a later follow-up issue.
+It is admitted only if it beats `gemm` end to end in the paired plan, or removes the
+allocation at no measured speed cost. Its design notes stand: scalar correctness first,
+x86 AVX2/FMA packing and panel reuse, `mc`/`kc`/`nc` and microtiles chosen by measurement
+(6 by 16 AVX2, 8 by 32 AVX-512 and 8 by 12 NEON are candidates, not mandated geometry), and
+upstream Rust code adapted only with its license and provenance preserved.
+
+| Alternative                | Disposition and rationale                                                                                                                                                                                                                      |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A: owned packed core first | Deferred. Its own gate (at least 80% of the faster reference) ships slower than B even on success. Admitted later only by beating B end to end or by removing B's allocation at no speed cost. It is the reversal target if B fails its gates. |
+| B: stock `gemm`            | Selected, 0.18.2 pinned, under the allocation exception above. 0.19.0's `x86-v4` feature is not used until it passes its own gate. Its parallel path runs in the shared Rayon pool, never a pool of its own.                                   |
+| C: stock `matrixmultiply`  | Retain as an independent timing reference. Its comparable recorded single-thread rates warrant attention, but do not establish superior end-to-end behavior. Do not enable its independent threading inside the shared pool.                   |
+| Keep the present kernel    | Keep as fallback and control, and for every target and shape class outside B's scope.                                                                                                                                                          |
 
 `matrixmultiply` 0.3.11 documents optional threading with its own thread-count control;
 its BLIS-style implementation also supplies an independently developed comparison.
@@ -151,26 +167,23 @@ its BLIS-style implementation also supplies an independently developed compariso
 [matrixmultiply documentation](https://docs.rs/matrixmultiply/latest/matrixmultiply/)
 (page identified itself as 0.3.11).
 
-**Cost accepted.** Lattice takes on hand-written AVX2/FMA microkernels and panel packing
-first, then AVX-512 and NEON only after their own gates; a manual unsafe review of each;
-and their maintenance across toolchains and targets. The alternative declined here is one
-audited heap allocation per GEMM call inside stock `gemm`, which needs an explicit
-exception to the preallocation rule.
+**Cost accepted.** One pinned external dependency closure on the x86_64 path, with its
+license notices and source audited before release; upstream unsafe code reviewed at the
+adapter boundary rather than owned; and the one charged allocation per call.
 
-**Reversal threshold.** If two bounded kernel/blocking candidates of the owned AVX2 core
-both miss the packed-core gate in the measurement plan (at least 2.0x geometric-mean
-single-thread gain over the parent on the original 18 shapes, and at least 80% of the
-faster reference's geometric-mean rate), this decision reverses. The reversal adopts
-stock `gemm` behind the internal workspace-aware entry with exactly one audited
-allocation per call, charged to the memory envelope, through an amendment to F1 that
-records the exception. The allocation, memory, compatibility and performance gates are
-then rerun against that integration.
+**Reversal threshold.** This decision reverses to A if `gemm` fails the drift or parity
+gates, or if its allocation costs more than 5% end to end against a pre-allocated control
+(the same packing storage provisioned once before the timed loop) measured in the same
+ABBA block. The reversal is an amendment to F1 and reruns the allocation, memory,
+compatibility and performance gates against the owned core.
 
-**MAY:** reuse audited f32 microkernels, add bounded panel packing, tune shape dispatch.
-**MAY NOT:** require nightly, C/C++ builds, an ML runtime, per-GEMM heap allocation,
-unbounded packed-weight caches, or a second compute pool. No new leaf-crate dependencies
-on inference. **Verify by:** allocation counters inside repeated kernel/layer execution,
-manual unsafe review, scalar equivalence, build/feature gates, and the F1 timing gate.
+**MAY:** integrate `gemm` behind the internal entry on Linux x86_64 `Auto`, tune shape
+dispatch between it and the existing kernel. **MAY NOT:** require nightly, C/C++ builds or
+an ML runtime; allocate more than the one charged packing buffer per GEMM call; keep
+unbounded packed-weight caches; or run a second compute pool. No new internal crate
+dependency on inference, which stays a leaf. **Verify by:** the allocation-count test, the
+envelope-charge test, scalar equivalence, drift and parity gates, build/feature gates and
+the F1 timing gate.
 
 ### F2: select one level of parallel work for each phase
 
@@ -404,8 +417,9 @@ All criteria apply before enabling the affected path by default.
    Any upstream adapter must review stride order and coefficient conventions explicitly.
    Require manual SIMD/raw-pointer review and the repository safety inventory update.
 4. **Allocation and resources.** Zero new heap allocations within provisioned GEMM and
-   parallel layer/head loops, including dependency code; output/request setup is measured
-   separately. No uncharged scratch growth, CPU width above the domain, deadlocks,
+   parallel layer/head loops, including dependency code, except the F1 exception: exactly
+   one charged packing allocation per stock-`gemm` call, counted by test. Output/request
+   setup is measured separately. No uncharged scratch growth, CPU width above the domain, deadlocks,
    permit leaks or early release on cancellation. Under the registered resource stress
    workloads, zero OOM kills and no accounted-byte overshoot. Test quota 0.5, 1, 2 and 8
    core equivalents, cpuset restrictions and mixed requests at offered concurrency
@@ -452,18 +466,18 @@ meet the gain threshold. For latency, its upper bound must meet the reduction
 threshold. A wide interval is inconclusive and cannot enable the candidate. Do not
 treat per-token samples from one run as independent host replicates.
 
-| Experiment, in order              | Primary cells and measurements                                                                                                                                                                            | Promotion / kill point                                                                                                                                                                                                                                                                                |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Reproduce and profile             | Rebase the isolated swap experiment onto the source baseline; BGE-small/base, batch 1/32/128; tokenize, allocation, packing, projections, attention, norm/GELU, pooling, queue and load times separately. | Reorder work if another isolated lever yields a qualifying end-to-end gain exceeding the GEMM intervention by at least 5 percentage points. Without a valid current-baseline reproduction, do not publish the historical ratios as current performance.                                               |
-| Packed f32 core                   | The 18 measured BERT shapes, plus short M 1/2/4/8/16/32/64, tails, fused QKV and attention shapes; threads 1/2/4/8. Compare owned core with parent and both Rust references, packing included.            | Require at least 2.0x geometric-mean single-thread gain over parent on the original 18 shapes and at least 80% of the faster reference's geometric-mean rate. After two bounded kernel/blocking candidates miss, stop expanding the ISA implementation; F1 reverses as its reversal threshold states. |
-| BERT ingestion enablement         | Warm, cache-miss BGE-small and BGE-base, batch 32 and 128, widths 1 and 8; original synthetic corpus plus a frozen representative document corpus.                                                        | Each primary model/corpus at eight threads must gain at least 20% throughput; no supported primary cell may regress more than 5%. The contaminated BGE-base H1 result supplies no waiver.                                                                                                             |
-| One-text latency                  | Exactly one outstanding text, lengths 8/32/64/128/256/512 where admitted, both models, widths 1/2/4/8; model resident, cache disabled.                                                                    | Enable multi-core latency policy only if p50 and p95 improve at least 10% at both 128 and 256 tokens versus the fast serial core; p99 and short-text p50/p95 must not regress more than 5%. Otherwise keep serial in those cells and report the latency objective still open.                         |
-| Non-GEMM threading                | Isolate attention, then fused norm/activation, then their composition against the accepted fast core. Measure batch 32/128 and the latency cells separately.                                              | Retain a batch policy only for at least 10% complete-encode throughput gain, or a latency policy meeting the preceding latency gate. No microbenchmark-only promotion.                                                                                                                                |
-| Sub-batches versus intra-op       | Same total texts/tokens, weights, CPU width and memory envelope; token-balanced serial sub-batches versus packed intra-op.                                                                                | Select sub-batches only for at least 10% throughput gain over intra-op, within the envelope and without more than 5% p95 regression in the matched service-load test. Otherwise keep packed intra-op.                                                                                                 |
-| AVX-512 refinement                | Compare against accepted packed AVX2 on the same AMD host, including long sustained runs and batch 1.                                                                                                     | Require at least 10% additional end-to-end throughput and at most 5% regression elsewhere; otherwise retain AVX2.                                                                                                                                                                                     |
-| Linux ARM qualification           | Repeat kernel, ingestion, latency and resource matrices on a quiet cloud ARM host; qualify Pi 5 separately with sustained thermal reporting.                                                              | Apply the same relevant gain and regression thresholds. No qualifying evidence means no new default or speed claim for that platform.                                                                                                                                                                 |
-| Resource and service policy       | Finite memory envelopes at 1.05x/1.25x/2x measured resident-model charge; fractional quotas; cancellations; mixed chat/embedding; declared foreign-load stress runs.                                      | Zero accounting violations/OOMs/deadlocks. On quiet underloaded cells at most 5% p95 regression. At fixed successful throughput under overload, p95 must be no worse than the independently capped baseline; disclose rejected requests and completed work so refusal cannot masquerade as a speedup. |
-| Footprint and protected platforms | Same clean build inputs and target profiles; stripped binary size, clean compile time, peak RSS; macOS and wasm checks.                                                                                   | Hold for review if binary growth exceeds the larger of 10% or 2 MiB, or clean compile time grows over 20%. Any wasm correctness failure blocks; a reproducible macOS throughput/latency regression over 5% blocks default rollout.                                                                    |
+| Experiment, in order              | Primary cells and measurements                                                                                                                                                                                                         | Promotion / kill point                                                                                                                                                                                                                                                                                |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Reproduce and profile             | Rebase the isolated swap experiment onto the source baseline; BGE-small/base, batch 1/32/128; tokenize, allocation, packing, projections, attention, norm/GELU, pooling, queue and load times separately.                              | Reorder work if another isolated lever yields a qualifying end-to-end gain exceeding the GEMM intervention by at least 5 percentage points. Without a valid current-baseline reproduction, do not publish the historical ratios as current performance.                                               |
+| Stock `gemm` integration          | The 18 measured BERT shapes, plus short M 1/2/4/8/16/32/64, tails, fused QKV and attention shapes; threads 1/2/4/8. Compare `gemm` behind the internal entry with the parent, plus a pre-allocated control arm in the same ABBA block. | Require at least 2.0x geometric-mean single-thread gain over the parent on the original 18 shapes, and an allocation cost of at most 5% end to end against the pre-allocated control. Otherwise F1 reverses as its reversal threshold states.                                                         |
+| BERT ingestion enablement         | Warm, cache-miss BGE-small and BGE-base, batch 32 and 128, widths 1 and 8; original synthetic corpus plus a frozen representative document corpus.                                                                                     | Each primary model/corpus at eight threads must gain at least 20% throughput; no supported primary cell may regress more than 5%. The contaminated BGE-base H1 result supplies no waiver.                                                                                                             |
+| One-text latency                  | Exactly one outstanding text, lengths 8/32/64/128/256/512 where admitted, both models, widths 1/2/4/8; model resident, cache disabled.                                                                                                 | Enable multi-core latency policy only if p50 and p95 improve at least 10% at both 128 and 256 tokens versus the fast serial core; p99 and short-text p50/p95 must not regress more than 5%. Otherwise keep serial in those cells and report the latency objective still open.                         |
+| Non-GEMM threading                | Isolate attention, then fused norm/activation, then their composition against the accepted fast core. Measure batch 32/128 and the latency cells separately.                                                                           | Retain a batch policy only for at least 10% complete-encode throughput gain, or a latency policy meeting the preceding latency gate. No microbenchmark-only promotion.                                                                                                                                |
+| Sub-batches versus intra-op       | Same total texts/tokens, weights, CPU width and memory envelope; token-balanced serial sub-batches versus packed intra-op.                                                                                                             | Select sub-batches only for at least 10% throughput gain over intra-op, within the envelope and without more than 5% p95 regression in the matched service-load test. Otherwise keep packed intra-op.                                                                                                 |
+| Owned core and AVX-512            | Only after `gemm` acceptance: an owned packed core, and AVX-512 (owned, or upstream on stable), against accepted `gemm` on the same AMD host, including long sustained runs and batch 1.                                               | Admit an owned core only if it beats `gemm` end to end or removes its allocation at no speed cost; retain AVX-512 only for at least 10% additional end-to-end throughput and at most 5% regression elsewhere.                                                                                         |
+| Linux ARM qualification           | Repeat kernel, ingestion, latency and resource matrices on a quiet cloud ARM host; qualify Pi 5 separately with sustained thermal reporting.                                                                                           | Apply the same relevant gain and regression thresholds. No qualifying evidence means no new default or speed claim for that platform.                                                                                                                                                                 |
+| Resource and service policy       | Finite memory envelopes at 1.05x/1.25x/2x measured resident-model charge; fractional quotas; cancellations; mixed chat/embedding; declared foreign-load stress runs.                                                                   | Zero accounting violations/OOMs/deadlocks. On quiet underloaded cells at most 5% p95 regression. At fixed successful throughput under overload, p95 must be no worse than the independently capped baseline; disclose rejected requests and completed work so refusal cannot masquerade as a speedup. |
+| Footprint and protected platforms | Same clean build inputs and target profiles; stripped binary size, clean compile time, peak RSS; macOS and wasm checks.                                                                                                                | Hold for review if binary growth exceeds the larger of 10% or 2 MiB, or clean compile time grows over 20%. Any wasm correctness failure blocks; a reproducible macOS throughput/latency regression over 5% blocks default rollout.                                                                    |
 
 The representative corpus, model revisions, raw 18-shape list, latency request counts
 and service offered-load traces must be committed to the measurement manifest before
@@ -475,11 +489,11 @@ than assigning it zero throughput in the speed comparison.
 
 ## Consequences
 
-The recorded evidence supports improving GEMM first for bulk BERT work. The allocation
-contract makes the quickest measured substitution a reference rather than the production
-implementation. Owning a narrow packed core costs more review and maintenance, but gives
-scratch and dispatch ownership without weakening the resource rules. That ownership
-does not automatically make it suitable for prepared identity.
+The recorded evidence supports improving GEMM first for bulk BERT work. The quickest
+measured substitution ships first, under an allocation exception that is bounded,
+envelope-charged and guarded by an allocation-count test. Owning a kernel waits until it
+can beat that substitution. Neither choice makes the path suitable for prepared identity
+by itself.
 
 Parallel work becomes a measured choice with a memory charge. A throughput win can ship
 while the one-text latency objective remains open; the release must say which improved.
@@ -492,8 +506,9 @@ shared vCPUs or eliminate races with unrelated consumers of a cgroup.
    feature flags, shape/corpus manifests and ABBA thresholds; verify the isolated swap.
 2. **Add shared CPU execution and memory admission domain**: unify tokenization, CPU
    chat and embeddings, including cancellation-safe leases and cgroup discovery.
-3. **Add reusable f32 GEMM workspace and audited packed AVX2 core**: preserve the public
-   boundary, scalar oracle, small-M fallback, provenance and allocation counters.
+3. **Integrate stock `gemm` behind an internal workspace entry on Linux x86_64**: preserve
+   the public boundary, scalar oracle and small-M fallback; add the allocation-count and
+   envelope-charge tests; audit the dependency closure and license notices.
 4. **Qualify packed GEMM on BERT single and batch paths**: pass drift, affected decoder
    parity, wasm/macOS protection and end-to-end ingestion gates before default dispatch.
 5. **Reduce one-text BERT latency with measured intra-op policy**: qualify short-M GEMM
@@ -502,8 +517,9 @@ shared vCPUs or eliminate races with unrelated consumers of a cgroup.
    fused row operations, then compare serial sub-batches under the same resource cap.
 7. **Qualify packed NEON on Linux cloud ARM and Pi 5**: produce separate correctness,
    throughput, latency, memory and sustained thermal evidence before each rollout.
-8. **Evaluate incremental AMD AVX-512 packed GEMM**: proceed only after AVX2 acceptance
-   and retain it only if the incremental threshold is met.
+8. **Evaluate an owned packed f32 core and AVX-512**: proceed only after `gemm` acceptance;
+   admit an owned core only if it beats `gemm` end to end or removes its allocation at no
+   speed cost, and AVX-512 only if the incremental threshold is met.
 9. **Bind future pinned CPU kernels to ADR-088 identities**: keep canonical per-item
    execution and require exact invariance before prepared adoption.
 10. **Evaluate reduced-precision embedding compute separately**: require retrieval
@@ -513,10 +529,10 @@ shared vCPUs or eliminate races with unrelated consumers of a cgroup.
 
 ## What acceptance commits to
 
-Accepting this ADR accepts the owned-kernel maintenance commitment, the F1 reversal
-threshold and the proposed measurement thresholds, including the 20% memory reserve.
-Enabling a dependency immediately under a bounded allocation exception is the declined
-alternative; it becomes the decision only through the F1 reversal, with its gates rerun.
+Accepting this ADR accepts the F1 allocation exception for stock `gemm` with its falsifier,
+the F1 reversal threshold and the proposed measurement thresholds, including the 20% memory
+reserve. An owned packed core is the deferred alternative; it is admitted only by beating
+`gemm` end to end or removing its allocation at no speed cost.
 
 This draft does not accept ADR-070 or ADR-088, weaken their existing gates, certify
 SIMD correctness, or record completed implementation work. ADR-081 supplies a model for
