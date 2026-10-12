@@ -219,7 +219,7 @@ jobs:
   publish:
     name: npm release preflight
     needs: package
-    # Manual dispatch can target any branch, but the NPM_TOKEN-bearing steps
+    # Manual dispatch can target any branch, but the publishing steps
     # below must only ever run against a protected main commit — never a
     # collaborator-selected branch. `environment: npm-publish` adds a manual
     # approval gate on top of the ref check (configured in repo Settings >
@@ -286,9 +286,25 @@ jobs:
         if: ${{ !inputs.publish }}
         run: make publish-npm-dry
 
+      # npm trusted publishing: `npm publish` exchanges this job's OIDC token
+      # (`id-token: write` above) for a short-lived publish credential, so no
+      # long-lived npm token is stored in the repository. Every package this
+      # job publishes must list this repository, the `npm-prebuild.yml`
+      # workflow and the `npm-publish` environment as its trusted publisher in
+      # its npmjs.com settings; a package without that entry refuses the
+      # publish. Trusted publishing needs npm 11.5.1 or later; the check also
+      # runs on a preflight dispatch so the dry run proves it first.
+      - name: Require npm with trusted publishing support
+        run: |
+          v=$(npm --version)
+          echo "npm $v"
+          printf '%s\n%s\n' 11.5.1 "$v" | sort -V -C || {
+            echo "npm $v is older than 11.5.1 and cannot publish through trusted publishing" >&2
+            exit 1
+          }
+
       - name: Publish the npm release
         if: inputs.publish
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_PROVENANCE: '1'
         run: make publish-npm
