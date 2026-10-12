@@ -62,11 +62,11 @@ struct WeightedAux<'a> {
     /// Decision 2's `epsilon` floor drop and renormalisation. Length must equal
     /// `gate.num_outputs()`.
     w_full: &'a [f32],
-    /// `1 / tau`. The load-balance gradient this module computes is `dL/dz`
-    /// for `p = softmax(z)`; the mixture weights are `softmax(z / tau)`, so
-    /// this factor rescales the returned gradient to the logits the trainer
-    /// actually updates.
-    inv_tau: f32,
+    /// The temperature that produced `w_full`. The load-balance gradient this
+    /// module computes is `dL/dz` for `p = softmax(z)`; the mixture weights are
+    /// `softmax(z / tau)`, so the update path scales the returned gradient by
+    /// `1 / tau` to reach the gradient with respect to the logits it updates.
+    tau: f32,
 }
 
 /// One recorded explored action, as
@@ -139,8 +139,9 @@ pub struct BatchRefitOutcome {
     /// operator-facing number: it says what the feedback was, not what the
     /// update did with it.
     pub mean_reward: f32,
-    /// Mean advantage-weighted policy loss over the contributing episodes,
-    /// `0.0` when none contributed.
+    /// Mean per-sample loss over the whole round, the same `1 / n` the update
+    /// was scaled by. `0.0` when no episode contributed, where the round is a
+    /// no-op on the gate.
     pub mean_loss: f32,
 }
 
@@ -269,16 +270,70 @@ struct SampleUpdate {
     loss: f32,
 }
 
+/// What a learned-mixture weight vector and its temperature must satisfy
+/// before the load-balance term reads them.
+///
+/// Shared by [`validate_explored_action`] and
+/// [`RlooTrainer::step_with_learned_weights`] so both paths refuse the same
+/// malformed inputs with the same words: `w_full` of the wrong width, any
+/// non-finite `w_full` entry, a `tau` that is not finite and strictly positive,
+/// and a `tau` whose `1 / tau` is not finite. `label` names the entry point in
+/// the message, so a refusal says which call refused it.
+///
+/// `1 / tau` is the quantity the update path actually multiplies the
+/// load-balance gradient by, and it overflows `f32` for `tau` below roughly
+/// `2.94e-39`, where a finite positive `tau` would otherwise pass. Checking
+/// only `tau > 0` therefore lets an infinite factor reach the gate.
+fn validate_weighted_aux(label: &str, gate: &Network, w_full: &[f32], tau: f32) -> FannResult<()> {
+    let num_outputs = gate.num_outputs();
+    if w_full.len() != num_outputs {
+        return Err(FannError::InputSizeMismatch {
+            expected: num_outputs,
+            actual: w_full.len(),
+        });
+    }
+    for (j, &w) in w_full.iter().enumerate() {
+        if !w.is_finite() {
+            return Err(FannError::TrainingError(format!(
+                "{label}: w_full[{j}] must be finite, got {w}"
+            )));
+        }
+    }
+    if !tau.is_finite() || tau <= 0.0 {
+        return Err(FannError::TrainingError(format!(
+            "{label}: tau must be finite and strictly positive, got {tau}"
+        )));
+    }
+    if !(1.0 / tau).is_finite() {
+        return Err(FannError::TrainingError(format!(
+            "{label}: 1 / tau must be finite, got {} for tau = {tau}",
+            1.0 / tau
+        )));
+    }
+    Ok(())
+}
+
 /// What an [`ExploredAction`] must satisfy before its columns are read.
 ///
 /// Separate from [`validate_action`] because these are facts about the
 /// recorded decision rather than about the update, and because a batch has
 /// to check both for every sample before applying any of them.
 ///
-/// The scale is checked here as well as through the reciprocal the update
-/// path takes, because `1.0 / 0.0` is infinite rather than zero: a scale of
-/// `0.0` would arrive there as `inf`, which the finite check catches while
-/// naming a number the caller never supplied.
+/// Every value that would write a non-finite number into the gate or the
+/// traffic EMA is refused here, before anything is applied, and each refusal
+/// names the field and the value it saw. `w_full` and `tau` go through
+/// [`validate_weighted_aux`], which is also what
+/// [`RlooTrainer::step_with_learned_weights`] uses, so the two paths cannot
+/// drift about what a usable weight vector is. The scale is checked here as
+/// well as through the reciprocal the update path takes, because `1.0 / 0.0`
+/// is infinite rather than zero: a scale of `0.0` would arrive there as `inf`,
+/// which the finite check catches while naming a number the caller never
+/// supplied.
+///
+/// The learner refuses only what makes its own arithmetic non-finite. A floor
+/// on a served `exploration_scale` — the smallest scale a policy is willing to
+/// serve, not the smallest this update can survive — belongs to whoever records
+/// the policy, and is deliberately not imposed here.
 fn validate_explored_action(gate: &Network, action: &ExploredAction<'_>) -> FannResult<()> {
     let num_outputs = gate.num_outputs();
     if action.sampled_logits.len() != num_outputs {
@@ -294,18 +349,7 @@ fn validate_explored_action(gate: &Network, action: &ExploredAction<'_>) -> Fann
             )));
         }
     }
-    if action.w_full.len() != num_outputs {
-        return Err(FannError::InputSizeMismatch {
-            expected: num_outputs,
-            actual: action.w_full.len(),
-        });
-    }
-    if !action.tau.is_finite() || action.tau <= 0.0 {
-        return Err(FannError::TrainingError(format!(
-            "explored action: tau must be finite and strictly positive, got {}",
-            action.tau
-        )));
-    }
+    validate_weighted_aux("explored action", gate, action.w_full, action.tau)?;
     if !action.exploration_scale.is_finite() || action.exploration_scale <= 0.0 {
         return Err(FannError::TrainingError(format!(
             "explored action: exploration_scale must be finite and strictly positive, got {}",
@@ -332,6 +376,13 @@ fn validate_action(gate: &Network, context: &[f32], action: &Action<'_>) -> Fann
             expected: num_inputs,
             actual: context.len(),
         });
+    }
+    for (j, &x) in context.iter().enumerate() {
+        if !x.is_finite() {
+            return Err(FannError::TrainingError(format!(
+                "context[{j}] must be finite, got {x}"
+            )));
+        }
     }
 
     match &action {
@@ -417,6 +468,12 @@ impl RlooTrainer {
     /// Decision 3 (amended 2026-09-20) requires that term to run on the
     /// caller's projected weight vector at `1 / tau` instead, see
     /// [`Self::step_with_learned_weights`].
+    ///
+    /// A non-finite context entry or a non-finite reward is refused before
+    /// anything is applied. Those are the only inputs whose result changes: for
+    /// every other input this call is bit-identical to its previous form, and
+    /// the newly refused inputs are exactly the ones that previously wrote a
+    /// non-finite value into the gate.
     pub fn step(
         &mut self,
         gate: &mut Network,
@@ -450,8 +507,18 @@ impl RlooTrainer {
     /// load-balance term's input and the frequency EMA's fold differ.
     ///
     /// Returns `FannError::InputSizeMismatch` if `w_full.len() !=
-    /// gate.num_outputs()`, and `FannError::TrainingError` if `tau` is not
-    /// finite and strictly positive.
+    /// gate.num_outputs()`, and `FannError::TrainingError` if any `w_full`
+    /// entry is not finite, if `tau` is not finite and strictly positive, or if
+    /// `1 / tau` is not finite. The floor on `tau` is guard (a)'s job in the
+    /// router; this call enforces only the arithmetic precondition that the
+    /// update path's `1 / tau` factor be finite, and does not reimplement that
+    /// floor.
+    ///
+    /// A non-finite context entry, a non-finite reward, or a non-finite
+    /// `w_full` entry is refused before anything is applied. Those are the only
+    /// inputs whose result changes: for every other input this call is
+    /// bit-identical to its previous form, and the newly refused inputs are
+    /// exactly the ones that previously wrote a non-finite value into the gate.
     pub fn step_with_learned_weights(
         &mut self,
         gate: &mut Network,
@@ -461,28 +528,14 @@ impl RlooTrainer {
         w_full: &[f32],
         tau: f32,
     ) -> FannResult<f32> {
-        let num_outputs = gate.num_outputs();
-        if w_full.len() != num_outputs {
-            return Err(FannError::InputSizeMismatch {
-                expected: num_outputs,
-                actual: w_full.len(),
-            });
-        }
-        if !tau.is_finite() || tau <= 0.0 {
-            return Err(FannError::TrainingError(format!(
-                "step_with_learned_weights: tau must be finite and strictly positive, got {tau}"
-            )));
-        }
+        validate_weighted_aux("step_with_learned_weights", gate, w_full, tau)?;
 
         self.step_impl(
             gate,
             context,
             Action::Single(action_idx),
             reward,
-            Some(WeightedAux {
-                w_full,
-                inv_tau: 1.0 / tau,
-            }),
+            Some(WeightedAux { w_full, tau }),
         )
     }
 
@@ -515,10 +568,28 @@ impl RlooTrainer {
     /// to be taken at the policy that produced the action, and an episode
     /// whose epoch has ended is not an on-policy sample at all.
     ///
-    /// Returns `FannError::TrainingError` if any sampled logit is not finite
-    /// or `exploration_scale` is not finite and strictly positive, and
-    /// `FannError::InputSizeMismatch` if any length differs from the gate's
-    /// output count.
+    /// # This is the per-sample primitive, not the ADR estimator
+    ///
+    /// This entry applies the raw reward with **no baseline**. The estimator
+    /// ADR-096 decision 3 defines is the leave-one-out round,
+    /// [`Self::step_batch_with_explored_actions`], and this is the single
+    /// sample it is built from. A caller holding one judgement should know what
+    /// that means: one completion rated helpful says the mixture was good, not
+    /// that it was better than whatever else the gate would have served, so the
+    /// update here moves on the reward's sign alone. Reach for the batch entry
+    /// when a round of judgements exists; a loop over this one is not the
+    /// estimator and, because each call moves the gate before the next reads
+    /// it, is not on-policy either.
+    ///
+    /// # Refusals
+    ///
+    /// Returns `FannError::InputSizeMismatch` if `sampled_logits.len()`,
+    /// `w_full.len()` or `context.len()` differs from the gate's input or
+    /// output count, and `FannError::TrainingError` if any context entry,
+    /// sampled logit or `w_full` entry is not finite, if `reward` is not
+    /// finite, if `tau` is not finite and strictly positive or its `1 / tau`
+    /// is not finite, or if `exploration_scale` is not finite and strictly
+    /// positive. Every refusal names the field and the value it saw.
     pub fn step_with_explored_action(
         &mut self,
         gate: &mut Network,
@@ -534,7 +605,7 @@ impl RlooTrainer {
             reward,
             Some(WeightedAux {
                 w_full: action.w_full,
-                inv_tau: 1.0 / action.tau,
+                tau: action.tau,
             }),
         )
     }
@@ -568,22 +639,40 @@ impl RlooTrainer {
     /// # A round with nothing to compare is a no-op, not a small step
     ///
     /// Rewards that are all equal carry no comparative information: every
-    /// leave-one-out advantage is zero, no sample contributes, and the gate
-    /// is left byte-for-byte unchanged. That includes a round of one. The
-    /// load-balance and z-loss terms do not fill the gap, and deliberately:
+    /// leave-one-out advantage is zero, no sample contributes, and the gate's
+    /// weights are left byte-for-byte unchanged. That includes a round of one.
+    /// The load-balance and z-loss terms do not fill the gap, and deliberately:
     /// they exist to shape a policy update, not to constitute one, and a gate
     /// that drifted toward balance because a refit was attempted would change
     /// served behaviour with no feedback behind it.
+    ///
+    /// # The step is the mean over the round, not over the contributors
+    ///
+    /// In a round with at least one non-zero advantage the update is
+    /// `(1 / n) * sum_i [A_i * grad log pi_i + aux_i + zloss_i]` over every
+    /// sample, as ADR-096 decision 3 writes it: the mean of the
+    /// advantage-weighted gradients over events `i = 1..n`. Dividing by the
+    /// contributor count instead would make the step discontinuous — a reward
+    /// one ULP off a tie moves a sample between the two denominators and
+    /// rescales the whole round — and would drop the regularisers of the
+    /// zero-advantage episodes even though their traffic still folds. Averaging
+    /// over `n` keeps the policy term continuous in the rewards and averages
+    /// each regulariser over the round it belongs to. `informative` still
+    /// reports the count of non-zero advantages, which is the number that says
+    /// how much of the round carried signal.
     ///
     /// The frequency EMA still sees every validated sample. Those completions
     /// were served traffic whether or not the round could learn from them.
     ///
     /// # Refusals
     ///
-    /// An empty round, a non-finite reward, and anything
-    /// [`Self::step_with_explored_action`] refuses about a single action. Every
-    /// sample is checked before any is applied, so a refused round leaves the
-    /// gate untouched.
+    /// An empty round, a non-finite reward, a non-finite leave-one-out
+    /// advantage, and anything [`Self::step_with_explored_action`] refuses
+    /// about a single action (a non-finite context entry, sampled logit, or
+    /// `w_full` entry; a `tau` or `exploration_scale` that is not finite and
+    /// strictly positive; a `tau` whose `1 / tau` is not finite). Every sample
+    /// is checked before any is applied, so a refused round leaves the gate
+    /// untouched.
     pub fn step_batch_with_explored_actions(
         &mut self,
         gate: &mut Network,
@@ -610,6 +699,13 @@ impl RlooTrainer {
 
         let rewards: Vec<f32> = samples.iter().map(|s| s.reward).collect();
         let advantages = leave_one_out_advantages(&rewards);
+        for (i, &a) in advantages.iter().enumerate() {
+            if !a.is_finite() {
+                return Err(FannError::TrainingError(format!(
+                    "batch refit: leave-one-out advantage[{i}] must be finite, got {a}"
+                )));
+            }
+        }
 
         // Read once, before the round: every sample's load-balance term sees
         // the traffic history that preceded the whole round.
@@ -624,7 +720,7 @@ impl RlooTrainer {
         for (sample, advantage) in samples.iter().zip(advantages.iter()) {
             let weighted = WeightedAux {
                 w_full: sample.action.w_full,
-                inv_tau: 1.0 / sample.action.tau,
+                tau: sample.action.tau,
             };
             // The forward pass inside this call is what leaves the activation
             // buffers the backward pass below reads, so the two stay adjacent.
@@ -637,12 +733,10 @@ impl RlooTrainer {
                 &route_freqs,
             )?;
             masses.push(update.mass);
-
-            if *advantage == 0.0 {
-                continue;
-            }
-            informative += 1;
             loss_total += update.loss;
+            if *advantage != 0.0 {
+                informative += 1;
+            }
 
             let gradients =
                 self.backprop_gradients(gate, sample.context, &update.output_deltas, num_layers)?;
@@ -652,11 +746,19 @@ impl RlooTrainer {
             }
         }
 
-        if let Some(mut gradients) = accumulated {
-            // Averaged over the samples that contributed, so a round's step
-            // size is not diluted by episodes the baseline found nothing to
-            // say about.
-            gradients.mean_over(informative);
+        // The update is the mean over ALL n samples, not over the contributors:
+        // ADR-096 decision 3 writes it as the mean of the advantage-weighted
+        // gradients over events `i = 1..n`, so the policy term stays continuous
+        // in the rewards (a reward a hair off a tie cannot rescale the whole
+        // step) and the regularisers are averaged over the round they belong to.
+        // A round whose every advantage is zero is the one exception, and it is
+        // a no-op on the gate: there is no policy update for the regularisers to
+        // shape, and applying them alone would move served behaviour on feedback
+        // that carried no comparison.
+        if informative > 0
+            && let Some(mut gradients) = accumulated
+        {
+            gradients.mean_over(samples.len());
             self.apply_gradients(gate, &gradients);
         }
 
@@ -672,7 +774,7 @@ impl RlooTrainer {
             mean_loss: if informative == 0 {
                 0.0
             } else {
-                loss_total / informative as f32
+                loss_total / count
             },
         })
     }
@@ -697,6 +799,11 @@ impl RlooTrainer {
         let num_layers = gate.num_layers();
 
         validate_action(gate, context, &action)?;
+        if !reward.is_finite() {
+            return Err(FannError::TrainingError(format!(
+                "reward must be finite, got {reward}"
+            )));
+        }
 
         let route_freqs = self.route_freqs_or_uniform(gate.num_outputs());
         let update = self.sample_update(
@@ -750,7 +857,7 @@ impl RlooTrainer {
         // every finite `f32` (`x * 1.0 == x` bit-for-bit), so this branch
         // changes no bit of `step`'s existing output.
         let (aux_source, aux_scale): (&[f32], f32) = match weighted {
-            Some(w) => (w.w_full, w.inv_tau),
+            Some(w) => (w.w_full, 1.0 / w.tau),
             None => (probs.as_slice(), 1.0),
         };
         let aux_grad = load_balance_aux_gradient(route_freqs, aux_source)?;
@@ -1732,14 +1839,22 @@ mod tests {
         );
     }
 
-    /// Control 2 — the `1 / tau` factor: with `w_full` and everything else
-    /// held fixed, two calls that differ only in `tau` (chosen well away from
-    /// 1.0) must move the gate by different amounts.
+    /// Control 2 — the `1 / tau` factor's VALUE: with reward 0, z-loss off and
+    /// the same `w_full`, the gate delta at `tau = 0.1` is 10× the delta at
+    /// `tau = 1.0`, because `1 / tau` is 10 there.
     ///
-    /// Mutation this guards: dropping the `1 / tau` scale on the load-balance
-    /// gradient. Predicted before running: with the factor dropped, `tau` has
-    /// no effect on the applied gradient at all, so the two calls below would
-    /// produce identical states and this test would redden.
+    /// Mutation this guards: using `w.tau` itself as the load-balance scale
+    /// instead of `1.0 / w.tau`. That mutant gives scale 1.0 at `tau = 1.0` (so
+    /// the `tau = 1.0` arm is unchanged) and 0.1 instead of 10 at `tau = 0.1`;
+    /// the ratio it produces is `0.1`, not 10, and this assertion reddens. A
+    /// test that only asked the two states to differ would stay green under it,
+    /// which is why the ratio is pinned rather than the difference.
+    ///
+    /// The tolerance is on the ratio, not the deltas: the gate is a fresh
+    /// seeded network and the two arms share `w_full` and the drift preamble,
+    /// so the only source of imprecision is f32 rounding in the two forward
+    /// passes, which moves the ratio by far less than the 1e-3 allowed here
+    /// (measured on this fixture: the ratio lands within 1e-5 of 10.0).
     #[test]
     fn step_with_learned_weights_scales_the_aux_gradient_by_inverse_tau() {
         let config = RlooConfig {
@@ -1747,30 +1862,50 @@ mod tests {
             aux_loss_coeff: 1.0,
             z_loss_coeff: 0.0,
         };
-        let gate_base = test_gate();
+        // A single Linear layer, so the forward output moves by exactly
+        // `-lr * delta_j * (1 + ||CTX||^2)` and the raw output move is
+        // proportional to the output-layer delta. On a gate with a hidden
+        // layer the move would also carry a second-order term in the delta,
+        // and the 10x ratio would be off by that much.
+        let gate_base = linear_gate();
         let w_full = [0.7_f32, 0.0, 0.3, 0.0];
 
-        let (mut gate_a, mut trainer_a) = drifted_off_uniform(&gate_base, config.clone());
-        trainer_a
-            .step_with_learned_weights(&mut gate_a, &CTX, 0, 0.0, &w_full, 1.0)
-            .unwrap();
-        let after_tau_1 = gate_a.forward(&CTX).unwrap().to_vec();
+        let move_at_tau = |tau: f32| -> Vec<f32> {
+            let (mut gate, mut trainer) = drifted_off_uniform(&gate_base, config.clone());
+            let before = gate.forward(&CTX).unwrap().to_vec();
+            trainer
+                .step_with_learned_weights(&mut gate, &CTX, 0, 0.0, &w_full, tau)
+                .unwrap();
+            let after = gate.forward(&CTX).unwrap().to_vec();
+            before
+                .iter()
+                .zip(after.iter())
+                .map(|(b, a)| a - b)
+                .collect()
+        };
 
-        let (mut gate_b, mut trainer_b) = drifted_off_uniform(&gate_base, config);
-        trainer_b
-            .step_with_learned_weights(&mut gate_b, &CTX, 0, 0.0, &w_full, 0.1)
-            .unwrap();
-        let after_tau_p1 = gate_b.forward(&CTX).unwrap().to_vec();
-
-        let max_diff = after_tau_1
-            .iter()
-            .zip(after_tau_p1.iter())
-            .map(|(&a, &b)| (a - b).abs())
-            .fold(0.0_f32, f32::max);
+        let at_one = move_at_tau(1.0);
+        let at_p1 = move_at_tau(0.1);
+        // `w_full` is zero at indices 1 and 3, so the load-balance gradient
+        // there is zero and there is no ratio to take; the non-zero columns are
+        // where the factor is observable.
+        let mut checked = 0_usize;
+        for (j, (&one, &p1)) in at_one.iter().zip(at_p1.iter()).enumerate() {
+            if one.abs() <= 1e-6 {
+                continue;
+            }
+            let ratio = p1 / one;
+            assert!(
+                (ratio - 10.0).abs() < 1e-3,
+                "index {j}: the aux scale must be 1/tau, so tau=0.1 must move \
+                 the gate 10x the tau=1.0 move; got ratio {ratio} \
+                 (at_one {one}, at_p1 {p1})"
+            );
+            checked += 1;
+        }
         assert!(
-            max_diff > 1e-3,
-            "tau=1.0 and tau=0.1 must move the gate by measurably different \
-             amounts; got after_tau_1.0={after_tau_1:?}, after_tau_0.1={after_tau_p1:?}"
+            checked >= 2,
+            "fixture must expose the factor at two columns, saw {checked}"
         );
     }
 
@@ -1809,6 +1944,52 @@ mod tests {
             f[1] < 0.25 && f[3] < 0.25,
             "indices absent from w_full must have moved down, got f={f:?}"
         );
+    }
+
+    /// `w_full` of the wrong width is a caller error, not a shape to silently
+    /// paper over.
+    #[test]
+    fn step_with_learned_weights_rejects_wrong_length_w_full() {
+        let mut gate = test_gate();
+        let mut trainer = RlooTrainer::with_seed(RlooConfig::default(), 1);
+        let wrong_w_full = [0.5_f32, 0.5]; // gate has 4 outputs
+        let err = trainer
+            .step_with_learned_weights(&mut gate, &CTX, 0, 0.0, &wrong_w_full, 1.0)
+            .unwrap_err();
+        assert!(
+            matches!(err, FannError::InputSizeMismatch { .. }),
+            "expected InputSizeMismatch, got {err:?}"
+        );
+    }
+
+    /// `tau` must be finite and strictly positive with a finite reciprocal;
+    /// this is the arithmetic precondition only — the collapse floor on `tau`
+    /// is guard (a)'s job in the router, not reimplemented here. The smallest
+    /// subnormal is included because a finite positive `tau` can still have an
+    /// infinite `1 / tau`, which is the value the update path actually
+    /// multiplies by; `f32::MIN_POSITIVE` is NOT in the list because its
+    /// reciprocal is finite and it is a legitimate temperature.
+    #[test]
+    fn step_with_learned_weights_rejects_non_finite_or_nonpositive_tau() {
+        let w_full = [0.25_f32; 4];
+        for bad_tau in [
+            0.0_f32,
+            -1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(1),
+        ] {
+            let mut gate = test_gate();
+            let mut trainer = RlooTrainer::with_seed(RlooConfig::default(), 1);
+            let err = trainer
+                .step_with_learned_weights(&mut gate, &CTX, 0, 0.0, &w_full, bad_tau)
+                .unwrap_err();
+            assert!(
+                matches!(err, FannError::TrainingError(_)),
+                "tau={bad_tau} must be rejected as TrainingError, got {err:?}"
+            );
+        }
     }
 
     /// Control 4 — `step`'s existing behaviour is pinned across this change:
@@ -2126,8 +2307,10 @@ mod tests {
     /// pinned outputs above pin `step`, and this arm pins that an explored
     /// action with zero offset is also a no-op for the batch entry.
     ///
-    /// Fails if the branch applies a term the `Single` path does not, which
-    /// the byte comparison to an all-equal (uninformative) round would show.
+    /// Fails if the branch applies a term the `Single` path does not: the two
+    /// samples carry opposite rewards, so the round IS informative and reaches
+    /// the apply, yet `z' == z` makes every policy delta zero. The gate bytes
+    /// are compared before and after the round, not to any other round.
     #[test]
     fn a_zero_offset_batch_round_leaves_the_gate_untouched() {
         let config = RlooConfig {
@@ -2268,11 +2451,16 @@ mod tests {
         assert_ne!(gate.to_bytes(), before);
     }
 
-    /// Every refusal, and each names the field it saw: a zero or negative or
-    /// non-finite scale, a non-finite tau, and a `w_full` of the wrong width.
+    /// Every refusal this entry makes on the action, and each names the field
+    /// it saw: a zero, negative or non-finite scale, a zero or non-finite tau,
+    /// and a `w_full` of the wrong width.
     ///
-    /// Fails if any of the checks is dropped; the accepted shape is the
-    /// control in the same test.
+    /// Fails if any of these checks is dropped; the accepted shape is the
+    /// control in the same test. (This arm covers only the refusals its `cases`
+    /// list actually passes — `tau = 0` and `scale = NaN` are here, `tau = NaN`
+    /// is not; the arms that pin the other refusals are
+    /// `step_with_learned_weights_rejects_non_finite_or_nonpositive_tau` and
+    /// `a_tau_that_cannot_be_inverted_is_refused`.)
     #[test]
     fn the_explored_entry_refuses_every_shape_that_is_not_an_action() {
         let config = RlooConfig {
@@ -2341,6 +2529,299 @@ mod tests {
             .expect("the valid shape must be accepted");
     }
 
+    /// A non-finite `w_full` entry is refused by both single-step entries
+    /// before the gate or the traffic EMA is touched.
+    ///
+    /// Fails if the `w_full` finiteness check is dropped: one NaN mass makes
+    /// the load-balance gradient NaN, the applied weights NaN, and the EMA
+    /// NaN, and a NaN EMA stays NaN through every later fold, so the gate never
+    /// recovers. The refusal must name the field and the value.
+    #[test]
+    fn non_finite_w_full_is_refused_before_the_gate_moves() {
+        let base = test_gate();
+        let sampled = [0.1_f32, -0.2, 0.3, 0.4];
+
+        for (label, bad) in [
+            ("nan w_full", [0.5_f32, f32::NAN, 0.5, 0.0]),
+            ("infinite w_full", [0.5_f32, f32::INFINITY, 0.5, 0.0]),
+        ] {
+            // step_with_learned_weights
+            let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+            let before = gate.to_bytes();
+            let freqs_before = trainer.route_freqs.clone();
+            let err = trainer
+                .step_with_learned_weights(&mut gate, &CTX, 0, 1.0, &bad, 1.0)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("w_full"),
+                "{label}: step_with_learned_weights must name w_full, got {err}"
+            );
+            assert_eq!(gate.to_bytes(), before, "{label}: the gate moved");
+            assert_eq!(
+                trainer.route_freqs, freqs_before,
+                "{label}: the traffic EMA moved"
+            );
+
+            // step_with_explored_action
+            let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+            let before = gate.to_bytes();
+            let freqs_before = trainer.route_freqs.clone();
+            let err = trainer
+                .step_with_explored_action(
+                    &mut gate,
+                    &CTX,
+                    &ExploredAction {
+                        sampled_logits: &sampled,
+                        exploration_scale: 1.0,
+                        w_full: &bad,
+                        tau: 1.0,
+                    },
+                    1.0,
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("w_full"),
+                "{label}: step_with_explored_action must name w_full, got {err}"
+            );
+            assert_eq!(gate.to_bytes(), before, "{label}: the gate moved");
+            assert_eq!(
+                trainer.route_freqs, freqs_before,
+                "{label}: the traffic EMA moved"
+            );
+        }
+
+        // The control: a finite `w_full` of the same shape is accepted and does
+        // move the gate, so the equalities above are about the refusal.
+        let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+        let before = gate.to_bytes();
+        trainer
+            .step_with_explored_action(
+                &mut gate,
+                &CTX,
+                &ExploredAction {
+                    sampled_logits: &sampled,
+                    exploration_scale: 1.0,
+                    w_full: &[0.5, 0.0, 0.5, 0.0],
+                    tau: 1.0,
+                },
+                1.0,
+            )
+            .unwrap();
+        assert_ne!(gate.to_bytes(), before);
+    }
+
+    /// A non-finite reward is refused by the single explored entry before
+    /// anything is applied.
+    ///
+    /// Fails if the reward check on the single-step entry is dropped: the
+    /// policy term is `reward * (z - z') / s^2`, which is NaN for a NaN reward
+    /// even when `z == z'` (`NaN * 0.0` is NaN), and it is applied to the gate.
+    #[test]
+    fn a_non_finite_reward_is_refused_on_the_explored_entry() {
+        let config = RlooConfig {
+            learning_rate: 0.5,
+            aux_loss_coeff: 0.0,
+            z_loss_coeff: 0.0,
+        };
+        let w_full = [0.5_f32, 0.0, 0.5, 0.0];
+        let base = test_gate();
+
+        for reward in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (mut gate, mut trainer) = drifted_off_uniform(&base, config.clone());
+            let z = gate.forward(&CTX).unwrap().to_vec();
+            let before = gate.to_bytes();
+            let err = trainer
+                .step_with_explored_action(
+                    &mut gate,
+                    &CTX,
+                    &ExploredAction {
+                        // `z' == z`: the offset cannot be the source of the NaN.
+                        sampled_logits: &z,
+                        exploration_scale: 1.0,
+                        w_full: &w_full,
+                        tau: 1.0,
+                    },
+                    reward,
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("reward"),
+                "reward {reward} must be refused and named, got {err}"
+            );
+            assert_eq!(gate.to_bytes(), before, "reward {reward} moved the gate");
+        }
+
+        // The control: the same action with a finite reward is accepted.
+        let (mut gate, mut trainer) = drifted_off_uniform(&base, config);
+        let z = gate.forward(&CTX).unwrap().to_vec();
+        trainer
+            .step_with_explored_action(
+                &mut gate,
+                &CTX,
+                &ExploredAction {
+                    sampled_logits: &z,
+                    exploration_scale: 1.0,
+                    w_full: &w_full,
+                    tau: 1.0,
+                },
+                1.0,
+            )
+            .unwrap();
+    }
+
+    /// A `tau` that is non-finite, or finite and positive but whose reciprocal
+    /// overflows `f32`, is refused on both single-step entries.
+    ///
+    /// Fails if the `1 / tau` check is dropped or weakened to `tau > 0`: the
+    /// smallest subnormal passes `tau > 0`, its `1 / tau` is `inf`, and an
+    /// unselected entry's `0.0 * inf` then makes the load-balance term NaN.
+    /// Fails too if the `tau` finiteness check is dropped: a NaN `tau` passes
+    /// `tau <= 0.0` (the comparison is false) and poisons the gate the same way.
+    #[test]
+    fn a_tau_that_cannot_be_inverted_is_refused() {
+        let w_full = [0.5_f32, 0.0, 0.5, 0.0];
+        let sampled = [0.1_f32, -0.2, 0.3, 0.4];
+        let bad_taus = [f32::from_bits(1), f32::NAN, f32::INFINITY];
+        assert!(
+            f32::from_bits(1).is_finite() && f32::from_bits(1) > 0.0,
+            "fixture: the subnormal must be finite and positive"
+        );
+        assert!(
+            !(1.0 / f32::from_bits(1)).is_finite(),
+            "fixture: the subnormal's reciprocal must overflow"
+        );
+
+        let base = test_gate();
+        for bad_tau in bad_taus {
+            let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+            let before = gate.to_bytes();
+            let err = trainer
+                .step_with_learned_weights(&mut gate, &CTX, 0, 1.0, &w_full, bad_tau)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("tau"),
+                "step_with_learned_weights must name tau, got {err}"
+            );
+            assert_eq!(gate.to_bytes(), before, "tau={bad_tau} moved the gate");
+
+            let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+            let before = gate.to_bytes();
+            let err = trainer
+                .step_with_explored_action(
+                    &mut gate,
+                    &CTX,
+                    &ExploredAction {
+                        sampled_logits: &sampled,
+                        exploration_scale: 1.0,
+                        w_full: &w_full,
+                        tau: bad_tau,
+                    },
+                    1.0,
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("tau"),
+                "step_with_explored_action must name tau, got {err}"
+            );
+            assert_eq!(gate.to_bytes(), before, "tau={bad_tau} moved the gate");
+        }
+
+        // The control: a small but representable `tau` whose reciprocal is
+        // finite is accepted.
+        let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+        trainer
+            .step_with_learned_weights(&mut gate, &CTX, 0, 1.0, &w_full, 1e-38)
+            .expect("a tau whose 1 / tau is finite must be accepted");
+    }
+
+    /// A non-finite context entry is refused before the gate is touched, on
+    /// both the single and the batch entry.
+    ///
+    /// Fails if the context finiteness check is dropped: a NaN context makes
+    /// every forward activation NaN, so every weight gradient is NaN and the
+    /// gate is poisoned.
+    #[test]
+    fn a_non_finite_context_is_refused_before_the_gate_moves() {
+        let w_full = [0.5_f32, 0.0, 0.5, 0.0];
+        let sampled = [0.1_f32, -0.2, 0.3, 0.4];
+        let bad_ctx = [0.1_f32, f32::NAN, 0.3, 0.4];
+        let base = test_gate();
+
+        // Single entry: step_with_explored_action.
+        let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+        let before = gate.to_bytes();
+        let err = trainer
+            .step_with_explored_action(
+                &mut gate,
+                &bad_ctx,
+                &ExploredAction {
+                    sampled_logits: &sampled,
+                    exploration_scale: 1.0,
+                    w_full: &w_full,
+                    tau: 1.0,
+                },
+                1.0,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("context"),
+            "must name the context, got {err}"
+        );
+        assert_eq!(gate.to_bytes(), before);
+
+        // Batch entry: the bad context is at a NON-zero index, and the gate and
+        // the traffic EMA must be byte-identical after the refusal.
+        let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+        let z = gate.forward(&CTX).unwrap().to_vec();
+        let served: Vec<f32> = z.iter().map(|zj| zj + 0.5).collect();
+        let other: Vec<f32> = z.iter().map(|zj| zj - 0.5).collect();
+        let before = gate.to_bytes();
+        let freqs_before = trainer.route_freqs.clone();
+        let samples = [
+            MixtureSample {
+                context: &CTX,
+                action: batch_action(&served, &w_full),
+                reward: 1.0,
+            },
+            MixtureSample {
+                context: &bad_ctx,
+                action: batch_action(&other, &w_full),
+                reward: -1.0,
+            },
+        ];
+        let err = trainer
+            .step_batch_with_explored_actions(&mut gate, &samples)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("context"),
+            "must name the context, got {err}"
+        );
+        assert_eq!(gate.to_bytes(), before, "the refused round moved the gate");
+        assert_eq!(
+            trainer.route_freqs, freqs_before,
+            "the refused round folded traffic"
+        );
+
+        // The control: the same round with a finite context reaches the gate.
+        let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+        let before = gate.to_bytes();
+        let samples = [
+            MixtureSample {
+                context: &CTX,
+                action: batch_action(&served, &w_full),
+                reward: 1.0,
+            },
+            MixtureSample {
+                context: &CTX,
+                action: batch_action(&other, &w_full),
+                reward: -1.0,
+            },
+        ];
+        trainer
+            .step_batch_with_explored_actions(&mut gate, &samples)
+            .unwrap();
+        assert_ne!(gate.to_bytes(), before);
+    }
     // ── Batch refit over recorded explored actions (ADR-096 decision 3) ─────
 
     /// Build an explored action from the served logits and the recorded
@@ -2762,15 +3243,15 @@ mod tests {
     /// entry refuses a non-finite scale.
     ///
     /// Fails if either guard is dropped: an empty round would silently return
-    /// an outcome, and a NaN reward would reach the policy term.
+    /// an outcome, and a NaN reward would reach the policy term. The bad reward
+    /// is the SECOND sample, so an apply-as-you-go validation would already
+    /// have moved the gate by the time it noticed.
     #[test]
     fn an_empty_round_and_a_non_finite_reward_are_refused() {
         let w_full = [0.6_f32, 0.0, 0.4, 0.0];
-        let mut gate = test_gate();
-        let z = gate.clone().forward(&CTX).unwrap().to_vec();
-        let served: Vec<f32> = z.iter().map(|zj| zj + 0.5).collect();
-        let other: Vec<f32> = z.iter().map(|zj| zj - 0.5).collect();
+        let base = test_gate();
         let mut trainer = RlooTrainer::with_seed(RlooConfig::default(), 1);
+        let mut gate = test_gate();
 
         assert!(
             trainer
@@ -2779,25 +3260,171 @@ mod tests {
         );
 
         for reward in [f32::NAN, f32::INFINITY] {
+            // A drifted trainer, so the EMA assertion below has content to
+            // compare and not just two empty vectors.
+            let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+            let z = gate.forward(&CTX).unwrap().to_vec();
+            let served: Vec<f32> = z.iter().map(|zj| zj + 0.5).collect();
+            let other: Vec<f32> = z.iter().map(|zj| zj - 0.5).collect();
+            let before = gate.to_bytes();
+            let freqs_before = trainer.route_freqs.clone();
+            assert!(
+                !freqs_before.is_empty(),
+                "fixture: the EMA must be sized for the comparison to mean anything"
+            );
             let samples = [
                 MixtureSample {
                     context: &CTX,
                     action: batch_action(&served, &w_full),
-                    reward,
+                    reward: 1.0,
                 },
                 MixtureSample {
                     context: &CTX,
                     action: batch_action(&other, &w_full),
-                    reward: 1.0,
+                    reward,
                 },
             ];
+            let err = trainer
+                .step_batch_with_explored_actions(&mut gate, &samples)
+                .unwrap_err();
             assert!(
-                trainer
-                    .step_batch_with_explored_actions(&mut gate, &samples)
-                    .is_err(),
-                "reward {reward} was accepted"
+                err.to_string().contains("reward"),
+                "reward {reward} must be refused and named, got {err}"
+            );
+            assert_eq!(gate.to_bytes(), before, "reward {reward} moved the gate");
+            assert_eq!(
+                trainer.route_freqs, freqs_before,
+                "reward {reward} folded traffic"
             );
         }
+    }
+
+    /// The batch refuses every malformed action, not only a bad sampled logit:
+    /// a non-finite `w_full` entry, a non-finite reward, a non-finite sampled
+    /// logit, a `tau` whose reciprocal overflows, and a `w_full` of the wrong
+    /// width. Each bad sample sits at index 1 — the non-zero index — and the
+    /// gate's weights and the traffic EMA are asserted byte-identical across the
+    /// refusal, so an apply-as-you-go validation would redden even though the
+    /// first sample is valid.
+    ///
+    /// Fails if any of the shared checks is dropped, or if the batch validates
+    /// inside the apply loop rather than before it.
+    #[test]
+    fn the_batch_refuses_a_malformed_action_before_applying_any_of_it() {
+        let config = RlooConfig {
+            learning_rate: 0.5,
+            aux_loss_coeff: 1.0,
+            z_loss_coeff: 0.1,
+        };
+        let base = test_gate();
+        let good_w = [0.6_f32, 0.0, 0.4, 0.0];
+        let nan_w = [0.6_f32, 0.0, f32::NAN, 0.0];
+        let inf_w = [0.6_f32, f32::INFINITY, 0.4, 0.0];
+        let short_w = [0.5_f32, 0.5];
+        let bad_tau = f32::from_bits(1);
+
+        // (label, sampled-logit index to poison (or None), w_full, tau, reward)
+        type Case<'a> = (&'a str, Option<usize>, &'a [f32], f32, f32);
+        let cases: [Case<'_>; 6] = [
+            ("nan w_full", None, &nan_w, 0.5, -1.0),
+            ("infinite w_full", None, &inf_w, 0.5, -1.0),
+            ("w_full wrong width", None, &short_w, 0.5, -1.0),
+            ("nan sampled logit", Some(2), &good_w, 0.5, -1.0),
+            ("tau with infinite reciprocal", None, &good_w, bad_tau, -1.0),
+            ("nan reward", None, &good_w, 0.5, f32::NAN),
+        ];
+
+        for (label, poison_index, bad_w, tau, reward) in cases {
+            let (mut gate, mut trainer) = drifted_off_uniform(&base, config.clone());
+            let z = gate.forward(&CTX).unwrap().to_vec();
+            let first_served: Vec<f32> = z.iter().map(|zj| zj + 0.5).collect();
+            let mut second_served: Vec<f32> = z.iter().map(|zj| zj - 0.5).collect();
+            if let Some(j) = poison_index {
+                second_served[j] = f32::NAN;
+            }
+            let before = gate.to_bytes();
+            let freqs_before = trainer.route_freqs.clone();
+
+            let samples = [
+                MixtureSample {
+                    context: &CTX,
+                    action: batch_action(&first_served, &good_w),
+                    reward: 1.0,
+                },
+                MixtureSample {
+                    context: &CTX,
+                    action: ExploredAction {
+                        sampled_logits: &second_served,
+                        exploration_scale: 1.0,
+                        w_full: bad_w,
+                        tau,
+                    },
+                    reward,
+                },
+            ];
+            let err = trainer
+                .step_batch_with_explored_actions(&mut gate, &samples)
+                .unwrap_err();
+            assert_eq!(
+                gate.to_bytes(),
+                before,
+                "{label}: the refused round moved the gate ({err})"
+            );
+            assert_eq!(
+                trainer.route_freqs, freqs_before,
+                "{label}: the refused round folded traffic"
+            );
+        }
+    }
+
+    /// A round of finite rewards whose leave-one-out advantage overflows is
+    /// refused before anything is applied.
+    ///
+    /// `[3e38, -3e38, 3e38]` is all finite as `f32`, but the leave-one-out mean
+    /// of the two `3e38` rewards overflows to `-inf` for the middle sample, and
+    /// an infinite advantage reaches the policy term and poisons the gate.
+    /// Fails if the advantage finiteness check is dropped.
+    #[test]
+    fn a_round_with_an_overflowing_advantage_is_refused() {
+        let w_full = [0.6_f32, 0.0, 0.4, 0.0];
+        let base = test_gate();
+        let rewards = [3e38_f32, -3e38, 3e38];
+        assert!(
+            rewards.iter().all(|r| r.is_finite()),
+            "fixture: the rewards must all be finite"
+        );
+        assert!(
+            leave_one_out_advantages(&rewards)
+                .iter()
+                .any(|a| !a.is_finite()),
+            "fixture: an advantage must overflow"
+        );
+
+        let (mut gate, mut trainer) = drifted_off_uniform(&base, RlooConfig::default());
+        let z = gate.forward(&CTX).unwrap().to_vec();
+        let served: Vec<f32> = z.iter().map(|zj| zj + 0.5).collect();
+        let before = gate.to_bytes();
+        let freqs_before = trainer.route_freqs.clone();
+        let samples: Vec<MixtureSample<'_>> = rewards
+            .iter()
+            .map(|r| MixtureSample {
+                context: &CTX,
+                action: batch_action(&served, &w_full),
+                reward: *r,
+            })
+            .collect();
+        let err = trainer
+            .step_batch_with_explored_actions(&mut gate, &samples)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("advantage"),
+            "the overflow must be named as an advantage, got {err}"
+        );
+        assert_eq!(gate.to_bytes(), before, "the refused round moved the gate");
+        assert_eq!(
+            trainer.route_freqs, freqs_before,
+            "the refused round folded traffic"
+        );
     }
 
     /// Every validated sample is traffic, whether or not the round could learn
@@ -2850,33 +3477,52 @@ mod tests {
         );
     }
 
-    /// A round can hold episodes the baseline has nothing to say about beside
-    /// ones it does, and the step is averaged over the CONTRIBUTORS.
+    /// The round's step is the mean over ALL `n` samples, not over the ones
+    /// that contributed: a three-episode round with one idle episode applies
+    /// `2/3` of the delta the same two contributing episodes apply alone.
     ///
-    /// Fails if the divisor is the round size rather than the contributing
-    /// count: the idle third episode would then shrink the step.
+    /// Fails if the divisor is the contributor count instead of `n`. The two
+    /// runs below carry the SAME two advantage-weighted gradients — rewards
+    /// `(+1, -1, 0)` give advantages `(+1.5, -1.5, 0)`, and `(+0.75, -0.75)`
+    /// gives `(+1.5, -1.5)` on the same two actions — so the ratio of the
+    /// applied deltas is exactly the ratio of the divisors, `2/3`. Under a
+    /// contributor-mean divisor the three-episode round would divide by `2` and
+    /// the ratio would be `1`.
     ///
-    /// Rewards `(+1, -1, 0)` put the third episode exactly on its own
-    /// leave-one-out baseline. Dividing by the round size instead would shrink
-    /// the step because an uninformative episode happened to be in the batch,
-    /// which is a step size that depends on what the round did NOT learn from.
+    /// Both guards are off and the gate is a single Linear layer, so the idle
+    /// episode's gradient is exactly zero, the two runs' numerator is
+    /// identical, and the applied output-layer delta is exactly recoverable
+    /// from the moved forward output. That isolates the divisor. (With the
+    /// guards on, the idle episode's aux and z-loss gradients would also be
+    /// summed and divided by `n`, which is the other half of what averaging
+    /// over the round means.)
     #[test]
-    fn the_step_is_averaged_over_the_episodes_that_contributed() {
+    fn the_step_is_averaged_over_the_whole_round() {
         let w_full = [0.6_f32, 0.0, 0.4, 0.0];
-        let base = test_gate();
+        let base = linear_gate();
         let config = RlooConfig {
             learning_rate: 0.5,
-            aux_loss_coeff: 1.0,
-            z_loss_coeff: 0.1,
+            aux_loss_coeff: 0.0,
+            z_loss_coeff: 0.0,
         };
         let z = base.clone().forward(&CTX).unwrap().to_vec();
         let first: Vec<f32> = z.iter().map(|zj| zj + 0.5).collect();
         let second: Vec<f32> = z.iter().map(|zj| zj - 0.5).collect();
-        let advantages = leave_one_out_advantages(&[1.0, -1.0, 0.0]);
-        assert_eq!(advantages, vec![1.5, -1.5, 0.0], "fixture assumption");
+        assert_eq!(
+            leave_one_out_advantages(&[1.0, -1.0, 0.0]),
+            vec![1.5, -1.5, 0.0],
+            "fixture assumption"
+        );
+        assert_eq!(
+            leave_one_out_advantages(&[0.75, -0.75]),
+            vec![1.5, -1.5],
+            "fixture assumption"
+        );
 
         let run = |rewards: &[f32]| {
-            let (mut gate, mut trainer) = drifted_off_uniform(&base, config.clone());
+            let mut gate = base.clone();
+            let mut trainer = RlooTrainer::with_seed(config.clone(), 1);
+            let before = gate.forward(&CTX).unwrap().to_vec();
             let samples: Vec<MixtureSample<'_>> = rewards
                 .iter()
                 .enumerate()
@@ -2889,33 +3535,132 @@ mod tests {
             let outcome = trainer
                 .step_batch_with_explored_actions(&mut gate, &samples)
                 .unwrap();
-            (outcome, gate.to_bytes())
+            let after = gate.forward(&CTX).unwrap().to_vec();
+            (
+                outcome,
+                applied_delta(&before, &after, config.learning_rate),
+            )
         };
 
-        let (three, with_idle) = run(&[1.0, -1.0, 0.0]);
+        let (three, delta_three) = run(&[1.0, -1.0, 0.0]);
         assert_eq!(three.samples, 3);
-        assert_eq!(three.informative, 2);
-
-        // The same two contributing episodes, alone, at the rewards that
-        // reproduce those advantages: a two-episode round has denominator 1,
-        // so `(+0.75, -0.75)` gives `(+1.5, -1.5)` again. Same advantages,
-        // same gradients, same divisor -- the idle third episode must not have
-        // changed where the round landed.
-        assert_eq!(leave_one_out_advantages(&[0.75, -0.75]), vec![1.5, -1.5]);
-        let (two, without_idle) = run(&[0.75, -0.75]);
-        assert_eq!(two.informative, 2);
         assert_eq!(
-            with_idle, without_idle,
-            "an episode the baseline found nothing to say about changed the step size"
+            three.informative, 2,
+            "the idle episode is not a contributor"
+        );
+        let (two, delta_two) = run(&[0.75, -0.75]);
+        assert_eq!(two.samples, 2);
+        assert_eq!(two.informative, 2);
+
+        for (j, (&d3, &d2)) in delta_three.iter().zip(delta_two.iter()).enumerate() {
+            assert!(
+                d2.abs() > 1e-6,
+                "index {j}: the two-episode delta must be non-zero to take a ratio"
+            );
+            let ratio = d3 / d2;
+            assert!(
+                (ratio - 2.0 / 3.0).abs() < 1e-4,
+                "index {j}: the three-episode round must divide by 3 and the \
+                 two-episode round by 2, a ratio of 2/3, got {ratio} \
+                 (three {d3}, two {d2})"
+            );
+        }
+    }
+
+    /// The round's applied update is continuous in the rewards: moving one
+    /// judgement by a hair moves the gate by a hair, because the divisor is
+    /// `n` whatever the advantages do. A contributor-mean divisor would put a
+    /// step discontinuity at every exact reward tie.
+    ///
+    /// Rewards `[1, 2, 3]` give advantages `[-1.5, 0, 1.5]` — two contributors
+    /// out of three — and rewards `[1, 2, 3.001]` give three non-zero
+    /// advantages. Under the `1 / n` divisor the applied deltas differ by under
+    /// a tenth of a percent; under a contributor-mean divisor the same pair
+    /// divides by 2 and by 3 and the deltas differ by a third. Fails if the
+    /// divisor is the contributor count.
+    ///
+    /// The bound: this fixture's per-column delta is `0.125` at `1 / n`, and
+    /// the two runs differ by less than `1e-3` of that, well inside the `1e-3`
+    /// asserted. A contributor-mean mutant differs by `0.334` of it, over 300
+    /// times the bound.
+    #[test]
+    fn the_rounds_step_is_continuous_across_a_reward_tie() {
+        let w_full = [0.6_f32, 0.0, 0.4, 0.0];
+        let base = linear_gate();
+        let config = RlooConfig {
+            learning_rate: 0.5,
+            aux_loss_coeff: 0.0,
+            z_loss_coeff: 0.0,
+        };
+        let z = base.clone().forward(&CTX).unwrap().to_vec();
+        let offsets: [&[f32]; 3] = [
+            &[0.5, -0.5, 0.5, -0.5],
+            &[-0.5, 0.5, -0.5, 0.5],
+            &[0.25, -0.25, 0.25, -0.25],
+        ];
+        let served: Vec<Vec<f32>> = offsets
+            .iter()
+            .map(|o| z.iter().zip(o.iter()).map(|(zj, d)| zj + d).collect())
+            .collect();
+
+        assert_eq!(
+            leave_one_out_advantages(&[1.0, 2.0, 3.0]),
+            vec![-1.5, 0.0, 1.5],
+            "fixture assumption: the exact tie is a zero advantage"
+        );
+        assert!(
+            leave_one_out_advantages(&[1.0, 2.0, 3.001])
+                .iter()
+                .all(|a| *a != 0.0),
+            "fixture assumption: the nudged round has three contributors"
+        );
+
+        let run = |rewards: [f32; 3]| -> Vec<f32> {
+            let mut gate = base.clone();
+            let mut trainer = RlooTrainer::with_seed(config.clone(), 1);
+            let before = gate.forward(&CTX).unwrap().to_vec();
+            let samples: Vec<MixtureSample<'_>> = rewards
+                .iter()
+                .enumerate()
+                .map(|(i, r)| MixtureSample {
+                    context: &CTX,
+                    action: batch_action(&served[i], &w_full),
+                    reward: *r,
+                })
+                .collect();
+            trainer
+                .step_batch_with_explored_actions(&mut gate, &samples)
+                .unwrap();
+            let after = gate.forward(&CTX).unwrap().to_vec();
+            applied_delta(&before, &after, config.learning_rate)
+        };
+
+        let exact = run([1.0, 2.0, 3.0]);
+        let nudged = run([1.0, 2.0, 3.001]);
+        let scale = exact.iter().fold(0.0_f32, |m, d| m.max(d.abs()));
+        assert!(scale > 1e-3, "fixture must apply a non-zero delta");
+        let change = exact
+            .iter()
+            .zip(nudged.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            change / scale < 1e-3,
+            "a 1e-3 reward change must move the gate by under 1e-3 of the step, \
+             got {change} of {scale} (the contributor-mean divisor would give about 1/3)"
         );
     }
 
     /// The outcome reports the raw feedback and the size of the population
     /// that contributed, separately.
     ///
-    /// Fails if `mean_reward` is taken over the contributors rather than the
-    /// round: the two below have the same contributing count but different
-    /// round means.
+    /// This fixture has all four samples informative, so it does NOT separate a
+    /// round mean from a contributor mean: `mean_reward` is `0.0` either way.
+    /// What it pins is the shape of the two fields — four samples, four
+    /// contributors, a round mean of zero, and a finite loss — and the arm that
+    /// actually separates the two divisors is
+    /// `the_step_is_averaged_over_the_whole_round`, which carries an idle
+    /// episode.
     #[test]
     fn the_outcome_separates_what_the_feedback_said_from_what_contributed() {
         let w_full = [0.6_f32, 0.0, 0.4, 0.0];

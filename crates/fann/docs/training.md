@@ -463,17 +463,33 @@ g[j] = reward · (z[j] − z'[j]) / s^2                                (policy)
      + z_coeff   · 2 · LSE · p[j]                                    (z-loss)
 ```
 
-with no derivative taken through the softmax or the floor: both sit downstream
-of the sampled action and affect only the reward earned. `w_full` and `tau` feed
+The **policy term** takes no derivative through the softmax or the floor: both
+sit downstream of the sampled action and affect only the reward earned. The
+load-balance and z-loss terms are ordinary functions of the gate's own logits
+and probabilities, and the load-balance term does differentiate its softmax —
+that is the gradient `load_balance_aux_gradient` returns. `w_full` and `tau` feed
 the load-balance term and the traffic mass exactly as in
 `step_with_learned_weights`. The returned scalar is the reward-weighted negative
 log density without its constant, `reward · ‖z' − z‖² / (2 s^2)`.
 
 The batch entry `step_batch_with_explored_actions` takes a round of recorded
 actions and a leave-one-out baseline over the round. Every sample's gradient is
-taken at the gate that produced the actions, every sample is validated before any
-is applied, and a round whose rewards are all equal is a byte-for-byte no-op,
-including a round of one.
+taken at the gate that produced the actions and every sample is validated before
+any is applied, so a refused round leaves the gate untouched. In a round with at
+least one non-zero advantage the update is the mean over **all** `n` samples,
+
+```text
+Δ = (1/n) · Σ_i [ A_i · (z_i − z'_i)/s² + aux_coeff·(1/tau_i)·aux_i + z_coeff·zgrad_i ]
+```
+
+as ADR-096 decision 3 writes it. Averaging over `n` rather than over the
+contributors keeps the policy term continuous in the rewards — a reward a hair
+off a tie cannot move a sample between denominators and rescale the whole step —
+and averages each regulariser over the round it belongs to. A round whose every
+advantage is zero is the exception: the gate's **weights** are left byte-for-byte
+unchanged, including a round of one, because there is no policy update for the
+regularisers to shape. The frequency EMA still folds every validated sample
+either way.
 
 ### Phase 2: multi-sample RLOO (`rloo_step`, not the default path)
 
