@@ -22,7 +22,78 @@ use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
+use crate::forward::cpu::matmul_bt;
 use crate::option_scoring::{OptionScores, check_letter_ids, option_scores_from_logits};
+
+/// **Unstable**: input for [`Qwen35Model::prefill_readout`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PrefillInput<'a> {
+    /// Raw token IDs from the model's vocabulary.
+    TokenIds(&'a [u32]),
+}
+
+fn gather_readout_rows(
+    head: &[f32],
+    hidden_size: usize,
+    rows: &[u32],
+    selected_scratch: &mut [f32],
+) -> Result<(), InferenceError> {
+    if hidden_size == 0 || !head.len().is_multiple_of(hidden_size) {
+        return Err(InferenceError::Inference(
+            "prefill_readout: inconsistent head geometry".into(),
+        ));
+    }
+    let selected_len = rows.len().checked_mul(hidden_size).ok_or_else(|| {
+        InferenceError::Inference("prefill_readout: selected head size overflow".into())
+    })?;
+    if selected_scratch.len() != selected_len {
+        return Err(InferenceError::Inference(
+            "prefill_readout: inconsistent selected head geometry".into(),
+        ));
+    }
+    let head_rows = head.len() / hidden_size;
+    for (destination, &row_id) in selected_scratch.chunks_exact_mut(hidden_size).zip(rows) {
+        let row = row_id as usize;
+        if row >= head_rows {
+            return Err(InferenceError::Inference(format!(
+                "prefill_readout: head row {row} out of range: head has {head_rows} rows"
+            )));
+        }
+        let start = row * hidden_size;
+        destination.copy_from_slice(&head[start..start + hidden_size]);
+    }
+    Ok(())
+}
+
+fn project_readout_hidden(
+    hidden: &[f32],
+    selected_scratch: &[f32],
+    logits: &mut [f32],
+) -> Result<(), InferenceError> {
+    let k = hidden.len();
+    let n = logits.len();
+    if k == 0 || !(1..=255).contains(&n) {
+        return Err(InferenceError::Inference(
+            "prefill_readout: inconsistent projection geometry".into(),
+        ));
+    }
+    let selected_len = k.checked_mul(n).ok_or_else(|| {
+        InferenceError::Inference("prefill_readout: projection size overflow".into())
+    })?;
+    if selected_scratch.len() != selected_len {
+        return Err(InferenceError::Inference(
+            "prefill_readout: inconsistent selected head geometry".into(),
+        ));
+    }
+    matmul_bt(hidden, selected_scratch, logits, 1, k, n);
+    if let Some((index, &value)) = logits.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(InferenceError::Inference(format!(
+            "prefill_readout: non-finite logit at selected row {index}: {value}"
+        )));
+    }
+    Ok(())
+}
 
 /// Configuration for [`Qwen35Model::compute_perplexity`].
 #[derive(Clone, Copy, Debug)]
@@ -189,6 +260,112 @@ impl Qwen35Model {
         }
         let logits = self.forward_prompt_debug(prompt_ids)?;
         option_scores_from_logits(&logits, letter_ids)
+    }
+
+    /// **Unstable**: read selected logits at selected positions with one CPU prefill.
+    ///
+    /// Processes the complete input from fresh recurrent and KV state. Each result row
+    /// corresponds to a position in `slots`, and contains the logits for `rows` in caller
+    /// order. The hidden states are captured after final RMSNorm. Each slot uses a separate
+    /// single-row projection over the selected head rows; there is no sampling or decode step.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::InvalidInput`] before any forward pass for empty input, input longer
+    /// than [`Self::max_context`], an input token outside the vocabulary, empty `slots`, a slot
+    /// outside the input, slots that are not strictly increasing, empty `rows`, more than 255
+    /// rows, a row outside the vocabulary, or duplicate rows.
+    /// [`InferenceError::Inference`] for inconsistent head geometry or a non-finite logit.
+    pub fn prefill_readout(
+        &self,
+        input: PrefillInput<'_>,
+        slots: &[usize],
+        rows: &[u32],
+    ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        let PrefillInput::TokenIds(tokens) = input;
+        let cfg = &self.config;
+        if tokens.is_empty() {
+            return Err(InferenceError::InvalidInput(
+                "prefill_readout: tokens must not be empty".into(),
+            ));
+        }
+        if tokens.len() > self.max_context() {
+            return Err(InferenceError::InvalidInput(format!(
+                "prefill_readout: tokens.len() ({}) exceeds RoPE capacity ({})",
+                tokens.len(),
+                self.max_context()
+            )));
+        }
+        if let Some((index, &token_id)) = tokens
+            .iter()
+            .enumerate()
+            .find(|&(_, &token)| token as usize >= cfg.vocab_size)
+        {
+            return Err(InferenceError::InvalidInput(format!(
+                "prefill_readout: tokens[{index}]={token_id} out of range: vocab_size is {}",
+                cfg.vocab_size
+            )));
+        }
+        if slots.is_empty() {
+            return Err(InferenceError::InvalidInput(
+                "prefill_readout: slots must not be empty".into(),
+            ));
+        }
+        if let Some(&slot) = slots.iter().find(|&&slot| slot >= tokens.len()) {
+            return Err(InferenceError::InvalidInput(format!(
+                "prefill_readout: slot {slot} out of range: input has {} tokens",
+                tokens.len()
+            )));
+        }
+        if slots.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(InferenceError::InvalidInput(
+                "prefill_readout: slots must be strictly increasing".into(),
+            ));
+        }
+        check_letter_ids(cfg.vocab_size, rows)?;
+        if rows.len() > 255 {
+            return Err(InferenceError::InvalidInput(format!(
+                "prefill_readout: at most 255 rows are supported, got {}",
+                rows.len()
+            )));
+        }
+
+        let hidden = cfg.hidden_size;
+        let selected_len = rows.len().checked_mul(hidden).ok_or_else(|| {
+            InferenceError::Inference("prefill_readout: selected head size overflow".into())
+        })?;
+        let mut selected = vec![0.0; selected_len];
+        gather_readout_rows(self.weights.logits_weight(), hidden, rows, &mut selected)?;
+
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::new(cfg))
+            .collect();
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        let mut scratch = ForwardScratch::new();
+        let mut captured = vec![vec![0.0; hidden]; slots.len()];
+        let mut next_slot = 0;
+        for (position, &token_id) in tokens.iter().enumerate() {
+            self.forward_hidden_step(
+                token_id,
+                position,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+            );
+            if next_slot < slots.len() && position == slots[next_slot] {
+                captured[next_slot].copy_from_slice(&scratch.hidden[..hidden]);
+                next_slot += 1;
+            }
+            if position < tokens.len() - 1 {
+                kv_cache.seq_len += 1;
+            }
+        }
+
+        let mut result = vec![vec![0.0; rows.len()]; slots.len()];
+        for (hidden, logits) in captured.iter().zip(&mut result) {
+            project_readout_hidden(hidden, &selected, logits)?;
+        }
+        Ok(result)
     }
 
     /// **Unstable (train-backward)**: per-position final hidden states.
@@ -1352,4 +1529,6 @@ mod tests {
             .score_option_letters(&[1; 8], &[1, 2])
             .expect("a prompt of exactly max_context tokens is valid");
     }
+
+    mod readout_tests;
 }
