@@ -101,6 +101,10 @@ pub fn bootstrap_policy() -> RouterPolicy {
         // No objective was optimised. An empty string here would read as a
         // recorded objective with an unprintable name.
         objective_version: None,
+        // A bootstrap is deterministic: it serves the same mixture for every
+        // request, and recording a scale would claim it explores. Absence, not
+        // zero -- zero is a scale, and `validate()` refuses it.
+        exploration_scale: None,
     }
 }
 

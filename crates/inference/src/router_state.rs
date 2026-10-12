@@ -341,6 +341,37 @@ pub const ROUTER_POLICY_KINDS: [&str; 2] = ["uniform", "softmax"];
 /// down.
 pub const ROUTER_TRAINING_STATES: [&str; 2] = ["bootstrap", "learned"];
 
+/// Smallest exploration scale an artifact may record, and the smallest the
+/// router will draw at (ADR-096 decision 3).
+///
+/// It lives here rather than beside the draw because it has to be enforced at
+/// both ends, and this module is compiled unconditionally while the router is
+/// behind a feature: an artifact that recorded a scale the router would refuse
+/// would be valid on disk and unservable, which is a configuration nobody
+/// finds until a request fails. Two constants with one meaning drift, and the
+/// drifting copy would be the one the file was validated against.
+///
+/// The draw is Gaussian on the gate's raw logits, `z' = z + e` with
+/// `e ~ N(0, s^2 I)`, and what a learner scores is the density of `z'` given
+/// `z`, whose gradient is `(z' - z) / s^2`. That division is why the floor is
+/// about the estimator rather than about a Gumbel score scale: as `s` falls
+/// toward zero the importance weight of any non-degenerate draw grows without
+/// bound, so a scale small enough that the perturbation cannot move the served
+/// mixture is not a gentle exploration, it is a numerically explosive one
+/// wearing a quiet perturbation. At `1e-3` a standard normal draw, which stays
+/// within roughly `[-5, +5]` over any realistic number of requests, moves a
+/// score by at most a few thousandths of a unit: gate scores carry no
+/// calibrated magnitude, but a top-`k` boundary that close to a tie is not one
+/// whose ordering carries information either, and the estimator divides by
+/// `s^2 = 1e-6`. Below this floor a draw cannot change the served action for
+/// any score gap a gate actually produces, so an enabled learning mode would
+/// record a scale, a mixture that never varies, and a score that explodes on
+/// the first real sample: exploitation wearing exploration's evidence, which
+/// reads as working. Policy, not derivation; the falsifier is a gate whose
+/// scores genuinely live on a `1e-3` scale, and the remedy there is to rescale
+/// the gate.
+pub const MIN_EXPLORATION_SCALE: f64 = 1e-3;
+
 /// The complete routing policy an artifact was admitted under.
 ///
 /// ADR-096 decision 5: a version is a policy, not a network blob. Loading the
@@ -372,6 +403,20 @@ pub struct RouterPolicy {
     /// Identity of the objective this artifact was trained under. `None` for a
     /// bootstrap, which was not trained under one.
     pub objective_version: Option<String>,
+    /// Scale of the exploration draw this policy admits, or `None` for a
+    /// policy that serves its decision deterministically (ADR-096 decision 3).
+    ///
+    /// In the artifact rather than in a serving flag for decision 5's reason:
+    /// a version label is a complete policy, and a scale supplied at startup
+    /// would let one label name a deterministic behaviour on one host and a
+    /// sampled one on another. The field must be present: an artifact that
+    /// does not say is refused rather than read as deterministic, because a
+    /// writer that dropped the field would produce exactly that value. The
+    /// derive reads a missing `Option` field as `None` on its own, without a
+    /// `#[serde(default)]`, so presence is enforced by deserializing through
+    /// `Option::deserialize`; an explicit `null` still reads as `None`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub exploration_scale: Option<f64>,
 }
 
 /// Where an artifact came from: its schema, its parent, and the admission
@@ -515,6 +560,22 @@ impl RouterPolicy {
             }
             _ => {}
         }
+        // A uniform policy cannot be explored on this serving path, which
+        // selects every trained column: the selected set is the whole set
+        // whatever the perturbation does and every weight is 1/k whatever the
+        // scores are, so the draw would record variation the action never had.
+        // Refused here as well as at the router, so the unservable artifact
+        // cannot be written. The falsifier is a serving path that narrows k,
+        // which would make a uniform draw reach the selected set -- at which
+        // point this refusal is the thing to revisit, not the router's.
+        if self.kind == "uniform"
+            && let Some(scale) = self.exploration_scale
+        {
+            return Err(bad(format!(
+                "a uniform policy records an exploration scale {scale}, but a draw cannot \
+                 change a uniform decision over every trained column"
+            )));
+        }
         // Every float is hashed by its bit pattern, and NaN has many of those
         // while comparing equal to none of them. A non-finite value here would
         // make a version label that cannot be reproduced from its own fields.
@@ -523,6 +584,7 @@ impl RouterPolicy {
             ("tau_floor", Some(self.tau_floor)),
             ("entropy_floor", Some(self.entropy_floor)),
             ("tau", self.tau),
+            ("exploration_scale", self.exploration_scale),
         ] {
             if let Some(v) = value
                 && !v.is_finite()
@@ -540,6 +602,16 @@ impl RouterPolicy {
         }
         if self.epsilon < 0.0 {
             return Err(bad(format!("epsilon {} is negative", self.epsilon)));
+        }
+        // Checked after the finiteness loop above, never before it: NaN
+        // compares false against `<` as it does against everything else, so a
+        // NaN scale must fail as non-finite rather than slip past this.
+        if let Some(scale) = self.exploration_scale
+            && scale < MIN_EXPLORATION_SCALE
+        {
+            return Err(bad(format!(
+                "exploration scale {scale} is below the minimum {MIN_EXPLORATION_SCALE}"
+            )));
         }
         Ok(())
     }
@@ -719,6 +791,7 @@ impl RouterArtifact {
                 lineage.parent.is_some(),
                 lineage.admission_record.is_some(),
                 policy.tau.is_some(),
+                policy.exploration_scale.is_some(),
             ] {
                 hasher.update([u8::from(present)]);
             }
@@ -729,6 +802,7 @@ impl RouterArtifact {
                 policy.epsilon,
                 policy.tau_floor,
                 policy.entropy_floor,
+                policy.exploration_scale.unwrap_or(0.0),
             ] {
                 hasher.update(f.to_bits().to_le_bytes());
             }
@@ -1410,6 +1484,7 @@ mod tests {
             max_consecutive_collapsed: 3,
             training_state: "learned".into(),
             objective_version: Some("whole-mixture-v1".into()),
+            exploration_scale: None,
         }
     }
 
@@ -1659,6 +1734,12 @@ mod tests {
                 "admission_record absent",
                 Box::new(|_: &mut RouterPolicy, l: &mut RouterLineage| l.admission_record = None),
             ),
+            (
+                "exploration_scale",
+                Box::new(|p: &mut RouterPolicy, _: &mut RouterLineage| {
+                    p.exploration_scale = Some(0.5)
+                }),
+            ),
         ];
 
         for (name, apply) in mutate {
@@ -1740,6 +1821,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The scale a policy explores at is part of the version, not a setting
+    /// beside it. Decision 5's whole claim is that one label names one
+    /// behaviour, and a deterministic gate and a sampled one are two.
+    ///
+    /// Would fail if `content_hash` stopped hashing `exploration_scale`, either
+    /// the presence bit or the value: the absent-versus-present arm pins the
+    /// presence bit and the two-values arm pins the value, because a hash that
+    /// covered only one of them would still pass a test that changed both at
+    /// once.
+    #[test]
+    fn the_exploration_scale_is_inside_the_version_hash() {
+        let deterministic = RouterArtifact {
+            provenance: RouterProvenance::recorded(policy(), lineage()),
+            ..artifact()
+        };
+        let sampled = RouterArtifact {
+            provenance: RouterProvenance::recorded(
+                RouterPolicy {
+                    exploration_scale: Some(0.5),
+                    ..policy()
+                },
+                lineage(),
+            ),
+            ..artifact()
+        };
+        let sampled_wider = RouterArtifact {
+            provenance: RouterProvenance::recorded(
+                RouterPolicy {
+                    exploration_scale: Some(1.5),
+                    ..policy()
+                },
+                lineage(),
+            ),
+            ..artifact()
+        };
+
+        assert_ne!(
+            deterministic.content_hash(),
+            sampled.content_hash(),
+            "absent and present must not hash alike, or the presence byte is dead"
+        );
+        assert_ne!(
+            sampled.content_hash(),
+            sampled_wider.content_hash(),
+            "two scales must not hash alike, or the value is outside the label"
+        );
+        // Control: the hash is stable for an unchanged policy, so the two
+        // inequalities above are about the field and not about the fixture.
+        assert_eq!(deterministic.content_hash(), deterministic.content_hash());
+    }
+
+    /// A bootstrap explores at nothing. Recorded as an absence rather than as
+    /// a zero: a zero would be a scale, and a refused one.
+    ///
+    /// Would fail if the bootstrap recorded `Some(0.0)` -- which `validate`
+    /// also refuses, so the two arms agree -- or any scale at all.
+    #[test]
+    fn a_bootstrap_policy_records_no_exploration_scale() {
+        let bootstrap = crate::router_init::bootstrap_policy();
+        assert_eq!(bootstrap.exploration_scale, None);
+        bootstrap
+            .validate()
+            .expect("the bootstrap policy must validate");
+    }
+
+    /// A recorded artifact that does not carry the scale field is refused at
+    /// LOAD, not read as deterministic. This is the "no serde default"
+    /// property: a writer that dropped the field would produce exactly the
+    /// value a default would supply, so a default would make the omission
+    /// silent.
+    ///
+    /// Would fail if `RouterPolicy::exploration_scale` lost its
+    /// `deserialize_with` or gained a `#[serde(default)]`: the hand-edited
+    /// manifest below would parse.
+    #[test]
+    fn an_artifact_that_does_not_say_its_scale_is_refused_at_load() {
+        let dir = scratch("missing-scale");
+        write_artifact(&dir, &recorded()).expect("write");
+        // The control: the fixture reads before the field is removed.
+        read_artifact(&dir, 7).expect("the fixture must read");
+
+        let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read manifest");
+        let mut v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
+        v["policy"]
+            .as_object_mut()
+            .expect("a policy object")
+            .remove("exploration_scale");
+        std::fs::write(
+            manifest_path(&dir, 7),
+            serde_json::to_vec_pretty(&v).expect("serialize"),
+        )
+        .expect("rewrite");
+
+        match read_artifact(&dir, 7) {
+            Err(RouterArtifactError::Malformed { message, .. }) => {
+                assert!(
+                    message.contains("exploration_scale"),
+                    "the refusal must name the missing field: {message}"
+                );
+            }
+            other => panic!("expected a malformed-manifest refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two artifacts that differ only in the scale -- or in whether it is
+    /// present -- are two versions on disk, not one.
+    ///
+    /// Would fail if the scale were written beside the artifact rather than
+    /// hashed into it, which is the pin-buys-one-behaviour property decision 5
+    /// exists to hold.
+    #[test]
+    fn two_artifacts_that_differ_only_in_the_scale_hash_differently() {
+        let dir = scratch("scale-version");
+        // Two counters, so both survive on disk and the round-trip is real
+        // rather than the second write overwriting the first.
+        let deterministic = RouterArtifact {
+            version: 7,
+            provenance: RouterProvenance::recorded(policy(), lineage()),
+            ..artifact()
+        };
+        let sampled = RouterArtifact {
+            version: 8,
+            provenance: RouterProvenance::recorded(
+                RouterPolicy {
+                    exploration_scale: Some(0.25),
+                    ..policy()
+                },
+                lineage(),
+            ),
+            ..artifact()
+        };
+        write_artifact(&dir, &deterministic).expect("write deterministic");
+        write_artifact(&dir, &sampled).expect("write sampled");
+        let a = read_artifact(&dir, 7).expect("read deterministic");
+        let b = read_artifact(&dir, 8).expect("read sampled");
+        assert_ne!(a.content_hash(), b.content_hash());
+        assert_eq!(a.content_hash(), deterministic.content_hash());
+        assert_eq!(b.content_hash(), sampled.content_hash());
+        // The operator-facing identity differs in its hash half, which is the
+        // property a pin depends on.
+        assert_ne!(
+            a.version_label().split_once(':').expect("a label").1,
+            b.version_label().split_once(':').expect("a label").1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn policy_validation_covers_each_way_a_policy_can_be_unservable() {
         let cases: Vec<(&str, RouterPolicy)> = vec![
@@ -1797,6 +2026,36 @@ mod tests {
                 "negative epsilon",
                 RouterPolicy {
                     epsilon: -0.01,
+                    ..policy()
+                },
+            ),
+            (
+                "uniform with an exploration scale",
+                RouterPolicy {
+                    kind: "uniform".into(),
+                    tau: None,
+                    exploration_scale: Some(1.0),
+                    ..policy()
+                },
+            ),
+            (
+                "exploration scale below the minimum",
+                RouterPolicy {
+                    exploration_scale: Some(MIN_EXPLORATION_SCALE / 2.0),
+                    ..policy()
+                },
+            ),
+            (
+                "non-finite exploration scale",
+                RouterPolicy {
+                    exploration_scale: Some(f64::NAN),
+                    ..policy()
+                },
+            ),
+            (
+                "negative exploration scale",
+                RouterPolicy {
+                    exploration_scale: Some(-1.0),
                     ..policy()
                 },
             ),
