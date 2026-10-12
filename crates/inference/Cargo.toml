@@ -187,6 +187,14 @@ required-features = ["f16", "metal-gpu", "serve"]
 name = "serve_startup_golden"
 required-features = ["f16", "metal-gpu", "serve"]
 
+# Request, prompt and answer layer for the system-one wire format (no model, no
+# route); runs under the default `serve` feature. Its checkpoint-tokenizer tests
+# skip with a printed reason when `LATTICE_DECIDER_DIR` is unset, and
+# `LATTICE_DECIDER_GATE_ENFORCE=1` turns that skip into a failure.
+[[test]]
+name = "systemone_decider_0_8b"
+required-features = ["serve"]
+
 # The serving checkpoint targets stay out of `cargo test`'s default target set
 # and run only when selected with `--test <name>`. Set
 # `LATTICE_SERVE_CHARACTERIZATION_GATE_ENFORCE=1` to fail when a checkpoint is
