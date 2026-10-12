@@ -4,6 +4,10 @@
 **Date**: 2026-10-12\
 **Crates**: lattice-inference, lattice-embed\
 **Scope**: f32 CPU embedding on Linux x86_64 and aarch64; shared CPU serving admission\
+**Requirements**: fast CPU embedding on Linux cloud hosts such as Fly and Hetzner, AMD x86_64
+first; use multiple cores where that pays, within CPU and memory limits that protect the host;
+keep Apple silicon and edge devices (Linux ARM boards such as the Raspberry Pi 5) supported,
+each qualified on its own hardware\
 **Related**: ADR-070, ADR-081, ADR-087, proposed ADR-088\
 **Source baseline**: `61f5f25e89f5cff14b904f2cc62a4eb1377ed7f0`
 
@@ -39,8 +43,8 @@ therefore has a plausible benefit and an explicit memory cost.
 ### Measurements and their limits
 
 The following measurements were taken before this decision was written; none was rerun
-while writing it. The clean Linux host was an 8-vCPU AMD EPYC (Zen 4) cloud VM, with
-32 GiB of memory and no SMT. H0 r2 and H1 used baseline `7b2e0878`, which differs from
+while writing it. The clean Linux host was a Fly.io Machine with 8 dedicated AMD EPYC (Zen 4)
+vCPUs, 32 GiB of memory and no SMT. H0 r2 and H1 used baseline `7b2e0878`, which differs from
 the source baseline above. H1 changed the x86 `matmul_bt` branch to `gemm` 0.18.2 and
 used ABBA ordering. The embedding corpus contained 1,024 synthetic texts, 55,693 tokens,
 lengths 1 through 256, with CLS pooling.
@@ -60,6 +64,14 @@ of 0.22%. H1's BGE-base comparison included a contaminated base arm and is exclu
 from quantitative acceptance. Six-decimal printed agreement is not a numerical gate.
 The raw run artifacts and complete build flags are not yet published. Attach those to the
 implementation PR before making release performance claims. No Linux aarch64 speedup has been measured in this evidence set.
+
+One later measurement on the same host bears on F3. With rustc 1.94.1,
+`std::thread::available_parallelism()` cost about 35.5 µs per call (2,000 calls after
+warm-up, three repeats: 35.6, 35.5 and 35.5 µs). At `72817c66`, WordPiece batch
+tokenization calls it on every call, batch 1 included. In one ABBA run of the tokenizer
+benchmark on that host, the batch-1 median was 50.6 µs with that call and 14.7 µs without
+it (in-run A/A spreads 0.9% and 1.2%); the sequential tokenization code was otherwise
+identical between the two arms.
 
 ## Refutation and priority
 
@@ -139,6 +151,21 @@ its BLIS-style implementation also supplies an independently developed compariso
 [matrixmultiply documentation](https://docs.rs/matrixmultiply/latest/matrixmultiply/)
 (page identified itself as 0.3.11).
 
+**Cost accepted.** Lattice takes on hand-written AVX2/FMA microkernels and panel packing
+first, then AVX-512 and NEON only after their own gates; a manual unsafe review of each;
+and their maintenance across toolchains and targets. The alternative declined here is one
+audited heap allocation per GEMM call inside stock `gemm`, which needs an explicit
+exception to the preallocation rule.
+
+**Reversal threshold.** If two bounded kernel/blocking candidates of the owned AVX2 core
+both miss the packed-core gate in the measurement plan (at least 2.0x geometric-mean
+single-thread gain over the parent on the original 18 shapes, and at least 80% of the
+faster reference's geometric-mean rate), this decision reverses. The reversal adopts
+stock `gemm` behind the internal workspace-aware entry with exactly one audited
+allocation per call, charged to the memory envelope, through an amendment to F1 that
+records the exception. The allocation, memory, compatibility and performance gates are
+then rerun against that integration.
+
 **MAY:** reuse audited f32 microkernels, add bounded panel packing, tune shape dispatch.
 **MAY NOT:** require nightly, C/C++ builds, an ML runtime, per-GEMM heap allocation,
 unbounded packed-weight caches, or a second compute pool. No new leaf-crate dependencies
@@ -191,7 +218,10 @@ and serving routes share it. Library hosts can supply the domain explicitly; com
 constructors share a single default domain rather than creating one pool per model.
 Place the primitive in inference so embed can consume it without an upward dependency.
 
-**CPU discovery.** Start with `available_parallelism` outside hot code. Rust 1.93's
+**CPU discovery.** Compute the budget once, when the domain is built or its limits are
+rechecked, and cache it. Never call `available_parallelism` per request, per batch or
+per tokenization: on the measured host one call cost about 35.5 µs, more than twice a
+whole batch-1 WordPiece tokenization without it. Start from `available_parallelism`. Rust 1.93's
 Linux implementation already combines affinity and detected cgroup quota, rounding quota
 down and returning at least one worker. It is an estimate, with discovery limitations;
 it does not measure shared-host contention. **SINGLE-SOURCE Rust project, accessed
@@ -300,6 +330,11 @@ Qualify a cloud ARM machine and a Raspberry Pi 5 separately before claims about 
 record model, cache topology, frequency, memory and thermal conditions. Pi-specific
 limits may select serial execution and smaller token batches.
 
+No dedicated Linux aarch64 timing host, cloud machine or Raspberry Pi 5, is provisioned
+for this work at the time of writing. The ARM rows of the measurement plan wait on one.
+Until then Linux ARM keeps its current NEON/scalar paths, checked for correctness by the
+existing aarch64 CI jobs only.
+
 **MAY:** stage x86 and ARM enablement separately. **MAY NOT:** publish a generic ARM
 speedup or enable an unmeasured ARM default. **Verify by:** the same ABBA matrix on
 Linux aarch64, using 1, 2, 4 and available higher thread counts, plus both drift gates.
@@ -392,8 +427,11 @@ These are **proposed thresholds fixed before the runs they judge**, not measured
 results. Changing one requires a recorded rationale before a new run; a failed run
 cannot be retroactively accepted by moving the threshold.
 
-Use dedicated Linux AMD x86_64 and Linux aarch64 hosts for builds and timing. Use a
-dedicated Apple silicon host for macOS regression checks. Run no heavy work on a
+Run x86_64 builds and timing on the H0/H1 host class: a Fly.io Machine with 8 dedicated
+AMD EPYC (Zen 4) vCPUs, 32 GiB of memory and no SMT. A Hetzner AMD host may be added as
+a second x86_64 host; report each host's results separately and never pool them. Linux
+aarch64 rows wait on a dedicated host (F4). Use a dedicated Apple silicon host for macOS
+regression checks. Run no heavy work on a
 developer laptop. Build both immutable revisions and download inputs before the quiet
 window. Record CPU/ISA, topology, OS, toolchain, target flags, Cargo features, lockfile,
 pool width, affinity, cgroup limits, corpus/model hashes, cache state and active policy.
@@ -417,7 +455,7 @@ treat per-token samples from one run as independent host replicates.
 | Experiment, in order              | Primary cells and measurements                                                                                                                                                                            | Promotion / kill point                                                                                                                                                                                                                                                                                |
 | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Reproduce and profile             | Rebase the isolated swap experiment onto the source baseline; BGE-small/base, batch 1/32/128; tokenize, allocation, packing, projections, attention, norm/GELU, pooling, queue and load times separately. | Reorder work if another isolated lever yields a qualifying end-to-end gain exceeding the GEMM intervention by at least 5 percentage points. Without a valid current-baseline reproduction, do not publish the historical ratios as current performance.                                               |
-| Packed f32 core                   | The 18 measured BERT shapes, plus short M 1/2/4/8/16/32/64, tails, fused QKV and attention shapes; threads 1/2/4/8. Compare owned core with parent and both Rust references, packing included.            | Require at least 2.0x geometric-mean single-thread gain over parent on the original 18 shapes and at least 80% of the faster reference's geometric-mean rate. After two bounded kernel/blocking candidates miss, stop expanding the ISA implementation and revisit F1.                                |
+| Packed f32 core                   | The 18 measured BERT shapes, plus short M 1/2/4/8/16/32/64, tails, fused QKV and attention shapes; threads 1/2/4/8. Compare owned core with parent and both Rust references, packing included.            | Require at least 2.0x geometric-mean single-thread gain over parent on the original 18 shapes and at least 80% of the faster reference's geometric-mean rate. After two bounded kernel/blocking candidates miss, stop expanding the ISA implementation; F1 reverses as its reversal threshold states. |
 | BERT ingestion enablement         | Warm, cache-miss BGE-small and BGE-base, batch 32 and 128, widths 1 and 8; original synthetic corpus plus a frozen representative document corpus.                                                        | Each primary model/corpus at eight threads must gain at least 20% throughput; no supported primary cell may regress more than 5%. The contaminated BGE-base H1 result supplies no waiver.                                                                                                             |
 | One-text latency                  | Exactly one outstanding text, lengths 8/32/64/128/256/512 where admitted, both models, widths 1/2/4/8; model resident, cache disabled.                                                                    | Enable multi-core latency policy only if p50 and p95 improve at least 10% at both 128 and 256 tokens versus the fast serial core; p99 and short-text p50/p95 must not regress more than 5%. Otherwise keep serial in those cells and report the latency objective still open.                         |
 | Non-GEMM threading                | Isolate attention, then fused norm/activation, then their composition against the accepted fast core. Measure batch 32/128 and the latency cells separately.                                              | Retain a batch policy only for at least 10% complete-encode throughput gain, or a latency policy meeting the preceding latency gate. No microbenchmark-only promotion.                                                                                                                                |
@@ -473,13 +511,12 @@ shared vCPUs or eliminate races with unrelated consumers of a cgroup.
 11. **Design model-aware decoder embedding batching separately**: address per-text
     Qwen/EmbeddingGemma 2 execution without folding projected gains into this work.
 
-## Open decisions for acceptance
+## What acceptance commits to
 
-Maintainers must accept the owned-kernel maintenance commitment and the proposed
-measurement thresholds, including the 20% memory reserve. If they instead choose a
-bounded allocation exception to enable a dependency immediately, amend F1 explicitly
-and rerun its memory, allocation, compatibility and performance gates. The measurements
-alone do not decide that engineering-policy tradeoff.
+Accepting this ADR accepts the owned-kernel maintenance commitment, the F1 reversal
+threshold and the proposed measurement thresholds, including the 20% memory reserve.
+Enabling a dependency immediately under a bounded allocation exception is the declined
+alternative; it becomes the decision only through the F1 reversal, with its gates rerun.
 
 This draft does not accept ADR-070 or ADR-088, weaken their existing gates, certify
 SIMD correctness, or record completed implementation work. ADR-081 supplies a model for
