@@ -58,6 +58,9 @@ pub mod weights;
 /// and [`model`].
 pub mod batch;
 pub(crate) mod bounded_read;
+/// Provisioning a router state directory with an untrained bootstrap
+/// (ADR-096 decision 2).
+pub mod router_init;
 /// The on-disk router gate artifact: version, trained-adapter names, payload.
 /// Deliberately free of the `mixture` gate — see the module doc comment.
 pub mod router_state;

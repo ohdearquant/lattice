@@ -462,6 +462,20 @@ impl RouterProvenance {
         }
     }
 
+    /// How this artifact was produced, as an operator reads it.
+    ///
+    /// A legacy artifact answers `"unrecorded"` rather than `"bootstrap"`.
+    /// The two are different claims: a bootstrap was deliberately minted
+    /// untrained and says so, while a legacy artifact says nothing at all and
+    /// may well have been trained. Collapsing them would report a trained gate
+    /// as a baseline, which is the reassuring direction.
+    pub fn training_state(&self) -> &str {
+        match self.policy() {
+            None => "unrecorded",
+            Some(p) => p.training_state.as_str(),
+        }
+    }
+
     /// Whether this artifact may be the parent of a learned refit. A legacy
     /// artifact may not: nothing recorded what it was serving under.
     pub fn is_learner_eligible(&self) -> bool {
