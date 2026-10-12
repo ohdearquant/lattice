@@ -1375,9 +1375,38 @@ impl Qwen35Config {
     ) -> Result<ValidatedQwen35Config, InferenceError> {
         let parsed: HfQwenConfigFile = serde_json::from_str(json)
             .map_err(|e| InferenceError::Inference(format!("invalid Qwen config.json: {e}")))?;
-        let mut cfg = parsed
-            .text_config
-            .unwrap_or_else(Qwen35Config::qwen36_35b_a3b);
+
+        // A text-only checkpoint saved as `Qwen3_5ForCausalLM` writes its text
+        // configuration at the TOP LEVEL of config.json (`model_type: qwen3_5_text`), with
+        // no `text_config` object. Read the geometry from there instead of substituting an
+        // unrelated preset; a file carrying neither form is refused. The top-level object
+        // deserializes into `Qwen35Config` exactly as `text_config` does -- the struct is
+        // `#[serde(default)]` and does not deny unknown fields -- so unrelated keys such as
+        // `architectures` and `transformers_version` are skipped. The vision-language fields
+        // are NOT skipped: `Qwen35Config` declares them at its own top level, so this parse
+        // reads them directly and the `parsed.*` copies below overwrite each with the
+        // identical value read from the same key.
+        let (mut cfg, flat_top_level) = match parsed.text_config {
+            Some(cfg) => (cfg, false),
+            None => {
+                let root: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+                    InferenceError::Inference(format!("invalid Qwen config.json: {e}"))
+                })?;
+                if !root.as_object().is_some_and(|obj| {
+                    obj.contains_key("num_hidden_layers") && obj.contains_key("hidden_size")
+                }) {
+                    return Err(InferenceError::Inference(
+                        "invalid Qwen config.json: no text_config object and no top-level \
+                         num_hidden_layers/hidden_size"
+                            .to_string(),
+                    ));
+                }
+                let cfg: Qwen35Config = serde_json::from_value(root).map_err(|e| {
+                    InferenceError::Inference(format!("invalid Qwen config.json: {e}"))
+                })?;
+                (cfg, true)
+            }
+        };
 
         if let Some(tie) = parsed.tie_word_embeddings {
             cfg.tie_word_embeddings = tie;
@@ -1393,17 +1422,30 @@ impl Qwen35Config {
         // Many models nest rope_theta and partial_rotary_factor under rope_parameters
         // instead of at the text_config level — use the nested value when the flat field is
         // absent from the JSON (or, for rope_theta, 0.0), and refuse when both disagree.
+        // A wrapped checkpoint spells the flat fields inside `text_config`; a flat file
+        // spells them at the top level. `field_prefix` keeps each conflict message naming
+        // the field as it is written in the file.
         if let Some(rp) = &cfg.rope_parameters {
-            let flat = serde_json::from_str::<HfFlatRopePresenceFile>(json)
-                .map_err(|e| InferenceError::Inference(format!("invalid Qwen config.json: {e}")))?
-                .text_config
-                .unwrap_or_default();
+            let (flat, field_prefix) = if flat_top_level {
+                let flat = serde_json::from_str::<HfFlatRopePresence>(json).map_err(|e| {
+                    InferenceError::Inference(format!("invalid Qwen config.json: {e}"))
+                })?;
+                (flat, "")
+            } else {
+                let flat = serde_json::from_str::<HfFlatRopePresenceFile>(json)
+                    .map_err(|e| {
+                        InferenceError::Inference(format!("invalid Qwen config.json: {e}"))
+                    })?
+                    .text_config
+                    .unwrap_or_default();
+                (flat, "text_config.")
+            };
             if rp.rope_theta > 0.0 {
                 match flat.rope_theta.filter(|&t| t != 0.0) {
                     Some(t) if t != rp.rope_theta => {
                         return Err(InferenceError::Inference(format!(
-                            "invalid Qwen config.json: text_config.rope_theta ({t}) conflicts \
-                             with text_config.rope_parameters.rope_theta ({})",
+                            "invalid Qwen config.json: {field_prefix}rope_theta ({t}) conflicts \
+                             with {field_prefix}rope_parameters.rope_theta ({})",
                             rp.rope_theta
                         )));
                     }
@@ -1414,8 +1456,8 @@ impl Qwen35Config {
                 match flat.partial_rotary_factor {
                     Some(f) if f != prf => {
                         return Err(InferenceError::Inference(format!(
-                            "invalid Qwen config.json: text_config.partial_rotary_factor ({f}) \
-                             conflicts with text_config.rope_parameters.partial_rotary_factor \
+                            "invalid Qwen config.json: {field_prefix}partial_rotary_factor ({f}) \
+                             conflicts with {field_prefix}rope_parameters.partial_rotary_factor \
                              ({prf})"
                         )));
                     }
@@ -3117,9 +3159,10 @@ mod tests {
 
     #[test]
     fn test_full_attention_geometry_accepted_full_attention_config() {
-        // A real full-attention-carrying config (the default MoE preset) must still load.
+        // A real full-attention-carrying config (the default MoE preset, whose fields an
+        // empty `text_config` object resolves) must still load.
         assert!(
-            Qwen35Config::from_config_json_str("{}").is_ok(),
+            Qwen35Config::from_config_json_str(r#"{"text_config": {}}"#).is_ok(),
             "a valid full-attention-carrying config must be accepted"
         );
     }
@@ -3530,6 +3573,209 @@ mod tests {
             "rope_parameters": {"partial_rotary_factor": 0.25}}}"#;
         let cfg = Qwen35Config::from_config_json_str(json).expect("equal values agree");
         assert_eq!(cfg.partial_rotary_factor, 0.25);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Flat (text-only) config.json: geometry written at the top level
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// One geometry literal, emitted in both HF shapes. A flat text-only checkpoint
+    /// (`Qwen3_5ForCausalLM`, transformers 5.x) writes these fields at the top level of
+    /// `config.json`; a vision-language checkpoint wraps the same fields in `text_config`.
+    /// Both forms are built from this single `F1_GEOMETRY` object so the test compares the
+    /// two forms rather than a remembered number.
+    ///
+    /// The five MoE fields are written as explicit `null` to state the fixture's density in
+    /// the literal itself. Each MoE field carries its own field-level `#[serde(default)]`,
+    /// so an ABSENT field would also resolve to `None`; the nulls do not change the parsed
+    /// result, they only keep the fixture dense if the field-level defaults are ever removed (the
+    /// container-level default is the MoE preset).
+    const F1_GEOMETRY: &str = r#"
+        "hidden_size": 2048,
+        "num_hidden_layers": 4,
+        "vocab_size": 151936,
+        "intermediate_size": 6144,
+        "rms_norm_eps": 1e-6,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "partial_rotary_factor": 0.25,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000000,
+                            "partial_rotary_factor": 0.25},
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "full_attention_interval": 4,
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention",
+                        "full_attention"],
+        "num_experts": null,
+        "num_experts_per_tok": null,
+        "moe_intermediate_size": null,
+        "shared_expert_intermediate_size": null,
+        "router_aux_loss_coef": null,
+        "tie_word_embeddings": false,
+        "eos_token_id": 248044,
+        "max_position_embeddings": 32768
+    "#;
+
+    fn flat_config_json() -> String {
+        format!(
+            r#"{{"architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text",
+                "transformers_version": "5.17.0", {F1_GEOMETRY}}}"#
+        )
+    }
+
+    fn wrapped_config_json() -> String {
+        format!(
+            r#"{{"architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5", "text_config": {{{F1_GEOMETRY}}}}}"#
+        )
+    }
+
+    #[test]
+    fn flat_config_reads_the_same_geometry_as_its_wrapped_twin() {
+        // A flat text-only config.json must yield the geometry its wrapped twin does, field
+        // by field. `Qwen35Config` has no `PartialEq`, so the loader-visible geometry is
+        // compared field by field.
+        let flat = Qwen35Config::from_config_json_str(&flat_config_json()).expect("flat parses");
+        let wrapped =
+            Qwen35Config::from_config_json_str(&wrapped_config_json()).expect("wrapped parses");
+
+        assert_eq!(flat.num_hidden_layers, wrapped.num_hidden_layers);
+        assert_eq!(flat.hidden_size, wrapped.hidden_size);
+        assert_eq!(flat.num_attention_heads, wrapped.num_attention_heads);
+        assert_eq!(flat.num_key_value_heads, wrapped.num_key_value_heads);
+        assert_eq!(flat.head_dim, wrapped.head_dim);
+        assert_eq!(flat.intermediate_size, wrapped.intermediate_size);
+        assert_eq!(flat.vocab_size, wrapped.vocab_size);
+        assert_eq!(flat.linear_num_key_heads, wrapped.linear_num_key_heads);
+        assert_eq!(flat.linear_num_value_heads, wrapped.linear_num_value_heads);
+        assert_eq!(flat.linear_key_head_dim, wrapped.linear_key_head_dim);
+        assert_eq!(flat.linear_value_head_dim, wrapped.linear_value_head_dim);
+        assert_eq!(flat.linear_conv_kernel_dim, wrapped.linear_conv_kernel_dim);
+        assert_eq!(
+            flat.full_attention_interval,
+            wrapped.full_attention_interval
+        );
+        assert_eq!(flat.layer_types, wrapped.layer_types);
+        assert_eq!(flat.rope_theta, wrapped.rope_theta);
+        assert_eq!(flat.partial_rotary_factor, wrapped.partial_rotary_factor);
+        assert_eq!(flat.rope_dim(), wrapped.rope_dim());
+        assert_eq!(flat.tie_word_embeddings, wrapped.tie_word_embeddings);
+        assert_eq!(flat.eos_token_id, wrapped.eos_token_id);
+        assert_eq!(
+            flat.max_position_embeddings,
+            wrapped.max_position_embeddings
+        );
+
+        // Anchor the comparison to the literal, not just to each other.
+        assert_eq!(flat.num_hidden_layers, 4);
+        assert_eq!(flat.hidden_size, 2048);
+        assert_eq!(flat.head_dim, 128);
+        assert_eq!(flat.vocab_size, 151_936);
+    }
+
+    #[test]
+    fn flat_config_is_not_the_moe_preset() {
+        // Before this fix, a flat file silently inherited the Qwen3.6-35B-A3B MoE preset.
+        // The preset sets `num_experts: Some(256)` (and the other MoE fields); a dense flat
+        // file must carry none of them.
+        let cfg = Qwen35Config::from_config_json_str(&flat_config_json()).expect("flat parses");
+        let preset = Qwen35Config::qwen36_35b_a3b();
+
+        // The preset the old fallback substituted carries the MoE router fields; the flat
+        // file explicitly resolves them to `None`.
+        assert_eq!(preset.num_experts, Some(256));
+        assert!(
+            !cfg.is_moe(),
+            "a dense flat config must not resolve to the MoE preset"
+        );
+        assert_eq!(cfg.num_experts, None);
+        assert_eq!(cfg.num_experts_per_tok, None);
+        assert_eq!(cfg.moe_intermediate_size, None);
+        assert_eq!(cfg.shared_expert_intermediate_size, None);
+        assert_eq!(cfg.router_aux_loss_coef, None);
+        assert!(!cfg.output_router_logits);
+        assert_eq!(
+            preset.num_hidden_layers, 40,
+            "the preset's layer count is the one the old fallback substituted"
+        );
+        assert_ne!(
+            cfg.num_hidden_layers, preset.num_hidden_layers,
+            "a flat config must use its own layer count, not the preset's 40"
+        );
+        assert_eq!(
+            preset.linear_num_value_heads,
+            Some(32),
+            "the preset's GDN value-head count is the MoE one"
+        );
+        assert_ne!(
+            cfg.linear_num_value_heads, preset.linear_num_value_heads,
+            "a flat config must use its own GDN value-head count, not the preset's"
+        );
+    }
+
+    #[test]
+    fn flat_config_missing_both_geometry_keys_refuses() {
+        for json in ["{}", r#"{"tie_word_embeddings": false}"#] {
+            let err = Qwen35Config::from_config_json_str(json)
+                .expect_err("a config with neither text_config nor flat geometry must refuse")
+                .to_string();
+            assert!(
+                err.contains("no text_config object and no top-level"),
+                "wrong refusal message for {json}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_config_rope_conflicts_are_refused_naming_the_flat_field() {
+        // Same conflict detection as the wrapped form, but the flat fields are spelled at
+        // the top level and the message must name them without a `text_config.` prefix.
+        let theta_conflict = r#"{"num_hidden_layers": 4, "hidden_size": 2048,
+            "rope_theta": 500000, "rope_parameters": {"rope_theta": 1000000}}"#;
+        let err = Qwen35Config::from_config_json_str(theta_conflict)
+            .expect_err("disagreeing flat and nested rope_theta must not pick one")
+            .to_string();
+        assert!(
+            err.contains("rope_theta (500000)") && err.contains("(1000000)"),
+            "error must name both values with the flat spelling: {err}"
+        );
+        assert!(
+            !err.contains("text_config."),
+            "a flat file's error must not claim a text_config prefix: {err}"
+        );
+
+        let factor_conflict = r#"{"num_hidden_layers": 4, "hidden_size": 2048,
+            "partial_rotary_factor": 0.25,
+            "rope_parameters": {"partial_rotary_factor": 0.5}}"#;
+        let err = Qwen35Config::from_config_json_str(factor_conflict)
+            .expect_err("disagreeing flat and nested partial_rotary_factor must not pick one")
+            .to_string();
+        assert!(
+            err.contains("(0.25)") && err.contains("(0.5)"),
+            "error must name both values: {err}"
+        );
+        assert!(
+            !err.contains("text_config."),
+            "a flat file's error must not claim a text_config prefix: {err}"
+        );
+    }
+
+    #[test]
+    fn flat_config_with_only_num_hidden_layers_refuses() {
+        // The top-level gate requires both keys; num_hidden_layers alone is not enough to
+        // read geometry.
+        let json = r#"{"num_hidden_layers": 24}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("a flat config with only num_hidden_layers must refuse")
+            .to_string();
+        assert!(
+            err.contains("no text_config object and no top-level"),
+            "wrong refusal message: {err}"
+        );
     }
 
     #[test]

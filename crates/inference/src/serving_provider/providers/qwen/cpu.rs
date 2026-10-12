@@ -156,6 +156,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cpu_preparation_preserves_supported_logprobs() {
+        let model = crate::model::qwen35::test_support::tiny_zero_model_with_context(4096);
+        let host = from_model(model);
+        for (logprobs, top_logprobs, expected) in [
+            (None, None, None),
+            (Some(false), None, None),
+            (Some(true), None, Some(0)),
+            (Some(true), Some(0), Some(0)),
+            (Some(true), Some(2), Some(2)),
+            (Some(true), Some(20), Some(20)),
+        ] {
+            let req: ChatRequest = serde_json::from_value(serde_json::json!({
+                "model": "served-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 5,
+                "logprobs": logprobs,
+                "top_logprobs": top_logprobs,
+            }))
+            .expect("chat request");
+            let prepared = host
+                .prepare(&req, "served-model", 64, 4096)
+                .expect("CPU preparation must support logprobs");
+            assert_eq!(prepared.prepared.logprobs, expected);
+            assert_eq!(prepared.config.logprobs, expected);
+        }
+    }
+
+    #[test]
     fn cpu_source_holds_shared_model_and_preparation_resources() {
         let model = crate::model::qwen35::test_support::tiny_zero_model_with_context(4096);
         assert_eq!(model.max_context(), 4096);

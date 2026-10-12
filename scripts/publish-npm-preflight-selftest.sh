@@ -1087,10 +1087,10 @@ echo "=== publish-npm.sh sourceable-without-executing self-test ==="
 # itself. Positive control passed to `command -v` alongside the guard names
 # (`echo`, always defined) to prove `command -v` is not silently reporting
 # false for everything in this shell.
-OUT="$(PUBLISH_NPM_SH_LIB_ONLY=1 /bin/sh -c '. "$1"; echo SOURCED_OK; command -v echo >/dev/null 2>&1 && echo COMMAND_V_WORKS; command -v main >/dev/null 2>&1 && echo MAIN_DEFINED; command -v parse_argv >/dev/null 2>&1 && echo PARSE_ARGV_DEFINED; command -v platform_matrix_guard >/dev/null 2>&1 && echo MATRIX_DEFINED; command -v check_platform_pkgjson >/dev/null 2>&1 && echo PKGJSON_DEFINED; command -v check_version_available >/dev/null 2>&1 && echo CVA_DEFINED; command -v run_version_checks >/dev/null 2>&1 && echo RUNCHECKS_DEFINED; command -v full_dryrun_guard >/dev/null 2>&1 && echo DRYRUN_DEFINED; command -v main_packlist_guard >/dev/null 2>&1 && echo PACKLIST_DEFINED' sh "$SRC" 2>&1)"
+OUT="$(PUBLISH_NPM_SH_LIB_ONLY=1 /bin/sh -c '. "$1"; echo SOURCED_OK; command -v echo >/dev/null 2>&1 && echo COMMAND_V_WORKS; command -v main >/dev/null 2>&1 && echo MAIN_DEFINED; command -v parse_argv >/dev/null 2>&1 && echo PARSE_ARGV_DEFINED; command -v platform_matrix_guard >/dev/null 2>&1 && echo MATRIX_DEFINED; command -v check_platform_pkgjson >/dev/null 2>&1 && echo PKGJSON_DEFINED; command -v check_version_available >/dev/null 2>&1 && echo CVA_DEFINED; command -v run_version_checks >/dev/null 2>&1 && echo RUNCHECKS_DEFINED; command -v full_dryrun_guard >/dev/null 2>&1 && echo DRYRUN_DEFINED; command -v main_packlist_guard >/dev/null 2>&1 && echo PACKLIST_DEFINED; command -v build_native_node_path >/dev/null 2>&1 && echo NODEPATH_DEFINED' sh "$SRC" 2>&1)"
 rc=$?
 check "(ff) sourcing with the sentinel set exits cleanly" 0 $rc
-for token in SOURCED_OK COMMAND_V_WORKS MAIN_DEFINED PARSE_ARGV_DEFINED MATRIX_DEFINED PKGJSON_DEFINED CVA_DEFINED RUNCHECKS_DEFINED DRYRUN_DEFINED PACKLIST_DEFINED; do
+for token in SOURCED_OK COMMAND_V_WORKS MAIN_DEFINED PARSE_ARGV_DEFINED MATRIX_DEFINED PKGJSON_DEFINED CVA_DEFINED RUNCHECKS_DEFINED DRYRUN_DEFINED PACKLIST_DEFINED NODEPATH_DEFINED; do
   if printf '%s' "$OUT" | grep -qF "$token"; then
     echo "  PASS:   -> $token"; pass=$((pass+1))
   else
@@ -1303,6 +1303,300 @@ assert_call "full dry run of the wasm package" "publish --dry-run -- lattice-emb
 assert_call "full dry run of the platform package" "publish --dry-run -- darwin-arm64"
 assert_call "full dry run of the native package" "publish --dry-run -- lattice-embed-native"
 assert_call "main packlist run" "pack --dry-run --json -- lattice-embed-native"
+
+echo
+echo "=== publish-npm.sh native NODE_PATH root self-test ==="
+# The native main package's prepublishOnly test requires the platform binding,
+# and on the release machine neither a co-located .node file nor an installed
+# optionalDependency provides it. build_native_node_path builds a temporary
+# require root -- one symlink per platform directory present under
+# $NATIVE_DIR/npm/ -- so binding.js's own platform-suffix logic can resolve the
+# matching package during `npm publish`; both native publish call sites apply
+# that root through NODE_PATH, and main() removes it on exit. These arms
+# exercise the function directly, then prove both call sites carry its output
+# by running the real, unsourced script under a NODE_PATH-logging npm stub.
+NPB="$SB/node-path-root"
+mkdir -p "$NPB"
+
+# A NATIVE_DIR ($1) whose optionalDependencies advertises each "platform:marker"
+# pair ($2...) and whose npm/<platform>/ holds a matching package whose "main"
+# is a plain .js stand-in exporting that marker -- a real .node binary cannot be
+# built in this sandbox, and the function under test inspects only the package's
+# declared name, never the file.
+build_node_path_fixture() {
+  native="$1"; shift
+  deps=""; sep=""
+  for pm in "$@"; do
+    p="${pm%%:*}"; m="${pm#*:}"
+    d="$native/npm/$p"
+    mkdir -p "$d"
+    printf 'module.exports = { marker: "%s" }\n' "$m" > "$d/entry.js"
+    cat > "$d/package.json" <<EOF
+{"name": "@khive-ai/lattice-embed-$p", "version": "1.2.3", "main": "entry.js"}
+EOF
+    deps="${deps}${sep}\"@khive-ai/lattice-embed-$p\": \"1.2.3\""
+    sep=", "
+  done
+  cat > "$native/package.json" <<EOF
+{"name": "@khive-ai/lattice-embed", "version": "1.2.3", "optionalDependencies": {$deps}}
+EOF
+}
+
+run_build_node_path_case() {  # $1=NATIVE_DIR; prints the root on stdout
+  RUNNER="$NPB/runner.sh"
+  {
+    echo 'PUBLISH_NPM_SH_LIB_ONLY=1'
+    printf 'export NODE_PATH=%q\n' "${2:-}"
+    printf '. %q\n' "$SRC"
+    printf 'NATIVE_DIR=%q\n' "$1"
+    printf 'build_native_node_path\n'
+  } > "$RUNNER"
+  OUT="$(/bin/sh -c "set -e; . '$RUNNER'" 2>&1)"
+  return $?
+}
+
+# (np1) two platform directories: the function exits 0, prints an existing
+#       directory, and the package each platform advertises resolves out of it
+#       from a cwd with no node_modules of its own -- binding.js's own require
+#       path, exercised end to end for BOTH platforms.
+NP1="$NPB/np1"; build_node_path_fixture "$NP1/native" "darwin-arm64:alpha" "linux-x64-gnu:beta"
+mkdir -p "$NP1/nomodules"
+np1_before="$(cd "$NP1/native" && find . -print | sort)"
+run_build_node_path_case "$NP1/native"; rc=$?
+check "(np1) build_native_node_path exits 0 with platform directories present" 0 $rc
+np1_root="$(printf '%s\n' "$OUT" | tail -n 1)"
+if [ -d "$np1_root" ]; then
+  echo "  PASS:   -> printed an existing directory: $np1_root"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> printed path is not a directory (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+for pm in "darwin-arm64:alpha" "linux-x64-gnu:beta"; do
+  p="${pm%%:*}"; m="${pm#*:}"
+  got="$(cd "$NP1/nomodules" && NODE_PATH="$np1_root" node -e "console.log(require('@khive-ai/lattice-embed-$p').marker)" 2>&1)"
+  if [ "$got" = "$m" ]; then
+    echo "  PASS:   -> NODE_PATH=<root> resolves @khive-ai/lattice-embed-$p to '$m'"; pass=$((pass+1))
+  else
+    echo "  FAIL:   -> @khive-ai/lattice-embed-$p resolved to '$got', expected '$m'"; fail=$((fail+1))
+  fi
+done
+
+# (np2) the same require WITHOUT NODE_PATH must fail with "Cannot find module":
+#       the control that proves (np1) passes because of the root and not
+#       because something ambient already provides the package.
+np2_out="$(cd "$NP1/nomodules" && env -u NODE_PATH node -e "require('@khive-ai/lattice-embed-darwin-arm64')" 2>&1)"; rc=$?
+check "(np2) the same require without NODE_PATH fails" 1 $rc
+if printf '%s' "$np2_out" | grep -qF "Cannot find module"; then
+  echo "  PASS:   -> 'Cannot find module' diagnostic printed"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> missing 'Cannot find module' diagnostic (got: $(printf '%s' "$np2_out" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+# (np3) nothing is created inside $NATIVE_DIR -- the tarball must not change,
+#       which is what main_packlist_guard would catch if a link landed there.
+np3_after="$(cd "$NP1/native" && find . -print | sort)"
+if [ "$np1_before" = "$np3_after" ]; then
+  echo "  PASS:   -> the package tree is unchanged by build_native_node_path"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> build_native_node_path modified the package tree:"
+  printf '%s\n' "$np3_after" | sed 's/^/        /'
+  fail=$((fail+1))
+fi
+
+# (np4) no platform directory on disk: the chosen behaviour is an EMPTY root
+#       (no refusal), because main() calls this only after platform_matrix_guard
+#       has already required every advertised platform to carry its binary --
+#       so this state cannot reach a real publish, and refusing here would only
+#       duplicate a check that has a better diagnostic. Verified explicitly
+#       rather than left to chance.
+NP4="$NPB/np4"; build_node_path_fixture "$NP4/native" "darwin-arm64:x" "linux-x64-gnu:y"
+rm -rf "$NP4/native/npm"
+run_build_node_path_case "$NP4/native"; rc=$?
+check "(np4) no platform directories: empty root, exit 0" 0 $rc
+np4_root="$(printf '%s\n' "$OUT" | tail -n 1)"
+if [ -d "$np4_root" ] && [ -z "$(ls -A "$np4_root/@khive-ai" 2>/dev/null)" ]; then
+  echo "  PASS:   -> printed root holds no platform package links"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> expected an empty root, got: $(printf '%s' "$OUT" | tr '\n' '|')"; fail=$((fail+1))
+fi
+
+# (np4b) a pre-existing NODE_PATH is PREPENDED to, not replaced: the printed
+#        value is "<root>:<existing>" with the two halves exactly as supplied
+#        and a single separating colon. The root half is proven populated
+#        separately by (np1); this arm isolates the composition rule.
+run_build_node_path_case "$NP1/native" "/pre-existing/one:/pre-existing/two"; rc=$?
+check "(np4b) build_native_node_path runs with an existing NODE_PATH" 0 $rc
+np4b_val="$(printf '%s\n' "$OUT" | tail -n 1)"
+np4b_root="${np4b_val%%:*}"
+if [ -d "$np4b_root" ] && [ "${np4b_val#*:}" = "/pre-existing/one:/pre-existing/two" ]; then
+  echo "  PASS:   -> existing NODE_PATH appended after the temporary root"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> NODE_PATH composition wrong (got: $(printf '%s' "$np4b_val" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+echo
+echo "=== publish-npm.sh native publish call-site NODE_PATH self-test ==="
+# (np1)-(np4) prove the root is correct; they say nothing about whether the two
+# native `npm publish` call sites actually apply it, which is the defect. Run
+# the real, unsourced script (the path CI takes) against a fixture repo and a
+# stub npm that records the NODE_PATH it received for every publish, then assert
+# the two native publishes carry the root and the wasm/platform publishes do not.
+NPCS="$SB/node-path-callsites"
+mkdir -p "$NPCS/repo/scripts" "$NPCS/repo/npm/lattice-embed-wasm" "$NPCS/stub-bin"
+cp "$SRC" "$NPCS/repo/scripts/publish-npm.sh"
+chmod +x "$NPCS/repo/scripts/publish-npm.sh"
+cat > "$NPCS/repo/npm/lattice-embed-wasm/package.json" <<'EOF'
+{"name": "@khive-ai/lattice-fixture-wasm", "version": "1.2.3"}
+EOF
+NPC_NATIVE="$NPCS/repo/npm/lattice-embed-native"
+build_native_fixture "$NPC_NATIVE" "darwin-arm64:1.2.3"
+add_valid_platform "$NPC_NATIVE" "darwin-arm64" "1.2.3"
+
+# A no-op sleep keeps the publish-mode run from paying main()'s real
+# inter-package indexing wait; it is sandbox-local (first on PATH) and the
+# script's single `sleep 30` is not what this arm is testing.
+cat > "$NPCS/stub-bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$NPCS/stub-bin/sleep"
+
+cat > "$NPCS/stub-bin/npm" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  publish)
+    echo "publish \$2 -- NODE_PATH=\${NODE_PATH:-} -- \$(basename "\$PWD")" >> "$NPCS/calls.log"
+    if [ -n "\${NODE_PATH:-}" ]; then
+      for link in \${NODE_PATH%%:*}/@khive-ai/*; do
+        [ -d "\$link" ] && echo "link \$link" >> "$NPCS/calls.log"
+      done
+    fi
+    if [ "\$#" -gt 2 ]; then
+      echo "UNEXPECTED PUBLISH ARGV in NODE_PATH stub: \$* (at most 2 args expected)" >&2
+      exit 98
+    fi
+    if [ "\$#" -eq 2 ] && [ "\$2" != "--dry-run" ] && [ "\$2" != "--provenance" ]; then
+      echo "UNEXPECTED PUBLISH ARGV in NODE_PATH stub: \$*" >&2
+      exit 98
+    fi
+    exit 0
+    ;;
+  run)
+    exit 0
+    ;;
+  view)
+    echo '{"error":{"code":"E404","summary":"Not Found"}}'
+    exit 1
+    ;;
+  pack)
+    if [ "\$(basename "\$PWD")" = "lattice-embed-native" ]; then
+      echo '[{"files":[{"path":"package.json"},{"path":"README.md"},{"path":"binding.js"},{"path":"index.js"},{"path":"index.d.ts"}]}]'
+    else
+      echo '[{"files":[{"path":"package.json"},{"path":"lattice-embed-native.darwin-arm64.node"}]}]'
+    fi
+    exit 0
+    ;;
+  *)
+    echo "unexpected npm invocation in NODE_PATH stub: \$*" >&2
+    exit 99
+    ;;
+esac
+EOF
+chmod +x "$NPCS/stub-bin/npm"
+
+# Exact-field parse of one logged line ("publish <flag> -- NODE_PATH=<v> -- <cwd>").
+call_node_path() { printf '%s' "${1#*NODE_PATH=}" | sed 's/ -- [^ ]*$//'; }
+
+# The stub also logs a "link <path>" line per populated require-root entry it
+# could see AT PUBLISH TIME -- before main()'s exit trap removes the root -- so
+# this proves the root was POPULATED when the native package published, not
+# merely that NODE_PATH was set to some path. One output line per native
+# publish row, in log order (first = preflight dry-run, second = live publish).
+native_publish_rows() {
+  awk '
+    /^publish / {
+      n++
+      is_native[n] = ($0 ~ / -- lattice-embed-native$/)
+      row[n] = $0
+      links[n] = ""
+    }
+    /^link / { if (n > 0) links[n] = links[n] " " $2 }
+    END { for (i = 1; i <= n; i++) if (is_native[i]) print row[i] links[i] }
+  ' "$NPCS/calls.log"
+}
+
+run_node_path_callset() {  # $1 = extra argv ("--dry-run" or "") $2 = TMPDIR for isolation
+  : > "$NPCS/calls.log"
+  mkdir -p "$2"
+  OUT="$(cd "$NPCS/repo" && PATH="$NPCS/stub-bin:$PATH" TMPDIR="$2" NPM_CONFIG_CACHE="$SB/npm-cache-node-path" /bin/sh scripts/publish-npm.sh "$1" 2>&1)"
+  return $?
+}
+
+# (np5) dry-run mode: the preflight dry-run native publish must carry the root,
+#       the other two dry-run publishes must not, and the temporary root must
+#       be gone once the script exits.
+run_node_path_callset "--dry-run" "$NPCS/tmp-np5"; rc=$?
+check "(np5) full script --dry-run reaches completion" 0 $rc
+np5_native="$(grep '^publish ' "$NPCS/calls.log" | grep -F -- ' -- lattice-embed-native' || true)"
+np5_native_count="$(printf '%s\n' "$np5_native" | grep -c .)"
+if [ "$np5_native_count" -eq 1 ]; then
+  echo "  PASS:   -> exactly one native dry-run publish recorded"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> expected 1 native dry-run publish, got $np5_native_count"; fail=$((fail+1))
+fi
+np5_root="$(call_node_path "$np5_native")"
+np5_rows="$(native_publish_rows)"
+if [ -n "$np5_root" ] && printf '%s\n' "$np5_rows" | grep -qF 'lattice-embed-darwin-arm64'; then
+  echo "  PASS:   -> native dry-run publish got NODE_PATH=$np5_root with the platform link at publish time"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> native dry-run publish NODE_PATH='$np5_root' had no platform link at publish time"; fail=$((fail+1))
+fi
+np5_others="$(grep '^publish ' "$NPCS/calls.log" | grep -vF -- ' -- lattice-embed-native' || true)"
+np5_others_bad="$(printf '%s\n' "$np5_others" | grep -vF 'NODE_PATH= -- ' || true)"
+if [ -n "$np5_others" ] && [ -z "$np5_others_bad" ]; then
+  echo "  PASS:   -> wasm + platform dry-run publishes carry no NODE_PATH"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> a non-native publish carried NODE_PATH (log: $(printf '%s' "$np5_others" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+np5_tmp_left="$(find "$NPCS/tmp-np5" -maxdepth 1 -name 'lattice-embed-node-path.*' -print 2>/dev/null)"
+if [ -z "$np5_tmp_left" ]; then
+  echo "  PASS:   -> the dry-run exit path left no temporary root behind"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> temporary root still present after exit: $np5_tmp_left"; fail=$((fail+1))
+fi
+
+# (np6) publish mode: BOTH native call sites -- the preflight dry-run and the
+#       live publish after the platform packages -- must carry the same root,
+#       and no other publish may. This is the arm the two call-site mutations
+#       must redden.
+run_node_path_callset "" "$NPCS/tmp-np6"; rc=$?
+check "(np6) full script publish mode reaches completion (stubbed npm)" 0 $rc
+np6_native="$(grep '^publish ' "$NPCS/calls.log" | grep -F -- ' -- lattice-embed-native' || true)"
+np6_count="$(printf '%s\n' "$np6_native" | grep -c .)"
+if [ "$np6_count" -eq 2 ]; then
+  echo "  PASS:   -> both native publish call sites recorded (dry-run + live)"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> expected 2 native publishes, got $np6_count (log: $(printf '%s' "$np6_native" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+np6_rows="$(native_publish_rows)"
+np6_row_count="$(printf '%s\n' "$np6_rows" | grep -c .)"
+np6_rows_with_link="$(printf '%s\n' "$np6_rows" | grep -cF 'lattice-embed-darwin-arm64' || true)"
+if [ "$np6_row_count" -eq 2 ] && [ "$np6_rows_with_link" -eq 2 ]; then
+  echo "  PASS:   -> both native publishes (preflight dry-run + live) saw a populated NODE_PATH root"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> native publish rows with a populated root: $np6_rows_with_link of $np6_row_count (rows: $(printf '%s' "$np6_rows" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+np6_others_bad="$(grep '^publish ' "$NPCS/calls.log" | grep -vF -- ' -- lattice-embed-native' | grep -vF 'NODE_PATH= -- ' || true)"
+if [ -z "$np6_others_bad" ]; then
+  echo "  PASS:   -> wasm + platform publishes carry no NODE_PATH in publish mode"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> a non-native publish carried NODE_PATH (log: $(printf '%s' "$np6_others_bad" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+np6_tmp_left="$(find "$NPCS/tmp-np6" -maxdepth 1 -name 'lattice-embed-node-path.*' -print 2>/dev/null)"
+if [ -z "$np6_tmp_left" ]; then
+  echo "  PASS:   -> the publish exit path left no temporary root behind"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> temporary root still present after exit: $np6_tmp_left"; fail=$((fail+1))
+fi
 
 echo
 echo "=== marker-extraction mechanism removal self-test ==="
