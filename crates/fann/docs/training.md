@@ -465,10 +465,12 @@ g[j] = reward · (z[j] − z'[j]) / s^2                                (policy)
 
 The **policy term** takes no derivative through the softmax or the floor: both
 sit downstream of the sampled action and affect only the reward earned. The
-load-balance and z-loss terms are ordinary functions of the gate's own logits
-and probabilities, and the load-balance term does differentiate its softmax —
-that is the gradient `load_balance_aux_gradient` returns. `w_full` and `tau` feed
-the load-balance term and the traffic mass exactly as in
+**z-loss** term is an ordinary function of the gate's own logits and
+probabilities. The **load-balance** term in this path takes the recorded
+mixture `w_full` as its probability input (not the gate's own softmax) and is
+scaled by `1/tau`; the gate's own logits enter the applied update only through
+the backward pass that carries the output-layer delta to the weights. `w_full`
+and `tau` feed the load-balance term and the traffic mass exactly as in
 `step_with_learned_weights`. The returned scalar is the reward-weighted negative
 log density without its constant, `reward · ‖z' − z‖² / (2 s^2)`.
 
@@ -486,10 +488,17 @@ as ADR-096 decision 3 writes it. Averaging over `n` rather than over the
 contributors keeps the policy term continuous in the rewards — a reward a hair
 off a tie cannot move a sample between denominators and rescale the whole step —
 and averages each regulariser over the round it belongs to. A round whose every
-advantage is zero is the exception: the gate's **weights** are left byte-for-byte
-unchanged, including a round of one, because there is no policy update for the
-regularisers to shape. The frequency EMA still folds every validated sample
-either way.
+advantage is zero is the exception: the **gate** is left byte-for-byte
+unchanged, its weights and its biases, including a round of one, because there
+is no policy update for the regularisers to shape. The frequency EMA still folds
+every validated sample either way.
+
+Before anything is written, the guard on every update checks that every
+gradient entry and every candidate `w − lr·g` / `b − lr·g` is finite; a finite
+input whose update would still overflow (the policy and load-balance products
+can sit at the `f32` ceiling) is refused there, and the gate and the traffic EMA
+are left unchanged. An update whose candidates are all finite is written exactly
+as the plain `w −= lr·g` step, byte for byte.
 
 ### Phase 2: multi-sample RLOO (`rloo_step`, not the default path)
 
