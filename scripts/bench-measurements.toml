@@ -155,6 +155,10 @@ path = "crates/inference/examples/dump_embeddinggemma2.rs"
 reason = "Correctness instrument: writes EmbeddingGemma 2 token ids and embeddings as JSON for offline comparison against a reference implementation; no timing, no Criterion. The optional --metal path holds the shared GPU lock for the whole run and still prints no timing."
 
 [[non_measurement_surface]]
+path = "crates/inference/examples/dump_embeddinggemma2_vision.rs"
+reason = "Correctness instrument: writes CPU EmbeddingGemma 2 multimodal stages and source image digests as safetensors for offline comparison against a reference implementation; no timing, no Criterion, no Metal dispatch."
+
+[[non_measurement_surface]]
 path = "crates/inference/examples/ernie45_trace_dump.rs"
 reason = "Correctness instrument: dumps forward-pass activations as raw f32 for offline diffing against the HF reference archive; no timing."
 

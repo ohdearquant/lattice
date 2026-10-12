@@ -336,6 +336,57 @@ platform_matrix_guard() {
     done
 }
 
+# Build a temporary NODE_PATH root so the native main package's own
+# prepublishOnly test can load its platform binary during `npm publish` in
+# the release job. binding.js loads either a .node file next to itself or the
+# platform package @khive-ai/lattice-embed-<suffix>. In the release job
+# neither resolves: the binaries live under $NATIVE_DIR/npm/<platform>/, and
+# the platform packages are not installed into any node_modules (at the
+# dry-run stage they are not published yet, and a publish never installs
+# them locally). The observed failure was:
+#   FL_EMBED_NATIVE_LOAD_FAILED ... Cannot find module '@khive-ai/lattice-embed-linux-x64-gnu'.
+#
+# The root holds one symlink per platform directory,
+# <root>/@khive-ai/lattice-embed-<platform> -> $NATIVE_DIR/npm/<platform>, so
+# nothing is copied into the package and its tarball is unchanged. Every
+# platform is linked, not only the runner's: binding.js's own platformSuffix()
+# picks the match at require time, so the suffix rules stay in one place.
+#
+# Platforms come from optionalDependencies, the list platform_binaries_present
+# and platform_matrix_guard enumerate. A directory that is missing, or whose
+# package.json does not declare exactly "@khive-ai/lattice-embed-<platform>",
+# is skipped rather than linked; platform_matrix_guard reports the omission.
+#
+# Prints the root, prepended to any existing NODE_PATH. With no platform
+# directory present the root holds no links. The caller removes the root
+# (main() does so from an EXIT trap).
+build_native_node_path() {
+    expected=$(node -p "Object.keys(require('$NATIVE_DIR/package.json').optionalDependencies || {}).map(n => n.replace('@khive-ai/lattice-embed-', '')).join(' ')" 2>/dev/null) || expected=""
+
+    node_path_root=$(mktemp -d "${TMPDIR:-/tmp}/lattice-embed-node-path.XXXXXX")
+
+    scope_dir="$node_path_root/@khive-ai"
+    mkdir -p "$scope_dir"
+
+    for platform in $expected; do
+        pkgdir="$NATIVE_DIR/npm/$platform"
+        if [ ! -d "$pkgdir" ]; then
+            continue
+        fi
+        declared=$(node -p "require('$pkgdir/package.json').name" 2>/dev/null) || declared=""
+        if [ "$declared" != "@khive-ai/lattice-embed-$platform" ]; then
+            continue
+        fi
+        ln -s "$pkgdir" "$scope_dir/lattice-embed-$platform"
+    done
+
+    if [ -n "${NODE_PATH:-}" ]; then
+        echo "$node_path_root:$NODE_PATH"
+    else
+        echo "$node_path_root"
+    fi
+}
+
 # Guard: verify none of the packages we're about to publish already exist on
 # npm. name@version tuples are immutable, so a collision discovered
 # mid-publish (after some platform packages already went out) is unrecoverable
@@ -412,12 +463,18 @@ run_version_checks() {
 # publish --dry-run )` is called as a bare statement (not inside `if`/`&&`),
 # both here and at every call site in main(), so a nonzero exit from any of
 # them triggers the same errexit abort it would have at top level.
+#
+# $1 is a PATH-style NODE_PATH value built by build_native_node_path, applied
+# to the native main package's dry-run ONLY. That call is the one that runs
+# the package's prepublishOnly test, which requires the native binding; the
+# wasm and platform packages do not and must keep their ambient NODE_PATH.
 full_dryrun_guard() {
+    native_node_path="${1:-}"
     ( cd "$WASM_DIR" && npm publish --dry-run )
     for pkgdir in $PLATFORM_DIRS; do
         ( cd "$pkgdir" && npm publish --dry-run )
     done
-    ( cd "$NATIVE_DIR" && npm publish --dry-run )
+    ( cd "$NATIVE_DIR" && NODE_PATH="$native_node_path" npm publish --dry-run )
 }
 
 # Guard: `npm publish --dry-run` above packs the main package but never
@@ -466,6 +523,17 @@ main_packlist_guard() {
 main() {
     parse_argv "$1"
 
+    # Remove build_native_node_path's temporary root on exit, however main()
+    # leaves -- a failed gate (a bare `exit N` inside a guard function), a
+    # successful dry-run, or the end of a real publish. The trap is registered
+    # here (before the root exists) so an early exit still has somewhere to
+    # clean up from, and the value starts empty so the `[ -n ]` test is what
+    # makes that registration a no-op until main() has actually built a root.
+    # It lives on main() only: a subshell created by `( )` resets traps to
+    # their default, so the guards that `cd` into a package cannot re-run it.
+    node_path_tmp=""
+    trap 'if [ -n "$node_path_tmp" ]; then rm -rf "$node_path_tmp"; fi' EXIT
+
     PROV=""
     if [ "${NPM_PROVENANCE:-}" = "1" ]; then
         PROV="--provenance"
@@ -493,6 +561,16 @@ main() {
 
     platform_matrix_guard
 
+    # Now that PLATFORM_DIRS is validated, build the NODE_PATH root the native
+    # package's prepublishOnly test needs. Done for BOTH modes: the dry-run
+    # gate below is exactly where the missing-binding failure was observed,
+    # and it runs before the mode branch, so a --dry-run release is gated
+    # against the same real load a user would hit. The PATH value is threaded
+    # to the native publish as an explicit argument so each call site's need
+    # for it (and its absence elsewhere) is visible at that call.
+    native_node_path=$(build_native_node_path)
+    node_path_tmp=${native_node_path%%:*}
+
     # ---- Preflight: verify none of the packages we're about to publish
     # already exist on npm.
     echo "=== Preflight (version-exists check against the npm registry) ==="
@@ -500,7 +578,7 @@ main() {
     echo "Preflight OK: no version collisions."
 
     echo "=== Preflight (dry-run: pack + gate the full release) ==="
-    full_dryrun_guard
+    full_dryrun_guard "$native_node_path"
 
     main_packlist_guard
     echo "Preflight OK."
@@ -523,7 +601,7 @@ main() {
     sleep 30
 
     echo "--- @khive-ai/lattice-embed (native main) ---"
-    ( cd "$NATIVE_DIR" && npm publish $PROV )
+    ( cd "$NATIVE_DIR" && NODE_PATH="$native_node_path" npm publish $PROV )
 
     echo "--- @khive-ai/lattice-embed-wasm (portable wasm) ---"
     ( cd "$WASM_DIR" && npm publish $PROV )

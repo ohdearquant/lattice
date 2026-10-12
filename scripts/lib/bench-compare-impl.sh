@@ -1010,6 +1010,7 @@ write_run_provenance
 # resolution, whether the machine was isolated, and how quiet it actually was.
 echo ""
 echo "=== Run conditions ==="
+printf '  cargo target protection: %s\n' "${LATTICE_BENCH_CARGO_TARGET_PROTECTION:-unavailable}"
 echo "  base: $BASE_REF ($BASE_SHA)   head: $HEAD_REF ($HEAD_SHA)"
 print_execution_provenance
 echo "  resolution: ${QUICK_FLAGS:---full}"
