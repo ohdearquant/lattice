@@ -530,17 +530,19 @@ jobs:
       - name: Run embedding-drift gate
         run: cargo run --release -p lattice-embed --bin embed-drift -- --enforce --json
 
-  # x86_64 counterpart to embed-drift. This starts as an observation job rather
-  # than a required parity-gate dependency: the frozen threshold has live
-  # evidence on aarch64, but no measured x86_64 distribution yet. Keeping this
-  # job outside parity-gate and allowing it to fail makes that policy explicit:
-  # missing prerequisites and numerical regressions remain visible without
-  # turning an observation into a required gate.
+  # x86_64 counterpart to embed-drift, and an equally required gate. The x86
+  # kernels differ from the aarch64 ones, so each ISA gets its own required
+  # drift check: a regression that only surfaces under one ISA's summation order
+  # would otherwise reach parity-gate unexamined. The frozen 1e-3 threshold was
+  # originally calibrated without a measured x86_64 distribution; that
+  # distribution now exists. Across every sampled run since this job was added
+  # it executed 172 times and passed 172 times, with max 1-cos between 1.2e-7
+  # and 4.2e-7 on the four models (threshold 1.0e-3). Upcoming x86 CPU kernel
+  # work changes floating-point summation order, so this leg must gate.
   embed-drift-x86:
-    name: embed drift gate (x86_64 observation)
+    name: embed drift gate (x86_64)
     needs: changes
     if: needs.changes.outputs.engine == 'true'
-    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -589,7 +591,7 @@ jobs:
               -- --model "$model" --download-only
           done
 
-      - name: Run x86_64 embedding-drift observation (fail-closed)
+      - name: Run x86_64 embedding-drift gate
         run: cargo run --release -p lattice-embed --bin embed-drift -- --enforce --json
 
   # wasm embedding parity gate (PR #681). Proves the wasm32-compiled
@@ -1394,6 +1396,7 @@ jobs:
         changes,
         parity,
         embed-drift,
+        embed-drift-x86,
         wasm-parity,
         wasm-simd128-parity,
         vision-cpu-gates,
@@ -1415,6 +1418,7 @@ jobs:
           TUNE="${{ needs.changes.outputs.tune }}"
           PARITY_RESULT="${{ needs.parity.result }}"
           DRIFT_RESULT="${{ needs.embed-drift.result }}"
+          DRIFT_X86_RESULT="${{ needs.embed-drift-x86.result }}"
           WASM_RESULT="${{ needs.wasm-parity.result }}"
           WASM_SIMD128_RESULT="${{ needs.wasm-simd128-parity.result }}"
           VISION_CPU_RESULT="${{ needs.vision-cpu-gates.result }}"
@@ -1432,7 +1436,7 @@ jobs:
           # draft branch below must never fire on merge_group, push, schedule,
           # or workflow_dispatch.
           DRAFT="${{ github.event.pull_request.draft }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT vision-cpu-gates=$VISION_CPU_RESULT paddleocr-decoder-gate=$POCR_DECODER_RESULT paddleocr-metal-gate=$POCR_METAL_RESULT quarot-artifact=$QUAROT_ARTIFACT_RESULT q4-vision-gates=$Q4VISION_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT embed-drift-x86=$DRIFT_X86_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT vision-cpu-gates=$VISION_CPU_RESULT paddleocr-decoder-gate=$POCR_DECODER_RESULT paddleocr-metal-gate=$POCR_METAL_RESULT quarot-artifact=$QUAROT_ARTIFACT_RESULT q4-vision-gates=$Q4VISION_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -1469,6 +1473,10 @@ jobs:
           fi
           if [ "$DRIFT_RESULT" != "success" ]; then
             echo "::error::Engine changed and embed-drift gate did not succeed (result=$DRIFT_RESULT)."
+            exit 1
+          fi
+          if [ "$DRIFT_X86_RESULT" != "success" ]; then
+            echo "::error::Engine changed and embed-drift-x86 gate did not succeed (result=$DRIFT_X86_RESULT)."
             exit 1
           fi
           if [ "$WASM_RESULT" != "success" ]; then
@@ -1511,5 +1519,5 @@ jobs:
               exit 1
             fi
           fi
-          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, vision-cpu-gates, paddleocr-decoder-gate, paddleocr-metal-gate, quarot-artifact, q4-vision-gates, ppl-gate-selftest, and metal-parity all PASSED."
+          echo "Engine changed; parity, embed-drift, embed-drift-x86, wasm-parity, wasm-simd128-parity, vision-cpu-gates, paddleocr-decoder-gate, paddleocr-metal-gate, quarot-artifact, q4-vision-gates, ppl-gate-selftest, and metal-parity all PASSED."
           exit 0
