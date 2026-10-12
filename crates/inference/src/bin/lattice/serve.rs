@@ -2569,6 +2569,7 @@ mod tests {
                     input_width: 4,
                 },
                 gate_bytes: vec![1, 2, 3],
+                provenance: lattice_inference::router_state::RouterProvenance::Legacy,
             },
             pinned: true,
         };

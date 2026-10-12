@@ -118,11 +118,13 @@ enum Command {
         /// Directory holding versioned router gate artifacts (ADR-095
         /// decision 3). Omitted, the server has no router: a request that
         /// omits `lora` selects the base model, exactly as it does today.
-        /// Given, the highest version present is loaded at startup and a
-        /// directory that holds an artifact which will not load FAILS the
-        /// startup rather than serving with routing silently off -- those two
-        /// states answer requests differently and only one of them was asked
-        /// for.
+        /// Given, a committed head record selects the artifact when the
+        /// directory holds one (ADR-096 decision 5), and the highest counter
+        /// present selects it otherwise, which is ADR-095's rule for a
+        /// format-4 directory. A directory that holds an artifact which will
+        /// not load FAILS the startup rather than serving with routing
+        /// silently off -- those two states answer requests differently and
+        /// only one of them was asked for.
         #[arg(long)]
         router_state: Option<String>,
         /// Serve a specific router gate version instead of the highest one
@@ -134,8 +136,14 @@ enum Command {
         /// the latest would serve exactly the artifact the operator was
         /// trying to get away from, under a flag that says otherwise. A pin
         /// without --router-state fails too, naming the missing flag.
+        ///
+        /// Takes `<version>` or `<version>:<hash-prefix>` -- the same two
+        /// spellings a running server prints. The bare counter is ADR-095's
+        /// pin and is what a format-4 directory can answer; the pair names a
+        /// full version identity and is refused if that counter now holds a
+        /// different artifact (ADR-096 decision 5).
         #[arg(long)]
-        router_pin: Option<u64>,
+        router_pin: Option<String>,
         /// Directory to load the embedding model from, instead of the served
         /// model's own directory (ADR-094 decision 1, amendment 2).
         ///
@@ -428,8 +436,20 @@ async fn main() {
 
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let router_artifact = {
-                use lattice_inference::router_state::{StartupDisposition, resolve_startup};
-                match resolve_startup(router_state.as_deref().map(Path::new), router_pin) {
+                use lattice_inference::router_state::{
+                    RouterPin, StartupDisposition, resolve_startup,
+                };
+                // Parsed here rather than by clap so the refusal is this
+                // module's error type, printed in the same shape as every
+                // other startup refusal below.
+                let parsed_pin = match router_pin.as_deref().map(RouterPin::parse).transpose() {
+                    Ok(pin) => pin,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                match resolve_startup(router_state.as_deref().map(Path::new), parsed_pin.as_ref()) {
                     Ok(StartupDisposition::NoRouter) => None,
                     Ok(StartupDisposition::Loaded(resolved)) => {
                         // Naming the embedder is REQUIRED for routing, rather
