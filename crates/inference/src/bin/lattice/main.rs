@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 mod chat;
 mod doctor;
 mod prune_score;
+mod router;
 mod serve;
 
 #[derive(Parser)]
@@ -201,6 +202,25 @@ enum Command {
     PruneScore {
         #[command(flatten)]
         args: prune_score::Args,
+    },
+    /// Provision and inspect a router state directory.
+    Router {
+        #[command(subcommand)]
+        command: RouterCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RouterCommand {
+    /// Provision a state directory with an UNTRAINED bootstrap gate.
+    ///
+    /// The output is a deterministic gate whose logits are zero, carrying the
+    /// uniform policy with nothing learned. It is legitimate to serve as a
+    /// baseline and is not evidence of learning: the artifact says so, and
+    /// `GET /v1/lora` reports it. Initialising does not enable learning.
+    Init {
+        #[command(flatten)]
+        args: router::InitArgs,
     },
 }
 
@@ -579,6 +599,13 @@ async fn main() {
                 }
             }
         }
+        Command::Router { command } => match command {
+            RouterCommand::Init { args } => {
+                if !router::run(&args) {
+                    std::process::exit(1);
+                }
+            }
+        },
         Command::PruneScore { args } => match prune_score::run(&args) {
             Ok(true) => {}
             Ok(false) => std::process::exit(1),
@@ -885,5 +912,137 @@ mod embedding_model_cli_tests {
                 Some("gme-qwen35".to_string())
             )
         );
+    }
+}
+
+// ─── `lattice router init` CLI boundary (ADR-096 decision 2) ──────────────
+//
+// The decision itself is tested in `lattice_inference::router_init`, which
+// needs no CLI and no model. What is testable only here is the wiring: that
+// the subcommand exists under `router`, that the ordered adapter list arrives
+// as an ordered list rather than one comma-joined string, and that the flags
+// the decision names are required rather than defaulted.
+#[cfg(test)]
+mod router_init_cli_tests {
+    use super::*;
+
+    fn init_args(extra: &[&str]) -> Result<router::InitArgs, clap::Error> {
+        let mut full = vec![
+            "lattice",
+            "router",
+            "init",
+            "--state",
+            "/tmp/router-state",
+            "--adapters",
+            "technical,casual",
+            "--schema-id",
+            "schema-1",
+            "--base-model",
+            "qwen3.5-0.8b",
+            "--embedding-model",
+            "/tmp/embedder",
+        ];
+        full.extend_from_slice(extra);
+        match Cli::try_parse_from(full)?.command {
+            Command::Router { command } => match command {
+                RouterCommand::Init { args } => Ok(args),
+            },
+            _ => panic!("expected Command::Router"),
+        }
+    }
+
+    /// The adapter list is the gate's COLUMN ORDER, so it has to arrive as an
+    /// ordered list. A single comma-joined string would be accepted by clap,
+    /// produce a one-element schema, and mint an artifact with one unroutable
+    /// column named `"technical,casual"`.
+    #[test]
+    fn the_adapter_list_is_split_and_ordered() {
+        let args = init_args(&[]).expect("the ordinary invocation parses");
+        assert_eq!(args.adapters, vec!["technical", "casual"]);
+        assert_eq!(args.pooling, "mean_visual");
+        assert_eq!(args.prompt_source, "last_user_message");
+        assert_eq!(args.embedding_model_id, None);
+
+        let reordered = {
+            let mut full = vec![
+                "lattice",
+                "router",
+                "init",
+                "--state",
+                "/tmp/s",
+                "--adapters",
+                "casual,technical",
+                "--schema-id",
+                "s",
+                "--base-model",
+                "m",
+                "--embedding-model",
+                "/tmp/e",
+            ];
+            full.push("--pooling");
+            full.push("last_token");
+            match Cli::try_parse_from(full).expect("parses").command {
+                Command::Router { command } => match command {
+                    RouterCommand::Init { args } => args,
+                },
+                _ => panic!("expected Command::Router"),
+            }
+        };
+        assert_eq!(
+            reordered.adapters,
+            vec!["casual", "technical"],
+            "the order given is the order recorded"
+        );
+        assert_eq!(reordered.pooling, "last_token");
+    }
+
+    /// Each flag ADR-096 decision 2 names is required. A default for any of
+    /// them would mint an artifact recording something nobody chose, and the
+    /// schema and base model are inside the content hash.
+    #[test]
+    fn every_flag_the_decision_names_is_required() {
+        for missing in [
+            "--state",
+            "--adapters",
+            "--schema-id",
+            "--base-model",
+            "--embedding-model",
+        ] {
+            let full: Vec<&str> = vec![
+                "lattice",
+                "router",
+                "init",
+                "--state",
+                "/tmp/s",
+                "--adapters",
+                "a,b",
+                "--schema-id",
+                "s",
+                "--base-model",
+                "m",
+                "--embedding-model",
+                "/tmp/e",
+            ];
+            // Drop the flag and its value.
+            let mut kept = Vec::new();
+            let mut skip = false;
+            for token in full {
+                if skip {
+                    skip = false;
+                    continue;
+                }
+                if token == missing {
+                    skip = true;
+                    continue;
+                }
+                kept.push(token);
+            }
+            assert!(
+                Cli::try_parse_from(kept).is_err(),
+                "{missing} should be required"
+            );
+        }
+        // The control: nothing dropped, and it parses.
+        assert!(init_args(&[]).is_ok());
     }
 }

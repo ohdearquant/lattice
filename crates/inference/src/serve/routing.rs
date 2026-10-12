@@ -466,7 +466,7 @@ pub fn context_text<'a>(
 }
 
 /// Resolve the prompt-selection rule the gate was trained under.
-fn trained_prompt_source(source: &str) -> Result<PromptSource, ApiError> {
+pub fn trained_prompt_source(source: &str) -> Result<PromptSource, ApiError> {
     if source == PromptSource::LastUserMessage.as_str() {
         return Ok(PromptSource::LastUserMessage);
     }
@@ -483,7 +483,14 @@ fn trained_prompt_source(source: &str) -> Result<PromptSource, ApiError> {
 /// Parsed once, at startup, rather than per request: an unrecognised value is
 /// a property of the artifact, so it is true of every request and there is no
 /// reason for a caller to be the one who learns about it.
-fn trained_pooling(pooling: &str) -> Result<crate::forward::cpu_f16::PoolingStrategy, ApiError> {
+///
+/// Public so `router init` validates its `--pooling` with the serving path's
+/// OWN parser rather than a second list. A second list is the shape where a
+/// build mints an artifact naming a rule it cannot reproduce, and every check
+/// downstream passes until a request arrives.
+pub fn trained_pooling(
+    pooling: &str,
+) -> Result<crate::forward::cpu_f16::PoolingStrategy, ApiError> {
     match pooling {
         "mean_visual" => Ok(crate::forward::cpu_f16::PoolingStrategy::MeanVisualTokens),
         "last_token" => Ok(crate::forward::cpu_f16::PoolingStrategy::LastToken),
