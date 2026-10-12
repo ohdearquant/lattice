@@ -77,10 +77,11 @@ enum Command {
         tokenizer_dir: Option<String>,
         /// Cap on outstanding (queued + in-flight) requests to the Metal GPU
         /// worker (issue #932) before new requests are rejected with HTTP
-        /// 503. Only applies to Q4/Metal-backed serving; the CPU backend has
-        /// no shared worker queue to bound. Conservative default: this
-        /// worker serializes all generation onto one dedicated thread, so a
-        /// deep queue just means memory growth with no throughput benefit.
+        /// 503. Only applies to Q4/Metal-backed serving; the CPU backend is
+        /// bounded separately by `--max-cpu-generations`. Conservative
+        /// default: this worker serializes all generation onto one dedicated
+        /// thread, so a deep queue just means memory growth with no
+        /// throughput benefit.
         /// Must be between 1 and `tokio::sync::Semaphore::MAX_PERMITS`
         /// (issue #939): zero would admit nothing (every request fails
         /// admission), and clap rejects anything larger here instead of
@@ -93,6 +94,26 @@ enum Command {
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
         max_pending: usize,
+        /// Number of chat generations the CPU backend runs at once. A
+        /// concurrency cap, not a queue: a request that arrives while this
+        /// many CPU generations are already in flight is rejected with HTTP
+        /// 503 `server_busy` immediately, never queued. A resource guard
+        /// rather than a throughput setting: each admitted generation holds
+        /// one serving runtime and its KV cache, and concurrent generations
+        /// contend for the same CPU cores, so the default stays small and an
+        /// operator with spare cores and memory can raise it. Ignored by the
+        /// Q4/Metal backend, whose own bound is `--max-pending`.
+        /// Must be between 1 and `tokio::sync::Semaphore::MAX_PERMITS`, the
+        /// same range rule as `--max-pending`: zero would admit nothing, and
+        /// clap rejects anything larger instead of deferring to
+        /// `Semaphore::new`'s precondition panic.
+        #[arg(
+            long,
+            default_value_t = serve::CPU_GENERATION_MAX_CONCURRENT_JOBS,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
+                .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
+        )]
+        max_cpu_generations: usize,
         /// Maximum resident adapter identities; reaching the cap rejects new loads.
         #[arg(long, default_value_t = lattice_inference::serve::lora::DEFAULT_MAX_RESIDENT_ADAPTERS,
             value_parser = lattice_inference::serve::lora::parse_resident_limit)]
@@ -269,6 +290,7 @@ async fn main() {
             model_id,
             tokenizer_dir,
             max_pending,
+            max_cpu_generations,
             max_resident_adapters,
             max_resident_adapter_bytes,
             preload_vision,
@@ -550,6 +572,7 @@ async fn main() {
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model,
                 embedding_admission: Arc::new(Semaphore::new(serve::EMBEDDING_MAX_CONCURRENT_JOBS)),
+                cpu_generation_admission: Arc::new(Semaphore::new(max_cpu_generations)),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: router_artifact,
             };
@@ -706,6 +729,18 @@ mod max_pending_cli_tests {
         }
     }
 
+    fn parse_max_cpu_generations(args: &[&str]) -> Result<usize, clap::Error> {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)?.command {
+            Command::Serve {
+                max_cpu_generations,
+                ..
+            } => Ok(max_cpu_generations),
+            _ => panic!("expected Command::Serve, got a different Command variant"),
+        }
+    }
+
     fn parse_resident_limits(args: &[&str]) -> Result<(usize, usize), clap::Error> {
         let mut full = vec!["lattice", "serve", "--model", "fixture"];
         full.extend_from_slice(args);
@@ -822,6 +857,28 @@ mod max_pending_cli_tests {
         assert_eq!(
             parse_max_pending(&["--max-pending", "8"]).expect("8 is a valid cap"),
             8
+        );
+    }
+
+    #[test]
+    fn max_cpu_generations_omitted_defaults_to_2() {
+        assert_eq!(
+            parse_max_cpu_generations(&[]).expect("no --max-cpu-generations"),
+            2
+        );
+    }
+
+    #[test]
+    fn max_cpu_generations_zero_is_rejected() {
+        parse_max_cpu_generations(&["--max-cpu-generations", "0"])
+            .expect_err("0 admits nothing and must be rejected, not silently accepted");
+    }
+
+    #[test]
+    fn max_cpu_generations_valid_override_is_accepted() {
+        assert_eq!(
+            parse_max_cpu_generations(&["--max-cpu-generations", "4"]).expect("4 is a valid cap"),
+            4
         );
     }
 }

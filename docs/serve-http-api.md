@@ -145,9 +145,9 @@ these fixed shutdown intervals.
 ## Auth, rate limiting, and concurrency
 
 Auth and rate limiting are not implemented today — worth stating explicitly, since issue #601
-asks for it. The Metal backend does have a per-request admission cap (see below), which is a
-different thing from rate limiting: it bounds outstanding work on one worker, not requests per
-client or per unit time.
+asks for it. Both backends have a per-request admission cap (see below), which is a different
+thing from rate limiting: they bound outstanding work on the backend, not requests per client or
+per unit time.
 
 - **No authentication.** There is no API-key check, bearer-token check, or any other
   `Authorization` handling anywhere in the router — none of the five routes shown above (or the
@@ -155,23 +155,31 @@ client or per unit time.
   any of them.
 - **No rate limiting.** There is no request-count or IP-based throttling middleware in front of the
   handlers. The only overload/admission controls are the 1 MiB body-size cap already shown above
-  and the Metal-backend admission cap described next. Request validation (shape, bounds, sampling
+  and the per-backend admission caps described next. Request validation (shape, bounds, sampling
   parameters, unsupported fields — see `crates/inference/src/serve/contract.rs`) also rejects
   requests before generation, but is a separate class of check from overload/rate control.
-- **CPU backend: not serialized by the server, but not free either.** Each CPU request's
-  `generate` call runs as blocking work on a Tokio blocking-pool task
-  (`tokio::task::spawn_blocking`, `crates/inference/src/bin/lattice/main.rs`), so multiple CPU requests
-  can execute concurrently up to Tokio's blocking-pool size — this is not a hard concurrency-1
-  limit, but concurrent CPU requests still contend for the same CPU cores and memory. There is no
-  per-request admission cap on this path.
+- **CPU backend: bounded concurrent generations.** Each CPU request's `generate` call runs as
+  blocking work on a Tokio blocking-pool task (`tokio::task::spawn_blocking`,
+  `crates/inference/src/serving_cpu_host.rs`), so concurrent CPU requests run at once up to the cap
+  below and contend for the same cores and memory.
+  `lattice serve --max-cpu-generations <N>` (default 2, ranged to
+  `1..=tokio::sync::Semaphore::MAX_PERMITS`) is the admission cap on this path: it is a concurrency
+  limit, not a queue, so a request that arrives while `N` CPU generations are already in flight is
+  rejected immediately with HTTP 503 `server_busy` rather than waiting. It is a resource guard, not a
+  throughput setting: each admitted generation holds one serving runtime and its KV cache, and
+  concurrent generations contend for the same CPU cores, so an operator with spare cores and memory
+  can raise it. The permit is held for the whole blocking generation, so it frees on completion,
+  error, or a cancelled stream, never when the HTTP future is dropped on client disconnect. The
+  Q4/Metal backend ignores this flag.
 - **Metal/Q4 backend: effectively concurrency-1, with a bounded pending-job admission cap.** All
   Metal generation is funneled through one dedicated worker thread (an `mpsc` channel into a
   single OS thread holding the `!Send` Metal state, `crates/inference/src/serve/metal_worker.rs`)
   — a deliberate design choice matching how one local GPU device actually works, not an oversight.
   Two concurrent requests against a Q4-backed `lattice serve` run back-to-back, not in parallel;
   the later request's connection simply stays open until its turn in the channel comes up, up to
-  `DEFAULT_MAX_PENDING_JOBS = 32` jobs queued or in flight at once by default (issue #932). Both
-  `lattice serve` and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
+  `DEFAULT_MAX_PENDING_JOBS = 32` jobs queued or in flight at once by default (issue #932). This is
+  the only cap on this backend: `--max-cpu-generations` does not apply to it. Both `lattice serve`
+  and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
   default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/inference/src/bin/lattice/main.rs`,
   `crates/inference/src/bin/lattice_serve.rs`). A request submitted while the cap is already full
   is rejected at the worker's admission boundary (`MetalWorkerClient::submit_with_lora`'s
@@ -197,9 +205,9 @@ client or per unit time.
   JSON error body rather than a stream that starts and then fails.
 
 None of this makes `lattice serve` unsafe to run locally or behind your own reverse proxy that adds
-auth and rate limiting — it just means `lattice serve` itself provides neither (the Metal admission
-cap is an overload guard, not an auth or rate-limiting mechanism), so don't expose it directly to
-an untrusted network.
+auth and rate limiting — it just means `lattice serve` itself provides neither (the per-backend
+admission caps are overload guards, not auth or rate-limiting mechanisms), so don't expose it
+directly to an untrusted network.
 
 ## `GET /health`
 
@@ -837,5 +845,6 @@ message content. There is no requirement to strip reasoning blocks between turns
   context at 4096 regardless of the model's own configured maximum.
 - The Metal/Q4 backend has cross-turn KV/GDN prefix caching and a bounded pending-job admission
   cap (`server_busy`, HTTP 503, at 32 outstanding jobs by default, configurable via
-  `--max-pending`); both binaries now support client-disconnect cancellation on the streaming
-  path.
+  `--max-pending`); the CPU backend has a bounded concurrent-generation admission cap of its own
+  (`server_busy`, HTTP 503, default 2, configurable via `--max-cpu-generations`); both binaries now
+  support client-disconnect cancellation on the streaming path.
