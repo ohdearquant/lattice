@@ -101,7 +101,7 @@ pub fn run(args: &InitArgs) -> bool {
             embedding_model: identity.as_str().to_string(),
             pooling: args.pooling.clone(),
             prompt_source: args.prompt_source.clone(),
-            loader_format: lattice_inference::serve::embeddings::EMBEDDING_LOADER_FORMAT
+            loader_format: lattice_inference::serve::embeddings::QWEN35_F16_DECODER_LOADER
                 .to_string(),
             input_width: embedder.dimensions() as u64,
         },
