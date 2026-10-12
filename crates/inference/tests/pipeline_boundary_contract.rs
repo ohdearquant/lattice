@@ -374,7 +374,7 @@ impl<'a> Walker<'a> {
             .ok_or_else(|| format!("root {} has no parent", root.display()))?;
         self.load(
             &canonical,
-            module_dir,
+            (module_dir, module_dir),
             namespace,
             root_module_path,
             CfgFormula::True,
@@ -385,7 +385,7 @@ impl<'a> Walker<'a> {
     fn load(
         &mut self,
         canonical: &Path,
-        module_dir: &Path,
+        module_dirs: (&Path, &Path),
         namespace: &str,
         module_path: Vec<String>,
         inherited_cfg: CfgFormula,
@@ -464,7 +464,7 @@ impl<'a> Walker<'a> {
                 self.walk_items(
                     &syntax.items,
                     canonical,
-                    module_dir,
+                    module_dirs,
                     namespace,
                     module_path,
                     file_cfg,
@@ -484,7 +484,7 @@ impl<'a> Walker<'a> {
         self.walk_items(
             &syntax.items,
             canonical,
-            module_dir,
+            module_dirs,
             namespace,
             module_path,
             file_cfg,
@@ -497,11 +497,12 @@ impl<'a> Walker<'a> {
         &mut self,
         items: &[Item],
         source_path: &Path,
-        module_dir: &Path,
+        module_dirs: (&Path, &Path),
         namespace: &str,
         module_path: Vec<String>,
         inherited_cfg: CfgFormula,
     ) -> Result<(), String> {
+        let (module_dir, path_attribute_dir) = module_dirs;
         let context = source_path
             .strip_prefix(self.manifest_dir)
             .unwrap_or(source_path)
@@ -525,10 +526,11 @@ impl<'a> Walker<'a> {
                         module.ident
                     ));
                 }
+                let inline_dir = module_dir.join(module.ident.to_string());
                 self.walk_items(
                     contents,
                     source_path,
-                    &module_dir.join(module.ident.to_string()),
+                    (&inline_dir, &inline_dir),
                     namespace,
                     child_module_path,
                     module_cfg,
@@ -536,8 +538,8 @@ impl<'a> Walker<'a> {
                 continue;
             }
             let direct_path = literal_module_path(&module.attrs, &context)?;
-            let target = if let Some(relative) = direct_path {
-                module_dir.join(relative)
+            let target = if let Some(relative) = &direct_path {
+                path_attribute_dir.join(relative)
             } else {
                 let flat = module_dir.join(format!("{}.rs", module.ident));
                 let nested = module_dir.join(module.ident.to_string()).join("mod.rs");
@@ -564,23 +566,19 @@ impl<'a> Walker<'a> {
                     target.display()
                 )
             })?;
-            let child_module_dir = if target_canonical
-                .file_name()
-                .is_some_and(|name| name == "mod.rs")
+            let child_module_dir = if direct_path.is_some()
+                || target.file_name().is_some_and(|name| name == "mod.rs")
             {
-                target_canonical
-                    .parent()
-                    .unwrap_or(module_dir)
-                    .to_path_buf()
+                target.parent().unwrap_or(module_dir).to_path_buf()
             } else {
-                target_canonical
+                target
                     .parent()
                     .unwrap_or(module_dir)
                     .join(module.ident.to_string())
             };
             self.load(
                 &target_canonical,
-                &child_module_dir,
+                (&child_module_dir, target.parent().unwrap_or(module_dir)),
                 namespace,
                 child_module_path,
                 module_cfg,
@@ -2302,6 +2300,133 @@ fn resolved_paths(report: &BoundaryReport) -> Vec<String> {
         .iter()
         .map(|crossing| crossing.resolved_path.clone())
         .collect()
+}
+
+fn assert_module_path_fixture(files: &[(&str, &str, &[&str])]) {
+    let fixture = tempfile::tempdir().expect("create module path fixture");
+    for (relative, source, _) in files {
+        let path = fixture.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("fixture source parent"))
+            .expect("create fixture source directory");
+        std::fs::write(path, source).expect("write fixture source");
+    }
+    let mut walker = Walker::new(fixture.path(), true).expect("create module walker");
+    walker
+        .walk_root(&fixture.path().join("src/lib.rs"), "fixture", Vec::new())
+        .expect("resolve compiler-selected module closure");
+    let actual = walker
+        .files
+        .into_iter()
+        .map(|(path, file)| (path, (file.namespace, file.module_path)))
+        .collect::<BTreeMap<_, _>>();
+    let expected = files
+        .iter()
+        .map(|(relative, _, module_path)| {
+            (
+                std::fs::canonicalize(fixture.path().join(relative))
+                    .expect("canonicalize fixture source"),
+                (
+                    "fixture".to_string(),
+                    module_path.iter().map(|name| (*name).to_string()).collect(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn module_path_attribute_in_non_mod_rs_uses_source_directory() {
+    assert_module_path_fixture(&[
+        ("src/lib.rs", "mod a;", &[]),
+        ("src/a.rs", "#[path = \"a/t.rs\"] mod t;", &["a"]),
+        ("src/a/t.rs", "", &["a", "t"]),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_in_crate_root_uses_source_directory() {
+    assert_module_path_fixture(&[
+        ("src/lib.rs", "#[path = \"nested/t.rs\"] mod t;", &[]),
+        ("src/nested/t.rs", "", &["t"]),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_in_mod_rs_uses_source_directory() {
+    assert_module_path_fixture(&[
+        ("src/lib.rs", "mod a;", &[]),
+        ("src/a/mod.rs", "#[path = \"t.rs\"] mod t;", &["a"]),
+        ("src/a/t.rs", "", &["a", "t"]),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_file_children_use_containing_directory() {
+    assert_module_path_fixture(&[
+        (
+            "src/lib.rs",
+            "#[path = \"nested/alternate.rs\"] mod renamed;",
+            &[],
+        ),
+        ("src/nested/alternate.rs", "mod child;", &["renamed"]),
+        (
+            "src/nested/child.rs",
+            "mod grandchild;",
+            &["renamed", "child"],
+        ),
+        (
+            "src/nested/child/grandchild.rs",
+            "",
+            &["renamed", "child", "grandchild"],
+        ),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_inside_non_mod_rs_inline_uses_module_directory() {
+    assert_module_path_fixture(&[
+        ("src/lib.rs", "mod a;", &[]),
+        (
+            "src/a.rs",
+            "mod inline { #[path = \"other.rs\"] mod inner; }",
+            &["a"],
+        ),
+        ("src/a/inline/other.rs", "", &["a", "inline", "inner"]),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_inside_root_inline_uses_module_directory() {
+    assert_module_path_fixture(&[
+        (
+            "src/lib.rs",
+            "mod inline { #[path = \"other.rs\"] mod inner; }",
+            &[],
+        ),
+        ("src/inline/other.rs", "", &["inline", "inner"]),
+    ]);
+}
+
+#[test]
+fn module_path_attribute_file_inline_children_use_containing_directory() {
+    assert_module_path_fixture(&[
+        (
+            "src/lib.rs",
+            "#[path = \"nested/alternate.rs\"] mod renamed;",
+            &[],
+        ),
+        (
+            "src/nested/alternate.rs",
+            "mod inline { #[path = \"other.rs\"] mod inner; }",
+            &["renamed"],
+        ),
+        (
+            "src/nested/inline/other.rs",
+            "",
+            &["renamed", "inline", "inner"],
+        ),
+    ]);
 }
 
 /// MUST BE REJECTED: `use crate::model::ConcreteModel as Renamed;` followed

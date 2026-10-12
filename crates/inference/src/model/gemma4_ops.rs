@@ -362,6 +362,87 @@ pub fn gemma4_apply_rope(
     }
 }
 
+// ---------------------------------------------------------------------------
+// G8b: axial (2-D) RoPE for the vision tower.
+// ---------------------------------------------------------------------------
+
+/// Axial 2-D RoPE inverse frequencies for a vision head: the first `head_dim / 4`
+/// entries are the axis-0 (x) frequencies and the next `head_dim / 4` are axis-1 (y).
+/// With theta 100 and a 64-wide head this is `100^(-2j/32)` for `j = 0..16`, x then y
+/// (`Gemma4VisionRotaryEmbedding.compute_axial_rope_parameters`,
+/// `modeling_gemma4.py:739-760`, `spatial_dim = head_dim // 2 = 32`).
+pub fn vision_axial_rope_inv_freq(head_dim: usize, theta: f64) -> Vec<f32> {
+    assert!(
+        head_dim > 0 && head_dim.is_multiple_of(4),
+        "head_dim must be a positive multiple of 4 for axial RoPE"
+    );
+    let per_axis = head_dim / 4;
+    let mut inv_freq = Vec::with_capacity(per_axis * 2);
+    for _ in 0..2 {
+        for j in 0..per_axis {
+            inv_freq.push((1.0 / theta.powf(2.0 * j as f64 / (2 * per_axis) as f64)) as f32);
+        }
+    }
+    inv_freq
+}
+
+/// Axial 2-D RoPE applied in place to a `[seq, heads, head_dim]` tensor (row-major,
+/// `head_dim` fastest-varying).
+///
+/// This mirrors the reference's `apply_multidimensional_rope` with `ndim = 2`
+/// (`modeling_gemma4.py:843-891`) rather than the single-axis rotate-half in
+/// [`gemma4_apply_rope`]. Each head splits into two `head_dim / 2` parts — the first
+/// rotated by the axis-0 (x) angle, the second by axis-1 (y) — and **within each part**
+/// the rotate-half pairing ties lane `j` to lane `j + head_dim / 4`. At `head_dim = 64`
+/// that is the reference's "two 32-channel halves, lane `j` paired with `j + 16`" form.
+///
+/// A whole-64 stride-half pairing, the layout [`gemma4_apply_rope`] implements, is a
+/// different map: it pairs lane `j` with `j + 32`, so the two functions must not be
+/// substituted for one another even though both are built from `rotate_half`.
+pub fn vision_axial_rope_apply(
+    x: &mut [f32],
+    positions: &[[usize; 2]],
+    inv_freq: &[f32],
+    heads: usize,
+    head_dim: usize,
+) {
+    let per_axis = head_dim / 4;
+    assert!(
+        per_axis > 0 && head_dim.is_multiple_of(4),
+        "head_dim must be a positive multiple of 4 for axial RoPE"
+    );
+    assert_eq!(
+        inv_freq.len(),
+        per_axis * 2,
+        "inv_freq must hold two per-axis blocks"
+    );
+    assert_eq!(
+        x.len(),
+        positions.len() * heads * head_dim,
+        "x must be seq*heads*head_dim"
+    );
+    let part = head_dim / 2;
+    for (t, &[x_coord, y_coord]) in positions.iter().enumerate() {
+        for h in 0..heads {
+            let base = (t * heads + h) * head_dim;
+            for axis in 0..2 {
+                let coordinate = if axis == 0 { x_coord } else { y_coord } as f32;
+                let offset = base + axis * part;
+                for j in 0..per_axis {
+                    let angle = coordinate * inv_freq[axis * per_axis + j];
+                    let (sine, cosine) = angle.sin_cos();
+                    let low = offset + j;
+                    let high = offset + per_axis + j;
+                    let u = x[low];
+                    let v = x[high];
+                    x[low] = u * cosine - v * sine;
+                    x[high] = v * cosine + u * sine;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -18,11 +18,15 @@
 //!
 //! ADR-058: every perf PR must include before/after bench output.
 
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
-use lattice_inference::weights::{SafetensorsFile, bench_support::f16_bits_to_f32};
+#[cfg(feature = "f16")]
+use criterion::BatchSize;
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+#[cfg(feature = "f16")]
+use lattice_inference::weights::SafetensorsFile;
+use lattice_inference::weights::bench_support::f16_bits_to_f32;
+#[cfg(feature = "f16")]
 use std::fs;
+#[cfg(feature = "f16")]
 use std::path::PathBuf;
 use std::time::Duration;
 

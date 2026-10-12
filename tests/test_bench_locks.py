@@ -235,7 +235,9 @@ class _Sandbox:
             "PATH": f"{self.bindir}:{os.environ['PATH']}",
             "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
             "MACHINE_STATE_CALLS_FILE": str(self.machine_calls),
+            "CARGO_TARGET_DIR": str(self.root / "target"),
         }
+        self.env.pop("CARGO_BUILD_TARGET_DIR", None)
         return self
 
     def __exit__(self, *exc):
