@@ -171,6 +171,129 @@ pub fn resolve_option_letters(
     Ok(ids)
 }
 
+/// **Unstable**: resolve the decider label table: `A`..`Z`, then the two-letter
+/// strings `AA`, `AB`, ... that each encode to exactly one token, in that order,
+/// until the table holds `max_entries` entries.
+///
+/// This extends [`resolve_option_letters`]'s rule to a wider table without
+/// relaxing it: every entry must encode to exactly one token and no two entries
+/// may share an id. The first [`LETTER_LABELS`] entries are required to be `A`..
+/// `J` so the narrow layout is byte-identical to the single-letter rendering.
+///
+/// The `open` token ids (the reference's `tok.encode("\\n(")`, two tokens on the
+/// decider tokenizer) are returned alongside, since the wide layout splices them
+/// around each label id.
+///
+/// # Errors
+///
+/// [`InferenceError::InvalidInput`] when `max_entries` is not at least
+/// [`LETTER_LABELS`] or exceeds the number of candidate labels.
+/// [`InferenceError::Tokenizer`] when the tokenizer cannot yield `max_entries`
+/// distinct single-token labels with `A`..`J` first, or when the open marker
+/// encodes to no tokens.
+pub fn resolve_decision_labels(
+    tokenizer: &dyn Tokenizer,
+    max_entries: usize,
+) -> Result<DecisionLabelTable, InferenceError> {
+    const ALPHABET: usize = 26;
+    let candidates = ALPHABET + ALPHABET * ALPHABET;
+    if max_entries < LETTER_LABELS || max_entries > candidates {
+        return Err(InferenceError::InvalidInput(format!(
+            "option scoring: max_entries must be in {LETTER_LABELS}..={candidates}, got {max_entries}"
+        )));
+    }
+
+    let upper: Vec<char> = (0..ALPHABET)
+        .map(|offset| char::from(b'A' + offset as u8))
+        .collect();
+    let mut names: Vec<String> = upper.iter().map(ToString::to_string).collect();
+    for first in &upper {
+        for second in &upper {
+            names.push(format!("{first}{second}"));
+        }
+    }
+
+    let mut labels = Vec::with_capacity(max_entries);
+    let mut ids = Vec::with_capacity(max_entries);
+    let mut seen = HashSet::with_capacity(max_entries);
+    for name in &names {
+        let mut batch = tokenizer.tokenize_batch(&[name.as_str()]);
+        let Some(encoded) = batch.pop() else {
+            continue;
+        };
+        if encoded.real_length != 1 || encoded.pre_truncation_len != 1 {
+            continue;
+        }
+        let Some(&id) = encoded.input_ids.first() else {
+            continue;
+        };
+        if !seen.insert(id) {
+            continue;
+        }
+        labels.push(name.clone());
+        ids.push(id);
+        if labels.len() == max_entries {
+            break;
+        }
+    }
+
+    if labels.len() != max_entries {
+        return Err(InferenceError::Tokenizer(format!(
+            "option scoring: the tokenizer yields only {} single-token labels, {max_entries} required",
+            labels.len()
+        )));
+    }
+    for (offset, name) in upper.iter().take(LETTER_LABELS).enumerate() {
+        let expected = name.to_string();
+        if labels.get(offset) != Some(&expected) {
+            return Err(InferenceError::Tokenizer(format!(
+                "option scoring: label {offset} must be {expected:?}, found {:?}",
+                labels.get(offset)
+            )));
+        }
+    }
+
+    let mut open_batch = tokenizer.tokenize_batch(&["\n("]);
+    let Some(open_marker) = open_batch.pop() else {
+        return Err(InferenceError::Tokenizer(
+            "option scoring: the open marker \"\\n(\" produced no token ids".into(),
+        ));
+    };
+    let open_ids: Vec<u32> = open_marker
+        .input_ids
+        .get(..open_marker.real_length)
+        .map(<[u32]>::to_vec)
+        .unwrap_or_default();
+    if open_ids.is_empty() {
+        return Err(InferenceError::Tokenizer(
+            "option scoring: the open marker \"\\n(\" produced no token ids".into(),
+        ));
+    }
+
+    Ok(DecisionLabelTable {
+        labels,
+        ids,
+        open_ids,
+    })
+}
+
+/// The narrow layout's letter count: at most this many options render as
+/// `(A) .. (J)` inside one string.
+pub const LETTER_LABELS: usize = 10;
+
+/// **Unstable**: the decider label table resolved against one tokenizer: the
+/// label strings, their single token ids (index-aligned), and the token ids of
+/// the `"\\n("` marker the wide layout splices around each label id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionLabelTable {
+    /// The label spellings, `A`..`J` first.
+    pub labels: Vec<String>,
+    /// The single token id of each label, index-aligned with `labels`.
+    pub ids: Vec<u32>,
+    /// The token ids of the `"\\n("` open marker.
+    pub open_ids: Vec<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +531,61 @@ mod tests {
         );
         let all = resolve_option_letters(&tokenizer, 26).expect("A..Z resolve");
         assert_eq!(all, (0..26).collect::<Vec<u32>>());
+    }
+
+    /// A tokenizer with single-token letters `A`..`Z`, all 676 two-letter
+    /// strings as single tokens, and `"\n("` as two tokens. Enough to exercise
+    /// the 255-entry table exactly.
+    fn table_bpe() -> BpeTokenizer {
+        let mut vocab = HashMap::new();
+        let mut merges = Vec::new();
+        for (id, letter) in (b'A'..=b'Z').enumerate() {
+            vocab.insert(char::from(letter).to_string(), id as u32);
+        }
+        for (offset, first) in (b'A'..=b'Z').enumerate() {
+            for (inner, second) in (b'A'..=b'Z').enumerate() {
+                let left = char::from(first).to_string();
+                let right = char::from(second).to_string();
+                vocab.insert(format!("{left}{right}"), 26 + (offset * 26 + inner) as u32);
+                merges.push((left, right));
+            }
+        }
+        // The newline's byte-level spelling, and the identity-mapped "(".
+        vocab.insert("\u{10a}".to_string(), 800);
+        vocab.insert("(".to_string(), 801);
+        BpeTokenizer::from_vocab_and_merges(vocab, merges).expect("table fixture builds")
+    }
+
+    #[test]
+    fn resolves_a_full_decision_label_table() {
+        let tokenizer = table_bpe();
+        let table = resolve_decision_labels(&tokenizer, 255).expect("255 labels resolve");
+        assert_eq!(table.labels.len(), 255);
+        assert_eq!(table.ids.len(), 255);
+        assert_eq!(table.labels[0], "A");
+        assert_eq!(table.labels[25], "Z");
+        assert_eq!(table.labels[26], "AA");
+        assert_eq!(table.ids[0], 0);
+        assert_eq!(table.ids[25], 25);
+        assert_eq!(table.ids[26], 26);
+        let distinct: HashSet<u32> = table.ids.iter().copied().collect();
+        assert_eq!(distinct.len(), 255);
+        assert_eq!(table.open_ids, vec![800, 801]);
+    }
+
+    #[test]
+    fn refuses_a_label_table_it_cannot_fill() {
+        // Only A..Z are single tokens, so 27 entries cannot be resolved.
+        let tokenizer = letter_bpe(26);
+        assert!(matches!(
+            resolve_decision_labels(&tokenizer, 27),
+            Err(InferenceError::Tokenizer(_))
+        ));
+        // A table shorter than the ten-letter narrow layout is refused outright.
+        assert!(matches!(
+            resolve_decision_labels(&tokenizer, 3),
+            Err(InferenceError::InvalidInput(_))
+        ));
     }
 
     #[test]

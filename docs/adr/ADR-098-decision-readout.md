@@ -2,6 +2,8 @@
 
 **Status**: Proposed (2026-10-10)\
 **Date**: 2026-10-10\
+**Amended**: 2026-10-12 (decision 6 names the checkpoint's `decider_config.json`; the letter table in decision 3 and
+the served prompt layout in the context corrected)\
 **Extends**: ADR-097\
 **Crate**: lattice-inference
 
@@ -26,9 +28,10 @@ design decision, and is not recorded here.
 
 A class of small models answers typed questions about a state (choose one of N options, yes/no, a score on an
 ordered scale) with one forward pass and no decoding: the answer is a probability over the options read off the
-model at a known position. Publicly: Mapika `decider-{0.8b,2b,4b}` (full fine-tunes of Qwen3.5-Base; the prompt
-lists every question first, then one `Answer k: (` slot per question; the read-out at each slot is the `lm_head`
-rows of the option-letter tokens, A-J then two-letter tokens up to 255 options, softmax at a fitted temperature),
+model at a known position. Publicly: Mapika `decider-{0.8b,2b,4b}` (full fine-tunes of Qwen3.5-Base; decider-0.8b
+and decider-2b as served by their published configs put the state first and ask one question per prompt, ending in an
+`Answer: (` slot; the read-out at the slot is the `lm_head` rows of the option-letter tokens, A-Z then two-letter
+tokens up to 255 options, softmax at a fitted temperature),
 autotrust `JEV-9B` / `JEV-27B` (frozen base + LoRA r=16 + a 24-slot fp32 head read at the last token of a bare
 template, per-kind temperatures), and a public benchmark (the Decision Index: 110,201 requests over 37-42
 benchmarks, chance-corrected skill, an HTTP wire format `POST /v1/systemone` with `{model, state, questions}` and
@@ -71,9 +74,11 @@ Metal prefill problem, and the public benchmark measures exactly that.
    question reads its own subset of those logits (for the decider layout, the first n entries of the letter table for
    an n-option question), so a single question has at most 255 options and a request with many questions still
    projects onto at most 255 rows.
-3. **The letter table extends ADR-097's resolution rule, it does not relax it.** A checkpoint's table (decider: `A`-`J`,
-   then 229 two-letter tokens) is resolved through the loaded tokenizer, and every entry must encode to exactly one
-   token with no duplicate ids, as in ADR-097 decision 3. A table that fails the check refuses at load, not at the
+3. **The letter table extends ADR-097's resolution rule, it does not relax it.** A checkpoint's table (decider: `A`-`Z`,
+   then the two-letter strings `AA`, `AB`, ... that encode to one token, in that order, until the table holds 255
+   entries; on the decider-0.8b tokenizer that is 26 single letters and 229 two-letter tokens, the last `JT`) is
+   resolved through the loaded tokenizer, and every entry must encode to exactly one token with no duplicate ids, as
+   in ADR-097 decision 3. A table that fails the check refuses at load, not at the
    first request.
 4. **A decision head is a second source for the projection.** `rows` selects `lm_head` rows; a loaded
    `[n_slots, hidden]` fp32 head (`head.safetensors`) is the other way to build the same per-slot logits. LoRA applies
@@ -85,8 +90,11 @@ Metal prefill problem, and the public benchmark measures exactly that.
 6. **The wire layer is `/v1/systemone`, format-compatible with the public benchmark.** Request `{model, state,
    questions}` with kinds `choice` (2-255 options, each with criteria text), `noul` (yes/no), `score` (2-10 ordered
    levels); response `answers{key:{type, choice, probabilities}}` and `usage.input_tokens`. The prompt rendering for
-   a checkpoint is a byte-exact port of that checkpoint's published prompt code, selected by a `readout` section in
-   the checkpoint's lattice config. The chat template is never involved.
+   a checkpoint is a byte-exact port of that checkpoint's published prompt code, selected by the checkpoint's own
+   `decider_config.json`, which is the one source of truth for it: a port names the `version` values it implements
+   (decider-0.8b: `0.8b-v1`) and the fields that version carries, refuses any other version or any field it does not
+   know with a message naming it, and checks the values it depends on (for decider-0.8b: `schema_first` false,
+   `max_options` 255, `neutralize_none` false) instead of assuming them. The chat template is never involved.
 7. **Acceptance is differential, before any number is reported.** For a checkpoint with a public reference engine:
    first, on a single prompt, the hidden state at a slot agrees with the reference framework's last-layer post-norm
    hidden state to < 1e-3 in f32; then, on 300 benchmark requests, max |delta p| <= 1e-3 per option and identical
@@ -117,8 +125,8 @@ Metal prefill problem, and the public benchmark measures exactly that.
 ## Consequences
 
 - New surface: one primitive in `forward/` (Metal and CPU), one letter-table resolver beside
-  `resolve_option_letters`, one head loader, one endpoint in the serving layer, one `readout` config section. No new
-  crate, no new dependency.
+  `resolve_option_letters`, one head loader, one endpoint in the serving layer, and an allowlisted reader of the checkpoint's
+  `decider_config.json`. No new crate, no new dependency.
 - The benchmark kit's HTTP engine becomes a standing differential test for the serving path.
 - Metal prefill throughput on 500-5,000-token prompts becomes a first-class measured number. The levers (batched
   prefill of N requests sharing a schema prefix, prefix reuse, KV precision, chunk size) each get their own ADR with
