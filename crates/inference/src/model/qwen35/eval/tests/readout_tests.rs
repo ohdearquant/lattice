@@ -129,19 +129,22 @@ struct ReadoutProjectionObservation {
     context: String,
     actual: Vec<f32>,
     expected: Vec<f32>,
-    gather_error: Option<InferenceError>,
     projection_error: Option<InferenceError>,
-    first_gather_difference: Option<(usize, usize, u32, u32)>,
+    projection_matches_reference: bool,
+    first_difference: Option<(usize, u32, u32)>,
     max_finite_ulp: Option<u32>,
-    first_full_nonfinite: Option<usize>,
+    first_reference_nonfinite: Option<usize>,
     head_unchanged: bool,
     hidden_unchanged: bool,
-    full_hidden_unchanged: bool,
-    selected_unchanged: bool,
     routing_distinct: bool,
 }
 
-fn readout_projection_t3(full_rows: usize, target_disposition: &str) {
+/// Drive `project_readout_hidden` over the four corpora at `full_rows` and
+/// compare each gathered value bit for bit against `matmul_bt` over the full
+/// head. The helper shares no buffer with the reference projection, so a
+/// mismatch in the full-row product, in the gather, or in input mutation
+/// surfaces here on every target.
+fn readout_projection_witness(full_rows: usize) {
     let k = 1024;
     let restricted_rows = 255;
     let rows: Vec<u32> = (0..restricted_rows)
@@ -164,36 +167,31 @@ fn readout_projection_t3(full_rows: usize, target_disposition: &str) {
     let mut all_case_max_finite_ulp: Option<u32> = None;
     for (corpus, seed) in cases {
         let (hidden, head) = readout_projection_fixture(full_rows, corpus, seed);
-        let hidden_for_full = hidden.clone();
         let hidden_before = readout_value_bits(&hidden);
         let head_before = readout_value_bits(&head);
-        let hidden_copy_identical = readout_value_bits(&hidden_for_full) == hidden_before;
         let context = format!(
-            "target={}-{}; disposition={target_disposition}; full=(1,{k},{full_rows}); \
-             restricted=(1,{k},{restricted_rows}); corpus={corpus:?}; seed={seed:016x}; rows={rows:?}",
+            "target={}-{}; full=(1,{k},{full_rows}); restricted=(1,{k},{restricted_rows}); \
+             corpus={corpus:?}; seed={seed:016x}; rows={rows:?}",
             std::env::consts::OS,
             std::env::consts::ARCH,
         );
 
-        let mut selected_scratch = vec![f32::NAN; restricted_rows * k];
-        let gather_error = super::gather_readout_rows(&head, k, &rows, &mut selected_scratch).err();
-        let mut first_gather_difference = None;
-        for (index, &row) in rows.iter().enumerate() {
-            let got = &selected_scratch[index * k..(index + 1) * k];
-            let want = &head[row as usize * k..(row as usize + 1) * k];
-            for (element, (&got, &want)) in got.iter().zip(want).enumerate() {
-                if first_gather_difference.is_none() && got.to_le_bytes() != want.to_le_bytes() {
-                    first_gather_difference = Some((index, element, got.to_bits(), want.to_bits()));
-                }
-            }
-        }
+        let mut reference = vec![f32::NAN; full_rows];
+        crate::forward::cpu::matmul_bt(&hidden, &head, &mut reference, 1, k, full_rows);
+        let expected: Vec<f32> = rows.iter().map(|&row| reference[row as usize]).collect();
 
         let mut full = vec![f32::NAN; full_rows];
-        crate::forward::cpu::matmul_bt(&hidden_for_full, &head, &mut full, 1, k, full_rows);
-        let expected: Vec<f32> = rows.iter().map(|&row| full[row as usize]).collect();
         let mut actual = vec![f32::NAN; restricted_rows];
-        let selected_before = readout_value_bits(&selected_scratch);
-        let result = super::project_readout_hidden(&hidden, &selected_scratch, &mut actual);
+        let result =
+            super::project_readout_hidden(&hidden, &head, full_rows, &rows, &mut full, &mut actual);
+        let projection_matches_reference =
+            readout_value_bits(&full) == readout_value_bits(&reference);
+        let first_difference = actual
+            .iter()
+            .zip(&expected)
+            .enumerate()
+            .find(|(_, (got, want))| got.to_bits() != want.to_bits())
+            .map(|(index, (&got, &want))| (index, got.to_bits(), want.to_bits()));
         let max_finite_ulp = actual
             .iter()
             .zip(&expected)
@@ -204,23 +202,20 @@ fn readout_projection_t3(full_rows: usize, target_disposition: &str) {
             all_case_max_finite_ulp = Some(all_case_max_finite_ulp.unwrap_or(0).max(distance));
         }
         let routing_distinct = !matches!(corpus, ReadoutCorpus::RowRouting)
-            || rows
-                .iter()
-                .all(|&row| full[row as usize].to_bits() != full[row as usize + 1].to_bits());
+            || rows.iter().all(|&row| {
+                reference[row as usize].to_bits() != reference[row as usize + 1].to_bits()
+            });
         observations.push(ReadoutProjectionObservation {
             context,
             actual,
             expected,
-            gather_error,
             projection_error: result.err(),
-            first_gather_difference,
+            projection_matches_reference,
+            first_difference,
             max_finite_ulp,
-            first_full_nonfinite: full.iter().position(|value| !value.is_finite()),
+            first_reference_nonfinite: reference.iter().position(|value| !value.is_finite()),
             head_unchanged: readout_value_bits(&head) == head_before,
             hidden_unchanged: readout_value_bits(&hidden) == hidden_before,
-            full_hidden_unchanged: hidden_copy_identical
-                && readout_value_bits(&hidden_for_full) == hidden_before,
-            selected_unchanged: readout_value_bits(&selected_scratch) == selected_before,
             routing_distinct,
         });
     }
@@ -232,37 +227,28 @@ fn readout_projection_t3(full_rows: usize, target_disposition: &str) {
             observation.context, observation.max_finite_ulp,
         );
         assert!(
-            observation.gather_error.is_none(),
-            "{context}: gather refused exact buffers: {:?}",
-            observation.gather_error,
+            observation.projection_error.is_none(),
+            "{context}: full-row projection refused: {:?}",
+            observation.projection_error,
         );
-        if let Some((index, element, got, want)) = observation.first_gather_difference {
+        if let Some((index, got, want)) = observation.first_difference {
             panic!(
-                "{context}: gathered bytes differ at selected index {index}, head row {}, \
-                 element {element}; actual_bits={got:08x}; expected_bits={want:08x}",
+                "{context}: gathered bytes differ at selected index {index}, head row {}; \
+                 actual_bits={got:08x}; expected_bits={want:08x}",
                 rows[index],
             );
         }
+        assert!(
+            observation.projection_matches_reference,
+            "{context}: helper full-row projection differs from matmul_bt reference",
+        );
         assert!(observation.head_unchanged, "{context}: head changed");
         assert!(observation.hidden_unchanged, "{context}: hidden changed");
-        assert!(
-            observation.full_hidden_unchanged,
-            "{context}: full hidden changed"
-        );
-        assert!(
-            observation.selected_unchanged,
-            "{context}: gathered weights changed"
-        );
-        assert!(
-            observation.projection_error.is_none(),
-            "{context}: restricted projection refused: {:?}",
-            observation.projection_error,
-        );
         readout_assert_exact(&observation.actual, &observation.expected, &context);
         assert!(
-            observation.first_full_nonfinite.is_none(),
+            observation.first_reference_nonfinite.is_none(),
             "{context}: full reference contains nonfinite output at {:?}",
-            observation.first_full_nonfinite,
+            observation.first_reference_nonfinite,
         );
         assert!(
             observation.routing_distinct,
@@ -270,47 +256,29 @@ fn readout_projection_t3(full_rows: usize, target_disposition: &str) {
         );
     }
     eprintln!(
-        "READOUT_PROJECTION_EXACT_OK target={}-{}; disposition={target_disposition}; \
-         full=(1,{k},{full_rows}); restricted=(1,{k},{restricted_rows}); \
-         corpus_count={}; all_case_max_finite_ulp={all_case_max_finite_ulp:?}",
+        "READOUT_PROJECTION_EXACT_OK target={}-{}; full=(1,{k},{full_rows}); \
+         restricted=(1,{k},{restricted_rows}); corpus_count={}; all_case_max_finite_ulp={all_case_max_finite_ulp:?}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         cases.len(),
     );
 }
 
-/// Accelerate is opaque: this checks exact equality, without a vendor-kernel claim.
-#[cfg(target_os = "macos")]
 #[test]
-fn readout_projection_matches_full_row_macos_bitwise() {
-    readout_projection_t3(2048, "Accelerate empirical equality only");
-}
-
-/// At revision 1c39a993edbfc112719e6af6270d4df442a8eb58, matmul.rs:150-159,
-/// 215-221 and 239-257 show the predicate crossing, but m=1 has zero tiled
-/// leading rows. Both calls are direct; this does not claim a kernel crossing.
-#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
-#[test]
-fn readout_projection_matches_full_row_x86_predicate_crossing_bitwise() {
-    readout_projection_t3(2048, "tiling predicate crosses; both calls direct");
-}
-
-/// NonmacOS ARM/scalar uses a real tiled/direct crossing at these m=1 shapes.
-#[cfg(all(not(target_os = "macos"), not(target_arch = "x86_64")))]
-#[test]
-fn readout_projection_matches_full_row_tiled_direct_bitwise() {
-    readout_projection_t3(1024, "full tiled; restricted direct NEON/scalar");
+fn readout_projection_matches_full_row_bitwise() {
+    readout_projection_witness(2048);
+    readout_projection_witness(1024);
 }
 
 #[test]
 fn readout_projection_rejects_nonfinite_outputs() {
     for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        let mut selected = vec![0.0; 1024];
-        selected[0] = nonfinite;
+        let head = vec![nonfinite; 1024];
         let hidden = vec![1.0; 1024];
-        let mut logits = vec![0.0];
+        let mut full = vec![0.0; 1];
+        let mut logits = vec![0.0; 1];
         assert!(matches!(
-            super::project_readout_hidden(&hidden, &selected, &mut logits),
+            super::project_readout_hidden(&hidden, &head, 1, &[0], &mut full, &mut logits),
             Err(InferenceError::Inference(_)),
         ));
     }
@@ -558,6 +526,24 @@ fn readout_accepts_exact_context_and_255_rows_in_caller_order() {
             "inclusive boundaries and caller order",
         );
     }
+}
+
+#[test]
+fn readout_full_sorted_row_list_matches_forward_step_logits_bitwise() {
+    let model = build_model(test_config(), 0x0A71_0C05);
+    let vocab = model.config.vocab_size;
+    let prompt = [11, 42, 7, 7, 63, 5, 20];
+    let rows: Vec<u32> = (0..vocab as u32).collect();
+    let result = readout_test_call(&model, &prompt, &[prompt.len() - 1], &rows).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].len(), vocab);
+    let reference = hand_read_last_logits(&model, &prompt);
+    assert_eq!(reference.len(), vocab);
+    readout_assert_exact(
+        &result[0],
+        &reference,
+        "full sorted row list equals forward_step logits",
+    );
 }
 
 #[test]

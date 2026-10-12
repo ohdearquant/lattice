@@ -33,60 +33,52 @@ pub enum PrefillInput<'a> {
     TokenIds(&'a [u32]),
 }
 
-fn gather_readout_rows(
-    head: &[f32],
-    hidden_size: usize,
-    rows: &[u32],
-    selected_scratch: &mut [f32],
-) -> Result<(), InferenceError> {
-    if hidden_size == 0 || !head.len().is_multiple_of(hidden_size) {
-        return Err(InferenceError::Inference(
-            "prefill_readout: inconsistent head geometry".into(),
-        ));
-    }
-    let selected_len = rows.len().checked_mul(hidden_size).ok_or_else(|| {
-        InferenceError::Inference("prefill_readout: selected head size overflow".into())
-    })?;
-    if selected_scratch.len() != selected_len {
-        return Err(InferenceError::Inference(
-            "prefill_readout: inconsistent selected head geometry".into(),
-        ));
-    }
-    let head_rows = head.len() / hidden_size;
-    for (destination, &row_id) in selected_scratch.chunks_exact_mut(hidden_size).zip(rows) {
-        let row = row_id as usize;
-        if row >= head_rows {
-            return Err(InferenceError::Inference(format!(
-                "prefill_readout: head row {row} out of range: head has {head_rows} rows"
-            )));
-        }
-        let start = row * hidden_size;
-        destination.copy_from_slice(&head[start..start + hidden_size]);
-    }
-    Ok(())
-}
-
+/// Project one captured hidden state onto the full vocabulary, then read the requested rows.
+///
+/// The returned values are read out of a full-vocabulary projection computed with the same call
+/// [`Qwen35Model::forward_step`] makes, so each one equals the logit that call produces at this
+/// position bit for bit on every CPU target. Projecting onto only the requested rows would not:
+/// the CPU kernels round differently depending on the number of rows in the product.
 fn project_readout_hidden(
     hidden: &[f32],
-    selected_scratch: &[f32],
+    head: &[f32],
+    vocab: usize,
+    rows: &[u32],
+    full: &mut [f32],
     logits: &mut [f32],
 ) -> Result<(), InferenceError> {
     let k = hidden.len();
-    let n = logits.len();
-    if k == 0 || !(1..=255).contains(&n) {
+    if k == 0 || vocab == 0 || !(1..=255).contains(&rows.len()) || logits.len() != rows.len() {
         return Err(InferenceError::Inference(
             "prefill_readout: inconsistent projection geometry".into(),
         ));
     }
-    let selected_len = k.checked_mul(n).ok_or_else(|| {
+    let head_span = vocab.checked_mul(k).ok_or_else(|| {
         InferenceError::Inference("prefill_readout: projection size overflow".into())
     })?;
-    if selected_scratch.len() != selected_len {
+    if head.len() < head_span {
         return Err(InferenceError::Inference(
-            "prefill_readout: inconsistent selected head geometry".into(),
+            "prefill_readout: inconsistent head geometry".into(),
         ));
     }
-    matmul_bt(hidden, selected_scratch, logits, 1, k, n);
+    if full.len() < vocab {
+        return Err(InferenceError::Inference(
+            "prefill_readout: inconsistent projection geometry".into(),
+        ));
+    }
+    let head_rows = head.len() / k;
+    for &row_id in rows {
+        let row = row_id as usize;
+        if row >= vocab {
+            return Err(InferenceError::Inference(format!(
+                "prefill_readout: head row {row} out of range: head has {head_rows} rows"
+            )));
+        }
+    }
+    matmul_bt(hidden, &head[..head_span], &mut full[..vocab], 1, k, vocab);
+    for (index, &row_id) in rows.iter().enumerate() {
+        logits[index] = full[row_id as usize];
+    }
     if let Some((index, &value)) = logits.iter().enumerate().find(|(_, v)| !v.is_finite()) {
         return Err(InferenceError::Inference(format!(
             "prefill_readout: non-finite logit at selected row {index}: {value}"
@@ -266,8 +258,12 @@ impl Qwen35Model {
     ///
     /// Processes the complete input from fresh recurrent and KV state. Each result row
     /// corresponds to a position in `slots`, and contains the logits for `rows` in caller
-    /// order. The hidden states are captured after final RMSNorm. Each slot uses a separate
-    /// single-row projection over the selected head rows; there is no sampling or decode step.
+    /// order. The hidden states are captured after final RMSNorm. Each slot's values are read
+    /// out of a full-vocabulary projection computed with the same call [`Self::forward_step`]
+    /// makes, so each equals the logit that call produces at this position bit for bit on every
+    /// CPU target; projecting onto only the requested rows would not, because the CPU kernels
+    /// round differently depending on the number of rows in the product. There is no sampling
+    /// or decode step.
     ///
     /// # Errors
     ///
@@ -331,11 +327,7 @@ impl Qwen35Model {
         }
 
         let hidden = cfg.hidden_size;
-        let selected_len = rows.len().checked_mul(hidden).ok_or_else(|| {
-            InferenceError::Inference("prefill_readout: selected head size overflow".into())
-        })?;
-        let mut selected = vec![0.0; selected_len];
-        gather_readout_rows(self.weights.logits_weight(), hidden, rows, &mut selected)?;
+        let mut full = vec![0.0; cfg.vocab_size];
 
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
             .map(|_| GatedDeltaNetState::new(cfg))
@@ -362,8 +354,15 @@ impl Qwen35Model {
         }
 
         let mut result = vec![vec![0.0; rows.len()]; slots.len()];
-        for (hidden, logits) in captured.iter().zip(&mut result) {
-            project_readout_hidden(hidden, &selected, logits)?;
+        for (hidden_state, logits) in captured.iter().zip(&mut result) {
+            project_readout_hidden(
+                hidden_state,
+                self.weights.logits_weight(),
+                cfg.vocab_size,
+                rows,
+                &mut full,
+                logits,
+            )?;
         }
         Ok(result)
     }
