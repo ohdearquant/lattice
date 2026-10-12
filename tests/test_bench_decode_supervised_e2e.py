@@ -475,6 +475,7 @@ int main(int argc, char **argv) {
         for name in (
             "LATTICE_BENCH_LOCK_STATUS", "LATTICE_BENCH_LOCK_FDS", "LATTICE_BENCH_SUPERVISOR_FD",
             "LATTICE_GPU_HANDOFF_CONTROL", "LATTICE_GPU_HANDOFF_FD", "LATTICE_GPU_HANDOFF_TOKEN",
+            "CARGO_BUILD_TARGET_DIR",
         ):
             env.pop(name, None)
         env.update(
@@ -484,6 +485,7 @@ int main(int argc, char **argv) {
                 "PYTHON_BIN": sys.executable,
                 "HOME": str(self.home),
                 "FIXTURE_REPO": str(self.root),
+                "CARGO_TARGET_DIR": str(self.root / "target"),
                 "FIXTURE_EVENTS": str(self.events),
                 "FIXTURE_PUBLISH_EVENTS": str(self.publish_events),
                 "FIXTURE_STATUS_FILE": str(self.status_file),

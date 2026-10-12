@@ -294,6 +294,8 @@ fn fixture_from(cfg: EmbeddingGemma2Config, list: Vec<NamedTensor>) -> Fixture {
             weights,
             tokenizer: None,
             max_tokens: Some(EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS),
+            vision: LazyVision::unavailable(),
+            image_parts: None,
         },
     }
 }
@@ -1057,6 +1059,46 @@ fn fixture_with_tokenizer() -> Fixture {
 }
 
 #[test]
+fn text_encode_ignores_absent_and_poisoned_vision() {
+    let expected = fixture_with_tokenizer()
+        .model
+        .encode("a b c", None)
+        .unwrap();
+    let cfg = tiny_cfg();
+    let text_config: serde_json::Value = serde_json::from_str(TINY_CONFIG).unwrap();
+    let config = serde_json::json!({
+        "text_config": text_config,
+        "vision_config": {"not_a_valid_vision_configuration": true}
+    });
+    for poisoned in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut tensors = synth_tensors(&cfg, PREFIX, 7);
+        let poison = "vision_tower.patch_embedder.input_proj.weight";
+        if poisoned {
+            tensors.push((poison.into(), vec![1], vec![f32::from_bits(0x7fc0_0000)]));
+        }
+        let bytes = safetensors_bytes(&tensors, &[]);
+        let proof = SafetensorsFile::from_bytes(bytes.clone()).unwrap();
+        if poisoned {
+            assert!(
+                matches!(proof.get_f32_tensor(poison), Err(InferenceError::InvalidSafetensors(message)) if message.contains(poison))
+            );
+        } else {
+            assert!(!proof.has_tensor(poison));
+        }
+        std::fs::write(directory.path().join("config.json"), config.to_string()).unwrap();
+        std::fs::write(directory.path().join("tokenizer.json"), TINY_TOKENIZER).unwrap();
+        std::fs::write(directory.path().join("model.safetensors"), bytes).unwrap();
+        let model = EmbeddingGemma2Model::from_model_dir(directory.path()).unwrap();
+        assert!(!model.vision.is_loaded());
+        assert_eq!(model.encode("a b c", None).unwrap(), expected);
+        assert!(!model.vision.is_loaded());
+        assert!(model.vision_weights().is_err());
+        assert!(!model.vision.is_loaded());
+    }
+}
+
+#[test]
 fn every_input_is_wrapped_in_the_beginning_and_end_tokens() {
     let fx = fixture_with_tokenizer();
     assert_eq!((fx.cfg.bos_token_id, fx.cfg.eos_token_id), (2, 1));
@@ -1173,4 +1215,289 @@ fn the_token_limit_keeps_both_wrapping_tokens_and_cuts_the_text() {
         .tokenize(&long)
         .expect("tokenizes");
     assert_eq!(unlimited.len(), long.len() + 2);
+}
+
+// ---------------------------------------------------------------------------
+// Multimodal parts: layout, injection, per-layer signal, cancellation, errors.
+// ---------------------------------------------------------------------------
+
+const IMAGE_TOKEN: u32 = 9;
+const BOI_TOKEN: u32 = 10;
+const EOI_TOKEN: u32 = 11;
+
+fn fixture_with_image_parts() -> Fixture {
+    let mut fx = fixture_with_tokenizer();
+    fx.model.image_parts = Some(ImagePartsConfig {
+        image_token_id: IMAGE_TOKEN,
+        boi_token_id: BOI_TOKEN,
+        eoi_token_id: EOI_TOKEN,
+    });
+    fx.model.vision = crate::model::embeddinggemma2_vision::tiny_test_loader();
+    fx
+}
+
+fn tiny_rgb8(side: usize, value: u8) -> EmbeddingGemma2Rgb8Image {
+    EmbeddingGemma2Rgb8Image::new(side, side, vec![value; side * side * 3]).unwrap()
+}
+
+#[test]
+fn text_only_parts_reproduce_encode_ids_at_widths() {
+    let fx = fixture_with_tokenizer();
+    let widths = [8usize, 4, 2];
+    let mut cancelled = || false;
+    let encoding = fx
+        .model
+        .encode_parts_at_widths(
+            &[EmbeddingGemma2Part::Text("abc".into())],
+            &widths,
+            &mut cancelled,
+        )
+        .expect("text parts run");
+    assert_eq!(encoding.input_ids, fx.model.tokenize("abc").unwrap());
+    let direct = fx
+        .model
+        .encode_ids_at_widths(&encoding.input_ids, &widths)
+        .expect("direct encode runs");
+    assert_eq!(encoding.embeddings, direct);
+    assert!(encoding.image_rows.is_empty());
+    assert!(encoding.image_stages.is_empty());
+    assert_eq!(encoding.counts.image_rows, 0);
+    assert_eq!(encoding.counts.sequence_length, encoding.input_ids.len());
+}
+
+#[test]
+fn image_rows_land_in_the_marker_slots_without_a_text_scale() {
+    let fx = fixture_with_image_parts();
+    let widths = [8usize];
+    let mut cancelled = || false;
+    let encoding = fx
+        .model
+        .encode_parts_at_widths(
+            &[
+                EmbeddingGemma2Part::Text("a".into()),
+                EmbeddingGemma2Part::Image(tiny_rgb8(48, 200)),
+                EmbeddingGemma2Part::Text("b".into()),
+            ],
+            &widths,
+            &mut cancelled,
+        )
+        .expect("mixed parts run");
+
+    let ids = &encoding.input_ids;
+    let hidden = fx.cfg.hidden_size;
+    assert_eq!(ids[0], fx.cfg.bos_token_id);
+    assert_eq!(*ids.last().unwrap(), fx.cfg.eos_token_id);
+    let first_image = ids
+        .iter()
+        .position(|&id| id == BOI_TOKEN)
+        .expect("begin-image marker");
+    let first_end = ids
+        .iter()
+        .position(|&id| id == EOI_TOKEN)
+        .expect("end-image marker");
+    let soft = encoding.counts.image_rows;
+    assert!(soft > 0);
+    assert_eq!(first_end, first_image + 1 + soft);
+    for id in &ids[first_image + 1..first_end] {
+        assert_eq!(*id, IMAGE_TOKEN);
+    }
+
+    let slots: Vec<usize> = (first_image + 1..first_end).collect();
+    let combined = fx
+        .model
+        .combine_rows(ids, &slots, &encoding.image_rows)
+        .expect("combine rows");
+    assert_eq!(combined.len(), ids.len() * hidden);
+    for (row, &slot) in slots.iter().enumerate() {
+        let source = &encoding.image_rows[row * hidden..(row + 1) * hidden];
+        assert_eq!(
+            &combined[slot * hidden..(slot + 1) * hidden],
+            source,
+            "image row {row} must land in marker slot {slot} unscaled"
+        );
+    }
+
+    for (slot, id) in [(first_image, BOI_TOKEN), (first_end, EOI_TOKEN)] {
+        let delimiter = &combined[slot * hidden..(slot + 1) * hidden];
+        let raw = &fx.model.weights.embed_tokens[id as usize * hidden..(id as usize + 1) * hidden];
+        for (index, (&gathered, &embedding)) in delimiter.iter().zip(raw).enumerate() {
+            assert_eq!(
+                gathered,
+                embedding * fx.cfg.embed_scale,
+                "delimiter {id} lane {index}"
+            );
+        }
+    }
+}
+
+#[test]
+fn per_layer_signal_is_derived_from_the_combined_rows() {
+    let fx = fixture_with_image_parts();
+    let encoding = fx
+        .model
+        .encode_parts_at_widths(
+            &[
+                EmbeddingGemma2Part::Text("a".into()),
+                EmbeddingGemma2Part::Image(tiny_rgb8(48, 200)),
+            ],
+            &[8],
+            &mut || false,
+        )
+        .expect("mixed parts run through the public encoder");
+    let ids = &encoding.input_ids;
+    let slots = ids
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, &id)| (id == IMAGE_TOKEN).then_some(slot))
+        .collect::<Vec<_>>();
+    assert!(!slots.is_empty());
+    assert_eq!(slots.len(), encoding.counts.image_rows);
+    let combined = fx
+        .model
+        .combine_rows(ids, &slots, &encoding.image_rows)
+        .expect("combined rows for the same public input");
+    let scaled = fx.model.scaled_embeddings(ids).unwrap();
+
+    let mut from_combined = combined.clone();
+    fx.model
+        .run_text_encoder(&mut from_combined, &combined, ids.len(), &mut || false)
+        .unwrap();
+    let expected = fx.model.project_states(&from_combined, ids.len()).unwrap();
+
+    let mut from_scaled = combined.clone();
+    fx.model
+        .run_text_encoder(&mut from_scaled, &scaled, ids.len(), &mut || false)
+        .unwrap();
+    let wrong_rows = fx.model.project_states(&from_scaled, ids.len()).unwrap();
+
+    assert_ne!(
+        expected, wrong_rows,
+        "the fixture must distinguish the two per-layer row inputs after projection"
+    );
+    assert_eq!(
+        encoding.token_states, expected,
+        "the public encoder must derive its per-layer signal from the combined rows"
+    );
+}
+
+#[test]
+fn mixed_parts_cancel_at_each_checkpoint() {
+    let fx = fixture_with_image_parts();
+    let widths = [8usize];
+    let parts = [
+        EmbeddingGemma2Part::Text("a".into()),
+        EmbeddingGemma2Part::Image(tiny_rgb8(48, 10)),
+    ];
+    let mut expected_checkpoints = [
+        "cancelled before embedding preparations",
+        "EmbeddingGemma 2 vision: cancelled before the patch embed",
+        "EmbeddingGemma 2 vision: cancelled during the vision tower",
+        "EmbeddingGemma 2 vision: cancelled during the vision tower",
+        "EmbeddingGemma 2 vision: cancelled before pooling",
+        "cancelled before assembling the combined sequence",
+        "cancelled before the text encoder",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    expected_checkpoints.extend(
+        (0..fx.cfg.num_hidden_layers).map(|layer| format!("cancelled before text layer {layer}")),
+    );
+    let mut total_polls = 0usize;
+    let mut never = || {
+        total_polls += 1;
+        false
+    };
+    fx.model
+        .encode_parts_at_widths(&parts, &widths, &mut never)
+        .expect("uncancelled run completes");
+    assert_eq!(
+        total_polls,
+        expected_checkpoints.len(),
+        "the two-layer vision fixture and every text layer must retain their checkpoints"
+    );
+
+    for threshold in 1..=total_polls {
+        let mut calls = 0usize;
+        let mut cancel_at = || {
+            calls += 1;
+            calls >= threshold
+        };
+        let result = fx
+            .model
+            .encode_parts_at_widths(&parts, &widths, &mut cancel_at);
+        assert!(
+            matches!(result, Err(InferenceError::Inference(ref message)) if message == &expected_checkpoints[threshold - 1]),
+            "threshold {threshold}: {result:?}"
+        );
+        assert_eq!(calls, threshold, "must stop at checkpoint {threshold}");
+    }
+}
+
+#[test]
+fn image_parts_without_a_layout_return_a_typed_error() {
+    let fx = fixture_with_tokenizer();
+    assert!(fx.model.image_parts.is_none());
+    let mut cancelled = || false;
+    let error = fx
+        .model
+        .encode_parts_at_widths(
+            &[EmbeddingGemma2Part::Image(tiny_rgb8(48, 0))],
+            &[8],
+            &mut cancelled,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, InferenceError::UnsupportedModel(_)),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn empty_part_lists_and_bad_widths_are_rejected() {
+    let fx = fixture_with_tokenizer();
+    let mut cancelled = || false;
+    assert!(matches!(
+        fx.model.encode_parts_at_widths(&[], &[8], &mut cancelled),
+        Err(InferenceError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        fx.model.encode_parts_at_widths(
+            &[EmbeddingGemma2Part::Text("a".into())],
+            &[0],
+            &mut cancelled
+        ),
+        Err(InferenceError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        fx.model.encode_parts_at_widths(
+            &[EmbeddingGemma2Part::Text("a".into())],
+            &[99],
+            &mut cancelled
+        ),
+        Err(InferenceError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn text_only_parts_never_load_vision_weights() {
+    let mut fx = fixture_with_tokenizer();
+    fx.model.image_parts = Some(ImagePartsConfig {
+        image_token_id: IMAGE_TOKEN,
+        boi_token_id: BOI_TOKEN,
+        eoi_token_id: EOI_TOKEN,
+    });
+    // No vision checkpoint: any load returns a typed error, so a text-only call that
+    // succeeds proves it never touched the loader.
+    assert!(fx.model.vision_weights().is_err());
+    let mut cancelled = || false;
+    let encoding = fx
+        .model
+        .encode_parts_at_widths(
+            &[EmbeddingGemma2Part::Text("abc".into())],
+            &[8],
+            &mut cancelled,
+        )
+        .expect("text-only parts run without the vision loader");
+    assert!(encoding.image_stages.is_empty());
+    assert_eq!(encoding.counts.valid_patches, 0);
 }

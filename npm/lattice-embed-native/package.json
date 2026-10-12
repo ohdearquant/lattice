@@ -1,6 +1,6 @@
 {
   "name": "@khive-ai/lattice-embed",
-  "version": "0.1.0",
+  "version": "0.11.1",
   "description": "Native (napi-rs) Node.js bindings for lattice-embed: local BERT-family text embeddings (MiniLM, BGE) loaded directly from disk, no WASM overhead.",
   "license": "MIT OR Apache-2.0",
   "main": "index.js",
@@ -51,13 +51,13 @@
     ]
   },
   "optionalDependencies": {
-    "@khive-ai/lattice-embed-darwin-arm64": "0.1.0",
-    "@khive-ai/lattice-embed-darwin-x64": "0.1.0",
-    "@khive-ai/lattice-embed-linux-x64-gnu": "0.1.0",
-    "@khive-ai/lattice-embed-linux-x64-musl": "0.1.0",
-    "@khive-ai/lattice-embed-linux-arm64-gnu": "0.1.0",
-    "@khive-ai/lattice-embed-linux-arm64-musl": "0.1.0",
-    "@khive-ai/lattice-embed-win32-x64-msvc": "0.1.0"
+    "@khive-ai/lattice-embed-darwin-arm64": "0.11.1",
+    "@khive-ai/lattice-embed-darwin-x64": "0.11.1",
+    "@khive-ai/lattice-embed-linux-x64-gnu": "0.11.1",
+    "@khive-ai/lattice-embed-linux-x64-musl": "0.11.1",
+    "@khive-ai/lattice-embed-linux-arm64-gnu": "0.11.1",
+    "@khive-ai/lattice-embed-linux-arm64-musl": "0.11.1",
+    "@khive-ai/lattice-embed-win32-x64-msvc": "0.11.1"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.7.2",
