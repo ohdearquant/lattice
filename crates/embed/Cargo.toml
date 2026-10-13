@@ -124,6 +124,7 @@ download = ["native", "lattice-inference/download"]
 # enabling this feature on a non-wasm target is a no-op rather than a build error.
 wasm = ["native", "dep:wasm-bindgen", "dep:console_error_panic_hook"]
 metal-gpu = ["lattice-inference/metal-gpu"]
+x86-gemm = ["lattice-inference/x86-gemm"]
 # Deprecated no-op: the AVX-512 VNNI int8 kernel this used to gate is now
 # compiled unconditionally on x86_64 (runtime-dispatched via
 # `SimdConfig::avx512vnni_enabled`, same pattern as the ungated f32 AVX-512F

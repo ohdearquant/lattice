@@ -185,6 +185,31 @@ dependency on inference, which stays a leaf. **Verify by:** the allocation-count
 envelope-charge test, scalar equivalence, drift and parity gates, build/feature gates and
 the F1 timing gate.
 
+**Amendment 1 (2026-10-13): follow-up issue 3 lands in two steps.** Step 1 is an adapter in
+`matmul_bt`'s Linux x86_64 branch behind the `x86-gemm` cargo feature, off by default and
+forwarded by `lattice-embed`: every product with more than one row goes to stock `gemm`
+0.18.2 on the calling thread, single rows keep the existing kernels, and an allocation-count
+test bounds the calls at one allocation each. `gemm`'s own parallel path allocates once per
+worker, which the exception does not admit, so step 1 does not use it. A build that enables
+the feature also moves decoder prefill, which F1 otherwise keeps on the current kernels;
+enable it only where no decoder runs. Step 2 is the workspace-aware internal entry, the F3
+envelope charge and default dispatch, after follow-up issue 1's baseline reproduction. Step
+1 was measured end to end through `NativeEmbeddingService::embed` on an 8-vCPU AMD EPYC (Zen
+4) Linux host, one core pinned, base, gemm, gemm, base, CPU time per text, the per-call
+packing allocation included:
+
+| Model, case                                   | parent (ms) | `gemm` (ms) | ratio |
+| --------------------------------------------- | ----------: | ----------: | ----: |
+| all-MiniLM-L6-v2, 1 text, ~22 tokens          |       15.31 |        9.65 |  0.63 |
+| all-MiniLM-L6-v2, 1 text, ~210 tokens         |      137.50 |       52.43 |  0.38 |
+| multilingual MiniLM-L12, 1 text, ~22 tokens   |       30.30 |       19.74 |  0.65 |
+| multilingual MiniLM-L12, 8 texts, ~210 tokens |      288.00 |       94.50 |  0.33 |
+
+Embeddings of 256 fixed texts differ from the parent by at most 2.4e-7, minimum cosine
+1.00000000, with identical top-10 neighbours. Release 0.9.0 measured 21.5 ms and 43.6 ms in
+the two short-text rows on the same harness. The step does not change the owned-core
+admission rule above.
+
 ### F2: select one level of parallel work for each phase
 
 Select **F2-c**, a small measured policy, with intra-operation execution as the first

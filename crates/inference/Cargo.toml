@@ -66,6 +66,8 @@ f16 = []
 metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann"]
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 bench-internals = []
+# Stock `gemm` for multi-row `matmul_bt` on Linux x86_64 (ADR-099 F1, step 1). Off by default.
+x86-gemm = ["dep:gemm"]
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
 backfill = ["dep:rusqlite", "f16"]
 download = ["dep:ureq"]
@@ -98,6 +100,7 @@ memmap2 = "0.9"
 indexmap = "2"
 rustc-hash = "2"
 rayon = { workspace = true }
+gemm = { version = "=0.18.2", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
