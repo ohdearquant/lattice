@@ -7,6 +7,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Pure Rust transformer inference engine — safetensors loading, SIMD matmul, BGE/Qwen3 embeddings"
+keywords = ["inference", "transformer", "llm", "embeddings", "metal"]
+categories = ["science", "algorithms", "hardware-support"]
 # Heavy test-only fixtures push the packaged crate past the crates.io 10MB
 # upload limit. They are consumed only by integration tests, which are never
 # run from the published crate. The two tokenizer vocabularies below are 43MB
@@ -19,6 +21,9 @@ exclude = [
     "tests/fixtures/gemma4/tokenizer",
     "tests/fixtures/paddleocr_vl/tokenizer",
 ]
+
+[package.metadata.docs.rs]
+features = ["f16", "x86-gemm", "mixture", "train-backward", "wgpu-gpu"]
 
 [package.metadata.gpu-bench-handoff]
 version = 1

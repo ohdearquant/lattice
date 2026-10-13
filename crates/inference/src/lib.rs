@@ -5,9 +5,7 @@
 //! sentence you are reading does not count itself; recompute with
 //! `grep -rn 'unsafe {' crates/inference/src --include='*.rs' | grep -vE ':\s*//' | wc -l`
 //! and the same pipeline over `allow(dead_code` rather than trusting these numbers verbatim. It is NOT intended for direct use by platform or feature crates.
-//! Consumers should go through `lattice-embed`. The unsafe blocks are documented in
-//! `foundation/STABILITY.md §Tech Debt`. Tracking issue: #1306.
-//! See `foundation/STABILITY.md` for the full policy.
+//! Consumers should go through `lattice-embed`.
 //!
 // ML inference kernels: many functions have >7 args by necessity (BLAS-style APIs
 // where grouping into structs would require heap allocation in hot paths), and many

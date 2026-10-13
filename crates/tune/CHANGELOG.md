@@ -4,9 +4,23 @@ All notable changes to this crate will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). All lattice crates share one
+workspace version; the workspace release notes are in
+[`docs/releases/`](https://github.com/ohdearquant/lattice/tree/main/docs/releases).
 
 ## [Unreleased]
+
+## [0.12.0] - 2026-10-13
+
+### Fixed
+
+- `train_grad_full --gradcheck` refuses `--load` and `--save`, which it used to accept and ignore (#1894).
+
+## 0.1.0 to 0.11.1
+
+These releases are described in the workspace release notes, `docs/releases/v<version>.md`.
+The entries below were recorded in this file under the Unreleased heading until 2026-08-11
+and shipped in releases up to and including 0.10.0.
 
 ### Changed
 
