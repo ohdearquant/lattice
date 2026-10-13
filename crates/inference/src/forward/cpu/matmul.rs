@@ -75,7 +75,18 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
     // the rayon pool for prefill-sized problems, and a single row's columns split across it
     // for large decode-step products.
     #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
-    matmul_bt_x86(a, b, c, m, k, n, ROW_THREAD_MIN_WORK, COL_THREAD_MIN_WORK);
+    {
+        // ADR-099 F1 step 1: stock `gemm` for every multi-row product. Single rows (decode
+        // steps) keep the existing kernels and their column split.
+        #[cfg(feature = "x86-gemm")]
+        {
+            if m > 1 {
+                matmul_bt_gemm(a, b, c, m, k, n);
+                return;
+            }
+        }
+        matmul_bt_x86(a, b, c, m, k, n, ROW_THREAD_MIN_WORK, COL_THREAD_MIN_WORK);
+    }
 
     // Other non-macOS targets: hand-written SIMD with tiling for large matrices.
     #[cfg(all(not(target_os = "macos"), not(target_arch = "x86_64")))]
@@ -110,6 +121,47 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
         }
 
         matmul_bt_scalar(a, b, c, m, k, n);
+    }
+}
+
+/// `matmul_bt` through stock `gemm` 0.18.2 (ADR-099 F1). It allocates its packing storage
+/// inside the call, the one allocation per call that ADR-099 admits. It runs on the calling
+/// thread: `gemm`'s parallel path allocates once per worker, which that exception does not admit.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64", feature = "x86-gemm"))]
+fn matmul_bt_gemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        c[..m * n].fill(0.0);
+        return;
+    }
+    // SAFETY: `matmul_bt` validated that a holds m*k, b holds n*k and c holds m*n elements,
+    // with no overflow. C is m x n row-major (column stride 1, row stride n), A is m x k
+    // row-major, and B^T is read from the n x k row-major B (row stride 1, column stride k).
+    // alpha = 0 with read_dst = false overwrites C without reading it.
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            1,
+            n as isize,
+            false,
+            a.as_ptr(),
+            1,
+            k as isize,
+            b.as_ptr(),
+            k as isize,
+            1,
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            gemm::Parallelism::None,
+        );
     }
 }
 
@@ -592,6 +644,10 @@ mod tests {
         /// m=5 with work >= 1M: rows 0..4 take the tiled kernel exactly as a 4-row call
         /// does, and row 4 takes the direct kernel exactly as a 1-row call does.
         #[test]
+        #[cfg_attr(
+            all(feature = "x86-gemm", target_arch = "x86_64", not(target_os = "macos")),
+            ignore = "x86-gemm runs multi-row products through gemm and single rows through the existing kernel, so they agree to about 1e-7, not bit for bit"
+        )]
         fn m5_splits_into_tiled_rows_and_direct_row() {
             let (m, k, n) = (5usize, 1024usize, 512usize);
             let a = lcg_vec(m * k, 0x0C33);
