@@ -5,9 +5,7 @@
 the pattern does not inflate them; recompute with
 `grep -rn 'unsafe {' crates/inference/src --include='*.rs' | grep -vE ':\s*//' | wc -l`
 and the same pipeline over `allow(dead_code` rather than trusting these numbers verbatim. It is NOT intended for direct use by platform or feature crates.
-Consumers should go through `lattice-embed`. The unsafe blocks are documented in
-`foundation/STABILITY.md §Tech Debt`. Tracking issue: #1306.
-See `foundation/STABILITY.md` for the full stability policy.
+Consumers should go through `lattice-embed`.
 
 If you are trying to generate embeddings in an application, start with `lattice-embed`, not
 this crate. The README you are reading is a contributor's map for people opening PRs on the

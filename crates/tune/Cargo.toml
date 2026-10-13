@@ -7,6 +7,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Training infrastructure for Lattice neural models"
+keywords = ["lora", "fine-tuning", "training", "neural-network", "distillation"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = ["std", "sqlite"]

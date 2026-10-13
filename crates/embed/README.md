@@ -171,8 +171,8 @@ println!("Hit rate: {:.1}%", stats.hit_rate() * 100.0);
 
 ```toml
 [dependencies]
-lattice-embed = { version = "0.4", default-features = false }  # SIMD only
-lattice-embed = { version = "0.4" }  # Full (native + SIMD)
+lattice-embed = { version = "0.12", default-features = false }  # SIMD only
+lattice-embed = { version = "0.12" }  # Full (native + SIMD)
 ```
 
 ## Batch Processing

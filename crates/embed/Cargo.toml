@@ -7,6 +7,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "SIMD-accelerated vector operations and embedding generation"
+keywords = ["embeddings", "simd", "vector-search", "bert", "semantic-search"]
+categories = ["science", "text-processing", "algorithms"]
 
 # `rlib` keeps existing native consumers (crates depending on this as a Rust
 # library) working unchanged. `cdylib` additionally produces a linkable
@@ -15,6 +17,9 @@ description = "SIMD-accelerated vector operations and embedding generation"
 # module.
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[package.metadata.docs.rs]
+features = ["x86-gemm"]
 
 [dependencies]
 async-trait = { workspace = true }
