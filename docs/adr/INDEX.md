@@ -134,6 +134,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [096](ADR-096-producing-a-router-artifact.md)                 | Producing a router artifact — schema lineage, bootstrap, the learned action, and admission                   | Accepted (2026-09-21) | ADR-091 (proposes an amendment to decision 1), ADR-093, ADR-094, ADR-095       |
 | [097](ADR-097-option-letter-scoring.md)                       | Option-letter scoring: one prefill, logits read at the option letters                                        | Proposed (2026-10-05) | none                                                                           |
 | [098](ADR-098-decision-readout.md)                            | A multi-slot decision read-out and a `/v1/systemone` endpoint                                                | Proposed (2026-10-10) | Extends ADR-097                                                                |
+| [099](ADR-099-linux-cpu-embedding-gemm-threading-budget.md)   | Linux CPU Embedding GEMM, Parallel Execution, and Resource Budgets                                           | Proposed (2026-10-12) | ADR-070, ADR-081, ADR-087, ADR-088                                             |
 
 ## informational
 
