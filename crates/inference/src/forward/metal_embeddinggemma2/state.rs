@@ -5,7 +5,7 @@
 
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
+    MTLCommandBufferStatus, MTLGPUFamily, MTLResourceOptions, MTLSize,
 };
 
 use crate::error::InferenceError;
@@ -28,8 +28,14 @@ const COMMON_SHADERS: &str = concat!(
 );
 const ATTENTION_SHADER: &str = include_str!("../shaders/embeddinggemma2_attention.metal");
 const VISION_SHADER: &str = include_str!("../shaders/embeddinggemma2_vision.metal");
+const GEMM_SG_SHADER: &str = include_str!("../shaders/gemm_f32_sg.metal");
+const ATTENTION_SG_SHADER: &str = include_str!("../shaders/attention_sg_hd64.metal");
 const ELEMENT_THREADS: u64 = 256;
 const ATTENTION_ROWS: u64 = 8;
+/// Threads of the simdgroup-matrix kernels: four simdgroups.
+const MATRIX_THREADS: u64 = 128;
+/// Query rows per threadgroup of the simdgroup-matrix attention kernel.
+const MATRIX_ATTENTION_ROWS: u64 = 32;
 const SIMD_WIDTH: u64 = 32;
 /// Attention scaling of this model (queries are already normalized).
 const ATTENTION_SCALE: f32 = 1.0;
@@ -574,6 +580,16 @@ struct Pipelines {
     #[cfg(test)]
     vision_rope: ComputePipelineState,
     attention: Vec<(usize, ComputePipelineState)>,
+    matrix: Option<MatrixPipelines>,
+}
+
+/// Simdgroup-matrix kernels for the vision tower: an f32 GEMM and bidirectional attention at head
+/// width 64. Present only on devices of the Apple7 family or later whose shader compiler built
+/// them (their source is guarded by `__METAL_VERSION__ >= 300`); otherwise the tower uses the
+/// vector kernels.
+struct MatrixPipelines {
+    matmul: ComputePipelineState,
+    attention_hd64: ComputePipelineState,
 }
 
 impl Pipelines {
@@ -591,6 +607,8 @@ impl Pipelines {
             source.push_str(&ATTENTION_SHADER.replace("__HD__", &head_dim.to_string()));
         }
         source.push_str(VISION_SHADER);
+        source.push_str(GEMM_SG_SHADER);
+        source.push_str(ATTENTION_SG_SHADER);
         let options = CompileOptions::new();
         options.set_fast_math_enabled(false);
         let library = device
@@ -632,6 +650,21 @@ impl Pipelines {
             }
             attention.push((head_dim, pipeline));
         }
+        let matrix = if device.supports_family(MTLGPUFamily::Apple7)
+            && library.get_function("gemm_f32_sg", None).is_ok()
+            && library.get_function("eg2_attention_sg_hd64", None).is_ok()
+        {
+            let attention_hd64 = make("eg2_attention_sg_hd64", MATRIX_THREADS)?;
+            if attention_hd64.thread_execution_width() != SIMD_WIDTH {
+                return Err(runtime("attention requires a 32-lane SIMD execution width"));
+            }
+            Some(MatrixPipelines {
+                matmul: make("gemm_f32_sg", MATRIX_THREADS)?,
+                attention_hd64,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             matmul: make("matmul_bt", ELEMENT_THREADS)?,
             norm: make("rms_norm", ELEMENT_THREADS)?,
@@ -644,6 +677,7 @@ impl Pipelines {
             #[cfg(test)]
             vision_rope: make("eg2_vision_axial_rope", ELEMENT_THREADS)?,
             attention,
+            matrix,
         })
     }
 
@@ -670,6 +704,42 @@ impl Pipelines {
         enc.dispatch_thread_groups(
             MTLSize::new(u64::from(n).div_ceil(16), u64::from(m).div_ceil(16), 1),
             MTLSize::new(16, 16, 1),
+        );
+    }
+
+    /// `c[m, n] = a[m, k] * b[n, k]^T` on simdgroup matrices where the device has them, else
+    /// [`Self::matmul`]. The matrix kernel stages operands as float4, so it also needs `k` to be a
+    /// multiple of 4 and the weight offset to be 16-byte aligned.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_matrix(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        a: &Buffer,
+        b: &Buffer,
+        b_offset: u64,
+        c: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) {
+        let Some(matrix) = self
+            .matrix
+            .as_ref()
+            .filter(|_| k.is_multiple_of(4) && b_offset.is_multiple_of(16))
+        else {
+            self.matmul(enc, a, b, b_offset, c, m, n, k);
+            return;
+        };
+        enc.set_compute_pipeline_state(&matrix.matmul);
+        bind(enc, 0, a);
+        enc.set_buffer(1, Some(b), b_offset);
+        bind(enc, 2, c);
+        scalar(enc, 3, &m);
+        scalar(enc, 4, &n);
+        scalar(enc, 5, &k);
+        enc.dispatch_thread_groups(
+            MTLSize::new(u64::from(n).div_ceil(32), u64::from(m).div_ceil(64), 1),
+            MTLSize::new(32, 4, 1),
         );
     }
 
@@ -830,6 +900,50 @@ impl Pipelines {
         enc.dispatch_thread_groups(
             MTLSize::new(u64::from(heads), u64::from(seq).div_ceil(ATTENTION_ROWS), 1),
             MTLSize::new(ATTENTION_ROWS * SIMD_WIDTH, 1, 1),
+        );
+        Ok(())
+    }
+
+    /// [`Self::attention`] without a window, on the simdgroup-matrix kernel when the device has it
+    /// and the head width is 64; otherwise the vector kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_matrix(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        head_dim: usize,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        out: &Buffer,
+        seq: u32,
+        heads: u32,
+        kv_heads: u32,
+    ) -> Result<(), InferenceError> {
+        let Some(matrix) = self.matrix.as_ref().filter(|_| head_dim == VISION_HEAD_DIM) else {
+            return self.attention(enc, head_dim, q, k, v, out, seq, heads, kv_heads, None);
+        };
+        let params = AttentionParams {
+            seq_len: seq,
+            heads,
+            kv_heads,
+            window: 0,
+            use_window: 0,
+            scale: ATTENTION_SCALE,
+            pad: [0; 2],
+        };
+        enc.set_compute_pipeline_state(&matrix.attention_hd64);
+        bind(enc, 0, q);
+        bind(enc, 1, k);
+        bind(enc, 2, v);
+        bind(enc, 3, out);
+        scalar(enc, 4, &params);
+        enc.dispatch_thread_groups(
+            MTLSize::new(
+                u64::from(heads),
+                u64::from(seq).div_ceil(MATRIX_ATTENTION_ROWS),
+                1,
+            ),
+            MTLSize::new(MATRIX_THREADS, 1, 1),
         );
         Ok(())
     }

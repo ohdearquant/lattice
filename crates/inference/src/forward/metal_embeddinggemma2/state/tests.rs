@@ -506,6 +506,135 @@ fn the_reused_matmul_matches_the_cpu_matmul_including_a_weight_offset() {
     }
 }
 
+/// True (after saying so) when the device has no simdgroup-matrix pipelines and the run is not
+/// enforcing them.
+fn skip_without_matrix(kit: &Kit) -> bool {
+    if kit.pipelines.matrix.is_some() {
+        return false;
+    }
+    assert!(
+        !enforce(),
+        "simdgroup-matrix pipelines required under enforcement"
+    );
+    eprintln!("SKIP embeddinggemma2 Metal: no simdgroup-matrix pipelines on this device");
+    true
+}
+
+#[test]
+fn the_matrix_matmul_matches_the_cpu_matmul_on_edge_tiles_and_falls_back_off_its_layout() {
+    let _gpu = gpu_test_lock();
+    if skip_without_device() {
+        return;
+    }
+    let kit = kit(&[]);
+    if skip_without_matrix(&kit) {
+        return;
+    }
+    // Shapes that are not multiples of the 64x32 output tile or of the 32-wide K step, one exact
+    // tile, and K = 37, which the float4 staging cannot take, so the call falls back to matmul_bt.
+    for (m, n, k) in [
+        (70usize, 65usize, 36usize),
+        (130, 33, 512),
+        (64, 32, 32),
+        (1, 5, 4),
+        (70, 65, 37),
+    ] {
+        let a = rand_vec(m * k, 61, 1.0);
+        let b = rand_vec(n * k, 62, 1.0);
+        let mut want = vec![0f32; m * n];
+        matmul_bt(&a, &b, &mut want, m, k, n);
+        // A 16-byte-aligned weight offset, as the per-layer slices of a stacked buffer have.
+        let pad = 4 * n * k;
+        let mut padded = rand_vec(pad, 63, 1.0);
+        padded.extend_from_slice(&b);
+        let (ab, bb, cb) = (
+            kit.buffer(&a, "a"),
+            kit.buffer(&padded, "b"),
+            kit.empty(m * n, "c"),
+        );
+        kit.ctx
+            .run(|enc| {
+                kit.pipelines.matmul_matrix(
+                    enc,
+                    &ab,
+                    &bb,
+                    (pad * size_of::<f32>()) as u64,
+                    &cb,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                );
+                Ok(())
+            })
+            .expect("matrix matmul runs");
+        assert_close(
+            &format!("matrix matmul {m}x{n}x{k}"),
+            &read_f32(&cb, m * n).expect("read back"),
+            &want,
+            1e-5,
+            2e-5,
+        );
+    }
+}
+
+#[test]
+fn the_matrix_attention_matches_the_cpu_kernel_on_partial_tiles_and_peaked_scores() {
+    let _gpu = gpu_test_lock();
+    if skip_without_device() {
+        return;
+    }
+    let kit = kit(&[VISION_HEAD_DIM]);
+    if skip_without_matrix(&kit) {
+        return;
+    }
+    // Sequence lengths around the 32-row query block and the 32-key tile. A query scale of 8
+    // makes the softmax peaked, so the running maximum moves between key tiles and the rescale of
+    // the partial output carries real weight.
+    let head_dim = VISION_HEAD_DIM;
+    for (heads, kv_heads) in [(4usize, 2usize), (3, 3)] {
+        for q_scale in [0.15f32, 1.0, 8.0] {
+            for seq in [1usize, 31, 32, 33, 100, 300] {
+                let seed = (seq * 17 + heads) as u64;
+                let q = rand_vec(seq * heads * head_dim, seed, q_scale);
+                let k = rand_vec(seq * kv_heads * head_dim, seed + 1, 1.0);
+                let v = rand_vec(seq * kv_heads * head_dim, seed + 2, 1.0);
+                let (qb, kb, vb) = (
+                    kit.buffer(&q, "q"),
+                    kit.buffer(&k, "k"),
+                    kit.buffer(&v, "v"),
+                );
+                let out = kit.empty(seq * heads * head_dim, "out");
+                kit.ctx
+                    .run(|enc| {
+                        kit.pipelines.attention_matrix(
+                            enc,
+                            head_dim,
+                            &qb,
+                            &kb,
+                            &vb,
+                            &out,
+                            seq as u32,
+                            heads as u32,
+                            kv_heads as u32,
+                        )
+                    })
+                    .expect("matrix attention runs");
+                let want =
+                    bidirectional_attention(&q, &k, &v, seq, heads, kv_heads, head_dim, None);
+                assert_close(
+                    &format!(
+                        "matrix attention heads={heads}/{kv_heads} q_scale={q_scale} seq={seq}"
+                    ),
+                    &read_f32(&out, seq * heads * head_dim).expect("read back"),
+                    &want,
+                    4e-5,
+                    0.0,
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn the_reused_weighted_rms_norm_uses_the_weight_as_given() {
     let _gpu = gpu_test_lock();
