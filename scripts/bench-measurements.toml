@@ -79,6 +79,7 @@ paths = [
     "crates/inference/examples/bench_gdn_decode.rs",
     "crates/inference/examples/bench_gdn_prefill_ab.rs",
     "crates/inference/examples/bench_gdn_state.rs",
+    "crates/inference/examples/bench_gemm_shapes.rs",
     "crates/inference/examples/bench_gpu.rs",
     "crates/inference/examples/bench_metal.rs",
     "crates/inference/examples/bench_metal_forward_allocation.rs",

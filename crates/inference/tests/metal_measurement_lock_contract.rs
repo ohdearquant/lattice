@@ -43,6 +43,10 @@ const RAW_HARNESS_ENTRYPOINTS: &[(&str, CallSelector)] = &[
     ("examples/bench_concurrent.rs", CallSelector::Path(&["run"])),
     ("examples/bench_dispatch.rs", DEVICE_SYSTEM_DEFAULT),
     ("examples/bench_dispatch2.rs", DEVICE_SYSTEM_DEFAULT),
+    (
+        "examples/bench_gemm_shapes.rs",
+        CallSelector::Path(&["run"]),
+    ),
     ("examples/bench_mps_gemm.rs", DEVICE_SYSTEM_DEFAULT),
     ("examples/bench_simdgroup.rs", DEVICE_SYSTEM_DEFAULT),
     ("examples/profile_metal_decode.rs", DEVICE_SYSTEM_DEFAULT),
@@ -381,6 +385,7 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "examples/bench_gdn_decode.rs",
     "examples/bench_gdn_prefill_ab.rs",
     "examples/bench_gdn_state.rs",
+    "examples/bench_gemm_shapes.rs",
     "examples/bench_gpu.rs",
     "examples/bench_metal.rs",
     "examples/bench_metal_forward_allocation.rs",
