@@ -656,3 +656,28 @@ fn a_head_width_the_attention_kernel_cannot_map_is_rejected_before_any_device_ac
         }
     }
 }
+
+#[test]
+fn shared_buffer_views_refuse_a_count_past_the_allocation() {
+    let _gpu = gpu_test_lock();
+    if skip_without_device() {
+        return;
+    }
+    let ctx = Context::new().expect("Metal context");
+    let mut buffer = allocate(&ctx.device, 4, "view-len").expect("allocate");
+    assert_eq!(as_f32(&buffer, 4).expect("in bounds").len(), 4);
+    assert_eq!(as_f32_mut(&mut buffer, 4).expect("in bounds").len(), 4);
+    // Each case is checked before the next view is built, so the first unguarded view fails
+    // on this assertion rather than reaching a later, larger count.
+    fn assert_refused(result: Result<usize, InferenceError>) {
+        match result {
+            Err(InferenceError::Inference(reason)) => {
+                assert!(reason.contains("shared buffer"), "wrong refusal: {reason}")
+            }
+            other => panic!("a view past the allocation must be refused, got {other:?}"),
+        }
+    }
+    assert_refused(as_f32(&buffer, 5).map(<[f32]>::len));
+    assert_refused(as_f32_mut(&mut buffer, 5).map(|view| view.len()));
+    assert_refused(as_f32(&buffer, usize::MAX).map(<[f32]>::len));
+}

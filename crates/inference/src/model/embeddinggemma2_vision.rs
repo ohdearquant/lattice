@@ -13,19 +13,19 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct VisionConfig {
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    patch_size: usize,
-    position_embedding_size: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) patch_size: usize,
+    pub(crate) position_embedding_size: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f64,
-    text_hidden_size: usize,
+    pub(crate) text_hidden_size: usize,
 }
 
 #[derive(Deserialize)]
@@ -619,7 +619,7 @@ pub(crate) fn tiny_test_weights() -> VisionWeights {
 
 /// Test seam: a loader that hands back [`tiny_test_weights`] without touching a file.
 #[cfg(test)]
-pub(crate) fn tiny_test_loader() -> LazyVision {
+pub(super) fn tiny_test_loader() -> LazyVision {
     LazyVision {
         checkpoint: None,
         weights: SuccessCache {
