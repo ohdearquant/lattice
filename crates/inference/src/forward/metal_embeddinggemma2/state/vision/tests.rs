@@ -160,7 +160,7 @@ fn vision_rope_matches_the_cpu_axial_rope_on_several_grids_and_head_counts() {
             .expect("vision rope runs");
         assert_close(
             &format!("vision_rope {rows}x{cols} heads={heads}"),
-            &read_f32(&xb, x.len()),
+            &read_f32(&xb, x.len()).expect("read back"),
             &want,
             1e-5,
             0.0,
@@ -211,7 +211,7 @@ fn vision_attention_at_head_width_64_matches_the_cpu_kernel() {
         let want = bidirectional_attention(&q, &k, &v, seq, heads, kv_heads, head_dim, None);
         assert_close(
             &format!("vision attention seq={seq} heads={heads} kv={kv_heads}"),
-            &read_f32(&out, seq * heads * head_dim),
+            &read_f32(&out, seq * heads * head_dim).expect("read back"),
             &want,
             2e-5,
             2e-5,

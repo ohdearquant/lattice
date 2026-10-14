@@ -108,7 +108,7 @@ fn run_attention(
             )
         })
         .expect("attention runs");
-    read_f32(&out, seq * heads * head_dim)
+    read_f32(&out, seq * heads * head_dim).expect("read back")
 }
 
 #[test]
@@ -388,7 +388,7 @@ fn gelu_mul_matches_the_cpu_exact_tanh_gelu() {
             .expect("gelu_mul runs");
         assert_close(
             &format!("gelu_mul {name}"),
-            &read_f32(&gate, count),
+            &read_f32(&gate, count).expect("read back"),
             &want,
             2e-6,
             4e-6,
@@ -419,7 +419,7 @@ fn value_norm_matches_the_cpu_unweighted_rms_norm() {
             .expect("norm_noweight runs");
         assert_close(
             &format!("norm_noweight width={width}"),
-            &read_f32(&buffer, rows * width),
+            &read_f32(&buffer, rows * width).expect("read back"),
             &want,
             1e-6,
             5e-6,
@@ -445,7 +445,7 @@ fn scale_matches_the_cpu_product_exactly() {
         })
         .expect("scale runs");
     let want: Vec<f32> = x.iter().map(|v| v * factor).collect();
-    let got = read_f32(&buffer, count);
+    let got = read_f32(&buffer, count).expect("read back");
     assert!(
         got.iter()
             .zip(&want)
@@ -498,7 +498,7 @@ fn the_reused_matmul_matches_the_cpu_matmul_including_a_weight_offset() {
             .expect("matmul runs");
         assert_close(
             &format!("matmul {m}x{n}x{k}"),
-            &read_f32(&cb, m * n),
+            &read_f32(&cb, m * n).expect("read back"),
             &want,
             1e-5,
             2e-5,
@@ -569,7 +569,7 @@ fn the_matrix_matmul_matches_the_cpu_matmul_on_edge_tiles_and_falls_back_off_its
             .expect("matrix matmul runs");
         assert_close(
             &format!("matrix matmul {m}x{n}x{k}"),
-            &read_f32(&cb, m * n),
+            &read_f32(&cb, m * n).expect("read back"),
             &want,
             1e-5,
             2e-5,
@@ -625,7 +625,7 @@ fn the_matrix_attention_matches_the_cpu_kernel_on_partial_tiles_and_peaked_score
                     &format!(
                         "matrix attention heads={heads}/{kv_heads} q_scale={q_scale} seq={seq}"
                     ),
-                    &read_f32(&out, seq * heads * head_dim),
+                    &read_f32(&out, seq * heads * head_dim).expect("read back"),
                     &want,
                     4e-5,
                     0.0,
@@ -659,7 +659,7 @@ fn the_reused_weighted_rms_norm_uses_the_weight_as_given() {
             .expect("norm runs");
         assert_close(
             &format!("rms_norm width={width}"),
-            &read_f32(&xb, rows * width),
+            &read_f32(&xb, rows * width).expect("read back"),
             &want,
             1e-6,
             5e-6,
@@ -709,7 +709,7 @@ fn the_reused_rope_matches_the_cpu_stride_half_rotation_at_both_thetas() {
             .expect("rope runs");
         assert_close(
             &format!("rope head_dim={head_dim} theta={theta}"),
-            &read_f32(&xb, x.len()),
+            &read_f32(&xb, x.len()).expect("read back"),
             &want,
             2e-6,
             0.0,
@@ -742,6 +742,7 @@ fn the_reused_copy_and_add_are_exact() {
     let want: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
     assert!(
         read_f32(&cb, count)
+            .expect("read back")
             .iter()
             .zip(&want)
             .all(|(g, w)| g.to_bits() == w.to_bits()),
@@ -809,4 +810,32 @@ fn shared_buffer_views_refuse_a_count_past_the_allocation() {
     assert_refused(as_f32(&buffer, 5).map(<[f32]>::len));
     assert_refused(as_f32_mut(&mut buffer, 5).map(|view| view.len()));
     assert_refused(as_f32(&buffer, usize::MAX).map(<[f32]>::len));
+}
+
+#[test]
+fn shared_buffer_copies_refuse_a_count_past_the_allocation() {
+    let _gpu = gpu_test_lock();
+    if skip_without_device() {
+        return;
+    }
+    let ctx = Context::new().expect("Metal context");
+    let buffer = allocate(&ctx.device, 4, "copy-len").expect("allocate");
+    write_f32(&buffer, &[1.0, 2.0, 3.0, 4.0]).expect("in bounds");
+    assert_eq!(
+        read_f32(&buffer, 4).expect("in bounds"),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    // Each case is checked before the next copy runs, so the first unguarded copy fails on this
+    // assertion rather than reaching a later, larger count.
+    fn assert_refused<T: std::fmt::Debug>(result: Result<T, InferenceError>) {
+        match result {
+            Err(InferenceError::Inference(reason)) => {
+                assert!(reason.contains("shared buffer"), "wrong refusal: {reason}")
+            }
+            other => panic!("a copy past the allocation must be refused, got {other:?}"),
+        }
+    }
+    assert_refused(write_f32(&buffer, &[0.0; 5]));
+    assert_refused(read_f32(&buffer, 5));
+    assert_refused(read_f32(&buffer, usize::MAX));
 }

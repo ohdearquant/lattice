@@ -467,7 +467,7 @@ fn allocate(device: &Device, count: usize, label: &str) -> Result<Buffer, Infere
 
 fn upload(device: &Device, values: &[f32], label: &str) -> Result<Buffer, InferenceError> {
     let buffer = allocate(device, values.len(), label)?;
-    write_f32(&buffer, values);
+    write_f32(&buffer, values)?;
     Ok(buffer)
 }
 
@@ -510,10 +510,11 @@ fn check_view_len(buffer: &Buffer, count: usize) -> Result<(), InferenceError> {
 
 /// Copies `values` to the start of a shared buffer. Callers pass a buffer allocated for at least
 /// `values.len()` elements, with no GPU work in flight on it.
-fn write_f32(buffer: &Buffer, values: &[f32]) {
-    debug_assert!(buffer.length() as usize >= size_of_val(values));
-    // SAFETY: the shared allocation holds at least values.len() aligned f32 elements and
-    // is not submitted to the GPU while this copy runs; it cannot alias the input slice.
+fn write_f32(buffer: &Buffer, values: &[f32]) -> Result<(), InferenceError> {
+    check_view_len(buffer, values.len())?;
+    // SAFETY: the length check above proves the shared allocation holds at least values.len()
+    // aligned f32 elements; it is not submitted to the GPU while this copy runs and cannot alias
+    // the input slice.
     unsafe {
         std::ptr::copy_nonoverlapping(
             values.as_ptr(),
@@ -521,14 +522,15 @@ fn write_f32(buffer: &Buffer, values: &[f32]) {
             values.len(),
         );
     }
+    Ok(())
 }
 
 /// Copies the first `count` elements of a shared buffer after its GPU work has completed.
-fn read_f32(buffer: &Buffer, count: usize) -> Vec<f32> {
-    debug_assert!(buffer.length() as usize >= count * size_of::<f32>());
-    // SAFETY: the buffer holds at least count aligned, initialized f32 elements, and the
-    // command that wrote them completed before this CPU read.
-    unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), count) }.to_vec()
+fn read_f32(buffer: &Buffer, count: usize) -> Result<Vec<f32>, InferenceError> {
+    check_view_len(buffer, count)?;
+    // SAFETY: the length check above proves the buffer holds at least count aligned f32
+    // elements, initialized by the command that completed before this CPU read.
+    Ok(unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), count) }.to_vec())
 }
 
 fn bind(enc: &ComputeCommandEncoderRef, index: u64, buffer: &Buffer) {
@@ -1284,11 +1286,11 @@ impl MetalEmbeddingGemma2State {
         let Some(scratch) = self.scratch.as_ref() else {
             return Err(runtime("scratch buffers missing after allocation"));
         };
-        write_f32(&scratch.hidden, embeddings);
-        write_f32(&scratch.embeddings, embeddings);
+        write_f32(&scratch.hidden, embeddings)?;
+        write_f32(&scratch.embeddings, embeddings)?;
         self.ctx.run(|enc| self.encode_forward(enc, scratch, seq))?;
         let count = seq_len * self.cfg.embedding_dim;
-        let states = read_f32(&scratch.states, count);
+        let states = read_f32(&scratch.states, count)?;
         if states.iter().any(|v| !v.is_finite()) {
             return Err(runtime("forward pass produced a non-finite value"));
         }

@@ -435,7 +435,7 @@ impl MetalEmbeddingGemma2VisionState {
             let Some(scratch) = self.scratch.as_ref() else {
                 return Err(runtime("vision scratch buffers missing after allocation"));
             };
-            write_f32(&scratch.hidden, patch);
+            write_f32(&scratch.hidden, patch)?;
         }
         let mut timings = VisionTimings::default();
         for index in 0..self.cfg.num_hidden_layers {
