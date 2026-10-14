@@ -1850,6 +1850,11 @@ jobs:
       # real cargo is invoked.
       - name: python3 tests/test_bench_locks.py
         run: python3 tests/test_bench_locks.py -v
+      # Measurement-lock timestamp refresh (#1882): acquiring a lock refreshes
+      # the opened file's times so macOS tmp cleaning cannot unlink a held lock.
+      # Temporary lock paths only; no benchmark runs.
+      - name: python3 tests/test_lock_file_refresh.py
+        run: python3 tests/test_lock_file_refresh.py -v
       # Advisory local measurement inventory + fail-closed lock/idle supervision.
       # Uses disposable lock paths and stub commands; no benchmark runs.
       - name: python3 tests/test_bench_measurement_supervision.py
