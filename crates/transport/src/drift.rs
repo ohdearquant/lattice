@@ -194,6 +194,7 @@ pub struct DriftSummary {
 ///
 /// **Stable** (provisional): primary output type of the drift API; all fields are documented outputs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct DriftReport<Id> {
     /// Wasserstein distance (scalar drift magnitude).
     pub wasserstein_distance: f32,

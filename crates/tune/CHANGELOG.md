@@ -10,6 +10,11 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `LRSchedule` is `#[non_exhaustive]`. A `match` on it outside the crate needs a
+  wildcard arm; building a schedule from its variants is unchanged.
+
 ## [0.12.1] - 2026-10-14
 
 Documentation and package metadata only; no code changes.

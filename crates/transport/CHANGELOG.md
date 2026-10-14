@@ -10,6 +10,12 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `DriftReport` is `#[non_exhaustive]`. Code outside the crate can no longer
+  build it with a struct literal or destructure it without `..`; reading its fields is unchanged.
+  It gained a field in 0.11.0, and this lets later fields arrive without another breaking release.
+
 ## [0.12.1] - 2026-10-14
 
 Documentation and package metadata only; no code changes.

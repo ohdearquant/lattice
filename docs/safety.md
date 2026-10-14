@@ -100,7 +100,6 @@ cargo build -p lattice-inference --no-default-features --features std,download
 
 ## Known Debt
 
-The `lattice-inference` crate has 22 `#[allow(dead_code)]` annotations on functions
-retained for reference (superseded BLAS fallbacks, alternative attention paths). These
-are tracked in `foundation/STABILITY.md §Tech Debt` under issue #1306. They will be
-removed once the replacement paths are confirmed stable in production.
+The `lattice-inference` crate carries `#[allow(dead_code)]` annotations on functions
+retained for reference (superseded BLAS fallbacks, alternative attention paths). They
+will be removed once the replacement paths are confirmed stable in production.
