@@ -279,7 +279,7 @@ impl Gemma4Model {
         &self.config
     }
 
-    /// **Unstable**: the full stop-token set [`Self::generate`]/[`Self::generate_with_trace`]/
+    /// **Unstable**: the full stop-token set [`Self::generate`]/`Self::generate_with_trace`/
     /// [`Self::generate_streaming_with_cancel`] halt on -- `config().eos_token_id` unioned with
     /// the checkpoint's `generation_config.json` or top-level `config.json` `eos_token_id` (issue
     /// #1597). `generate_greedy`/`generate_greedy_with_probe` ignore this entirely.
@@ -775,13 +775,13 @@ impl Gemma4Model {
     /// 75+ call sites) and is out of scope to change here; callers that care
     /// should set `stop_token_ids` explicitly.
     ///
-    /// This session declares every [`crate::decoder::ExecutionCapabilities`]
+    /// This session declares every `ExecutionCapabilities`
     /// field `false` (see `decoder::gemma_cpu`'s module doc comment): a
     /// `gen_cfg` requesting grammar, logprobs, `stop_strings`, or a
-    /// reasoning budget is refused by [`driver::run`]'s `check_capabilities`
+    /// reasoning budget is refused by `driver::run`'s `check_capabilities`
     /// before any session method runs.
     ///
-    /// Delegates to [`Self::generate_with_trace`] and discards the driver
+    /// Delegates to `Self::generate_with_trace` and discards the driver
     /// trace, mirroring `Qwen35Model::generate`'s relationship to
     /// `generate_with_trace` (ADR-090 row C, decomposition "Open question 3,
     /// ANSWERED"): the trace exists for this migration's own tests to see,
@@ -953,7 +953,7 @@ impl Gemma4Model {
     /// stop_reason: Some(StopReason::Interrupt)`, matching the Qwen CPU/Metal
     /// contract.
     ///
-    /// Deltas are UTF-8-boundary-safe: [`IncrementalByteFallbackDetokenizer`]
+    /// Deltas are UTF-8-boundary-safe: `IncrementalByteFallbackDetokenizer`
     /// re-decodes the full generated-id list on every call and holds back a
     /// trailing incomplete byte-fallback run (see that type's doc comment).
     /// The concatenation of every streamed delta plus the `driver::run`

@@ -13,6 +13,10 @@
 //! family default. [`prepare_gemma_chat_request`] is the Gemma E2B text
 //! preparation entry, called by `serving_cpu` for `lattice serve` and by
 //! tests and the measurement example.
+//!
+//! [`prepare_chat_request`]: crate::serve::prepare::prepare_chat_request
+//! [`build_cfg`]: crate::serve::prepare::build_cfg
+//! [`prepare_gemma_chat_request`]: crate::serve::prepare::prepare_gemma_chat_request
 
 use crate::forward::metal_qwen35::ChatMessage;
 use crate::generation::GenerateConfig;

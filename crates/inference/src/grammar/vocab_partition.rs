@@ -79,7 +79,7 @@ impl VocabPartition {
     /// `vocab_bytes[i]` is the byte sequence for token `i`.
     ///
     /// Builds a [`ByteTrie`] over `vocab_bytes` and delegates to
-    /// [`Self::build_from_trie`]. Callers that already hold a trie for this
+    /// `Self::build_from_trie`. Callers that already hold a trie for this
     /// vocabulary (`GrammarEngine::new`) use that entry point directly so the
     /// trie is built once.
     pub fn build(

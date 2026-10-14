@@ -28,7 +28,7 @@
 //!
 //! # Partition classification
 //!
-//! [`ByteTrie::classify`] walks the same trie from one grammar state and
+//! `ByteTrie::classify` walks the same trie from one grammar state and
 //! reproduces `simulate_token`'s three-way result for every non-empty token at
 //! once. Empty tokens are not in the trie: they are always blocked, as in the
 //! previous partition builder and `mask_by_simulation` (an empty token emits

@@ -12,11 +12,11 @@ use crate::tokenizer::common::{
     ThreadSafeLruCache, invert_vocab, json_object_to_vocab, json_path, pad_ids,
     pad_ids_with_token_types, parse_added_tokens, parse_json,
 };
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::thread;
 use tracing::warn;
 
 const DEFAULT_WORDPIECE_CACHE_CAPACITY: usize = 8_192;
@@ -644,58 +644,41 @@ impl Tokenizer for WordPieceTokenizer {
             return Vec::new();
         }
 
-        let threads = thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .max(1);
+        let threads = rayon::current_num_threads();
 
         let id_batches = if texts.len() > 16 && threads > 1 {
             let chunk_count = threads.min(texts.len());
             let chunk_size = texts.len().div_ceil(chunk_count);
-            thread::scope(|scope| {
-                let mut handles = Vec::new();
-                for (chunk_idx, chunk) in texts.chunks(chunk_size).enumerate() {
-                    let tokenizer = self;
-                    handles.push(scope.spawn(move || {
-                        let mut scratch = TokenizeScratch::default();
-                        let mut reusable_ids = Vec::new();
-                        let mut local_max = 0usize;
-                        let mut local = Vec::with_capacity(chunk.len());
-                        for text in chunk {
-                            let pre_truncation_len = tokenizer.tokenize_to_ids_into(
-                                text,
-                                &mut scratch,
-                                &mut reusable_ids,
-                            );
-                            local_max = local_max.max(reusable_ids.len());
-                            local.push((reusable_ids.clone(), pre_truncation_len));
+            let parts = texts
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    #[cfg(test)]
+                    {
+                        if let Some(thread_name) = std::thread::current().name() {
+                            batch_chunk_probe::record(thread_name, chunk.len());
                         }
-                        (chunk_idx, local_max, local)
-                    }));
-                }
+                    }
+                    let mut scratch = TokenizeScratch::default();
+                    let mut reusable_ids = Vec::new();
+                    let mut local_max = 0usize;
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for text in chunk {
+                        let pre_truncation_len =
+                            self.tokenize_to_ids_into(text, &mut scratch, &mut reusable_ids);
+                        local_max = local_max.max(reusable_ids.len());
+                        local.push((reusable_ids.clone(), pre_truncation_len));
+                    }
+                    (local_max, local)
+                })
+                .collect::<Vec<_>>();
 
-                let mut parts = Vec::with_capacity(handles.len());
-                for handle in handles {
-                    #[expect(
-                        clippy::expect_used,
-                        reason = "the scoped tokenization workers do not panic"
-                    )]
-                    parts.push(
-                        handle
-                            .join()
-                            .expect("invariant: scoped tokenization worker should not panic"),
-                    );
-                }
-                parts.sort_by_key(|(chunk_idx, _, _)| *chunk_idx);
-
-                let mut max_len = 0usize;
-                let mut all = Vec::with_capacity(texts.len());
-                for (_, local_max, local) in parts {
-                    max_len = max_len.max(local_max);
-                    all.extend(local);
-                }
-                (all, max_len)
-            })
+            let mut max_len = 0usize;
+            let mut all = Vec::with_capacity(texts.len());
+            for (local_max, local) in parts {
+                max_len = max_len.max(local_max);
+                all.extend(local);
+            }
+            (all, max_len)
         } else {
             let mut scratch = TokenizeScratch::default();
             let mut reusable_ids = Vec::new();
@@ -1101,6 +1084,52 @@ unsafe fn find_next_space_neon(bytes: &[u8], start: usize) -> Option<usize> {
 }
 
 #[cfg(test)]
+mod batch_chunk_probe {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Maps a worker thread name to the lengths of the chunks it tokenized, one
+    /// entry per chunk execution, so the total execution count is preserved no
+    /// matter how the pool schedules chunks onto threads.
+    static CHUNKS: OnceLock<Mutex<HashMap<String, Vec<usize>>>> = OnceLock::new();
+
+    fn chunks() -> &'static Mutex<HashMap<String, Vec<usize>>> {
+        CHUNKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn record(thread_name: &str, chunk_len: usize) {
+        if let Ok(mut map) = chunks().lock() {
+            map.entry(thread_name.to_string())
+                .or_default()
+                .push(chunk_len);
+        }
+    }
+
+    /// Removes and returns every entry whose thread name starts with `prefix`.
+    pub(super) fn take_matching(prefix: &str) -> Vec<(String, Vec<usize>)> {
+        let mut taken = Vec::new();
+        if let Ok(mut map) = chunks().lock() {
+            let matching: Vec<String> = map
+                .keys()
+                .filter(|name| name.starts_with(prefix))
+                .cloned()
+                .collect();
+            for name in matching {
+                if let Some(lengths) = map.remove(&name) {
+                    taken.push((name, lengths));
+                }
+            }
+        }
+        taken
+    }
+
+    /// Removes every entry whose thread name starts with `prefix`, discarding it.
+    pub(super) fn discard_matching(prefix: &str) {
+        let _ = take_matching(prefix);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1309,6 +1338,161 @@ mod tests {
         assert_eq!(batch[1].input_ids.len(), 4);
         assert_eq!(batch[0].attention_mask, vec![1, 1, 1, 0]);
         assert_eq!(batch[1].attention_mask, vec![1, 1, 1, 1]);
+    }
+
+    /// A deterministic, varied batch: ASCII, accented, CJK, empty, whitespace,
+    /// punctuation, a sub-`max_seq_len` long text and a text past
+    /// `DEFAULT_MAX_SEQ_LEN` (512) so the truncation path is exercised too.
+    fn varied_batch_texts() -> Vec<String> {
+        let mut texts: Vec<String> = vec![
+            String::new(),
+            " ".to_string(),
+            "a".to_string(),
+            "hello".to_string(),
+            "hello world".to_string(),
+            "HELLO, WORLD!".to_string(),
+            "héllo wörld".to_string(),
+            "He\u{0301}llo".to_string(),
+            "中文测试".to_string(),
+            "embedding plugin".to_string(),
+            "unrecognizable transforming ai tokenizer throughput".to_string(),
+            "the quick brown fox".to_string(),
+        ];
+        texts.push("hello world ".repeat(80));
+        texts.push("hello ".repeat(600));
+
+        let seeds = [
+            "hello",
+            "world",
+            "quick",
+            "brown",
+            "fox",
+            "embedding",
+            "ai",
+            "tokenizer",
+        ];
+        let mut i = 0usize;
+        while texts.len() < 120 {
+            let a = seeds[i % seeds.len()];
+            let b = seeds[(i * 7 + 3) % seeds.len()];
+            texts.push(format!("{a} {b} 中文 {i}"));
+            i += 1;
+        }
+        texts
+    }
+
+    #[test]
+    fn test_tokenize_batch_matches_per_text_tokenize_on_rayon_pools() {
+        let tokenizer = WordPieceTokenizer::from_str(&synthetic_spec_vocab()).unwrap();
+        let texts = varied_batch_texts();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+        // `tokenize` pads every text to `max_seq_len` while `tokenize_batch`
+        // pads to the batch maximum, so the two structs differ in trailing pad
+        // slots by design. Compare the tokens that are real, the real length
+        // and the pre-truncation count; those are the batch-independent
+        // outputs of the tokenizer itself.
+        fn real(input: &TokenizedInput) -> (Vec<u32>, usize, usize) {
+            (
+                input.input_ids[..input.real_length].to_vec(),
+                input.real_length,
+                input.pre_truncation_len,
+            )
+        }
+        let expected: Vec<(Vec<u32>, usize, usize)> = refs
+            .iter()
+            .map(|text| real(&tokenizer.tokenize(text)))
+            .collect();
+
+        for threads in [1usize, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let batch = pool.install(|| tokenizer.tokenize_batch(&refs));
+            let actual: Vec<(Vec<u32>, usize, usize)> = batch.iter().map(real).collect();
+            assert_eq!(
+                actual, expected,
+                "a {threads}-thread pool diverged from per-text tokenize"
+            );
+        }
+
+        // With a `max_seq_len` small enough to bind on every text, both paths
+        // pad to the same length, so the full structs must compare equal.
+        let clipped = tokenizer.with_max_seq_len(4);
+        let expected_full: Vec<TokenizedInput> =
+            refs.iter().map(|text| clipped.tokenize(text)).collect();
+        for threads in [1usize, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let batch = pool.install(|| clipped.tokenize_batch(&refs));
+            assert_eq!(
+                batch, expected_full,
+                "a {threads}-thread pool diverged from per-text tokenize at max_seq_len 4"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tokenize_batch_chunks_stay_on_current_pool_threads() {
+        let tokenizer = WordPieceTokenizer::from_str(&synthetic_spec_vocab()).unwrap();
+        let texts = varied_batch_texts();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        assert!(
+            refs.len() >= 100,
+            "the bound below assumes a 100-plus batch"
+        );
+
+        let prefix = "wp-batch-bound-";
+        batch_chunk_probe::discard_matching(prefix);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(move |index| format!("{prefix}{index}"))
+            .build()
+            .unwrap();
+        let batch = pool.install(|| tokenizer.tokenize_batch(&refs));
+        assert_eq!(batch.len(), refs.len());
+
+        let recorded = batch_chunk_probe::take_matching(prefix);
+        assert!(
+            !recorded.is_empty(),
+            "the chunk hook observed no chunk; the batch did not take the parallel path"
+        );
+        // `par_chunks` splits the batch into exactly `min(pool_threads, texts)`
+        // chunks up front, so a 2-thread pool over 100-plus texts produces two
+        // chunk executions. Sizing the chunks from a wider thread count (the
+        // host's parallelism rather than the pool's) would raise this count.
+        // The count is summed over executing threads so it does not depend on
+        // how the pool schedules the two chunks onto its two threads.
+        let chunk_executions: usize = recorded.iter().map(|(_, lengths)| lengths.len()).sum();
+        assert_eq!(
+            chunk_executions, 2,
+            "expected two chunks from a 2-thread pool, saw {recorded:?}"
+        );
+        let threads: std::collections::BTreeSet<&str> =
+            recorded.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(
+            threads.len() <= 2,
+            "chunks ran on {} threads ({threads:?}); a 2-thread pool must bound the batch",
+            threads.len()
+        );
+        for name in &threads {
+            assert!(
+                name.starts_with(prefix),
+                "chunk ran on {name}, outside the test pool"
+            );
+        }
+        let texts_seen: usize = recorded
+            .iter()
+            .flat_map(|(_, lengths)| lengths.iter())
+            .sum();
+        assert_eq!(
+            texts_seen,
+            refs.len(),
+            "the hook did not observe every text exactly once"
+        );
     }
 
     #[test]

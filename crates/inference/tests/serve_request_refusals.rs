@@ -39,10 +39,6 @@ const STRICT_SCHEMA_UNSUPPORTED: Expected = Expected {
     status: 400,
     code: Some("unsupported_strict_schema"),
 };
-const INTERNAL_ERROR: Expected = Expected {
-    status: 500,
-    code: Some("internal_error"),
-};
 
 const LATTICE_QWEN_CPU: [Expected; 15] = [
     OK,
@@ -95,7 +91,7 @@ const LATTICE_GEMMA_CPU: [Expected; 15] = [
 const LATTICE_QWEN_Q4_METAL: [Expected; 15] = [
     OK,
     OK,
-    INTERNAL_ERROR,
+    UNSUPPORTED,
     UNSUPPORTED,
     UNSUPPORTED,
     Expected {

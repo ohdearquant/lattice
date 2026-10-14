@@ -2191,21 +2191,21 @@ class E2eParityChangeClassificationTests(unittest.TestCase):
         )
 
 
-class X86EmbedDriftObservationWorkflowTests(unittest.TestCase):
+class X86EmbedDriftWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.contents = _E2E_PARITY_WORKFLOW.read_text(encoding="utf-8")
         cls.job = _workflow_job(cls.contents, "embed-drift-x86")
 
     def test_job_selects_x86_64_for_engine_changes(self) -> None:
-        self.assertIn("name: embed drift gate (x86_64 observation)", self.job)
+        self.assertIn("name: embed drift gate (x86_64)", self.job)
         self.assertIn("needs: changes", self.job)
         self.assertIn("if: needs.changes.outputs.engine == 'true'", self.job)
         self.assertIn("runs-on: ubuntu-latest", self.job)
         self.assertIn("""run: test "$(uname -m)" = 'x86_64'""", self.job)
 
-    def test_job_reports_failures_without_gating_the_workflow(self) -> None:
-        self.assertIn("continue-on-error: true", self.job)
+    def test_job_is_required_and_fails_the_workflow(self) -> None:
+        self.assertNotIn("continue-on-error", self.job)
         self._assert_provisions_all_four_models(self.job)
         self.assertIn(
             "cargo run --release -p lattice-embed --bin embed-drift "
@@ -2228,10 +2228,10 @@ class X86EmbedDriftObservationWorkflowTests(unittest.TestCase):
             provision_step,
         )
 
-    def test_observation_does_not_replace_the_required_arm_gate(self) -> None:
+    def test_both_isa_arms_are_required_by_the_gate(self) -> None:
         arm_job = _workflow_job(self.contents, "embed-drift")
         self.assertIn("runs-on: ubuntu-24.04-arm", arm_job)
-        self.assertNotIn("continue-on-error: true", arm_job)
+        self.assertNotIn("continue-on-error", arm_job)
         self._assert_provisions_all_four_models(arm_job)
         self.assertIn(
             "cargo run --release -p lattice-embed --bin embed-drift "
@@ -2240,8 +2240,25 @@ class X86EmbedDriftObservationWorkflowTests(unittest.TestCase):
         )
 
         parity_gate = _workflow_job(self.contents, "parity-gate")
-        self.assertIn("embed-drift,", parity_gate)
-        self.assertNotIn("embed-drift-x86", parity_gate)
+        # The needs list is asserted structurally: a substring check would also
+        # be satisfied by the job's own echo line and would stay green after the
+        # dependency was deleted.
+        needs = yaml.safe_load(self.contents)["jobs"]["parity-gate"]["needs"]
+        self.assertIn("embed-drift", needs)
+        self.assertIn("embed-drift-x86", needs)
+        self.assertEqual(
+            needs[needs.index("embed-drift") + 1],
+            "embed-drift-x86",
+        )
+        self.assertIn(
+            'DRIFT_X86_RESULT="${{ needs.embed-drift-x86.result }}"',
+            parity_gate,
+        )
+        self.assertIn('if [ "$DRIFT_X86_RESULT" != "success" ]; then', parity_gate)
+        self.assertIn(
+            "Engine changed and embed-drift-x86 gate did not succeed",
+            parity_gate,
+        )
 
 
 class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
@@ -2331,7 +2348,7 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
         self.assertIn("shasum -a 256 quarot-q4.tar", artifact_code)
         self.assertIn(
             "actions/upload-artifact@"
-            "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
             artifact_code,
         )
         self.assertIn(
@@ -2349,7 +2366,7 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
         self.assertIn("needs: [changes, quarot-artifact]", q4_metal_code)
         self.assertIn(
             "actions/download-artifact@"
-            "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+            "9000827ccba6bdab643e8b6fd33ac0654aef8333",
             q4_metal_code,
         )
         self.assertIn(

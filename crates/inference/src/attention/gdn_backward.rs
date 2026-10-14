@@ -157,7 +157,7 @@ pub struct GdnSaved {
     pub kv_mem: Vec<f32>,
 
     /// Recurrent state S after each step: [seq_len, value_heads, key_dim * value_dim]
-    /// S[t] is the state AFTER processing token t.
+    /// `S[t]` is the state AFTER processing token t.
     /// S[-1] (initial) is implicitly zero.
     pub s_after: Vec<f32>,
 

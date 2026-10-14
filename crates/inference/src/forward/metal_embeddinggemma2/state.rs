@@ -5,7 +5,7 @@
 
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
+    MTLCommandBufferStatus, MTLGPUFamily, MTLResourceOptions, MTLSize,
 };
 
 use crate::error::InferenceError;
@@ -15,6 +15,10 @@ use crate::model::gemma4_ops::{gemma4_rope_cos_sin, gemma4_rope_inv_freq};
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+mod vision;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub use vision::VisionTimings;
 
 const COMMON_SHADERS: &str = concat!(
     include_str!("../shaders/rms_reduce.metal"),
@@ -23,11 +27,20 @@ const COMMON_SHADERS: &str = concat!(
     include_str!("../shaders/embeddinggemma2.metal"),
 );
 const ATTENTION_SHADER: &str = include_str!("../shaders/embeddinggemma2_attention.metal");
+const VISION_SHADER: &str = include_str!("../shaders/embeddinggemma2_vision.metal");
+const GEMM_SG_SHADER: &str = include_str!("../shaders/gemm_f32_sg.metal");
+const ATTENTION_SG_SHADER: &str = include_str!("../shaders/attention_sg_hd64.metal");
 const ELEMENT_THREADS: u64 = 256;
 const ATTENTION_ROWS: u64 = 8;
+/// Threads of the simdgroup-matrix kernels: four simdgroups.
+const MATRIX_THREADS: u64 = 128;
+/// Query rows per threadgroup of the simdgroup-matrix attention kernel.
+const MATRIX_ATTENTION_ROWS: u64 = 32;
 const SIMD_WIDTH: u64 = 32;
 /// Attention scaling of this model (queries are already normalized).
 const ATTENTION_SCALE: f32 = 1.0;
+/// Vision attention head width; its geometry does not change with the checkpoint.
+const VISION_HEAD_DIM: usize = 64;
 /// Largest supported attention head width; the key and value tiles of the attention kernel must
 /// fit threadgroup memory with at least one key.
 const MAX_HEAD_DIM: usize = 2048;
@@ -54,8 +67,16 @@ fn elements(name: &str, rows: usize, width: usize) -> Result<usize, InferenceErr
     Ok(count)
 }
 
+/// The distinct attention head widths the device pipelines must cover.
+///
+/// The text tower's own widths plus the vision tower's 64, so one state serves both towers.
 fn distinct_head_dims(cfg: &EmbeddingGemma2Config) -> Vec<usize> {
-    let mut dims: Vec<usize> = cfg.layer_shapes.iter().map(|s| s.head_dim).collect();
+    let mut dims: Vec<usize> = cfg
+        .layer_shapes
+        .iter()
+        .map(|s| s.head_dim)
+        .chain([VISION_HEAD_DIM])
+        .collect();
     dims.sort_unstable();
     dims.dedup();
     dims
@@ -260,6 +281,8 @@ struct Context {
     queue: CommandQueue,
     command_buffer_selector: objc::runtime::Sel,
     compute_encoder_selector: objc::runtime::Sel,
+    gpu_start_time_selector: objc::runtime::Sel,
+    gpu_end_time_selector: objc::runtime::Sel,
 }
 
 impl Context {
@@ -283,6 +306,8 @@ impl Context {
             queue,
             command_buffer_selector: objc::runtime::Sel::register("commandBuffer"),
             compute_encoder_selector: objc::runtime::Sel::register("computeCommandEncoder"),
+            gpu_start_time_selector: objc::runtime::Sel::register("GPUStartTime"),
+            gpu_end_time_selector: objc::runtime::Sel::register("GPUEndTime"),
         })
     }
 
@@ -332,6 +357,79 @@ impl Context {
             Ok(())
         })
     }
+
+    /// As [`Context::run`], also reporting the command buffer's GPU execution span in seconds.
+    ///
+    /// The two timestamps are the command buffer's own first-command start and last-command
+    /// end, so the span is device work only; it excludes the host wait and any launcher
+    /// scheduling. It is zero when the driver reports no timestamps.
+    pub(super) fn run_timed(
+        &self,
+        encode: impl FnOnce(&ComputeCommandEncoderRef) -> Result<(), InferenceError>,
+    ) -> Result<f64, InferenceError> {
+        // Metal command buffers and encoders are autoreleased even on Rust worker threads.
+        objc::rc::autoreleasepool(|| {
+            // SAFETY: commandBuffer takes no arguments and returns a nullable,
+            // autoreleased MTLCommandBuffer. The checked reference stays inside this
+            // pool, which remains alive through command completion.
+            let command = unsafe {
+                let raw: *mut metal::MTLCommandBuffer =
+                    objc::Message::send_message(&*self.queue, self.command_buffer_selector, ())
+                        .map_err(|error| runtime(format!("command creation failed: {error}")))?;
+                if raw.is_null() {
+                    return Err(runtime("command buffer allocation failed"));
+                }
+                <metal::CommandBufferRef as metal::foreign_types::ForeignTypeRef>::from_ptr(raw)
+            };
+            // SAFETY: computeCommandEncoder takes no arguments and returns a
+            // nullable autoreleased encoder for this command. Nil is rejected before
+            // borrowing, and the reference cannot escape the enclosing pool.
+            let encoder = unsafe {
+                let raw: *mut metal::MTLComputeCommandEncoder =
+                    objc::Message::send_message(command, self.compute_encoder_selector, ())
+                        .map_err(|error| runtime(format!("encoder creation failed: {error}")))?;
+                if raw.is_null() {
+                    return Err(runtime("compute encoder allocation failed"));
+                }
+                <ComputeCommandEncoderRef as metal::foreign_types::ForeignTypeRef>::from_ptr(raw)
+            };
+            let encoded = encode(encoder);
+            encoder.end_encoding();
+            encoded?;
+            command.commit();
+            command.wait_until_completed();
+            if command.status() != MTLCommandBufferStatus::Completed {
+                return Err(runtime(format!(
+                    "command buffer ended with {:?}",
+                    command.status()
+                )));
+            }
+            Ok(gpu_span(
+                command,
+                self.gpu_start_time_selector,
+                self.gpu_end_time_selector,
+            ))
+        })
+    }
+}
+
+/// The command buffer's GPU execution span in seconds, clamped at zero.
+///
+/// `MTLCommandBuffer.GPUStartTime` and `GPUEndTime` are `CFTimeInterval` (`f64`) properties,
+/// read after the buffer completed. The clamp also turns the all-zero "no timestamps reported"
+/// case into zero rather than a negative span.
+fn gpu_span(
+    command: &metal::CommandBufferRef,
+    start_selector: objc::runtime::Sel,
+    end_selector: objc::runtime::Sel,
+) -> f64 {
+    // SAFETY: both selectors are the documented no-argument CFTimeInterval command-buffer
+    // properties. The command buffer completed before this read, so the timestamps are final.
+    // A send that returns no value falls back to zero, which the clamp then reports as no span.
+    let start: f64 =
+        unsafe { objc::Message::send_message(command, start_selector, ()).unwrap_or(0.0) };
+    let end: f64 = unsafe { objc::Message::send_message(command, end_selector, ()).unwrap_or(0.0) };
+    (end - start).max(0.0)
 }
 
 fn allocate(device: &Device, count: usize, label: &str) -> Result<Buffer, InferenceError> {
@@ -369,16 +467,45 @@ fn allocate(device: &Device, count: usize, label: &str) -> Result<Buffer, Infere
 
 fn upload(device: &Device, values: &[f32], label: &str) -> Result<Buffer, InferenceError> {
     let buffer = allocate(device, values.len(), label)?;
-    write_f32(&buffer, values);
+    write_f32(&buffer, values)?;
     Ok(buffer)
+}
+
+/// A read-only `f32` view over the first `count` elements of a shared buffer, without a copy.
+///
+/// The caller must not hold the view across a GPU submission that reads or writes the buffer,
+/// and must not take a second live view over the same buffer.
+fn as_f32(buffer: &Buffer, count: usize) -> Result<&[f32], InferenceError> {
+    check_view_len(buffer, count)?;
+    // SAFETY: the length check above proves the shared allocation holds at least count aligned,
+    // initialized f32 elements, and the caller keeps every GPU submission off this buffer for the
+    // lifetime of the view.
+    Ok(unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), count) })
+}
+
+/// Refuses a view of `count` elements over a buffer allocated shorter than that, in every build
+/// profile, so a sizing mistake surfaces as an error instead of an out-of-bounds slice.
+fn check_view_len(buffer: &Buffer, count: usize) -> Result<(), InferenceError> {
+    let needed = count
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| runtime("shared buffer view length overflows"))?;
+    let available = usize::try_from(buffer.length())
+        .map_err(|_| runtime("shared buffer length does not fit in usize"))?;
+    if available < needed {
+        return Err(runtime(format!(
+            "shared buffer holds {available} bytes, a view of {count} f32 elements needs {needed}"
+        )));
+    }
+    Ok(())
 }
 
 /// Copies `values` to the start of a shared buffer. Callers pass a buffer allocated for at least
 /// `values.len()` elements, with no GPU work in flight on it.
-fn write_f32(buffer: &Buffer, values: &[f32]) {
-    debug_assert!(buffer.length() as usize >= size_of_val(values));
-    // SAFETY: the shared allocation holds at least values.len() aligned f32 elements and
-    // is not submitted to the GPU while this copy runs; it cannot alias the input slice.
+fn write_f32(buffer: &Buffer, values: &[f32]) -> Result<(), InferenceError> {
+    check_view_len(buffer, values.len())?;
+    // SAFETY: the length check above proves the shared allocation holds at least values.len()
+    // aligned f32 elements; it is not submitted to the GPU while this copy runs and cannot alias
+    // the input slice.
     unsafe {
         std::ptr::copy_nonoverlapping(
             values.as_ptr(),
@@ -386,14 +513,15 @@ fn write_f32(buffer: &Buffer, values: &[f32]) {
             values.len(),
         );
     }
+    Ok(())
 }
 
 /// Copies the first `count` elements of a shared buffer after its GPU work has completed.
-fn read_f32(buffer: &Buffer, count: usize) -> Vec<f32> {
-    debug_assert!(buffer.length() as usize >= count * size_of::<f32>());
-    // SAFETY: the buffer holds at least count aligned, initialized f32 elements, and the
-    // command that wrote them completed before this CPU read.
-    unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), count) }.to_vec()
+fn read_f32(buffer: &Buffer, count: usize) -> Result<Vec<f32>, InferenceError> {
+    check_view_len(buffer, count)?;
+    // SAFETY: the length check above proves the buffer holds at least count aligned f32
+    // elements, initialized by the command that completed before this CPU read.
+    Ok(unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), count) }.to_vec())
 }
 
 fn bind(enc: &ComputeCommandEncoderRef, index: u64, buffer: &Buffer) {
@@ -440,7 +568,18 @@ struct Pipelines {
     add: ComputePipelineState,
     gelu_mul: ComputePipelineState,
     scale: ComputePipelineState,
+    vision_rope: ComputePipelineState,
     attention: Vec<(usize, ComputePipelineState)>,
+    matrix: Option<MatrixPipelines>,
+}
+
+/// Simdgroup-matrix kernels for the vision tower: an f32 GEMM and bidirectional attention at head
+/// width 64. Present only on devices of the Apple7 family or later whose shader compiler built
+/// them (their source is guarded by `__METAL_VERSION__ >= 300`); otherwise the tower uses the
+/// vector kernels.
+struct MatrixPipelines {
+    matmul: ComputePipelineState,
+    attention_hd64: ComputePipelineState,
 }
 
 impl Pipelines {
@@ -457,6 +596,9 @@ impl Pipelines {
         for head_dim in head_dims {
             source.push_str(&ATTENTION_SHADER.replace("__HD__", &head_dim.to_string()));
         }
+        source.push_str(VISION_SHADER);
+        source.push_str(GEMM_SG_SHADER);
+        source.push_str(ATTENTION_SG_SHADER);
         let options = CompileOptions::new();
         options.set_fast_math_enabled(false);
         let library = device
@@ -498,6 +640,21 @@ impl Pipelines {
             }
             attention.push((head_dim, pipeline));
         }
+        let matrix = if device.supports_family(MTLGPUFamily::Apple7)
+            && library.get_function("gemm_f32_sg", None).is_ok()
+            && library.get_function("eg2_attention_sg_hd64", None).is_ok()
+        {
+            let attention_hd64 = make("eg2_attention_sg_hd64", MATRIX_THREADS)?;
+            if attention_hd64.thread_execution_width() != SIMD_WIDTH {
+                return Err(runtime("attention requires a 32-lane SIMD execution width"));
+            }
+            Some(MatrixPipelines {
+                matmul: make("gemm_f32_sg", MATRIX_THREADS)?,
+                attention_hd64,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             matmul: make("matmul_bt", ELEMENT_THREADS)?,
             norm: make("rms_norm", ELEMENT_THREADS)?,
@@ -507,7 +664,9 @@ impl Pipelines {
             add: make("add_buf", ELEMENT_THREADS)?,
             gelu_mul: make("eg2_gelu_mul", ELEMENT_THREADS)?,
             scale: make("eg2_scale", ELEMENT_THREADS)?,
+            vision_rope: make("eg2_vision_axial_rope", ELEMENT_THREADS)?,
             attention,
+            matrix,
         })
     }
 
@@ -534,6 +693,42 @@ impl Pipelines {
         enc.dispatch_thread_groups(
             MTLSize::new(u64::from(n).div_ceil(16), u64::from(m).div_ceil(16), 1),
             MTLSize::new(16, 16, 1),
+        );
+    }
+
+    /// `c[m, n] = a[m, k] * b[n, k]^T` on simdgroup matrices where the device has them, else
+    /// [`Self::matmul`]. The matrix kernel stages operands as float4, so it also needs `k` to be a
+    /// multiple of 4 and the weight offset to be 16-byte aligned.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_matrix(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        a: &Buffer,
+        b: &Buffer,
+        b_offset: u64,
+        c: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) {
+        let Some(matrix) = self
+            .matrix
+            .as_ref()
+            .filter(|_| k.is_multiple_of(4) && b_offset.is_multiple_of(16))
+        else {
+            self.matmul(enc, a, b, b_offset, c, m, n, k);
+            return;
+        };
+        enc.set_compute_pipeline_state(&matrix.matmul);
+        bind(enc, 0, a);
+        enc.set_buffer(1, Some(b), b_offset);
+        bind(enc, 2, c);
+        scalar(enc, 3, &m);
+        scalar(enc, 4, &n);
+        scalar(enc, 5, &k);
+        enc.dispatch_thread_groups(
+            MTLSize::new(u64::from(n).div_ceil(32), u64::from(m).div_ceil(64), 1),
+            MTLSize::new(32, 4, 1),
         );
     }
 
@@ -631,6 +826,28 @@ impl Pipelines {
         element_dispatch(enc, count);
     }
 
+    /// Axial (2-D) RoPE over `[tokens, heads, head_dim]`, with one `(x, y)` pair per token and a
+    /// `head_dim / 2`-entry inverse-frequency table (the axis-0 block then the axis-1 block).
+    fn vision_rope(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        positions: &Buffer,
+        inv_freq: &Buffer,
+        tokens: u32,
+        heads: u32,
+        head_dim: u32,
+    ) {
+        enc.set_compute_pipeline_state(&self.vision_rope);
+        bind(enc, 0, x);
+        bind(enc, 1, positions);
+        bind(enc, 2, inv_freq);
+        scalar(enc, 3, &tokens);
+        scalar(enc, 4, &heads);
+        scalar(enc, 5, &head_dim);
+        element_dispatch(enc, tokens * heads * (head_dim / 2));
+    }
+
     /// Bidirectional attention over `[seq, heads, head_dim]` queries and `[seq, kv_heads,
     /// head_dim]` keys and values. `window = Some(w)` restricts a query at `i` to keys with
     /// `|i - j| <= w`.
@@ -671,6 +888,50 @@ impl Pipelines {
         enc.dispatch_thread_groups(
             MTLSize::new(u64::from(heads), u64::from(seq).div_ceil(ATTENTION_ROWS), 1),
             MTLSize::new(ATTENTION_ROWS * SIMD_WIDTH, 1, 1),
+        );
+        Ok(())
+    }
+
+    /// [`Self::attention`] without a window, on the simdgroup-matrix kernel when the device has it
+    /// and the head width is 64; otherwise the vector kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_matrix(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        head_dim: usize,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        out: &Buffer,
+        seq: u32,
+        heads: u32,
+        kv_heads: u32,
+    ) -> Result<(), InferenceError> {
+        let Some(matrix) = self.matrix.as_ref().filter(|_| head_dim == VISION_HEAD_DIM) else {
+            return self.attention(enc, head_dim, q, k, v, out, seq, heads, kv_heads, None);
+        };
+        let params = AttentionParams {
+            seq_len: seq,
+            heads,
+            kv_heads,
+            window: 0,
+            use_window: 0,
+            scale: ATTENTION_SCALE,
+            pad: [0; 2],
+        };
+        enc.set_compute_pipeline_state(&matrix.attention_hd64);
+        bind(enc, 0, q);
+        bind(enc, 1, k);
+        bind(enc, 2, v);
+        bind(enc, 3, out);
+        scalar(enc, 4, &params);
+        enc.dispatch_thread_groups(
+            MTLSize::new(
+                u64::from(heads),
+                u64::from(seq).div_ceil(MATRIX_ATTENTION_ROWS),
+                1,
+            ),
+            MTLSize::new(MATRIX_THREADS, 1, 1),
         );
         Ok(())
     }
@@ -849,6 +1110,7 @@ pub struct MetalEmbeddingGemma2State {
     cfg: EmbeddingGemma2Config,
     fingerprint: u64,
     scratch: Option<Scratch>,
+    vision: Option<vision::MetalEmbeddingGemma2VisionState>,
 }
 
 impl MetalEmbeddingGemma2State {
@@ -898,7 +1160,78 @@ impl MetalEmbeddingGemma2State {
             cfg: cfg.clone(),
             fingerprint: fingerprint(cfg, host),
             scratch: None,
+            vision: None,
         })
+    }
+
+    /// Runs the vision tower on the GPU for `prepared`, uploading its weights on first use.
+    ///
+    /// The patch embed, pooling and bridge stay on the host. `should_cancel` is polled between
+    /// vision layers; a device failure returns an error and is never replayed on the host.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub(crate) fn vision_forward(
+        &mut self,
+        weights: &crate::model::embeddinggemma2_vision::VisionWeights,
+        prepared: &crate::model::embeddinggemma2_image::PreparedImage,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<
+        (
+            crate::model::embeddinggemma2_vision::VisionStages,
+            VisionTimings,
+        ),
+        InferenceError,
+    > {
+        if self.vision.is_none() {
+            self.vision = Some(vision::MetalEmbeddingGemma2VisionState::new(
+                &self.ctx.device,
+                weights,
+            )?);
+        }
+        let Some(layers) = self.vision.as_mut() else {
+            return Err(runtime("vision state missing after allocation"));
+        };
+        if should_cancel() {
+            return Err(InferenceError::Inference(
+                "EmbeddingGemma 2 vision: cancelled before the patch embed".to_string(),
+            ));
+        }
+        let patch = weights.patch_embed(prepared)?;
+        let positions = prepared.positions();
+        let (mut stages, timings) = layers.tower_forward(
+            &self.ctx,
+            &self.pipelines,
+            weights,
+            &patch,
+            positions,
+            should_cancel,
+        )?;
+        if should_cancel() {
+            return Err(InferenceError::Inference(
+                "EmbeddingGemma 2 vision: cancelled before pooling".to_string(),
+            ));
+        }
+        let (pooler_values, pooler_occupancy) = weights.pool(&stages.encoder, positions)?;
+        let soft_rows = prepared.soft_rows();
+        if pooler_values.len() != soft_rows * weights.config.hidden_size {
+            return Err(InferenceError::Inference(
+                "EmbeddingGemma 2 vision: pooled rows do not match the prepared soft-row count"
+                    .to_string(),
+            ));
+        }
+        let projected = weights.bridge(&pooler_values, soft_rows)?;
+        stages.patch = patch;
+        Ok((
+            weights
+                .finish_encoding(
+                    stages,
+                    pooler_values,
+                    pooler_occupancy,
+                    projected,
+                    soft_rows,
+                )
+                .stages,
+            timings,
+        ))
     }
 
     /// Rejects a model other than the one this state was built from.
@@ -941,11 +1274,11 @@ impl MetalEmbeddingGemma2State {
         let Some(scratch) = self.scratch.as_ref() else {
             return Err(runtime("scratch buffers missing after allocation"));
         };
-        write_f32(&scratch.hidden, embeddings);
-        write_f32(&scratch.embeddings, embeddings);
+        write_f32(&scratch.hidden, embeddings)?;
+        write_f32(&scratch.embeddings, embeddings)?;
         self.ctx.run(|enc| self.encode_forward(enc, scratch, seq))?;
         let count = seq_len * self.cfg.embedding_dim;
-        let states = read_f32(&scratch.states, count);
+        let states = read_f32(&scratch.states, count)?;
         if states.iter().any(|v| !v.is_finite()) {
             return Err(runtime("forward pass produced a non-finite value"));
         }

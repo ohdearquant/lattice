@@ -6,6 +6,8 @@ from __future__ import annotations
 import ast
 import fcntl
 import importlib.util
+import io
+import json
 import os
 import re
 import shlex
@@ -1828,9 +1830,14 @@ class _SupervisorSandbox:
             )
         (lib / "bench-locks.py").write_text(lock_source)
         self.helper = lib / "bench_supervision.py"
+        self.target_env = mock.patch.dict(
+            os.environ, {"CARGO_TARGET_DIR": str(self.root / "target")})
+        self.target_env.start()
+        os.environ.pop("CARGO_BUILD_TARGET_DIR", None)
         return self
 
     def __exit__(self, *exc):
+        self.target_env.stop()
         self.tmp.cleanup()
         return False
 
@@ -1858,6 +1865,169 @@ class _SupervisorSandbox:
             env={**os.environ, **env},
             timeout=30,
         )
+
+
+class InheritedLockFileRefresh(unittest.TestCase):
+    CHILD_SOURCE = '''
+import errno
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location("refresh_supervisor", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+fds = tuple(int(value) for value in os.environ[module.FDS_ENV].split(","))
+fail_index = int(sys.argv[2])
+marker = Path(sys.argv[3])
+real_utime = os.utime
+calls = []
+
+def refresh(fd, times):
+    calls.append(fd)
+    if fail_index >= 0 and fd == fds[fail_index]:
+        raise PermissionError(errno.EPERM, "fixture timestamp refresh refused")
+    return real_utime(fd, times)
+
+failure = None
+verified = None
+try:
+    with mock.patch.object(module.os, "utime", side_effect=refresh):
+        receipt, held, paths = module.verify_supervision()
+        verified = [str(receipt), list(held), list(map(str, paths))]
+except module.SupervisionError as exc:
+    failure = {
+        "message": str(exc),
+        "cause_type": type(exc.__cause__).__name__,
+        "errno": getattr(exc.__cause__, "errno", None),
+    }
+else:
+    marker.write_text("admitted")
+
+# A parent copy would hide an accidental close in this process.
+identities = [[os.fstat(fd).st_dev, os.fstat(fd).st_ino] for fd in fds]
+print(json.dumps({
+    "failure": failure,
+    "verified": verified,
+    "calls": calls,
+    "identities": identities,
+    "inheritable": [os.get_inheritable(fd) for fd in fds],
+}))
+raise SystemExit(2 if failure is not None else 0)
+'''
+
+    def _assert_retained_locks(self, paths):
+        for path in paths:
+            probe = os.open(path, os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+
+    def _run_refresh_fixture(self, *, held: bool, fail_index: int = -1):
+        with _SupervisorSandbox() as sb:
+            paths = (sb.bench_lock, sb.gpu_lock)
+            sentinels = (b"bench-window sentinel\n", b"metal-gpu sentinel\n")
+            for path, sentinel in zip(paths, sentinels, strict=True):
+                path.write_bytes(sentinel)
+            status = Path(sb.tmp.name) / "refresh.status"
+            status.write_text(
+                f"supervisor_pid={os.getpid()}\n"
+                f"lock=bench-window ({sb.bench_lock}): fixture\n"
+                f"lock=Metal GPU ({sb.gpu_lock}): fixture\n"
+            )
+            child = Path(sb.tmp.name) / "refresh-child.py"
+            child.write_text(self.CHILD_SOURCE)
+            marker = Path(sb.tmp.name) / "admitted"
+            inherited = []
+            try:
+                # Do not call sb.run or bench-locks.acquire: either could mask
+                # a missing refresh in verify_supervision.
+                for path in paths:
+                    fd = os.open(path, os.O_RDWR)
+                    inherited.append(fd)
+                    if held:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                old = time.time_ns() - 4 * 24 * 60 * 60 * 1_000_000_000
+                identities = []
+                for fd in inherited:
+                    # ctime cannot be backdated; this fixture ages only atime/mtime.
+                    os.utime(fd, ns=(old, old))
+                    before = os.fstat(fd)
+                    self.assertEqual(before.st_atime_ns, old)
+                    self.assertEqual(before.st_mtime_ns, old)
+                    identities.append([before.st_dev, before.st_ino])
+                started = time.time_ns()
+                result = subprocess.run(
+                    [sys.executable, str(child), str(sb.helper),
+                     str(fail_index), str(marker)],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "LATTICE_BENCH_LOCK_STATUS": str(status),
+                        "LATTICE_BENCH_LOCK_FDS": ",".join(map(str, inherited)),
+                    },
+                    pass_fds=tuple(inherited),
+                    timeout=30,
+                )
+                finished = time.time_ns()
+                self.assertEqual(
+                    result.returncode, 2 if fail_index >= 0 else 0,
+                    result.stderr + result.stdout,
+                )
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["identities"], identities)
+                for fd, path, identity in zip(inherited, paths, identities, strict=True):
+                    # Inspect timestamps before sentinel reads can change atime.
+                    for current in (os.fstat(fd), path.stat()):
+                        self.assertEqual([current.st_dev, current.st_ino], identity)
+                        self.assertEqual(current.st_size, len(sentinels[paths.index(path)]))
+                        if fail_index < 0:
+                            for stamp in (current.st_atime_ns, current.st_mtime_ns,
+                                          current.st_ctime_ns):
+                                self.assertGreaterEqual(stamp, started - 2_000_000_000)
+                                self.assertLessEqual(stamp, finished + 2_000_000_000)
+                self.assertEqual(
+                    payload["calls"],
+                    inherited[:fail_index + 1] if fail_index >= 0 else inherited,
+                )
+                if fail_index >= 0:
+                    self.assertFalse(marker.exists())
+                    self.assertIsNone(payload["verified"])
+                    self.assertEqual(payload["failure"]["cause_type"], "PermissionError")
+                    self.assertEqual(payload["failure"]["errno"], 1)
+                    self.assertIn("fixture timestamp refresh refused",
+                                  payload["failure"]["message"])
+                    self.assertIn(str(paths[fail_index]), payload["failure"]["message"])
+                else:
+                    self.assertEqual(marker.read_text(), "admitted")
+                    self.assertIsNone(payload["failure"])
+                    self.assertEqual(payload["verified"],
+                                     [str(status), inherited, list(map(str, paths))])
+                    self.assertEqual(payload["inheritable"], [False, False])
+                self._assert_retained_locks(paths)
+                for path, sentinel in zip(paths, sentinels, strict=True):
+                    self.assertEqual(path.read_bytes(), sentinel)
+            finally:
+                for fd in inherited:
+                    os.close(fd)
+
+    def test_idle_inherited_descriptors_refresh_times(self):
+        self._run_refresh_fixture(held=False)
+
+    def test_held_inherited_descriptors_refresh_times(self):
+        self._run_refresh_fixture(held=True)
+
+    def test_first_refresh_error_preserves_borrowed_descriptors(self):
+        self._run_refresh_fixture(held=True, fail_index=0)
+
+    def test_second_refresh_error_preserves_borrowed_descriptors(self):
+        self._run_refresh_fixture(held=True, fail_index=1)
 
 
 def _run_bench_ci_fixture(*, fail_first: bool) -> tuple[subprocess.CompletedProcess[str], list[str]]:
@@ -2003,6 +2173,176 @@ def _run_wasm_fixture(*, prerequisites: bool) -> subprocess.CompletedProcess[str
             env=env,
             timeout=30,
         )
+
+
+class CargoTargetProtection(unittest.TestCase):
+    def load_supervisor(self, sb):
+        spec = importlib.util.spec_from_file_location("target_supervision", sb.helper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def run_fixture(self, sb, module, env, child_check, *, resolver=None):
+        real_run = subprocess.run
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if command[0] == "/bin/bash":
+                return real_run(command, **kwargs)
+            self.assertEqual(command, ["fixture-child"])
+            child_check(kwargs["env"])
+            return subprocess.CompletedProcess(command, 0)
+
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {module.STATUS_ENV: "fixture-receipt", **env}, clear=True), \
+                mock.patch.object(module, "verify_supervision", return_value=(Path("receipt"), (10, 11), (sb.bench_lock, sb.gpu_lock))), \
+                mock.patch.object(module, "_sample_path_identities"), \
+                mock.patch.object(module.subprocess, "run", fake_run), \
+                mock.patch.object(sys, "stdout", output):
+            if resolver is None:
+                rc = module.run_supervised("fixture", ["fixture-child"], quiet=False)
+            else:
+                with mock.patch.object(module, "_cargo_target_directory", resolver):
+                    rc = module.run_supervised("fixture", ["fixture-child"], quiet=False)
+        return rc, calls, output.getvalue()
+
+    def test_out_of_tree_env_target_is_marked_before_child(self):
+        with _SupervisorSandbox() as sb:
+            module = self.load_supervisor(sb)
+            target = Path(sb.tmp.name) / "external-target"
+
+            def check_child(env):
+                marker = target / ".metadata_never_index"
+                self.assertTrue(marker.is_file())
+                self.assertFalse(marker.is_symlink())
+                record = json.loads(env[module.TARGET_PROTECTION_ENV])
+                self.assertEqual(record, {"status": "marked", "directory": str(target.resolve())})
+
+            rc, calls, output = self.run_fixture(
+                sb, module, {"CARGO_TARGET_DIR": str(target)}, check_child)
+            self.assertEqual(rc, 0)
+            self.assertEqual(sum(call[-1] == str(target.resolve()) for call in calls), 1)
+            self.assertIn("Run conditions: cargo target protection", output)
+
+    def test_unresolvable_target_is_reported_before_child(self):
+        with _SupervisorSandbox() as sb:
+            module = self.load_supervisor(sb)
+
+            def unavailable(command):
+                raise module.SupervisionError("fixture metadata unavailable")
+
+            def check_child(env):
+                record = json.loads(env[module.TARGET_PROTECTION_ENV])
+                self.assertEqual(record["status"], "unresolved")
+                self.assertIn("fixture metadata unavailable", record["reason"])
+
+            rc, calls, output = self.run_fixture(
+                sb, module, {}, check_child, resolver=unavailable)
+            self.assertEqual(rc, 0)
+            self.assertIn('"status": "unresolved"', output)
+            self.assertIn("fixture metadata unavailable", output)
+            self.assertEqual(sum(call[0] == "/bin/bash" for call in calls), 2)
+
+    def test_in_repo_target_is_not_marked_twice(self):
+        with _SupervisorSandbox() as sb:
+            module = self.load_supervisor(sb)
+            target = sb.root / "target"
+            rc, calls, _ = self.run_fixture(
+                sb, module, {}, lambda env: self.assertEqual(
+                    json.loads(env[module.TARGET_PROTECTION_ENV])["status"], "marked"),
+                resolver=lambda command: target.resolve())
+            self.assertEqual(rc, 0)
+            self.assertEqual(sum(call[-1] == str(target.resolve()) for call in calls), 1)
+            self.assertEqual(sum(call[0] == "/bin/bash" for call in calls), 2)
+
+    def test_unresolvable_repo_tree_refuses_before_target_query(self):
+        with _SupervisorSandbox() as sb:
+            module = self.load_supervisor(sb)
+            with mock.patch.object(Path, "resolve", side_effect=RuntimeError("fixture symlink loop")):
+                rc, calls, _ = self.run_fixture(
+                    sb, module, {}, lambda env: self.fail("child launched"),
+                    resolver=lambda command: self.fail("target query ran"))
+            self.assertEqual(rc, module.REFUSAL_EXIT)
+            self.assertEqual(calls, [])
+
+    def test_unmarkable_external_target_refuses_child(self):
+        with _SupervisorSandbox() as sb:
+            module = self.load_supervisor(sb)
+            target = Path(sb.tmp.name) / "external-target"
+            (target / ".metadata_never_index" / "occupied").mkdir(parents=True)
+            rc, calls, _ = self.run_fixture(
+                sb, module, {"CARGO_TARGET_DIR": str(target)},
+                lambda env: self.fail("unprotected child launched"))
+            self.assertEqual(rc, module.REFUSAL_EXIT)
+            self.assertNotIn(["fixture-child"], calls)
+
+    def test_metadata_target_is_resolved_without_running_cargo(self):
+        with _SupervisorSandbox() as sb:
+            module = self.load_supervisor(sb)
+            target = Path(sb.tmp.name) / "configured-target"
+            response = subprocess.CompletedProcess(
+                ["cargo", "metadata"], 0,
+                stdout=json.dumps({"target_directory": str(target)}), stderr="")
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(module.subprocess, "run", return_value=response) as run:
+                resolved = module._cargo_target_directory(
+                    ["cargo", "+1.94.1", "bench", "--manifest-path", "other/Cargo.toml",
+                     "--config", 'build.target-dir="configured-target"'])
+            self.assertEqual(resolved, target.resolve())
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[:3], ["cargo", "+1.94.1", "metadata"])
+            self.assertIn("--no-deps", argv)
+            self.assertIn("--manifest-path", argv)
+            self.assertIn("--config", argv)
+            self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_failed_metadata_reports_resolution_error(self):
+        with _SupervisorSandbox() as sb:
+            module = self.load_supervisor(sb)
+            response = subprocess.CompletedProcess(
+                ["cargo", "metadata"], 1, stdout="", stderr="fixture resolution failed")
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(module.subprocess, "run", return_value=response):
+                with self.assertRaisesRegex(module.SupervisionError, "fixture resolution failed"):
+                    module._cargo_target_directory(["cargo", "bench"])
+
+    def test_direct_target_dir_overrides_env_and_stops_at_separator(self):
+        with _SupervisorSandbox() as sb:
+            module = self.load_supervisor(sb)
+            target = Path(sb.tmp.name) / "command-target"
+            with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "wrong-target"}, clear=True), \
+                    mock.patch.object(module.subprocess, "run", side_effect=AssertionError("cargo invoked")):
+                resolved = module._cargo_target_directory(
+                    ["cargo", "bench", "--target-dir", str(target), "--", "--target-dir=ignored"])
+            self.assertEqual(resolved, target.resolve())
+
+    def test_config_override_with_target_env_uses_metadata(self):
+        with _SupervisorSandbox() as sb:
+            module = self.load_supervisor(sb)
+            target = Path(sb.tmp.name) / "configured-target"
+            response = subprocess.CompletedProcess(
+                ["cargo", "metadata"], 0,
+                stdout=json.dumps({"target_directory": str(target)}), stderr="")
+            with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "env-target"}, clear=True), \
+                    mock.patch.object(module.subprocess, "run", return_value=response) as run:
+                resolved = module._cargo_target_directory(
+                    ["cargo", "bench", "--config", 'build.target-dir="configured-target"'])
+            self.assertTrue(run.called)
+            self.assertEqual(resolved, target.resolve())
+
+    def test_both_target_env_spellings_use_metadata(self):
+        with _SupervisorSandbox() as sb:
+            module = self.load_supervisor(sb)
+            target = Path(sb.tmp.name) / "metadata-target"
+            response = subprocess.CompletedProcess(
+                ["cargo", "metadata"], 0,
+                stdout=json.dumps({"target_directory": str(target)}), stderr="")
+            with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "first", "CARGO_BUILD_TARGET_DIR": "second"}, clear=True), \
+                    mock.patch.object(module.subprocess, "run", return_value=response) as run:
+                resolved = module._cargo_target_directory(["cargo", "bench"])
+            self.assertTrue(run.called)
+            self.assertEqual(resolved, target.resolve())
 
 
 class RuntimeContract(unittest.TestCase):

@@ -41,16 +41,19 @@ struct SentencePieceEntry {
     kind: SentencePieceType,
 }
 
-#[derive(Debug, Clone)]
-struct ByteTrieNode {
-    children: HashMap<u8, usize>,
-    terminal: Option<u32>,
+/// Byte trie over piece bytes in flat arrays. The edges out of node `i` are
+/// `child_start[i]..child_start[i + 1]`, sorted by `edge_byte`, each leading to `edge_child`.
+/// A hash map per node made large vocabularies cost hundreds of megabytes.
+#[derive(Debug)]
+struct ByteTrie {
+    child_start: Vec<u32>,
+    edge_byte: Vec<u8>,
+    edge_child: Vec<u32>,
+    /// Piece id ending at each node, `NO_PIECE` when none does.
+    terminal: Vec<u32>,
 }
 
-#[derive(Debug, Clone)]
-struct ByteTrie {
-    nodes: Vec<ByteTrieNode>,
-}
+const NO_PIECE: u32 = u32::MAX;
 
 #[derive(Debug, Clone)]
 struct BestPathNode {
@@ -61,9 +64,9 @@ struct BestPathNode {
 
 #[derive(Debug)]
 struct SentencePieceInner {
-    pieces: Vec<SentencePieceEntry>,
-    id_to_piece: Vec<String>,
-    trie: ByteTrie,
+    pieces: Arc<[SentencePieceEntry]>,
+    id_to_piece: Arc<[String]>,
+    trie: Arc<ByteTrie>,
     min_score: f32,
     unk_id: u32,
     pad_id: u32,
@@ -90,32 +93,66 @@ pub struct SentencePieceTokenizer {
 }
 
 impl ByteTrie {
-    fn new() -> Self {
+    /// Builds the trie from `(piece, id)` pairs. When a piece occurs more than once, the
+    /// last pair wins.
+    fn build(entries: &[(&str, u32)]) -> Self {
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        // Stable, so equal pieces keep their input order and the last one is written last.
+        order.sort_by(|&x, &y| entries[x].0.as_bytes().cmp(entries[y].0.as_bytes()));
+
+        // Walk the sorted pieces, sharing each piece's common prefix with the previous one, and
+        // record every new edge as (parent, byte, child). Siblings arrive in byte order.
+        let mut terminal = vec![NO_PIECE];
+        let mut edges: Vec<(u32, u8, u32)> = Vec::new();
+        let mut path: Vec<u32> = vec![0];
+        let mut prev: &[u8] = &[];
+        for &i in &order {
+            let (piece, id) = entries[i];
+            let bytes = piece.as_bytes();
+            let common = prev.iter().zip(bytes).take_while(|(x, y)| x == y).count();
+            path.truncate(common + 1);
+            for &byte in &bytes[common..] {
+                let parent = path[path.len() - 1];
+                let child = terminal.len() as u32;
+                terminal.push(NO_PIECE);
+                edges.push((parent, byte, child));
+                path.push(child);
+            }
+            terminal[path[path.len() - 1] as usize] = id;
+            prev = bytes;
+        }
+
+        // Group the edges by parent; a stable counting sort keeps each parent's edges in byte order.
+        let nodes = terminal.len();
+        let mut child_start = vec![0u32; nodes + 1];
+        for &(parent, _, _) in &edges {
+            child_start[parent as usize + 1] += 1;
+        }
+        for i in 0..nodes {
+            child_start[i + 1] += child_start[i];
+        }
+        let mut next = child_start.clone();
+        let mut edge_byte = vec![0u8; edges.len()];
+        let mut edge_child = vec![0u32; edges.len()];
+        for (parent, byte, child) in edges {
+            let slot = next[parent as usize] as usize;
+            next[parent as usize] += 1;
+            edge_byte[slot] = byte;
+            edge_child[slot] = child;
+        }
         Self {
-            nodes: vec![ByteTrieNode {
-                children: HashMap::new(),
-                terminal: None,
-            }],
+            child_start,
+            edge_byte,
+            edge_child,
+            terminal,
         }
     }
 
-    fn insert(&mut self, piece: &str, id: u32) {
-        let mut node_idx = 0usize;
-        for &byte in piece.as_bytes() {
-            let next_idx = if let Some(&child) = self.nodes[node_idx].children.get(&byte) {
-                child
-            } else {
-                let child = self.nodes.len();
-                self.nodes.push(ByteTrieNode {
-                    children: HashMap::new(),
-                    terminal: None,
-                });
-                self.nodes[node_idx].children.insert(byte, child);
-                child
-            };
-            node_idx = next_idx;
-        }
-        self.nodes[node_idx].terminal = Some(id);
+    fn child(&self, node: usize, byte: u8) -> Option<usize> {
+        let lo = self.child_start[node] as usize;
+        let hi = self.child_start[node + 1] as usize;
+        let at = self.edge_byte[lo..hi].binary_search(&byte).ok()?;
+        Some(self.edge_child[lo + at] as usize)
     }
 
     fn matches(&self, bytes: &[u8], start: usize) -> Vec<(usize, u32)> {
@@ -123,12 +160,13 @@ impl ByteTrie {
         let mut node_idx = 0usize;
         let mut pos = start;
         while pos < bytes.len() {
-            let Some(&child) = self.nodes[node_idx].children.get(&bytes[pos]) else {
+            let Some(child) = self.child(node_idx, bytes[pos]) else {
                 break;
             };
             node_idx = child;
             pos += 1;
-            if let Some(id) = self.nodes[node_idx].terminal {
+            let id = self.terminal[node_idx];
+            if id != NO_PIECE {
                 out.push((pos, id));
             }
         }
@@ -341,7 +379,7 @@ impl SentencePieceTokenizer {
         model.added_tokens.retain(|token, _| !token.is_empty());
         let mut added_tokens_sorted: Vec<String> = model.added_tokens.keys().cloned().collect();
         added_tokens_sorted.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-        let mut trie = ByteTrie::new();
+        let mut trie_entries = Vec::with_capacity(model.pieces.len());
         let mut byte_fallback_ids = vec![None; 256];
         let mut id_to_piece = Vec::with_capacity(model.pieces.len());
 
@@ -350,7 +388,7 @@ impl SentencePieceTokenizer {
             id_to_piece.push(piece.piece.clone());
             match piece.kind {
                 SentencePieceType::Normal | SentencePieceType::UserDefined => {
-                    trie.insert(piece.piece.as_str(), id);
+                    trie_entries.push((piece.piece.as_str(), id));
                 }
                 SentencePieceType::Byte => {
                     if let Some(byte) = parse_byte_piece(piece.piece.as_str()) {
@@ -363,10 +401,13 @@ impl SentencePieceTokenizer {
             }
         }
 
+        let trie = ByteTrie::build(&trie_entries);
+        drop(trie_entries);
+
         let inner = SentencePieceInner {
-            pieces: model.pieces,
-            id_to_piece,
-            trie,
+            pieces: model.pieces.into(),
+            id_to_piece: id_to_piece.into(),
+            trie: Arc::new(trie),
             min_score,
             unk_id,
             pad_id,
@@ -999,6 +1040,87 @@ fn skip_field(bytes: &[u8], pos: &mut usize, wire_type: u8) -> Result<(), Infere
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every (end, id) a reference scan over all pieces finds, last id winning for a repeated piece.
+    fn reference_matches(entries: &[(&str, u32)], bytes: &[u8], start: usize) -> Vec<(usize, u32)> {
+        let mut by_end: Vec<(usize, u32)> = Vec::new();
+        for &(piece, id) in entries {
+            let p = piece.as_bytes();
+            if p.is_empty() || !bytes[start..].starts_with(p) {
+                continue;
+            }
+            let end = start + p.len();
+            match by_end.iter_mut().find(|(e, _)| *e == end) {
+                Some(slot) => slot.1 = id,
+                None => by_end.push((end, id)),
+            }
+        }
+        by_end.sort_unstable();
+        by_end
+    }
+
+    #[test]
+    fn byte_trie_matches_reference_scan() {
+        let pieces = [
+            "",
+            "a",
+            "ab",
+            "abc",
+            "abd",
+            "b",
+            "ab",
+            "ba",
+            "\u{2581}",
+            "\u{2581}a",
+            "\u{2581}ab",
+            "é",
+            "éa",
+            "日",
+            "日本",
+            "日本語",
+            "本",
+            "語",
+            "zz",
+            "z",
+            "a",
+            "\u{ff}",
+        ];
+        let entries: Vec<(&str, u32)> = pieces
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (*p, i as u32 * 3 + 1))
+            .collect();
+        let trie = ByteTrie::build(&entries);
+        let texts = [
+            "abcabdab",
+            "\u{2581}ab\u{2581}a",
+            "日本語本日",
+            "éaé",
+            "zzz",
+            "x",
+            "",
+            "ba\u{ff}",
+        ];
+        let mut checked = 0;
+        for text in texts {
+            let bytes = text.as_bytes();
+            for start in 0..bytes.len() {
+                assert_eq!(
+                    trie.matches(bytes, start),
+                    reference_matches(&entries, bytes, start),
+                    "text {text:?} start {start}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 40);
+        // A repeated piece resolves to its last id: "ab" is entries 2 and 6, "a" is 1 and 20.
+        assert_eq!(
+            trie.matches(b"ab", 0),
+            vec![(1, 20 * 3 + 1), (2, 6 * 3 + 1)]
+        );
+        assert!(ByteTrie::build(&[]).matches(b"abc", 0).is_empty());
+    }
 
     fn synthetic_tokenizer() -> SentencePieceTokenizer {
         SentencePieceTokenizer::from_pieces_for_test(
