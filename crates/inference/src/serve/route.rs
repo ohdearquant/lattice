@@ -19,6 +19,9 @@
 //! by the code that prints it.
 //!
 //! Not a stable API: `#[doc(hidden)]` is a convention, not a semver guarantee.
+//!
+//! [`select_route`]: crate::serve::route::select_route
+//! [`select_standalone_route`]: crate::serve::route::select_standalone_route
 
 use crate::model_format::{ModelFamily, ModelFormat, unrecognized_format_message};
 use std::path::Path;

@@ -145,7 +145,7 @@ fn build_rope_tables(cfg: &TinyConfig, seq_len: usize) -> (Vec<f32>, Vec<f32>) {
     (cos_t, sin_t)
 }
 
-/// Run the full 2-layer tiny forward pass, returning (logits [vocab], all caches).
+/// Run the full 2-layer tiny forward pass, returning (logits `[vocab]`, all caches).
 pub fn tiny_forward(
     token_ids: &[u32],
     weights: &TinyWeights,

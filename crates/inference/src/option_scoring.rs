@@ -11,6 +11,8 @@
 //!
 //! Scores are uncalibrated: `probs` is the plain softmax over the k letters, and the option order
 //! is the caller's to control and to report.
+//!
+//! [`OptionScores`]: crate::option_scoring::OptionScores
 
 use std::collections::HashSet;
 

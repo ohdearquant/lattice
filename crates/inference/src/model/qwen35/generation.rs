@@ -75,7 +75,7 @@ pub(crate) fn force_serial_prefill() -> bool {
 impl Qwen35Model {
     /// **Unstable**: autoregressive text generation with temperature/top-k/top-p sampling.
     ///
-    /// Delegates to [`Self::generate_with_trace`] and discards the driver trace (ADR-090
+    /// Delegates to `Self::generate_with_trace` and discards the driver trace (ADR-090
     /// row C, decomposition "Open question 3, ANSWERED"): this entry's signature and
     /// observable behaviour are unchanged, and the trace exists for the migration's own
     /// tests to see, not for callers of the public API.
@@ -350,9 +350,9 @@ impl Qwen35Model {
     /// `generated_ids`, never from a step that grammar-stops or EOS-stops
     /// before the token is pushed.
     ///
-    /// Delegates to [`Self::generate_streaming_with_trace`] and discards the driver
+    /// Delegates to `Self::generate_streaming_with_trace` and discards the driver
     /// trace, mirroring [`Self::generate`]'s relationship to
-    /// [`Self::generate_with_trace`] (ADR-092 arm 1): this entry's signature and
+    /// `Self::generate_with_trace` (ADR-092 arm 1): this entry's signature and
     /// observable behaviour are unchanged.
     pub fn generate_streaming_with_observer<F, C, O>(
         &self,

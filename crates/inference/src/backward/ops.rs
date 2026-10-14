@@ -5,11 +5,11 @@
 
 /// Cross-entropy backward: dL/dlogits at completion positions only.
 ///
-/// p = softmax(logits); at position i (completion), dL/dlogits[i] = (p[i] - onehot(target[i])) / N_comp.
+/// p = softmax(logits); at position i (completion), `dL/dlogits[i] = (p[i] - onehot(target[i])) / N_comp`.
 /// At prompt/masked positions, dL/dlogits = 0 (output is zeros there).
 ///
 /// `logits` shape: [seq_len, vocab_size]
-/// `targets` shape: [seq_len] — u32, only positions in completion_range matter
+/// `targets` shape: `[seq_len]` — u32, only positions in completion_range matter
 /// `completion_start` — first index in the completion (0-indexed in sequence)
 /// returns `dlogits` shape: [seq_len, vocab_size]
 pub fn cross_entropy_backward(
@@ -49,7 +49,7 @@ pub fn cross_entropy_backward(
 /// Linear VJP (base weights frozen): given upstream grad g=dL/dy (output-side),
 /// computes dL/dx = W^T g.
 ///
-/// `w` is row-major [d_out, d_in].  `g` is [d_out].  Returns [d_in].
+/// `w` is row-major `[d_out, d_in]`.  `g` is `[d_out]`.  Returns `[d_in]`.
 ///
 /// Reuses the same GEMM dispatch the forward path uses (`matmul_into`, m=1):
 /// `dx = g @ W` treating `g` as a `[1, d_out]` row and `w` as `[d_out, d_in]`
@@ -72,9 +72,9 @@ pub fn linear_vjp(w: &[f32], g: &[f32], d_in: usize, d_out: usize) -> Vec<f32> {
 /// LoRA VJP: given upstream g=dL/dy and forward-cached h=A·x,
 /// computes grad_A, grad_B, and dL/dx contribution.
 ///
-/// dL/dB[i,r] = scale * g[i] * h[r]    → shape [d_out, rank]
-/// dL/dA[r,j] = scale * (B^T g)[r] * x[j] → shape [rank, d_in]
-/// dL/dx += scale * A^T (B^T g)          → shape [d_in]
+/// `dL/dB[i,r] = scale * g[i] * h[r]`    → shape `[d_out, rank]`
+/// `dL/dA[r,j] = scale * (B^T g)[r] * x[j]` → shape `[rank, d_in]`
+/// dL/dx += scale * A^T (B^T g)          → shape `[d_in]`
 ///
 /// Returns (grad_b, grad_a, dx_delta).
 pub fn lora_vjp(
@@ -199,7 +199,7 @@ pub fn rope_backward(g: &[f32], cos_vals: &[f32], sin_vals: &[f32], rope_dim: us
 ///   dL/dgate = dL/ds * silu'(gate)  where silu'(a) = sigma(a) + a*sigma(a)*(1-sigma(a))
 ///   dL/dx = W_gate^T dL/dgate + W_up^T dL/dup
 ///
-/// Returns (dx [hidden], dm [inter]) where dm = W_down^T dy (the down-proj pre-activation grad).
+/// Returns (dx `[hidden]`, dm `[inter]`) where dm = W_down^T dy (the down-proj pre-activation grad).
 pub fn swiglu_backward(
     dy: &[f32],
     gate_pre: &[f32],

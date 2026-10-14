@@ -13,6 +13,8 @@
 //! separately (the state once, then each question), which is the length
 //! measured for `usage.input_tokens` and the shape the answers were calibrated
 //! against.
+//!
+//! [`DeciderConfig::temperature`]: crate::serve::systemone::DeciderConfig::temperature
 
 pub mod answer;
 pub mod config;

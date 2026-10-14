@@ -259,7 +259,7 @@ impl Qwen35Model {
     /// Processes the complete input from fresh recurrent and KV state. Each result row
     /// corresponds to a position in `slots`, and contains the logits for `rows` in caller
     /// order. The hidden states are captured after final RMSNorm. Each slot's values are read
-    /// out of a full-vocabulary projection computed with the same call [`Self::forward_step`]
+    /// out of a full-vocabulary projection computed with the same call `Self::forward_step`
     /// makes, so each equals the logit that call produces at this position bit for bit on every
     /// CPU target; projecting onto only the requested rows would not, because the CPU kernels
     /// round differently depending on the number of rows in the product. There is no sampling

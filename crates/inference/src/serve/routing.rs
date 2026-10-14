@@ -7,7 +7,7 @@
 //!
 //! # Why this matches adapters by name
 //!
-//! [`crate::mixture::AdapterRouter::route`] maps a gate output column to an
+//! `mixture::AdapterRouter::route` (feature `mixture`) maps a gate output column to an
 //! adapter **by position**: the selected column index is used directly as
 //! `available[idx]`, and the `AdapterId` is a label copied into the result,
 //! never matched against anything the gate holds. The gate itself is a bare
