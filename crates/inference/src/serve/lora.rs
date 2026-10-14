@@ -198,6 +198,24 @@ pub const LORA_ROUTES: &[(&str, &[&str])] = &[
     ("/v1/lora/unload", &["POST"]),
 ];
 
+/// The router feedback routes, as data (ADR-096 decision 3).
+///
+/// A separate list from [`LORA_ROUTES`] because it has a different scope, and
+/// the scope is the point: these are registered by `lattice` ONLY. The other
+/// serving binary cannot route -- it takes no `--router-state` -- so it
+/// records no episodes, and a feedback route there would accept judgements
+/// about completions that no gate produced and answer every one of them with
+/// `unknown_completion`. A 404 is the honest answer from a binary that does
+/// not route.
+///
+/// Kept as data anyway, and checked by that binary's own presence test, for
+/// the reason `LORA_ROUTES` exists: a route table is not a registration, and
+/// the drift between the two is invisible to anything that reads only one.
+pub const ROUTER_FEEDBACK_ROUTES: &[(&str, &[&str])] = &[
+    ("/v1/router/feedback", &["POST"]),
+    ("/v1/router/episodes", &["GET"]),
+];
+
 /// One contribution to an ordered request mixture.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -56,6 +56,9 @@ pub mod weights;
 /// and [`model`].
 pub mod batch;
 pub(crate) mod bounded_read;
+/// What a routed completion recorded about itself, and the judgements against
+/// it (ADR-096 decision 3).
+pub mod router_episode;
 /// Provisioning a router state directory with an untrained bootstrap
 /// (ADR-096 decision 2).
 pub mod router_init;

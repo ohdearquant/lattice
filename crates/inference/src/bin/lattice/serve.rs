@@ -403,6 +403,26 @@ impl ModelBackend {
 // Shared application state
 // -----------------------------------------------------------------------
 
+/// How many routed completions the episode store holds.
+///
+/// A window, not a history. Sized so an ordinary interactive session's
+/// feedback arrives while its episode is still present; a deployment that
+/// needs a longer one needs a durable store, which is a schema and a retention
+/// policy and is not decided by ADR-096.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub const DEFAULT_EPISODE_CAPACITY: usize = 4096;
+
+/// A fresh episode store at the default capacity.
+///
+/// One constructor rather than a literal per `AppState` site: a second
+/// capacity written at a call site is a second policy nobody knows exists.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub fn episode_store() -> Arc<std::sync::Mutex<lattice_inference::router_episode::EpisodeStore>> {
+    Arc::new(std::sync::Mutex::new(
+        lattice_inference::router_episode::EpisodeStore::new(DEFAULT_EPISODE_CAPACITY),
+    ))
+}
+
 /// State shared across all request handlers via axum's `State` extractor.
 #[derive(Clone)]
 pub struct AppState {
@@ -462,6 +482,15 @@ pub struct AppState {
     /// than loaded into a field nothing on that build could ever apply.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub router_state: Option<Arc<lattice_inference::serve::routing::ServedRouter>>,
+    /// Routed completions and the judgements against them (ADR-096 D3).
+    ///
+    /// Present on every Metal build whether or not a router is configured, and
+    /// it stays empty on a server with no gate: `route_selection` is the only
+    /// producer, and it does not run without one. A field that appeared and
+    /// disappeared with the router would make "no episodes" and "no store"
+    /// two states the feedback route answers identically.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub episodes: Arc<std::sync::Mutex<lattice_inference::router_episode::EpisodeStore>>,
 }
 
 /// See [`AppState::embedding_admission`]. Same cap `lattice_serve.rs` uses
@@ -1154,6 +1183,13 @@ async fn chat_completions_with_request(
     // result means the gate declined (no user turn to read), which is the base model -- the
     // original resolution already says that, so it stands rather than being restated as an
     // `Explicit` list that names nothing.
+    //
+    // Declared here and filled only on the branch that actually applies a
+    // routed mixture. A request that was not routed, or was routed to nothing,
+    // leaves this `None` and records no episode: putting it in the learner's
+    // population would be a completion no gate produced.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let mut routing_provenance: Option<lattice_inference::serve::routing::RoutedRequest> = None;
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     let requested = match state
         .router_state
@@ -1162,13 +1198,17 @@ async fn chat_completions_with_request(
     {
         None => requested,
         Some(served) => {
-            let routed = route_selection(&state, &served, &chat_messages).await?;
-            if routed.is_empty() {
-                requested
-            } else {
-                lattice_inference::serve::lora::validate_scales(&routed)?;
-                adapter_client(&state)?.validate_lora(&routed)?;
-                lattice_inference::serve::lora::RequestedAdapters::Explicit(routed)
+            let decision = route_selection(&state, &served, &chat_messages).await?;
+            match &decision {
+                Some(routed) if !routed.selections.is_empty() => {
+                    lattice_inference::serve::lora::validate_scales(&routed.selections)?;
+                    adapter_client(&state)?.validate_lora(&routed.selections)?;
+                    routing_provenance = decision.clone();
+                    lattice_inference::serve::lora::RequestedAdapters::Explicit(
+                        routed.selections.clone(),
+                    )
+                }
+                _ => requested,
             }
         }
     };
@@ -1188,6 +1228,62 @@ async fn chat_completions_with_request(
         .unwrap_or(0);
     let seq = state.request_counter.fetch_add(1, Ordering::Relaxed);
     let response_id = format!("chatcmpl-{created}-{seq}");
+
+    // Recorded here because this is the first moment both halves exist: the
+    // routing decision was made above, and the id a judgement will name is
+    // minted on the line above this one. Recording earlier would need an id
+    // that does not exist yet; recording later, after generation, would lose
+    // every episode whose completion failed -- and a mixture that produced a
+    // failure is exactly the one a learner should be able to hear about.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    if let (Some(routed), Some(served)) = (&routing_provenance, &state.router_state) {
+        use lattice_inference::router_episode::{PolicyIdentity, RouterEpisode};
+        let (artifact_version, schema_id) = served.with_report(|report| {
+            (
+                report.artifact.version_label(),
+                report
+                    .artifact
+                    .provenance
+                    .lineage()
+                    .map(|l| l.schema_id.clone())
+                    // A legacy artifact records no schema. Named as absent
+                    // rather than defaulted to the empty string, which would
+                    // read as a schema whose name is unprintable.
+                    .unwrap_or_else(|| "unrecorded".to_string()),
+            )
+        });
+        let episode = RouterEpisode {
+            completion_id: response_id.clone(),
+            policy: PolicyIdentity {
+                artifact_version,
+                schema_id,
+                // The epoch the decision was made under, carried out of the
+                // routing call rather than read again here: between the two
+                // reads a reload could land, and this episode would be dated
+                // to a policy that did not produce it.
+                epoch: routed.policy_epoch,
+            },
+            adapter_names: served.with_report(|report| report.artifact.adapter_names.clone()),
+            context_vector: routed.context_vector.clone(),
+            selected_scores: routed.selected_scores.clone(),
+            sampled_scores: routed.sampled_scores.clone(),
+            pre_floor_weights: routed.pre_floor_weights.clone(),
+            applied_weights: routed.applied_weights.clone(),
+            dropped: routed.dropped.clone(),
+            tau: routed.tau,
+            #[cfg(feature = "mixture")]
+            exploration: routed.exploration.clone(),
+        };
+        // A poisoned store loses episodes and must not lose the request: the
+        // completion is the product, the episode is telemetry about it.
+        match state.episodes.lock() {
+            Ok(mut store) => store.record(episode),
+            Err(_) => eprintln!(
+                "[router] the episode store panicked on an earlier request; \
+                 completion {response_id} is served but not recorded"
+            ),
+        }
+    }
 
     if stream {
         // --- Streaming path ---
@@ -1721,7 +1817,7 @@ async fn route_selection(
     state: &AppState,
     served: &Arc<lattice_inference::serve::routing::ServedRouter>,
     messages: &[ChatMessage],
-) -> Result<Vec<lattice_inference::serve::lora::LoraSelection>, ApiError> {
+) -> Result<Option<lattice_inference::serve::routing::RoutedRequest>, ApiError> {
     use lattice_inference::serve::routing::{PromptSource, context_text};
 
     // No user turn means no text under the rule the gate was trained on. Serving the base model is
@@ -1737,7 +1833,11 @@ async fn route_selection(
         )
     });
     let Some(text) = context_text(PromptSource::SERVED, turns) else {
-        return Ok(Vec::new());
+        // `None` rather than an empty selection: a request with nothing to
+        // route on produced no routing decision at all, and recording an
+        // episode for it would put a completion in the learner's population
+        // that no gate ever saw.
+        return Ok(None);
     };
 
     // Startup refuses a router without an embedding model, so this is unreachable rather than
@@ -1775,7 +1875,119 @@ async fn route_selection(
     // included, which is what any acceptance run over it can and cannot claim. Turning the softmax
     // on is ADR-091's evidence gate, not a flag.
     let k = served.with_report(|report| report.artifact.adapter_names.len());
-    served.route(&resident, &context_vector, k)
+    // The vector the gate consumed goes in by value, so the decision carries
+    // the input it was made from. ADR-096 decision 3: the server holds this,
+    // and a caller cannot supply one in its place -- a caller's vector would
+    // describe a mixture the server never formed.
+    Ok(Some(served.route(&resident, context_vector, k)?))
+}
+
+/// `POST /v1/router/feedback` — judge one routed completion (ADR-096 D3).
+///
+/// The body carries a completion id and a signal, and nothing else. Everything
+/// a learner needs about the decision was captured by the server when the
+/// decision was made, because a completion produced by a weighted mixture does
+/// not identify an adapter index and a caller cannot supply one without
+/// inventing credit the feedback never gave.
+///
+/// Three successes and two refusals, and the three successes are different
+/// answers rather than one. `recorded` is an on-policy judgement. `idempotent`
+/// is a retry of the same signal and changed nothing. `stale` means the
+/// judgement is real and counted and will not be used as an on-policy sample,
+/// because the policy epoch it belongs to has ended. Collapsing stale into
+/// success would silently feed a learner samples from a gate that no longer
+/// serves; collapsing it into a failure would tell a caller its feedback was
+/// lost, which is also untrue.
+pub async fn router_feedback(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        let _ = (&state, headers, body);
+        Err(adapter_unsupported_build())
+    }
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    {
+        use lattice_inference::router_episode::FeedbackRequest;
+
+        lattice_inference::serve::require_json_content_type(&headers)?;
+        let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
+            .await
+            .map_err(|_| ApiError::BadRequest {
+                message: "invalid request body".into(),
+                code: "invalid_request",
+            })?;
+        let request: FeedbackRequest =
+            serde_json::from_slice(&bytes).map_err(|err| ApiError::BadRequest {
+                message: format!("invalid feedback body: {err}"),
+                code: "invalid_feedback_body",
+            })?;
+        let Some(signal) = request.parsed_signal() else {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "signal {:?} is not one this server can act on; it is \"helpful\" or \"unhelpful\"",
+                    request.signal
+                ),
+                code: "invalid_feedback_signal",
+            });
+        };
+
+        // Read before the store's lock is taken, never while holding it: the
+        // two locks are never nested in either order, here or on the chat
+        // path. `None` when no gate is loaded, which the store reads as "the
+        // policy that produced this has ended" -- a stand-in number here would
+        // mark every episode on-policy for a router that does not exist.
+        let current_epoch = state
+            .router_state
+            .as_ref()
+            .map(|served| served.policy_epoch());
+        let mut store = state.episodes.lock().map_err(|_| ApiError::Internal {
+            message: "the episode store panicked on an earlier request and is no longer recording"
+                .to_string(),
+        })?;
+        let outcome = store
+            .judge(&request.completion_id, signal, current_epoch)
+            .map_err(|err| ApiError::BadRequest {
+                code: lattice_inference::router_episode::judgement_error_code(&err),
+                message: err.to_string(),
+            })?;
+        Ok(Json(lattice_inference::router_episode::feedback_response(
+            &request.completion_id,
+            signal,
+            outcome,
+        )))
+    }
+}
+
+/// `GET /v1/router/episodes` — the episode census (ADR-096 D3).
+///
+/// Counts, not a rate. The honest denominator for a feedback rate is
+/// contested, and judged-over-recorded describes response behaviour rather
+/// than utility; reporting only that invites reading it as coverage of the
+/// population. `unjudged` is published alongside because missing feedback is
+/// missing and not zero, and `evicted` because a census taken over a bounded
+/// window is a window, which a reader cannot otherwise tell.
+pub async fn router_episodes(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        let _ = &state;
+        Err(adapter_unsupported_build())
+    }
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    {
+        let store = state.episodes.lock().map_err(|_| ApiError::Internal {
+            message: "the episode store panicked on an earlier request and is no longer recording"
+                .to_string(),
+        })?;
+        let census = store.census();
+        Ok(Json(lattice_inference::router_episode::census_response(
+            &census,
+        )))
+    }
 }
 
 /// Make a PEFT or MLX adapter resident without applying it to generation.
@@ -1911,6 +2123,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/lora", get(lora_list))
         .route("/v1/lora/load", post(lora_load))
         .route("/v1/lora/unload", post(lora_unload))
+        .route("/v1/router/feedback", post(router_feedback))
+        .route("/v1/router/episodes", get(router_episodes))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
 }
@@ -2060,6 +2274,8 @@ mod tests {
                 )),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                episodes: episode_store(),
             };
             (state, unblock_tx, started_rx)
         }
@@ -3685,6 +3901,254 @@ mod tests {
     /// two binaries do not share. Asserting a specific status would make this
     /// a behaviour test that passes or fails for reasons unrelated to
     /// registration.
+
+    /// The feedback handler's three successes and three refusals, against a
+    /// store this test populates directly.
+    ///
+    /// Direct population rather than a routed completion: this asks what the
+    /// handler does with an episode, and going through generation to get one
+    /// would make a handler test fail for model reasons.
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal-gpu",
+        feature = "mixture",
+        feature = "test-utils"
+    ))]
+    #[tokio::test]
+    async fn the_feedback_handler_separates_its_three_outcomes_and_two_refusals() {
+        use lattice_inference::router_episode::{PolicyIdentity, RouterEpisode};
+        use tower::ServiceExt;
+
+        let state = tiny_state_with_router(64);
+        let epoch = state
+            .router_state
+            .as_ref()
+            .expect("the fixture installs a router")
+            .policy_epoch();
+        state
+            .episodes
+            .lock()
+            .expect("fresh store")
+            .record(RouterEpisode {
+                completion_id: "chatcmpl-1-0".into(),
+                policy: PolicyIdentity {
+                    artifact_version: "1:abcdef0123456789".into(),
+                    schema_id: "schema-1".into(),
+                    epoch,
+                },
+                adapter_names: vec!["technical".into()],
+                context_vector: vec![0.5, 0.5],
+                selected_scores: vec![("technical".into(), 0.9)],
+                sampled_scores: vec![("technical".into(), 0.9)],
+                pre_floor_weights: vec![("technical".into(), 1.0)],
+                applied_weights: vec![("technical".into(), 1.0)],
+                dropped: Vec::new(),
+                tau: Some(0.7),
+                exploration: None,
+            });
+
+        let post = |state: AppState, body: &'static str| async move {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/router/feedback")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .expect("fixture request must build");
+            let response = router(state).oneshot(request).await.expect("a response");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("a body");
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("the body is JSON");
+            (status, value)
+        };
+
+        let (status, body) = post(
+            state.clone(),
+            r#"{"completion_id":"chatcmpl-1-0","signal":"helpful"}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["outcome"], "recorded");
+
+        let (status, body) = post(
+            state.clone(),
+            r#"{"completion_id":"chatcmpl-1-0","signal":"helpful"}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            body["outcome"], "idempotent",
+            "a retry of the same signal must not refuse"
+        );
+
+        let (status, body) = post(
+            state.clone(),
+            r#"{"completion_id":"chatcmpl-1-0","signal":"unhelpful"}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "conflicting_judgement");
+
+        let (status, body) = post(
+            state.clone(),
+            r#"{"completion_id":"never-routed","signal":"helpful"}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "unknown_completion");
+
+        let (status, body) = post(
+            state.clone(),
+            r#"{"completion_id":"chatcmpl-1-0","signal":"maybe"}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_feedback_signal");
+
+        // A caller supplying provenance is refused rather than having it
+        // quietly dropped: accepting this body would let a caller believe it
+        // had told the server which adapter to credit.
+        let (status, body) = post(
+            state.clone(),
+            r#"{"completion_id":"chatcmpl-1-0","signal":"helpful","context_vector":[0.1]}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_feedback_body");
+    }
+
+    /// The census publishes the three counts a rate would hide, and the
+    /// eviction count that says it is a window.
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal-gpu",
+        feature = "mixture",
+        feature = "test-utils"
+    ))]
+    #[tokio::test]
+    async fn the_episode_census_publishes_unjudged_separately_from_judged() {
+        use lattice_inference::router_episode::{PolicyIdentity, RouterEpisode};
+        use tower::ServiceExt;
+
+        let state = tiny_state_with_router(64);
+        let epoch = state
+            .router_state
+            .as_ref()
+            .expect("the fixture installs a router")
+            .policy_epoch();
+        {
+            let mut store = state.episodes.lock().expect("fresh store");
+            for id in ["a", "b", "c"] {
+                store.record(RouterEpisode {
+                    completion_id: id.into(),
+                    policy: PolicyIdentity {
+                        artifact_version: "1:abcdef0123456789".into(),
+                        schema_id: "schema-1".into(),
+                        epoch,
+                    },
+                    adapter_names: vec!["technical".into()],
+                    context_vector: vec![0.5],
+                    selected_scores: vec![("technical".into(), 0.9)],
+                    sampled_scores: vec![("technical".into(), 0.9)],
+                    pre_floor_weights: vec![("technical".into(), 1.0)],
+                    applied_weights: vec![("technical".into(), 1.0)],
+                    dropped: Vec::new(),
+                    tau: Some(0.7),
+                    exploration: None,
+                });
+            }
+            store
+                .judge(
+                    "a",
+                    lattice_inference::router_episode::EpisodeSignal::Helpful,
+                    Some(epoch),
+                )
+                .expect("judge");
+        }
+
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/router/episodes")
+            .body(axum::body::Body::empty())
+            .expect("fixture request must build");
+        let response = router(state).oneshot(request).await.expect("a response");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("a body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(body["recorded"], 3);
+        assert_eq!(body["judged"], 1);
+        assert_eq!(
+            body["unjudged"], 2,
+            "unjudged must be published, not folded into a rate"
+        );
+        assert_eq!(body["stale"], 0);
+        assert_eq!(body["evicted"], 0);
+    }
+
+    /// Every declared router-feedback route is registered here, with the same
+    /// must-not-match control: `ROUTER_FEEDBACK_ROUTES` is a list, and a list
+    /// is not a registration.
+    ///
+    /// These are `lattice`-only by design. The other serving binary takes no
+    /// `--router-state`, records no episodes, and would answer every judgement
+    /// with `unknown_completion`; a 404 there is the honest answer. That
+    /// asymmetry is why they are a separate const from `LORA_ROUTES` rather
+    /// than three more rows in it.
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn every_router_feedback_route_is_registered_in_this_binary() {
+        use lattice_inference::serve::lora::ROUTER_FEEDBACK_ROUTES;
+        use tower::ServiceExt;
+
+        assert!(
+            !ROUTER_FEEDBACK_ROUTES.is_empty(),
+            "the route list is empty, so this test would pass while checking nothing"
+        );
+
+        for (path, methods) in ROUTER_FEEDBACK_ROUTES {
+            for method in *methods {
+                let request = axum::http::Request::builder()
+                    .method(*method)
+                    .uri(*path)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .expect("fixture request must build");
+                let response = router(tiny_state(64))
+                    .oneshot(request)
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_ne!(
+                    response.status(),
+                    axum::http::StatusCode::NOT_FOUND,
+                    "{method} {path} is in ROUTER_FEEDBACK_ROUTES but not registered here"
+                );
+            }
+        }
+
+        // The must-not-match control: a neighbouring path nobody registered
+        // still 404s, so the loop above is not passing because the router
+        // answers everything.
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/router/definitely-not-a-route")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .expect("fixture request must build");
+        let response = router(tiny_state(64))
+            .oneshot(request)
+            .await
+            .expect("router must produce a response");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "an unregistered path answered, so the loop above proves nothing"
+        );
+    }
+
     #[cfg(feature = "test-utils")]
     #[tokio::test]
     async fn every_shared_lora_route_is_registered_in_this_binary() {
@@ -3762,6 +4226,63 @@ mod tests {
             cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             router_state: None,
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            episodes: episode_store(),
+        }
+    }
+
+    /// A state whose router is real, for the handlers that compare a
+    /// judgement against the epoch a gate is serving under.
+    ///
+    /// The `None` router the plain fixture carries is a state the feedback
+    /// path can no longer be exercised from: with no gate there is no epoch,
+    /// and every judgement is stale by construction. That is production's
+    /// answer too -- a server with no router records no episode -- so the
+    /// fixture installs the gate rather than the handler inventing an epoch
+    /// for a router that is not there.
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal-gpu",
+        feature = "mixture",
+        feature = "test-utils"
+    ))]
+    fn tiny_state_with_router(max_tokens_cap: usize) -> AppState {
+        use lattice_inference::router_init::{BootstrapSpec, bootstrap_artifact};
+        use lattice_inference::router_state::{ResolvedRouter, TrainedRepresentation};
+        use lattice_inference::serve::embeddings::QWEN35_F16_DECODER_LOADER;
+        use lattice_inference::serve::routing::{PromptSource, ServedRouter};
+
+        const WIDTH: usize = 4;
+        let embedder = lattice_inference::serve::routing::EmbedderIdentity::resolve(
+            std::path::Path::new("/models"),
+            Some("gme-qwen35"),
+        );
+        let artifact = bootstrap_artifact(&BootstrapSpec {
+            adapter_names: vec!["technical".to_string()],
+            representation: TrainedRepresentation {
+                embedding_model: embedder.as_str().to_string(),
+                pooling: "mean_visual".to_string(),
+                prompt_source: PromptSource::SERVED.as_str().to_string(),
+                loader_format: QWEN35_F16_DECODER_LOADER.to_string(),
+                input_width: WIDTH as u64,
+            },
+            schema_id: "schema-1".to_string(),
+            base_model: "test-model".to_string(),
+        })
+        .expect("the bootstrap specification must be valid");
+        let served = ServedRouter::new(
+            ResolvedRouter {
+                artifact,
+                pinned: false,
+            },
+            &embedder,
+            WIDTH,
+        )
+        .expect("a bootstrap artifact must be servable by the build that wrote it");
+
+        AppState {
+            router_state: Some(std::sync::Arc::new(served)),
+            ..tiny_state(max_tokens_cap)
         }
     }
 
@@ -4397,6 +4918,8 @@ mod tests {
                 )),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                episodes: episode_store(),
             };
 
             let response = router(state)
@@ -5310,6 +5833,8 @@ mod tests {
                 cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                episodes: episode_store(),
             }
         }
 
@@ -5817,6 +6342,8 @@ mod tests {
                 cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                episodes: episode_store(),
             }
         }
 
@@ -6041,6 +6568,8 @@ mod tests {
                 cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                episodes: episode_store(),
             };
             let request = axum::http::Request::builder()
                 .method("POST")
@@ -6240,6 +6769,8 @@ mod tests {
                 cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                episodes: episode_store(),
             }
         }
 
