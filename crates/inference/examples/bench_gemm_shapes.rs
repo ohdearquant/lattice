@@ -17,6 +17,11 @@
 //!   device that reports the Apple7 GPU family. Buffers 0/1/2 are QW, X, Y;
 //!   constants 3/4/5 are M, N, K; the grid is `(ceil(N/32), ceil(M/64), 1)` with
 //!   32x4 threads per threadgroup.
+//! - `gemm_f32_sg` (`Y[M,N] = X[M,K] . W[N,K]^T`, all f32) runs the same tile as
+//!   `gemm_q4_tiled` with f32 operands and accumulators on simdgroup matrices.
+//!   It is compiled like `gemm_q4_tiled` (Metal 3.0, Apple7 family); buffers
+//!   0/1/2 are X, W, Y, constants 3/4/5 are M, N, K, and the grid and
+//!   threadgroup size are `gemm_q4_tiled`'s.
 //!
 //! Timing: each repetition encodes one dispatch in its own command buffer,
 //! commits it, waits, and reads that command buffer's `GPUStartTime` and
@@ -35,7 +40,7 @@
 //!     --features f16,metal-gpu -- --shape 2304x768x768 --kernel all --reps 20
 //!
 //! CLI: `--shape MxNxK` (repeatable; defaults to 2304x768x768, 2304x3072x768,
-//! 2304x768x3072, 2304x2304x64), `--kernel matmul_bt|q4_tiled|all` (default all),
+//! 2304x768x3072, 2304x2304x64), `--kernel matmul_bt|q4_tiled|f32_sg|all` (default all),
 //! `--reps N` (default 20), `--warmup N` (default 3).
 
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -64,12 +69,16 @@ fn run() -> Result<(), String> {
     let queue = device.new_command_queue();
 
     let matmul = match options.kernel {
-        KernelSelection::Q4Tiled => None,
         KernelSelection::MatmulBt | KernelSelection::All => Some(build_matmul_pipeline(&device)?),
+        KernelSelection::Q4Tiled | KernelSelection::F32Sg => None,
     };
     let q4_tiled = match options.kernel {
-        KernelSelection::MatmulBt => None,
         KernelSelection::Q4Tiled | KernelSelection::All => Some(build_q4_tiled_pipeline(&device)?),
+        KernelSelection::MatmulBt | KernelSelection::F32Sg => None,
+    };
+    let f32_sg = match options.kernel {
+        KernelSelection::F32Sg | KernelSelection::All => Some(build_f32_sg_pipeline(&device)?),
+        KernelSelection::MatmulBt | KernelSelection::Q4Tiled => None,
     };
 
     let mut failed = false;
@@ -81,6 +90,11 @@ fn run() -> Result<(), String> {
         }
         if let Some(pipeline) = q4_tiled.as_ref()
             && !run_q4_tiled(&device, &queue, pipeline, *shape, &options)?
+        {
+            failed = true;
+        }
+        if let Some(pipeline) = f32_sg.as_ref()
+            && !run_f32_sg(&device, &queue, pipeline, *shape, &options)?
         {
             failed = true;
         }
@@ -96,6 +110,7 @@ fn run() -> Result<(), String> {
 enum KernelSelection {
     MatmulBt,
     Q4Tiled,
+    F32Sg,
     All,
 }
 
@@ -154,6 +169,12 @@ const MATMUL_REL_BOUND: f64 = 1.0e-3;
 /// margin over that while a decode, layout or dispatch mistake lands far above it.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 const Q4_REL_BOUND: f64 = 5.0e-3;
+/// Relative-error bound for `gemm_f32_sg`: f32 operands and accumulation, so the
+/// difference from the f64 reference is accumulation order alone. 1e-6 is f32
+/// class (`matmul_bt` measures about 1.6e-7 at K=3072) and sits far below what
+/// an operand staged through f16 would produce.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const F32_SG_REL_BOUND: f64 = 1.0e-6;
 /// Number of sampled output elements compared against the host reference.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 const SAMPLE_COUNT: usize = 64;
@@ -176,14 +197,15 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> 
             "--kernel" => {
                 let value = args
                     .next()
-                    .ok_or("--kernel needs matmul_bt, q4_tiled or all")?;
+                    .ok_or("--kernel needs matmul_bt, q4_tiled, f32_sg or all")?;
                 options.kernel = match value.as_str() {
                     "matmul_bt" => KernelSelection::MatmulBt,
                     "q4_tiled" => KernelSelection::Q4Tiled,
+                    "f32_sg" => KernelSelection::F32Sg,
                     "all" => KernelSelection::All,
                     other => {
                         return Err(format!(
-                            "--kernel must be matmul_bt, q4_tiled or all, got {other}"
+                            "--kernel must be matmul_bt, q4_tiled, f32_sg or all, got {other}"
                         ));
                     }
                 };
@@ -296,6 +318,32 @@ fn matmul_source() -> String {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 const Q4_TILED_SOURCE: &str = include_str!("../src/forward/shaders/gemm_q4_tiled.metal");
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const F32_SG_SOURCE: &str = include_str!("../src/forward/shaders/gemm_f32_sg.metal");
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn build_f32_sg_pipeline(device: &metal::Device) -> Result<metal::ComputePipelineState, String> {
+    use metal::{CompileOptions, MTLGPUFamily, MTLLanguageVersion};
+
+    if !device.supports_family(MTLGPUFamily::Apple7) {
+        return Err(
+            "gemm_f32_sg needs the Apple7 GPU family (simdgroup matrix operations)".to_string(),
+        );
+    }
+    let options = CompileOptions::new();
+    options.set_language_version(MTLLanguageVersion::V3_0);
+    options.set_fast_math_enabled(false);
+    let library = device
+        .new_library_with_source(F32_SG_SOURCE, &options)
+        .map_err(|error| format!("gemm_f32_sg shader compilation failed: {error}"))?;
+    let function = library
+        .get_function("gemm_f32_sg", None)
+        .map_err(|error| format!("gemm_f32_sg kernel missing: {error}"))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|error| format!("gemm_f32_sg pipeline failed: {error}"))
+}
 
 /// Deterministic 64-bit counter RNG (SplitMix64), so every buffer and every
 /// sample index is reproducible from a fixed seed.
@@ -638,6 +686,66 @@ fn run_q4_tiled(
     if max_rel > Q4_REL_BOUND {
         let bound = Q4_REL_BOUND;
         eprintln!("q4_tiled {m}x{n}x{k} relative error {max_rel:.6e} exceeds {bound:.1e}");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn run_f32_sg(
+    device: &metal::Device,
+    queue: &metal::CommandQueue,
+    pipeline: &metal::ComputePipelineState,
+    shape: Shape,
+    options: &Options,
+) -> Result<bool, String> {
+    if !shape.k.is_multiple_of(4) {
+        let k = shape.k;
+        return Err(format!(
+            "f32_sg needs K divisible by 4 (float4 staging), got K={k}"
+        ));
+    }
+    let m = u32::try_from(shape.m).map_err(|_| "M exceeds u32 indexing".to_string())?;
+    let n = u32::try_from(shape.n).map_err(|_| "N exceeds u32 indexing".to_string())?;
+    let k = u32::try_from(shape.k).map_err(|_| "K exceeds u32 indexing".to_string())?;
+
+    let x_values = activation(0x1111_2222_3333_4444, shape.m * shape.k);
+    let w_values = activation(0x5555_6666_7777_8888, shape.n * shape.k);
+    let x_buffer = shared_buffer(device, shape.m * shape.k * 4);
+    let w_buffer = shared_buffer(device, shape.n * shape.k * 4);
+    let y_buffer = shared_buffer(device, shape.m * shape.n * 4);
+    write_slice(&x_buffer, &x_values);
+    write_slice(&w_buffer, &w_values);
+
+    let encode = |encoder: &metal::ComputeCommandEncoderRef| {
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(&x_buffer), 0);
+        encoder.set_buffer(1, Some(&w_buffer), 0);
+        encoder.set_buffer(2, Some(&y_buffer), 0);
+        encoder.set_bytes(3, 4, std::ptr::from_ref(&m).cast());
+        encoder.set_bytes(4, 4, std::ptr::from_ref(&n).cast());
+        encoder.set_bytes(5, 4, std::ptr::from_ref(&k).cast());
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(u64::from(n).div_ceil(32), u64::from(m).div_ceil(64), 1),
+            metal::MTLSize::new(32, 4, 1),
+        );
+    };
+
+    for _ in 0..options.warmup {
+        timed_dispatch(queue, encode)?;
+    }
+    let mut spans = Vec::with_capacity(options.reps);
+    for _ in 0..options.reps {
+        spans.push(timed_dispatch(queue, encode)?);
+    }
+    summary("f32_sg", shape, &spans)?;
+
+    let y = read_slice(&y_buffer, shape.m * shape.n);
+    let (max_abs, max_rel) = matmul_reference_error(&x_values, &w_values, &y, shape);
+    report_check("f32_sg", shape, max_abs, max_rel);
+    if max_rel > F32_SG_REL_BOUND {
+        let bound = F32_SG_REL_BOUND;
+        eprintln!("f32_sg {m}x{n}x{k} relative error {max_rel:.6e} exceeds {bound:.1e}");
         return Ok(false);
     }
     Ok(true)
