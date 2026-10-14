@@ -1,10 +1,12 @@
 //! EmbeddingGemma 2 vision tower, f32 forward pass on Metal.
 //!
 //! The tower runs on the valid patch rows only, exactly as the CPU reference does, and each
-//! layer hands off between the host and the GPU around the two reused kernels: bidirectional
-//! attention at head width 64 (scale 1.0, no window) and the GeGLU MLP block. The residual
-//! stream and the q/k/v/context buffers are shared `MTLBuffer`s, so the host reads and writes
-//! them directly and a handoff is a command buffer commit and wait rather than a copy.
+//! layer hands off between the host and the GPU around two GPU segments: bidirectional attention
+//! at head width 64 (scale 1.0, no window) and the GeGLU MLP block. Both run their matrix
+//! products on simdgroup matrices where the device has them (Apple7 family or later), and on the
+//! vector kernels otherwise. The residual stream and the q/k/v/context buffers are shared
+//! `MTLBuffer`s, so the host reads and writes them directly and a handoff is a command buffer
+//! commit and wait rather than a copy.
 //!
 //! The host runs the input RMSNorm, the q/k/v projections, the QK norm with a scale-free V norm,
 //! the axial RoPE, the output projection, the post-attention norm and residual add; the GPU runs
@@ -547,7 +549,7 @@ impl MetalEmbeddingGemma2VisionState {
 
         // GPU: bidirectional attention at head width 64, scale 1.0, no window.
         let span = ctx.run_timed(|enc| {
-            pipelines.attention(
+            pipelines.attention_matrix(
                 enc,
                 head_dim,
                 &scratch.q,
@@ -557,7 +559,6 @@ impl MetalEmbeddingGemma2VisionState {
                 rows as u32,
                 heads as u32,
                 kv_heads as u32,
-                None,
             )
         })?;
         timings.attention_gpu_us += micros(span);
@@ -595,7 +596,7 @@ impl MetalEmbeddingGemma2VisionState {
                 hidden as u32,
                 eps,
             );
-            p.matmul(
+            p.matmul_matrix(
                 enc,
                 &scratch.normed,
                 &gpu.gate,
@@ -605,7 +606,7 @@ impl MetalEmbeddingGemma2VisionState {
                 intermediate as u32,
                 hidden as u32,
             );
-            p.matmul(
+            p.matmul_matrix(
                 enc,
                 &scratch.normed,
                 &gpu.up,
@@ -621,7 +622,7 @@ impl MetalEmbeddingGemma2VisionState {
                 &scratch.up,
                 (rows * intermediate) as u32,
             );
-            p.matmul(
+            p.matmul_matrix(
                 enc,
                 &scratch.gate,
                 &gpu.down,
