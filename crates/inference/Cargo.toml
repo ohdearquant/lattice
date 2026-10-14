@@ -380,6 +380,10 @@ name = "bench_concurrent"
 required-features = ["f16", "metal-gpu"]
 
 [[example]]
+name = "bench_gemm_shapes"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
 name = "decode_profile"
 required-features = ["f16", "metal-gpu"]
 
