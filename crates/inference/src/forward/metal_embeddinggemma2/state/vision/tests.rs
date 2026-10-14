@@ -325,6 +325,27 @@ fn one_vision_layer_on_metal_matches_the_cpu_layer() {
     let diff = max_diff(&stages.encoder, &cpu.encoder);
     eprintln!("one layer: max abs diff {diff:e} (bound {limit:e})");
     assert!(diff <= limit, "one layer differs by {diff}, bound {limit}");
+    for (name, got, want) in [
+        ("q normed", &stages.layer_0_q_normed, &cpu.layer_0_q_normed),
+        ("k normed", &stages.layer_0_k_normed, &cpu.layer_0_k_normed),
+        (
+            "q rotated",
+            &stages.layer_0_q_rotated,
+            &cpu.layer_0_q_rotated,
+        ),
+        (
+            "k rotated",
+            &stages.layer_0_k_rotated,
+            &cpu.layer_0_k_rotated,
+        ),
+    ] {
+        assert!(!want.is_empty(), "{name}: the CPU tower captured nothing");
+        assert_eq!(got.len(), want.len(), "{name}: length mismatch");
+        let limit = tower_bound(want);
+        let diff = max_diff(got, want);
+        eprintln!("one layer {name}: max abs diff {diff:e} (bound {limit:e})");
+        assert!(diff <= limit, "{name} differs by {diff}, bound {limit}");
+    }
 }
 
 #[test]
