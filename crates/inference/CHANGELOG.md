@@ -10,6 +10,17 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-14
+
+Documentation and package metadata only; no code changes.
+
+### Documentation
+
+- crates.io keywords and categories; docs.rs builds the documentation with `f16`, `x86-gemm`, `mixture`, `train-backward` and `wgpu-gpu` (#1936).
+- The crate documentation builds without rustdoc warnings under the default features and the docs.rs feature set (#1937).
+- The README and crate docs no longer point at a stability document that does not exist (#1936).
+- The README's supported architectures table lists EmbeddingGemma 2, Gemma 4 E2B and PaddleOCR-VL / ERNIE-4.5 (#1938).
+
 ## [0.12.0] - 2026-10-13
 
 ### Breaking

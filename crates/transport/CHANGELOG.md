@@ -10,6 +10,14 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-14
+
+Documentation and package metadata only; no code changes.
+
+### Documentation
+
+- crates.io keywords and categories (#1936).
+
 ## [0.12.0] - 2026-10-13
 
 No changes in this crate; the version follows the workspace.
