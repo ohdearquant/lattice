@@ -173,11 +173,11 @@ reason = "Long-running interactive product process; process-lifetime, not a fini
 
 [[non_measurement_surface]]
 path = "crates/inference/src/bin/lattice/main.rs"
-reason = "Long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+reason = "Product CLI for interactive chat, one-shot responses, serving and model inspection; it emits no timed measurements (see metal_measurement_lock_contract.rs product-process exemptions)."
 
 [[non_measurement_surface]]
 path = "crates/inference/src/bin/lattice/chat.rs"
-reason = "`lattice chat` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+reason = "`lattice chat` product subcommand for interactive or one-shot generation; response text and token counts are not timed measurements (see metal_measurement_lock_contract.rs product-process exemptions)."
 
 [[non_measurement_surface]]
 path = "crates/inference/src/bin/lattice/serve.rs"
