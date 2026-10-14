@@ -567,11 +567,11 @@ fn run_matmul_bt(
     };
 
     for _ in 0..options.warmup {
-        timed_dispatch(queue, &encode)?;
+        timed_dispatch(queue, encode)?;
     }
     let mut spans = Vec::with_capacity(options.reps);
     for _ in 0..options.reps {
-        spans.push(timed_dispatch(queue, &encode)?);
+        spans.push(timed_dispatch(queue, encode)?);
     }
     summary("matmul_bt", shape, &spans)?;
 
@@ -624,11 +624,11 @@ fn run_q4_tiled(
     };
 
     for _ in 0..options.warmup {
-        timed_dispatch(queue, &encode)?;
+        timed_dispatch(queue, encode)?;
     }
     let mut spans = Vec::with_capacity(options.reps);
     for _ in 0..options.reps {
-        spans.push(timed_dispatch(queue, &encode)?);
+        spans.push(timed_dispatch(queue, encode)?);
     }
     summary("q4_tiled", shape, &spans)?;
 
