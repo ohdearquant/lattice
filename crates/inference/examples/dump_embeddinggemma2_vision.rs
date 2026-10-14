@@ -4,7 +4,7 @@
 //! Usage:
 //!   cargo run -p lattice-inference --release --example dump_embeddinggemma2_vision -- \
 //!     --model-dir <dir> --corpus <corpus.json> --out <out.safetensors> \
-//!     [--widths 768,512,256,128] [--max-tokens 8192]
+//!     [--widths 768,512,256,128] [--max-tokens 8192] [--metal]
 //!
 //! `<corpus.json>` is `[{"id": "...", "parts": [{"text": "..."} | {"image":
 //! {"raw_rgb8_path": "...", "width": N, "height": N}}]}, ...]`. Each `raw_rgb8_path`
@@ -39,10 +39,16 @@
 //! The `layer_0_q_*`/`layer_0_k_*` pairs are extra: the reference captures neither, and
 //! they feed the RoPE differential. `q_normed`/`k_normed` are pre-rotation.
 //! `--max-tokens` bounds each text part including its own wrapping tokens (default 8192);
-//! `--max-tokens 0` removes the bound.
+//! `--max-tokens 0` removes the bound. `--metal` runs the vision tower on the GPU in f32
+//! (macOS with the `metal-gpu` feature); it holds the machine GPU lock for the run, reports
+//! the per-segment tower times on stderr as `@@mvt` lines, and never falls back to the host.
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use lattice_inference::forward::metal_embeddinggemma2::MetalEmbeddingGemma2State;
+use lattice_inference::forward::metal_embeddinggemma2::VisionTimings;
 use lattice_inference::model::embeddinggemma2::{
     EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS, EmbeddingGemma2Model, EmbeddingGemma2Part,
+    EmbeddingGemma2PartsEncoding,
 };
 use lattice_inference::model::embeddinggemma2_image::EmbeddingGemma2Rgb8Image;
 use serde_json::Value;
@@ -56,7 +62,18 @@ struct Args {
     out: PathBuf,
     widths: Vec<usize>,
     max_tokens: Option<usize>,
+    metal: bool,
 }
+
+/// Runs one row's parts through either the host or the Metal entry, returning the encoding and,
+/// on the Metal path, the vision tower's per-segment timings.
+type Forward<'a> = dyn FnMut(
+        &[EmbeddingGemma2Part],
+        &[usize],
+    ) -> Result<
+        (EmbeddingGemma2PartsEncoding, Option<VisionTimings>),
+        Box<dyn std::error::Error>,
+    > + 'a;
 
 fn parse_args() -> Result<Args, String> {
     let mut model_dir = None;
@@ -64,8 +81,13 @@ fn parse_args() -> Result<Args, String> {
     let mut out = None;
     let mut widths = vec![768, 512, 256, 128];
     let mut max_tokens = Some(EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS);
+    let mut metal = false;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
+        if flag == "--metal" {
+            metal = true;
+            continue;
+        }
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--model-dir" => model_dir = Some(PathBuf::from(value)),
@@ -96,6 +118,7 @@ fn parse_args() -> Result<Args, String> {
         out: out.ok_or("--out is required")?,
         widths,
         max_tokens,
+        metal,
     })
 }
 
@@ -156,6 +179,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     let model =
         EmbeddingGemma2Model::from_model_dir(&args.model_dir)?.with_max_tokens(args.max_tokens)?;
+    if args.metal {
+        return dump_metal(&args, &model);
+    }
+    dump(&args, &model, &mut |parts, widths| {
+        Ok((
+            model.encode_parts_at_widths(parts, widths, &mut || false)?,
+            None,
+        ))
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn dump_metal(args: &Args, model: &EmbeddingGemma2Model) -> Result<(), Box<dyn std::error::Error>> {
+    let _gpu = lattice_inference::measurement::gpu_test_lock();
+    let mut state = MetalEmbeddingGemma2State::new(model)?;
+    dump(args, model, &mut |parts, widths| {
+        let (encoding, timings) =
+            model.encode_parts_at_widths_metal(&mut state, parts, widths, &mut || false)?;
+        Ok((encoding, Some(timings)))
+    })
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+fn dump_metal(
+    _args: &Args,
+    _model: &EmbeddingGemma2Model,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("--metal requires macOS and the metal-gpu feature".into())
+}
+
+fn dump(
+    args: &Args,
+    model: &EmbeddingGemma2Model,
+    forward: &mut Forward<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let corpus: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(&args.corpus)?)?;
 
     let mut sink = TensorSink::default();
@@ -200,8 +258,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?));
         }
 
-        let mut cancelled = || false;
-        let encoding = model.encode_parts_at_widths(&parts, &args.widths, &mut cancelled)?;
+        let (encoding, timings) = forward(&parts, &args.widths)?;
+        if let Some(timings) = timings {
+            eprintln!(
+                "@@mvt row={id} tokens={} attn_gpu_us={} mlp_gpu_us={} cpu_pre_us={} \
+                 cpu_post_us={} tower_us={}",
+                encoding.counts.sequence_length,
+                timings.attention_gpu_us,
+                timings.mlp_gpu_us,
+                timings.cpu_pre_attention_us,
+                timings.cpu_post_attention_us,
+                timings.tower_us,
+            );
+        }
         let embedding_dim = model.dimensions();
         let prefix = |name: &str| format!("{id}/{name}");
 
