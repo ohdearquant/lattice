@@ -122,6 +122,11 @@ pub mod route;
 /// Gate-free routing facade for the serving path (ADR-094 decision 2).
 pub mod routing;
 
+/// Request, prompt, and answer layer for the system-one (multi-slot decision)
+/// wire format: the pure half of the decision read-out, ported from the public
+/// decider checkpoint's own server code. Holds no HTTP route and no model call.
+pub mod systemone;
+
 /// Request body size cap shared by both HTTP servers: 1 MiB. Both binaries
 /// already enforced this exact limit independently (`lattice.rs` via
 /// `DefaultBodyLimit::max`, `lattice_serve.rs` via `to_bytes(body, LIMIT)`);

@@ -7,6 +7,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Fast neural network primitives for Lattice - tiny models, fast inference"
+keywords = ["neural-network", "fann", "mlp", "simd", "router"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = ["std", "simd"]

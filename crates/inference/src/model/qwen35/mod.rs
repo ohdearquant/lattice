@@ -26,7 +26,7 @@ pub(crate) mod stop_strings;
 mod weights;
 
 pub use embed::HiddenPooling;
-pub use eval::{PerplexityConfig, PerplexityReport};
+pub use eval::{PerplexityConfig, PerplexityReport, PrefillInput};
 /// Re-exported for the Metal Q4 perplexity harness in
 /// [`crate::forward::metal_qwen35`]; the CPU forward path consumes them
 /// directly inside [`eval`].

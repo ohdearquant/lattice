@@ -662,7 +662,9 @@ def _run(
         # Zero is honest for a run whose output is never quoted as a
         # measurement; it is not a default anything else should use.
         env = {
-            **os.environ,
+            **{key: value for key, value in os.environ.items()
+               if key != "CARGO_BUILD_TARGET_DIR"},
+            "CARGO_TARGET_DIR": str(root / "target"),
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "BENCH_IDLE_FLOOR": "0",
             "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
@@ -1238,6 +1240,50 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stderr:\n{result.stderr}",
         )
         self.assertIn("Done.", result.stdout)
+
+    def test_out_of_tree_target_protection_reaches_real_gate_with_valid_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "external-target"
+            captured = []
+
+            def capture_provenance(root):
+                path = root / ".cache" / "bench-run-provenance.txt"
+                captured.append(gate.load_run_provenance(path))
+
+            guarded_cargo = STALE_CHANGE_CARGO.replace(
+                "#!/usr/bin/env bash\n",
+                "#!/usr/bin/env bash\n"
+                'if [ ! -f "$CARGO_TARGET_DIR/.metadata_never_index" ] || '
+                '[ -L "$CARGO_TARGET_DIR/.metadata_never_index" ]; then\n'
+                '  echo "fixture target was not protected before Cargo" >&2\n'
+                "  exit 87\n"
+                "fi\n",
+                1,
+            )
+            result = _run(
+                [],
+                stub_cargo=guarded_cargo,
+                extra_env={"CARGO_TARGET_DIR": str(target)},
+                post_run=capture_provenance,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            marker = target / ".metadata_never_index"
+            self.assertTrue(marker.is_file())
+            self.assertFalse(marker.is_symlink())
+            prefix = "[bench-supervision] Run conditions: cargo target protection "
+            dispositions = [
+                json.loads(line[len(prefix):])
+                for line in result.stdout.splitlines() if line.startswith(prefix)
+            ]
+            self.assertEqual(dispositions, [
+                {"status": "marked", "directory": str(target.resolve())}
+            ])
+            self.assertIn("  cargo target protection: ", result.stdout)
+            self.assertIn("host_id=local-random:", result.stdout)
+            self.assertNotIn("invalid run provenance", result.stdout + result.stderr)
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0].schema, gate.PROVENANCE_SCHEMA_V2)
+            self.assertNotIn("cargo_target_protection", captured[0].fields)
 
     def test_report_only_mode_uses_balanced_order(self):
         """Report-only evidence uses the same balanced ABBA measurement."""
@@ -2834,8 +2880,9 @@ print(json.dumps(dict(reason="compiler-artifact", package_id="path+" + (root / "
             env = {key: value for key, value in os.environ.items()
                    if not key.startswith("LATTICE_GPU_HANDOFF_") and key not in (
                        "LATTICE_BENCH_LOCK_STATUS", "LATTICE_BENCH_LOCK_FDS", "LATTICE_BENCH_SUPERVISOR_FD",
-                       "CARGO_BUILD_TARGET", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}
+                       "CARGO_BUILD_TARGET", "CARGO_BUILD_TARGET_DIR", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}
             env.update({"PATH": f"{bindir}:{env['PATH']}", "PYTHONDONTWRITEBYTECODE": "1",
+                        "CARGO_TARGET_DIR": str(root / "target"),
                         "LATTICE_MODEL_DIR": "fixture-model.txt", "FIXTURE_KIND": kind, "FIXTURE_ARGS": " ".join(bin_args), "FIXTURE_SECOND": str(int(second_acquisition)),
                         "FIXTURE_REPO": str(root), "FIXTURE_GPU": str(lock_names["GPU_LOCK"]),
                         "FIXTURE_WORK": str(temp / "worked.json"), "FIXTURE_QUIET": str(temp / "quiet"),

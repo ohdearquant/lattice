@@ -154,3 +154,12 @@ let (embedding, timings) = model.encode_with_profile("your text")?;
 
 `BertModel` does not currently expose per-layer timings. Use `bench_profile.rs` for
 whole-pass measurement.
+
+## Decision Model Reference Table
+
+[`bench/decision-index/`](../bench/decision-index/README.md) measures public "system one" decision models, which
+return a probability over each question's options from a single prefill with no generated text, on the
+[Decision Index](https://github.com/apolinario/decision-index) edition 0.3 benchmark. Each model runs its author's
+own inference code on an Apple M4. The directory holds the scorer, the engine and server scripts, the reproduction
+steps and the reference table. No row runs lattice yet; a lattice row is added through the same scorer once lattice
+serves the decision read-out described in [ADR-098](adr/ADR-098-decision-readout.md).

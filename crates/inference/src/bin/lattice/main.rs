@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 mod chat;
 mod doctor;
 mod prune_score;
+mod router;
 mod serve;
 
 #[derive(Parser)]
@@ -76,10 +77,11 @@ enum Command {
         tokenizer_dir: Option<String>,
         /// Cap on outstanding (queued + in-flight) requests to the Metal GPU
         /// worker (issue #932) before new requests are rejected with HTTP
-        /// 503. Only applies to Q4/Metal-backed serving; the CPU backend has
-        /// no shared worker queue to bound. Conservative default: this
-        /// worker serializes all generation onto one dedicated thread, so a
-        /// deep queue just means memory growth with no throughput benefit.
+        /// 503. Only applies to Q4/Metal-backed serving; the CPU backend is
+        /// bounded separately by `--max-cpu-generations`. Conservative
+        /// default: this worker serializes all generation onto one dedicated
+        /// thread, so a deep queue just means memory growth with no
+        /// throughput benefit.
         /// Must be between 1 and `tokio::sync::Semaphore::MAX_PERMITS`
         /// (issue #939): zero would admit nothing (every request fails
         /// admission), and clap rejects anything larger here instead of
@@ -92,6 +94,26 @@ enum Command {
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
         max_pending: usize,
+        /// Number of chat generations the CPU backend runs at once. A
+        /// concurrency cap, not a queue: a request that arrives while this
+        /// many CPU generations are already in flight is rejected with HTTP
+        /// 503 `server_busy` immediately, never queued. A resource guard
+        /// rather than a throughput setting: each admitted generation holds
+        /// one serving runtime and its KV cache, and concurrent generations
+        /// contend for the same CPU cores, so the default stays small and an
+        /// operator with spare cores and memory can raise it. Ignored by the
+        /// Q4/Metal backend, whose own bound is `--max-pending`.
+        /// Must be between 1 and `tokio::sync::Semaphore::MAX_PERMITS`, the
+        /// same range rule as `--max-pending`: zero would admit nothing, and
+        /// clap rejects anything larger instead of deferring to
+        /// `Semaphore::new`'s precondition panic.
+        #[arg(
+            long,
+            default_value_t = serve::CPU_GENERATION_MAX_CONCURRENT_JOBS,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
+                .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
+        )]
+        max_cpu_generations: usize,
         /// Maximum resident adapter identities; reaching the cap rejects new loads.
         #[arg(long, default_value_t = lattice_inference::serve::lora::DEFAULT_MAX_RESIDENT_ADAPTERS,
             value_parser = lattice_inference::serve::lora::parse_resident_limit)]
@@ -118,11 +140,13 @@ enum Command {
         /// Directory holding versioned router gate artifacts (ADR-095
         /// decision 3). Omitted, the server has no router: a request that
         /// omits `lora` selects the base model, exactly as it does today.
-        /// Given, the highest version present is loaded at startup and a
-        /// directory that holds an artifact which will not load FAILS the
-        /// startup rather than serving with routing silently off -- those two
-        /// states answer requests differently and only one of them was asked
-        /// for.
+        /// Given, a committed head record selects the artifact when the
+        /// directory holds one (ADR-096 decision 5), and the highest counter
+        /// present selects it otherwise, which is ADR-095's rule for a
+        /// format-4 directory. A directory that holds an artifact which will
+        /// not load FAILS the startup rather than serving with routing
+        /// silently off -- those two states answer requests differently and
+        /// only one of them was asked for.
         #[arg(long)]
         router_state: Option<String>,
         /// Serve a specific router gate version instead of the highest one
@@ -134,8 +158,14 @@ enum Command {
         /// the latest would serve exactly the artifact the operator was
         /// trying to get away from, under a flag that says otherwise. A pin
         /// without --router-state fails too, naming the missing flag.
+        ///
+        /// Takes `<version>` or `<version>:<hash-prefix>` -- the same two
+        /// spellings a running server prints. The bare counter is ADR-095's
+        /// pin and is what a format-4 directory can answer; the pair names a
+        /// full version identity and is refused if that counter now holds a
+        /// different artifact (ADR-096 decision 5).
         #[arg(long)]
-        router_pin: Option<u64>,
+        router_pin: Option<String>,
         /// Directory to load the embedding model from, instead of the served
         /// model's own directory (ADR-094 decision 1, amendment 2).
         ///
@@ -194,6 +224,25 @@ enum Command {
         #[command(flatten)]
         args: prune_score::Args,
     },
+    /// Provision and inspect a router state directory.
+    Router {
+        #[command(subcommand)]
+        command: RouterCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RouterCommand {
+    /// Provision a state directory with an UNTRAINED bootstrap gate.
+    ///
+    /// The output is a deterministic gate whose logits are zero, carrying the
+    /// uniform policy with nothing learned. It is legitimate to serve as a
+    /// baseline and is not evidence of learning: the artifact says so, and
+    /// `GET /v1/lora` reports it. Initialising does not enable learning.
+    Init {
+        #[command(flatten)]
+        args: router::InitArgs,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +290,7 @@ async fn main() {
             model_id,
             tokenizer_dir,
             max_pending,
+            max_cpu_generations,
             max_resident_adapters,
             max_resident_adapter_bytes,
             preload_vision,
@@ -428,8 +478,20 @@ async fn main() {
 
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let router_artifact = {
-                use lattice_inference::router_state::{StartupDisposition, resolve_startup};
-                match resolve_startup(router_state.as_deref().map(Path::new), router_pin) {
+                use lattice_inference::router_state::{
+                    RouterPin, StartupDisposition, resolve_startup,
+                };
+                // Parsed here rather than by clap so the refusal is this
+                // module's error type, printed in the same shape as every
+                // other startup refusal below.
+                let parsed_pin = match router_pin.as_deref().map(RouterPin::parse).transpose() {
+                    Ok(pin) => pin,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                match resolve_startup(router_state.as_deref().map(Path::new), parsed_pin.as_ref()) {
                     Ok(StartupDisposition::NoRouter) => None,
                     Ok(StartupDisposition::Loaded(resolved)) => {
                         // Naming the embedder is REQUIRED for routing, rather
@@ -510,6 +572,7 @@ async fn main() {
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model,
                 embedding_admission: Arc::new(Semaphore::new(serve::EMBEDDING_MAX_CONCURRENT_JOBS)),
+                cpu_generation_admission: Arc::new(Semaphore::new(max_cpu_generations)),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: router_artifact,
             };
@@ -559,6 +622,13 @@ async fn main() {
                 }
             }
         }
+        Command::Router { command } => match command {
+            RouterCommand::Init { args } => {
+                if !router::run(&args) {
+                    std::process::exit(1);
+                }
+            }
+        },
         Command::PruneScore { args } => match prune_score::run(&args) {
             Ok(true) => {}
             Ok(false) => std::process::exit(1),
@@ -655,6 +725,18 @@ mod max_pending_cli_tests {
         full.extend_from_slice(args);
         match Cli::try_parse_from(full)?.command {
             Command::Serve { max_pending, .. } => Ok(max_pending),
+            _ => panic!("expected Command::Serve, got a different Command variant"),
+        }
+    }
+
+    fn parse_max_cpu_generations(args: &[&str]) -> Result<usize, clap::Error> {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)?.command {
+            Command::Serve {
+                max_cpu_generations,
+                ..
+            } => Ok(max_cpu_generations),
             _ => panic!("expected Command::Serve, got a different Command variant"),
         }
     }
@@ -777,6 +859,28 @@ mod max_pending_cli_tests {
             8
         );
     }
+
+    #[test]
+    fn max_cpu_generations_omitted_defaults_to_2() {
+        assert_eq!(
+            parse_max_cpu_generations(&[]).expect("no --max-cpu-generations"),
+            2
+        );
+    }
+
+    #[test]
+    fn max_cpu_generations_zero_is_rejected() {
+        parse_max_cpu_generations(&["--max-cpu-generations", "0"])
+            .expect_err("0 admits nothing and must be rejected, not silently accepted");
+    }
+
+    #[test]
+    fn max_cpu_generations_valid_override_is_accepted() {
+        assert_eq!(
+            parse_max_cpu_generations(&["--max-cpu-generations", "4"]).expect("4 is a valid cap"),
+            4
+        );
+    }
 }
 
 // ─── #1336 CLI boundary tests: `--preload-vision` defaults to lazy ────────
@@ -865,5 +969,137 @@ mod embedding_model_cli_tests {
                 Some("gme-qwen35".to_string())
             )
         );
+    }
+}
+
+// ─── `lattice router init` CLI boundary (ADR-096 decision 2) ──────────────
+//
+// The decision itself is tested in `lattice_inference::router_init`, which
+// needs no CLI and no model. What is testable only here is the wiring: that
+// the subcommand exists under `router`, that the ordered adapter list arrives
+// as an ordered list rather than one comma-joined string, and that the flags
+// the decision names are required rather than defaulted.
+#[cfg(test)]
+mod router_init_cli_tests {
+    use super::*;
+
+    fn init_args(extra: &[&str]) -> Result<router::InitArgs, clap::Error> {
+        let mut full = vec![
+            "lattice",
+            "router",
+            "init",
+            "--state",
+            "/tmp/router-state",
+            "--adapters",
+            "technical,casual",
+            "--schema-id",
+            "schema-1",
+            "--base-model",
+            "qwen3.5-0.8b",
+            "--embedding-model",
+            "/tmp/embedder",
+        ];
+        full.extend_from_slice(extra);
+        match Cli::try_parse_from(full)?.command {
+            Command::Router { command } => match command {
+                RouterCommand::Init { args } => Ok(args),
+            },
+            _ => panic!("expected Command::Router"),
+        }
+    }
+
+    /// The adapter list is the gate's COLUMN ORDER, so it has to arrive as an
+    /// ordered list. A single comma-joined string would be accepted by clap,
+    /// produce a one-element schema, and mint an artifact with one unroutable
+    /// column named `"technical,casual"`.
+    #[test]
+    fn the_adapter_list_is_split_and_ordered() {
+        let args = init_args(&[]).expect("the ordinary invocation parses");
+        assert_eq!(args.adapters, vec!["technical", "casual"]);
+        assert_eq!(args.pooling, "mean_visual");
+        assert_eq!(args.prompt_source, "last_user_message");
+        assert_eq!(args.embedding_model_id, None);
+
+        let reordered = {
+            let mut full = vec![
+                "lattice",
+                "router",
+                "init",
+                "--state",
+                "/tmp/s",
+                "--adapters",
+                "casual,technical",
+                "--schema-id",
+                "s",
+                "--base-model",
+                "m",
+                "--embedding-model",
+                "/tmp/e",
+            ];
+            full.push("--pooling");
+            full.push("last_token");
+            match Cli::try_parse_from(full).expect("parses").command {
+                Command::Router { command } => match command {
+                    RouterCommand::Init { args } => args,
+                },
+                _ => panic!("expected Command::Router"),
+            }
+        };
+        assert_eq!(
+            reordered.adapters,
+            vec!["casual", "technical"],
+            "the order given is the order recorded"
+        );
+        assert_eq!(reordered.pooling, "last_token");
+    }
+
+    /// Each flag ADR-096 decision 2 names is required. A default for any of
+    /// them would mint an artifact recording something nobody chose, and the
+    /// schema and base model are inside the content hash.
+    #[test]
+    fn every_flag_the_decision_names_is_required() {
+        for missing in [
+            "--state",
+            "--adapters",
+            "--schema-id",
+            "--base-model",
+            "--embedding-model",
+        ] {
+            let full: Vec<&str> = vec![
+                "lattice",
+                "router",
+                "init",
+                "--state",
+                "/tmp/s",
+                "--adapters",
+                "a,b",
+                "--schema-id",
+                "s",
+                "--base-model",
+                "m",
+                "--embedding-model",
+                "/tmp/e",
+            ];
+            // Drop the flag and its value.
+            let mut kept = Vec::new();
+            let mut skip = false;
+            for token in full {
+                if skip {
+                    skip = false;
+                    continue;
+                }
+                if token == missing {
+                    skip = true;
+                    continue;
+                }
+                kept.push(token);
+            }
+            assert!(
+                Cli::try_parse_from(kept).is_err(),
+                "{missing} should be required"
+            );
+        }
+        // The control: nothing dropped, and it parses.
+        assert!(init_args(&[]).is_ok());
     }
 }

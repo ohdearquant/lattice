@@ -880,6 +880,7 @@ mod tests {
                 input_width: 4,
             },
             gate_bytes: vec![0],
+            provenance: crate::router_state::RouterProvenance::Legacy,
         }
     }
 

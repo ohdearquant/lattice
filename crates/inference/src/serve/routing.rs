@@ -7,7 +7,7 @@
 //!
 //! # Why this matches adapters by name
 //!
-//! [`crate::mixture::AdapterRouter::route`] maps a gate output column to an
+//! `mixture::AdapterRouter::route` (feature `mixture`) maps a gate output column to an
 //! adapter **by position**: the selected column index is used directly as
 //! `available[idx]`, and the `AdapterId` is a label copied into the result,
 //! never matched against anything the gate holds. The gate itself is a bare
@@ -466,7 +466,7 @@ pub fn context_text<'a>(
 }
 
 /// Resolve the prompt-selection rule the gate was trained under.
-fn trained_prompt_source(source: &str) -> Result<PromptSource, ApiError> {
+pub fn trained_prompt_source(source: &str) -> Result<PromptSource, ApiError> {
     if source == PromptSource::LastUserMessage.as_str() {
         return Ok(PromptSource::LastUserMessage);
     }
@@ -483,7 +483,14 @@ fn trained_prompt_source(source: &str) -> Result<PromptSource, ApiError> {
 /// Parsed once, at startup, rather than per request: an unrecognised value is
 /// a property of the artifact, so it is true of every request and there is no
 /// reason for a caller to be the one who learns about it.
-fn trained_pooling(pooling: &str) -> Result<crate::forward::cpu_f16::PoolingStrategy, ApiError> {
+///
+/// Public so `router init` validates its `--pooling` with the serving path's
+/// OWN parser rather than a second list. A second list is the shape where a
+/// build mints an artifact naming a rule it cannot reproduce, and every check
+/// downstream passes until a request arrives.
+pub fn trained_pooling(
+    pooling: &str,
+) -> Result<crate::forward::cpu_f16::PoolingStrategy, ApiError> {
     match pooling {
         "mean_visual" => Ok(crate::forward::cpu_f16::PoolingStrategy::MeanVisualTokens),
         "last_token" => Ok(crate::forward::cpu_f16::PoolingStrategy::LastToken),
@@ -848,6 +855,7 @@ mod tests {
                 adapter_names: vec!["technical".into()],
                 representation: rep,
                 gate_bytes: gate(),
+                provenance: crate::router_state::RouterProvenance::Legacy,
             },
             pinned: false,
         };
@@ -894,6 +902,7 @@ mod tests {
             adapter_names: names.iter().map(|n| (*n).to_string()).collect(),
             representation: representation(4),
             gate_bytes: vec![0],
+            provenance: crate::router_state::RouterProvenance::Legacy,
         }
     }
 
@@ -1247,6 +1256,7 @@ mod tests {
                 adapter_names: vec!["technical".into()],
                 representation: representation(4),
                 gate_bytes: gate_bytes.clone(),
+                provenance: crate::router_state::RouterProvenance::Legacy,
             })
             .is_ok(),
             "a truthful artifact must construct, or the refusal proves nothing"
@@ -1257,6 +1267,7 @@ mod tests {
             adapter_names: vec!["technical".into()],
             representation: representation(1024),
             gate_bytes,
+            provenance: crate::router_state::RouterProvenance::Legacy,
         }) {
             Err(err) => {
                 let m = err.message();
@@ -1296,6 +1307,7 @@ mod tests {
             adapter_names: vec!["technical".into(), "legal".into()],
             representation: representation(4),
             gate_bytes: gate(2),
+            provenance: crate::router_state::RouterProvenance::Legacy,
         };
         assert!(
             ServingRouter::new(ok).is_ok(),
@@ -1308,6 +1320,7 @@ mod tests {
                 adapter_names: (0..names).map(|i| format!("a{i}")).collect(),
                 representation: representation(4),
                 gate_bytes: gate(outputs),
+                provenance: crate::router_state::RouterProvenance::Legacy,
             };
             match ServingRouter::new(artifact) {
                 Err(err) => {

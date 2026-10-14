@@ -178,16 +178,16 @@ impl Qwen35Model {
     ///
     /// Shapes for Qwen3.5-0.8B (24 layers, 8 Q-heads, 2 KV-heads, head_dim=256):
     ///   lm_head:  [vocab, hidden]
-    ///   final_norm: [hidden]
+    ///   final_norm: `[hidden]`
     ///   embed: [vocab, hidden]
     ///   q_proj: [2*q_dim, hidden]
     ///   k_proj: [kv_dim, hidden]
     ///   v_proj: [kv_dim, hidden]
     ///   o_proj: [hidden, q_dim]
-    ///   q_norm: [head_dim]
-    ///   k_norm: [head_dim]
-    ///   pre_attn_norm: [hidden]  (input_layernorm)
-    ///   post_attn_norm: [hidden]  (post_attention_layernorm)
+    ///   q_norm: `[head_dim]`
+    ///   k_norm: `[head_dim]`
+    ///   pre_attn_norm: `[hidden]`  (input_layernorm)
+    ///   post_attn_norm: `[hidden]`  (post_attention_layernorm)
     ///   gate_proj: [inter, hidden]
     ///   up_proj: [inter, hidden]
     ///   down_proj: [hidden, inter]
@@ -278,8 +278,6 @@ impl Qwen35Model {
     /// **Unstable (train-backward)**: Number of layers actually present in the
     /// loaded weight storage.
     ///
-    /// [`Self::config_mut`] allows a caller to change `config.num_hidden_layers`
-    /// after load, independently of the weights this model was loaded with.
     /// Callers deriving a layer range from `config().num_hidden_layers` must
     /// check it against this value first — indexing past it inside
     /// [`Self::gqa_layer_weights`]/[`Self::gdn_layer_weights`] panics rather

@@ -153,6 +153,16 @@ pub fn lora_list_body(
                 "duplicate_trained": state.duplicate_trained,
                 "duplicate_resident": state.duplicate_resident,
                 "blend_refusal": state.blend_refusal,
+                // Serving a deliberately untrained baseline and serving a
+                // learned gate are different claims, and the responses do not
+                // distinguish them: a bootstrap routes, reports a version, and
+                // looks exactly like a gate that learned something. ADR-096
+                // decision 2 puts the difference on this surface rather than
+                // leaving it to be inferred from behaviour.
+                //
+                // A legacy artifact answers "unrecorded", never "bootstrap":
+                // it may well have been trained, and nothing wrote down which.
+                "training_state": report.artifact.provenance.training_state(),
             })
         }
     };
@@ -473,6 +483,78 @@ pub fn prepare_adapter_load(path: &str, name: &str) -> Result<PreparedAdapter, A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bootstrap, a learned gate and a legacy one are three different
+    /// answers on this surface, and the responses they produce are identical.
+    /// The legacy arm is the one that matters: reporting it as `"bootstrap"`
+    /// would describe a possibly-trained gate as a deliberate baseline, which
+    /// is wrong in the reassuring direction.
+    #[test]
+    fn the_lora_index_reports_how_the_serving_gate_was_produced() {
+        use crate::router_state::{
+            RouterArtifact, RouterLineage, RouterPolicy, RouterProvenance, TrainedRepresentation,
+        };
+
+        let index = AdapterIndex {
+            adapters: Vec::new(),
+            applied: Vec::new(),
+            blend_refusal: None,
+        };
+        let representation = TrainedRepresentation {
+            embedding_model: "qwen3.5-0.8b".into(),
+            pooling: "mean_visual".into(),
+            prompt_source: "last_user_message".into(),
+            loader_format: "qwen35-f16-decoder".into(),
+            input_width: 8,
+        };
+        let policy = |training_state: &str| RouterPolicy {
+            kind: "uniform".into(),
+            tau: None,
+            epsilon: 0.0,
+            tau_floor: 0.0,
+            entropy_floor: 0.0,
+            max_consecutive_collapsed: 0,
+            training_state: training_state.into(),
+            objective_version: None,
+            exploration_scale: None,
+        };
+        let lineage = RouterLineage {
+            schema_id: "schema-1".into(),
+            base_model: "qwen3.5-0.8b".into(),
+            parent: None,
+            admission_record: None,
+        };
+        let artifact = |provenance| RouterArtifact {
+            version: 1,
+            adapter_names: vec!["technical".into()],
+            representation: representation.clone(),
+            gate_bytes: vec![1, 2, 3],
+            provenance,
+        };
+
+        for (provenance, expected) in [
+            (
+                RouterProvenance::recorded(policy("bootstrap"), lineage.clone()),
+                "bootstrap",
+            ),
+            (
+                RouterProvenance::recorded(policy("learned"), lineage.clone()),
+                "learned",
+            ),
+            (RouterProvenance::Legacy, "unrecorded"),
+        ] {
+            let served = artifact(provenance);
+            let resolved = crate::router_state::ResolvedRouter {
+                artifact: served,
+                pinned: false,
+            };
+            let body = lora_list_body(&index, Some(resolved.report("qwen3.5-0.8b")));
+            assert_eq!(
+                body["router"]["training_state"], expected,
+                "the three provenances must not report the same thing"
+            );
+        }
+    }
 
     #[test]
     fn duplicate_ids_are_rejected_before_admission() {

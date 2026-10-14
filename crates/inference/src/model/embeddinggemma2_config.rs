@@ -124,6 +124,40 @@ fn default_eos_token_id() -> serde_json::Value {
     serde_json::json!(1)
 }
 
+/// The checkpoint's top-level multimodal token layout: the ids that mark
+/// image slots in the text sequence.
+///
+/// Read from `config.json`'s top-level keys, not from `text_config`. The
+/// released checkpoint uses `image_token_id` 258880, `boi_token_id` 255999 and
+/// `eoi_token_id` 258882; a config that omits them makes the model text-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImagePartsConfig {
+    /// Placeholder id replaced by one image soft row.
+    pub(crate) image_token_id: u32,
+    /// Beginning-of-image marker id.
+    pub(crate) boi_token_id: u32,
+    /// End-of-image marker id.
+    pub(crate) eoi_token_id: u32,
+}
+
+/// Reads the image token layout from a `config.json` document's top level.
+/// Returns `None` when any of the three ids is absent or out of range, which
+/// keeps a text-only checkpoint loadable.
+pub(crate) fn image_parts_config(json: &str, vocab_size: usize) -> Option<ImagePartsConfig> {
+    let root: serde_json::Value = serde_json::from_str(json).ok()?;
+    let id = |name: &str| {
+        root.get(name)
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&value| (value as usize) < vocab_size)
+            .and_then(|value| u32::try_from(value).ok())
+    };
+    Some(ImagePartsConfig {
+        image_token_id: id("image_token_id")?,
+        boi_token_id: id("boi_token_id")?,
+        eoi_token_id: id("eoi_token_id")?,
+    })
+}
+
 /// A special-token id: one non-negative integer below the vocabulary size.
 fn token_id(
     name: &str,

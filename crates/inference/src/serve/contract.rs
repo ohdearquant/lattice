@@ -429,6 +429,12 @@ impl<'a> ServeProfile<'a> {
         self.vision_supported = supported;
         self
     }
+
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+    pub(crate) const fn with_logprobs_support(mut self, supported: bool) -> Self {
+        self.logprobs_supported = supported;
+        self
+    }
 }
 
 /// Fully normalized request fields consumed by generation adapters.
@@ -771,9 +777,11 @@ where
 /// `normalize_request` cascade had moved those two checks into
 /// `normalize_logprobs`, which runs after `validate_model_name` -- silently
 /// reordering client-observable first-error precedence. `top_logprobs`-
-/// without-`logprobs` and `top_logprobs > 20` stay in `normalize_logprobs`,
-/// matching both binaries' original post-model-check position for those
-/// two. The conflicting `max_tokens`/`max_completion_tokens` check is
+/// without-`logprobs` and `top_logprobs > 20` stay in `normalize_logprobs`
+/// on logprobs-capable profiles, retaining their post-model-check position.
+/// Profiles without logprobs support reject either field at the capability
+/// check, including the unified server's Metal provider. The conflicting
+/// `max_tokens`/`max_completion_tokens` check is
 /// profile-gated (`ServeProfile::max_tokens_conflict_checked_early`)
 /// instead of unconditionally grouped here: the daemon profile checked it
 /// ahead of the model-id match pre-refactor, but the `lattice` profile

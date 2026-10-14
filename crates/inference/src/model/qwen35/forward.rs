@@ -125,6 +125,87 @@ impl Qwen35Model {
         );
     }
 
+    /// Keep this sequence aligned with `forward_step`; per-position hidden-state
+    /// equivalence tests guard against drift before the separate row projection.
+    pub(super) fn forward_hidden_step(
+        &self,
+        token_id: u32,
+        position: usize,
+        gdn_states: &mut [GatedDeltaNetState],
+        kv_cache: &mut KvCache,
+        scratch: &mut ForwardScratch,
+    ) {
+        let cfg = &self.config;
+        let hidden = cfg.hidden_size;
+
+        assert!(
+            (token_id as usize) < cfg.vocab_size,
+            "token_id {token_id} out of range: vocab_size is {}",
+            cfg.vocab_size,
+        );
+
+        scratch.ensure_capacity(cfg, kv_cache.seq_len + 1);
+
+        let embed_start = token_id as usize * hidden;
+        scratch.hidden[..hidden]
+            .copy_from_slice(&self.weights.embed_tokens[embed_start..embed_start + hidden]);
+
+        let mut linear_idx = 0usize;
+        let mut full_idx = 0usize;
+
+        for layer_i in 0..cfg.num_hidden_layers {
+            let (attn_weights, common) = &self.weights.layers[layer_i];
+
+            scratch.residual[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+
+            qwen35_rms_norm(
+                &mut scratch.hidden[..hidden],
+                &common.input_layernorm,
+                hidden,
+                cfg.rms_norm_eps,
+            );
+
+            self.run_attention_layer(
+                layer_i,
+                attn_weights,
+                &mut linear_idx,
+                &mut full_idx,
+                position,
+                gdn_states,
+                kv_cache,
+                scratch,
+                hidden,
+            );
+
+            for i in 0..hidden {
+                scratch.hidden[i] = scratch.residual[i] + scratch.attn_out[i];
+            }
+
+            scratch.residual[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+
+            qwen35_rms_norm(
+                &mut scratch.hidden[..hidden],
+                &common.post_attention_layernorm,
+                hidden,
+                cfg.rms_norm_eps,
+            );
+
+            scratch.ffn_out[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+            self.run_ffn_layer(layer_i, common, scratch, hidden);
+
+            for i in 0..hidden {
+                scratch.hidden[i] = scratch.residual[i] + scratch.ffn_out[i];
+            }
+        }
+
+        qwen35_rms_norm(
+            &mut scratch.hidden[..hidden],
+            &self.weights.final_norm,
+            hidden,
+            cfg.rms_norm_eps,
+        );
+    }
+
     fn run_attention_layer(
         &self,
         layer_i: usize,

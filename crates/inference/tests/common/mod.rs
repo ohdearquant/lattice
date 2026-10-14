@@ -63,7 +63,10 @@ pub fn gemma_config() -> Vec<u8> {
 }
 
 pub fn qwen_config() -> Vec<u8> {
-    br#"{"model_type":"qwen3_5"}"#.to_vec()
+    // An empty `text_config` resolves every geometry field from the default preset, which
+    // these startup and routing tests do not depend on; a config with no text configuration
+    // at all is now refused before the loader step each test is about.
+    br#"{"model_type":"qwen3_5","text_config":{}}"#.to_vec()
 }
 
 pub fn write_model_dir(dir: &Path, config: &[u8], weights_file: Option<&str>) {
