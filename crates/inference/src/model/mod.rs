@@ -7,7 +7,7 @@ pub mod embeddinggemma2;
 pub mod embeddinggemma2_config;
 /// RGB image input and internal patch preparation for EmbeddingGemma 2.
 pub mod embeddinggemma2_image;
-mod embeddinggemma2_vision;
+pub(crate) mod embeddinggemma2_vision;
 pub mod ernie45;
 pub mod gemma4_cache;
 pub mod gemma4_config;

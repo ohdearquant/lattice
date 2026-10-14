@@ -13,10 +13,32 @@
 mod state;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use state::MetalEmbeddingGemma2State;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub use state::VisionTimings;
 
 /// EmbeddingGemma 2 Metal state; unavailable without macOS and `metal-gpu`.
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
 pub struct MetalEmbeddingGemma2State;
+
+/// Per-segment wall time of one vision-tower pass.
+///
+/// Not a stable API: `#[doc(hidden)]` is a convention for the `dump_embeddinggemma2_vision`
+/// example, which reports the segments of a measured run.
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VisionTimings {
+    /// Sum of the attention command buffers' GPU spans.
+    pub attention_gpu_us: u64,
+    /// Sum of the MLP command buffers' GPU spans.
+    pub mlp_gpu_us: u64,
+    /// Host time of the per-layer work before attention.
+    pub cpu_pre_attention_us: u64,
+    /// Host time of the per-layer work after attention.
+    pub cpu_post_attention_us: u64,
+    /// Wall time of the whole tower pass, handoffs included.
+    pub tower_us: u64,
+}
 
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
 impl MetalEmbeddingGemma2State {

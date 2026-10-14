@@ -72,9 +72,21 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
     }
 
     // x86_64 fallback: hand-written SIMD with tiling for large matrices, rows split across
-    // the rayon pool for prefill-sized problems.
+    // the rayon pool for prefill-sized problems, and a single row's columns split across it
+    // for large decode-step products.
     #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
-    matmul_bt_x86(a, b, c, m, k, n, ROW_THREAD_MIN_WORK);
+    {
+        // ADR-099 F1 step 1: stock `gemm` for every multi-row product. Single rows (decode
+        // steps) keep the existing kernels and their column split.
+        #[cfg(feature = "x86-gemm")]
+        {
+            if m > 1 {
+                matmul_bt_gemm(a, b, c, m, k, n);
+                return;
+            }
+        }
+        matmul_bt_x86(a, b, c, m, k, n, ROW_THREAD_MIN_WORK, COL_THREAD_MIN_WORK);
+    }
 
     // Other non-macOS targets: hand-written SIMD with tiling for large matrices.
     #[cfg(all(not(target_os = "macos"), not(target_arch = "x86_64")))]
@@ -112,6 +124,47 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
     }
 }
 
+/// `matmul_bt` through stock `gemm` 0.18.2 (ADR-099 F1). It allocates its packing storage
+/// inside the call, the one allocation per call that ADR-099 admits. It runs on the calling
+/// thread: `gemm`'s parallel path allocates once per worker, which that exception does not admit.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64", feature = "x86-gemm"))]
+fn matmul_bt_gemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        c[..m * n].fill(0.0);
+        return;
+    }
+    // SAFETY: `matmul_bt` validated that a holds m*k, b holds n*k and c holds m*n elements,
+    // with no overflow. C is m x n row-major (column stride 1, row stride n), A is m x k
+    // row-major, and B^T is read from the n x k row-major B (row stride 1, column stride k).
+    // alpha = 0 with read_dst = false overwrites C without reading it.
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            1,
+            n as isize,
+            false,
+            a.as_ptr(),
+            1,
+            k as isize,
+            b.as_ptr(),
+            k as isize,
+            1,
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            gemm::Parallelism::None,
+        );
+    }
+}
+
 /// Multiply-add count (m*n*k) at and above which `matmul_bt` splits its rows across the
 /// rayon pool on x86_64: twice the smallest shape measured to gain from the split
 /// (16 x 1024 x 3584). Only rows are split, and only on x86_64; other targets are unmeasured.
@@ -142,6 +195,47 @@ fn row_chunk_len(m: usize, k: usize, n: usize, threads: usize, min_work: u64) ->
     (chunk < m).then_some(chunk)
 }
 
+/// Multiply-add count (n*k) at and above which a single-row `matmul_bt` splits its output
+/// columns across the rayon pool on x86_64: twice the smallest shape measured to gain from the
+/// split at 2, 4 and 8 threads (1 x 1024 x 256, split/serial 0.89 / 0.77 / 0.73 with B read
+/// from DRAM, 8-vCPU AMD EPYC Zen 4; 1 x 1024 x 128 lost at every width). Only x86_64 splits.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+const COL_THREAD_MIN_WORK: u64 = 524_288;
+
+/// Column chunks are whole multiples of this many outputs, one 64-byte cache line of f32, so
+/// no two threads write the same line of C.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+const COL_THREAD_MIN_CHUNK: usize = 16;
+
+/// Columns per chunk when a single-row `matmul_bt` should split its output columns across
+/// `threads`, else `None`.
+///
+/// `None` unless m is 1 (a column chunk of a longer product is not contiguous in C and the
+/// kernels take no output stride), when the caller already runs on a rayon worker thread
+/// (`in_worker`; it may be one of several parallel tasks, and splitting again would put more
+/// tasks on the pool than it has threads; this includes a call made inside
+/// `ThreadPool::install`), for fewer than two threads, an empty shared or output dimension,
+/// work (n*k) below `min_work`, or when the chunk would cover every column.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+fn col_chunk_len(
+    m: usize,
+    k: usize,
+    n: usize,
+    threads: usize,
+    in_worker: bool,
+    min_work: u64,
+) -> Option<usize> {
+    if m != 1 || in_worker || threads < 2 || k == 0 || n == 0 {
+        return None;
+    }
+    let work = (n as u64).saturating_mul(k as u64);
+    if work < min_work {
+        return None;
+    }
+    let chunk = n.div_ceil(threads).div_ceil(COL_THREAD_MIN_CHUNK) * COL_THREAD_MIN_CHUNK;
+    (chunk < n).then_some(chunk)
+}
+
 /// Whether the tiled kernel takes the leading rows of an m x k x n product.
 ///
 /// Decided once for the whole product: a row chunk that recomputed this from its own,
@@ -159,11 +253,24 @@ fn tiled_applies(m: usize, k: usize, n: usize) -> bool {
     total_work >= 1024 * 1024 && k >= super::tiled::TILE_K
 }
 
-/// x86_64 `matmul_bt`: the serial kernels over the whole product, or over row chunks run in
-/// parallel when `row_chunk_len` says the product is large enough. Each output row is computed
-/// from its own A row and B alone, and chunks start on TILE_I boundaries, so the split result
-/// is bit-identical to the serial one. Returns the chunk length used, `None` when it ran serially.
+/// How `matmul_bt_x86` ran a product.
 #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Split {
+    Serial,
+    /// Row chunks of this many rows, run in parallel.
+    Rows(usize),
+    /// A single row's output columns in chunks of this many columns, run in parallel.
+    Columns(usize),
+}
+
+/// x86_64 `matmul_bt`: the serial kernels over the whole product, over row chunks run in
+/// parallel when `row_chunk_len` says the product is large enough, or, for a single row, over
+/// column chunks run in parallel when `col_chunk_len` says so. Each output row is computed
+/// from its own A row and B alone, and row chunks start on TILE_I boundaries, so a row split
+/// is bit-identical to the serial call; see `matmul_bt_x86_columns` for the column split.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
 fn matmul_bt_x86(
     a: &[f32],
     b: &[f32],
@@ -172,23 +279,53 @@ fn matmul_bt_x86(
     k: usize,
     n: usize,
     min_work: u64,
-) -> Option<usize> {
+    col_min_work: u64,
+) -> Split {
     use rayon::prelude::*;
 
     let tiled = tiled_applies(m, k, n);
-    let chunk = row_chunk_len(m, k, n, rayon::current_num_threads(), min_work);
-    match chunk {
-        Some(rows) => {
-            c[..m * n]
-                .par_chunks_mut(rows * n)
-                .zip(a[..m * k].par_chunks(rows * k))
-                .for_each(|(c_chunk, a_chunk)| {
-                    matmul_bt_x86_rows(a_chunk, b, c_chunk, c_chunk.len() / n, k, n, tiled);
-                });
-        }
-        None => matmul_bt_x86_rows(a, b, c, m, k, n, tiled),
+    let threads = rayon::current_num_threads();
+    if let Some(rows) = row_chunk_len(m, k, n, threads, min_work) {
+        c[..m * n]
+            .par_chunks_mut(rows * n)
+            .zip(a[..m * k].par_chunks(rows * k))
+            .for_each(|(c_chunk, a_chunk)| {
+                matmul_bt_x86_rows(a_chunk, b, c_chunk, c_chunk.len() / n, k, n, tiled);
+            });
+        return Split::Rows(rows);
     }
-    chunk
+    let in_worker = rayon::current_thread_index().is_some();
+    if let Some(cols) = col_chunk_len(m, k, n, threads, in_worker, col_min_work) {
+        matmul_bt_x86_columns(a, b, c, k, n, cols, tiled);
+        return Split::Columns(cols);
+    }
+    matmul_bt_x86_rows(a, b, c, m, k, n, tiled);
+    Split::Serial
+}
+
+/// A single row's `matmul_bt` over column chunks of `cols` outputs, run across the rayon pool.
+///
+/// Each output column is computed from the A row and its own B row alone, and a single row is
+/// never a whole TILE_I tile, so every chunk runs the same direct kernel the unsplit call runs
+/// on the same columns: the result is bit-identical to the serial call.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+fn matmul_bt_x86_columns(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    k: usize,
+    n: usize,
+    cols: usize,
+    tiled: bool,
+) {
+    use rayon::prelude::*;
+
+    c[..n]
+        .par_chunks_mut(cols)
+        .zip(b[..n * k].par_chunks(cols * k))
+        .for_each(|(c_chunk, b_chunk)| {
+            matmul_bt_x86_rows(&a[..k], b_chunk, c_chunk, 1, k, c_chunk.len(), tiled);
+        });
 }
 
 /// Serial x86_64 `matmul_bt` over `m` rows; `tiled` is `tiled_applies` for the whole product.
@@ -507,6 +644,10 @@ mod tests {
         /// m=5 with work >= 1M: rows 0..4 take the tiled kernel exactly as a 4-row call
         /// does, and row 4 takes the direct kernel exactly as a 1-row call does.
         #[test]
+        #[cfg_attr(
+            all(feature = "x86-gemm", target_arch = "x86_64", not(target_os = "macos")),
+            ignore = "x86-gemm runs multi-row products through gemm and single rows through the existing kernel, so they agree to about 1e-7, not bit for bit"
+        )]
         fn m5_splits_into_tiled_rows_and_direct_row() {
             let (m, k, n) = (5usize, 1024usize, 512usize);
             let a = lcg_vec(m * k, 0x0C33);
@@ -572,7 +713,7 @@ mod tests {
                 .install(f)
         }
 
-        /// The split result and the chunk length the dispatcher reports having used.
+        /// The split result and how the dispatcher reports having run it.
         fn threaded(
             a: &[f32],
             b: &[f32],
@@ -580,10 +721,10 @@ mod tests {
             k: usize,
             n: usize,
             min_work: u64,
-        ) -> (Vec<f32>, Option<usize>) {
+        ) -> (Vec<f32>, Split) {
             in_pool(4, || {
                 let mut c = vec![0.0f32; m * n];
-                let used = matmul_bt_x86(a, b, &mut c, m, k, n, min_work);
+                let used = matmul_bt_x86(a, b, &mut c, m, k, n, min_work, COL_THREAD_MIN_WORK);
                 (c, used)
             })
         }
@@ -592,8 +733,15 @@ mod tests {
             let a = lcg_vec(m * k, 0x2A11 + m as u32);
             let b = lcg_vec(n * k, 0x2B22 + n as u32);
             let (got, used) = threaded(&a, &b, m, k, n, 0);
-            assert!(used.is_some(), "m={m} k={k} n={n}: the split must engage");
-            assert_eq!(used, row_chunk_len(m, k, n, 4, 0), "m={m} k={k} n={n}");
+            assert!(
+                matches!(used, Split::Rows(_)),
+                "m={m} k={k} n={n}: the split must engage"
+            );
+            assert_eq!(
+                used,
+                row_chunk_len(m, k, n, 4, 0).map_or(Split::Serial, Split::Rows),
+                "m={m} k={k} n={n}"
+            );
             assert_eq!(
                 bits(&got),
                 bits(&serial(&a, &b, m, k, n)),
@@ -696,19 +844,19 @@ mod tests {
             let want = serial(&a, &b, m, k, n);
 
             let (got, used) = threaded(&a, &b, m, k, n, ROW_THREAD_MIN_WORK);
-            assert_eq!(used, None, "below the work threshold");
+            assert_eq!(used, Split::Serial, "below the work threshold");
             assert_eq!(bits(&got), bits(&want));
 
             let (got, used) = threaded(&a, &b, m, k, n, 0);
-            assert_eq!(used, Some(16), "split forced by min_work 0");
+            assert_eq!(used, Split::Rows(16), "split forced by min_work 0");
             assert_eq!(bits(&got), bits(&want));
 
             let (got, used) = in_pool(1, || {
                 let mut c = vec![0.0f32; m * n];
-                let used = matmul_bt_x86(&a, &b, &mut c, m, k, n, 0);
+                let used = matmul_bt_x86(&a, &b, &mut c, m, k, n, 0, COL_THREAD_MIN_WORK);
                 (c, used)
             });
-            assert_eq!(used, None, "one thread");
+            assert_eq!(used, Split::Serial, "one thread");
             assert_eq!(bits(&got), bits(&want));
         }
 
@@ -718,11 +866,216 @@ mod tests {
             let a = lcg_vec(m * k, 0x2C33);
             let b = lcg_vec(n * k, 0x2D44);
             let (got, used) = threaded(&a, &b, m, k, n, 0);
-            assert!(used.is_some());
+            assert!(matches!(used, Split::Rows(_)));
             let mut want = vec![0.0f32; m * n];
             matmul_bt_scalar(&a, &b, &mut want, m, k, n);
             for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert!((g - w).abs() < 1e-4, "idx={idx}: got {g}, want {w}");
+            }
+        }
+    }
+
+    // --- x86_64: single-row column-split dispatch ---
+
+    #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+    mod column_threads {
+        use super::*;
+        use rayon::prelude::*;
+
+        fn bits(v: &[f32]) -> Vec<u32> {
+            v.iter().map(|x| x.to_bits()).collect()
+        }
+
+        fn serial(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
+            let mut c = vec![0.0f32; n];
+            matmul_bt_x86_rows(a, b, &mut c, 1, k, n, tiled_applies(1, k, n));
+            c
+        }
+
+        fn in_pool<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("rayon pool")
+                .install(f)
+        }
+
+        /// The dispatcher called on this test thread, which is not a rayon worker, so the
+        /// global pool's width decides the split.
+        fn dispatch(
+            a: &[f32],
+            b: &[f32],
+            k: usize,
+            n: usize,
+            col_min_work: u64,
+        ) -> (Vec<f32>, Split) {
+            assert_eq!(rayon::current_thread_index(), None);
+            let mut c = vec![0.0f32; n];
+            let used = matmul_bt_x86(a, b, &mut c, 1, k, n, ROW_THREAD_MIN_WORK, col_min_work);
+            (c, used)
+        }
+
+        fn expected(k: usize, n: usize, col_min_work: u64) -> Split {
+            col_chunk_len(1, k, n, rayon::current_num_threads(), false, col_min_work)
+                .map_or(Split::Serial, Split::Columns)
+        }
+
+        #[test]
+        fn col_chunk_len_decides_the_split() {
+            let min = COL_THREAD_MIN_WORK;
+            assert_eq!(min, 2 * 1024 * 256);
+            // Only a single row splits by columns.
+            assert_eq!(col_chunk_len(2, 1024, 4096, 8, false, 0), None);
+            // No threads, one thread, a caller already on a rayon worker.
+            assert_eq!(col_chunk_len(1, 1024, 4096, 0, false, 0), None);
+            assert_eq!(col_chunk_len(1, 1024, 4096, 1, false, 0), None);
+            assert_eq!(col_chunk_len(1, 1024, 4096, 8, true, 0), None);
+            assert_eq!(col_chunk_len(1, 1024, 248_320, 8, true, min), None);
+            // Empty shared or output dimension cannot be chunked.
+            assert_eq!(col_chunk_len(1, 0, 4096, 8, false, 0), None);
+            assert_eq!(col_chunk_len(1, 1024, 0, 8, false, 0), None);
+            // The work threshold is inclusive: 1024 x 512 is exactly min_work.
+            assert_eq!(col_chunk_len(1, 1024, 512, 8, false, min), Some(64));
+            assert_eq!(col_chunk_len(1, 1024, 511, 8, false, min), None);
+            // The largest shape measured to lose from the split stays serial.
+            assert_eq!(col_chunk_len(1, 1024, 128, 8, false, min), None);
+            // A chunk that would cover every column is no split.
+            assert_eq!(col_chunk_len(1, 64, 16, 8, false, 0), None);
+            assert_eq!(col_chunk_len(1, 64, 17, 8, false, 0), Some(16));
+            // Output head: 248320 / 8 is already a multiple of 16.
+            assert_eq!(col_chunk_len(1, 1024, 248_320, 8, false, min), Some(31_040));
+            // ceil(n / threads) that is not a multiple of 16 is rounded up.
+            assert_eq!(col_chunk_len(1, 64, 1001, 3, false, 0), Some(336));
+        }
+
+        #[test]
+        fn col_chunk_len_is_line_aligned_and_fits_the_pool() {
+            for n in 17..600usize {
+                for threads in 2..=16usize {
+                    let cols = col_chunk_len(1, 8, n, threads, false, 0)
+                        .unwrap_or_else(|| panic!("n={n} threads={threads}: expected a split"));
+                    assert_eq!(cols % COL_THREAD_MIN_CHUNK, 0, "n={n} threads={threads}");
+                    assert!(cols < n, "n={n} threads={threads}: cols={cols}");
+                    assert!(
+                        n.div_ceil(cols) <= threads,
+                        "n={n} threads={threads}: cols={cols}"
+                    );
+                }
+            }
+        }
+
+        /// Odd n, a last chunk shorter than 16 columns, k below the SIMD width, odd k, and a
+        /// product large enough that the tiled kernel is selected for the whole call.
+        #[test]
+        fn column_split_matches_serial_bit_for_bit() {
+            let cases = [
+                (7usize, 50usize, 16usize),
+                (64, 37, 16),
+                (256, 1003, 16),
+                (1031, 333, 48),
+                (1024, 2049, 528),
+            ];
+            assert!(
+                cases
+                    .iter()
+                    .any(|&(_, n, cols)| (1..16).contains(&(n % cols)))
+            );
+            assert!(tiled_applies(1, 1024, 2049));
+            for (k, n, cols) in cases {
+                let a = lcg_vec(k, 0x3A11 + k as u32);
+                let b = lcg_vec(n * k, 0x3B22 + n as u32);
+                let got = in_pool(4, || {
+                    let mut c = vec![0.0f32; n];
+                    matmul_bt_x86_columns(&a, &b, &mut c, k, n, cols, tiled_applies(1, k, n));
+                    c
+                });
+                assert_eq!(
+                    bits(&got),
+                    bits(&serial(&a, &b, k, n)),
+                    "k={k} n={n} cols={cols}"
+                );
+            }
+        }
+
+        #[test]
+        fn column_split_matches_scalar_reference() {
+            let (k, n) = (256usize, 1003usize);
+            let a = lcg_vec(k, 0x3C33);
+            let b = lcg_vec(n * k, 0x3D44);
+            let got = in_pool(4, || {
+                let mut c = vec![0.0f32; n];
+                matmul_bt_x86_columns(&a, &b, &mut c, k, n, 16, tiled_applies(1, k, n));
+                c
+            });
+            let mut want = vec![0.0f32; n];
+            matmul_bt_scalar(&a, &b, &mut want, 1, k, n);
+            for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!((g - w).abs() < 1e-4, "idx={idx}: got {g}, want {w}");
+            }
+        }
+
+        /// Outside the pool the dispatcher splits a single row by columns at and above the
+        /// threshold, and the result equals the serial row.
+        #[test]
+        fn dispatcher_splits_a_single_row_outside_the_pool() {
+            for (k, n, min) in [
+                (256usize, 1003usize, 0u64),
+                (1024, 512, COL_THREAD_MIN_WORK),
+            ] {
+                let a = lcg_vec(k, 0x3E55 + n as u32);
+                let b = lcg_vec(n * k, 0x3F66 + n as u32);
+                let (got, used) = dispatch(&a, &b, k, n, min);
+                assert_eq!(used, expected(k, n, min), "k={k} n={n}");
+                if rayon::current_num_threads() >= 2 {
+                    assert!(matches!(used, Split::Columns(_)), "k={k} n={n}: {used:?}");
+                }
+                assert_eq!(bits(&got), bits(&serial(&a, &b, k, n)), "k={k} n={n}");
+            }
+        }
+
+        /// Below the threshold the dispatcher stays serial.
+        #[test]
+        fn dispatcher_stays_serial_below_the_column_threshold() {
+            for (k, n) in [(1024usize, 511usize), (1024, 128)] {
+                assert!(((n * k) as u64) < COL_THREAD_MIN_WORK);
+                let a = lcg_vec(k, 0x4A11 + n as u32);
+                let b = lcg_vec(n * k, 0x4B22 + n as u32);
+                let (got, used) = dispatch(&a, &b, k, n, COL_THREAD_MIN_WORK);
+                assert_eq!(used, Split::Serial, "k={k} n={n}");
+                assert_eq!(bits(&got), bits(&serial(&a, &b, k, n)), "k={k} n={n}");
+            }
+        }
+
+        /// A caller already on a rayon worker, directly under `install` or as one of several
+        /// parallel tasks, never gets a column split, even with no work threshold.
+        #[test]
+        fn dispatcher_does_not_split_columns_inside_a_rayon_worker() {
+            let (k, n) = (256usize, 1003usize);
+            let a = lcg_vec(k, 0x4C33);
+            let b = lcg_vec(n * k, 0x4D44);
+            let want = bits(&serial(&a, &b, k, n));
+
+            let (got, used) = in_pool(4, || {
+                let mut c = vec![0.0f32; n];
+                let used = matmul_bt_x86(&a, &b, &mut c, 1, k, n, ROW_THREAD_MIN_WORK, 0);
+                (c, used)
+            });
+            assert_eq!(used, Split::Serial, "under install");
+            assert_eq!(bits(&got), want);
+
+            let tasks: Vec<(Vec<f32>, Split)> = in_pool(4, || {
+                (0..4)
+                    .into_par_iter()
+                    .map(|_| {
+                        let mut c = vec![0.0f32; n];
+                        let used = matmul_bt_x86(&a, &b, &mut c, 1, k, n, ROW_THREAD_MIN_WORK, 0);
+                        (c, used)
+                    })
+                    .collect()
+            });
+            for (got, used) in tasks {
+                assert_eq!(used, Split::Serial, "inside a parallel iterator");
+                assert_eq!(bits(&got), want);
             }
         }
     }

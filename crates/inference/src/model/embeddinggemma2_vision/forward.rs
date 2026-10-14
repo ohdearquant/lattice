@@ -393,7 +393,7 @@ impl VisionWeights {
         }
         let patch = self.patch_embed(prepared)?;
         let positions = prepared.positions();
-        let mut stages = self.tower_forward(&patch, positions, should_cancel)?;
+        let stages = self.tower_forward(&patch, positions, should_cancel)?;
         if should_cancel() {
             return Err(vision_error("cancelled before pooling"));
         }
@@ -405,10 +405,30 @@ impl VisionWeights {
             ));
         }
         let projected = self.bridge(&pooler_values, soft_rows)?;
+        Ok(self.finish_encoding(
+            stages,
+            pooler_values,
+            pooler_occupancy,
+            projected,
+            soft_rows,
+        ))
+    }
+
+    /// Fills the pooled and bridged tiers of `stages` and pairs them with the soft-row count.
+    /// Shared by the whole-CPU path ([`VisionWeights::encode`]) and any backend that produces the
+    /// same tower output, so the two package an encoding identically.
+    pub(crate) fn finish_encoding(
+        &self,
+        mut stages: VisionStages,
+        pooler_values: Vec<f32>,
+        pooler_occupancy: Vec<bool>,
+        projected: Vec<f32>,
+        soft_rows: usize,
+    ) -> VisionEncoding {
         stages.pooler_values = pooler_values.clone();
         stages.pooler_occupancy = pooler_occupancy;
         stages.valid = pooler_values;
         stages.projected = projected;
-        Ok(VisionEncoding { stages, soft_rows })
+        VisionEncoding { stages, soft_rows }
     }
 }

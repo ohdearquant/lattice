@@ -17,7 +17,7 @@
 use super::embeddinggemma2_config::{
     EmbeddingGemma2Config, EmbeddingGemma2LayerKind, ImagePartsConfig, image_parts_config,
 };
-use super::embeddinggemma2_image::{EmbeddingGemma2Rgb8Image, prepare_image};
+use super::embeddinggemma2_image::{EmbeddingGemma2Rgb8Image, PreparedImage, prepare_image};
 use super::embeddinggemma2_vision::{LazyVision, VisionStages, VisionWeights};
 use super::gemma4_ops::{
     gemma4_apply_rope, gemma4_geglu_mlp, gemma4_gelu_tanh, gemma4_qk_norm_v_unscaled,
@@ -25,7 +25,7 @@ use super::gemma4_ops::{
 };
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, matmul_into};
-use crate::forward::metal_embeddinggemma2::MetalEmbeddingGemma2State;
+use crate::forward::metal_embeddinggemma2::{MetalEmbeddingGemma2State, VisionTimings};
 use crate::model::config_file::read_config_json_bounded;
 use crate::tokenizer::common::{EmbeddingTokenCounts, Tokenizer};
 use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
@@ -548,6 +548,50 @@ fn add_in_place(dst: &mut [f32], src: &[f32]) {
     }
 }
 
+/// Tower stages for one image part, on the backend `state` names.
+///
+/// With `state` present the host hands the patch rows to the Metal tower and folds the pass's
+/// per-segment times into `timings`; with `state` absent the whole encoding stays on the host.
+/// Host runs are never mixed into a Metal pass and a device failure is never replayed on the
+/// host.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn vision_part_stages(
+    state: Option<&mut MetalEmbeddingGemma2State>,
+    weights: &VisionWeights,
+    prepared: &PreparedImage,
+    should_cancel: &mut dyn FnMut() -> bool,
+    timings: &mut VisionTimings,
+) -> Result<VisionStages, InferenceError> {
+    match state {
+        Some(metal) => {
+            let (stages, part_timings) = metal.vision_forward(weights, prepared, should_cancel)?;
+            timings.add(&part_timings);
+            Ok(stages)
+        }
+        None => Ok(weights.encode(prepared, should_cancel)?.stages),
+    }
+}
+
+/// Host-only counterpart of [`vision_part_stages`].
+///
+/// A request that names a Metal state on a build without the `metal-gpu` feature is refused
+/// rather than silently answered from the host.
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+fn vision_part_stages(
+    state: Option<&mut MetalEmbeddingGemma2State>,
+    weights: &VisionWeights,
+    prepared: &PreparedImage,
+    should_cancel: &mut dyn FnMut() -> bool,
+    _timings: &mut VisionTimings,
+) -> Result<VisionStages, InferenceError> {
+    if state.is_some() {
+        return Err(InferenceError::Inference(
+            "EmbeddingGemma 2 Metal forward requires macOS and the metal-gpu feature".to_string(),
+        ));
+    }
+    Ok(weights.encode(prepared, should_cancel)?.stages)
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -880,6 +924,38 @@ impl EmbeddingGemma2Model {
         widths: &[usize],
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<EmbeddingGemma2PartsEncoding, InferenceError> {
+        let (encoding, _) = self.encode_parts_impl(parts, widths, should_cancel, None)?;
+        Ok(encoding)
+    }
+
+    /// As [`EmbeddingGemma2Model::encode_parts_at_widths`], with the vision tower running on the
+    /// GPU in f32 through `state`, which must have been built from this model with
+    /// [`MetalEmbeddingGemma2State::new`]. The patch embed, pooling, the bridge and the text
+    /// encoder stay on the host; the per-segment timings of the whole pass are returned with the
+    /// encoding. A device failure returns an error and the call never falls back to the host.
+    ///
+    /// The caller holds the machine GPU lock for the whole call.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub fn encode_parts_at_widths_metal(
+        &self,
+        state: &mut MetalEmbeddingGemma2State,
+        parts: &[EmbeddingGemma2Part],
+        widths: &[usize],
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<(EmbeddingGemma2PartsEncoding, VisionTimings), InferenceError> {
+        state.check_model(self)?;
+        self.encode_parts_impl(parts, widths, should_cancel, Some(state))
+    }
+
+    /// The shared body of the host and Metal entry points. `state` is `Some` only on the Metal
+    /// path, and `None` from the host entry point, which never touches Metal.
+    fn encode_parts_impl(
+        &self,
+        parts: &[EmbeddingGemma2Part],
+        widths: &[usize],
+        should_cancel: &mut dyn FnMut() -> bool,
+        mut state: Option<&mut MetalEmbeddingGemma2State>,
+    ) -> Result<(EmbeddingGemma2PartsEncoding, VisionTimings), InferenceError> {
         self.check_widths(widths)?;
         if parts.is_empty() {
             return Err(InferenceError::InvalidInput(
@@ -898,6 +974,11 @@ impl EmbeddingGemma2Model {
                 "cancelled before embedding preparations".to_string(),
             ));
         }
+        #[cfg_attr(
+            not(all(target_os = "macos", feature = "metal-gpu")),
+            allow(unused_mut, reason = "the host-only dispatch leaves the total at zero")
+        )]
+        let mut timings = VisionTimings::default();
         let mut image_rows: Vec<f32> = Vec::new();
         let mut image_stages: Vec<EmbeddingGemma2ImageStages> = Vec::new();
         let mut soft_rows_per_part = vec![0usize; parts.len()];
@@ -916,12 +997,18 @@ impl EmbeddingGemma2Model {
                 .checked_add(prepared.soft_rows())
                 .ok_or_else(|| image_error("image row count overflow"))?;
             let weights = self.vision.get()?;
-            let encoding = weights.encode(&prepared, should_cancel)?;
-            image_rows.extend_from_slice(&encoding.stages.projected);
+            let stages = vision_part_stages(
+                state.as_deref_mut(),
+                &weights,
+                &prepared,
+                should_cancel,
+                &mut timings,
+            )?;
+            image_rows.extend_from_slice(&stages.projected);
             image_stages.push(EmbeddingGemma2ImageStages::from_parts(
                 prepared.valid_count(),
                 prepared.soft_rows(),
-                encoding.stages,
+                stages,
             ));
             if should_cancel() {
                 return Err(InferenceError::Inference(
@@ -937,19 +1024,22 @@ impl EmbeddingGemma2Model {
         let states = self.project_states(&hidden, tokens)?;
         let embeddings = self.pool_widths(&states, tokens, widths)?;
         let pre_normalization = mean_pool(&states, tokens, self.cfg.embedding_dim);
-        Ok(EmbeddingGemma2PartsEncoding {
-            embeddings,
-            input_ids,
-            counts: EmbeddingGemma2PartCounts {
-                sequence_length: tokens,
-                valid_patches,
-                image_rows: image_row_count,
+        Ok((
+            EmbeddingGemma2PartsEncoding {
+                embeddings,
+                input_ids,
+                counts: EmbeddingGemma2PartCounts {
+                    sequence_length: tokens,
+                    valid_patches,
+                    image_rows: image_row_count,
+                },
+                image_rows,
+                image_stages,
+                token_states: states,
+                pre_normalization,
             },
-            image_rows,
-            image_stages,
-            token_states: states,
-            pre_normalization,
-        })
+            timings,
+        ))
     }
 
     /// Per-token states after the final norm and the `hidden -> embedding_dim` projection,

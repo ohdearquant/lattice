@@ -5,9 +5,7 @@
 the pattern does not inflate them; recompute with
 `grep -rn 'unsafe {' crates/inference/src --include='*.rs' | grep -vE ':\s*//' | wc -l`
 and the same pipeline over `allow(dead_code` rather than trusting these numbers verbatim. It is NOT intended for direct use by platform or feature crates.
-Consumers should go through `lattice-embed`. The unsafe blocks are documented in
-`foundation/STABILITY.md §Tech Debt`. Tracking issue: #1306.
-See `foundation/STABILITY.md` for the full stability policy.
+Consumers should go through `lattice-embed`.
 
 If you are trying to generate embeddings in an application, start with `lattice-embed`, not
 this crate. The README you are reading is a contributor's map for people opening PRs on the
@@ -82,13 +80,16 @@ A deeper Qwen3.5-specific walkthrough lives in `docs/forward-pass.md`.
 
 ## Supported Architectures
 
-| Architecture                   | Submodule                        | Notes                                                                                                                                                      |
-| ------------------------------ | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| BERT / BGE (encoder-only)      | `model/bert.rs`                  | Bidirectional attention, WordPiece tokenizer, mean or CLS pooling. Covers BGE-small/base/large, E5-small/base, all-MiniLM, paraphrase-multilingual-MiniLM. |
-| Qwen3 / Qwen3.5 (decoder-only) | `model/qwen.rs`, `model/qwen35/` | Causal GQA, RoPE, RMSNorm, SwiGLU FFN, BPE tokenizer, last-token pooling. Covers Qwen3-Embedding-0.6B and 4B.                                              |
-| BitNet                         | `model/bitnet_config.rs`         | 1.58-bit quantized weight architecture.                                                                                                                    |
-| Qwen3-VL (vision)              | `vision/`                        | ViT patch encoder + MLP merger for multimodal input; CPU-only (ADR-049 v0 scope).                                                                          |
-| Cross-encoder                  | `model/cross_encoder.rs`         | BERT-style reranker with a classification head on top of the CLS token.                                                                                    |
+| Architecture                   | Submodule                                                     | Notes                                                                                                                                                                                                                                                  |
+| ------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| BERT / BGE (encoder-only)      | `model/bert.rs`                                               | Bidirectional attention, WordPiece tokenizer, mean or CLS pooling. Covers BGE-small/base/large, E5-small/base, all-MiniLM, paraphrase-multilingual-MiniLM.                                                                                             |
+| Qwen3 / Qwen3.5 (decoder-only) | `model/qwen.rs`, `model/qwen35/`                              | Causal GQA, RoPE, RMSNorm, SwiGLU FFN, BPE tokenizer, last-token pooling. Covers Qwen3-Embedding-0.6B and 4B.                                                                                                                                          |
+| BitNet                         | `model/bitnet_config.rs`                                      | 1.58-bit quantized weight architecture.                                                                                                                                                                                                                |
+| Qwen3-VL (vision)              | `vision/`                                                     | ViT patch encoder + MLP merger for multimodal input; CPU-only (ADR-049 v0 scope).                                                                                                                                                                      |
+| Cross-encoder                  | `model/cross_encoder.rs`                                      | BERT-style reranker with a classification head on top of the CLS token.                                                                                                                                                                                |
+| EmbeddingGemma 2               | `model/embeddinggemma2.rs`, `model/embeddinggemma2_vision.rs` | 24-layer bidirectional Gemma-family encoder, mean pooling to a 768-dimension vector; callers take leading widths, each L2-normalized. Text and image parts on the CPU in f32; an explicit f32 Metal text encoder (`forward/metal_embeddinggemma2.rs`). |
+| Gemma 4 E2B (decoder-only)     | `model/gemma4_model.rs`                                       | Text-only greedy generation on the CPU in f32: sliding-window local layers interleaved with full-attention layers, shared K/V across the final layers, attention without score scaling.                                                                |
+| PaddleOCR-VL / ERNIE-4.5       | `model/paddleocr_vl.rs`, `model/ernie45.rs`                   | Image + prompt to greedy text: SigLIP-shaped vision encoder and projector, ERNIE-4.5 dense decoder with sectioned multimodal RoPE. CPU f32, plus an explicit Metal decoder (`forward/metal_ernie45.rs`).                                               |
 
 ---
 

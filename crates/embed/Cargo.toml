@@ -7,6 +7,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "SIMD-accelerated vector operations and embedding generation"
+keywords = ["embeddings", "simd", "vector-search", "bert", "semantic-search"]
+categories = ["science", "text-processing", "algorithms"]
 
 # `rlib` keeps existing native consumers (crates depending on this as a Rust
 # library) working unchanged. `cdylib` additionally produces a linkable
@@ -15,6 +17,9 @@ description = "SIMD-accelerated vector operations and embedding generation"
 # module.
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[package.metadata.docs.rs]
+features = ["x86-gemm"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -53,7 +58,7 @@ tracing = "0.1"
 # its own ureq/download stack to non-wasm targets, so a plain `--features wasm`
 # build stays download-free; edge/cross builds drop it with
 # `--no-default-features --features native`. See issue #1095.
-lattice-inference = { version = "0.11.1", path = "../inference", optional = true, default-features = false, features = [
+lattice-inference = { version = "0.12.1", path = "../inference", optional = true, default-features = false, features = [
     "std",
     "f16",
 ] }
@@ -101,7 +106,7 @@ tempfile = { workspace = true }
 # jpeg for its broader image-loading surface, which this crate's tests don't
 # exercise.
 image = { version = "0.25", default-features = false, features = ["png"] }
-lattice-transport = { version = "0.11.1", path = "../transport" }
+lattice-transport = { version = "0.12.1", path = "../transport" }
 serde_json = { workspace = true }
 
 [features]
@@ -124,6 +129,7 @@ download = ["native", "lattice-inference/download"]
 # enabling this feature on a non-wasm target is a no-op rather than a build error.
 wasm = ["native", "dep:wasm-bindgen", "dep:console_error_panic_hook"]
 metal-gpu = ["lattice-inference/metal-gpu"]
+x86-gemm = ["lattice-inference/x86-gemm"]
 # Deprecated no-op: the AVX-512 VNNI int8 kernel this used to gate is now
 # compiled unconditionally on x86_64 (runtime-dispatched via
 # `SimdConfig::avx512vnni_enabled`, same pattern as the ungated f32 AVX-512F

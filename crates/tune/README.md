@@ -376,10 +376,10 @@ maintain both sides themselves.
 
 ```toml
 [dependencies]
-lattice-tune = { version = "0.4.2" }                           # Default
-lattice-tune = { version = "0.4.2", features = ["serde"] }     # With serialization
-lattice-tune = { version = "0.4.2", features = ["gpu"] }       # GPU training
-lattice-tune = { version = "0.4.2", features = ["safetensors"] } # LoRA adapter I/O
+lattice-tune = { version = "0.12" }                           # Default
+lattice-tune = { version = "0.12", features = ["serde"] }     # With serialization
+lattice-tune = { version = "0.12", features = ["gpu"] }       # GPU training
+lattice-tune = { version = "0.12", features = ["safetensors"] } # LoRA adapter I/O
 ```
 
 ### Injecting an adapter into `lattice-inference`
@@ -390,8 +390,8 @@ as a `Box<dyn LoraHook>`:
 
 ```toml
 [dependencies]
-lattice-tune = { version = "0.4.2", features = ["inference-hook", "safetensors"] }
-lattice-inference = "0.4.2" # provides the LoraHook trait
+lattice-tune = { version = "0.12", features = ["inference-hook", "safetensors"] }
+lattice-inference = "0.12" # provides the LoraHook trait
 ```
 
 ```rust,ignore
@@ -410,7 +410,7 @@ This crate depends on `lattice-fann` for neural network primitives.
 
 ```toml
 [dependencies]
-lattice-tune = { version = "0.4.2" }
+lattice-tune = { version = "0.12" }
 # lattice-fann is automatically included as a transitive dependency
 ```
 

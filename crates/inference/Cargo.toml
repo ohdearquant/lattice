@@ -7,6 +7,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Pure Rust transformer inference engine — safetensors loading, SIMD matmul, BGE/Qwen3 embeddings"
+keywords = ["inference", "transformer", "llm", "embeddings", "metal"]
+categories = ["science", "algorithms", "hardware-support"]
 # Heavy test-only fixtures push the packaged crate past the crates.io 10MB
 # upload limit. They are consumed only by integration tests, which are never
 # run from the published crate. The two tokenizer vocabularies below are 43MB
@@ -19,6 +21,9 @@ exclude = [
     "tests/fixtures/gemma4/tokenizer",
     "tests/fixtures/paddleocr_vl/tokenizer",
 ]
+
+[package.metadata.docs.rs]
+features = ["f16", "x86-gemm", "mixture", "train-backward", "wgpu-gpu"]
 
 [package.metadata.gpu-bench-handoff]
 version = 1
@@ -66,6 +71,8 @@ f16 = []
 metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann"]
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 bench-internals = []
+# Stock `gemm` for multi-row `matmul_bt` on Linux x86_64 (ADR-099 F1, step 1). Off by default.
+x86-gemm = ["dep:gemm"]
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
 backfill = ["dep:rusqlite", "f16"]
 download = ["dep:ureq"]
@@ -98,6 +105,7 @@ memmap2 = "0.9"
 indexmap = "2"
 rustc-hash = "2"
 rayon = { workspace = true }
+gemm = { version = "=0.18.2", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
@@ -128,7 +136,7 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-lattice-fann = { version = "0.11.1", path = "../fann", optional = true }
+lattice-fann = { version = "0.12.1", path = "../fann", optional = true }
 
 # Two independent unix-only uses: (1) `fcntl(F_GETPATH)` for `weights/f32_weights.rs`'s
 # `real_path_of_open_file`, which reports the real path of an already-open shard descriptor
@@ -186,6 +194,14 @@ required-features = ["f16", "metal-gpu", "serve"]
 [[test]]
 name = "serve_startup_golden"
 required-features = ["f16", "metal-gpu", "serve"]
+
+# Request, prompt and answer layer for the system-one wire format (no model, no
+# route); runs under the default `serve` feature. Its checkpoint-tokenizer tests
+# skip with a printed reason when `LATTICE_DECIDER_DIR` is unset, and
+# `LATTICE_DECIDER_GATE_ENFORCE=1` turns that skip into a failure.
+[[test]]
+name = "systemone_decider_0_8b"
+required-features = ["serve"]
 
 # The serving checkpoint targets stay out of `cargo test`'s default target set
 # and run only when selected with `--test <name>`. Set
@@ -361,6 +377,10 @@ required-features = ["f16", "metal-gpu"]
 
 [[example]]
 name = "bench_concurrent"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "bench_gemm_shapes"
 required-features = ["f16", "metal-gpu"]
 
 [[example]]

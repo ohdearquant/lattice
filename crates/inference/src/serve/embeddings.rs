@@ -530,7 +530,7 @@ fn is_data_uri(text: &str) -> bool {
 /// Returns [`ApiError::BadRequest`] (`invalid_input`) if `items` is empty or
 /// exceeds [`MAX_EMBEDDING_INPUT_COUNT`]; [`ApiError::BadRequest`]
 /// (`data_uri_as_text_item`) for a plain-string item that is shaped like a
-/// data URI (see [`is_data_uri`]) -- a data URI is only ever meaningful as an
+/// data URI (see `is_data_uri`) -- a data URI is only ever meaningful as an
 /// `image_url` object (see [`EmbeddingInputItem`]'s own doc comment), so one
 /// arriving as a text item is a caller passing the wrong shape, not text to
 /// embed; propagates [`decode_inline_image`]'s error for a malformed or

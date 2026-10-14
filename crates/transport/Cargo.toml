@@ -7,6 +7,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Optimal transport math (Sinkhorn, Wasserstein, barycenters) for Lattice"
+keywords = ["optimal-transport", "sinkhorn", "wasserstein", "barycenter", "math"]
+categories = ["mathematics", "science", "algorithms"]
 
 [dependencies]
 rayon = { workspace = true }
