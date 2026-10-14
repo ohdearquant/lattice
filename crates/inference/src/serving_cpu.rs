@@ -23,6 +23,12 @@
 //! Qwen3.5 CPU entries and return the same counters.
 //!
 //! Not a stable API: `#[doc(hidden)]` is a convention, not a semver guarantee.
+//!
+//! [`GemmaCpuServing`]: crate::serving_cpu::GemmaCpuServing
+//! [`prepare_gemma_chat_request`]: crate::serve::prepare::prepare_gemma_chat_request
+//! [`GemmaCpuServing::load`]: crate::serving_cpu::GemmaCpuServing::load
+//! [`qwen_generate_traced`]: crate::serving_cpu::qwen_generate_traced
+//! [`qwen_generate_streaming_traced`]: crate::serving_cpu::qwen_generate_streaming_traced
 
 use crate::error::InferenceError;
 use crate::forward::metal_qwen35::{ChatMessage, ChatRole};

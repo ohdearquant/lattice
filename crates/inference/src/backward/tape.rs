@@ -7,25 +7,25 @@
 
 /// Cached activations for a single GQA layer (layer-23 in the full model).
 pub struct LayerCache {
-    /// Residual stream input before pre-attention RMSNorm: [hidden]
+    /// Residual stream input before pre-attention RMSNorm: `[hidden]`
     pub residual_pre_attn: Vec<f32>,
-    /// Pre-attention RMSNorm output (i.e. the normed hidden): [hidden]
+    /// Pre-attention RMSNorm output (i.e. the normed hidden): `[hidden]`
     pub normed_pre_attn: Vec<f32>,
-    /// inv_rms values for the pre-attention RMSNorm: scalar per token, stored [1]
+    /// inv_rms values for the pre-attention RMSNorm: scalar per token, stored `[1]`
     pub inv_rms_pre_attn: f32,
-    /// Pre-FFN residual: [hidden]
+    /// Pre-FFN residual: `[hidden]`
     pub residual_pre_ffn: Vec<f32>,
-    /// Normed pre-FFN: [hidden]
+    /// Normed pre-FFN: `[hidden]`
     pub normed_pre_ffn: Vec<f32>,
     /// inv_rms for pre-FFN norm: scalar
     pub inv_rms_pre_ffn: f32,
-    /// Gate pre-activation (before silu) for SwiGLU: [inter]
+    /// Gate pre-activation (before silu) for SwiGLU: `[inter]`
     pub gate_pre: Vec<f32>,
-    /// Up pre-activation: [inter]
+    /// Up pre-activation: `[inter]`
     pub up_pre: Vec<f32>,
-    /// Attention output (after o_proj) before residual add: [hidden]
+    /// Attention output (after o_proj) before residual add: `[hidden]`
     pub attn_out: Vec<f32>,
-    /// FFN output (after down_proj) before residual add: [hidden]
+    /// FFN output (after down_proj) before residual add: `[hidden]`
     pub ffn_out: Vec<f32>,
 }
 
@@ -46,24 +46,24 @@ pub struct SequenceLayerCache {
     pub context: Vec<f32>,
     /// h_q = A_q x per-token: [seq_len * rank]
     pub h_q: Vec<f32>,
-    /// h_v = A_v x per-token: [seq_len * rank]
+    /// h_v = A_v x per-token: `[seq_len * rank]`
     pub h_v: Vec<f32>,
-    /// Q after rope: per-token head layout [seq_len][q_dim]
+    /// Q after rope: per-token head layout `[seq_len][q_dim]`
     pub q_after_rope: Vec<Vec<f32>>,
 }
 
 /// Top-level activation tape covering the trained segment.
 pub struct BackwardTape {
     /// Hidden state at the input of layer-23 (= output of layer-22 after residual).
-    /// Shape [hidden] — we treat the prefix as frozen so we only need this boundary.
+    /// Shape `[hidden]` — we treat the prefix as frozen so we only need this boundary.
     pub layer23_input: Vec<f32>,
     /// Per-sequence cache for layer-23.
     pub layer23: SequenceLayerCache,
-    /// Final RMSNorm normed output: [hidden]
+    /// Final RMSNorm normed output: `[hidden]`
     pub final_normed: Vec<f32>,
     /// inv_rms for the final norm: scalar
     pub inv_rms_final: f32,
-    /// Logits: [vocab_size]
+    /// Logits: `[vocab_size]`
     pub logits: Vec<f32>,
 }
 
@@ -80,7 +80,7 @@ pub fn rms_norm_forward(x: &[f32], w: &[f32], eps: f32) -> (Vec<f32>, f32) {
     (normed, inv_rms)
 }
 
-/// SwiGLU forward: returns (output [hidden], gate_pre [inter], up_pre [inter]).
+/// SwiGLU forward: returns (output `[hidden]`, gate_pre `[inter]`, up_pre `[inter]`).
 pub fn swiglu_forward(
     x: &[f32],
     w_gate: &[f32],

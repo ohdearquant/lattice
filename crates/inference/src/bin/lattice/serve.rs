@@ -470,7 +470,7 @@ pub struct AppState {
 /// `lattice_inference::serve::embeddings::MAX_EMBEDDING_TOTAL_TOKENS`
 /// aggregate scaffold tokens by the budget check `embeddings()` runs inside
 /// the admitted `spawn_blocking` job (see
-/// [`check_pooled_embedding_total_tokens`]'s doc comment for why that check
+/// `check_pooled_embedding_total_tokens`'s doc comment for why that check
 /// runs after admission rather than before it, unlike the sibling route), so
 /// aggregate pooled-decoder work across concurrent requests is bounded by
 /// (this cap) x (that per-request budget) rather than growing with however

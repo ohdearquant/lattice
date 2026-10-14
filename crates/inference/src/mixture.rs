@@ -36,6 +36,15 @@
 //! repository resolves it. See `submit_refit`'s doc for the reasoning; an
 //! answer invented here would be a spec change wearing an implementation's
 //! clothes. `Softmax` should not be preferred in production ahead of it.
+//!
+//! [`AdapterRouter::route`]: crate::mixture::AdapterRouter::route
+//! [`WeightPolicy`]: crate::mixture::WeightPolicy
+//! [`WeightPolicy::Softmax`]: crate::mixture::WeightPolicy::Softmax
+//! [`AdapterRouter::set_weight_policy`]: crate::mixture::AdapterRouter::set_weight_policy
+//! [`AdapterRouter::set_epsilon`]: crate::mixture::AdapterRouter::set_epsilon
+//! [`AdapterRouter::set_tau_floor`]: crate::mixture::AdapterRouter::set_tau_floor
+//! [`RouterError::TauBelowFloor`]: crate::mixture::RouterError::TauBelowFloor
+//! [`AdapterRouter::submit_refit`]: crate::mixture::AdapterRouter::submit_refit
 
 use lattice_fann::{FannError, Network};
 
