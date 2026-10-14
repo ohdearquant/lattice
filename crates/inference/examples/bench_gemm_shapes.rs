@@ -1,6 +1,7 @@
-//! GEMM shape microbench: dispatch the production `matmul_bt` and `gemm_q4_tiled`
-//! kernels at caller-given shapes and check their output against a host
-//! reference.
+//! GEMM and attention shape microbench: dispatch the production `matmul_bt` and
+//! `gemm_q4_tiled` kernels, the simdgroup-matrix `gemm_f32_sg`, and the head-64
+//! attention kernels at caller-given shapes, and check their output against a
+//! host reference.
 //!
 //! Both kernels are the existing shader sources, compiled and dispatched the way
 //! the library dispatches them:
@@ -22,26 +23,52 @@
 //!   It is compiled like `gemm_q4_tiled` (Metal 3.0, Apple7 family); buffers
 //!   0/1/2 are X, W, Y, constants 3/4/5 are M, N, K, and the grid and
 //!   threadgroup size are `gemm_q4_tiled`'s.
+//! - `eg2_attention_hd64` (`attn_vec`) and `eg2_attention_sg_hd64` (`attn_sg`):
+//!   bidirectional attention without a window over `[seq, 12, 64]` queries,
+//!   keys and values with scale 1, the vision encoder's geometry. Both are
+//!   compiled from one library: the four-file source above followed by the
+//!   attention shader specialised to head width 64 and the simdgroup-matrix
+//!   attention shader, fast math disabled. Buffers 0-3 are Q, K, V, O and buffer
+//!   4 holds the attention parameters. `attn_vec` runs one simdgroup per query
+//!   row, grid `(heads, ceil(seq/8))` with 256 threads; `attn_sg` runs 32 query
+//!   rows per threadgroup on simdgroup matrices, grid `(heads, ceil(seq/32))`
+//!   with 128 threads. Each sequence length runs in two input regimes: uniform
+//!   (Q, K, V in [-1, 1)) and peaked (Q scaled by 8, so the running maximum
+//!   moves across key tiles and the rescale of the partial output carries
+//!   weight).
+//!
+//! Before any timed work the GPU clock is brought up by a fixed, untimed run of
+//! `gemm_f32_sg` at 2304x3072x768 (`CLOCK_WARMUP_DISPATCHES` dispatches, each
+//! in its own command buffer); its first and last spans are printed as an
+//! `@@warmup` line. Without it, a short kernel timed first after an idle pause
+//! measures the ramp rather than the kernel.
 //!
 //! Timing: each repetition encodes one dispatch in its own command buffer,
 //! commits it, waits, and reads that command buffer's `GPUStartTime` and
 //! `GPUEndTime`. Warmup repetitions are discarded. Per (kernel, shape) the
 //! reported figure is the median of the timed GPU spans, with min, max and the
-//! implied `2*M*N*K / median_seconds` rate.
+//! implied `2*M*N*K / median_seconds` rate (`4*seq^2*heads*64 / median_seconds`
+//! for attention).
 //!
 //! After the timed repetitions each (kernel, shape) is checked: a deterministic
 //! sample of output elements is compared against a host dot product that mirrors
 //! the kernel's staging. A sample whose relative error exceeds the kernel's
 //! bound exits nonzero, so a timing of a mis-dispatched kernel is never
-//! reported.
+//! reported. Attention is checked per sampled (query row, head) pair against an
+//! f64 softmax over every key: the largest absolute difference over the 64
+//! output dimensions, divided by the largest `sum_j p_j |v_j|`. `attn_sg` exits
+//! nonzero above its bound and either kernel exits nonzero on a non-finite
+//! output; `attn_vec`'s error is reported as a reading.
 //!
 //! Usage:
 //!   cargo run --release --example bench_gemm_shapes -p lattice-inference \
 //!     --features f16,metal-gpu -- --shape 2304x768x768 --kernel all --reps 20
 //!
 //! CLI: `--shape MxNxK` (repeatable; defaults to 2304x768x768, 2304x3072x768,
-//! 2304x768x3072, 2304x2304x64), `--kernel matmul_bt|q4_tiled|f32_sg|all` (default all),
-//! `--reps N` (default 20), `--warmup N` (default 3).
+//! 2304x768x3072, 2304x2304x64),
+//! `--kernel matmul_bt|q4_tiled|f32_sg|attn_vec|attn_sg|all` (default all),
+//! `--attn-seq N` (repeatable; defaults to 2304 and 2394), `--reps N` (default
+//! 20), `--warmup N` (default 3).
 
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
 fn main() {
@@ -70,16 +97,24 @@ fn run() -> Result<(), String> {
 
     let matmul = match options.kernel {
         KernelSelection::MatmulBt | KernelSelection::All => Some(build_matmul_pipeline(&device)?),
-        KernelSelection::Q4Tiled | KernelSelection::F32Sg => None,
+        _ => None,
     };
     let q4_tiled = match options.kernel {
         KernelSelection::Q4Tiled | KernelSelection::All => Some(build_q4_tiled_pipeline(&device)?),
-        KernelSelection::MatmulBt | KernelSelection::F32Sg => None,
+        _ => None,
     };
     let f32_sg = match options.kernel {
         KernelSelection::F32Sg | KernelSelection::All => Some(build_f32_sg_pipeline(&device)?),
-        KernelSelection::MatmulBt | KernelSelection::Q4Tiled => None,
+        _ => None,
     };
+    let attention = match options.kernel {
+        KernelSelection::AttnVec | KernelSelection::AttnSg | KernelSelection::All => {
+            Some(build_attention_pipelines(&device)?)
+        }
+        _ => None,
+    };
+
+    clock_warmup(&device, &queue)?;
 
     let mut failed = false;
     for shape in &options.shapes {
@@ -99,8 +134,42 @@ fn run() -> Result<(), String> {
             failed = true;
         }
     }
+    if let Some((vector, matrix)) = attention.as_ref() {
+        for &seq in &options.attn_seqs {
+            for regime in [Regime::Uniform, Regime::Peaked] {
+                let selected: [(&str, &metal::ComputePipelineState, bool); 2] = [
+                    (
+                        "attn_vec",
+                        vector,
+                        matches!(
+                            options.kernel,
+                            KernelSelection::AttnVec | KernelSelection::All
+                        ),
+                    ),
+                    (
+                        "attn_sg",
+                        matrix,
+                        matches!(
+                            options.kernel,
+                            KernelSelection::AttnSg | KernelSelection::All
+                        ),
+                    ),
+                ];
+                for (kernel, pipeline, enabled) in selected {
+                    if enabled
+                        && !run_attention(&device, &queue, pipeline, kernel, seq, regime, &options)?
+                    {
+                        failed = true;
+                    }
+                }
+            }
+        }
+    }
     if failed {
-        return Err("a sampled output exceeded its kernel's relative-error bound".to_string());
+        return Err(
+            "a sampled output exceeded its kernel's relative-error bound or was not finite"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -111,6 +180,8 @@ enum KernelSelection {
     MatmulBt,
     Q4Tiled,
     F32Sg,
+    AttnVec,
+    AttnSg,
     All,
 }
 
@@ -126,6 +197,7 @@ struct Shape {
 struct Options {
     shapes: Vec<Shape>,
     kernel: KernelSelection,
+    attn_seqs: Vec<usize>,
     reps: usize,
     warmup: usize,
 }
@@ -155,7 +227,19 @@ const DEFAULT_SHAPES: [Shape; 4] = [
 ];
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const DEFAULT_ATTN_SEQS: [usize; 2] = [2304, 2394];
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 const DEFAULT_REPS: usize = 20;
+/// Untimed dispatches of `gemm_f32_sg` at [`CLOCK_WARMUP_SHAPE`] run before any
+/// timed work.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const CLOCK_WARMUP_DISPATCHES: usize = 40;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const CLOCK_WARMUP_SHAPE: Shape = Shape {
+    m: 2304,
+    n: 3072,
+    k: 768,
+};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 const DEFAULT_WARMUP: usize = 3;
 /// Relative-error bound for `matmul_bt`: f32 inputs, f32 accumulation, f32 output.
@@ -175,6 +259,20 @@ const Q4_REL_BOUND: f64 = 5.0e-3;
 /// an operand staged through f16 would produce.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 const F32_SG_REL_BOUND: f64 = 1.0e-6;
+/// Error bound for `attn_sg`, as a fraction of the largest `sum_j p_j |v_j|` of
+/// the checked row: f32 scores, exponentials and accumulation over every key,
+/// against an f64 reference. 1e-4 leaves room for the online rescaling across
+/// key tiles while a dropped rescale or a misplaced tile lands far above it.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const ATTN_SG_REL_BOUND: f64 = 1.0e-4;
+/// Attention geometry of the vision encoder: 12 query and key/value heads of
+/// width 64, scale 1.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const ATTN_HEADS: usize = 12;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const ATTN_HEAD_DIM: usize = 64;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const ATTN_SCALE: f32 = 1.0;
 /// Number of sampled output elements compared against the host reference.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 const SAMPLE_COUNT: usize = 64;
@@ -184,6 +282,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> 
     let mut options = Options {
         shapes: Vec::new(),
         kernel: KernelSelection::All,
+        attn_seqs: Vec::new(),
         reps: DEFAULT_REPS,
         warmup: DEFAULT_WARMUP,
     };
@@ -195,20 +294,30 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> 
                 options.shapes.push(parse_shape(&value)?);
             }
             "--kernel" => {
-                let value = args
-                    .next()
-                    .ok_or("--kernel needs matmul_bt, q4_tiled, f32_sg or all")?;
+                let value = args.next().ok_or(
+                    "--kernel needs matmul_bt, q4_tiled, f32_sg, attn_vec, attn_sg or all",
+                )?;
                 options.kernel = match value.as_str() {
                     "matmul_bt" => KernelSelection::MatmulBt,
                     "q4_tiled" => KernelSelection::Q4Tiled,
                     "f32_sg" => KernelSelection::F32Sg,
+                    "attn_vec" => KernelSelection::AttnVec,
+                    "attn_sg" => KernelSelection::AttnSg,
                     "all" => KernelSelection::All,
                     other => {
                         return Err(format!(
-                            "--kernel must be matmul_bt, q4_tiled, f32_sg or all, got {other}"
+                            "--kernel must be matmul_bt, q4_tiled, f32_sg, attn_vec, attn_sg or all, got {other}"
                         ));
                     }
                 };
+            }
+            "--attn-seq" => {
+                let value = args.next().ok_or("--attn-seq needs a sequence length")?;
+                let seq = parse_count(&value, "--attn-seq")?;
+                if seq == 0 {
+                    return Err("--attn-seq must be at least 1".to_string());
+                }
+                options.attn_seqs.push(seq);
             }
             "--reps" => {
                 let value = args.next().ok_or("--reps needs a count")?;
@@ -223,6 +332,9 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> 
     }
     if options.shapes.is_empty() {
         options.shapes.extend_from_slice(&DEFAULT_SHAPES);
+    }
+    if options.attn_seqs.is_empty() {
+        options.attn_seqs.extend_from_slice(&DEFAULT_ATTN_SEQS);
     }
     if options.reps == 0 {
         return Err("--reps must be at least 1".to_string());
@@ -494,15 +606,22 @@ fn timed_dispatch(
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-fn summary(kernel: &str, shape: Shape, spans_us: &[f64]) -> Result<(), String> {
+fn span_stats(spans_us: &[f64]) -> Result<(f64, f64, f64), String> {
     if spans_us.is_empty() {
         return Err("no timed repetitions were collected".to_string());
     }
     let mut sorted = spans_us.to_vec();
     sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    let median = sorted[sorted.len() / 2];
-    let min = sorted[0];
-    let max = sorted[sorted.len() - 1];
+    Ok((
+        sorted[sorted.len() / 2],
+        sorted[0],
+        sorted[sorted.len() - 1],
+    ))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn summary(kernel: &str, shape: Shape, spans_us: &[f64]) -> Result<(), String> {
+    let (median, min, max) = span_stats(spans_us)?;
     let reps = spans_us.len();
     let (m, n, k) = (shape.m, shape.n, shape.k);
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
@@ -849,4 +968,341 @@ fn dequantized_q4_weights(payload: &[u8], shape: Shape) -> Result<Vec<[f32; 32]>
         }
     }
     Ok(decoded)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const ATTENTION_SOURCE: &str =
+    include_str!("../src/forward/shaders/embeddinggemma2_attention.metal");
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const ATTENTION_SG_SOURCE: &str = include_str!("../src/forward/shaders/attention_sg_hd64.metal");
+
+/// Layout of `Eg2AttentionParams` in `embeddinggemma2.metal`.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[repr(C)]
+struct AttentionParams {
+    seq_len: u32,
+    heads: u32,
+    kv_heads: u32,
+    window: u32,
+    use_window: u32,
+    scale: f32,
+    pad: [u32; 2],
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[derive(Clone, Copy)]
+enum Regime {
+    Uniform,
+    Peaked,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+impl Regime {
+    fn name(self) -> &'static str {
+        match self {
+            Regime::Uniform => "uniform",
+            Regime::Peaked => "peaked",
+        }
+    }
+
+    fn query_factor(self) -> f32 {
+        match self {
+            Regime::Uniform => 1.0,
+            Regime::Peaked => 8.0,
+        }
+    }
+}
+
+/// Build `eg2_attention_hd64` and `eg2_attention_sg_hd64` from one library: the
+/// four-file source, the attention shader at head width 64, then the
+/// simdgroup-matrix attention shader, with fast math disabled.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn build_attention_pipelines(
+    device: &metal::Device,
+) -> Result<(metal::ComputePipelineState, metal::ComputePipelineState), String> {
+    use metal::{CompileOptions, MTLGPUFamily};
+
+    if !device.supports_family(MTLGPUFamily::Apple7) {
+        return Err(
+            "eg2_attention_sg_hd64 needs the Apple7 GPU family (simdgroup matrix operations)"
+                .to_string(),
+        );
+    }
+    let mut source = matmul_source();
+    source.push_str(&ATTENTION_SOURCE.replace("__HD__", "64"));
+    source.push_str(ATTENTION_SG_SOURCE);
+    let options = CompileOptions::new();
+    options.set_fast_math_enabled(false);
+    let library = device
+        .new_library_with_source(&source, &options)
+        .map_err(|error| format!("attention shader compilation failed: {error}"))?;
+    let make = |name: &str, threads: u64| -> Result<metal::ComputePipelineState, String> {
+        let function = library
+            .get_function(name, None)
+            .map_err(|error| format!("{name} kernel missing: {error}"))?;
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|error| format!("{name} pipeline failed: {error}"))?;
+        if pipeline.max_total_threads_per_threadgroup() < threads {
+            let permitted = pipeline.max_total_threads_per_threadgroup();
+            return Err(format!(
+                "{name} needs {threads} threads per group, pipeline permits {permitted}"
+            ));
+        }
+        if pipeline.thread_execution_width() != 32 {
+            return Err(format!("{name} requires a 32-lane SIMD execution width"));
+        }
+        Ok(pipeline)
+    };
+    Ok((
+        make("eg2_attention_hd64", 256)?,
+        make("eg2_attention_sg_hd64", 128)?,
+    ))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn run_attention(
+    device: &metal::Device,
+    queue: &metal::CommandQueue,
+    pipeline: &metal::ComputePipelineState,
+    kernel: &str,
+    seq: usize,
+    regime: Regime,
+    options: &Options,
+) -> Result<bool, String> {
+    let seq_len = u32::try_from(seq).map_err(|_| "sequence length exceeds u32".to_string())?;
+    let width = ATTN_HEADS * ATTN_HEAD_DIM;
+    let factor = regime.query_factor();
+    let q_values: Vec<f32> = activation(0x2122_2324_2526_2728, seq * width)
+        .into_iter()
+        .map(|value| value * factor)
+        .collect();
+    let k_values = activation(0x3132_3334_3536_3738, seq * width);
+    let v_values = activation(0x4142_4344_4546_4748, seq * width);
+    let q_buffer = shared_buffer(device, seq * width * 4);
+    let k_buffer = shared_buffer(device, seq * width * 4);
+    let v_buffer = shared_buffer(device, seq * width * 4);
+    let o_buffer = shared_buffer(device, seq * width * 4);
+    write_slice(&q_buffer, &q_values);
+    write_slice(&k_buffer, &k_values);
+    write_slice(&v_buffer, &v_values);
+    let heads = ATTN_HEADS as u32;
+    let params = AttentionParams {
+        seq_len,
+        heads,
+        kv_heads: heads,
+        window: 0,
+        use_window: 0,
+        scale: ATTN_SCALE,
+        pad: [0; 2],
+    };
+    let (rows_per_group, threads) = if kernel == "attn_sg" {
+        (32u64, 128u64)
+    } else {
+        (8u64, 256u64)
+    };
+
+    let encode = |encoder: &metal::ComputeCommandEncoderRef| {
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(&q_buffer), 0);
+        encoder.set_buffer(1, Some(&k_buffer), 0);
+        encoder.set_buffer(2, Some(&v_buffer), 0);
+        encoder.set_buffer(3, Some(&o_buffer), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<AttentionParams>() as u64,
+            std::ptr::from_ref(&params).cast(),
+        );
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(
+                u64::from(heads),
+                u64::from(seq_len).div_ceil(rows_per_group),
+                1,
+            ),
+            metal::MTLSize::new(threads, 1, 1),
+        );
+    };
+
+    for _ in 0..options.warmup {
+        timed_dispatch(queue, encode)?;
+    }
+    let mut spans = Vec::with_capacity(options.reps);
+    for _ in 0..options.reps {
+        spans.push(timed_dispatch(queue, encode)?);
+    }
+    let (median, min, max) = span_stats(&spans)?;
+    let flops = 4.0 * (seq as f64) * (seq as f64) * width as f64;
+    let tflops = if median > 0.0 {
+        flops / (median * 1.0e-6) / 1.0e12
+    } else {
+        0.0
+    };
+    let reps = spans.len();
+    let regime_name = regime.name();
+    println!(
+        "@@attn kernel={kernel} s={seq} heads={heads} hd={ATTN_HEAD_DIM} regime={regime_name} reps={reps} median_us={median:.3} min_us={min:.3} max_us={max:.3} tflops={tflops:.4}"
+    );
+
+    let o = read_slice(&o_buffer, seq * width);
+    let nonfinite = o.iter().filter(|value| !value.is_finite()).count();
+    let (max_abs, max_rel) = attention_reference_error(&q_values, &k_values, &v_values, &o, seq);
+    println!(
+        "@@check kernel={kernel} s={seq} regime={regime_name} max_abs={max_abs:.6e} max_rel={max_rel:.6e} nonfinite={nonfinite}"
+    );
+    if nonfinite > 0 {
+        eprintln!("{kernel} s={seq} {regime_name}: {nonfinite} output values are not finite");
+        return Ok(false);
+    }
+    if kernel == "attn_sg" && max_rel > ATTN_SG_REL_BOUND {
+        let bound = ATTN_SG_REL_BOUND;
+        eprintln!(
+            "{kernel} s={seq} {regime_name} relative error {max_rel:.6e} exceeds {bound:.1e}"
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Deterministic sample of (query row, head) pairs: tile-boundary rows (8-row
+/// and 32-row blocks, 32-key tiles), the last rows, both edge heads, then
+/// pseudo-random fill up to `SAMPLE_COUNT`.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn attention_samples(seq: usize) -> Vec<(usize, usize)> {
+    use std::collections::BTreeSet;
+
+    let mut pairs = BTreeSet::new();
+    let rows = [
+        0,
+        7,
+        8,
+        31,
+        32,
+        33,
+        63,
+        64,
+        seq / 2,
+        seq.saturating_sub(33),
+        seq.saturating_sub(32),
+        seq.saturating_sub(2),
+        seq - 1,
+    ];
+    for row in rows {
+        for head in [0, ATTN_HEADS - 1] {
+            if row < seq {
+                pairs.insert((row, head));
+            }
+        }
+    }
+    let target = SAMPLE_COUNT.min(seq * ATTN_HEADS);
+    let mut rng = Rng::new(0x5EED_A77E_0000_0064);
+    while pairs.len() < target {
+        let row = (rng.next_u64() as usize) % seq;
+        let head = (rng.next_u64() as usize) % ATTN_HEADS;
+        pairs.insert((row, head));
+    }
+    pairs.into_iter().collect()
+}
+
+/// f64 softmax attention for each sampled (row, head) pair over every key.
+/// Returns `(max_abs, max_rel)`, where a pair's relative error is its largest
+/// absolute difference over the head's outputs divided by its largest
+/// `sum_j p_j |v_j|`, the magnitude the output is a weighted average of.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn attention_reference_error(q: &[f32], k: &[f32], v: &[f32], o: &[f32], seq: usize) -> (f64, f64) {
+    let width = ATTN_HEADS * ATTN_HEAD_DIM;
+    let scale = f64::from(ATTN_SCALE);
+    let mut max_abs = 0.0f64;
+    let mut max_rel = 0.0f64;
+    let mut scores = vec![0.0f64; seq];
+    for (row, head) in attention_samples(seq) {
+        let base = head * ATTN_HEAD_DIM;
+        let query = &q[row * width + base..row * width + base + ATTN_HEAD_DIM];
+        let mut peak = f64::NEG_INFINITY;
+        for (key, score) in scores.iter_mut().enumerate() {
+            let keys = &k[key * width + base..key * width + base + ATTN_HEAD_DIM];
+            let dot: f64 = query
+                .iter()
+                .zip(keys)
+                .map(|(left, right)| f64::from(*left) * f64::from(*right))
+                .sum();
+            *score = dot * scale;
+            peak = peak.max(*score);
+        }
+        let mut denominator = 0.0f64;
+        for score in scores.iter_mut() {
+            *score = (*score - peak).exp();
+            denominator += *score;
+        }
+        let mut worst_difference = 0.0f64;
+        let mut largest_magnitude = 0.0f64;
+        for dim in 0..ATTN_HEAD_DIM {
+            let mut reference = 0.0f64;
+            let mut magnitude = 0.0f64;
+            for (key, weight) in scores.iter().enumerate() {
+                let value = f64::from(v[key * width + base + dim]);
+                reference += weight * value;
+                magnitude += weight * value.abs();
+            }
+            reference /= denominator;
+            magnitude /= denominator;
+            let difference = (f64::from(o[row * width + base + dim]) - reference).abs();
+            worst_difference = worst_difference.max(difference);
+            largest_magnitude = largest_magnitude.max(magnitude);
+        }
+        max_abs = max_abs.max(worst_difference);
+        max_rel = max_rel.max(worst_difference / largest_magnitude.max(f64::MIN_POSITIVE));
+    }
+    (max_abs, max_rel)
+}
+
+/// Bring the GPU clock up before anything is timed: a fixed number of untimed
+/// `gemm_f32_sg` dispatches at [`CLOCK_WARMUP_SHAPE`], each in its own command
+/// buffer. The first and last spans are printed so a run records the ramp it
+/// discarded.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn clock_warmup(device: &metal::Device, queue: &metal::CommandQueue) -> Result<(), String> {
+    let pipeline = build_f32_sg_pipeline(device)?;
+    let shape = CLOCK_WARMUP_SHAPE;
+    let m = u32::try_from(shape.m).map_err(|_| "M exceeds u32 indexing".to_string())?;
+    let n = u32::try_from(shape.n).map_err(|_| "N exceeds u32 indexing".to_string())?;
+    let k = u32::try_from(shape.k).map_err(|_| "K exceeds u32 indexing".to_string())?;
+    let x_buffer = shared_buffer(device, shape.m * shape.k * 4);
+    let w_buffer = shared_buffer(device, shape.n * shape.k * 4);
+    let y_buffer = shared_buffer(device, shape.m * shape.n * 4);
+    write_slice(
+        &x_buffer,
+        &activation(0x6162_6364_6566_6768, shape.m * shape.k),
+    );
+    write_slice(
+        &w_buffer,
+        &activation(0x7172_7374_7576_7778, shape.n * shape.k),
+    );
+    let encode = |encoder: &metal::ComputeCommandEncoderRef| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&x_buffer), 0);
+        encoder.set_buffer(1, Some(&w_buffer), 0);
+        encoder.set_buffer(2, Some(&y_buffer), 0);
+        encoder.set_bytes(3, 4, std::ptr::from_ref(&m).cast());
+        encoder.set_bytes(4, 4, std::ptr::from_ref(&n).cast());
+        encoder.set_bytes(5, 4, std::ptr::from_ref(&k).cast());
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(u64::from(n).div_ceil(32), u64::from(m).div_ceil(64), 1),
+            metal::MTLSize::new(32, 4, 1),
+        );
+    };
+    let mut first = 0.0f64;
+    let mut last = 0.0f64;
+    for index in 0..CLOCK_WARMUP_DISPATCHES {
+        let span = timed_dispatch(queue, encode)?;
+        if index == 0 {
+            first = span;
+        }
+        last = span;
+    }
+    let dispatches = CLOCK_WARMUP_DISPATCHES;
+    println!(
+        "@@warmup kernel=f32_sg m={m} n={n} k={k} dispatches={dispatches} first_us={first:.3} last_us={last:.3}"
+    );
+    Ok(())
 }
