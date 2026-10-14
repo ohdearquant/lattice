@@ -437,6 +437,15 @@ pub(crate) trait DecoderSession {
 
     fn prefill(&mut self, cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError>;
 
+    /// Opts into cancellation during prefill; `None` requires a poisoned finish.
+    /// The default preserves existing backends' driver-owned cancellation checkpoints.
+    fn prefill_interruptible(
+        &mut self,
+        _cancel: &dyn Cancellation,
+    ) -> Result<Option<StepStamp>, InferenceError> {
+        self.prefill(&|| false).map(Some)
+    }
+
     fn decode(
         &mut self,
         accepted: &AcceptedToken,
@@ -779,6 +788,25 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn default_interruptible_prefill_preserves_driver_owned_cancellation() {
+        let mut session = DummySession {
+            caps: ExecutionCapabilities::default(),
+            ledger: PredictionLedger::new(),
+        };
+        let polls = std::cell::Cell::new(0);
+        let cancel = || {
+            polls.set(polls.get() + 1);
+            true
+        };
+        let stamp = session.prefill_interruptible(&cancel).unwrap().unwrap();
+        assert_eq!(stamp.evaluated_len, 3);
+        assert_eq!(stamp.prediction, None);
+        assert_eq!(polls.get(), 0);
+        assert!(session.prefill(&cancel).is_err());
+        assert_eq!(polls.get(), 1);
     }
 
     #[test]
