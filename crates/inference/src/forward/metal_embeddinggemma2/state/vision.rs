@@ -456,7 +456,7 @@ impl MetalEmbeddingGemma2VisionState {
                     let Some(scratch) = self.scratch.as_ref() else {
                         return Err(runtime("vision scratch buffers missing after allocation"));
                     };
-                    as_f32(&scratch.hidden, rows * hidden).to_vec()
+                    as_f32(&scratch.hidden, rows * hidden)?.to_vec()
                 };
                 match index {
                     0 => stages.layer_0 = stream,
@@ -469,7 +469,7 @@ impl MetalEmbeddingGemma2VisionState {
             let Some(scratch) = self.scratch.as_ref() else {
                 return Err(runtime("vision scratch buffers missing after allocation"));
             };
-            as_f32(&scratch.hidden, rows * hidden).to_vec()
+            as_f32(&scratch.hidden, rows * hidden)?.to_vec()
         };
         if encoder.iter().any(|value| !value.is_finite()) {
             return Err(runtime("the vision tower produced a non-finite value"));
@@ -518,15 +518,15 @@ impl MetalEmbeddingGemma2VisionState {
         // GPU segments below borrow the same buffers.
         let pre_start = std::time::Instant::now();
         {
-            let normed = as_f32_mut(&mut scratch.normed, rows * hidden);
-            normed.copy_from_slice(as_f32(&scratch.hidden, rows * hidden));
+            let normed = as_f32_mut(&mut scratch.normed, rows * hidden)?;
+            normed.copy_from_slice(as_f32(&scratch.hidden, rows * hidden)?);
             rms_norm(normed, &layer.input_layernorm, hidden, eps);
             let (q, k, v) = (
-                as_f32_mut(&mut scratch.q, rows * q_dim),
-                as_f32_mut(&mut scratch.k, rows * kv_dim),
-                as_f32_mut(&mut scratch.v, rows * kv_dim),
+                as_f32_mut(&mut scratch.q, rows * q_dim)?,
+                as_f32_mut(&mut scratch.k, rows * kv_dim)?,
+                as_f32_mut(&mut scratch.v, rows * kv_dim)?,
             );
-            let normed = as_f32(&scratch.normed, rows * hidden);
+            let normed = as_f32(&scratch.normed, rows * hidden)?;
             matmul_bt(normed, &layer.q_proj, q, rows, hidden, q_dim);
             matmul_bt(normed, &layer.k_proj, k, rows, hidden, kv_dim);
             matmul_bt(normed, &layer.v_proj, v, rows, hidden, kv_dim);
@@ -565,11 +565,11 @@ impl MetalEmbeddingGemma2VisionState {
         // Host: output projection over the attention output, post-attention norm, residual add.
         let post_start = std::time::Instant::now();
         {
-            let context = as_f32(&scratch.context, rows * q_dim);
-            let o_proj = as_f32_mut(&mut scratch.o_proj, rows * hidden);
+            let context = as_f32(&scratch.context, rows * q_dim)?;
+            let o_proj = as_f32_mut(&mut scratch.o_proj, rows * hidden)?;
             matmul_bt(context, &layer.o_proj, o_proj, rows, q_dim, hidden);
             rms_norm(o_proj, &layer.post_attention_layernorm, hidden, eps);
-            let hidden_states = as_f32_mut(&mut scratch.hidden, rows * hidden);
+            let hidden_states = as_f32_mut(&mut scratch.hidden, rows * hidden)?;
             for (value, delta) in hidden_states.iter_mut().zip(o_proj.iter()) {
                 *value += *delta;
             }

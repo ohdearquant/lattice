@@ -469,20 +469,37 @@ fn upload(device: &Device, values: &[f32], label: &str) -> Result<Buffer, Infere
 ///
 /// The caller must not hold the view across a GPU submission that reads or writes the buffer,
 /// and must not take a second live view over the same buffer.
-fn as_f32(buffer: &Buffer, count: usize) -> &[f32] {
-    debug_assert!(buffer.length() as usize >= count * size_of::<f32>());
-    // SAFETY: the shared allocation holds at least count aligned, initialized f32 elements, and
-    // the caller keeps every GPU submission off this buffer for the lifetime of the view.
-    unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), count) }
+fn as_f32(buffer: &Buffer, count: usize) -> Result<&[f32], InferenceError> {
+    check_view_len(buffer, count)?;
+    // SAFETY: the length check above proves the shared allocation holds at least count aligned,
+    // initialized f32 elements, and the caller keeps every GPU submission off this buffer for the
+    // lifetime of the view.
+    Ok(unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), count) })
 }
 
 /// A read-write `f32` view over the first `count` elements of a shared buffer, without a copy.
 /// The same lifetime contract as [`as_f32`] applies.
-fn as_f32_mut(buffer: &mut Buffer, count: usize) -> &mut [f32] {
-    debug_assert!(buffer.length() as usize >= count * size_of::<f32>());
+fn as_f32_mut(buffer: &mut Buffer, count: usize) -> Result<&mut [f32], InferenceError> {
+    check_view_len(buffer, count)?;
     // SAFETY: as `as_f32`; the single-view rule means this exclusive view cannot alias another
     // live view of the same buffer.
-    unsafe { std::slice::from_raw_parts_mut(buffer.contents().cast::<f32>(), count) }
+    Ok(unsafe { std::slice::from_raw_parts_mut(buffer.contents().cast::<f32>(), count) })
+}
+
+/// Refuses a view of `count` elements over a buffer allocated shorter than that, in every build
+/// profile, so a sizing mistake surfaces as an error instead of an out-of-bounds slice.
+fn check_view_len(buffer: &Buffer, count: usize) -> Result<(), InferenceError> {
+    let needed = count
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| runtime("shared buffer view length overflows"))?;
+    let available = usize::try_from(buffer.length())
+        .map_err(|_| runtime("shared buffer length does not fit in usize"))?;
+    if available < needed {
+        return Err(runtime(format!(
+            "shared buffer holds {available} bytes, a view of {count} f32 elements needs {needed}"
+        )));
+    }
+    Ok(())
 }
 
 /// Copies `values` to the start of a shared buffer. Callers pass a buffer allocated for at least
