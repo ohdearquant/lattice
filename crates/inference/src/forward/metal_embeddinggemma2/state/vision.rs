@@ -1,31 +1,25 @@
 //! EmbeddingGemma 2 vision tower, f32 forward pass on Metal.
 //!
 //! The tower runs on the valid patch rows only, exactly as the CPU reference does, and each
-//! layer hands off between the host and the GPU around two GPU segments: bidirectional attention
-//! at head width 64 (scale 1.0, no window) and the GeGLU MLP block. Both run their matrix
-//! products on simdgroup matrices where the device has them (Apple7 family or later), and on the
-//! vector kernels otherwise. The residual stream and the q/k/v/context buffers are shared
-//! `MTLBuffer`s, so the host reads and writes them directly and a handoff is a command buffer
-//! commit and wait rather than a copy.
+//! layer runs as two GPU segments, one command buffer each: the attention block (input RMSNorm,
+//! q/k/v projections, the QK norm with a scale-free V norm, the axial RoPE, bidirectional
+//! attention at head width 64 with scale 1.0 and no window, the output projection, the
+//! post-attention norm and residual add) and the GeGLU MLP block. Both run their matrix products
+//! on simdgroup matrices where the device has them (Apple7 family or later), and on the vector
+//! kernels otherwise. The residual stream lives in a shared `MTLBuffer` the host writes once and
+//! reads at the captured layers.
 //!
-//! The host runs the input RMSNorm, the q/k/v projections, the QK norm with a scale-free V norm,
-//! the axial RoPE, the output projection, the post-attention norm and residual add; the GPU runs
-//! attention and the whole MLP block. Weights upload once as f32 and the same host tensors feed
-//! the host segments. A device failure returns an error and is never replayed on the host.
+//! Weights upload once as f32. A device failure returns an error and is never replayed on the
+//! host.
 
 use metal::Buffer;
 
-use super::{
-    Context, Pipelines, allocate, as_f32, as_f32_mut, elements, invalid, runtime, upload, write_f32,
-};
+use super::{Context, Pipelines, allocate, as_f32, elements, invalid, runtime, upload, write_f32};
 use crate::error::InferenceError;
-use crate::forward::cpu::{matmul_bt, rms_norm};
 use crate::model::embeddinggemma2_vision::{
     VisionConfig, VisionLayerWeights, VisionStages, VisionWeights,
 };
-use crate::model::gemma4_ops::{
-    gemma4_qk_norm_v_unscaled, vision_axial_rope_apply, vision_axial_rope_inv_freq,
-};
+use crate::model::gemma4_ops::vision_axial_rope_inv_freq;
 
 #[cfg(test)]
 mod tests;
@@ -233,9 +227,16 @@ fn validate_weights(cfg: &VisionConfig, w: &VisionWeights) -> Result<(), Inferen
     Ok(())
 }
 
-/// The per-layer vision tensors that live on the device. The host segments read the same tensors
-/// from the model's own [`VisionWeights`], so only what the GPU kernels consume is uploaded.
+/// The per-layer vision tensors that live on the device.
 struct GpuVisionLayer {
+    input_norm: Buffer,
+    q: Buffer,
+    k: Buffer,
+    v: Buffer,
+    q_norm: Buffer,
+    k_norm: Buffer,
+    o: Buffer,
+    post_attention_norm: Buffer,
     pre_ff_norm: Buffer,
     post_ff_norm: Buffer,
     gate: Buffer,
@@ -251,6 +252,14 @@ impl GpuVisionLayer {
     ) -> Result<Self, InferenceError> {
         let up = |values: &[f32], name: &str| upload(device, values, &format!("eg2v.l{l}.{name}"));
         Ok(Self {
+            input_norm: up(&w.input_layernorm, "input_norm")?,
+            q: up(&w.q_proj, "q_proj")?,
+            k: up(&w.k_proj, "k_proj")?,
+            v: up(&w.v_proj, "v_proj")?,
+            q_norm: up(&w.q_norm, "q_norm")?,
+            k_norm: up(&w.k_norm, "k_norm")?,
+            o: up(&w.o_proj, "o_proj")?,
+            post_attention_norm: up(&w.post_attention_layernorm, "post_attention_norm")?,
             pre_ff_norm: up(&w.pre_feedforward_layernorm, "pre_ff_norm")?,
             post_ff_norm: up(&w.post_feedforward_layernorm, "post_ff_norm")?,
             gate: up(&w.gate_proj, "gate_proj")?,
@@ -265,12 +274,17 @@ struct VisionScratch {
     rows: usize,
     /// The residual stream.
     hidden: Buffer,
-    /// A normed copy the MLP segment consumes.
+    /// A normed copy of the stream each block's projections consume.
     normed: Buffer,
+    /// Two floats per row, the patch's x then y grid coordinate, for the axial RoPE.
+    positions: Buffer,
     q: Buffer,
     k: Buffer,
     v: Buffer,
-    /// The attention kernel's output, read back by the host.
+    /// Layer 0's q and k after the QK norm and before the RoPE, kept for the stage captures.
+    q_normed: Buffer,
+    k_normed: Buffer,
+    /// The attention kernel's output.
     context: Buffer,
     /// The output projection's result.
     o_proj: Buffer,
@@ -285,19 +299,20 @@ struct VisionScratch {
 /// Per-segment wall time of one tower pass, in microseconds.
 ///
 /// The two GPU fields are the sum of their command buffers' `GPUStartTime`/`GPUEndTime` spans,
-/// the two CPU fields are host wall time measured around the host segments, and `tower_us` is the
-/// whole pass, handoffs included. Not a stable API: `#[doc(hidden)]` is a convention for the
+/// the two CPU fields are host wall time measured around the host work beside them, and
+/// `tower_us` is the whole pass, handoffs included. Not a stable API: `#[doc(hidden)]` is a convention for the
 /// `dump_embeddinggemma2_vision` example, which reports the segments of a measured run.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VisionTimings {
-    /// Sum of the attention command buffers' GPU spans.
+    /// Sum of the attention-block command buffers' GPU spans.
     pub attention_gpu_us: u64,
     /// Sum of the MLP command buffers' GPU spans.
     pub mlp_gpu_us: u64,
-    /// Host time of the per-layer work before attention (norm, qkv, QK/V norm, axial RoPE).
+    /// Host time before the attention block: writing the patch rows and their grid positions
+    /// into the shared buffers, on the first layer only.
     pub cpu_pre_attention_us: u64,
-    /// Host time of the per-layer work after attention (output projection, norm, residual add).
+    /// Host time after the attention block: reading layer 0's q/k stage captures back.
     pub cpu_post_attention_us: u64,
     /// Wall time of the whole tower pass, handoffs included.
     pub tower_us: u64,
@@ -338,7 +353,7 @@ pub(super) struct MetalEmbeddingGemma2VisionState {
     layers: Vec<GpuVisionLayer>,
     cfg: VisionConfig,
     /// Two per-axis blocks of inverse frequencies, shared by every layer.
-    inv_freq: Vec<f32>,
+    inv_freq: Buffer,
     fingerprint: u64,
     scratch: Option<VisionScratch>,
 }
@@ -370,6 +385,7 @@ impl MetalEmbeddingGemma2VisionState {
                 "vision rope_theta produces a non-finite inverse frequency",
             ));
         }
+        let inv_freq = upload(device, &inv_freq, "eg2v.inv_freq")?;
         Ok(Self {
             layers,
             fingerprint: fingerprint(&cfg, weights),
@@ -410,6 +426,14 @@ impl MetalEmbeddingGemma2VisionState {
                 patch.len()
             )));
         }
+        // The RoPE kernel reads coordinates as f32, exact only up to 2^24.
+        if positions
+            .iter()
+            .flatten()
+            .any(|&coordinate| coordinate > 1 << 24)
+        {
+            return Err(vision_error("a patch grid coordinate exceeds 2^24"));
+        }
         let pass_start = std::time::Instant::now();
         self.ensure_scratch(ctx, rows)?;
         let mut stages = VisionStages {
@@ -431,13 +455,20 @@ impl MetalEmbeddingGemma2VisionState {
             heads: self.cfg.num_attention_heads,
             head_dim: self.cfg.head_dim,
         };
+        let mut timings = VisionTimings::default();
+        let write_start = std::time::Instant::now();
         {
             let Some(scratch) = self.scratch.as_ref() else {
                 return Err(runtime("vision scratch buffers missing after allocation"));
             };
             write_f32(&scratch.hidden, patch)?;
+            let coordinates: Vec<f32> = positions
+                .iter()
+                .flat_map(|&[x, y]| [x as f32, y as f32])
+                .collect();
+            write_f32(&scratch.positions, &coordinates)?;
         }
-        let mut timings = VisionTimings::default();
+        timings.cpu_pre_attention_us += micros(write_start.elapsed().as_secs_f64());
         for index in 0..self.cfg.num_hidden_layers {
             if should_cancel() {
                 return Err(vision_error("cancelled during the vision tower"));
@@ -446,9 +477,7 @@ impl MetalEmbeddingGemma2VisionState {
                 ctx,
                 pipelines,
                 index,
-                weights,
                 rows,
-                positions,
                 index == 0,
                 &mut stages,
                 &mut timings,
@@ -481,16 +510,14 @@ impl MetalEmbeddingGemma2VisionState {
         Ok((stages, timings))
     }
 
-    /// One encoder layer, split host / GPU / host / GPU as the module describes.
+    /// One encoder layer: the attention block, then the MLP block, one command buffer each.
     #[allow(clippy::too_many_arguments)]
     fn run_layer(
         &mut self,
         ctx: &Context,
         pipelines: &Pipelines,
         index: usize,
-        weights: &VisionWeights,
         rows: usize,
-        positions: &[[usize; 2]],
         capture: bool,
         stages: &mut VisionStages,
         timings: &mut VisionTimings,
@@ -504,79 +531,125 @@ impl MetalEmbeddingGemma2VisionState {
         let q_dim = heads * head_dim;
         let kv_dim = kv_heads * head_dim;
         let intermediate = cfg.intermediate_size;
-        let layer = weights
-            .layers
-            .get(index)
-            .ok_or_else(|| vision_error(format!("missing weights for vision layer {index}")))?;
         let gpu = self.layers.get(index).ok_or_else(|| {
             vision_error(format!("missing device tensors for vision layer {index}"))
         })?;
-        let Some(scratch) = self.scratch.as_mut() else {
+        let inv_freq = &self.inv_freq;
+        let Some(scratch) = self.scratch.as_ref() else {
             return Err(runtime("vision scratch buffers missing after allocation"));
         };
 
-        // Host: input norm, q/k/v projections, QK norm with a scale-free V norm, axial RoPE.
-        // Every shared-memory view is confined to this block, so no host view is live when the
-        // GPU segments below borrow the same buffers.
-        let pre_start = std::time::Instant::now();
-        {
-            let normed = as_f32_mut(&mut scratch.normed, rows * hidden)?;
-            normed.copy_from_slice(as_f32(&scratch.hidden, rows * hidden)?);
-            rms_norm(normed, &layer.input_layernorm, hidden, eps);
-            let (q, k, v) = (
-                as_f32_mut(&mut scratch.q, rows * q_dim)?,
-                as_f32_mut(&mut scratch.k, rows * kv_dim)?,
-                as_f32_mut(&mut scratch.v, rows * kv_dim)?,
-            );
-            let normed = as_f32(&scratch.normed, rows * hidden)?;
-            matmul_bt(normed, &layer.q_proj, q, rows, hidden, q_dim);
-            matmul_bt(normed, &layer.k_proj, k, rows, hidden, kv_dim);
-            matmul_bt(normed, &layer.v_proj, v, rows, hidden, kv_dim);
-            gemma4_qk_norm_v_unscaled(q, k, v, &layer.q_norm, &layer.k_norm, head_dim, eps);
-            if capture {
-                stages.layer_0_q_normed = q.to_vec();
-                stages.layer_0_k_normed = k.to_vec();
-            }
-            vision_axial_rope_apply(q, positions, &self.inv_freq, heads, head_dim);
-            vision_axial_rope_apply(k, positions, &self.inv_freq, kv_heads, head_dim);
-            if capture {
-                stages.layer_0_q_rotated = q.to_vec();
-                stages.layer_0_k_rotated = k.to_vec();
-            }
-        }
-        let pre_elapsed = pre_start.elapsed();
-        timings.cpu_pre_attention_us += micros(pre_elapsed.as_secs_f64());
-
-        // GPU: bidirectional attention at head width 64, scale 1.0, no window.
+        // GPU: input norm, q/k/v projections, QK norm with a scale-free V norm, axial RoPE,
+        // attention, output projection, post-attention norm, residual add into the stream.
         let span = ctx.run_timed(|enc| {
-            pipelines.attention_matrix(
+            let p = pipelines;
+            let (r, h) = (rows as u32, hidden as u32);
+            p.copy(enc, &scratch.hidden, &scratch.normed, r * h);
+            p.norm(enc, &scratch.normed, &gpu.input_norm, r, h, eps);
+            p.matmul_matrix(
+                enc,
+                &scratch.normed,
+                &gpu.q,
+                0,
+                &scratch.q,
+                r,
+                q_dim as u32,
+                h,
+            );
+            p.matmul_matrix(
+                enc,
+                &scratch.normed,
+                &gpu.k,
+                0,
+                &scratch.k,
+                r,
+                kv_dim as u32,
+                h,
+            );
+            p.matmul_matrix(
+                enc,
+                &scratch.normed,
+                &gpu.v,
+                0,
+                &scratch.v,
+                r,
+                kv_dim as u32,
+                h,
+            );
+            p.norm(
+                enc,
+                &scratch.q,
+                &gpu.q_norm,
+                r * heads as u32,
+                head_dim as u32,
+                eps,
+            );
+            p.norm(
+                enc,
+                &scratch.k,
+                &gpu.k_norm,
+                r * kv_heads as u32,
+                head_dim as u32,
+                eps,
+            );
+            p.norm_noweight(enc, &scratch.v, r * kv_heads as u32, head_dim as u32, eps);
+            if capture {
+                p.copy(enc, &scratch.q, &scratch.q_normed, r * q_dim as u32);
+                p.copy(enc, &scratch.k, &scratch.k_normed, r * kv_dim as u32);
+            }
+            p.vision_rope(
+                enc,
+                &scratch.q,
+                &scratch.positions,
+                inv_freq,
+                r,
+                heads as u32,
+                head_dim as u32,
+            );
+            p.vision_rope(
+                enc,
+                &scratch.k,
+                &scratch.positions,
+                inv_freq,
+                r,
+                kv_heads as u32,
+                head_dim as u32,
+            );
+            p.attention_matrix(
                 enc,
                 head_dim,
                 &scratch.q,
                 &scratch.k,
                 &scratch.v,
                 &scratch.context,
-                rows as u32,
+                r,
                 heads as u32,
                 kv_heads as u32,
-            )
+            )?;
+            p.matmul_matrix(
+                enc,
+                &scratch.context,
+                &gpu.o,
+                0,
+                &scratch.o_proj,
+                r,
+                h,
+                q_dim as u32,
+            );
+            p.norm(enc, &scratch.o_proj, &gpu.post_attention_norm, r, h, eps);
+            p.add(enc, &scratch.o_proj, &scratch.hidden, r * h);
+            Ok(())
         })?;
         timings.attention_gpu_us += micros(span);
 
-        // Host: output projection over the attention output, post-attention norm, residual add.
-        let post_start = std::time::Instant::now();
-        {
-            let context = as_f32(&scratch.context, rows * q_dim)?;
-            let o_proj = as_f32_mut(&mut scratch.o_proj, rows * hidden)?;
-            matmul_bt(context, &layer.o_proj, o_proj, rows, q_dim, hidden);
-            rms_norm(o_proj, &layer.post_attention_layernorm, hidden, eps);
-            let hidden_states = as_f32_mut(&mut scratch.hidden, rows * hidden)?;
-            for (value, delta) in hidden_states.iter_mut().zip(o_proj.iter()) {
-                *value += *delta;
-            }
+        if capture {
+            let read_start = std::time::Instant::now();
+            stages.layer_0_q_normed = as_f32(&scratch.q_normed, rows * q_dim)?.to_vec();
+            stages.layer_0_k_normed = as_f32(&scratch.k_normed, rows * kv_dim)?.to_vec();
+            stages.layer_0_q_rotated = as_f32(&scratch.q, rows * q_dim)?.to_vec();
+            stages.layer_0_k_rotated = as_f32(&scratch.k, rows * kv_dim)?.to_vec();
+            timings.cpu_post_attention_us += micros(read_start.elapsed().as_secs_f64());
         }
-        let post_elapsed = post_start.elapsed();
-        timings.cpu_post_attention_us += micros(post_elapsed.as_secs_f64());
 
         // GPU: pre-FF norm, gate/up projections, GELU product, down projection, post-FF norm,
         // residual add into the stream.
@@ -679,9 +752,12 @@ impl MetalEmbeddingGemma2VisionState {
             rows,
             hidden: buf("hidden", hidden)?,
             normed: buf("normed", hidden)?,
+            positions: buf("positions", 2)?,
             q: buf("q", q_dim)?,
             k: buf("k", kv_dim)?,
             v: buf("v", kv_dim)?,
+            q_normed: buf("q_normed", q_dim)?,
+            k_normed: buf("k_normed", kv_dim)?,
             context: buf("context", q_dim)?,
             o_proj: buf("o_proj", hidden)?,
             branch: buf("branch", hidden)?,

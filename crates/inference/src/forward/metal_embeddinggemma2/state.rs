@@ -483,15 +483,6 @@ fn as_f32(buffer: &Buffer, count: usize) -> Result<&[f32], InferenceError> {
     Ok(unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), count) })
 }
 
-/// A read-write `f32` view over the first `count` elements of a shared buffer, without a copy.
-/// The same lifetime contract as [`as_f32`] applies.
-fn as_f32_mut(buffer: &mut Buffer, count: usize) -> Result<&mut [f32], InferenceError> {
-    check_view_len(buffer, count)?;
-    // SAFETY: as `as_f32`; the single-view rule means this exclusive view cannot alias another
-    // live view of the same buffer.
-    Ok(unsafe { std::slice::from_raw_parts_mut(buffer.contents().cast::<f32>(), count) })
-}
-
 /// Refuses a view of `count` elements over a buffer allocated shorter than that, in every build
 /// profile, so a sizing mistake surfaces as an error instead of an out-of-bounds slice.
 fn check_view_len(buffer: &Buffer, count: usize) -> Result<(), InferenceError> {
@@ -577,7 +568,6 @@ struct Pipelines {
     add: ComputePipelineState,
     gelu_mul: ComputePipelineState,
     scale: ComputePipelineState,
-    #[cfg(test)]
     vision_rope: ComputePipelineState,
     attention: Vec<(usize, ComputePipelineState)>,
     matrix: Option<MatrixPipelines>,
@@ -674,7 +664,6 @@ impl Pipelines {
             add: make("add_buf", ELEMENT_THREADS)?,
             gelu_mul: make("eg2_gelu_mul", ELEMENT_THREADS)?,
             scale: make("eg2_scale", ELEMENT_THREADS)?,
-            #[cfg(test)]
             vision_rope: make("eg2_vision_axial_rope", ELEMENT_THREADS)?,
             attention,
             matrix,
@@ -839,7 +828,6 @@ impl Pipelines {
 
     /// Axial (2-D) RoPE over `[tokens, heads, head_dim]`, with one `(x, y)` pair per token and a
     /// `head_dim / 2`-entry inverse-frequency table (the axis-0 block then the axis-1 block).
-    #[cfg(test)]
     fn vision_rope(
         &self,
         enc: &ComputeCommandEncoderRef,
