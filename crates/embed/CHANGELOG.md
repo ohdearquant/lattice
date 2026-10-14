@@ -10,6 +10,15 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-14
+
+Documentation and package metadata only; no code changes.
+
+### Documentation
+
+- crates.io keywords and categories; docs.rs builds the documentation with the `x86-gemm` feature (#1936).
+- README install snippets pin `0.12` (#1936).
+
 ## [0.12.0] - 2026-10-13
 
 ### Added
