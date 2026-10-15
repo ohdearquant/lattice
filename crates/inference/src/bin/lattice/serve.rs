@@ -1188,6 +1188,23 @@ async fn chat_completions_with_request(
     // routed mixture. A request that was not routed, or was routed to nothing,
     // leaves this `None` and records no episode: putting it in the learner's
     // population would be a completion no gate produced.
+    //
+    // Shared response metadata, minted BEFORE routing rather than after. It
+    // used to sit below the routing block, where it read more naturally:
+    // nothing above needed it. An exploration draw does. The seed is derived
+    // from the completion id so that an episode replays from the episode alone,
+    // which requires the id to exist when the draw happens. The cost of the
+    // move is that a request refused during routing now consumes a sequence
+    // number, so the ids a server emits can skip -- `seq` exists to make the id
+    // unique, nothing counts with it, and a gap is the honest record of a
+    // request that was admitted and then refused.
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let seq = state.request_counter.fetch_add(1, Ordering::Relaxed);
+    let response_id = format!("chatcmpl-{created}-{seq}");
+
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     let mut routing_provenance: Option<lattice_inference::serve::routing::RoutedRequest> = None;
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -1198,7 +1215,7 @@ async fn chat_completions_with_request(
     {
         None => requested,
         Some(served) => {
-            let decision = route_selection(&state, &served, &chat_messages).await?;
+            let decision = route_selection(&state, &served, &chat_messages, &response_id).await?;
             match &decision {
                 Some(routed) if !routed.selections.is_empty() => {
                     lattice_inference::serve::lora::validate_scales(&routed.selections)?;
@@ -1221,20 +1238,12 @@ async fn chat_completions_with_request(
 
     let model = state.model.clone();
 
-    // Compute shared response metadata before branching on stream flag.
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let seq = state.request_counter.fetch_add(1, Ordering::Relaxed);
-    let response_id = format!("chatcmpl-{created}-{seq}");
-
     // Recorded here because this is the first moment both halves exist: the
-    // routing decision was made above, and the id a judgement will name is
-    // minted on the line above this one. Recording earlier would need an id
-    // that does not exist yet; recording later, after generation, would lose
-    // every episode whose completion failed -- and a mixture that produced a
-    // failure is exactly the one a learner should be able to hear about.
+    // id a judgement will name was minted before routing, and the routing
+    // decision it seeded was made above. Recording later, after generation,
+    // would lose every episode whose completion failed -- and a mixture that
+    // produced a failure is exactly the one a learner should be able to hear
+    // about.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     if let (Some(routed), Some(served)) = (&routing_provenance, &state.router_state) {
         use lattice_inference::router_episode::{PolicyIdentity, RouterEpisode};
@@ -1817,6 +1826,7 @@ async fn route_selection(
     state: &AppState,
     served: &Arc<lattice_inference::serve::routing::ServedRouter>,
     messages: &[ChatMessage],
+    completion_id: &str,
 ) -> Result<Option<lattice_inference::serve::routing::RoutedRequest>, ApiError> {
     use lattice_inference::serve::routing::{PromptSource, context_text};
 
@@ -1868,18 +1878,27 @@ async fn route_selection(
     // What this does NOT do, stated because an earlier version of this comment said the gate
     // decides the weight here: it does not, and that is ADR-091 decision 1, not an oversight.
     // Uniform `1/k` is the default until that ADR's evidence gate passes. `ServingRouter::new`
-    // builds the router with `AdapterRouter::new`, whose `WeightPolicy::default()` is `Uniform`,
-    // and no serving path calls `set_weight_policy` — so every selected adapter receives `1.0 / k`
-    // and, with `k` equal to the column count, the gate's scores change neither the selection nor
-    // the weights. A response from this path is therefore the same for any gate, a zeroed one
+    // builds the router with `AdapterRouter::new`, whose `WeightPolicy::default()` is `Uniform`;
+    // `set_weight_policy` is called only by `apply_recorded_policy`, which requires the artifact to
+    // record a learned policy AND `--router-learn`. Absent both, every selected adapter receives
+    // `1.0 / k` and, with `k` equal to the column count, the gate's scores change neither the
+    // selection nor the weights: a response from this path is the same for any gate, a zeroed one
     // included, which is what any acceptance run over it can and cannot claim. Turning the softmax
-    // on is ADR-091's evidence gate, not a flag.
+    // on is ADR-091's evidence gate, made an explicit startup flag rather than a default.
     let k = served.with_report(|report| report.artifact.adapter_names.len());
     // The vector the gate consumed goes in by value, so the decision carries
     // the input it was made from. ADR-096 decision 3: the server holds this,
     // and a caller cannot supply one in its place -- a caller's vector would
     // describe a mixture the server never formed.
-    Ok(Some(served.route(&resident, context_vector, k)?))
+    // `completion_id` seeds the draw when the recorded policy explores; it is
+    // the id the response will carry, so the seed the episode records replays
+    // from the episode alone.
+    Ok(Some(served.route(
+        &resident,
+        context_vector,
+        k,
+        completion_id,
+    )?))
 }
 
 /// `POST /v1/router/feedback` — judge one routed completion (ADR-096 D3).
@@ -2865,9 +2884,16 @@ mod tests {
             },
             pinned: true,
         };
+        let applied = || lattice_inference::router_state::AppliedPolicy {
+            kind: "uniform".to_string(),
+            tau: None,
+            epsilon: 0.0,
+            exploration_scale: None,
+            learning_enabled: false,
+        };
         let body = lattice_inference::serve::lora::lora_list_body(
             &index,
-            Some(resolved.report("gme-qwen35")),
+            Some(resolved.report("gme-qwen35", applied())),
         );
         assert!(
             body["adapters"].is_array(),
@@ -2912,7 +2938,7 @@ mod tests {
         over_budget.blend_refusal = Some("summed rank exceeds MAX_BLEND_RANK_TOTAL".to_string());
         let body = lattice_inference::serve::lora::lora_list_body(
             &over_budget,
-            Some(resolved.report("gme-qwen35")),
+            Some(resolved.report("gme-qwen35", applied())),
         );
         assert!(
             body["adapters"].is_array() && body["applied"].is_array(),
@@ -2936,7 +2962,7 @@ mod tests {
         let empty = AdapterIndex::default();
         let body = lattice_inference::serve::lora::lora_list_body(
             &empty,
-            Some(resolved.report("gme-qwen35")),
+            Some(resolved.report("gme-qwen35", applied())),
         );
         assert_eq!(
             body["router"]["routable"], false,
@@ -2954,7 +2980,7 @@ mod tests {
         assert_eq!(
             lattice_inference::serve::lora::lora_list_body(
                 &index,
-                Some(unpinned.report("gme-qwen35"))
+                Some(unpinned.report("gme-qwen35", applied()))
             )["router"]["pinned"],
             false,
             "an unpinned gate must not report itself pinned"
@@ -4268,6 +4294,10 @@ mod tests {
             },
             schema_id: "schema-1".to_string(),
             base_model: "test-model".to_string(),
+            // The uniform bootstrap: this fixture builds a server with learning
+            // off, which is what these tests are about.
+            tau: None,
+            exploration_scale: None,
         })
         .expect("the bootstrap specification must be valid");
         let served = ServedRouter::new(
@@ -4277,6 +4307,7 @@ mod tests {
             },
             &embedder,
             WIDTH,
+            false,
         )
         .expect("a bootstrap artifact must be servable by the build that wrote it");
 

@@ -150,9 +150,11 @@ pub struct RouterEpisode {
     /// `None` means the decision was deterministic, not that a draw went
     /// unrecorded. Those are different claims: a learner can attribute an
     /// episode carrying a record and must not attribute one without it. The
-    /// record holds the sampled logits `z'` over every gate output and the
-    /// exploration scale `s` the draw ran at, which together are the action
-    /// probability the learner weights the episode by.
+    /// record holds the sampled logits `z'` over every gate output, the
+    /// exploration scale `s` and seed the draw ran at, and the log density of
+    /// `z'` under the draw. There is no action probability: the draw is
+    /// Gaussian on the logits, so what the learner scores is the density of
+    /// `z'` (see [`crate::mixture::ExplorationOutcome::log_density`]).
     #[cfg(feature = "mixture")]
     pub exploration: Option<crate::mixture::ExplorationOutcome>,
 }
