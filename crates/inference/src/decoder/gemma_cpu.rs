@@ -140,12 +140,13 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
                 return Err(InferenceError::Inference("cancelled during prefill".into()));
             }
             let token_id = self.prompt_ids[i];
-            self.model.forward_step(
+            self.model.forward_step_impl(
                 token_id,
                 self.position,
                 &mut self.cache,
                 &mut self.scratch,
                 &[],
+                i + 1 == prompt_len,
             )?;
             self.position += 1;
         }
@@ -281,7 +282,7 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
 mod tests {
     use super::*;
     use crate::generation::GenerateConfig;
-    use crate::model::gemma4_model::tiny_zero_model;
+    use crate::model::gemma4_model::{tiny_nonzero_model, tiny_zero_model};
 
     fn cancel_false() -> impl Fn() -> bool {
         || false
@@ -468,6 +469,7 @@ mod tests {
         for completed in 0..prompt_ids.len() {
             let mut session =
                 GemmaCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), 16).unwrap();
+            session.scratch.logits.fill(1234.0);
             let polls = std::cell::Cell::new(0);
             let cancel = || {
                 let poll = polls.get();
@@ -480,6 +482,7 @@ mod tests {
             assert_eq!(session.position, completed);
             assert_eq!(session.cache.seq_len(0).unwrap(), completed);
             assert_eq!(polls.get(), completed + 2);
+            assert!(session.scratch.logits.iter().all(|&value| value == 1234.0));
         }
     }
 
@@ -509,7 +512,7 @@ mod tests {
 
     #[test]
     fn uncancelled_prefill_matches_raw_gemma_steps() {
-        let model = tiny_zero_model();
+        let model = tiny_nonzero_model();
         for prompt_ids in [vec![2], vec![2, 3, 4], vec![2, 3, 4, 5, 6, 7, 8, 9]] {
             let mut session =
                 GemmaCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), 16).unwrap();
@@ -529,7 +532,25 @@ mod tests {
             assert_eq!(session.cache.k_view(0).unwrap(), cache.k_view(0).unwrap());
             assert_eq!(session.cache.v_view(0).unwrap(), cache.v_view(0).unwrap());
             assert!(session.scratch.logits.iter().all(|value| value.is_finite()));
-            assert_eq!(session.scratch.logits, scratch.logits);
+            let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert!(scratch.logits.iter().any(|&value| value != 0.0));
+            assert_eq!(bits(&session.scratch.logits), bits(&scratch.logits));
+        }
+    }
+
+    #[test]
+    fn prefill_preserves_invalid_token_position_without_projecting_prefix() {
+        let model = tiny_nonzero_model();
+        for invalid_at in 0..3 {
+            let mut prompt = vec![2, 3, 4];
+            prompt[invalid_at] = model.config.vocab_size as u32;
+            let mut session = GemmaCpuSession::new(&model, prompt, 0.0, Some(7), 16).unwrap();
+            session.scratch.logits.fill(1234.0);
+            let error = session.prefill(&cancel_false()).unwrap_err();
+            assert!(matches!(error, InferenceError::InvalidInput(_)));
+            assert_eq!(session.position, invalid_at);
+            assert_eq!(session.cache.seq_len(0).unwrap(), invalid_at);
+            assert!(session.scratch.logits.iter().all(|&value| value == 1234.0));
         }
     }
 
