@@ -585,6 +585,8 @@ async fn main() {
                 cpu_generation_admission: Arc::new(Semaphore::new(max_cpu_generations)),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: router_artifact,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                episodes: serve::episode_store(),
             };
 
             let app = serve::router(state);
