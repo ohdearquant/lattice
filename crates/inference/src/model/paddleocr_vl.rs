@@ -525,6 +525,10 @@ pub fn argmax_u32(row: &[f32]) -> u32 {
 }
 
 #[cfg(test)]
+#[path = "paddleocr_vl/decode_scratch_bench.rs"]
+mod decode_scratch_bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::ernie45::Ernie45LayerWeights;
