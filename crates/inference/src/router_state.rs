@@ -372,6 +372,54 @@ pub const ROUTER_TRAINING_STATES: [&str; 2] = ["bootstrap", "learned"];
 /// the gate.
 pub const MIN_EXPLORATION_SCALE: f64 = 1e-3;
 
+// The three guard defaults below live here rather than beside the router for
+// the reason `MIN_EXPLORATION_SCALE` does: `router init` mints an artifact that
+// records them, this module is compiled unconditionally, and two constants
+// with one meaning drift. An artifact recording a weaker floor than the router
+// enforces is valid on disk and silently disables the guard it names.
+
+/// Default floor on the softmax temperature `tau` (ADR-091 Decision 3,
+/// `AdapterRouter::set_tau_floor`).
+///
+/// Below this, `exp((score - max_score) / tau)` underflows toward zero in
+/// `f32` for any score gap of a couple of units, so the softmax is already
+/// an argmax in floating point, not merely "practically" one. `1e-2` is a
+/// round, conservative number rather than one derived from a specific score
+/// scale — gate scores have no calibrated magnitude (see the router module
+/// doc) — chosen far enough above numerical underflow that it catches
+/// near-collapse well before floating point would. It is a policy default,
+/// not a proof: the Decision 5 evidence run is what should move it.
+pub const DEFAULT_TAU_FLOOR: f32 = 1e-2;
+
+/// Default entropy floor, in nats, below which a refit round's mean
+/// weight-entropy counts as collapsed (ADR-091 Decision 3,
+/// `AdapterRouter::submit_refit`).
+///
+/// At `k = 2` (the smallest, most common selection width) this is roughly a
+/// 97.7 / 2.3 split — sharp enough to already read as collapse rather than a
+/// confident, healthy preference. Entropy's scale depends on `k`, and this
+/// guard compares every round against one static floor regardless of `k`; a
+/// deployment mixing very different `k` across rounds should treat this as a
+/// known limitation, not a tuned-away one. As the ADR states: this floor
+/// cannot tell collapse from a correctly sharp distribution — a router that
+/// has genuinely learned to prefer one adapter produces the same low-entropy
+/// weight vector as one that has collapsed under sparse reward. It is a guard
+/// on refits, not a guard on truth: it decides which gate gets reloaded, not
+/// whether the resulting policy is good. A rejected refit whose held-out
+/// metric (Decision 5) was improving is the stated falsifier for the floor
+/// value — that observation, not intuition about the number, is what should
+/// move it.
+pub const DEFAULT_ENTROPY_FLOOR: f32 = 0.1;
+
+/// Default number of consecutive collapsed rounds tolerated before
+/// `AdapterRouter::submit_refit` rejects a refit (ADR-091 Decision 3).
+///
+/// `3` tolerates a single noisy round — one round at or above the floor resets
+/// the count — while still catching a sustained collapse within a small,
+/// bounded number of refit cycles. Policy, not derivation; see
+/// `DEFAULT_ENTROPY_FLOOR`.
+pub const DEFAULT_MAX_CONSECUTIVE_COLLAPSED: usize = 3;
+
 /// The complete routing policy an artifact was admitted under.
 ///
 /// ADR-096 decision 5: a version is a policy, not a network blob. Loading the
@@ -1175,10 +1223,17 @@ pub struct ResolvedRouter {
 /// mean two, and two copies of a value that a later refit will replace is a
 /// pairing nothing checks — the reported version and the routing version can
 /// then disagree with no instrument able to say so.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RouterReport<'a> {
     /// The artifact currently serving.
     pub artifact: &'a RouterArtifact,
+    /// The policy routed requests are ACTUALLY served under.
+    ///
+    /// Read from the live router rather than from the artifact beside it.
+    /// Those are two claims: a server that declines to enable a recorded
+    /// learned policy would otherwise report the recorded one and serve a
+    /// different one, which is the shape this endpoint exists to prevent.
+    pub applied_policy: AppliedPolicy,
     /// True when `--router-pin` selected this version.
     pub pinned: bool,
     /// The identity of the embedding model THIS server loaded.
@@ -1192,16 +1247,47 @@ pub struct RouterReport<'a> {
     pub embedder: &'a str,
 }
 
+/// The policy a running router is serving under, as an operator reads it.
+///
+/// Separate from [`RouterPolicy`], which is what an artifact RECORDS. The two
+/// agree on a server that enabled the artifact's policy and disagree on one
+/// that did not, and reporting only the recorded one would make the second
+/// case invisible. Defined here rather than beside the router because this
+/// module is compiled unconditionally and the router is not.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AppliedPolicy {
+    /// One of [`ROUTER_POLICY_KINDS`], as in force.
+    pub kind: String,
+    /// The temperature in force, `Some` only under a softmax.
+    pub tau: Option<f64>,
+    /// The drop floor in force.
+    pub epsilon: f64,
+    /// The scale routed requests are drawn at, or `None` when the decision is
+    /// served deterministically.
+    pub exploration_scale: Option<f64>,
+    /// Whether the operator enabled the artifact's learned policy on this
+    /// server. Reported beside the fields rather than inferred from them: a
+    /// server that enabled learning over a uniform artifact and one that never
+    /// enabled it serve the same way and are not the same configuration.
+    pub learning_enabled: bool,
+}
+
 impl ResolvedRouter {
     /// Borrow this resolution as a report.
     ///
-    /// The embedder identity is a parameter because a resolution does not
-    /// have one: it is read from disk before this server's embedding model is
-    /// known. Passing it in keeps the caller unable to report a gate without
-    /// saying what it is being served against.
-    pub fn report<'a>(&'a self, embedder: &'a str) -> RouterReport<'a> {
+    /// The embedder identity and the applied policy are parameters because a
+    /// resolution has neither: it is read from disk before this server's
+    /// embedding model is loaded and before any router installs a policy.
+    /// Passing them in keeps the caller unable to report a gate without saying
+    /// what it is being served against and under.
+    pub fn report<'a>(
+        &'a self,
+        embedder: &'a str,
+        applied_policy: AppliedPolicy,
+    ) -> RouterReport<'a> {
         RouterReport {
             artifact: &self.artifact,
+            applied_policy,
             pinned: self.pinned,
             embedder,
         }
@@ -1879,7 +1965,7 @@ mod tests {
     /// also refuses, so the two arms agree -- or any scale at all.
     #[test]
     fn a_bootstrap_policy_records_no_exploration_scale() {
-        let bootstrap = crate::router_init::bootstrap_policy();
+        let bootstrap = crate::router_init::bootstrap_policy(None, None);
         assert_eq!(bootstrap.exploration_scale, None);
         bootstrap
             .validate()

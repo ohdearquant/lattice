@@ -276,12 +276,116 @@ fn to_selections(
 pub struct ServingRouter {
     router: crate::mixture::AdapterRouter,
     artifact: RouterArtifact,
+    learning_enabled: bool,
+    exploration_scale: Option<f64>,
+}
+
+/// Install the artifact's recorded policy on a freshly built router, or
+/// refuse why it cannot be installed (ADR-096 decisions 3 and 5).
+///
+/// Returns whether learning is in force, which is not the same question as
+/// whether the flag was given. Four outcomes, and the reasoning behind each
+/// is below rather than in a comment on the single `match`:
+///
+/// A recorded learned policy WITHOUT `learning` fails the startup rather than
+/// being served uniform. Serving it uniform would make one version label name
+/// two behaviours, which is exactly what putting the policy inside the
+/// artifact's content hash prevents, and an operator would read a learned
+/// version number off a server that never ran it.
+///
+/// `learning` over an artifact recording a uniform policy, or recording no
+/// policy at all, fails too, and those are two DIFFERENT refusals: nothing was
+/// written down is not the same as uniform having been written down. Serving
+/// uniform while reporting learning as enabled would be true of the flag and
+/// false of the behaviour.
+///
+/// A recorded UNIFORM policy with `learning` off installs NOTHING and the
+/// router keeps its own defaults, which is what this server serves today. Its
+/// recorded guard fields are deliberately not installed: a bootstrap records
+/// every one of them as zero because the hashed policy shape must not depend
+/// on how the artifact was produced, so installing them would put a zeroed
+/// `tau` floor on a server that never asked for one.
+#[cfg(feature = "mixture")]
+fn apply_recorded_policy(
+    router: &mut crate::mixture::AdapterRouter,
+    artifact: &RouterArtifact,
+    learning: bool,
+) -> Result<bool, ApiError> {
+    let Some(recorded) = artifact.provenance.policy() else {
+        if learning {
+            return Err(ApiError::BadRequest {
+                message: "learning was enabled but this artifact records no policy at all (it \
+                          predates the policy field), so there is no learned policy to serve"
+                    .to_string(),
+                code: "router_no_recorded_policy",
+            });
+        }
+        return Ok(false);
+    };
+
+    match (recorded.kind.as_str(), learning) {
+        ("uniform", false) => Ok(false),
+        ("uniform", true) => Err(ApiError::BadRequest {
+            message: format!(
+                "learning was enabled but artifact {} records a uniform policy, which has \
+                 nothing learned to serve",
+                artifact.version_label()
+            ),
+            code: "router_policy_not_learned",
+        }),
+        (_, false) => Err(ApiError::BadRequest {
+            message: format!(
+                "artifact {} records a {} policy, and this server did not enable learning; \
+                 serving it uniform would make one version label name two behaviours",
+                artifact.version_label(),
+                recorded.kind
+            ),
+            code: "router_learning_not_enabled",
+        }),
+        (_, true) => {
+            let tau = recorded.tau.ok_or_else(|| ApiError::Internal {
+                message: "a softmax policy reached the serving path with no temperature; \
+                          validation should have refused it"
+                    .to_string(),
+            })?;
+            // Floors before the temperature they bound: installing `tau` first
+            // would put it briefly under the router's default floor, and a
+            // refusal ordering that depends on which setter ran first is one
+            // nobody can reason about from the artifact.
+            router.set_tau_floor(as_served_f32(recorded.tau_floor));
+            router.set_entropy_floor(as_served_f32(recorded.entropy_floor));
+            router.set_max_consecutive_collapsed(recorded.max_consecutive_collapsed as usize);
+            router.set_epsilon(as_served_f32(recorded.epsilon));
+            router.set_weight_policy(crate::mixture::WeightPolicy::Softmax {
+                tau: as_served_f32(tau),
+            });
+            Ok(true)
+        }
+    }
+}
+
+/// The artifact stores its policy floats at the width its hash is computed
+/// over; the router compares them against `f32` scores. Narrowed in one named
+/// place so the conversion is visible rather than scattered through the
+/// installer.
+///
+/// The narrowing is why [`ServingRouter::applied_policy`] can report a
+/// temperature whose last bits differ from the recorded one. That is the
+/// report doing its job: it says what the router is running, and what the
+/// router is running is the narrowed value.
+#[cfg(feature = "mixture")]
+fn as_served_f32(value: f64) -> f32 {
+    value as f32
 }
 
 #[cfg(feature = "mixture")]
 impl ServingRouter {
     /// Build a router from a loaded gate artifact.
-    pub fn new(artifact: RouterArtifact) -> Result<Self, ApiError> {
+    ///
+    /// `learning` enables the artifact's recorded learned policy (ADR-096
+    /// decision 3). It is off by default at the CLI, and the three refusals
+    /// that make the flag meaningful are in `apply_recorded_policy`.
+    pub fn new(artifact: RouterArtifact, learning: bool) -> Result<Self, ApiError> {
         let gate = lattice_fann::Network::from_bytes(&artifact.gate_bytes).map_err(|err| {
             ApiError::Internal {
                 message: format!("router gate did not load: {err}"),
@@ -331,10 +435,49 @@ impl ServingRouter {
             });
         }
 
+        let mut router = crate::mixture::AdapterRouter::new(gate);
+        let learning_enabled = apply_recorded_policy(&mut router, &artifact, learning)?;
+        // Carried only when learning is enabled: the scale is the artifact's,
+        // and on a server that did not enable the recorded policy nothing
+        // draws, so reporting a scale would name one a request never ran at.
+        let exploration_scale = learning_enabled
+            .then(|| {
+                artifact
+                    .provenance
+                    .policy()
+                    .and_then(|policy| policy.exploration_scale)
+            })
+            .flatten();
+
         Ok(Self {
-            router: crate::mixture::AdapterRouter::new(gate),
+            router,
             artifact,
+            learning_enabled,
+            exploration_scale,
         })
+    }
+
+    /// The policy this router is serving under, which is not always the one
+    /// its artifact records: a recorded learned policy that was not enabled is
+    /// not applied, and reporting the recorded one would name a policy the
+    /// server is not running. See [`crate::router_state::AppliedPolicy`].
+    ///
+    /// The values are read from the live router, so they are the narrowed
+    /// `f32`s the router computes in rather than the `f64`s the artifact
+    /// records; the two can differ in their last bits and this reports the one
+    /// a request is served under.
+    pub fn applied_policy(&self) -> crate::router_state::AppliedPolicy {
+        let (kind, tau) = match self.router.weight_policy() {
+            crate::mixture::WeightPolicy::Uniform => ("uniform", None),
+            crate::mixture::WeightPolicy::Softmax { tau } => ("softmax", Some(f64::from(tau))),
+        };
+        crate::router_state::AppliedPolicy {
+            kind: kind.to_string(),
+            tau,
+            epsilon: f64::from(self.router.epsilon()),
+            exploration_scale: self.exploration_scale,
+            learning_enabled: self.learning_enabled,
+        }
     }
 
     /// Route one request against the currently resident adapters.
@@ -342,25 +485,41 @@ impl ServingRouter {
     /// `RouterError` renders into the message through `Display` rather than
     /// becoming a new error type: a move should not change the text a user
     /// sees, and a new enum would exist only to be converted at this boundary.
+    ///
+    /// `completion_id` seeds the draw when one happens. It is the id the
+    /// response will carry, so the seed an episode records replays from the
+    /// episode alone -- which is why the caller mints the id BEFORE routing
+    /// rather than after: a seed from an id that does not exist yet would have
+    /// to be random, and a random seed is recorded truthfully and reproducible
+    /// by nobody.
     pub fn route(
         &mut self,
         resident: &AdapterIndex,
         context_vector: Vec<f32>,
         k: usize,
+        completion_id: &str,
     ) -> Result<RoutedRequest, ApiError> {
         let order = trained_order(&self.artifact, resident)?;
+        let draw = self
+            .exploration_scale
+            .map(|scale| crate::mixture::Exploration {
+                // Narrowed for the same reason the report narrows: this is the
+                // value the router computes in, and recording the f64 would
+                // name a scale the draw did not use.
+                scale: as_served_f32(scale),
+                seed: crate::mixture::seed_from_completion_id(completion_id),
+            });
         let outcome = self
             .router
-            .route_detailed(&context_vector, &order, k)
+            .route_explored(&context_vector, &order, k, draw)
             .map_err(|err| ApiError::BadRequest {
                 message: format!("router refused: {err}"),
                 code: "router_refused",
             })?;
-        // Read from the policy in force inside this same lock acquisition,
-        // not from the artifact: at this commit the serving path applies the
-        // compiled-in uniform default, and an artifact's recorded temperature
-        // is a value the router has not installed. The two coincide only once
-        // a serving path installs the recorded policy.
+        // Read from the policy in force inside this same lock acquisition, not
+        // from the artifact: the artifact records what was admitted, the router
+        // carries what a request runs under, and the installed policy is the
+        // router's.
         let tau = match self.router.weight_policy() {
             crate::mixture::WeightPolicy::Uniform => None,
             crate::mixture::WeightPolicy::Softmax { tau } => Some(tau),
@@ -446,9 +605,12 @@ pub struct RoutedRequest {
     /// `None` is the ordinary case and means the decision was deterministic,
     /// not that a draw happened and went unrecorded. The two are different
     /// claims and a learner treats them differently: an absent record is an
-    /// off-policy sample it must not attribute, while a present one carries
-    /// the sampled logits and the action probability that make attribution
-    /// possible.
+    /// off-policy sample it must not attribute, while a present one carries the
+    /// sampled logits `z'`, the scale `s`, the seed and the log density of `z'`
+    /// that make attribution possible. There is no action probability: under
+    /// this draw the policy is Gaussian on the logits, so what the learner
+    /// scores is the density of `z'` (see
+    /// [`crate::mixture::ExplorationOutcome::log_density`]).
     #[cfg(feature = "mixture")]
     pub exploration: Option<crate::mixture::ExplorationOutcome>,
 }
@@ -476,7 +638,7 @@ fn router_unsupported_build() -> ApiError {
 #[cfg(not(feature = "mixture"))]
 impl ServingRouter {
     /// Refuse: this build has no gate implementation.
-    pub fn new(_artifact: RouterArtifact) -> Result<Self, ApiError> {
+    pub fn new(_artifact: RouterArtifact, _learning: bool) -> Result<Self, ApiError> {
         Err(router_unsupported_build())
     }
 
@@ -488,6 +650,7 @@ impl ServingRouter {
         _resident: &AdapterIndex,
         _context_vector: Vec<f32>,
         _k: usize,
+        _completion_id: &str,
     ) -> Result<RoutedRequest, ApiError> {
         Err(router_unsupported_build())
     }
@@ -503,6 +666,19 @@ impl ServingRouter {
     /// a claim that this server serves epoch zero.
     pub fn policy_epoch(&self) -> u64 {
         0
+    }
+
+    /// Unobservable, for the same reason as [`policy_epoch`](Self::policy_epoch).
+    /// Reports the uniform default this build would serve: it installed no
+    /// policy, because `new` refuses before one could be installed.
+    pub fn applied_policy(&self) -> crate::router_state::AppliedPolicy {
+        crate::router_state::AppliedPolicy {
+            kind: "uniform".to_string(),
+            tau: None,
+            epsilon: 0.0,
+            exploration_scale: None,
+            learning_enabled: false,
+        }
     }
 }
 
@@ -757,6 +933,7 @@ impl ServedRouter {
         resolved: crate::router_state::ResolvedRouter,
         embedder_identity: &EmbedderIdentity,
         dimensions: usize,
+        learning: bool,
     ) -> Result<Self, ApiError> {
         // Ordered from the most general refusal to the most specific, which
         // is the same rule the `/v1/lora` handlers follow. A build with no
@@ -766,7 +943,7 @@ impl ServedRouter {
         // embedding model enter it. Reversed, an operator on a build without
         // `mixture` is told to go fix a representation that was never the
         // problem.
-        let router = ServingRouter::new(resolved.artifact)?;
+        let router = ServingRouter::new(resolved.artifact, learning)?;
         let pooling = check_representation(router.artifact(), embedder_identity, dimensions)?;
         Ok(Self {
             router: std::sync::Mutex::new(router),
@@ -795,6 +972,7 @@ impl ServedRouter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(crate::router_state::RouterReport {
             artifact: guard.artifact(),
+            applied_policy: guard.applied_policy(),
             pinned: self.pinned,
             embedder: self.embedder.as_str(),
         })
@@ -812,12 +990,13 @@ impl ServedRouter {
         resident: &AdapterIndex,
         context_vector: Vec<f32>,
         k: usize,
+        completion_id: &str,
     ) -> Result<RoutedRequest, ApiError> {
         let mut guard = self.router.lock().map_err(|_| ApiError::Internal {
             message: "the adapter router panicked on an earlier request and is no longer serving"
                 .to_string(),
         })?;
-        guard.route(resident, context_vector, k)
+        guard.route(resident, context_vector, k, completion_id)
     }
 
     /// The policy epoch the next request would route under.
@@ -978,13 +1157,19 @@ mod tests {
         // without it a green refusal arm could be a gate the constructor was
         // always going to reject.
         assert!(
-            ServedRouter::new(resolved(representation(4)), &identity("gme-qwen35"), 4).is_ok(),
+            ServedRouter::new(
+                resolved(representation(4)),
+                &identity("gme-qwen35"),
+                4,
+                false
+            )
+            .is_ok(),
             "an artifact carrying this binary's own loader must start, or the arm below proves nothing"
         );
 
         let mut rep = representation(4);
         rep.loader_format = crate::serve::embeddings::BERT_ENCODER_LOADER.into();
-        let Err(err) = ServedRouter::new(resolved(rep), &identity("gme-qwen35"), 4) else {
+        let Err(err) = ServedRouter::new(resolved(rep), &identity("gme-qwen35"), 4, false) else {
             panic!("a gate trained through the other binary's loader must refuse at startup")
         };
         assert_eq!(err.code(), "router_representation_loader_mismatch");
@@ -1018,22 +1203,25 @@ mod tests {
             .build()
             .expect("gate must build")
             .to_bytes();
-        let mut router = ServingRouter::new(RouterArtifact {
-            version: 1,
-            adapter_names: vec!["technical".into()],
-            representation: representation(4),
-            gate_bytes,
-            provenance: crate::router_state::RouterProvenance::Legacy,
-        })
+        let mut router = ServingRouter::new(
+            RouterArtifact {
+                version: 1,
+                adapter_names: vec!["technical".into()],
+                representation: representation(4),
+                gate_bytes,
+                provenance: crate::router_state::RouterProvenance::Legacy,
+            },
+            false,
+        )
         .expect("a truthful artifact must construct");
 
         let pool = resident(&[(0, "technical")]);
         let before = router
-            .route(&pool, vec![0.0; 4], 1)
+            .route(&pool, vec![0.0; 4], 1, "chatcmpl-epoch-0")
             .expect("the gate must route its own adapter");
         router.router.set_epsilon(0.25);
         let after = router
-            .route(&pool, vec![0.0; 4], 1)
+            .route(&pool, vec![0.0; 4], 1, "chatcmpl-epoch-1")
             .expect("the gate must still route");
 
         assert_eq!(
@@ -1055,6 +1243,92 @@ mod tests {
             prompt_source: crate::serve::routing::PromptSource::SERVED.as_str().into(),
             loader_format: crate::serve::embeddings::QWEN35_F16_DECODER_LOADER.into(),
             input_width,
+        }
+    }
+
+    /// A gate with `outputs` linear columns of the right width, so a test can
+    /// build an artifact that constructs.
+    ///
+    /// Zero weights and fixed, strictly descending biases, so the gate scores
+    /// the same values on every run and for every input.
+    /// `NetworkBuilder::build` seeds its weights randomly, which would make
+    /// whether a draw reorders the selection a property of the run rather than
+    /// of the seed: an assertion about reordering would then be flaky, and a
+    /// passing first run is exactly how that ships. Distinct biases also keep
+    /// the selected order a real ordering instead of a tie resolved by column
+    /// index.
+    #[cfg(feature = "mixture")]
+    fn servable_gate(outputs: usize) -> Vec<u8> {
+        use lattice_fann::{Activation, Layer, Network};
+        let mut layer =
+            Layer::zeros(4, outputs, Activation::Linear).expect("the gate layer must build");
+        for (column, bias) in layer.biases_mut().iter_mut().enumerate() {
+            *bias = 0.1 * (outputs - column) as f32;
+        }
+        Network::new(vec![layer])
+            .expect("gate must build")
+            .to_bytes()
+    }
+
+    /// A learned policy: a softmax at a real temperature, carrying a scale and
+    /// a non-zero pair of guard fields so the install can be seen to happen.
+    #[cfg(feature = "mixture")]
+    fn learned_policy() -> crate::router_state::RouterPolicy {
+        crate::router_state::RouterPolicy {
+            kind: "softmax".into(),
+            tau: Some(0.7),
+            epsilon: 0.05,
+            tau_floor: 0.1,
+            entropy_floor: 0.35,
+            max_consecutive_collapsed: 3,
+            training_state: "learned".into(),
+            objective_version: Some("whole-mixture-v1".into()),
+            exploration_scale: Some(0.5),
+        }
+    }
+
+    /// A uniform (bootstrap) policy. `epsilon` and the other guard fields are
+    /// recorded non-zero deliberately: the arm that says they are NOT installed
+    /// needs them to differ from the router's defaults.
+    #[cfg(feature = "mixture")]
+    fn uniform_policy() -> crate::router_state::RouterPolicy {
+        crate::router_state::RouterPolicy {
+            kind: "uniform".into(),
+            tau: None,
+            epsilon: 0.25,
+            tau_floor: 0.5,
+            entropy_floor: 0.75,
+            max_consecutive_collapsed: 9,
+            training_state: "bootstrap".into(),
+            objective_version: None,
+            exploration_scale: None,
+        }
+    }
+
+    #[cfg(feature = "mixture")]
+    fn recorded_artifact(policy: crate::router_state::RouterPolicy) -> RouterArtifact {
+        recorded_artifact_over(policy, 1)
+    }
+
+    #[cfg(feature = "mixture")]
+    fn recorded_artifact_over(
+        policy: crate::router_state::RouterPolicy,
+        outputs: usize,
+    ) -> RouterArtifact {
+        RouterArtifact {
+            version: 1,
+            adapter_names: (0..outputs).map(|i| format!("a{i}")).collect(),
+            representation: representation(4),
+            gate_bytes: servable_gate(outputs),
+            provenance: crate::router_state::RouterProvenance::recorded(
+                policy,
+                crate::router_state::RouterLineage {
+                    schema_id: "schema-1".into(),
+                    base_model: "test-model".into(),
+                    parent: None,
+                    admission_record: None,
+                },
+            ),
         }
     }
 
@@ -1187,7 +1461,7 @@ mod tests {
         rep.embedding_model = "some-other-model".into();
         // `match` rather than `expect_err`: a test's convenience is not a
         // reason to derive `Debug` on a type that holds a gate.
-        let msg = match ServedRouter::new(resolved(rep), &identity("gme-qwen35"), 4) {
+        let msg = match ServedRouter::new(resolved(rep), &identity("gme-qwen35"), 4, false) {
             Ok(_) => panic!("a build with no gate implementation must refuse"),
             Err(err) => err.message().to_string(),
         };
@@ -1413,24 +1687,30 @@ mod tests {
 
         // Control first: the truthful record constructs.
         assert!(
-            ServingRouter::new(RouterArtifact {
-                version: 1,
-                adapter_names: vec!["technical".into()],
-                representation: representation(4),
-                gate_bytes: gate_bytes.clone(),
-                provenance: crate::router_state::RouterProvenance::Legacy,
-            })
+            ServingRouter::new(
+                RouterArtifact {
+                    version: 1,
+                    adapter_names: vec!["technical".into()],
+                    representation: representation(4),
+                    gate_bytes: gate_bytes.clone(),
+                    provenance: crate::router_state::RouterProvenance::Legacy,
+                },
+                false
+            )
             .is_ok(),
             "a truthful artifact must construct, or the refusal proves nothing"
         );
 
-        match ServingRouter::new(RouterArtifact {
-            version: 1,
-            adapter_names: vec!["technical".into()],
-            representation: representation(1024),
-            gate_bytes,
-            provenance: crate::router_state::RouterProvenance::Legacy,
-        }) {
+        match ServingRouter::new(
+            RouterArtifact {
+                version: 1,
+                adapter_names: vec!["technical".into()],
+                representation: representation(1024),
+                gate_bytes,
+                provenance: crate::router_state::RouterProvenance::Legacy,
+            },
+            false,
+        ) {
             Err(err) => {
                 let m = err.message();
                 assert!(
@@ -1472,7 +1752,7 @@ mod tests {
             provenance: crate::router_state::RouterProvenance::Legacy,
         };
         assert!(
-            ServingRouter::new(ok).is_ok(),
+            ServingRouter::new(ok, false).is_ok(),
             "an agreeing artifact must construct, or the refusal arm proves nothing"
         );
 
@@ -1484,7 +1764,7 @@ mod tests {
                 gate_bytes: gate(outputs),
                 provenance: crate::router_state::RouterProvenance::Legacy,
             };
-            match ServingRouter::new(artifact) {
+            match ServingRouter::new(artifact, false) {
                 Err(err) => {
                     let m = err.message();
                     assert!(
@@ -1502,9 +1782,221 @@ mod tests {
     #[test]
     fn a_build_without_mixture_refuses_at_construction_rather_than_lacking_the_symbol() {
         // The whole point of the facade: the symbol exists and answers.
-        match ServingRouter::new(artifact(&["technical"])) {
+        match ServingRouter::new(artifact(&["technical"]), false) {
             Err(err) => assert!(err.message().contains("mixture"), "got {}", err.message()),
             Ok(_) => panic!("a build without `mixture` must refuse, not construct a router"),
         }
+    }
+
+    /// A learned policy is not served quietly as uniform. Serving it uniform
+    /// would make one version label name two behaviours, and an operator would
+    /// read a learned version number off a server that never ran it.
+    #[cfg(feature = "mixture")]
+    #[test]
+    fn a_learned_artifact_is_refused_unless_learning_is_enabled() {
+        match ServingRouter::new(recorded_artifact(learned_policy()), false) {
+            Err(err) => assert_eq!(err.code(), "router_learning_not_enabled"),
+            Ok(_) => panic!("a learned policy must not be served without the flag"),
+        }
+        // The control, and it is the whole test: the same artifact constructs
+        // once the flag is given, so the refusal is about the flag and not
+        // about the artifact.
+        let enabled = ServingRouter::new(recorded_artifact(learned_policy()), true)
+            .expect("the same artifact must construct with learning enabled");
+        assert!(enabled.applied_policy().learning_enabled);
+    }
+
+    /// The flag asks for a learned policy. Over an artifact that records none,
+    /// reporting learning as enabled would be true of the flag and false of the
+    /// behaviour.
+    #[cfg(feature = "mixture")]
+    #[test]
+    fn enabling_learning_needs_something_learned_to_serve() {
+        match ServingRouter::new(recorded_artifact(uniform_policy()), true) {
+            Err(err) => assert_eq!(err.code(), "router_policy_not_learned"),
+            Ok(_) => panic!("a uniform policy has nothing learned to enable"),
+        }
+        // A legacy artifact records no policy at all, which is a DIFFERENT
+        // refusal from recording a uniform one: nothing was written down,
+        // rather than uniform having been written down.
+        let mut legacy = recorded_artifact(uniform_policy());
+        legacy.provenance = crate::router_state::RouterProvenance::Legacy;
+        match ServingRouter::new(legacy, true) {
+            Err(err) => assert_eq!(err.code(), "router_no_recorded_policy"),
+            Ok(_) => panic!("an artifact with no policy has nothing to enable"),
+        }
+        // Control: both of those artifacts serve with the flag off.
+        assert!(ServingRouter::new(recorded_artifact(uniform_policy()), false).is_ok());
+        let mut legacy_off = recorded_artifact(uniform_policy());
+        legacy_off.provenance = crate::router_state::RouterProvenance::Legacy;
+        assert!(ServingRouter::new(legacy_off, false).is_ok());
+    }
+
+    /// What the endpoint reports is what the router is running, field by field,
+    /// and the recorded values are the ones that arrive.
+    #[cfg(feature = "mixture")]
+    #[test]
+    fn an_enabled_router_serves_and_reports_the_recorded_policy() {
+        let enabled = ServingRouter::new(recorded_artifact(learned_policy()), true)
+            .expect("a learned artifact must construct with learning enabled");
+        let applied = enabled.applied_policy();
+        assert_eq!(applied.kind, "softmax");
+        // Compared with a tolerance, not for equality: the router runs these at
+        // `f32` and the report widens them back, so the last bits of a recorded
+        // `f64` do not survive. The report is right and the exact comparison
+        // would be the wrong question.
+        assert!(
+            applied.tau.is_some_and(|tau| (tau - 0.7).abs() < 1e-6),
+            "{applied:?}"
+        );
+        assert_eq!(
+            applied.exploration_scale,
+            Some(0.5),
+            "the scale is carried, not narrowed: nothing installs it on the router"
+        );
+        assert!((applied.epsilon - 0.05).abs() < 1e-6, "{applied:?}");
+        assert!(applied.learning_enabled);
+    }
+
+    /// A uniform artifact's recorded guard fields are NOT installed, and this
+    /// is the arm that says so rather than a comment claiming it. A bootstrap
+    /// records every guard as zero because the hashed policy shape must not
+    /// depend on how the artifact was produced; installing those would put a
+    /// zeroed `tau` floor on a server that never asked for one. This fixture
+    /// records them NON-zero precisely so the arm can tell.
+    #[cfg(feature = "mixture")]
+    #[test]
+    fn a_uniform_artifacts_recorded_policy_is_not_installed() {
+        let served = ServingRouter::new(recorded_artifact(uniform_policy()), false)
+            .expect("a uniform artifact must construct");
+        let applied = served.applied_policy();
+        assert_eq!(applied.kind, "uniform");
+        assert_eq!(applied.tau, None);
+        assert_eq!(applied.exploration_scale, None);
+        assert!(!applied.learning_enabled);
+        assert_eq!(
+            applied.epsilon, 0.0,
+            "the artifact records epsilon 0.25; the router must still be at its own default"
+        );
+    }
+
+    /// The draw: with learning enabled and a scale recorded, the routing call
+    /// draws, seeds from the completion id, records the outcome, and does NOT
+    /// overwrite the gate's own scores. With learning off the same gate serves
+    /// the same scores with no draw recorded.
+    #[cfg(feature = "mixture")]
+    #[test]
+    fn an_explored_decision_records_its_draw_and_keeps_the_gate_scores() {
+        // ONE artifact, cloned. `NetworkBuilder` initialises randomly, so two
+        // calls to the fixture produce two different gates, and any comparison
+        // across them would be a comparison of two gates rather than of two
+        // decisions.
+        let artifact = recorded_artifact_over(learned_policy(), 2);
+        let pool = resident(&[(0, "a0"), (1, "a1")]);
+        let context = vec![0.25; 4];
+
+        let mut router = ServingRouter::new(artifact.clone(), true)
+            .expect("a learned artifact must construct with learning enabled");
+        let routed = router
+            .route(&pool, context.clone(), 2, "chatcmpl-1789991322-0")
+            .expect("the gate must route");
+        let draw = routed
+            .exploration
+            .as_ref()
+            .expect("an enabled policy with a recorded scale must draw");
+
+        assert_eq!(
+            draw.seed,
+            crate::mixture::seed_from_completion_id("chatcmpl-1789991322-0"),
+            "the seed is the completion id's, so the episode replays from itself"
+        );
+        assert_eq!(
+            f64::from(draw.scale),
+            learned_policy()
+                .exploration_scale
+                .expect("the fixture records one"),
+            "the scale served is the scale recorded"
+        );
+        assert!(
+            draw.log_density.is_finite() && draw.log_density <= 0.0,
+            "a log density must be finite and non-positive, got {}",
+            draw.log_density
+        );
+        assert_ne!(
+            draw.sampled_logits[..2].to_vec(),
+            routed
+                .selected_scores
+                .iter()
+                .map(|(_, score)| *score)
+                .collect::<Vec<f32>>(),
+            "a scale of 0.5 must actually perturb, or the comparison below is vacuous"
+        );
+
+        // The same gate with learning off: no draw, and the SAME score values.
+        let mut deterministic = ServingRouter::new(
+            RouterArtifact {
+                provenance: crate::router_state::RouterProvenance::Legacy,
+                ..artifact.clone()
+            },
+            false,
+        )
+        .expect("a legacy artifact serves the uniform default");
+        let baseline = deterministic
+            .route(&pool, context.clone(), 2, "chatcmpl-1789991322-0")
+            .expect("the gate must route");
+        assert!(
+            baseline.exploration.is_none(),
+            "a router with learning off records no draw"
+        );
+        // Compared as a MAPPING, not as a list: the VALUES are the gate's own
+        // either way, but the ORDER is the drawn order under exploration and
+        // the score order without it. Selection order is part of the action, so
+        // it is right that the draw moves it, and a reader who takes
+        // `selected_scores[0]` for "the gate's favourite" is wrong whenever a
+        // draw happened.
+        let as_map = |v: &[(String, f32)]| -> std::collections::BTreeMap<String, String> {
+            v.iter()
+                .map(|(name, score)| (name.clone(), format!("{score:.7}")))
+                .collect()
+        };
+        assert_eq!(
+            as_map(&baseline.selected_scores),
+            as_map(&routed.selected_scores),
+            "the draw must not overwrite the gate's own score values"
+        );
+        // Non-vacuousness, established over a sweep rather than on the pinned
+        // id. Whether ONE seed happens to reorder a score gap is a fact about
+        // that seed; the claim being made is that the draw CAN reorder, and a
+        // single-id assertion of it is a coin flip written as a test.
+        let mut reorderings = 0;
+        for i in 0..32 {
+            let mut probe = ServingRouter::new(artifact.clone(), true).expect("construct");
+            let out = probe
+                .route(&pool, vec![0.25; 4], 2, &format!("chatcmpl-sweep-{i}"))
+                .expect("route");
+            if out.selected_scores != baseline.selected_scores {
+                reorderings += 1;
+            }
+        }
+        assert!(
+            reorderings > 0,
+            "no draw in 32 reordered a 0.1 score gap at scale 0.5; the mapping \
+             comparison above is then vacuous"
+        );
+
+        // Reproducibility: the same id replays, a different id does not.
+        let mut again = ServingRouter::new(artifact.clone(), true).expect("construct");
+        let replay = again
+            .route(&pool, context.clone(), 2, "chatcmpl-1789991322-0")
+            .expect("route");
+        assert_eq!(replay.exploration, routed.exploration);
+        let other = again
+            .route(&pool, context, 2, "chatcmpl-1789991322-1")
+            .expect("route");
+        assert_ne!(
+            other.exploration.as_ref().map(|e| e.seed),
+            routed.exploration.as_ref().map(|e| e.seed),
+            "a different completion draws differently"
+        );
     }
 }

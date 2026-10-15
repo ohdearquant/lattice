@@ -56,6 +56,28 @@ pub struct InitArgs {
     /// explicitly and a second rule needs no new surface.
     #[arg(long, default_value = "last_user_message")]
     pub prompt_source: String,
+    /// Mint the bootstrap in the shape a learning run can use: a `softmax`
+    /// policy at this temperature, carrying the router's own guard floors.
+    ///
+    /// Omitted, the bootstrap is the original uniform one. Given, the served
+    /// mixture over the zero gate is unchanged -- a softmax over equal logits
+    /// IS `1/k` -- but the mixture is now a function of the scores, so a draw
+    /// can reach it. That is what `serve --router-learn` requires and what a
+    /// uniform artifact can never provide.
+    ///
+    /// Refused below the router's own tau floor, here rather than at the first
+    /// startup that loads the directory.
+    #[arg(long)]
+    pub tau: Option<f64>,
+    /// The exploration scale to record. Requires `--tau`: a draw cannot change
+    /// a uniform decision over every trained column, so the pair is refused at
+    /// the specification when the scale arrives without the temperature.
+    ///
+    /// Recording no scale is legitimate and is what a softmax bootstrap
+    /// carries by default; the artifact then names a policy a learning run can
+    /// enable but no scale to explore at.
+    #[arg(long)]
+    pub exploration_scale: Option<f64>,
 }
 
 /// Run `router init`, returning false when the command refused.
@@ -107,6 +129,8 @@ pub fn run(args: &InitArgs) -> bool {
         },
         schema_id: args.schema_id.clone(),
         base_model: args.base_model.clone(),
+        tau: args.tau,
+        exploration_scale: args.exploration_scale,
     };
 
     let dir = Path::new(&args.state);
@@ -118,18 +142,37 @@ pub fn run(args: &InitArgs) -> bool {
                 spec.adapter_names.len(),
                 spec.adapter_names.join(", ")
             );
+            let policy_line = match (args.tau, args.exploration_scale) {
+                (None, _) => "uniform, training_state=bootstrap".to_string(),
+                (Some(tau), None) => {
+                    format!("softmax tau={tau}, no exploration scale, training_state=bootstrap")
+                }
+                (Some(tau), Some(scale)) => format!(
+                    "softmax tau={tau}, exploration_scale={scale}, training_state=bootstrap"
+                ),
+            };
             println!(
-                "  manifest:    {}\n  embedder:    {} ({} dimensions, measured)\n  policy:      uniform, training_state=bootstrap",
+                "  manifest:    {}\n  embedder:    {} ({} dimensions, measured)\n  policy:      {}",
                 path.display(),
                 identity.as_str(),
-                spec.representation.input_width
+                spec.representation.input_width,
+                policy_line
             );
             println!(
-                "This gate has learned nothing. Serving it is the uniform baseline, and \
+                "This gate has learned nothing. Serving it is the uniform baseline either \
+                 way -- a softmax over the zero logits this command writes IS 1/k -- and \
                  GET /v1/lora reports training_state=bootstrap so a response from it is \
                  never read as evidence of learning. Enabling learning is a separate \
                  explicit action; this command did not perform it."
             );
+            if args.tau.is_some() {
+                println!(
+                    "The policy is recorded as softmax, so the served mixture is a function \
+                     of the gate's scores and a draw can reach it. `serve --router-learn` \
+                     accepts this directory; without that flag the server serves the \
+                     baseline above and says so."
+                );
+            }
             true
         }
         Err(err) => {
