@@ -535,10 +535,42 @@ jobs:
             cat "$log"
             exit "$status"
           fi
-          grep -Eq '^test result: ok\. 16 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || {
-            echo "GUARD FAILED: expected all 16 router candidate construction tests."
+          grep -Eq '^test result: ok\. 21 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || {
+            echo "GUARD FAILED: expected all 21 router candidate construction tests."
             exit 1
           }
+      - name: inference registered router admission (CPU)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-router-admission-tests.log"
+          if cargo test --locked -p lattice-inference --lib --features serve,f16,router-learning router_admission:: \
+            -- --nocapture --test-threads=1 --color never >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          for name in \
+            statistics::tests::paired_bootstrap_uses_the_same_resampled_parent_population \
+            reference::scoring::tests::reference_scoring_teacher_forcing_alignment_and_count \
+            tests::real_candidate_positive_paired_bound_admits_without_changing_the_live_parent \
+            tests::parent_logit_tolerance_is_registered_and_inclusive_without_relaxing_draw_replay \
+            tests::entropy_history_advances_once_per_completed_round_and_not_on_errors
+          do
+            grep -Fxq "test router_admission::${name} ... ok" "$log" || {
+              echo "GUARD FAILED: admission control ${name} did not run and pass."
+              exit 1
+            }
+          done
+          count=$(grep -Ec '^test result: ok\. 42 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
+          if [ "$count" -ne 1 ]; then
+            echo "GUARD FAILED: expected one complete 42-test router admission result."
+            exit 1
+          fi
+      - name: inference router admission Metal integration clippy
+        if: runner.os == 'macOS'
+        run: cargo clippy --locked -p lattice-inference --all-targets --features serve,f16,metal-gpu,router-learning -- -D warnings
       - name: Router trainer artifact probe unit tests
         run: python3 tests/test_router_learning_artifacts.py -v
       - name: Router trainer feature isolation in emitted artifacts

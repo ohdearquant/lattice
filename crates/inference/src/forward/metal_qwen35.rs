@@ -14935,6 +14935,11 @@ mod inner {
         }
     }
 
+    #[cfg(all(test, feature = "router-learning", feature = "serve", feature = "f16"))]
+    pub(crate) fn reference_scoring_fixture() -> (Qwen35Config, ModelWeights) {
+        tests::option_scoring_fixture()
+    }
+
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
@@ -29009,7 +29014,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// path: q_proj and k_proj stay zero, so attention is uniform over the positions seen so
         /// far, value channel 0 reads hidden[0], and o_proj routes that channel into hidden[1].
         /// The last position's letter logits therefore depend on every earlier prompt token.
-        fn option_scoring_fixture() -> (Qwen35Config, ModelWeights) {
+        pub(super) fn option_scoring_fixture() -> (Qwen35Config, ModelWeights) {
             let (cfg, mut weights) = tiny_hybrid_fixture();
             let hidden = cfg.hidden_size;
             let q_dim = cfg.full_q_dim();
@@ -44799,6 +44804,16 @@ pub use inner::{
     PathProofSnapshot, arm_moe_routing_trace, blend_lora_layer_data, dump_moe_routing_trace_jsonl,
     take_moe_routing_trace,
 };
+
+#[cfg(all(
+    test,
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "router-learning",
+    feature = "serve",
+    feature = "f16"
+))]
+pub(crate) use inner::reference_scoring_fixture;
 
 /// The ordinary-generation route planner and samplers, shared with
 /// `crate::decoder::qwen_metal` so the decoder session selects exactly as
