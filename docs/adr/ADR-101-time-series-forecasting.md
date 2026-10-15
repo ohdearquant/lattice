@@ -124,7 +124,8 @@ optional `downsample` and `flip`) and writes one forecast per line. It is the ha
 ### D10. Combination after the three ports
 
 With three model families running locally, a learned per-series combination (selection or weighting by series
-features) is built on the same module and scored on GIFT-Eval. It trains on the benchmark's training split only; a
+features) is built on the same module and scored on GIFT-Eval. The aim is a combination whose aggregate CRPS, on the
+same protocol, is lower than 0.419, the best published aggregate today. It trains on the benchmark's training split only; a
 result is reported with the split and the protocol, and no leaderboard submission is made without an explicit
 decision to publish.
 
