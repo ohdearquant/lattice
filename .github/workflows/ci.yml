@@ -277,6 +277,8 @@ jobs:
       - name: inference - ERNIE cached decode scratch and caller regressions
         run: |
           python3 - <<'PY'
+          if not __debug__:
+              raise RuntimeError("validation requires Python assertions")
           import json, os, pathlib, re, subprocess, sys
 
           SUITES = [
