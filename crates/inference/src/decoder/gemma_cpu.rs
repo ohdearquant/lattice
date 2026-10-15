@@ -278,6 +278,10 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
     }
 }
 
+#[cfg(all(test, feature = "f16"))]
+#[path = "gemma_cpu_bench.rs"]
+mod prefill_bench;
+
 #[cfg(test)]
 mod tests {
     use super::*;
