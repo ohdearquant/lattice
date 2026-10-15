@@ -691,47 +691,90 @@ jobs:
       - name: embed — metal-gpu (macOS only)
         if: runner.os == 'macOS'
         run: cargo build -p lattice-embed --features metal-gpu
-      # bench_serve_http is the HTTP measurement harness for `lattice serve`. Its
-      # tests check that it refuses to certify a run that measured nothing (a
-      # missing checkpoint or binary, a server that never listens, a response
-      # with no tokens, a stream with no content). They need no model. The
-      # example sets `test = true`, so `cargo test --workspace` also runs them,
-      # but only while `serve` and `download` stay default features: cargo skips
-      # a target whose required features are off and does not fail. Naming the
-      # target turns that case into an error, and the count catches a module
-      # that was emptied. The step requires exactly one `test result:` line and
-      # exactly one cargo `Running unittests examples/bench_serve_http.rs` line,
-      # so the count it reads is the example's own and not another target's.
-      # The workflow sets CARGO_TERM_COLOR=always, which puts escape codes in
-      # front of cargo's `Running` line; the step turns colour off and also
-      # strips escapes before counting, so the anchored patterns see plain text.
+      # Name the example explicitly so missing required features cannot skip it.
+      # Require all 44 existing controls plus the platform-specific spawn controls.
       - name: inference — bench_serve_http harness tests (example target)
         env:
           CARGO_TERM_COLOR: never
         run: |
           set -euo pipefail
-          out=$(cargo test -p lattice-inference --example bench_serve_http 2>&1) || {
+          log=$(mktemp)
+          cargo test --locked -p lattice-inference --example bench_serve_http -- --color never >"$log" 2>&1 || {
             status=$?
-            printf '%s\n' "$out"
+            cat "$log"
             exit "$status"
           }
-          out=$(printf '%s\n' "$out" | sed "s/$(printf '\033')\\[[0-9;]*m//g")
-          printf '%s\n' "$out"
-          runs=$(printf '%s\n' "$out" | grep -c '^ *Running unittests examples/bench_serve_http\.rs (' || true)
-          if [ "$runs" -ne 1 ]; then
-            echo "expected exactly one 'Running unittests examples/bench_serve_http.rs' line, found $runs" >&2
-            exit 1
-          fi
-          summaries=$(printf '%s\n' "$out" | grep -c '^test result: ' || true)
-          if [ "$summaries" -ne 1 ]; then
-            echo "expected exactly one 'test result:' line from the bench_serve_http target, found $summaries" >&2
-            exit 1
-          fi
-          passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p')
-          if [ -z "$passed" ] || [ "$passed" -lt 32 ]; then
-            echo "expected at least 32 passing bench_serve_http tests, parsed '${passed:-<none>}'" >&2
-            exit 1
-          fi
+          cat "$log"
+          python3 - "$log" <<'PY'
+          import collections, os, pathlib, re, sys
+          text = re.sub(r"\x1b\[[0-9;]*m", "", pathlib.Path(sys.argv[1]).read_text())
+          common = """
+          tests::any_event_after_done_is_refused
+          tests::complete_stream_is_certified_with_the_first_delta_after_the_role_chunk
+          tests::completion_tokens_above_the_requested_max_tokens_are_refused
+          tests::config_rejects_unusable_values_and_applies_defaults
+          tests::each_servers_announcement_yields_its_address
+          tests::empty_finish_reason_is_refused_in_both_modes
+          tests::healthy_http_server_is_certified_in_both_modes_for_both_prompts
+          tests::http_error_body_that_trickles_past_the_request_deadline_is_refused
+          tests::http_error_status_with_a_prompt_body_is_reported_with_that_body
+          tests::http_nonstream_body_that_trickles_past_the_request_deadline_is_refused
+          tests::http_response_reporting_more_tokens_than_requested_is_refused
+          tests::http_response_reporting_zero_completion_tokens_is_refused
+          tests::http_server_that_never_answers_is_refused_as_a_timeout
+          tests::http_stream_ending_inside_an_event_is_refused
+          tests::http_stream_left_open_after_done_is_refused_as_a_timeout
+          tests::http_stream_that_trickles_past_the_request_deadline_is_refused
+          tests::http_stream_total_time_runs_to_the_end_of_the_body
+          tests::http_stream_with_an_empty_data_event_is_refused
+          tests::http_stream_with_an_event_after_done_is_refused
+          tests::http_stream_with_multi_line_data_events_is_certified
+          tests::http_stream_without_content_deltas_is_refused
+          tests::marker_lines_are_counted_by_substring
+          tests::missing_binary_is_a_skip_and_never_a_success
+          tests::missing_model_dir_refusal_is_classified_as_a_skip_with_exit_code_two
+          tests::model_dir_without_weights_is_a_skip
+          tests::nonstream_body_without_usage_or_with_an_error_is_refused
+          tests::nonstream_response_without_generated_text_is_refused
+          tests::positive_completion_tokens_are_certified_and_reported
+          tests::server_announcing_a_different_address_than_the_selected_port_is_refused
+          tests::server_that_announces_listening_is_admitted_and_timed
+          tests::server_that_exits_before_listening_is_refused_whatever_its_status
+          tests::server_that_never_listens_times_out_as_a_refusal
+          tests::spawn_retry_immediate_success_does_not_pause
+          tests::spawn_retry_nonretryable_errors_are_returned_without_pausing
+          tests::sse_data_lines_are_joined_at_the_blank_line_event_boundary
+          tests::sse_lines_yield_data_and_ignore_comments_and_blanks
+          tests::standalone_server_that_announces_its_api_line_is_admitted
+          tests::start_server_binds_retry_to_its_timed_spawn
+          tests::stream_error_event_is_refused_even_with_earlier_deltas
+          tests::stream_event_with_an_empty_data_payload_is_refused
+          tests::stream_with_more_content_deltas_than_max_tokens_is_refused
+          tests::stream_without_a_content_delta_is_refused
+          tests::the_lattice_binary_keeps_its_serve_command_line
+          tests::the_standalone_binary_is_started_without_a_subcommand_or_model_id
+          tests::truncated_stream_is_refused_for_a_missing_finish_or_done
+          tests::unknown_finish_reason_is_refused_in_both_modes
+          tests::zero_completion_tokens_refuse_certification_whatever_the_text
+          """.split()
+          platform = {
+              "Linux": """
+          tests::spawn_retry_text_busy_recovers_on_the_last_attempt
+          tests::spawn_retry_text_busy_exhaustion_returns_the_final_error
+          tests::spawn_retry_real_text_busy_exec_recovers_after_writer_closes
+          """.split(),
+              "macOS": ["tests::spawn_retry_text_busy_is_not_retried_off_linux"],
+          }
+          expected = common + platform[os.environ["RUNNER_OS"]]
+          runs = re.findall(r"^ *Running unittests examples/bench_serve_http\.rs \(", text, re.M)
+          assert len(runs) == 1, runs
+          actual = re.findall(r"^test (tests::\w+) \.\.\. ok$", text, re.M)
+          assert collections.Counter(actual) == collections.Counter(expected), (actual, expected)
+          summaries = re.findall(r"^test result: .*$", text, re.M)
+          assert len(summaries) == 1, summaries
+          assert re.fullmatch(rf"test result: ok\. {len(expected)} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9.]+s", summaries[0]), summaries
+          print(f"Verified {len(expected)} named bench_serve_http tests on {os.environ['RUNNER_OS']}")
+          PY
       # The unit tests classify a missing checkpoint as a skip with exit code 2,
       # but only `main` turns that classification into the process status. Run the
       # example itself with the model directory pointing at an empty directory and
