@@ -1139,12 +1139,16 @@ mod tests {
 
     #[test]
     fn source_requires_enabled_recorded_exploration_and_exact_live_gate() {
+        assert!(RefitSource::from_serving(artifact(), source().router, true, Some(0.5)).is_ok());
+        assert!(matches!(
+            RefitSource::from_serving(artifact(), source().router, false, Some(0.5)),
+            Err(RefitError::IneligibleSource(problem)) if problem == "learning is not enabled"
+        ));
         let mut art = artifact();
         art.provenance = RouterProvenance::Legacy;
-        let router = ServingRouter::new(art, false).unwrap();
         assert!(matches!(
-            router.refit_source(),
-            Err(RefitError::IneligibleSource(_))
+            RefitSource::from_serving(art, source().router, true, Some(0.5)),
+            Err(RefitError::IneligibleSource(problem)) if problem == "the artifact is not learner eligible"
         ));
         let mut art = artifact();
         if let RouterProvenance::Recorded(recorded) = &mut art.provenance {
@@ -1502,34 +1506,82 @@ mod tests {
 
     #[test]
     fn a_failed_training_update_does_not_consume_ids_or_commit_trainer_history() {
-        let source = source();
-        let mut config = training();
-        config.learning_rate = f32::MAX;
-        let mut builder = RefitBuilder::new(
-            config,
-            RefitConfig {
-                minimum_round: 2,
-                maximum_round: 2,
-            },
-        )
-        .unwrap();
+        let mut art = artifact();
+        if let RouterProvenance::Recorded(recorded) = &mut art.provenance {
+            recorded.policy.exploration_scale = Some(f64::from(5e18_f32));
+        }
+        let bad_source = ServingRouter::new(art, true)
+            .unwrap()
+            .refit_source()
+            .unwrap();
         let mut store = EpisodeStore::new(2);
         record(
             &mut store,
-            episode(&source, "large-one", vec![100.0, 100.0], 3),
+            episode(&bad_source, "late-overflow-430", vec![0.4, -0.2], 3),
             EpisodeSignal::Helpful,
         );
         record(
             &mut store,
-            episode(&source, "large-two", vec![100.0, 100.0], 3),
+            episode(&bad_source, "large-two", vec![-0.3, 0.8], 3),
             EpisodeSignal::Unhelpful,
         );
+        let mut builder = builder(2, 2);
         assert!(matches!(
-            builder.build_candidate(&source, &store),
-            Err(RefitError::Training(_))
+            builder.build_candidate(&bad_source, &store),
+            Err(RefitError::Training(problem)) if problem == "batch statistics are not finite"
         ));
         assert!(builder.source.is_none());
         assert!(builder.consumed.is_empty());
+
+        let good_source = source();
+        let good = pair(&good_source, 2);
+        let recovered = candidate(builder.build_candidate(&good_source, &good).unwrap());
+        let pristine = candidate(
+            super::tests::builder(2, 2)
+                .build_candidate(&good_source, &good)
+                .unwrap(),
+        );
+        assert_eq!(recovered, pristine);
+
+        // The scale keeps gradients finite but overflows the scalar loss only
+        // after the trainer has observed both traffic masses. Retaining that
+        // trainer must change the follow-up, or this fixture proves nothing.
+        let mut producing = bad_source.policy_router(bad_source.gate_bytes()).unwrap();
+        let columns = bad_source
+            .key
+            .adapter_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_str(), index))
+            .collect();
+        let prepared: Vec<_> = store
+            .ordered_on_policy_samples(bad_source.identity().epoch)
+            .map(|(event, signal)| {
+                prepare(&bad_source, &mut producing, event, signal, &columns).unwrap()
+            })
+            .collect();
+        let samples: Vec<_> = prepared
+            .iter()
+            .map(|p| MixtureSample {
+                context: &p.episode.context_vector,
+                action: ExploredAction {
+                    sampled_logits: &p.draw.sampled_logits,
+                    exploration_scale: p.draw.scale,
+                    w_full: &p.w_full,
+                    tau: bad_source.tau,
+                },
+                reward: p.reward,
+            })
+            .collect();
+        let mut contaminated = super::tests::builder(2, 2);
+        let mut gate = Network::from_bytes(bad_source.gate_bytes()).unwrap();
+        let update = contaminated
+            .trainer
+            .step_batch_with_explored_actions(&mut gate, &samples)
+            .unwrap();
+        assert!(!update.mean_loss.is_finite());
+        let contaminated = candidate(contaminated.build_candidate(&good_source, &good).unwrap());
+        assert_ne!(contaminated.gate_bytes(), pristine.gate_bytes());
     }
 
     #[test]
