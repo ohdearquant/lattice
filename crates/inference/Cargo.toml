@@ -20,6 +20,7 @@ exclude = [
     "tests/fixtures/gdn_chunk",
     "tests/fixtures/gemma4/tokenizer",
     "tests/fixtures/paddleocr_vl/tokenizer",
+    "tests/fixtures/mlx_headers",
 ]
 
 [package.metadata.docs.rs]
