@@ -14,8 +14,8 @@ workspace version; the workspace release notes are in
 
 - Serialized, create-only router publication with synced staging outside the
   selectable namespace. Bootstrap commits its durable HEAD before returning.
-  A failure after HEAD replacement reports an uncertain commit for startup
-  recovery, without authorizing live activation.
+  A failure after HEAD replacement or legacy artifact publication reports an
+  uncertain commit for startup recovery, without authorizing live activation.
 - Historical format-5 receipts preserve the exact previous HEAD before an
   advance. Explicit format-5 pins require current HEAD or such a receipt.
 
@@ -32,6 +32,8 @@ workspace version; the workspace release notes are in
 - Router readers use a shared persistent lock when available. Older read-only
   directories remain readable without creating a lock; cooperating publishers
   create the lock before publication and never replace or remove its inode.
+- Directory initialization synchronizes the target and newly created ancestry
+  through its first existing parent, without opening unrelated higher ancestors.
 
 ### Deprecated
 

@@ -349,14 +349,14 @@ pub enum RouterArtifactError {
         problem: String,
     },
 
-    /// HEAD was replaced, but its final durability could not be confirmed.
+    /// A version became selectable, but its final durability could not be confirmed.
     #[error(
         "router commit outcome is uncertain for {identity}: {message}; do not activate from this result; recover by reopening the state directory"
     )]
     CommitUncertain {
         /// The proposed counter and full content hash.
         identity: String,
-        /// The failure after the atomic HEAD replacement.
+        /// The failure after HEAD replacement or legacy artifact publication.
         message: String,
     },
 

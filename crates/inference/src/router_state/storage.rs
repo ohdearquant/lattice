@@ -205,27 +205,57 @@ fn ensure_dir_with_sync(
     path: &Path,
     mut sync: impl FnMut(&Path) -> Result<(), RouterArtifactError>,
 ) -> Result<(), RouterArtifactError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => {}
+    let missing = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => false,
         Ok(_) => return Err(write_error(path, "not a directory")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(path).map_err(|error| write_error(path, error))?;
-            if !std::fs::symlink_metadata(path)
-                .map_err(|error| write_error(path, error))?
-                .is_dir()
-            {
-                return Err(write_error(path, "not a directory"));
-            }
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => return Err(write_error(path, error)),
+    };
+    let creation_boundary = if missing {
+        let mut ancestor = path.parent().unwrap_or_else(|| Path::new("."));
+        let boundary = loop {
+            if ancestor.as_os_str().is_empty() {
+                ancestor = Path::new(".");
+            }
+            match std::fs::metadata(ancestor) {
+                Ok(metadata) if metadata.is_dir() => {
+                    break std::fs::canonicalize(ancestor)
+                        .map_err(|error| write_error(ancestor, error))?;
+                }
+                Ok(_) => return Err(write_error(ancestor, "not a directory")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if ancestor == Path::new(".") || ancestor.parent().is_none() {
+                        return Err(write_error(ancestor, error));
+                    }
+                    ancestor = ancestor.parent().unwrap_or_else(|| Path::new("."));
+                }
+                Err(error) => return Err(write_error(ancestor, error)),
+            }
+        };
+        std::fs::create_dir_all(path).map_err(|error| write_error(path, error))?;
+        Some(boundary)
+    } else {
+        None
+    };
+    if !std::fs::symlink_metadata(path)
+        .map_err(|error| write_error(path, error))?
+        .is_dir()
+    {
+        return Err(write_error(path, "not a directory"));
     }
-    // An existing name may have been created by a concurrent initializer or
-    // survived a failed sync. Each successful writer establishes durability
-    // independently. Canonical ancestry permits ordinary /tmp and /var aliases
-    // while the selected directory itself must remain a real directory.
     let canonical = std::fs::canonicalize(path).map_err(|error| write_error(path, error))?;
+    // An existing target may have survived a failed parent sync. Its parent
+    // repairs that name; older pre-existing ancestry is outside this boundary.
+    let boundary =
+        creation_boundary.unwrap_or_else(|| canonical.parent().unwrap_or(&canonical).to_path_buf());
+    if !canonical.starts_with(&boundary) {
+        return Err(write_error(path, "directory escaped its creation boundary"));
+    }
     for ancestor in canonical.ancestors() {
         sync(ancestor)?;
+        if ancestor == boundary {
+            break;
+        }
     }
     Ok(())
 }
@@ -354,8 +384,18 @@ fn materialize(
         &manifest_path(stage, artifact.version),
         &manifest_path(dir, artifact.version),
     )?;
-    sync_dir(dir)?;
-    fault(Phase::ManifestPublished)
+    let durable = sync_dir(dir).and_then(|()| fault(Phase::ManifestPublished));
+    durable.map_err(|error| {
+        if artifact.provenance.format() == ROUTER_ARTIFACT_FORMAT_LEGACY {
+            // Counter selection can see both legacy names before this sync.
+            RouterArtifactError::CommitUncertain {
+                identity: identity(artifact),
+                message: error.to_string(),
+            }
+        } else {
+            error
+        }
+    })
 }
 
 pub(super) fn publish_legacy(
@@ -1045,6 +1085,43 @@ mod tests {
     }
 
     #[test]
+    fn legacy_post_link_sync_failure_reports_the_visible_uncertain_version() {
+        use sync_probe::Kind;
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let first = artifact(1, false);
+        let second = artifact(2, false);
+        publish_legacy(dir, &first).unwrap();
+        let failure_dir = dir.to_path_buf();
+        let (result, events) = sync_probe::run(
+            move |event| {
+                event.kind == Kind::Directory
+                    && event.path == failure_dir
+                    && manifest_path(&failure_dir, 2).exists()
+            },
+            || publish_legacy(dir, &second),
+        );
+        let error = result.expect_err("the post-link directory sync must be reached");
+        assert!(
+            error
+                .to_string()
+                .contains("injected synchronization failure")
+        );
+        assert!(
+            matches!(error, RouterArtifactError::CommitUncertain { identity: named, .. } if named == identity(&second))
+        );
+        assert_eq!(events.last().unwrap().path, dir);
+        assert_eq!(selected(dir), second);
+        assert_eq!(read_artifact(dir, 1).unwrap(), first);
+        assert_eq!(read_head(dir).unwrap(), None);
+        assert!(!receipt_path(dir, 2).exists());
+        assert!(matches!(
+            publish_legacy(dir, &second),
+            Err(RouterArtifactError::AlreadyExists { .. })
+        ));
+    }
+
+    #[test]
     fn read_only_legacy_and_copied_modern_directories_need_no_new_lock() {
         use std::os::unix::fs::PermissionsExt;
         for recorded in [false, true] {
@@ -1088,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn both_existing_and_new_directories_sync_every_canonical_ancestor() {
+    fn directory_sync_stops_at_the_observed_creation_boundary() {
         for already_present in [false, true] {
             let temporary = tempfile::tempdir().unwrap();
             let dir = temporary.path().join("first/second/router");
@@ -1102,30 +1179,119 @@ mod tests {
             })
             .unwrap();
             let canonical = std::fs::canonicalize(&dir).unwrap();
-            let expected: Vec<_> = canonical.ancestors().map(Path::to_path_buf).collect();
+            let count = if already_present { 2 } else { 4 };
+            let expected: Vec<_> = canonical
+                .ancestors()
+                .take(count)
+                .map(Path::to_path_buf)
+                .collect();
             assert_eq!(observed, expected);
-            assert_eq!(observed.last().unwrap(), Path::new("/"));
+            if !already_present {
+                assert_eq!(
+                    observed.last().unwrap(),
+                    &std::fs::canonicalize(temporary.path()).unwrap()
+                );
+            }
+        }
+    }
 
-            let parent = canonical.parent().unwrap();
+    #[test]
+    fn publication_below_a_0711_ancestor_syncs_only_the_writable_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: PathBuf,
+            permissions: std::fs::Permissions,
+        }
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.path, self.permissions.clone());
+            }
+        }
+
+        for target_exists in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let ancestor = temporary.path().join("ancestor");
+            let writable = ancestor.join("writable");
+            let dir = writable.join("router");
+            std::fs::create_dir_all(&writable).unwrap();
+            if target_exists {
+                std::fs::create_dir(&dir).unwrap();
+            }
+            let canonical_ancestor = std::fs::canonicalize(&ancestor).unwrap();
+            let restore = RestorePermissions {
+                path: ancestor.clone(),
+                permissions: std::fs::metadata(&ancestor).unwrap().permissions(),
+            };
+            std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o711)).unwrap();
+            assert_eq!(
+                std::fs::metadata(&ancestor).unwrap().permissions().mode() & 0o777,
+                0o711
+            );
+            let original = artifact(1, true);
+            let (result, events) =
+                sync_probe::run(|_| false, || publish(&dir, &original, None, None));
+            drop(restore);
+            result.unwrap();
+            assert_eq!(selected(&dir), original);
+            let canonical_dir = std::fs::canonicalize(&dir).unwrap();
+            let canonical_writable = std::fs::canonicalize(&writable).unwrap();
+            for expected in [&canonical_dir, &canonical_writable] {
+                assert!(events.iter().any(|event| {
+                    event.kind == sync_probe::Kind::Directory && &event.path == expected
+                }));
+            }
+            // The current user owns this fixture, so 0711 still permits reads.
+            // Observed paths make the boundary check independent of credentials.
+            for forbidden in canonical_ancestor.ancestors() {
+                assert!(!events.iter().any(|event| {
+                    event.kind == sync_probe::Kind::Directory && event.path == forbidden
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_existing_target_retries_only_its_failed_parent_sync() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = std::fs::canonicalize(temporary.path()).unwrap();
+        let dir = parent.join("router");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let first_dir = dir.clone();
+        let first_parent = parent.clone();
+        let worker = std::thread::spawn(move || {
             let mut attempted = Vec::new();
-            let error = ensure_dir_with_sync(&dir, |path| {
+            let result = ensure_dir_with_sync(&first_dir, |path| {
                 attempted.push(path.to_path_buf());
-                if path == parent {
+                if path == first_parent {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(30)).unwrap();
                     return Err(write_error(path, "injected parent synchronization failure"));
                 }
                 sync_dir(path)
-            })
-            .unwrap_err();
-            assert!(matches!(error, RouterArtifactError::Write { path, .. } if path == parent));
-            assert_eq!(attempted, expected[..2]);
-            let mut retry = Vec::new();
-            ensure_dir_with_sync(&dir, |path| {
-                retry.push(path.to_path_buf());
-                sync_dir(path)
-            })
-            .unwrap();
-            assert_eq!(retry, expected);
-        }
+            });
+            finished_tx.send((result, attempted)).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(dir.is_dir());
+        let mut recovered = Vec::new();
+        ensure_dir_with_sync(&dir, |path| {
+            recovered.push(path.to_path_buf());
+            sync_dir(path)
+        })
+        .unwrap();
+        let expected = vec![dir, parent.clone()];
+        assert_eq!(recovered, expected);
+        resume_tx.send(()).unwrap();
+        let (result, attempted) = finished_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(result, Err(RouterArtifactError::Write { path, .. }) if path == parent));
+        assert_eq!(attempted, expected);
     }
 
     #[test]
@@ -1142,9 +1308,12 @@ mod tests {
             })
             .unwrap();
             let canonical = std::fs::canonicalize(path).unwrap();
-            let expected: Vec<_> = canonical.ancestors().map(Path::to_path_buf).collect();
+            let expected: Vec<_> = canonical
+                .ancestors()
+                .take(2)
+                .map(Path::to_path_buf)
+                .collect();
             assert_eq!(observed, expected);
-            assert_eq!(observed.last().unwrap(), Path::new("/"));
             if path == Path::new("/") {
                 assert_eq!(observed.len(), 1);
             }

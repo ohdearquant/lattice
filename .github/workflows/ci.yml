@@ -532,13 +532,21 @@ jobs:
             cat "$log"
             exit "$status"
           fi
-          grep -Fxq 'test router_state::storage::tests::failure_after_head_replacement_reports_an_uncertain_commit ... ok' "$log" || {
-            echo "GUARD FAILED: the storage publication controls did not run and pass."
-            exit 1
-          }
-          count=$(grep -Ec '^test result: ok\. 92 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
+          for name in \
+            failure_after_head_replacement_reports_an_uncertain_commit \
+            legacy_post_link_sync_failure_reports_the_visible_uncertain_version \
+            directory_sync_stops_at_the_observed_creation_boundary \
+            publication_below_a_0711_ancestor_syncs_only_the_writable_boundary \
+            concurrent_existing_target_retries_only_its_failed_parent_sync
+          do
+            grep -Fxq "test router_state::storage::tests::${name} ... ok" "$log" || {
+              echo "GUARD FAILED: the storage control ${name} did not run and pass."
+              exit 1
+            }
+          done
+          count=$(grep -Ec '^test result: ok\. 95 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
           if [ "$count" -ne 1 ]; then
-            echo "GUARD FAILED: expected one complete 92-test router-state result."
+            echo "GUARD FAILED: expected one complete 95-test router-state result."
             exit 1
           fi
       - name: inference — router bootstrap publication (CPU, mixture)
