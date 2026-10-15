@@ -24,7 +24,12 @@ fn lattice_qwen_cpu_concurrent_greedy_requests_are_isolated_and_stream_disconnec
         return;
     };
     report_capture_identity(&model, "qwen35");
-    let server = Server::spawn(Binary::Lattice, &model, &[]);
+    // All four isolation requests must fit the admission cap.
+    let server = Server::spawn(
+        Binary::Lattice,
+        &model,
+        &["--max-cpu-generations".to_owned(), "4".to_owned()],
+    );
     observe_http_characterization(&server, "qwen35");
     assert_concurrent_greedy_results(
         &server,
