@@ -29,11 +29,12 @@ sequence.
 GIFT-Eval scores 97 dataset, frequency and horizon configurations. The aggregate is, per configuration, a model's MASE and
 CRPS divided by Seasonal Naive's, then the geometric mean over configurations. Recomputing it from the published raw
 files reproduces a published paper value to four decimals (t0-alpha: MASE 0.7240, CRPS 0.4941), so the figures below
-are the leaderboard's own. Snapshot: results as of 2026-10-09.
+are the leaderboard's own. Source: the per-model raw result files of the GIFT-Eval leaderboard (Hugging Face Space
+`Salesforce/GIFT-Eval`), snapshot as of 2026-10-09.
 
 | Model                 | Params      | License        | CRPS               | Shape                                                                                               |
 | --------------------- | ----------- | -------------- | ------------------ | --------------------------------------------------------------------------------------------------- |
-| Best agentic ensemble | n/a         | n/a            | 0.419              | Several models combined per series                                                                  |
+| Best agentic ensemble | n/a         | n/a            | 0.419              | Several models combined per series (EXAONE-Forecast-Agent)                                          |
 | TimesFM-3             | n/a         | Non-commercial | 0.456              | Decoder-only patched transformer (excluded: license)                                                |
 | Toto-2.0 2.5B / 313M  | 2.5B / 313M | Apache-2.0     | 0.476 / 0.481      | Patched pre-norm transformer, alternating time and variate attention, one code path from 4M to 2.5B |
 | Chronos-2             | 120M        | Apache-2.0     | 0.485              | T5-style encoder, patch 16, context 8192, 21 quantiles, group attention for covariates              |
@@ -46,8 +47,8 @@ The spread among the best 28 single models is about 7 % (0.456 to 0.490). Every 
 
 - **Reverso first.** It is small (2.6M parameters), MIT-licensed, and exercises the parts no other model needs but the
   infrastructure must own: a long FFT convolution, a delta-rule recurrence (nearest to existing code, L2), an
-  autoregressive rollout, and the evaluation's context preparation (missing values, padding, striding, sign-flip
-  averaging). A full end-to-end port costs days, not weeks, and a published score checks it.
+  autoregressive rollout, and the evaluation's prediction path (missing values, padding, striding, and sign-flip
+  averaging over a second rollout). A full end-to-end port costs days, not weeks, and a published score checks it.
 - **Chronos-2 second.** A transformer encoder in the BERT size class, which lattice already runs; it adds patching,
   quantile heads, and multi-series group attention, so the forecast type gains quantiles and the input gains
   covariates.
@@ -70,6 +71,10 @@ arithmetic follows `numpy.interp` in f64 because the published evaluations prepa
 its published score only when it sees the same context. Each model's predictor composes these steps in its reference
 order.
 
+Sign-flip averaging belongs to each model's predictor (for Reverso, `Reverso::predict`), not to `prep`, because it needs
+a second rollout: with the flag set, the predictor also rolls out the negated context and returns
+`0.5 * (f(x) - f(-x))` elementwise, before any resampling, so the averaged forecast keeps the sign of the input.
+
 ### D3. FFT in-house
 
 A radix-2 complex FFT in f64, crate-private, with precomputed kernel spectra. Reverso needs one fixed power-of-two length
@@ -78,9 +83,10 @@ negligible next to the projections. A general-length or SIMD FFT is added only w
 
 ### D4. Weights are converted outside lattice
 
-Upstream checkpoints are PyTorch pickles. Lattice reads only safetensors: conversion happens in a separate step that
-loads with `weights_only=True`, strips training-only buffers, and writes f32 tensors under the reference state-dict
-names. Loading requires every tensor the configuration needs, at its exact shape, and refuses any tensor left over. A
+Upstream checkpoints are PyTorch pickles. Lattice reads only safetensors (ADR-003): conversion happens in a separate step
+that checks each checkpoint's sha256 against its pin (D8), loads it with `weights_only=True` under a pinned torch
+version, drops the upstream FFT-convolution library's `flashfftconv.*` entries (the reference model loads strictly
+without them), and writes f32 tensors under the reference state-dict names. The golden generator loads checkpoints the same way. Loading requires every tensor the configuration needs, at its exact shape, and refuses any tensor left over. A
 leftover tensor means the configuration and the checkpoint disagree. The upstream torch-native Reverso port drops the
 output position embedding that the full checkpoint was trained with and cannot load that checkpoint strictly, so this
 refusal is the guard that matters most.
@@ -93,9 +99,11 @@ differs from the window). Unsupported means refused, never approximated.
 
 ### D6. Precision
 
-f32 compute, matching the reference's f32 path. Where the reference rounds to bfloat16 explicitly inside the model
-(Reverso's gated convolution), lattice rounds at the same points, round-to-nearest-even. Published scores that were
-produced under mixed-precision autocast are matched by score, not bit for bit.
+f32 compute, matching the reference's f32 path, with two named f64 exceptions: context preparation (D2) and the FFT
+convolution (D3), whose results are rounded to f32 before the next layer. The goldens are not evidence for the f64
+choice in D3 over an f32 FFT; it is a design choice, not a measured requirement. Where the reference rounds to bfloat16
+explicitly inside the model (Reverso's gated convolution), lattice rounds at the same points, round-to-nearest-even.
+Published scores that were produced under mixed-precision autocast are matched by score, not bit for bit.
 
 ### D7. Forecast output
 
@@ -105,26 +113,42 @@ degenerate distribution, as its reference evaluation does.
 
 ### D8. Verification
 
-- **Goldens.** Each port is tested against reference outputs generated from the pinned upstream source and pinned
-  checkpoints: every layer's output, one forward call, an autoregressive rollout, the rollout of the negated series, and
-  the context preparation on missing-value, short and constant inputs. Thresholds are registered before the first run.
-  For Reverso: model outputs within 1e-3 of `max |reference| + 1`, each layer within 1e-2 of its largest magnitude,
-  context preparation bit-identical.
-- **Score.** Each port reproduces its published GIFT-Eval aggregate within a stated tolerance before it is called done.
-  The harness is split: a Python step reads the benchmark data and scores forecasts with the benchmark's own metric
-  code; lattice produces every forecast through the CLI. No model code runs in Python.
-- **Mutation.** Each architectural feature the goldens cover (state weaving, output positions, the bfloat16 casts) has a
-  control that removes it and must fail.
+- **Pins.** Each port names its upstream source commit and the sha256 of every checkpoint it converts. Reverso:
+  `shinfxh/reverso` at `35f724d3ccf26527f17bc774e897ff0c07d0761a`, checkpoints
+  `checkpoints/<name>/checkpoint.pth` with sha256 `91e4244e786ca26ffaaddd452775bd5d57bf7bd257493f6849af2059468e1a8d`
+  (`reverso`, 2.6M), `a475a728a7d6a625bead27b283abd4e7746d3a7099086e5a8cf6a23bb647502b` (`reverso_small`) and
+  `7ad57992b268deb8f1d4c1cff23db6383b1924d7880ba8edf28002ec4613f389` (`reverso_nano`). The benchmark data and metric
+  code are pinned the same way: GIFT-Eval code at commit `577a65cfa3acb812405c00d989230bf59f7f8a3d` with its lockfile,
+  and the `Salesforce/GiftEval` dataset at revision `30841734ac5cfddbd0c3bad6d09d2b6b32becbb0`.
+- **Goldens.** Each port is tested against reference outputs generated from the pinned source and checkpoints: every
+  layer's output, one forward call, an autoregressive rollout, the rollout of the negated series, the sign-flip
+  averaged prediction, and the context preparation on missing-value, short and constant inputs. Thresholds are
+  registered before the first run. For Reverso, with `ref` the reference tensor and `got` lattice's: model outputs
+  satisfy `max |got - ref| / (max |ref| + 1) <= 1e-3`; each layer satisfies `max |got - ref| / max |ref| <= 1e-2`;
+  context preparation is identical in f32 bits.
+- **Score.** Each port reproduces its published GIFT-Eval aggregate MASE and CRPS within a tolerance registered before
+  its first scored run. For Reverso: each aggregate within 2 % (relative) of the published 0.711 and 0.610, and the mean
+  over the 97 configurations of `|log(lattice MASE / published MASE)|` below 0.03. The published run used bfloat16
+  autocast on a GPU and lattice computes f32 (D6), so equality is not expected; the score checks the whole harness end
+  to end, and the goldens, not the score, establish that the right model was ported. The harness is split: a Python
+  step reads the benchmark data and scores forecasts with the benchmark's own metric code; lattice produces every
+  forecast through the CLI. No model code runs in Python.
+- **Mutation.** Each architectural feature the goldens cover has a control that removes it and must fail. For Reverso:
+  state weaving (in each attention block that is neither the first nor the last block of the stack, the final
+  position's input is added to the first position's before the block runs), the output position table, and the
+  bfloat16 casts.
 
 ### D9. CLI
 
-`lattice forecast --model <dir>` reads one series per JSON line (`target` with `null` for missing values, `horizon`,
-optional `downsample` and `flip`) and writes one forecast per line. It is the harness's only entry point into lattice.
+`lattice forecast --model <dir>` reads one series per JSON line (`id`, `target` with `null` for missing values, `horizon`,
+optional `downsample` and `flip`, the sign-flip averaging of D2) and writes one line per input, `{"id", "forecast"}`, with
+`forecast` the point forecast of length `horizon`. The scorer turns each point forecast into the degenerate distribution
+of D7. It is the harness's only entry point into lattice.
 
 ### D10. Combination after the three ports
 
 With three model families running locally, a learned per-series combination (selection or weighting by series
-features) is built on the same module and scored on GIFT-Eval. The aim is a combination whose aggregate CRPS, on the
+features, the same shape of decision as ADR-096's learned router) is built on the same module and scored on GIFT-Eval. The aim is a combination whose aggregate CRPS, on the
 same protocol, is lower than 0.419, the best published aggregate today. It trains on the benchmark's training split only; a
 result is reported with the split and the protocol, and no leaderboard submission is made without an explicit
 decision to publish.
