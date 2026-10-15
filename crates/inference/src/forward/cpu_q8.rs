@@ -708,6 +708,10 @@ mod tests {
     use super::*;
     use crate::decoder::standalone_cpu::parity;
 
+    mod scratch_bench {
+        include!("cpu_q8_scratch_bench.rs");
+    }
+
     /// Regression test for #392: cpu Q8 RoPE must use stride-half pairing (i, half+i), not
     /// interleaved (2i, 2i+1).
     ///
