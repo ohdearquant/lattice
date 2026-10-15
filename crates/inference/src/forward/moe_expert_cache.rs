@@ -1506,4 +1506,49 @@ mod tests {
             assert!(err.contains("is 0"), "unexpected error message: {err}");
         });
     }
+
+    /// The per-expert dequantization is one of the Q4 consumers that must honour a
+    /// negative scale; see `signed_scale_fixture` for the controls.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    #[test]
+    fn dequant_expert_f16_honours_negative_scales() {
+        use crate::weights::q4_weights::signed_scale_fixture::{
+            abs_scales, assert_sign_honoured, negative_scale_tensor, reference, zero_scales,
+        };
+        use crate::weights::q4_weights::{Q4Tensor, q4_f16_to_f32, save_q4_file};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shape = [2usize, 4, 64];
+        let mut t = negative_scale_tensor(8, 64, 0xA1);
+        t.shape = shape.to_vec();
+        let per_expert = 4 * 64;
+        let load = |t: &Q4Tensor, name: &str| -> Result<Vec<f64>, String> {
+            let path = dir.path().join(name);
+            save_q4_file(&path, t).map_err(|e| e.to_string())?;
+            let table = ExpertByteTable::open(&path, &shape)?;
+            let mut out = Vec::with_capacity(t.original_len);
+            for expert in 0..shape[0] {
+                let bits = table.dequant_expert_f16(expert)?;
+                assert_eq!(bits.len(), per_expert);
+                out.extend(bits.into_iter().map(|b| f64::from(q4_f16_to_f32(b))));
+            }
+            Ok(out)
+        };
+        // A zero scale is refused when the expert is read, so the zero control is what
+        // a clamping consumer would compute: every weight equal to its bias.
+        let zero = zero_scales(&t);
+        let err = load(&zero, "zero.q4").expect_err("a zero scale is refused");
+        assert!(
+            err.contains("finite and nonzero"),
+            "unexpected error: {err}"
+        );
+        assert_sign_honoured(
+            "ExpertByteTable::dequant_expert_f16",
+            &reference(&t),
+            &load(&t, "neg.q4").expect("a negative scale loads"),
+            &load(&abs_scales(&t), "abs.q4").expect("abs control loads"),
+            &reference(&zero),
+            1e-3,
+        );
+    }
 }
