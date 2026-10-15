@@ -541,6 +541,149 @@ jobs:
         run: cargo test --locked -p lattice-inference --features metal-gpu,f16 --test pipeline_boundary_contract -- --nocapture
       - name: fann — no default features
         run: cargo build -p lattice-fann --no-default-features
+      - name: inference Q8 request scratch controls
+        timeout-minutes: 30
+        run: |
+          set -eu
+          log="${RUNNER_TEMP:-/tmp}/q8-scratch-controls.log"
+          if cargo test --locked -p lattice-inference --lib -- \
+            forward::cpu_q8:: weights::q8_weights:: decoder::standalone_cpu:: \
+            --skip forward::cpu_q8::tests::print_q8_generate_goldens \
+            --skip forward::cpu_q8::tests::scratch_bench::bench_generate_q8_request_scratch \
+            --color never >"$log" 2>&1; then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          python3 - "$log" <<'PYQ8'
+          import collections, pathlib, re, sys
+          log = pathlib.Path(sys.argv[1]).read_text()
+          COMMON = [
+              "decoder::standalone_cpu::tests::driver_refuses_every_unsupported_control_on_the_standalone_profile",
+              "decoder::standalone_cpu::tests::f16_session_does_not_prereserve_kv",
+              "decoder::standalone_cpu::tests::neon_session_reserves_kv_for_prompt_plus_budget",
+              "decoder::standalone_cpu::tests::q8_session_does_not_prereserve_kv",
+              "decoder::standalone_cpu::tests::session_declares_none_of_the_optional_controls",
+              "forward::cpu_q8::tests::generate_q8_greedy_golden",
+              "forward::cpu_q8::tests::generate_q8_max_new_tokens_one_golden",
+              "forward::cpu_q8::tests::generate_q8_rejects_empty_prompt",
+              "forward::cpu_q8::tests::generate_q8_rejects_grammar_config_before_sampling",
+              "forward::cpu_q8::tests::generate_q8_rejects_logprobs_config_before_sampling",
+              "forward::cpu_q8::tests::generate_q8_rejects_out_of_vocab_prompt_id",
+              "forward::cpu_q8::tests::generate_q8_rejects_reasoning_budget_config_before_sampling",
+              "forward::cpu_q8::tests::generate_q8_rejects_stop_strings_config_before_sampling",
+              "forward::cpu_q8::tests::generate_q8_seeded_sampling_golden",
+              "forward::cpu_q8::tests::generate_q8_stop_token_golden",
+              "forward::cpu_q8::tests::q8_request_scratch_prepares_every_projection_width",
+              "forward::cpu_q8::tests::q8_request_scratch_survives_poisoned_prefill_and_decode",
+              "forward::cpu_q8::tests::standalone_session_cancellation_precedes_state_change",
+              "forward::cpu_q8::tests::standalone_session_finish_invalidates_the_live_prediction",
+              "forward::cpu_q8::tests::standalone_session_logits_match_reference_replay",
+              "forward::cpu_q8::tests::standalone_session_matches_recorded_outputs_deterministic_cases",
+              "forward::cpu_q8::tests::standalone_session_matches_recorded_outputs_seeded",
+              "forward::cpu_q8::tests::standalone_session_refuses_a_second_prefill",
+              "forward::cpu_q8::tests::standalone_session_refuses_undeclared_controls",
+              "forward::cpu_q8::tests::standalone_session_rejects_a_stale_prediction",
+              "forward::cpu_q8::tests::standalone_session_select_refuses_config_controls",
+              "forward::cpu_q8::tests::test_forward_step_q8_decode_survives_dirty_scratch_reuse",
+              "forward::cpu_q8::tests::test_full_attn_step_q8_clean_row_still_normalizes",
+              "forward::cpu_q8::tests::test_full_attn_step_q8_nan_score_fails_closed",
+              "forward::cpu_q8::tests::test_full_attn_step_q8_rope_stride_half_parity",
+              "forward::cpu_q8::tests::test_gdn_q8_decay_gate_overflow_fails_closed",
+              "forward::cpu_q8::tests::test_gdn_q8_step_with_zeros",
+              "forward::cpu_q8::tests::test_generate_q8_honors_stop_token_ids",
+              "forward::cpu_q8::tests::test_generate_q8_max_new_tokens_zero_returns_empty",
+              "forward::cpu_q8::tests::test_generate_q8_rejects_context_overflow",
+              "forward::cpu_q8::tests::test_q8_forward_compiles",
+              "weights::q8_weights::scratch_tests::q8_scratch_comparison_rejects_nonfinite_operands",
+              "weights::q8_weights::scratch_tests::reused_q8_counts_successful_calls_exactly_once",
+              "weights::q8_weights::scratch_tests::reused_q8_matches_frozen_kernel_and_independent_oracle",
+              "weights::q8_weights::scratch_tests::reused_q8_overwrites_poisoned_scratch_and_preserves_output_tails",
+              "weights::q8_weights::scratch_tests::reused_q8_preserves_all_common_shape_refusals_before_mutation",
+              "weights::q8_weights::scratch_tests::reused_q8_preserves_exact_nonzero_known_values",
+              "weights::q8_weights::tests::checked_full_kv_dim_accepts_valid_config",
+              "weights::q8_weights::tests::checked_full_kv_dim_rejects_overflow",
+              "weights::q8_weights::tests::checked_full_q_dim_accepts_valid_config",
+              "weights::q8_weights::tests::checked_full_q_dim_rejects_overflow",
+              "weights::q8_weights::tests::checked_linear_conv_len_accepts_valid_config",
+              "weights::q8_weights::tests::checked_linear_conv_len_rejects_overflow",
+              "weights::q8_weights::tests::checked_linear_output_dim_accepts_valid_config",
+              "weights::q8_weights::tests::checked_linear_output_dim_rejects_overflow",
+              "weights::q8_weights::tests::checked_linear_qkv_dim_accepts_valid_config",
+              "weights::q8_weights::tests::checked_linear_qkv_dim_rejects_overflow",
+              "weights::q8_weights::tests::quantize_common_weights_rejects_empty_input_layernorm",
+              "weights::q8_weights::tests::quantize_common_weights_rejects_short_post_attention_layernorm",
+              "weights::q8_weights::tests::quantize_common_weights_rejects_zero_hidden_size",
+              "weights::q8_weights::tests::quantize_full_attn_weights_rejects_empty_q_norm",
+              "weights::q8_weights::tests::quantize_full_attn_weights_rejects_mismatched_k_norm",
+              "weights::q8_weights::tests::quantize_full_attn_weights_rejects_overflowing_config",
+              "weights::q8_weights::tests::quantize_full_attn_weights_rejects_q_norm_disagreeing_with_cfg_head_dim",
+              "weights::q8_weights::tests::quantize_gdn_weights_accepts_all_finite_retained_vectors",
+              "weights::q8_weights::tests::quantize_gdn_weights_accepts_consistent_value_head_shapes",
+              "weights::q8_weights::tests::quantize_gdn_weights_accepts_conv_dim_matching_cfg",
+              "weights::q8_weights::tests::quantize_gdn_weights_rejects_conv_dim_disagreeing_with_cfg",
+              "weights::q8_weights::tests::quantize_gdn_weights_rejects_decay_shape_mismatch",
+              "weights::q8_weights::tests::quantize_gdn_weights_rejects_malformed_conv1d_weight",
+              "weights::q8_weights::tests::quantize_gdn_weights_rejects_malformed_norm_weight",
+              "weights::q8_weights::tests::quantize_gdn_weights_rejects_non_finite_retained_vectors",
+              "weights::q8_weights::tests::quantize_gdn_weights_rejects_value_heads_disagreeing_with_cfg",
+              "weights::q8_weights::tests::test_fused_pass_matches_two_pass_reference_bit_exact",
+              "weights::q8_weights::tests::test_matmul_bt_q8_known_values",
+              "weights::q8_weights::tests::test_matmul_bt_q8_matches_f32",
+              "weights::q8_weights::tests::test_matmul_bt_q8_rejects_mk_overflow",
+              "weights::q8_weights::tests::test_matmul_bt_q8_rejects_mn_overflow",
+              "weights::q8_weights::tests::test_matmul_bt_q8_rejects_nk_overflow",
+              "weights::q8_weights::tests::test_memory_report",
+              "weights::q8_weights::tests::test_quantize_common_weights_dense_returns_ok",
+              "weights::q8_weights::tests::test_quantize_common_weights_moe_returns_err_not_panic",
+              "weights::q8_weights::tests::test_quantize_gdn_weights_rejects_nonfinite_source",
+              "weights::q8_weights::tests::test_quantize_identity",
+              "weights::q8_weights::tests::test_quantize_large_matrix",
+              "weights::q8_weights::tests::test_quantize_matrix_rejects_nan_input",
+              "weights::q8_weights::tests::test_quantize_matrix_rejects_nonfinite_source_row",
+              "weights::q8_weights::tests::test_quantize_matrix_rejects_scale_underflow",
+              "weights::q8_weights::tests::test_quantize_matrix_rejects_shape_overflow",
+              "weights::q8_weights::tests::test_quantize_roundtrip_accuracy",
+              "weights::q8_weights::tests::test_scale_computation",
+              "weights::q8_weights::tests::test_zero_row_handling"
+          ]
+          MAC = [
+              "weights::q8_weights::scratch_tests::mac_q8_prepare_grows_both_buffers_without_shrinking",
+              "weights::q8_weights::scratch_tests::mac_q8_prepare_rejects_unaddressable_extents_before_mutation",
+              "weights::q8_weights::scratch_tests::mac_q8_tile_overflow_guards_match_frozen_kernel",
+              "weights::q8_weights::tests::test_matmul_bt_q8_rejects_m_tile_n_overflow",
+              "weights::q8_weights::tests::test_matmul_bt_q8_rejects_tile_nk_overflow"
+          ]
+          NONMAC = [
+              "weights::q8_weights::scratch_tests::nonmac_q8_prepare_ignores_unused_tile_bounds_without_storage"
+          ]
+          expected = COMMON + (MAC if sys.platform == "darwin" else NONMAC)
+          count = len(expected)
+          passing = re.findall(r"^test (\S+)( - should panic)? \.\.\. ok$", log, re.MULTILINE)
+          actual = [name for name, _ in passing]
+          rows = re.findall(r"^test (?!result:)(.*)$", log, re.MULTILINE)
+          if collections.Counter(actual) != collections.Counter(expected) or len(rows) != count:
+              raise SystemExit("Q8 scratch gate: exact named passing population differs")
+          should_panic = {
+              "weights::q8_weights::tests::test_matmul_bt_q8_rejects_mk_overflow",
+              "weights::q8_weights::tests::test_matmul_bt_q8_rejects_nk_overflow",
+              "weights::q8_weights::tests::test_matmul_bt_q8_rejects_mn_overflow",
+              "weights::q8_weights::tests::test_matmul_bt_q8_rejects_tile_nk_overflow",
+              "weights::q8_weights::tests::test_matmul_bt_q8_rejects_m_tile_n_overflow",
+          } & set(expected)
+          if {name for name, suffix in passing if suffix} != should_panic:
+              raise SystemExit("Q8 scratch gate: should-panic attributes differ")
+          if re.findall(r"^running (\d+) tests?$", log, re.MULTILINE) != [str(count)]:
+              raise SystemExit("Q8 scratch gate: missing, duplicate or wrong running count")
+          summaries = re.findall(r"^test result: (.*)$", log, re.MULTILINE)
+          pattern = rf"ok\. {count} passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in .+$"
+          if len(summaries) != 1 or re.fullmatch(pattern, summaries[0]) is None:
+              raise SystemExit("Q8 scratch gate: invalid libtest summary")
+          print(f"Q8 scratch controls: {count} exact tests passed")
+          PYQ8
+
       # `-p lattice-inference` in isolation, default features only, no `--features`
       # flag. Neither the pre-commit hook's `--workspace --all-targets` nor this
       # job's own `f16,metal-gpu` clippy step below can see what this catches:

@@ -195,6 +195,89 @@ fn quantize_named_matrix(
     })
 }
 
+#[cfg(target_os = "macos")]
+const TILE_N: usize = 64;
+
+#[derive(Debug, Default)]
+pub(crate) struct Q8MatmulScratch {
+    #[cfg(target_os = "macos")]
+    b_f32: Vec<f32>,
+    #[cfg(target_os = "macos")]
+    c_tile: Vec<f32>,
+    #[cfg(test)]
+    calls: usize,
+}
+
+impl Q8MatmulScratch {
+    pub(crate) fn prepare(&mut self, max_m: usize, max_k: usize) -> Result<(), InferenceError> {
+        #[cfg(target_os = "macos")]
+        {
+            let b_len = TILE_N.checked_mul(max_k).ok_or_else(|| {
+                InferenceError::InvalidInput("matmul shape overflow: TILE_N*k".into())
+            })?;
+            let c_len = max_m.checked_mul(TILE_N).ok_or_else(|| {
+                InferenceError::InvalidInput("matmul shape overflow: m*TILE_N".into())
+            })?;
+            for (len, label) in [(b_len, "TILE_N*k"), (c_len, "m*TILE_N")] {
+                if len
+                    .checked_mul(size_of::<f32>())
+                    .is_none_or(|bytes| bytes > isize::MAX as usize)
+                {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "matmul scratch byte extent exceeds isize::MAX: {label}"
+                    )));
+                }
+            }
+            if self.b_f32.len() < b_len {
+                self.b_f32.resize(b_len, 0.0);
+            }
+            if self.c_tile.len() < c_len {
+                self.c_tile.resize(c_len, 0.0);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (max_m, max_k);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn call_count(&self) -> usize {
+        self.calls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_snapshot(&self) -> [[usize; 3]; 2] {
+        #[cfg(target_os = "macos")]
+        {
+            [
+                [
+                    self.b_f32.as_ptr() as usize,
+                    self.b_f32.len(),
+                    self.b_f32.capacity(),
+                ],
+                [
+                    self.c_tile.as_ptr() as usize,
+                    self.c_tile.len(),
+                    self.c_tile.capacity(),
+                ],
+            ]
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            [[0; 3]; 2]
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.b_f32.fill(f32::NAN);
+            self.c_tile.fill(f32::NAN);
+        }
+    }
+}
+
 /// **Unstable**: quantized matmul_bt kernel; tile size and dispatch strategy may change.
 ///
 /// Compute `C = A @ B_q^T` where `B_q` is stored as per-row quantized INT8.
@@ -213,6 +296,18 @@ fn quantize_named_matrix(
 /// The activation input remains f32, so the inner product is accumulated in f32 and the
 /// per-row scale is applied once per output element.
 pub fn matmul_bt_q8(a: &[f32], b_q: &Q8Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
+    matmul_bt_q8_with_scratch(a, b_q, c, m, k, n, &mut Q8MatmulScratch::default());
+}
+
+pub(crate) fn matmul_bt_q8_with_scratch(
+    a: &[f32],
+    b_q: &Q8Matrix,
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    scratch: &mut Q8MatmulScratch,
+) {
     // Guard the dimension products against usize overflow BEFORE any `m * k` /
     // `n * k` / `m * n` is evaluated below: in release those multiplies wrap
     // silently, so an overflowing shape could pass a length check and drive an
@@ -247,23 +342,11 @@ pub fn matmul_bt_q8(a: &[f32], b_q: &Q8Matrix, c: &mut [f32], m: usize, k: usize
     // directly into c; for M>1 we scatter from a contiguous tile output buffer.
     #[cfg(target_os = "macos")]
     {
-        const TILE_N: usize = 64;
-        // The tile scratch buffers are sized by `TILE_N * k` and `m * TILE_N`,
-        // which are NOT covered by the `m*k` / `n*k` / `m*n` guards above: when
-        // `n < TILE_N` (including `n == 0`) these products can overflow while the
-        // guarded ones do not, and a wrapped size would under-allocate the
-        // scratch and drive an OOB scatter below. Guard them on the same
-        // fail-closed contract.
-        assert!(
-            TILE_N.checked_mul(k).is_some(),
-            "matmul shape overflow: TILE_N*k"
-        );
-        assert!(
-            m.checked_mul(TILE_N).is_some(),
-            "matmul shape overflow: m*TILE_N"
-        );
-        let mut b_f32 = vec![0.0f32; TILE_N * k];
-        let mut c_tile = vec![0.0f32; m * TILE_N];
+        if let Err(error) = scratch.prepare(m, k) {
+            panic!("{error}");
+        }
+        let b_f32 = &mut scratch.b_f32[..TILE_N * k];
+        let c_tile = &mut scratch.c_tile[..m * TILE_N];
 
         for tile_start in (0..n).step_by(TILE_N) {
             let tile_n = (n - tile_start).min(TILE_N);
@@ -306,6 +389,7 @@ pub fn matmul_bt_q8(a: &[f32], b_q: &Q8Matrix, c: &mut [f32], m: usize, k: usize
     // Scalar fallback for non-macOS platforms.
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = &scratch;
         for i in 0..m {
             let a_row = &a[i * k..(i + 1) * k];
             let c_row = &mut c[i * n..(i + 1) * n];
@@ -319,6 +403,11 @@ pub fn matmul_bt_q8(a: &[f32], b_q: &Q8Matrix, c: &mut [f32], m: usize, k: usize
                 c_row[j] = acc * b_q.scales[j];
             }
         }
+    }
+
+    #[cfg(test)]
+    {
+        scratch.calls += 1;
     }
 }
 
@@ -917,6 +1006,10 @@ fn dequantize_matrix(q: &Q8Matrix) -> Vec<f32> {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "q8_matmul_scratch_tests.rs"]
+mod scratch_tests;
 
 #[cfg(test)]
 mod tests {

@@ -40,7 +40,7 @@ use super::{
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
 use crate::forward::cpu_f16::forward_step_f16;
-use crate::forward::cpu_q8::forward_step_q8;
+use crate::forward::cpu_q8::forward_step_q8_with_scratch;
 use crate::forward::neon_forward::{Q8NeonModel, forward_step_q8_neon};
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::{
@@ -51,7 +51,7 @@ use crate::model::qwen35_config::Qwen35Config;
 use crate::rope::RopeTable;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::weights::f16_weights::F16ModelWeights;
-use crate::weights::q8_weights::Q8ModelWeights;
+use crate::weights::q8_weights::{Q8AttentionWeights, Q8MatmulScratch, Q8ModelWeights};
 
 /// Weights of one standalone wrapper, borrowed for the life of a session.
 #[derive(Clone, Copy)]
@@ -76,6 +76,7 @@ pub(crate) struct StandaloneCpuSession<'w> {
     gdn_states: Vec<GatedDeltaNetState>,
     kv_cache: KvCache,
     scratch: ForwardScratch,
+    q8_scratch: Q8MatmulScratch,
     prompt_ids: Vec<u32>,
     prompt_len: usize,
     rng_state: u64,
@@ -99,6 +100,28 @@ impl<'w> StandaloneCpuSession<'w> {
             required_capacity,
         } = plan;
 
+        let mut q8_scratch = Q8MatmulScratch::default();
+        if let StandaloneWeights::Q8(model) = weights {
+            let mut max_cols = cfg.hidden_size.max(cfg.intermediate_size);
+            for (attention, _) in model.layers.iter().take(cfg.num_hidden_layers) {
+                // Matrix metadata is checked later; it must not enlarge this early allocation.
+                let columns = match attention {
+                    Q8AttentionWeights::Linear(_) => cfg.checked_linear_output_dim(),
+                    Q8AttentionWeights::Full(_) => cfg.checked_full_q_dim(),
+                };
+                match columns {
+                    Ok(columns) => max_cols = max_cols.max(columns),
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            if cfg.num_hidden_layers != 0
+                && !model.layers.is_empty()
+                && let Err(error) = q8_scratch.prepare(1, max_cols)
+            {
+                panic!("{error}");
+            }
+        }
+
         let gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
             .map(|_| GatedDeltaNetState::new(cfg))
             .collect();
@@ -117,6 +140,7 @@ impl<'w> StandaloneCpuSession<'w> {
             gdn_states,
             kv_cache,
             scratch,
+            q8_scratch,
             prompt_ids,
             prompt_len,
             rng_state,
@@ -140,7 +164,7 @@ impl<'w> StandaloneCpuSession<'w> {
                 None,
             ),
             StandaloneWeights::Q8(weights) => {
-                forward_step_q8(
+                forward_step_q8_with_scratch(
                     weights,
                     self.cfg,
                     self.rope,
@@ -149,6 +173,7 @@ impl<'w> StandaloneCpuSession<'w> {
                     &mut self.gdn_states,
                     &mut self.kv_cache,
                     &mut self.scratch,
+                    &mut self.q8_scratch,
                 );
                 Ok(())
             }
@@ -350,6 +375,10 @@ pub(crate) fn generate_with_trace(
         result.trace,
     ))
 }
+
+#[cfg(test)]
+#[path = "standalone_cpu_q8_scratch_checks.rs"]
+pub(crate) mod q8_scratch_checks;
 
 /// Checks shared by the three wrapper test modules, whose model fixtures are private to each.
 /// A wrapper's tests hand its fixture and its direct forward step to these helpers.
@@ -1287,6 +1316,11 @@ mod tests {
             session.scratch.scores.len() >= cfg.num_attention_heads * (required + 1),
             "scratch was not sized for the planned capacity"
         );
+        assert_eq!(
+            session.q8_scratch.storage_snapshot(),
+            Q8MatmulScratch::default().storage_snapshot()
+        );
+        assert_eq!(session.q8_scratch.call_count(), 0);
     }
 
     #[test]
@@ -1306,6 +1340,11 @@ mod tests {
         assert!(session.kv_cache.k.iter().all(|k| k.capacity() == 0));
         assert!(session.kv_cache.v.iter().all(|v| v.capacity() == 0));
         assert!(session.scratch.scores.is_empty());
+        assert_eq!(
+            session.q8_scratch.storage_snapshot(),
+            Q8MatmulScratch::default().storage_snapshot()
+        );
+        assert_eq!(session.q8_scratch.call_count(), 0);
     }
 
     #[test]
@@ -1325,5 +1364,10 @@ mod tests {
         assert!(session.kv_cache.k.iter().all(|k| k.capacity() == 0));
         assert!(session.kv_cache.v.iter().all(|v| v.capacity() == 0));
         assert!(session.scratch.scores.is_empty());
+        assert_eq!(
+            session.q8_scratch.storage_snapshot(),
+            Q8MatmulScratch::default().storage_snapshot()
+        );
+        assert_eq!(session.q8_scratch.call_count(), 0);
     }
 }
