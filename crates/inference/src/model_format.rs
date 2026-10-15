@@ -45,6 +45,8 @@ pub enum ModelFormat {
     /// No safetensors file, but at least one `*.q4` tensor file present
     /// (the output of `quantize_q4`).
     Q4,
+    /// Neither a safetensors file, a `.q4` file nor a `.gguf` file was found.
+    Unknown,
     /// A safetensors checkpoint whose `config.json` carries an MLX
     /// `quantization` object and whose quantized modules all have a
     /// complete set of tensors. Lattice does not load this format yet.
@@ -57,8 +59,6 @@ pub enum ModelFormat {
     /// declaration, or a quantized tensor that nothing declares.
     /// [`inspect_format`] names the reason.
     Refused,
-    /// Neither a safetensors file, a `.q4` file nor a `.gguf` file was found.
-    Unknown,
 }
 
 /// The format of a model directory together with the reason for a refusal.
