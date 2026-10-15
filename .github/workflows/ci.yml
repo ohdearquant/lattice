@@ -787,6 +787,37 @@ jobs:
       - name: inference — metal-gpu bench clippy, release (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy --release -p lattice-inference --all-targets --features f16,metal-gpu,bench-internals -- -D warnings
+      # The timestamp regressions for #1882 need the macOS/Metal module but use
+      # temporary lock paths without GPU work. The handoff test also runs a
+      # one-test child harness; only the parent has a two-test summary.
+      - name: inference — measurement lock timestamp regressions (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          lock_refresh_log="${RUNNER_TEMP:-/tmp}/measurement-lock-refresh-tests.log"
+          if cargo test --locked -p lattice-inference --lib --features f16,metal-gpu \
+            measurement::lock_file_refresh_tests:: \
+            -- --nocapture --test-threads=1 --color never >"$lock_refresh_log" 2>&1
+          then
+            cat "$lock_refresh_log"
+          else
+            lock_refresh_status=$?
+            cat "$lock_refresh_log"
+            exit "$lock_refresh_status"
+          fi
+          for lock_refresh_test in \
+            measurement::lock_file_refresh_tests::native_acquisition_refreshes_old_lock_timestamps_without_replacing_inode \
+            measurement::lock_file_refresh_tests::handoff_refreshes_old_lock_timestamps_before_ready_without_replacing_inode
+          do
+            if ! grep -Fxq "test ${lock_refresh_test} ... ok" "$lock_refresh_log"; then
+              echo "::error::${lock_refresh_test} did not run; check the macOS/Metal module gate"
+              exit 1
+            fi
+          done
+          lock_refresh_summaries=$(grep -Ec '^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$' "$lock_refresh_log") || lock_refresh_summaries=0
+          if [ "$lock_refresh_summaries" -ne 1 ]; then
+            echo "::error::expected exactly one passing two-test parent summary for measurement lock timestamp regressions"
+            exit 1
+          fi
       # The worker module is macOS/metal-gpu-gated, but this lifecycle test
       # uses only a blocking thread-local destructor and never acquires a
       # Metal device. Run it explicitly so compiling the test is not mistaken
