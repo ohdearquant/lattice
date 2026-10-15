@@ -6,6 +6,7 @@
 //! lattice chat --model /path/to/model [--prompt "Hello"] [--max-tokens 256] [--temperature 0.7]
 //! lattice serve --model /path/to/model [--host 127.0.0.1] [--port 8080] [--max-tokens 256]
 //! lattice doctor --model /path/to/model [--context 4096]
+//! lattice forecast --model /path/to/reverso [--input series.jsonl] [--output forecasts.jsonl]
 //! lattice prune-score --q4-dir /path/to/model-q4 --tokenizer-dir /path/to/model \
 //!   --calibration-corpus calibration.txt --validation-corpus validation.txt \
 //!   --prune-layers 4 --output lattice_pruning.json
@@ -15,6 +16,7 @@ use clap::{Parser, Subcommand};
 
 mod chat;
 mod doctor;
+mod forecast;
 mod prune_score;
 mod router;
 mod serve;
@@ -226,6 +228,11 @@ enum Command {
     PruneScore {
         #[command(flatten)]
         args: prune_score::Args,
+    },
+    /// Point forecasts for univariate series read as JSON lines.
+    Forecast {
+        #[command(flatten)]
+        args: forecast::Args,
     },
     /// Provision and inspect a router state directory.
     Router {
@@ -639,6 +646,12 @@ async fn main() {
                 }
             }
         },
+        Command::Forecast { args } => {
+            if let Err(e) = forecast::run(&args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::PruneScore { args } => match prune_score::run(&args) {
             Ok(true) => {}
             Ok(false) => std::process::exit(1),
