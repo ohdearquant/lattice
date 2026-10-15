@@ -1887,12 +1887,10 @@ mod tests {
         )
     }
 
-    /// `driver::run` returns early without calling `finish` when cancelled
-    /// before prefill, and through `?` when prefill fails. Neither runs a
-    /// forward pass here: the cancel fires first, and `try_forward_prefill`
-    /// refuses an out-of-vocabulary id before dispatch.
+    /// Early driver exits must release the compact route while the session is
+    /// still alive, so teardown cannot depend on the caller dropping it.
     #[test]
-    fn decoder_session_tears_down_the_compact_route_when_the_driver_skips_finish() {
+    fn decoder_session_finish_tears_down_the_compact_route_on_early_driver_exit() {
         let Some(_) = metal::Device::system_default() else {
             return;
         };
@@ -1909,14 +1907,24 @@ mod tests {
                 MetalEntryProfile::Streaming,
                 COMPACT_ENV,
             );
+            assert_eq!(
+                s.state.session.compact_topk, 1,
+                "control: route engaged before cancel"
+            );
             let result = run_driver(&mut s, &gen_cfg, &[1, 2, 3], &|| true)
                 .expect("cancel before prefill is not an error");
             assert_eq!(result.stop_reason, StopReason::Interrupt);
             assert!(result.generated_ids.is_empty());
             assert_eq!(
-                s.state.session.compact_topk, 1,
-                "control: finish was skipped"
+                s.state.session.position(),
+                0,
+                "cancel refused before prefill"
             );
+            assert_eq!(
+                s.state.session.compact_topk, 0,
+                "finish tears down the route before Drop"
+            );
+            assert_route_disengaged(&*s.state);
         }
         assert_route_disengaged(&state);
 
@@ -1930,6 +1938,10 @@ mod tests {
                 COMPACT_ENV,
             )
             .expect("session");
+            assert_eq!(
+                s.state.session.compact_topk, 1,
+                "control: route engaged before prefill error"
+            );
             let failed = run_driver(&mut s, &gen_cfg, &out_of_vocab, &|| false);
             assert!(
                 matches!(&failed, Err(InferenceError::InvalidInput(_))),
@@ -1937,9 +1949,10 @@ mod tests {
                 failed.as_ref().err()
             );
             assert_eq!(
-                s.state.session.compact_topk, 1,
-                "control: finish was skipped"
+                s.state.session.compact_topk, 0,
+                "finish tears down the route before Drop"
             );
+            assert_route_disengaged(&*s.state);
             assert_eq!(
                 s.state.session.position(),
                 0,

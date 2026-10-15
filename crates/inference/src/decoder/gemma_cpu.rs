@@ -136,6 +136,9 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
 
         let prompt_len = self.prompt_ids.len();
         for i in 0..prompt_len {
+            if cancel.is_cancelled() {
+                return Err(InferenceError::Inference("cancelled during prefill".into()));
+            }
             let token_id = self.prompt_ids[i];
             self.model.forward_step(
                 token_id,
@@ -151,6 +154,23 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
             evaluated_len: self.position,
             prediction: None,
         })
+    }
+
+    fn prefill_interruptible(
+        &mut self,
+        cancel: &dyn Cancellation,
+    ) -> Result<Option<StepStamp>, InferenceError> {
+        let interrupted = std::cell::Cell::new(false);
+        let observe_cancel = || {
+            let cancelled = cancel.is_cancelled();
+            interrupted.set(interrupted.get() || cancelled);
+            cancelled
+        };
+        match self.prefill(&observe_cancel) {
+            Ok(stamp) => Ok(Some(stamp)),
+            Err(_) if interrupted.get() => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Consumes `accepted.prediction` (rejecting a stale/foreign/already-consumed
@@ -251,12 +271,8 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         })
     }
 
-    /// `Poisoned` invalidates whatever prediction is still live; `Reusable` is
-    /// a no-op. Same rationale as `QwenCpuSession::finish`.
-    fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError> {
-        if disposition == FinishDisposition::Poisoned {
-            self.ledger.invalidate();
-        }
+    fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
+        self.ledger.invalidate();
         Ok(())
     }
 }
@@ -273,6 +289,38 @@ mod tests {
 
     fn cancel_true() -> impl Fn() -> bool {
         || true
+    }
+
+    #[test]
+    fn finish_invalidates_the_prediction_for_every_disposition() {
+        let model = tiny_zero_model();
+        let prompt_ids = vec![2, 3];
+        let config = GenerateConfig {
+            temperature: 0.0,
+            max_new_tokens: 2,
+            ..Default::default()
+        };
+        for disposition in [FinishDisposition::Reusable, FinishDisposition::Poisoned] {
+            let mut session = GemmaCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), 16)
+                .expect("session");
+            session.prefill(&cancel_false()).expect("prefill");
+            let outcome = session
+                .select(&SelectionRequest {
+                    config: &config,
+                    history: &prompt_ids,
+                    grammar_mask: None,
+                })
+                .expect("selection");
+            let SelectOutcome::Candidate(candidate) = outcome else {
+                panic!("unconstrained selection must yield a candidate")
+            };
+            assert!(session.ledger.is_live(candidate.prediction));
+            session.finish(disposition).expect("finish");
+            assert!(
+                !session.ledger.is_live(candidate.prediction),
+                "{disposition:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------
@@ -413,6 +461,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prefill_checks_cancellation_before_each_gemma_forward() {
+        let model = tiny_zero_model();
+        let prompt_ids = vec![2, 3, 4, 5, 6];
+        for completed in 0..prompt_ids.len() {
+            let mut session =
+                GemmaCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), 16).unwrap();
+            let polls = std::cell::Cell::new(0);
+            let cancel = || {
+                let poll = polls.get();
+                polls.set(poll + 1);
+                poll > completed
+            };
+
+            let error = session.prefill(&cancel).unwrap_err();
+            assert!(error.to_string().contains("cancelled during prefill"));
+            assert_eq!(session.position, completed);
+            assert_eq!(session.cache.seq_len(0).unwrap(), completed);
+            assert_eq!(polls.get(), completed + 2);
+        }
+    }
+
+    #[test]
+    fn mid_prefill_cancellation_does_not_evaluate_an_invalid_tail() {
+        let model = tiny_zero_model();
+        let mut session = GemmaCpuSession::new(
+            &model,
+            vec![2, 3, model.config.vocab_size as u32],
+            0.0,
+            Some(7),
+            16,
+        )
+        .unwrap();
+        let polls = std::cell::Cell::new(0);
+        let cancel = || {
+            let poll = polls.get();
+            polls.set(poll + 1);
+            poll > 2
+        };
+
+        let error = session.prefill(&cancel).unwrap_err();
+        assert!(error.to_string().contains("cancelled during prefill"));
+        assert_eq!(session.position, 2);
+        assert_eq!(session.cache.seq_len(0).unwrap(), 2);
+    }
+
+    #[test]
+    fn uncancelled_prefill_matches_raw_gemma_steps() {
+        let model = tiny_zero_model();
+        for prompt_ids in [vec![2], vec![2, 3, 4], vec![2, 3, 4, 5, 6, 7, 8, 9]] {
+            let mut session =
+                GemmaCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), 16).unwrap();
+            let stamp = session.prefill(&cancel_false()).unwrap();
+            let mut cache = model.new_cache(16).unwrap();
+            let mut scratch = Gemma4Scratch::new(&model.config);
+            for (position, &token_id) in prompt_ids.iter().enumerate() {
+                model
+                    .forward_step(token_id, position, &mut cache, &mut scratch, &[])
+                    .unwrap();
+            }
+
+            assert_eq!(stamp.evaluated_len, prompt_ids.len());
+            assert_eq!(stamp.prediction, None);
+            assert_eq!(session.position, prompt_ids.len());
+            assert_eq!(session.cache.seq_len(0).unwrap(), cache.seq_len(0).unwrap());
+            assert_eq!(session.cache.k_view(0).unwrap(), cache.k_view(0).unwrap());
+            assert_eq!(session.cache.v_view(0).unwrap(), cache.v_view(0).unwrap());
+            assert!(session.scratch.logits.iter().all(|value| value.is_finite()));
+            assert_eq!(session.scratch.logits, scratch.logits);
+        }
+    }
+
+    #[test]
+    fn interruptible_prefill_preserves_forward_errors() {
+        let model = tiny_zero_model();
+        let prompt_ids = vec![model.config.vocab_size as u32];
+        let mut raw = GemmaCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), 16).unwrap();
+        let mut wrapped = GemmaCpuSession::new(&model, prompt_ids, 0.0, Some(7), 16).unwrap();
+        let expected = raw.prefill(&cancel_false()).unwrap_err();
+        let actual = wrapped.prefill_interruptible(&cancel_false()).unwrap_err();
+        assert_eq!(actual.to_string(), expected.to_string());
+        assert_eq!(wrapped.position, 0);
+        assert_eq!(wrapped.cache.seq_len(0).unwrap(), 0);
+    }
+
     // -----------------------------------------------------------------
     // Ledger lifecycle mutation target, mid-decode cancellation: a cancelled
     // decode must consume nothing, and finish(Poisoned) must invalidate a
@@ -463,5 +596,207 @@ mod tests {
             !session.ledger.is_live(candidate.prediction),
             "finish(Poisoned) must invalidate whatever prediction was live"
         );
+    }
+
+    mod driver_lifecycle_regressions {
+        use super::*;
+        use crate::decoder::driver;
+        use crate::stop_reason::StopReason;
+        use std::cell::Cell;
+
+        struct RecordingGemmaSession<'model> {
+            inner: GemmaCpuSession<'model>,
+            finishes: Vec<FinishDisposition>,
+            plain_prefill_calls: usize,
+            interruptible_prefill_calls: usize,
+            select_calls: usize,
+            decode_calls: usize,
+            metadata_calls: usize,
+            fail_cleanup: bool,
+        }
+
+        impl<'model> RecordingGemmaSession<'model> {
+            fn new(model: &'model Gemma4Model, prompt_ids: Vec<u32>, fail_cleanup: bool) -> Self {
+                Self {
+                    inner: GemmaCpuSession::new(model, prompt_ids, 0.0, Some(7), 16).unwrap(),
+                    finishes: Vec::new(),
+                    plain_prefill_calls: 0,
+                    interruptible_prefill_calls: 0,
+                    select_calls: 0,
+                    decode_calls: 0,
+                    metadata_calls: 0,
+                    fail_cleanup,
+                }
+            }
+
+            fn assert_interrupted_prefill_only(&self, evaluated_len: usize) {
+                assert_eq!(self.inner.position, evaluated_len);
+                assert_eq!(self.inner.cache.seq_len(0).unwrap(), evaluated_len);
+                assert_eq!(self.interruptible_prefill_calls, 1);
+                assert_eq!(self.plain_prefill_calls, 0);
+                assert_eq!(self.select_calls, 0);
+                assert_eq!(self.decode_calls, 0);
+                assert_eq!(self.metadata_calls, 0);
+                assert_eq!(self.finishes, vec![FinishDisposition::Poisoned]);
+            }
+        }
+
+        impl DecoderSession for RecordingGemmaSession<'_> {
+            fn capabilities(&self) -> &ExecutionCapabilities {
+                self.inner.capabilities()
+            }
+
+            fn prefill(&mut self, cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
+                self.plain_prefill_calls += 1;
+                self.inner.prefill(cancel)
+            }
+
+            fn prefill_interruptible(
+                &mut self,
+                cancel: &dyn Cancellation,
+            ) -> Result<Option<StepStamp>, InferenceError> {
+                self.interruptible_prefill_calls += 1;
+                self.inner.prefill_interruptible(cancel)
+            }
+
+            fn decode(
+                &mut self,
+                accepted: &AcceptedToken,
+                cancel: &dyn Cancellation,
+            ) -> Result<StepStamp, InferenceError> {
+                self.decode_calls += 1;
+                self.inner.decode(accepted, cancel)
+            }
+
+            fn select(
+                &mut self,
+                request: &SelectionRequest<'_>,
+            ) -> Result<SelectOutcome, InferenceError> {
+                self.select_calls += 1;
+                self.inner.select(request)
+            }
+
+            fn metadata(
+                &mut self,
+                prediction: PredictionId,
+                final_token: u32,
+                request: &MetadataRequest,
+            ) -> Result<TokenMetadata, InferenceError> {
+                self.metadata_calls += 1;
+                self.inner.metadata(prediction, final_token, request)
+            }
+
+            fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError> {
+                self.finishes.push(disposition);
+                self.inner.finish(disposition)?;
+                if self.fail_cleanup {
+                    Err(InferenceError::Inference(
+                        "synthetic cleanup failure".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        fn run_prefill_only(
+            session: &mut RecordingGemmaSession<'_>,
+            prompt_ids: &[u32],
+            cancel: &dyn Cancellation,
+            text: &mut String,
+            offsets: &mut Vec<usize>,
+        ) -> Result<driver::DriverResult, InferenceError> {
+            driver::run(
+                session,
+                &GenerateConfig::default(),
+                None,
+                prompt_ids,
+                999,
+                false,
+                cancel,
+                |_| panic!("incomplete prefill must not publish a token"),
+                |_| panic!("incomplete prefill must not detokenize"),
+                text,
+                offsets,
+                |_, _| panic!("incomplete prefill must not emit"),
+                || panic!("incomplete prefill must not report completion"),
+                || panic!("incomplete prefill must not flush a tail"),
+            )
+        }
+
+        #[test]
+        fn real_partial_prefill_cancel_finishes_poisoned_once() {
+            let model = tiny_zero_model();
+            let prompt_ids = vec![2, 3, 4, model.config.vocab_size as u32];
+            for completed in [1, 2, 3] {
+                let mut session = RecordingGemmaSession::new(&model, prompt_ids.clone(), false);
+                let polls = Cell::new(0);
+                let cancel = || {
+                    let poll = polls.get();
+                    polls.set(poll + 1);
+                    poll > completed + 1
+                };
+                let mut text = String::new();
+                let mut offsets = Vec::new();
+                let result =
+                    run_prefill_only(&mut session, &prompt_ids, &cancel, &mut text, &mut offsets)
+                        .unwrap();
+
+                assert_eq!(result.stop_reason, StopReason::Interrupt);
+                assert!(result.generated_ids.is_empty());
+                assert!(result.token_logprobs.is_empty());
+                assert!(text.is_empty());
+                assert!(offsets.is_empty());
+                assert_eq!(polls.get(), completed + 3);
+                session.assert_interrupted_prefill_only(completed);
+            }
+        }
+
+        #[test]
+        fn real_prefill_error_survives_optional_cleanup_failure() {
+            let model = tiny_zero_model();
+            let prompt_ids = vec![2, model.config.vocab_size as u32];
+            let mut raw =
+                GemmaCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), 16).unwrap();
+            let expected = raw.prefill_interruptible(&|| false).unwrap_err();
+            assert!(matches!(&expected, InferenceError::InvalidInput(_)));
+            let expected_message = expected.to_string();
+
+            for fail_cleanup in [false, true] {
+                let mut session =
+                    RecordingGemmaSession::new(&model, prompt_ids.clone(), fail_cleanup);
+                let mut text = String::new();
+                let mut offsets = Vec::new();
+                let result = run_prefill_only(
+                    &mut session,
+                    &prompt_ids,
+                    &|| false,
+                    &mut text,
+                    &mut offsets,
+                )
+                .map(|output| {
+                    format!(
+                        "DriverResult {{ generated_ids: {:?}, token_logprobs: {:?}, stopped: {}, stop_reason: {:?}, confirmed_stop_string_match: {}, trace: {:?} }}",
+                        output.generated_ids,
+                        output.token_logprobs,
+                        output.stopped,
+                        output.stop_reason,
+                        output.confirmed_stop_string_match,
+                        output.trace,
+                    )
+                });
+                let Err(actual) = result else {
+                    panic!(
+                        "invalid prompt token must preserve its forward error; returned {result:?}"
+                    );
+                };
+
+                assert!(matches!(&actual, InferenceError::InvalidInput(_)));
+                assert_eq!(actual.to_string(), expected_message);
+                assert!(text.is_empty());
+                assert!(offsets.is_empty());
+                session.assert_interrupted_prefill_only(1);
+            }
+        }
     }
 }
