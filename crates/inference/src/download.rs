@@ -87,7 +87,7 @@ fn ensure_model_files_inner_with_checksums(
 
     #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
     {
-        std::fs::create_dir_all(&model_dir)?;
+        create_model_dir(&model_dir)?;
 
         let hf_model_id = match model_name {
             "bge-small-en-v1.5" => "BAAI/bge-small-en-v1.5",
@@ -322,12 +322,51 @@ fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
 
     let tmp_path = path.with_extension("part");
     let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(&tmp_path)?;
+    let mut file = create_download_target(&tmp_path)?;
     std::io::copy(&mut reader, &mut file)?;
     file.flush()?;
     drop(file);
     std::fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+// The mmap trust gate refuses a checkpoint whose file or any ancestor directory is
+// group- or other-writable. The default creation modes (0o777 and 0o666 minus the
+// umask) produce exactly that under a group-writable umask such as 0002, so the
+// download would be refused by the loader it was fetched for.
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn create_model_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+// A `.part` left by an interrupted download keeps whatever mode it was created with,
+// so it is removed and recreated rather than reopened.
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn create_download_target(tmp_path: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(tmp_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o644);
+    }
+    options.open(tmp_path)
 }
 
 fn sha256_hex(path: &Path) -> Result<String, InferenceError> {
@@ -364,6 +403,50 @@ mod tests {
     const TOKENIZER_FIXTURE: &[u8] = b"tokenizer fixture";
     const TOKENIZER_FIXTURE_SHA256: &str =
         "c882d95b612f23378308ac1207596a83cf97ed59d57e1b18e12a7085a10bf8e2";
+
+    #[cfg(all(unix, feature = "download", not(target_arch = "wasm32")))]
+    #[test]
+    fn download_paths_are_not_group_writable_under_a_group_writable_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const ROOT_ENV: &str = "LATTICE_DOWNLOAD_UMASK_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            // SAFETY: `umask` has no preconditions; this branch runs only in the child
+            // process spawned below, so no other test observes the changed mask.
+            unsafe { libc::umask(0o002) };
+            let root = PathBuf::from(root);
+            let model_dir = root.join("cache").join("all-minilm-l6-v2");
+            create_model_dir(&model_dir).expect("create model dir");
+            let stale = model_dir.join("model.part");
+            std::fs::write(&stale, b"stale").expect("write stale part");
+            std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o664))
+                .expect("make stale part group-writable");
+            drop(create_download_target(&stale).expect("create download target"));
+            for path in [root.join("cache"), model_dir.clone(), stale.clone()] {
+                let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+                assert_eq!(
+                    mode & 0o022,
+                    0,
+                    "{} is mode {:o}",
+                    path.display(),
+                    mode & 0o777
+                );
+            }
+            assert_eq!(std::fs::metadata(&stale).expect("stat").len(), 0);
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "download::tests::download_paths_are_not_group_writable_under_a_group_writable_umask",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ROOT_ENV, temp.path())
+            .status()
+            .expect("spawn child test");
+        assert!(status.success(), "child test under umask 0002 failed");
+    }
 
     fn fixture_checksums() -> ExpectedChecksums {
         ExpectedChecksums {
