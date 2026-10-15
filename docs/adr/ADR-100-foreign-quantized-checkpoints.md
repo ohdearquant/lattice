@@ -83,7 +83,16 @@ Add `ModelFormat` variants (the enum is `#[non_exhaustive]`) decided before any 
 every shard `model.safetensors.index.json` lists when the index exists, and `model.safetensors` otherwise. No
 file escapes inspection: with an index, a `.safetensors` file the index does not list refuses; without one,
 `model.safetensors` must be the only `.safetensors` file in the directory, the rule the vision loader already
-applies to an unindexed directory (`vision/checkpoint.rs`).
+applies to an unindexed directory (`vision/checkpoint.rs`). A `.safetensors` symbolic link that resolves to a
+shard the index lists counts as listed; a link that resolves anywhere else, and a plain copy of a listed shard
+under another name, refuse (`a_symlink_to_a_listed_shard_is_not_an_unlisted_file`).
+
+`config.json` is read once, with the size bound the loaders use. A `config.json` that is missing, unreadable,
+unparsable, oversized or not a JSON object declares nothing, and detection proceeds on the files and
+`hf_quant_config.json`: a foreign declaration with no native `quantization` object still refuses under rule 2, a
+quantized checkpoint is still refused by its dtypes under rule 4, and a floating-point checkpoint stays
+`Safetensors` for its loader to report the broken `config.json` (`an_unreadable_config_declares_nothing`). A
+`quantization` value that is present but not an object refuses (`a_non_object_quantization_refuses`).
 
 The rules apply in order, and the first that matches decides:
 
