@@ -207,6 +207,7 @@ enum Action<'a> {
 ///
 /// It applies softmax in the loss and leaves EWC composition to the caller.
 /// See [`docs/training.md`](../../docs/training.md#reinforce-with-leave-one-out-rloo) for the gate contract and loss terms.
+#[derive(Clone)]
 pub struct RlooTrainer {
     config: RlooConfig,
     /// RNG used for Gumbel-max sampling in the Phase-2 multi-sample path.

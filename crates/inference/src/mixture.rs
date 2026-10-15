@@ -383,6 +383,26 @@ pub struct AdapterRouter {
 }
 
 impl AdapterRouter {
+    #[cfg(all(feature = "router-learning", feature = "serve"))]
+    pub(crate) fn gate_bytes(&self) -> Vec<u8> {
+        self.gate.to_bytes()
+    }
+
+    #[cfg(feature = "router-learning")]
+    pub(crate) fn refit_snapshot(&self) -> Self {
+        Self {
+            gate: self.gate.clone(),
+            weight_policy: self.weight_policy,
+            epsilon: self.epsilon,
+            last_dropped: self.last_dropped.clone(),
+            tau_floor: self.tau_floor,
+            entropy_floor: self.entropy_floor,
+            max_consecutive_collapsed: self.max_consecutive_collapsed,
+            consecutive_collapsed_rounds: self.consecutive_collapsed_rounds,
+            policy_epoch: self.policy_epoch,
+        }
+    }
+
     /// Create a router backed by an existing fann `Network`.
     ///
     /// The network's output dimension must be `≥` the maximum number of

@@ -356,13 +356,21 @@ impl EpisodeStore {
     /// episodes from other epochs are absent rather than reweighted. Both
     /// exclusions are the decision, not an implementation convenience.
     pub fn on_policy_samples(&self, epoch: u64) -> Vec<(&RouterEpisode, EpisodeSignal)> {
-        self.episodes
-            .values()
-            .filter_map(|(episode, signal)| match signal {
+        self.ordered_on_policy_samples(epoch).collect()
+    }
+
+    /// Borrow the bounded window in recording order without allocating a batch.
+    pub(crate) fn ordered_on_policy_samples(
+        &self,
+        epoch: u64,
+    ) -> impl Iterator<Item = (&RouterEpisode, EpisodeSignal)> {
+        self.order
+            .iter()
+            .filter_map(|id| self.episodes.get(id))
+            .filter_map(move |(episode, signal)| match signal {
                 Some(signal) if episode.policy.epoch == epoch => Some((episode, *signal)),
                 _ => None,
             })
-            .collect()
     }
 
     /// The episode for `completion_id`, with its judgement if it has one.
