@@ -511,7 +511,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // the same way as `Unknown`: report it rather than silently
         // guessing a loader.
         _ => {
-            return Err(model_format::unrecognized_format_message(dir).into());
+            return Err(model_format::unloadable_format_message(dir).into());
         }
     }
 

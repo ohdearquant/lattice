@@ -824,7 +824,7 @@ pub fn build_report(
         // the same way as `Unknown`: report it as an error rather than
         // silently guessing an inventory shape.
         _ => {
-            return Err(crate::backend::unrecognized_format_message(model_dir));
+            return Err(crate::backend::unloadable_format_message(model_dir));
         }
     };
 

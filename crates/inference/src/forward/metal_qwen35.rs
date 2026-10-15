@@ -14945,6 +14945,7 @@ mod inner {
         mod path_proof_bytes;
         mod prefix_cache_disposition;
         mod prefix_cache_route;
+        mod q4_signed_scale;
         mod speculative_route;
 
         use super::super::{

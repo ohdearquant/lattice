@@ -1876,7 +1876,7 @@ mod imp {
             // Any format this binary doesn't yet know how to load is handled
             // the same way as `Unknown`: report it rather than silently
             // guessing a loader.
-            _ => Err(model_format::unrecognized_format_message(model_dir)),
+            _ => Err(model_format::unloadable_format_message(model_dir)),
         }
     }
 
@@ -7079,8 +7079,12 @@ mod imp {
         #[test]
         fn gemma_startup_refuses_options_it_cannot_honor_by_name() {
             let directory = tempfile::tempdir().expect("create Gemma checkpoint directory");
-            std::fs::write(directory.path().join("model.safetensors"), b"fixture")
-                .expect("write safetensors sentinel");
+            let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+            let mut weights = (header.len() as u64).to_le_bytes().to_vec();
+            weights.extend_from_slice(header);
+            weights.extend_from_slice(&[0u8; 4]);
+            std::fs::write(directory.path().join("model.safetensors"), weights)
+                .expect("write minimal safetensors");
             std::fs::write(
                 directory.path().join("config.json"),
                 br#"{"model_type":"gemma4"}"#,

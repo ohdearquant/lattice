@@ -548,10 +548,13 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
         IngestPayload::NativeQ4Block(metadata) => {
             let scale = super::half_bits::f16_bits_to_f32(metadata.scale_bits);
             let bias = super::half_bits::f16_bits_to_f32(metadata.bias_bits);
-            if !scale.is_finite() || scale <= 0.0 {
+            // A negative scale is admitted: every consumer computes `nibble * scale + bias`,
+            // so the block's weights are `bias` and `bias + 15 * scale` in either order. A
+            // zero scale (either sign) carries no step and is refused like a non-finite one.
+            if !scale.is_finite() || scale == 0.0 {
                 return Err(InferenceError::InvalidSafetensors(format!(
                     "{}: tensor {} (Q4) block {} has invalid scale {scale}; scale must be \
-                     finite and strictly positive",
+                     finite and nonzero",
                     tensor.source, tensor.tensor_name, metadata.index,
                 )));
             }

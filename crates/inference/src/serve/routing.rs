@@ -345,24 +345,112 @@ impl ServingRouter {
     pub fn route(
         &mut self,
         resident: &AdapterIndex,
-        context_vector: &[f32],
+        context_vector: Vec<f32>,
         k: usize,
-    ) -> Result<Vec<LoraSelection>, ApiError> {
+    ) -> Result<RoutedRequest, ApiError> {
         let order = trained_order(&self.artifact, resident)?;
-        let routed = self
+        let outcome = self
             .router
-            .route(context_vector, &order, k)
+            .route_detailed(&context_vector, &order, k)
             .map_err(|err| ApiError::BadRequest {
                 message: format!("router refused: {err}"),
                 code: "router_refused",
             })?;
-        to_selections(routed, resident)
+        // Read from the policy in force inside this same lock acquisition,
+        // not from the artifact: at this commit the serving path applies the
+        // compiled-in uniform default, and an artifact's recorded temperature
+        // is a value the router has not installed. The two coincide only once
+        // a serving path installs the recorded policy.
+        let tau = match self.router.weight_policy() {
+            crate::mixture::WeightPolicy::Uniform => None,
+            crate::mixture::WeightPolicy::Softmax { tau } => Some(tau),
+        };
+        Ok(RoutedRequest {
+            selections: to_selections(outcome.weights.clone(), resident)?,
+            context_vector,
+            selected_scores: outcome.selected_scores,
+            sampled_scores: outcome.sampled_scores,
+            pre_floor_weights: outcome.pre_floor_weights,
+            applied_weights: outcome.weights,
+            dropped: outcome.dropped,
+            tau,
+            policy_epoch: self.router.policy_epoch(),
+            #[cfg(feature = "mixture")]
+            exploration: outcome.exploration,
+        })
     }
 
     /// The gate artifact this router is serving.
     pub fn artifact(&self) -> &RouterArtifact {
         &self.artifact
     }
+
+    /// The policy epoch the gate is currently serving under.
+    pub fn policy_epoch(&self) -> u64 {
+        self.router.policy_epoch()
+    }
+}
+
+/// One routing decision as the serving path needs it: what to apply, and what
+/// the decision was made from.
+///
+/// The provenance travels with the selections rather than being fetched
+/// afterwards, because "what did the gate score" has no answer once the next
+/// request has run through the same router. ADR-096 decision 3 requires a
+/// feedback event to carry the sampled logits and both weight vectors, and
+/// there is exactly one moment at which all three exist.
+///
+/// Defined outside the `mixture` gate, like every other type here: a build
+/// without a gate still has to name this in the signature it refuses from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutedRequest {
+    /// The adapters to apply, resolved against the resident index.
+    pub selections: Vec<LoraSelection>,
+    /// The vector the gate consumed.
+    ///
+    /// Moved in rather than filled afterwards. A field a caller is expected to
+    /// populate after construction is a field that is empty whenever someone
+    /// forgets, and an episode carrying an empty context vector is one the
+    /// learner cannot use and nothing rejects.
+    pub context_vector: Vec<f32>,
+    /// The gate scores `z` of the selected columns, by adapter name, in
+    /// selection order.
+    pub selected_scores: Vec<(String, f32)>,
+    /// The logits the selection and the weight policy consumed, by adapter
+    /// name, in selection order: `z` on the deterministic path and `z'` under
+    /// a draw.
+    pub sampled_scores: Vec<(String, f32)>,
+    /// What the policy produced before the floor, by adapter name.
+    pub pre_floor_weights: Vec<(String, f32)>,
+    /// What the request ran with, by adapter name.
+    pub applied_weights: Vec<(String, f32)>,
+    /// Adapters the `epsilon` floor removed, by name.
+    pub dropped: Vec<String>,
+    /// The softmax temperature the mixture was formed at, or `None` for the
+    /// uniform policy, which reads no temperature.
+    ///
+    /// Read off the policy in force when the decision was made, so an event
+    /// records the temperature that produced its weights and not one installed
+    /// since.
+    pub tau: Option<f32>,
+    /// The policy epoch the decision was made under.
+    ///
+    /// Read inside the same lock acquisition that produced the decision, and
+    /// carried out with it. Read afterwards it would be a different question:
+    /// a reload between the two reads would date this episode to a policy that
+    /// did not produce it, and an off-epoch sample is discarded rather than
+    /// refused, so nothing would ever report the mislabelling.
+    pub policy_epoch: u64,
+    /// The draw, when learning was enabled and the artifact recorded a scale.
+    ///
+    /// `None` is the ordinary case and means the decision was deterministic,
+    /// not that a draw happened and went unrecorded. The two are different
+    /// claims and a learner treats them differently: an absent record is an
+    /// off-policy sample it must not attribute, while a present one carries
+    /// the sampled logits and the action probability that make attribution
+    /// possible.
+    #[cfg(feature = "mixture")]
+    pub exploration: Option<crate::mixture::ExplorationOutcome>,
 }
 
 /// The serving path's router — refusal body.
@@ -398,15 +486,23 @@ impl ServingRouter {
     pub fn route(
         &mut self,
         _resident: &AdapterIndex,
-        _context_vector: &[f32],
+        _context_vector: Vec<f32>,
         _k: usize,
-    ) -> Result<Vec<LoraSelection>, ApiError> {
+    ) -> Result<RoutedRequest, ApiError> {
         Err(router_unsupported_build())
     }
 
     /// The gate artifact this router would serve.
     pub fn artifact(&self) -> &RouterArtifact {
         &self.artifact
+    }
+
+    /// Unobservable: `new` always refuses in this build, so no value of this
+    /// type exists to call it on. Present for the same reason `route` is --
+    /// the façade's signatures do not change shape between builds -- and not
+    /// a claim that this server serves epoch zero.
+    pub fn policy_epoch(&self) -> u64 {
+        0
     }
 }
 
@@ -714,14 +810,31 @@ impl ServedRouter {
     pub fn route(
         &self,
         resident: &AdapterIndex,
-        context_vector: &[f32],
+        context_vector: Vec<f32>,
         k: usize,
-    ) -> Result<Vec<LoraSelection>, ApiError> {
+    ) -> Result<RoutedRequest, ApiError> {
         let mut guard = self.router.lock().map_err(|_| ApiError::Internal {
             message: "the adapter router panicked on an earlier request and is no longer serving"
                 .to_string(),
         })?;
         guard.route(resident, context_vector, k)
+    }
+
+    /// The policy epoch the next request would route under.
+    ///
+    /// Tolerant of a poisoned lock, like [`with_report`](Self::with_report)
+    /// and unlike [`route`](Self::route): this answers a question about state,
+    /// and refusing to say which policy is loaded withholds it exactly when
+    /// something has already gone wrong. Nothing routes on the value.
+    ///
+    /// Callers read this before taking the episode store's lock, never while
+    /// holding it. The two locks are never nested in either order.
+    pub fn policy_epoch(&self) -> u64 {
+        let guard = self
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.policy_epoch()
     }
 }
 
@@ -883,6 +996,55 @@ mod tests {
                     .contains(crate::serve::embeddings::QWEN35_F16_DECODER_LOADER),
             "the refusal names BOTH loaders, the artifact's and this binary's: {}",
             err.message()
+        );
+    }
+
+    /// The epoch travels with the decision. Read afterwards instead, a reload
+    /// landing in between would date the episode to a policy that did not
+    /// produce it, and an off-epoch sample is discarded rather than refused --
+    /// so nothing would ever report the mislabelling.
+    ///
+    /// Reaches the private router to make a policy change, because no serving
+    /// endpoint changes a running gate yet; when one lands it replaces this
+    /// lever rather than adding to it.
+    #[cfg(feature = "mixture")]
+    #[test]
+    fn a_routed_request_carries_the_epoch_it_was_decided_under() {
+        use lattice_fann::{Activation, NetworkBuilder};
+
+        let gate_bytes = NetworkBuilder::new()
+            .input(4)
+            .output(1, Activation::Linear)
+            .build()
+            .expect("gate must build")
+            .to_bytes();
+        let mut router = ServingRouter::new(RouterArtifact {
+            version: 1,
+            adapter_names: vec!["technical".into()],
+            representation: representation(4),
+            gate_bytes,
+            provenance: crate::router_state::RouterProvenance::Legacy,
+        })
+        .expect("a truthful artifact must construct");
+
+        let pool = resident(&[(0, "technical")]);
+        let before = router
+            .route(&pool, vec![0.0; 4], 1)
+            .expect("the gate must route its own adapter");
+        router.router.set_epsilon(0.25);
+        let after = router
+            .route(&pool, vec![0.0; 4], 1)
+            .expect("the gate must still route");
+
+        assert_eq!(
+            before.policy_epoch,
+            crate::mixture::INITIAL_POLICY_EPOCH,
+            "a router nobody has reconfigured serves the initial epoch"
+        );
+        assert_eq!(
+            after.policy_epoch,
+            before.policy_epoch + 1,
+            "a decision made after a policy change belongs to the new epoch"
         );
     }
 

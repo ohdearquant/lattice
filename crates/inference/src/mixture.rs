@@ -313,6 +313,15 @@ pub const DEFAULT_MAX_CONSECUTIVE_COLLAPSED: usize = 3;
 /// why it refuses instead of clamping.
 pub use crate::router_state::MIN_EXPLORATION_SCALE;
 
+/// The policy epoch a freshly constructed [`AdapterRouter`] serves under
+/// (ADR-096 decision 3).
+///
+/// A router that has never been reconfigured and has never reloaded a gate is
+/// still serving the policy it was constructed with, and that is an epoch of
+/// its own rather than an absence of one: an episode recorded under it is an
+/// on-policy sample for it.
+pub const INITIAL_POLICY_EPOCH: u64 = 0;
+
 /// A request to draw the routing decision instead of computing it
 /// (ADR-096 decision 3).
 ///
@@ -391,6 +400,7 @@ pub struct AdapterRouter {
     entropy_floor: f32,
     max_consecutive_collapsed: usize,
     consecutive_collapsed_rounds: usize,
+    policy_epoch: u64,
 }
 
 impl AdapterRouter {
@@ -410,6 +420,7 @@ impl AdapterRouter {
             entropy_floor: DEFAULT_ENTROPY_FLOOR,
             max_consecutive_collapsed: DEFAULT_MAX_CONSECUTIVE_COLLAPSED,
             consecutive_collapsed_rounds: 0,
+            policy_epoch: INITIAL_POLICY_EPOCH,
         }
     }
 
@@ -417,7 +428,9 @@ impl AdapterRouter {
     ///
     /// Parsing and both dimensions must validate before any mutation: a failed
     /// reload leaves the live gate intact so a bad refit fails once, rather than
-    /// disrupting subsequent requests.
+    /// disrupting subsequent requests. A failed reload also leaves
+    /// [`policy_epoch`](Self::policy_epoch) alone, because nothing about what
+    /// the next request runs has changed.
     pub fn reload(&mut self, gate_bytes: &[u8]) -> Result<(), RouterError> {
         let gate = Network::from_bytes(gate_bytes)?;
         let expected_inputs = self.gate.num_inputs();
@@ -433,6 +446,7 @@ impl AdapterRouter {
             });
         }
         self.gate = gate;
+        self.policy_epoch = self.policy_epoch.saturating_add(1);
         Ok(())
     }
 
@@ -440,8 +454,14 @@ impl AdapterRouter {
     /// [`route`](Self::route) calls.
     ///
     /// The default, from [`AdapterRouter::new`], is [`WeightPolicy::Uniform`].
+    ///
+    /// A change to the policy advances [`policy_epoch`](Self::policy_epoch);
+    /// re-applying the policy already in force does not.
     pub fn set_weight_policy(&mut self, policy: WeightPolicy) {
-        self.weight_policy = policy;
+        if self.weight_policy != policy {
+            self.weight_policy = policy;
+            self.policy_epoch = self.policy_epoch.saturating_add(1);
+        }
     }
 
     /// Set the `epsilon` floor used by subsequent [`route`](Self::route)
@@ -453,8 +473,14 @@ impl AdapterRouter {
     /// never drops anything, since every weight `route` can produce is
     /// `>= 0.0`. `epsilon` should be non-negative; a negative or NaN value
     /// disables the floor, since no weight then compares less than it.
+    ///
+    /// A change advances [`policy_epoch`](Self::policy_epoch); re-applying the
+    /// same value does not.
     pub fn set_epsilon(&mut self, epsilon: f32) {
-        self.epsilon = epsilon;
+        if self.epsilon != epsilon {
+            self.epsilon = epsilon;
+            self.policy_epoch = self.policy_epoch.saturating_add(1);
+        }
     }
 
     /// Adapters dropped by the most recent [`route`](Self::route) call for
@@ -468,6 +494,18 @@ impl AdapterRouter {
         &self.last_dropped
     }
 
+    /// The mixture weight policy this router currently serves under
+    /// (ADR-091 decision 1).
+    ///
+    /// Reported so a caller can record the temperature that produced a
+    /// decision: ADR-096 decision 3 requires an event to carry "the `tau` that
+    /// produced them", and a temperature read from anywhere other than the
+    /// policy in force at the decision is a different claim. `Uniform` carries
+    /// no temperature, which is why the served temperature is an `Option`.
+    pub fn weight_policy(&self) -> WeightPolicy {
+        self.weight_policy
+    }
+
     /// Set the floor below which [`route`](Self::route) refuses `tau` for
     /// [`WeightPolicy::Softmax`], returning [`RouterError::TauBelowFloor`]
     /// (ADR-091 Decision 3).
@@ -479,8 +517,14 @@ impl AdapterRouter {
     /// of the caller's request, it is a different request answered as if it
     /// were the one asked. The default, from [`AdapterRouter::new`], is
     /// [`DEFAULT_TAU_FLOOR`].
+    ///
+    /// A change advances [`policy_epoch`](Self::policy_epoch); re-applying the
+    /// same value does not.
     pub fn set_tau_floor(&mut self, floor: f32) {
-        self.tau_floor = floor;
+        if self.tau_floor != floor {
+            self.tau_floor = floor;
+            self.policy_epoch = self.policy_epoch.saturating_add(1);
+        }
     }
 
     /// Set the entropy floor (nats) used by [`submit_refit`](Self::submit_refit)
@@ -506,6 +550,33 @@ impl AdapterRouter {
     /// the configured floor.
     pub fn consecutive_collapsed_rounds(&self) -> usize {
         self.consecutive_collapsed_rounds
+    }
+
+    /// The policy epoch this router currently serves under (ADR-096
+    /// decision 3).
+    ///
+    /// Starts at [`INITIAL_POLICY_EPOCH`] and advances whenever a mutation
+    /// changes what a request would actually run with: a successful gate
+    /// [`reload`](Self::reload) — which is also how an accepted
+    /// [`submit_refit`](Self::submit_refit) advances it — or a change to the
+    /// weight policy, the `epsilon` floor, or the `tau` floor. A feedback
+    /// event recorded under one epoch is not an on-policy sample for a later
+    /// one.
+    ///
+    /// It deliberately does **not** advance for the refit guards
+    /// ([`set_entropy_floor`](Self::set_entropy_floor),
+    /// [`set_max_consecutive_collapsed`](Self::set_max_consecutive_collapsed)):
+    /// those decide which future gate is accepted and change no request's
+    /// action distribution, so bumping on them would discard on-policy samples
+    /// that are still on-policy. The falsifier is one of those guards starting
+    /// to influence a served decision; then it belongs in the list above.
+    ///
+    /// The setters compare before they bump, so re-applying an identical
+    /// configuration is not a policy change. A server that re-applies its
+    /// config per request would otherwise never accumulate a single on-policy
+    /// sample and would report that as normal operation.
+    pub fn policy_epoch(&self) -> u64 {
+        self.policy_epoch
     }
 
     /// Select the top-`k` adapters for the given context and assign each a
@@ -2261,6 +2332,7 @@ mod tests {
     fn a_draw_is_not_a_policy_change() {
         let mut router = AdapterRouter::new(scored_gate(2, &[0.3, 0.2, 0.1]));
         let pool: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let start = router.policy_epoch();
         let before = router.route_detailed(&[1.0, 0.5], &pool, 2).unwrap();
         router
             .route_explored(
@@ -2277,6 +2349,104 @@ mod tests {
         assert_eq!(
             before, after,
             "drawing must not change the deterministic decision"
+        );
+        assert_eq!(
+            router.policy_epoch(),
+            start,
+            "sampling an action is not a policy change, so a draw must not advance the epoch"
+        );
+    }
+
+    #[test]
+    fn a_fresh_router_serves_the_initial_epoch() {
+        assert_eq!(make_router(2, 2).policy_epoch(), INITIAL_POLICY_EPOCH);
+    }
+
+    /// A successful reload replaces the gate a request runs, so it ends the
+    /// epoch; a refused one changes nothing and must leave the epoch where it
+    /// was, or an off-epoch episode would be dated to a gate that never served
+    /// it.
+    #[test]
+    fn a_successful_reload_advances_the_epoch_and_a_failed_one_does_not() {
+        let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+        let before = router.policy_epoch();
+        router.reload(&fixed_gate(2, 2, 1).to_bytes()).unwrap();
+        let after = router.policy_epoch();
+        assert_eq!(after, before + 1);
+        router.reload(&fixed_gate(3, 2, 1).to_bytes()).unwrap_err();
+        assert_eq!(
+            router.policy_epoch(),
+            after,
+            "a refused gate changes nothing a request runs"
+        );
+    }
+
+    /// Each setter that changes what a request runs advances the epoch once,
+    /// and re-applying the same configuration does not: a server that
+    /// re-applies its config per request must still accumulate on-policy
+    /// samples.
+    #[test]
+    fn a_policy_change_advances_the_epoch_and_re_applying_it_does_not() {
+        let mut router = make_router(2, 2);
+        let start = router.policy_epoch();
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        assert_eq!(router.policy_epoch(), start + 1);
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        assert_eq!(
+            router.policy_epoch(),
+            start + 1,
+            "the same policy again is not a policy change"
+        );
+        router.set_epsilon(0.1);
+        assert_eq!(router.policy_epoch(), start + 2);
+        router.set_epsilon(0.1);
+        assert_eq!(router.policy_epoch(), start + 2);
+        router.set_tau_floor(0.5);
+        assert_eq!(router.policy_epoch(), start + 3);
+        router.set_tau_floor(0.5);
+        assert_eq!(router.policy_epoch(), start + 3);
+    }
+
+    /// The refit guards decide which future gate is accepted and change no
+    /// served action, so they must not end the epoch of the samples they are
+    /// about to judge.
+    #[test]
+    fn the_refit_guards_do_not_advance_the_epoch() {
+        let mut router = make_router(2, 2);
+        let start = router.policy_epoch();
+        router.set_entropy_floor(0.9);
+        router.set_max_consecutive_collapsed(1);
+        assert_eq!(
+            router.policy_epoch(),
+            start,
+            "a guard on which future gate is accepted changes no served action"
+        );
+    }
+
+    /// An accepted refit loads a gate and advances the epoch through `reload`;
+    /// a rejected one loads nothing and leaves the epoch alone.
+    #[test]
+    fn a_refit_advances_the_epoch_only_when_it_is_accepted() {
+        let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+        let candidate = fixed_gate(2, 2, 1).to_bytes();
+        let start = router.policy_epoch();
+        assert!(matches!(
+            router.submit_refit(&candidate, &[vec![0.5, 0.5]]).unwrap(),
+            RefitOutcome::Accepted { .. }
+        ));
+        assert_eq!(router.policy_epoch(), start + 1);
+
+        router.set_entropy_floor(1.0);
+        router.set_max_consecutive_collapsed(1);
+        let after_config = router.policy_epoch();
+        assert!(matches!(
+            router.submit_refit(&candidate, &[vec![1.0, 0.0]]).unwrap(),
+            RefitOutcome::Rejected { .. }
+        ));
+        assert_eq!(
+            router.policy_epoch(),
+            after_config,
+            "a rejected refit loads no gate, so it is still the same policy"
         );
     }
 

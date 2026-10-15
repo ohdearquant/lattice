@@ -343,7 +343,7 @@ fn lattice_qwen_safetensors_stub_reaches_the_cpu_loader() {
         &result,
         Some(dir.path()),
         Some(1),
-        "Error: failed to load model: Invalid safetensors file: file too small to contain safetensors header",
+        "Error: failed to load model: Missing tensor: model.language_model.embed_tokens.weight",
         &[
             "Loading model from <TEMP>...",
             "[route] selected family=qwen35 backend=cpu format=safetensors",
@@ -501,7 +501,7 @@ fn lattice_router_or_embedding_flag_loses_to_qwen_load(extra: &[&str]) {
         &result,
         Some(dir.path()),
         Some(1),
-        "Error: failed to load model: Invalid safetensors file: file too small to contain safetensors header",
+        "Error: failed to load model: Missing tensor: model.language_model.embed_tokens.weight",
         &[
             "Loading model from <TEMP>...",
             "[route] selected family=qwen35 backend=cpu format=safetensors",

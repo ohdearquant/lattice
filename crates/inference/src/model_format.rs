@@ -28,49 +28,519 @@
 //! match on this single [`ModelFormat`](crate::model_format::ModelFormat) enum; none re-checks sentinel files
 //! after the match.
 
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
 
 /// The on-disk format of a model directory, decided before any tensor I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ModelFormat {
-    /// `model.safetensors` or `model.safetensors.index.json` present.
+    /// `model.safetensors` or `model.safetensors.index.json` present, every
+    /// listed header readable, and no quantized tensor or quantization
+    /// declaration found.
     Safetensors,
     /// No safetensors file, but at least one `*.q4` tensor file present
     /// (the output of `quantize_q4`).
     Q4,
-    /// Neither a safetensors file nor a `.q4` file was found.
+    /// Neither a safetensors file, a `.q4` file nor a `.gguf` file was found.
     Unknown,
+    /// A safetensors checkpoint whose `config.json` carries an MLX
+    /// `quantization` object and whose quantized modules all have a
+    /// complete set of tensors. Lattice does not load this format yet.
+    MlxQuantized,
+    /// A single `*.gguf` file and no safetensors file. Lattice does not load
+    /// this format yet.
+    Gguf,
+    /// A model directory that cannot be classified safely: an ambiguous file
+    /// set, an unreadable header or index, a foreign quantization
+    /// declaration, or a quantized tensor that nothing declares.
+    /// [`inspect_format`] names the reason.
+    Refused,
 }
 
-/// Detect whether `dir` is a safetensors model directory, a native Q4
-/// quantized directory, or neither.
-///
-/// A directory is Q4 when it has no safetensors file and contains at least
-/// one file whose name ends in `.q4`. Safetensors presence always wins over
-/// `.q4` presence (a directory containing both resolves to `Safetensors`),
-/// and an unreadable directory (`read_dir` failure) or one matching neither
-/// pattern resolves to `Unknown` -- fail-closed, never a silent guess.
+/// The format of a model directory together with the reason for a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatDetection {
+    format: ModelFormat,
+    refusal: Option<String>,
+}
+
+impl FormatDetection {
+    fn found(format: ModelFormat) -> Self {
+        Self {
+            format,
+            refusal: None,
+        }
+    }
+
+    fn refused(reason: String) -> Self {
+        Self {
+            format: ModelFormat::Refused,
+            refusal: Some(reason),
+        }
+    }
+
+    /// The detected format.
+    pub fn format(&self) -> ModelFormat {
+        self.format
+    }
+
+    /// Why the directory was refused, when [`Self::format`] is
+    /// [`ModelFormat::Refused`].
+    pub fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
+    }
+}
+
+/// Detect the format of a model directory. See [`inspect_format`] for the
+/// rules; this drops the refusal reason.
 pub fn detect_format(dir: &Path) -> ModelFormat {
-    if dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists() {
-        return ModelFormat::Safetensors;
+    inspect_format(dir).format()
+}
+
+const SAFETENSORS_FILE: &str = "model.safetensors";
+const SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
+/// Dtypes that only a quantized checkpoint stores as weights. A tensor of one
+/// of these dtypes is admitted only as part of a declared quantized module.
+const QUANTIZED_DTYPES: [&str; 6] = ["U32", "U8", "I8", "I32", "F8_E4M3", "F8_E8M0"];
+const AFFINE_METADATA_DTYPES: [&str; 3] = ["F16", "BF16", "F32"];
+const NON_AFFINE_SCALE_DTYPES: [&str; 3] = ["U8", "F8_E8M0", "F8_E4M3"];
+
+/// Detect the format of a model directory, reading only directory entries,
+/// `config.json`, `hf_quant_config.json`, the safetensors index and the
+/// safetensors headers. No tensor payload is read.
+///
+/// The rules apply in order, and the first that matches decides:
+///
+/// 1. `Q4`: no `model.safetensors` and no `model.safetensors.index.json`, and
+///    at least one `*.q4` file.
+/// 2. `Gguf`: exactly one `*.gguf` file and no safetensors file. Two or more
+///    `.gguf` files, or a `.gguf` file beside a safetensors file, refuse.
+/// 3. `Unknown`: no `model.safetensors` and no index.
+/// 4. The header set is every shard the index lists, or `model.safetensors`
+///    when there is no index. An index must have a non-empty `weight_map`
+///    whose entries match the shard headers exactly, and every `.safetensors`
+///    file in the directory must be listed. Without an index,
+///    `model.safetensors` must be the only `.safetensors` file. A header or
+///    index that cannot be read refuses.
+/// 5. A `config.json` that cannot be read or parsed declares nothing. A
+///    quantization declaration other than an MLX `quantization` object
+///    (`quantization_config` at the top level or in `text_config`, or an
+///    `hf_quant_config.json` file) with no `quantization` object refuses.
+/// 6. `MlxQuantized`: a `quantization` object at the top level of
+///    `config.json` or in `text_config`. Every `U32` `<p>.weight` with
+///    `<p>.scales` is claimed as a module: affine when the scales are F16,
+///    BF16 or F32 and `<p>.biases` has the same dtype, non-affine when the
+///    scales are `U8`, `F8_E8M0` or `F8_E4M3`, there are no biases, and any
+///    `<p>.global_scale` is F32. A partial or mixed module refuses, and so
+///    does any tensor of a quantized dtype, `scales`, `biases` or
+///    `global_scale` tensor that no module claims, or a declaration with no
+///    module.
+/// 7. With no declaration at all, any tensor of a quantized dtype and any
+///    `*.global_scale` tensor refuses.
+/// 8. Otherwise `Safetensors`.
+///
+/// An unreadable directory resolves to `Unknown`.
+pub fn inspect_format(dir: &Path) -> FormatDetection {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return FormatDetection::found(ModelFormat::Unknown);
+    };
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                names.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+            Err(err) => {
+                return FormatDetection::refused(format!(
+                    "failed to list an entry of {}: {err}",
+                    dir.display()
+                ));
+            }
+        }
     }
-    let has_q4_file = std::fs::read_dir(dir)
-        .ok()
-        .and_then(|mut entries| {
-            entries.find(|e| {
-                e.as_ref()
-                    .ok()
-                    .and_then(|e| e.file_name().to_str().map(|n| n.ends_with(".q4")))
-                    .unwrap_or(false)
-            })
+    let has_single = dir.join(SAFETENSORS_FILE).exists();
+    let has_index = dir.join(SAFETENSORS_INDEX).exists();
+    let safetensors_files: Vec<&String> = names
+        .iter()
+        .filter(|n| n.ends_with(".safetensors"))
+        .collect();
+
+    if !has_single && !has_index && names.iter().any(|n| n.ends_with(".q4")) {
+        return FormatDetection::found(ModelFormat::Q4);
+    }
+
+    let gguf_files: Vec<&String> = names.iter().filter(|n| n.ends_with(".gguf")).collect();
+    if !gguf_files.is_empty() {
+        if has_index || !safetensors_files.is_empty() {
+            return FormatDetection::refused(format!(
+                "{} holds both GGUF and safetensors files; keep one format per directory",
+                dir.display()
+            ));
+        }
+        if gguf_files.len() > 1 {
+            return FormatDetection::refused(format!(
+                "{} holds {} GGUF files ({}); keep exactly one",
+                dir.display(),
+                gguf_files.len(),
+                join_names(gguf_files.iter().map(|s| s.as_str()))
+            ));
+        }
+        return FormatDetection::found(ModelFormat::Gguf);
+    }
+
+    if !has_single && !has_index {
+        return FormatDetection::found(ModelFormat::Unknown);
+    }
+
+    let tensors = match read_header_set(dir, has_index, &safetensors_files) {
+        Ok(tensors) => tensors,
+        Err(reason) => return FormatDetection::refused(reason),
+    };
+    let declarations = match read_declarations(dir) {
+        Ok(declarations) => declarations,
+        Err(reason) => return FormatDetection::refused(reason),
+    };
+
+    if declarations.native {
+        return match claim_mlx_modules(&tensors) {
+            Ok(()) => FormatDetection::found(ModelFormat::MlxQuantized),
+            Err(reason) => FormatDetection::refused(format!("{}: {reason}", dir.display())),
+        };
+    }
+    if !declarations.foreign.is_empty() {
+        return FormatDetection::refused(format!(
+            "{} declares a quantization lattice cannot read ({}) and no MLX \
+             `quantization` object",
+            dir.display(),
+            declarations.foreign.join(", ")
+        ));
+    }
+    let undeclared: Vec<String> = tensors
+        .iter()
+        .filter(|(name, dtype)| {
+            QUANTIZED_DTYPES.contains(&dtype.as_str()) || name.ends_with(".global_scale")
         })
-        .is_some();
-    if has_q4_file {
-        ModelFormat::Q4
-    } else {
-        ModelFormat::Unknown
+        .map(|(name, dtype)| format!("{name} ({dtype})"))
+        .collect();
+    if !undeclared.is_empty() {
+        return FormatDetection::refused(format!(
+            "{} holds {} quantized tensor(s) but no readable config.json declares a \
+             quantization, e.g. {}",
+            dir.display(),
+            undeclared.len(),
+            join_names(undeclared.iter().take(3).map(String::as_str))
+        ));
     }
+    FormatDetection::found(ModelFormat::Safetensors)
+}
+
+fn join_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    names.collect::<Vec<_>>().join(", ")
+}
+
+/// Tensor name to dtype over the whole header set.
+fn read_header_set(
+    dir: &Path,
+    has_index: bool,
+    safetensors_files: &[&String],
+) -> Result<BTreeMap<String, String>, String> {
+    if !has_index {
+        if safetensors_files.len() != 1 || safetensors_files[0] != SAFETENSORS_FILE {
+            return Err(format!(
+                "{} has no {SAFETENSORS_INDEX} and holds {} .safetensors files ({}); without an \
+                 index, {SAFETENSORS_FILE} must be the only one",
+                dir.display(),
+                safetensors_files.len(),
+                join_names(safetensors_files.iter().map(|s| s.as_str()))
+            ));
+        }
+        return read_safetensors_header_dtypes(&dir.join(SAFETENSORS_FILE));
+    }
+
+    let index = crate::weights::parse_index(dir).map_err(|err| err.to_string())?;
+    if index.weight_map.is_empty() {
+        return Err(format!(
+            "{} has an empty weight_map",
+            dir.join(SAFETENSORS_INDEX).display()
+        ));
+    }
+    let shards: BTreeSet<&str> = index.weight_map.values().map(String::as_str).collect();
+    let listed_here: BTreeSet<&str> = shards
+        .iter()
+        .filter_map(|shard| {
+            let mut parts = Path::new(shard)
+                .components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir));
+            match (parts.next(), parts.next()) {
+                (Some(std::path::Component::Normal(name)), None) => name.to_str(),
+                _ => None,
+            }
+        })
+        .collect();
+    // A symlink that resolves to a listed shard (a `model.safetensors` link
+    // beside a one-shard index) holds no bytes the header set does not read.
+    let listed_targets: BTreeSet<PathBuf> = listed_here
+        .iter()
+        .filter_map(|name| std::fs::canonicalize(dir.join(name)).ok())
+        .collect();
+    let unlisted: Vec<&str> = safetensors_files
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|name| !listed_here.contains(name))
+        .filter(|name| {
+            let path = dir.join(name);
+            let is_link =
+                std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+            !(is_link && std::fs::canonicalize(&path).is_ok_and(|p| listed_targets.contains(&p)))
+        })
+        .collect();
+    if !unlisted.is_empty() {
+        return Err(format!(
+            "{} holds .safetensors file(s) its {SAFETENSORS_INDEX} does not list: {}",
+            dir.display(),
+            join_names(unlisted.into_iter())
+        ));
+    }
+    let mut tensors = BTreeMap::new();
+    let mut shard_of: HashMap<String, &str> = HashMap::new();
+    for shard in &shards {
+        let path =
+            crate::weights::contained_shard_path(dir, shard).map_err(|err| err.to_string())?;
+        for (name, dtype) in read_safetensors_header_dtypes(&path)? {
+            if let Some(previous) = shard_of.insert(name.clone(), shard) {
+                return Err(format!(
+                    "tensor {name} appears in both {previous} and {shard} in {}",
+                    dir.display()
+                ));
+            }
+            tensors.insert(name, dtype);
+        }
+    }
+    for (name, shard) in &index.weight_map {
+        if shard_of.get(name.as_str()) != Some(&shard.as_str()) {
+            return Err(format!(
+                "{SAFETENSORS_INDEX} in {} maps {name} to {shard}, but that shard's header does \
+                 not hold it",
+                dir.display()
+            ));
+        }
+    }
+    if let Some(name) = shard_of
+        .keys()
+        .find(|name| !index.weight_map.contains_key(*name))
+    {
+        return Err(format!(
+            "tensor {name} in shard {} is missing from {SAFETENSORS_INDEX} in {}",
+            shard_of[name],
+            dir.display()
+        ));
+    }
+    Ok(tensors)
+}
+
+/// Read one safetensors header, bounded, and return tensor name to dtype.
+fn read_safetensors_header_dtypes(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let mut file = crate::weights::mmap_trust::open_regular_file_no_hang(path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?
+        .len();
+    let mut len_bytes = [0u8; 8];
+    file.read_exact(&mut len_bytes).map_err(|err| {
+        format!(
+            "{} is too short for a safetensors header: {err}",
+            path.display()
+        )
+    })?;
+    let header_len = u64::from_le_bytes(len_bytes);
+    if header_len > crate::weights::f32_weights::MAX_SAFETENSORS_HEADER_BYTES as u64 {
+        return Err(format!(
+            "{} declares a {header_len}-byte header, over the {}-byte limit",
+            path.display(),
+            crate::weights::f32_weights::MAX_SAFETENSORS_HEADER_BYTES
+        ));
+    }
+    if header_len > file_len.saturating_sub(8) {
+        return Err(format!(
+            "{} declares a {header_len}-byte header but holds {file_len} bytes",
+            path.display()
+        ));
+    }
+    let mut header = vec![0u8; header_len as usize];
+    file.read_exact(&mut header)
+        .map_err(|err| format!("failed to read the header of {}: {err}", path.display()))?;
+    let parsed: serde_json::Map<String, Value> =
+        serde_json::from_slice(&header).map_err(|err| {
+            format!(
+                "{} has a malformed safetensors header: {err}",
+                path.display()
+            )
+        })?;
+    let mut tensors = BTreeMap::new();
+    for (name, entry) in parsed {
+        if name == "__metadata__" {
+            continue;
+        }
+        let dtype = entry
+            .get("dtype")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{}: tensor {name} has no dtype", path.display()))?;
+        tensors.insert(name, dtype.to_owned());
+    }
+    Ok(tensors)
+}
+
+struct Declarations {
+    /// An MLX `quantization` object at the top level or in `text_config`.
+    native: bool,
+    /// Where any other quantization declaration was found.
+    foreign: Vec<&'static str>,
+}
+
+fn read_declarations(dir: &Path) -> Result<Declarations, String> {
+    let mut foreign = Vec::new();
+    match std::fs::symlink_metadata(dir.join("hf_quant_config.json")) {
+        Ok(_) => foreign.push("hf_quant_config.json"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "failed to inspect {}: {err}",
+                dir.join("hf_quant_config.json").display()
+            ));
+        }
+    }
+    let config_path = dir.join("config.json");
+    // A config.json that cannot be read declares nothing. That is safe because
+    // every quantized layout stores a dtype the no-declaration rule refuses,
+    // and reporting a broken config.json stays the loader's job.
+    let config = match std::fs::symlink_metadata(&config_path) {
+        Err(_) => None,
+        Ok(_) => crate::model::config_file::read_config_json_bounded(&config_path, "config.json")
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(Value::is_object),
+    };
+    let mut native = false;
+    if let Some(config) = &config {
+        let text_config = config.get("text_config");
+        for (scope, holder) in [("top level", Some(config)), ("text_config", text_config)] {
+            let Some(holder) = holder else { continue };
+            if let Some(quantization) = holder.get("quantization") {
+                if !quantization.is_object() {
+                    return Err(format!(
+                        "{}: `quantization` at the {scope} is not an object",
+                        config_path.display()
+                    ));
+                }
+                native = true;
+            }
+            if holder.get("quantization_config").is_some() {
+                foreign.push(if scope == "top level" {
+                    "config.json quantization_config"
+                } else {
+                    "text_config.quantization_config"
+                });
+            }
+        }
+    }
+    Ok(Declarations { native, foreign })
+}
+
+/// Claim every MLX quantized module in the header set, refusing a partial or
+/// mixed module and any quantized-looking tensor that no module claims.
+fn claim_mlx_modules(tensors: &BTreeMap<String, String>) -> Result<(), String> {
+    let mut claimed: BTreeSet<&str> = BTreeSet::new();
+    let dtype_of = |name: &str| tensors.get(name).map(String::as_str);
+    for (name, dtype) in tensors {
+        let Some(prefix) = name.strip_suffix(".weight") else {
+            continue;
+        };
+        if dtype != "U32" {
+            continue;
+        }
+        let scales = format!("{prefix}.scales");
+        let biases = format!("{prefix}.biases");
+        let global = format!("{prefix}.global_scale");
+        let Some(scale_dtype) = dtype_of(&scales) else {
+            continue;
+        };
+        if AFFINE_METADATA_DTYPES.contains(&scale_dtype) {
+            match dtype_of(&biases) {
+                None => {
+                    return Err(format!(
+                        "module {prefix} has {scale_dtype} scales and no biases"
+                    ));
+                }
+                Some(bias_dtype) if bias_dtype != scale_dtype => {
+                    return Err(format!(
+                        "module {prefix} has {scale_dtype} scales and {bias_dtype} biases"
+                    ));
+                }
+                Some(_) => {}
+            }
+            if tensors.contains_key(&global) {
+                return Err(format!("affine module {prefix} carries a global_scale"));
+            }
+            claimed.extend([
+                name.as_str(),
+                map_key(tensors, &scales),
+                map_key(tensors, &biases),
+            ]);
+        } else if NON_AFFINE_SCALE_DTYPES.contains(&scale_dtype) {
+            if tensors.contains_key(&biases) {
+                return Err(format!(
+                    "module {prefix} has {scale_dtype} scales beside biases"
+                ));
+            }
+            if let Some(global_dtype) = dtype_of(&global) {
+                if global_dtype != "F32" {
+                    return Err(format!(
+                        "module {prefix} has a {global_dtype} global_scale; only F32 is defined"
+                    ));
+                }
+                claimed.insert(map_key(tensors, &global));
+            }
+            claimed.extend([name.as_str(), map_key(tensors, &scales)]);
+        } else {
+            return Err(format!(
+                "module {prefix} has {scale_dtype} scales, which no quantization mode defines"
+            ));
+        }
+    }
+    if claimed.is_empty() {
+        return Err(
+            "config.json declares a `quantization` object but no tensor forms a quantized module"
+                .to_owned(),
+        );
+    }
+    for (name, dtype) in tensors {
+        if claimed.contains(name.as_str()) {
+            continue;
+        }
+        let quantized_dtype = QUANTIZED_DTYPES.contains(&dtype.as_str());
+        let quantization_part = name.ends_with(".scales")
+            || name.ends_with(".biases")
+            || name.ends_with(".global_scale");
+        if quantized_dtype || quantization_part {
+            return Err(format!(
+                "tensor {name} ({dtype}) is not part of a complete quantized module"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The map's own key for `name`, so claimed names borrow from the map.
+fn map_key<'a>(tensors: &'a BTreeMap<String, String>, name: &str) -> &'a str {
+    tensors
+        .get_key_value(name)
+        .map(|(key, _)| key.as_str())
+        .unwrap_or_default()
 }
 
 /// The model family a serving binary routes a checkpoint directory to.
@@ -156,6 +626,40 @@ pub fn unrecognized_format_message(dir: &Path) -> String {
     )
 }
 
+/// Error message for a directory this build cannot load as safetensors or
+/// native Q4: names the detected format, or the reason the directory was
+/// refused. Reads the directory again, so it is meant for error paths.
+pub fn unloadable_format_message(dir: &Path) -> String {
+    let detection = inspect_format(dir);
+    match detection.format() {
+        ModelFormat::MlxQuantized => format!(
+            "'{}' is an MLX quantized checkpoint, which lattice cannot load yet",
+            dir.display()
+        ),
+        ModelFormat::Gguf => format!(
+            "'{}' is a GGUF checkpoint, which lattice cannot load yet",
+            dir.display()
+        ),
+        ModelFormat::Refused => format!(
+            "'{}' cannot be loaded: {}",
+            dir.display(),
+            detection
+                .refusal()
+                .unwrap_or("its format could not be determined")
+        ),
+        ModelFormat::Safetensors | ModelFormat::Q4 => format!(
+            "'{}' is a {} checkpoint, which this build cannot load",
+            dir.display(),
+            if detection.format() == ModelFormat::Q4 {
+                "native Q4"
+            } else {
+                "safetensors"
+            }
+        ),
+        ModelFormat::Unknown => unrecognized_format_message(dir),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,19 +679,65 @@ mod tests {
         dir
     }
 
+    /// A safetensors file holding only a header that declares `tensors`
+    /// (name, dtype), each with shape `[1]`. Detection reads no payload.
+    fn write_header(path: &Path, tensors: &[(&str, &str)]) {
+        let mut header = serde_json::Map::new();
+        header.insert(
+            "__metadata__".to_owned(),
+            serde_json::json!({ "format": "pt" }),
+        );
+        for (name, dtype) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({ "dtype": dtype, "shape": [1], "data_offsets": [0, 0] }),
+            );
+        }
+        let json = serde_json::to_vec(&Value::Object(header)).unwrap();
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&json);
+        fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn detect_format_safetensors_file() {
         let dir = tempdir("safetensors-file");
-        fs::write(dir.join("model.safetensors"), b"stub").unwrap();
+        write_header(&dir.join("model.safetensors"), &[("w", "F32")]);
         assert_eq!(detect_format(&dir), ModelFormat::Safetensors);
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn detect_format_safetensors_index_only() {
+    fn detect_format_refuses_an_unreadable_header() {
+        let dir = tempdir("safetensors-stub");
+        fs::write(dir.join("model.safetensors"), b"stub").unwrap();
+        let detection = inspect_format(&dir);
+        assert_eq!(detection.format(), ModelFormat::Refused);
+        assert!(
+            detection.refusal().is_some_and(|r| r.contains("too short")),
+            "{detection:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_format_refuses_an_index_with_no_shards() {
         let dir = tempdir("safetensors-index");
         fs::write(dir.join("model.safetensors.index.json"), b"{}").unwrap();
-        assert_eq!(detect_format(&dir), ModelFormat::Safetensors);
+        assert_eq!(detect_format(&dir), ModelFormat::Refused);
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            br#"{"weight_map": {}}"#,
+        )
+        .unwrap();
+        let detection = inspect_format(&dir);
+        assert_eq!(detection.format(), ModelFormat::Refused);
+        assert!(
+            detection
+                .refusal()
+                .is_some_and(|r| r.contains("empty weight_map")),
+            "{detection:?}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -206,7 +756,7 @@ mod tests {
         // stray .q4 file must resolve as Safetensors — the safetensors
         // loader path is untouched and takes priority.
         let dir = tempdir("mixed");
-        fs::write(dir.join("model.safetensors"), b"stub").unwrap();
+        write_header(&dir.join("model.safetensors"), &[("w", "F32")]);
         fs::write(dir.join("leftover.q4"), b"stub").unwrap();
         assert_eq!(detect_format(&dir), ModelFormat::Safetensors);
         fs::remove_dir_all(&dir).ok();
@@ -223,7 +773,12 @@ mod tests {
         // checks both sentinel files before falling through to .q4, so this
         // case now resolves to Safetensors everywhere.
         let dir = tempdir("mixed-index");
-        fs::write(dir.join("model.safetensors.index.json"), b"{}").unwrap();
+        write_header(&dir.join("model.safetensors"), &[("w", "F32")]);
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            br#"{"weight_map": {"w": "model.safetensors"}}"#,
+        )
+        .unwrap();
         fs::write(dir.join("leftover.q4"), b"stub").unwrap();
         assert_eq!(detect_format(&dir), ModelFormat::Safetensors);
         fs::remove_dir_all(&dir).ok();
@@ -340,5 +895,419 @@ mod tests {
         let msg = metal_gpu_required_message(&dir);
         assert!(msg.contains("metal-gpu"));
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// ADR-100 D1 detection: real MLX headers, and one fixture per refusal.
+#[cfg(test)]
+mod detection_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn write_header(path: &Path, tensors: &[(&str, &str)]) {
+        let mut header = serde_json::Map::new();
+        for (name, dtype) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({ "dtype": dtype, "shape": [1], "data_offsets": [0, 0] }),
+            );
+        }
+        let json = serde_json::to_vec(&Value::Object(header)).unwrap();
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&json);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn write_config(dir: &Path, config: Value) {
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn mlx_config() -> Value {
+        serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": { "group_size": 64, "bits": 4, "mode": "affine" },
+            "quantization_config": { "group_size": 64, "bits": 4, "mode": "affine" }
+        })
+    }
+
+    const AFFINE: [(&str, &str); 4] = [
+        ("layer.q.weight", "U32"),
+        ("layer.q.scales", "BF16"),
+        ("layer.q.biases", "BF16"),
+        ("norm.weight", "BF16"),
+    ];
+
+    fn dir_with(tensors: &[(&str, &str)], config: Option<Value>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write_header(&dir.path().join("model.safetensors"), tensors);
+        if let Some(config) = config {
+            write_config(dir.path(), config);
+        }
+        dir
+    }
+
+    #[track_caller]
+    fn assert_refused(dir: &Path, needle: &str) {
+        let detection = inspect_format(dir);
+        assert_eq!(detection.format(), ModelFormat::Refused, "{detection:?}");
+        let reason = detection.refusal().unwrap_or_default();
+        assert!(
+            reason.contains(needle),
+            "refusal {reason:?} lacks {needle:?}"
+        );
+    }
+
+    fn fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("mlx_headers")
+    }
+
+    /// Rebuild a captured repository as header-only files: its `config.json`,
+    /// its index when it had one, and one header-only safetensors file per
+    /// shard.
+    fn materialize(fixture: &str) -> tempfile::TempDir {
+        let path = fixtures_dir().join(fixture);
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let record: Value = serde_json::from_str(&text).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), record["config"].clone());
+        let shards = record["shards"].as_object().unwrap();
+        let mut weight_map = serde_json::Map::new();
+        for (shard, tensors) in shards {
+            let tensors: Vec<(&str, &str)> = tensors
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(name, dtype)| (name.as_str(), dtype.as_str().unwrap()))
+                .collect();
+            write_header(&dir.path().join(shard), &tensors);
+            for (name, _) in tensors {
+                weight_map.insert(name.to_owned(), Value::String(shard.clone()));
+            }
+        }
+        if record["index"].as_bool().unwrap() {
+            fs::write(
+                dir.path().join(SAFETENSORS_INDEX),
+                serde_json::to_vec(&serde_json::json!({ "weight_map": weight_map })).unwrap(),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn captured_mlx_repositories_detect_as_mlx_quantized() {
+        let fixtures = [
+            "Qwen3.5-4B-MLX-4bit.json",
+            "Qwen3.5-9B-MLX-4bit.json",
+            "gemma-4-e4b-it-4bit.json",
+            "Qwen3-Embedding-0.6B-4bit-DWQ.json",
+        ];
+        for fixture in fixtures {
+            let dir = materialize(fixture);
+            let detection = inspect_format(dir.path());
+            assert_eq!(
+                detection.format(),
+                ModelFormat::MlxQuantized,
+                "{fixture}: {detection:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_repository_without_its_declaration_is_refused_not_read_as_floating_point() {
+        let dir = materialize("Qwen3.5-4B-MLX-4bit.json");
+        write_config(dir.path(), serde_json::json!({ "model_type": "qwen3_5" }));
+        assert_refused(dir.path(), "declares a quantization");
+    }
+
+    #[test]
+    fn sharded_capture_refuses_an_unlisted_shard() {
+        let dir = materialize("Qwen3.5-9B-MLX-4bit.json");
+        assert_eq!(detect_format(dir.path()), ModelFormat::MlxQuantized);
+        write_header(&dir.path().join("extra.safetensors"), &[("x", "BF16")]);
+        assert_refused(dir.path(), "does not list: extra.safetensors");
+    }
+
+    #[test]
+    fn affine_triad_without_a_declaration_refuses() {
+        let dir = dir_with(
+            &AFFINE,
+            Some(serde_json::json!({ "model_type": "qwen3_5" })),
+        );
+        assert_refused(dir.path(), "declares a quantization");
+        let no_config = dir_with(&AFFINE, None);
+        assert_refused(no_config.path(), "declares a quantization");
+    }
+
+    #[test]
+    fn declared_affine_triad_is_mlx_quantized_at_top_level_and_in_text_config() {
+        let dir = dir_with(&AFFINE, Some(mlx_config()));
+        assert_eq!(detect_format(dir.path()), ModelFormat::MlxQuantized);
+        let nested = dir_with(
+            &AFFINE,
+            Some(serde_json::json!({
+                "text_config": { "quantization": { "group_size": 64, "bits": 4 } }
+            })),
+        );
+        assert_eq!(detect_format(nested.path()), ModelFormat::MlxQuantized);
+    }
+
+    #[test]
+    fn partial_and_mixed_modules_refuse() {
+        let config = Some(mlx_config());
+        let orphan_scales = dir_with(
+            &[
+                ("layer.q.weight", "U32"),
+                ("layer.q.scales", "BF16"),
+                ("layer.q.biases", "BF16"),
+                ("layer.k.scales", "BF16"),
+            ],
+            config.clone(),
+        );
+        assert_refused(orphan_scales.path(), "layer.k.scales");
+        let no_biases = dir_with(
+            &[("layer.q.weight", "U32"), ("layer.q.scales", "F16")],
+            config.clone(),
+        );
+        assert_refused(no_biases.path(), "F16 scales and no biases");
+        let mixed = dir_with(
+            &[
+                ("layer.q.weight", "U32"),
+                ("layer.q.scales", "F16"),
+                ("layer.q.biases", "BF16"),
+            ],
+            config.clone(),
+        );
+        assert_refused(mixed.path(), "F16 scales and BF16 biases");
+        let affine_global = dir_with(
+            &[
+                ("layer.q.weight", "U32"),
+                ("layer.q.scales", "BF16"),
+                ("layer.q.biases", "BF16"),
+                ("layer.q.global_scale", "F32"),
+            ],
+            config.clone(),
+        );
+        assert_refused(affine_global.path(), "carries a global_scale");
+        let orphan_global = dir_with(
+            &[
+                ("layer.q.weight", "U32"),
+                ("layer.q.scales", "BF16"),
+                ("layer.q.biases", "BF16"),
+                ("layer.k.global_scale", "F32"),
+            ],
+            config.clone(),
+        );
+        assert_refused(orphan_global.path(), "layer.k.global_scale");
+        let byte_scales_with_biases = dir_with(
+            &[
+                ("layer.q.weight", "U32"),
+                ("layer.q.scales", "U8"),
+                ("layer.q.biases", "BF16"),
+            ],
+            config.clone(),
+        );
+        assert_refused(byte_scales_with_biases.path(), "beside biases");
+        let weight_without_scales = dir_with(
+            &[
+                ("layer.q.weight", "U32"),
+                ("layer.q.scales", "BF16"),
+                ("layer.q.biases", "BF16"),
+                ("layer.k.weight", "U32"),
+            ],
+            config.clone(),
+        );
+        assert_refused(weight_without_scales.path(), "layer.k.weight (U32)");
+        let nothing_quantized = dir_with(&[("norm.weight", "BF16")], config);
+        assert_refused(
+            nothing_quantized.path(),
+            "no tensor forms a quantized module",
+        );
+    }
+
+    #[test]
+    fn non_affine_module_is_claimed_and_reported_by_its_tensors() {
+        let dir = dir_with(
+            &[
+                ("layer.q.weight", "U32"),
+                ("layer.q.scales", "F8_E8M0"),
+                ("layer.q.global_scale", "F32"),
+                ("norm.weight", "BF16"),
+            ],
+            Some(serde_json::json!({
+                "quantization": { "group_size": 32, "bits": 4, "mode": "mxfp4" }
+            })),
+        );
+        assert_eq!(detect_format(dir.path()), ModelFormat::MlxQuantized);
+        let bad_global = dir_with(
+            &[
+                ("layer.q.weight", "U32"),
+                ("layer.q.scales", "F8_E8M0"),
+                ("layer.q.global_scale", "BF16"),
+            ],
+            Some(mlx_config()),
+        );
+        assert_refused(bad_global.path(), "BF16 global_scale");
+    }
+
+    #[test]
+    fn foreign_declarations_refuse() {
+        let top = dir_with(
+            &[("w", "BF16")],
+            Some(serde_json::json!({ "quantization_config": { "quant_method": "gptq" } })),
+        );
+        assert_refused(top.path(), "config.json quantization_config");
+        let nested = dir_with(
+            &[("w", "BF16")],
+            Some(serde_json::json!({
+                "text_config": { "quantization_config": { "quant_method": "awq" } }
+            })),
+        );
+        assert_refused(nested.path(), "text_config.quantization_config");
+        let hf = dir_with(&[("w", "BF16")], Some(serde_json::json!({})));
+        fs::write(hf.path().join("hf_quant_config.json"), b"{}").unwrap();
+        assert_refused(hf.path(), "hf_quant_config.json");
+    }
+
+    #[test]
+    fn undeclared_quantized_dtypes_refuse() {
+        for dtype in QUANTIZED_DTYPES {
+            let dir = dir_with(&[("w", dtype), ("norm.weight", "BF16")], None);
+            assert_refused(dir.path(), &format!("w ({dtype})"));
+        }
+        let global = dir_with(&[("w.global_scale", "F32")], None);
+        assert_refused(global.path(), "w.global_scale (F32)");
+        let declared_unclaimed = dir_with(
+            &[
+                ("layer.q.weight", "U32"),
+                ("layer.q.scales", "BF16"),
+                ("layer.q.biases", "BF16"),
+                ("router.weight", "F8_E4M3"),
+            ],
+            Some(mlx_config()),
+        );
+        assert_refused(declared_unclaimed.path(), "router.weight (F8_E4M3)");
+    }
+
+    #[test]
+    fn layout_ambiguity_refuses() {
+        let second = dir_with(&[("w", "BF16")], None);
+        write_header(&second.path().join("other.safetensors"), &[("v", "BF16")]);
+        assert_refused(second.path(), "must be the only one");
+
+        let mixed = dir_with(&[("w", "BF16")], None);
+        fs::write(mixed.path().join("model.gguf"), b"GGUF").unwrap();
+        assert_refused(mixed.path(), "both GGUF and safetensors");
+
+        let gguf = tempfile::tempdir().unwrap();
+        fs::write(gguf.path().join("model.gguf"), b"GGUF").unwrap();
+        assert_eq!(detect_format(gguf.path()), ModelFormat::Gguf);
+        fs::write(gguf.path().join("other.gguf"), b"GGUF").unwrap();
+        assert_refused(gguf.path(), "2 GGUF files");
+    }
+
+    #[test]
+    fn index_must_match_the_shard_headers() {
+        let dir = dir_with(&[("w", "BF16"), ("v", "BF16")], None);
+        let index = dir.path().join(SAFETENSORS_INDEX);
+        fs::write(
+            &index,
+            br#"{"weight_map": {"w": "model.safetensors", "v": "model.safetensors"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_format(dir.path()), ModelFormat::Safetensors);
+        fs::write(&index, br#"{"weight_map": {"w": "model.safetensors"}}"#).unwrap();
+        assert_refused(dir.path(), "tensor v in shard model.safetensors is missing");
+        fs::write(
+            &index,
+            br#"{"weight_map": {"w": "model.safetensors", "v": "model.safetensors", "u": "model.safetensors"}}"#,
+        )
+        .unwrap();
+        assert_refused(dir.path(), "maps u to model.safetensors");
+        fs::write(
+            &index,
+            br#"{"weight_map": {"w": "./model.safetensors", "v": "./model.safetensors"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_format(dir.path()), ModelFormat::Safetensors);
+    }
+
+    /// A `model.safetensors` symlink to the one shard its index lists (a
+    /// layout in real model directories) is that shard, so it is not an
+    /// unlisted file. A link to an unlisted file, and a plain copy of the
+    /// shard, are still refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_listed_shard_is_not_an_unlisted_file() {
+        let shard = "model.safetensors-00001-of-00001.safetensors";
+        let dir = tempfile::tempdir().unwrap();
+        write_header(&dir.path().join(shard), &[("w", "BF16")]);
+        fs::write(
+            dir.path().join(SAFETENSORS_INDEX),
+            format!(r#"{{"weight_map": {{"w": "{shard}"}}}}"#),
+        )
+        .unwrap();
+        let link = dir.path().join(SAFETENSORS_FILE);
+        std::os::unix::fs::symlink(shard, &link).unwrap();
+        assert_eq!(detect_format(dir.path()), ModelFormat::Safetensors);
+
+        fs::remove_file(&link).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_header(&outside.path().join("other.safetensors"), &[("w", "BF16")]);
+        std::os::unix::fs::symlink(outside.path().join("other.safetensors"), &link).unwrap();
+        assert_refused(dir.path(), "does not list: model.safetensors");
+
+        fs::remove_file(&link).unwrap();
+        fs::copy(dir.path().join(shard), &link).unwrap();
+        assert_refused(dir.path(), "does not list: model.safetensors");
+    }
+
+    /// A converted directory carries `quantize_index.json` and `.q4` files and
+    /// may keep a `config.json` naming a quantization. Native Q4 detection
+    /// runs before any configuration rule, so it stays `Q4`.
+    #[test]
+    fn native_q4_output_with_a_quantization_object_stays_q4() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("model_layers_0_weight.q4"), b"stub").unwrap();
+        write_config(dir.path(), mlx_config());
+        assert_eq!(detect_format(dir.path()), ModelFormat::Q4);
+    }
+
+    #[test]
+    fn a_non_object_quantization_refuses() {
+        let dir = dir_with(&AFFINE, Some(serde_json::json!({ "quantization": true })));
+        assert_refused(dir.path(), "is not an object");
+    }
+
+    /// An unreadable `config.json` declares nothing: a floating-point checkpoint
+    /// stays `Safetensors` for its loader to report, and a quantized one is
+    /// still refused by its dtypes.
+    #[test]
+    fn an_unreadable_config_declares_nothing() {
+        let float = dir_with(&[("w", "BF16")], None);
+        fs::write(float.path().join("config.json"), b"{").unwrap();
+        assert_eq!(detect_format(float.path()), ModelFormat::Safetensors);
+        let quantized = dir_with(&AFFINE, None);
+        fs::write(quantized.path().join("config.json"), b"{").unwrap();
+        assert_refused(quantized.path(), "declares a quantization");
+    }
+
+    #[test]
+    fn unloadable_message_names_the_format_or_the_refusal() {
+        let mlx = dir_with(&AFFINE, Some(mlx_config()));
+        assert!(unloadable_format_message(mlx.path()).contains("MLX quantized"));
+        let refused = dir_with(&AFFINE, None);
+        assert!(unloadable_format_message(refused.path()).contains("declares a quantization"));
+        let empty = tempfile::tempdir().unwrap();
+        assert!(unloadable_format_message(empty.path()).contains("not a recognized"));
     }
 }
