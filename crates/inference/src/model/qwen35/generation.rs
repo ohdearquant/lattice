@@ -4,7 +4,7 @@ use super::model::Qwen35Model;
 // Row R03 deleted this module's last production callers of `sample_token`/`DecodePolicy`/
 // `StepOutcome` (the `generate_inline`/`generate_streaming_inline`/`decode_loop`/
 // `decode_loop_with_stops` family): production CPU generation now routes entirely through
-// `QwenCpuSession`/`decoder::driver::run`. This module's own tests still exercise
+// `QwenCpuSession`/`decoder::driver::run_into`. This module's own tests still exercise
 // `DecodePolicy`/`StepOutcome`/`sample_token` directly (see `mod tests` below), so the
 // import is `#[cfg(test)]`-gated rather than deleted.
 #[cfg(test)]
@@ -29,7 +29,7 @@ use crate::tokenizer::detokenize::{IncrementalDetokenizer, decode_tokens};
 /// `decoder::Cancellation`, whose blanket impl covers only non-mutating `Fn`
 /// closures (see that trait's own doc comment, which names this exact
 /// conversion as a future row's job). `RefCell` gives `is_cancelled(&self)` a
-/// runtime-checked path to the one mutable call it needs; `decoder::driver::run`
+/// runtime-checked path to the one mutable call it needs; `decoder::driver::run_into`
 /// calls it strictly sequentially from a single thread, so the borrow never
 /// conflicts.
 struct FnMutCancellation<'a, F: FnMut() -> bool>(&'a std::cell::RefCell<F>);
@@ -90,7 +90,7 @@ impl Qwen35Model {
 
     /// ADR-090 row C dispatch point (row R03: unconditional -- every canonical Qwen3.5 CPU
     /// generate/stream request now routes through [`Self::generate_via_driver`]
-    /// (`decoder::driver::run` over a [`crate::decoder::qwen_cpu::QwenCpuSession`]), grammar
+    /// (`decoder::driver::run_into` over a [`crate::decoder::qwen_cpu::QwenCpuSession`]), grammar
     /// and logprobs included; the pre-driver `generate_inline`/`decode_loop`/
     /// `decode_loop_with_stops` fallback this comment used to describe is deleted).
     ///
@@ -107,13 +107,13 @@ impl Qwen35Model {
 
     /// ADR-090 row C, extended by row R03 to every canonical Qwen3.5 CPU generate request
     /// (grammar and logprobs included -- no exceptions remain): constructs a
-    /// [`QwenCpuSession`] and runs [`driver::run`] over it. Every preflight step through
+    /// [`QwenCpuSession`] and runs [`driver::run_into`] over it. Every preflight step through
     /// `think_close_id` resolution is unchanged from the pre-driver implementation -- only
     /// the decode mechanics after prefill are re-routed. `gen_cfg.seed` and
     /// `gen_cfg.temperature` go straight into [`QwenCpuSession::new`], which owns the RNG
     /// draw and the per-request `gdn_states`/`kv_cache`/`scratch` allocation from here on
     /// (see that constructor's own doc comment for why it captures exactly those two
-    /// fields). `gen_cfg.grammar` is read by [`driver::run`] itself now, not by this
+    /// fields). `gen_cfg.grammar` is read by [`driver::run_into`] itself now, not by this
     /// constructor -- the driver owns grammar transitions (ADR-090 D1).
     fn generate_via_driver(
         &self,
@@ -160,6 +160,10 @@ impl Qwen35Model {
 
         let mut session =
             QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
+        session.reserve_generation(prompt_len.saturating_add(decode_cap(
+            gen_cfg.effective_reasoning_budget(),
+            gen_cfg.max_new_tokens,
+        )));
 
         // Non-streaming callers never cancel and never need raw-event/tail-flush
         // hooks; only the streaming dispatch target (`generate_streaming_via_driver`)
@@ -169,7 +173,7 @@ impl Qwen35Model {
         if gen_cfg.stop_strings.is_empty() {
             let mut throwaway_text = String::new();
             let mut throwaway_offsets: Vec<usize> = Vec::new();
-            let result = driver::run(
+            let result = driver::run_into(
                 &mut session,
                 gen_cfg,
                 think_close_id,
@@ -178,7 +182,7 @@ impl Qwen35Model {
                 false,
                 &never_cancel,
                 |_generated_len| {},
-                |_next_id| String::new(),
+                |_next_id, _out| {},
                 &mut throwaway_text,
                 &mut throwaway_offsets,
                 |_delta, _next_id| true,
@@ -205,7 +209,7 @@ impl Qwen35Model {
             let mut full = String::new();
             let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
-            let result = driver::run(
+            let result = driver::run_into(
                 &mut session,
                 gen_cfg,
                 think_close_id,
@@ -214,7 +218,7 @@ impl Qwen35Model {
                 false,
                 &never_cancel,
                 |_generated_len| {},
-                |next_id| detok.push(&self.tokenizer, next_id),
+                |next_id, out| detok.push_into(&self.tokenizer, next_id, out),
                 &mut full,
                 &mut token_logprob_end_offsets,
                 |_delta, _next_id| true,
@@ -397,20 +401,20 @@ impl Qwen35Model {
 
     /// Driver-routed dispatch target -- streaming sibling of [`Self::generate_via_driver`],
     /// which it mirrors closely: same tokenize/preflight/context-budget/reasoning-close
-    /// sequence, same [`QwenCpuSession`], same `driver::run` call. Two differences, both
+    /// sequence, same [`QwenCpuSession`], same `driver::run_into` call. Two differences, both
     /// load-bearing for the streaming contract:
     ///
     /// 1. **Cancellation.** `should_cancel` here is `FnMut` (it may capture a
     ///    `Receiver`-style handle), while `decoder::Cancellation`'s blanket impl covers
     ///    only non-mutating `Fn` closures. [`FnMutCancellation`] bridges the two via a
     ///    `RefCell`, per that trait's own doc comment.
-    /// 2. **Raw-token eventing.** `decoder::driver::run` calls its dedicated `on_push`
+    /// 2. **Raw-token eventing.** `decoder::driver::run_into` calls its dedicated `on_push`
     ///    parameter exactly once per token that becomes part of `generated_ids`,
     ///    immediately at the push, in generation order, with `generated_ids.len()` at
     ///    that moment -- the same guarantee [`RawGenEvent::RawToken`]'s own doc comment
     ///    relies on. This entry fires `RawToken` from that hook directly, using the
     ///    length it is handed as the index, rather than from `decode_delta`: `decode_delta`
-    ///    runs later in `driver::run`'s fixed per-step order (after `record_metadata`'s
+    ///    runs later in `driver::run_into`'s fixed per-step order (after `record_metadata`'s
     ///    session-scored logprob call whenever `gen_cfg.logprobs` is set), so firing from
     ///    it would let the event's timing drift with that call's cost instead of marking
     ///    the true push boundary.
@@ -418,7 +422,7 @@ impl Qwen35Model {
     /// Always builds a real incremental detokenizer and real output buffers (unlike
     /// `generate_via_driver`'s fast/stop-strings split, which throws the delta away when
     /// nothing needs to observe it): a streaming caller needs `on_token` fired
-    /// incrementally regardless of whether `stop_strings` is set, and `driver::run`'s own
+    /// incrementally regardless of whether `stop_strings` is set, and `driver::run_into`'s own
     /// `policy` (built from `gen_cfg.stop_strings`) already decides internally whether
     /// that incremental work does anything.
     fn generate_streaming_via_driver<F, C, O>(
@@ -474,17 +478,21 @@ impl Qwen35Model {
 
         let mut session =
             QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
+        session.reserve_generation(prompt_len.saturating_add(decode_cap(
+            gen_cfg.effective_reasoning_budget(),
+            gen_cfg.max_new_tokens,
+        )));
 
         let should_cancel_cell = std::cell::RefCell::new(should_cancel);
         let cancel = FnMutCancellation(&should_cancel_cell);
 
         // Shared via `RefCell` rather than plain captures: `on_push` (called once per
         // pushed token, before `decode_delta` runs for that same token -- see
-        // `driver::run`'s doc comment), `decode_delta` (also called once per pushed
+        // `driver::run_into`'s doc comment), `decode_delta` (also called once per pushed
         // token), and `on_prefill_end` (called once, before any token) are three
-        // separate closures passed into the same `driver::run` call, and both `on_push`
+        // separate closures passed into the same `driver::run_into` call, and both `on_push`
         // and `on_prefill_end` need `on_raw_event`; `decode_delta` and `finish_tail`
-        // both need `detok`. No two of these are ever live concurrently (`driver::run`
+        // both need `detok`. No two of these are ever live concurrently (`driver::run_into`
         // calls them strictly sequentially, single-threaded), so the runtime borrow
         // check never conflicts.
         let on_raw_event_cell = std::cell::RefCell::new(on_raw_event);
@@ -492,7 +500,7 @@ impl Qwen35Model {
         let mut text = String::new();
         let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
-        let result = driver::run(
+        let result = driver::run_into(
             &mut session,
             gen_cfg,
             think_close_id,
@@ -500,9 +508,9 @@ impl Qwen35Model {
             cfg.eos_token_id,
             true,
             &cancel,
-            // Fires `RawToken` at `driver::run`'s own `on_push` hook, i.e. immediately
+            // Fires `RawToken` at `driver::run_into`'s own `on_push` hook, i.e. immediately
             // at the push that grows `generated_ids` to `generated_len` -- never from
-            // `decode_delta` below, which `driver::run` calls later in the fixed
+            // `decode_delta` below, which `driver::run_into` calls later in the fixed
             // per-step order (after `record_metadata`'s session-scored logprob call
             // whenever `gen_cfg.logprobs` is set). `generated_len` IS the index this
             // event must report (`RawGenEvent::RawToken`'s own doc comment), so no
@@ -512,7 +520,11 @@ impl Qwen35Model {
                     index: generated_len,
                 });
             },
-            |next_id| detok_cell.borrow_mut().push(&self.tokenizer, next_id),
+            |next_id, out| {
+                detok_cell
+                    .borrow_mut()
+                    .push_into(&self.tokenizer, next_id, out)
+            },
             &mut text,
             &mut token_logprob_end_offsets,
             |delta, _next_id| on_token(delta),

@@ -24,7 +24,7 @@
 //!   the per-token interface cannot be hidden behind a removal elsewhere in a model.
 //!
 //! The probed entry mirrors `Qwen35Model::generate_streaming_via_driver` step for step
-//! (tokenize, preflight, session, `driver::run`) for requests without a reasoning budget. The bench proves the mirror is faithful
+//! (tokenize, preflight, session, `driver::run_into`) for requests without a reasoning budget. The bench proves the mirror is faithful
 //! rather than assuming it: an unchanged probe must reproduce the production entry's
 //! token ids and allocation counts.
 
@@ -163,8 +163,11 @@ pub fn run_qwen_cpu_probed(
     }
     let think_close_id = None;
 
+    let mut inner =
+        QwenCpuSession::new(model, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
+    inner.reserve_generation(prompt_len.saturating_add(gen_cfg.max_new_tokens));
     let mut session = ProbedSession {
-        inner: QwenCpuSession::new(model, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed),
+        inner,
         probe,
         capacity_of: QwenCpuSession::first_layer_key_capacity,
         initial_capacity: None,
@@ -176,7 +179,7 @@ pub fn run_qwen_cpu_probed(
     let mut text = String::new();
     let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
-    let result = driver::run(
+    let result = driver::run_into(
         &mut session,
         gen_cfg,
         think_close_id,
@@ -189,7 +192,11 @@ pub fn run_qwen_cpu_probed(
                 index: generated_len,
             });
         },
-        |next_id| detok_cell.borrow_mut().push(&model.tokenizer, next_id),
+        |next_id, out| {
+            detok_cell
+                .borrow_mut()
+                .push_into(&model.tokenizer, next_id, out)
+        },
         &mut text,
         &mut token_logprob_end_offsets,
         |_delta, _next_id| true,
