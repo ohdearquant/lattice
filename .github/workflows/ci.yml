@@ -520,6 +520,12 @@ jobs:
           }
       - name: inference — mixture clippy
         run: cargo clippy -p lattice-inference --all-targets --features mixture -- -D warnings
+      - name: inference router-learning clippy
+        run: cargo clippy --locked -p lattice-inference --all-targets --features router-learning -- -D warnings
+      - name: Router trainer artifact probe unit tests
+        run: python3 tests/test_router_learning_artifacts.py -v
+      - name: Router trainer feature isolation in emitted artifacts
+        run: python3 scripts/check-router-learning-artifacts.py
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
       # wgpu-gpu is excluded from default builds and was silently broken under
