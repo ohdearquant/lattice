@@ -26,6 +26,8 @@ pub use bert_policy::{BertCpuKernelPolicy, BertCpuKernelProfile};
 pub use blas::{sgemm_bt_strided, sgemm_nn_ab, sgemm_nn_strided};
 pub use elementwise::{elementwise_mul, rms_norm, silu_inplace};
 pub(crate) use gemm_validate::{validate_gemm_bt, validate_gemm_nn, validate_ternary_matvec_args};
+#[cfg(all(test, feature = "train-backward"))]
+pub(crate) use matmul::observe_matmul_calls;
 pub use matmul::{matmul, matmul_bt, matmul_into, matmul_scalar};
 pub use norm::{layer_norm, residual_add_layer_norm};
 pub(crate) use simd::simd_config;

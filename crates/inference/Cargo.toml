@@ -517,7 +517,7 @@ harness = false
 [[bench]]
 name = "backward_stage0"
 harness = false
-required-features = ["train-backward"]
+required-features = ["train-backward", "test-utils"]
 
 [[bench]]
 name = "f16_convert_bench"

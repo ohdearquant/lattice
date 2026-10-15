@@ -12,6 +12,30 @@ use super::blas::{accelerate_matmul, accelerate_matmul_bt};
 #[cfg(not(target_os = "macos"))]
 use super::tiled::matmul_bt_tiled;
 
+#[cfg(all(test, feature = "train-backward"))]
+std::thread_local! {
+    static OBSERVED_MATMUL_CALLS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, feature = "train-backward"))]
+pub(crate) fn observe_matmul_calls<T>(work: impl FnOnce() -> T) -> (T, usize) {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVED_MATMUL_CALLS.with(|calls| {
+                let nested = calls.get().unwrap_or(0);
+                calls.set(self.0.map(|previous| previous.saturating_add(nested)));
+            });
+        }
+    }
+    let previous = OBSERVED_MATMUL_CALLS.with(|calls| calls.replace(Some(0)));
+    let restore = Restore(previous);
+    let result = work();
+    let count = OBSERVED_MATMUL_CALLS.with(|calls| calls.get().unwrap_or(0));
+    drop(restore);
+    (result, count)
+}
+
 /// **Unstable**: general matmul C = A*B; dispatches to platform BLAS or SIMD fallback.
 ///
 /// General matrix multiplication: C = A * B.
@@ -32,6 +56,12 @@ pub fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
 ///
 /// Matrix multiply into a pre-allocated output buffer.
 pub fn matmul_into(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    #[cfg(all(test, feature = "train-backward"))]
+    OBSERVED_MATMUL_CALLS.with(|calls| {
+        if let Some(count) = calls.get() {
+            calls.set(Some(count.saturating_add(1)));
+        }
+    });
     // Release-active, overflow-first, oversized-scratch-allowed contract (#368, ADR-080 C4) —
     // see `gemm_validate` for the shared rationale. Some callers pass reused scratch buffers
     // longer than the exact footprint; that is sound (the check is `>=`). Note the output

@@ -528,6 +528,153 @@ jobs:
         run: python3 scripts/check-router-learning-artifacts.py
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
+      - name: inference backward forced scalar feature isolation
+        run: cargo check --locked -p lattice-inference --no-default-features --features train-backward --lib
+      - name: inference backward forced scalar clippy
+        run: cargo clippy --locked -p lattice-inference --no-default-features --features train-backward,test-utils --lib --tests --bench backward_stage0 -- -D warnings
+      - name: inference backward forced scalar tests
+        run: |
+          set -eu
+          for filter in backward::simd:: backward::ops::tests:: backward::attention_gqa::tests:: attention::gdn_backward::tests::; do
+            log="${RUNNER_TEMP:-/tmp}/inference-backward-${filter//:/_}.log"
+            if cargo test --locked -p lattice-inference --no-default-features \
+              --features train-backward,test-utils --lib "$filter" -- --nocapture >"$log" 2>&1
+            then
+              cat "$log"
+            else
+              status=$?
+              cat "$log"
+              exit "$status"
+            fi
+            python3 - "$log" "$filter" <<'PYTEST'
+          import pathlib
+          import re
+          import sys
+          log = pathlib.Path(sys.argv[1]).read_text()
+          expected = {
+              "backward::simd::": [
+                  "backward::simd::tests::scalar_execution_records_operation_and_bypasses_real_gemm",
+                  "backward::simd::tests::unavailable_accelerated_backend_fails_closed",
+                  "backward::simd::tests::manual_labels_never_attest_arithmetic_and_poison_reuse",
+                  "backward::simd::tests::completion_for_another_operation_invalidates_evidence",
+                  "backward::simd::tests::duplicate_execution_invalidates_prior_success_without_writing",
+                  "backward::simd::tests::missing_completion_and_unwind_never_produce_success",
+                  "backward::simd::tests::wrong_implementation_completion_and_reentrant_use_fail_closed",
+                  "backward::simd::tests::invalid_shape_and_overflow_poison_probe_and_preserve_output",
+                  "backward::simd::tests::probes_and_matmul_observation_are_isolated_between_threads",
+                  "backward::simd::tests::nested_observation_preserves_real_gemm_counts_including_unwind",
+                  "backward::simd::tests::observation_restores_after_panicking_work",
+                  "backward::simd::scalar::tests::cross_entropy_matches_independent_loss_and_masked_rows",
+                  "backward::simd::scalar::tests::linear_has_independent_gradient_and_ascending_accumulation",
+                  "backward::simd::scalar::tests::lora_all_three_outputs_match_independent_gradients",
+                  "backward::simd::scalar::tests::rmsnorm_matches_independent_normalized_forward",
+                  "backward::simd::scalar::tests::rope_uses_stride_half_inverse_and_preserves_tail_bits",
+                  "backward::simd::scalar::tests::rope_matches_independent_forward_derivative",
+                  "backward::simd::scalar::tests::swiglu_both_outputs_match_independent_forward_derivatives",
+                  "backward::simd::scalar::tests::swiglu_reduces_gate_separately_before_adding_the_up_branch",
+                  "backward::simd::scalar::tests::forced_reductions_bypass_shared_gemm_with_real_positive_controls",
+                  "backward::simd::scalar::tests::empty_dimensions_have_explicit_portable_results",
+                  "backward::simd::scalar::tests::nonfinite_and_zero_factors_are_not_sanitized",
+                  "backward::simd::scalar::tests::into_replaces_every_output_and_scratch_element",
+                  "backward::simd::scalar::tests::cross_entropy_rejects_all_shape_errors_before_writes",
+                  "backward::simd::scalar::tests::linear_rejects_all_shape_errors_before_writes",
+                  "backward::simd::scalar::tests::lora_rejects_each_input_output_and_scratch_shape_before_writes",
+                  "backward::simd::scalar::tests::rmsnorm_and_rope_reject_shapes_before_writes",
+                  "backward::simd::scalar::tests::swiglu_rejects_each_input_output_and_scratch_shape_before_writes",
+                  "backward::simd::scalar::tests::zero_factor_shapes_still_reject_unallocatable_outputs_and_scratch",
+                  "backward::simd::composite::tests::forced_gqa_all_arrays_and_lora_permutations_bypass_gemm",
+                  "backward::simd::composite::tests::forced_gqa_zero_sparse_saturated_and_nonfinite_classifications",
+                  "backward::simd::composite::tests::forced_gqa_rejects_incomplete_shapes_before_execution",
+                  "backward::simd::composite::tests::forced_gdn_all_eleven_arrays_and_asymmetric_recurrence_bypass_gemm",
+                  "backward::simd::composite::tests::forced_gdn_zero_sparse_saturated_and_nonfinite_classifications",
+                  "backward::simd::composite::tests::forced_gdn_empty_sequence_preserves_empty_gradients",
+                  "backward::simd::composite::tests::forced_gdn_rejects_incomplete_shapes_before_execution",
+              ],
+              "backward::ops::tests::": [
+                  "backward::ops::tests::cross_entropy_backward_gradcheck",
+                  "backward::ops::tests::linear_vjp_gradcheck",
+                  "backward::ops::tests::lora_vjp_gradcheck",
+                  "backward::ops::tests::rmsnorm_backward_gradcheck",
+                  "backward::ops::tests::rope_backward_gradcheck",
+                  "backward::ops::tests::swiglu_backward_gradcheck",
+                  "backward::ops::tests::linear_vjp_parity_vs_scalar",
+                  "backward::ops::tests::lora_vjp_parity_vs_scalar",
+                  "backward::ops::tests::swiglu_backward_parity_vs_scalar",
+              ],
+              "backward::attention_gqa::tests::": [
+                  "backward::attention_gqa::tests::gqa_lora_gradcheck",
+                  "backward::attention_gqa::tests::forced_gqa_independent_gradcheck",
+                  "backward::attention_gqa::tests::gqa_forward_with_cache_nan_q_score_fails_closed_sibling_head_stays_finite",
+                  "backward::attention_gqa::tests::gqa_projections_parity_with_q_and_v_lora",
+                  "backward::attention_gqa::tests::gqa_projections_parity_without_lora",
+                  "backward::attention_gqa::tests::gqa_projections_parity_q_lora_only",
+                  "backward::attention_gqa::tests::gqa_projections_parity_v_lora_only",
+                  "backward::attention_gqa::tests::gqa_forward_with_cache_rank_zero_lora_matches_no_lora",
+                  "backward::attention_gqa::tests::gqa_forward_with_cache_zero_query_heads_returns_zero_output",
+                  "backward::attention_gqa::tests::gqa_forward_with_cache_zero_kv_heads_is_rejected",
+                  "backward::attention_gqa::tests::gqa_forward_with_cache_indivisible_head_counts_are_rejected",
+              ],
+              "attention::gdn_backward::tests::": [
+                  "attention::gdn_backward::tests::gradcheck_gdn_backward",
+                  "attention::gdn_backward::tests::gradcheck_gdn_backward_multi_head",
+                  "attention::gdn_backward::tests::zero_grad_output_yields_zero_input_grad",
+                  "attention::gdn_backward::tests::gradcheck_gdn_lora_weight_grads",
+                  "attention::gdn_backward::tests::gradcheck_gdn_lora_weight_grads_multi_head",
+                  "attention::gdn_backward::tests::forced_gdn_independent_input_gradcheck",
+                  "attention::gdn_backward::tests::forced_gdn_independent_ten_array_gradcheck",
+                  "attention::gdn_backward::tests::source_parity_forward_save_vs_fused_asymmetric_heads",
+              ],
+          }[sys.argv[2]]
+          assert expected, "missing explicit execution population"
+          passed = re.findall(r"^test (\S+)(?: - should panic)? \.\.\. ok$", log, re.M)
+          assert sorted(passed) == sorted(expected), ("test population mismatch", passed)
+          summary = re.findall(r"^test result: ok\. ([0-9]+) passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;", log, re.M)
+          assert summary == [str(len(expected))], ("test count mismatch", summary)
+          PYTEST
+          done
+      - name: inference backward selected benchmark execution
+        run: |
+          set -eu
+          for mode in forced ordinary; do
+            log="${RUNNER_TEMP:-/tmp}/inference-backward-bench-${mode}.log"
+            if [ "$mode" = forced ]; then
+              filter='^backward_stage0/(cross_entropy_backward|linear_vjp|lora_vjp|rmsnorm_backward|rope_backward|swiglu_backward|gqa_backward|gdn_backward)_forced_scalar/tiny$'
+            else
+              filter='^backward_stage0/linear_vjp/tiny$'
+            fi
+            if cargo bench --locked -p lattice-inference --no-default-features \
+              --features train-backward,test-utils --bench backward_stage0 \
+              -- --test "$filter" >"$log" 2>&1
+            then
+              cat "$log"
+            else
+              status=$?
+              cat "$log"
+              exit "$status"
+            fi
+            python3 - "$log" "$mode" <<'PYBENCH'
+          import collections
+          import pathlib
+          import re
+          import sys
+          log = pathlib.Path(sys.argv[1]).read_text()
+          forced = sys.argv[2] == "forced"
+          operations = ["cross_entropy_backward", "linear_vjp", "lora_vjp", "rmsnorm_backward", "rope_backward", "swiglu_backward", "gqa_backward", "gdn_backward"] if forced else ["linear_vjp"]
+          suffix = "_forced_scalar" if forced else ""
+          expected_ids = [f"backward_stage0/{op}{suffix}/tiny" for op in operations]
+          executed = re.findall(r"^Testing (.+)$", log, re.M)
+          assert collections.Counter(executed) == collections.Counter(expected_ids), ("selected benchmark IDs", executed)
+          chunks = re.split(r"^Testing (.+)\n", log, flags=re.M)
+          for index in range(1, len(chunks), 2):
+              assert len(re.findall(r"^Success$", chunks[index + 1], re.M)) == 1, ("benchmark did not complete", chunks[index])
+          fixture_rows = re.findall(r"^BACKWARD_FIXTURE (.*)$", log, re.M)
+          expected_fixtures = [f"operation={op} case=tiny count=1" for op in operations]
+          assert collections.Counter(fixture_rows) == collections.Counter(expected_fixtures), ("unexpected or missing fixture construction", fixture_rows)
+          markers = re.findall(r"^BACKWARD_FORCED (.*)$", log, re.M)
+          expected_markers = [f"operation={op} backend=Scalar" for op in operations] if forced else []
+          assert collections.Counter(markers) == collections.Counter(expected_markers), ("forced execution evidence", markers)
+          PYBENCH
+          done
       # wgpu-gpu is excluded from default builds and was silently broken under
       # --all-features (gpu/inner module-resolution rot) until #194. Build it on
       # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
