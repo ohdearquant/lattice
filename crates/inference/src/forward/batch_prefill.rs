@@ -24,6 +24,10 @@ use crate::model::qwen35::{
 };
 use crate::model::qwen35_config::Qwen35Config;
 
+#[cfg(test)]
+#[path = "batch_prefill_attention_bench.rs"]
+mod attention_bench;
+
 /// Scratch buffers reused across batched prompt prefill.
 ///
 /// Large tensors are stored row-major as flattened `[seq_len, dim]` buffers.
