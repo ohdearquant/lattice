@@ -813,6 +813,24 @@ jobs:
           fi
           grep -q 'test serve::metal_worker::tests::owner_shutdown_deadline_covers_blocking_thread_local_destructor ... ok' "$log"
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference - measurement worker lock lifetime (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/measurement-worker-lock-tests.log"
+          if cargo test --locked -p lattice-inference --features f16,metal-gpu \
+            --lib serve::metal_worker::tests::measurement_worker_guard_ \
+            -- --nocapture >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -Fq 'test serve::metal_worker::tests::measurement_worker_guard_stays_on_the_worker_after_owner_timeout ... ok' "$log"
+          grep -Fq 'test serve::metal_worker::tests::measurement_worker_guard_outlives_work_capture_destruction_and_unwind ... ok' "$log"
+          grep -Fq 'test serve::metal_worker::tests::measurement_worker_guard_releases_after_a_real_factory_load_error ... ok' "$log"
+          grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: embed — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-embed --features metal-gpu -- -D warnings

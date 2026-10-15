@@ -10,6 +10,13 @@ use syn::{Attribute, ItemFn, Meta, Token};
 mod source_graph;
 use source_graph::*;
 
+#[path = "support/measurement_admission.rs"]
+mod measurement_admission;
+#[path = "support/measurement_indirect.rs"]
+mod measurement_indirect;
+#[path = "support/measurement_worker.rs"]
+mod measurement_worker;
+
 #[derive(Clone, Copy)]
 enum CallSelector {
     Path(&'static [&'static str]),
@@ -124,33 +131,256 @@ const STATE_WORK_HELPER_ENTRYPOINTS: &[(&str, CallSelector)] = &[(
     CallSelector::Path(&["run_one"]),
 )];
 
-struct GenerateWorkTarget {
-    path: &'static str,
-    owner: &'static str,
-    receiver: &'static str,
-    calls: usize,
+#[derive(Clone, Copy)]
+enum SyncWorkKind {
+    Metal {
+        initial_assignments: usize,
+    },
+    OtherBackend {
+        reason: &'static str,
+        source_sha256: &'static str,
+        function_sha256: &'static str,
+    },
 }
 
-// Only these reviewed synchronous receivers are covered; other generate methods,
-// mixed CPU/Metal targets, and cross-module wrapper calls need separate contracts.
-const GENERATE_WORK_TARGETS: &[GenerateWorkTarget] = &[
-    GenerateWorkTarget {
+#[derive(Clone, Copy)]
+struct SyncWorkCall {
+    source: &'static str,
+    owner: &'static str,
+    receiver: &'static str,
+    method: &'static str,
+    count: usize,
+    kind: SyncWorkKind,
+}
+
+struct SyncWorkTarget<'a> {
+    path: &'static str,
+    calls: &'a [SyncWorkCall],
+}
+
+// Scan independently of the rows so removing a method contract cannot hide work.
+const SYNC_WORK_METHODS: &[&str] = &[
+    "generate",
+    "generate_streaming_with_cancel",
+    "encode",
+    "encode_profiled",
+    "generate_streaming",
+    "chat_completion",
+    "generate_with_lora_mixture",
+    "load_lora_adapter",
+    "unload_lora_adapter",
+    "compute_perplexity",
+];
+
+const fn sync_metal_call(
+    source: &'static str,
+    owner: &'static str,
+    receiver: &'static str,
+    method: &'static str,
+    count: usize,
+) -> SyncWorkCall {
+    SyncWorkCall {
+        source,
+        owner,
+        receiver,
+        method,
+        count,
+        kind: SyncWorkKind::Metal {
+            initial_assignments: 0,
+        },
+    }
+}
+
+// Callback/helper/worker lifetimes remain separate contracts; this table admits
+// only synchronous bare receivers and exact reviewed other-backend occurrences.
+const SYNC_WORK_TARGETS: &[SyncWorkTarget<'static>] = &[
+    SyncWorkTarget {
         path: "examples/bench_persistent_state.rs",
-        owner: "run",
-        receiver: "state",
-        calls: 2,
+        calls: &[sync_metal_call(
+            "examples/bench_persistent_state.rs",
+            "run",
+            "state",
+            "generate",
+            2,
+        )],
     },
-    GenerateWorkTarget {
+    SyncWorkTarget {
         path: "src/bin/bench_decode_slopefit.rs",
-        owner: "run",
-        receiver: "metal",
-        calls: 2,
+        calls: &[SyncWorkCall {
+            kind: SyncWorkKind::Metal {
+                initial_assignments: 2,
+            },
+            ..sync_metal_call(
+                "src/bin/bench_decode_slopefit.rs",
+                "run",
+                "metal",
+                "generate",
+                2,
+            )
+        }],
     },
-    GenerateWorkTarget {
+    SyncWorkTarget {
         path: "src/bin/dump_quarot_q4_golden.rs",
-        owner: "run",
-        receiver: "metal",
-        calls: 1,
+        calls: &[sync_metal_call(
+            "src/bin/dump_quarot_q4_golden.rs",
+            "run",
+            "metal",
+            "generate",
+            1,
+        )],
+    },
+    SyncWorkTarget {
+        path: "examples/bench_decode_streaming.rs",
+        calls: &[sync_metal_call(
+            "examples/bench_decode_streaming.rs",
+            "run",
+            "metal",
+            "generate_streaming_with_cancel",
+            1,
+        )],
+    },
+    SyncWorkTarget {
+        path: "examples/bench_embedding.rs",
+        calls: &[
+            sync_metal_call("examples/bench_embedding.rs", "main", "model", "encode", 2),
+            SyncWorkCall {
+                source: "examples/bench_embedding.rs",
+                owner: "run_onnx_encode",
+                receiver: "tokenizer",
+                method: "encode",
+                count: 1,
+                kind: SyncWorkKind::OtherBackend {
+                    reason: "tokenizers::Tokenizer encodes ONNX input IDs without Metal work",
+                    source_sha256: "4e1bc3f0de66b4d7798b4b5890a8db5025d4b7f4659609cd184457ba6beeece2",
+                    function_sha256: "30622cfe0d51a8b013e57c0694eb24134929d27d7ac3b6f442522bb72d4375ee",
+                },
+            },
+        ],
+    },
+    SyncWorkTarget {
+        path: "examples/bench_gpu.rs",
+        calls: &[sync_metal_call(
+            "examples/bench_gpu.rs",
+            "run_bench",
+            "cpu_model",
+            "encode",
+            2,
+        )],
+    },
+    SyncWorkTarget {
+        path: "examples/bench_profile.rs",
+        calls: &[
+            sync_metal_call("examples/bench_profile.rs", "main", "model", "encode", 7),
+            sync_metal_call(
+                "examples/bench_profile.rs",
+                "main",
+                "model",
+                "encode_profiled",
+                1,
+            ),
+        ],
+    },
+    SyncWorkTarget {
+        path: "examples/bench_stability.rs",
+        calls: &[sync_metal_call(
+            "examples/bench_stability.rs",
+            "run",
+            "state",
+            "generate_streaming",
+            1,
+        )],
+    },
+    SyncWorkTarget {
+        path: "examples/bench_suite.rs",
+        calls: &[
+            sync_metal_call(
+                "examples/bench_suite.rs",
+                "bench_llm_metal",
+                "metal_state",
+                "generate",
+                2,
+            ),
+            sync_metal_call(
+                "examples/bench_suite.rs",
+                "bench_embedding",
+                "model",
+                "encode",
+                2,
+            ),
+            SyncWorkCall {
+                source: "examples/bench_suite.rs",
+                owner: "bench_llm",
+                receiver: "model",
+                method: "generate",
+                count: 2,
+                kind: SyncWorkKind::OtherBackend {
+                    reason: "Qwen35Model::generate uses the CPU decoder; bench_llm_metal owns the separate Metal state",
+                    source_sha256: "e9375d91f4fe093c42b7fb2ba2f15459a9fc8f2d906534c31f21c0979bfc5827",
+                    function_sha256: "6e90a4d08142b32155d54dad90d2538559f60f373488e21dd4fdab10b4c5963e",
+                },
+            },
+        ],
+    },
+    SyncWorkTarget {
+        path: "src/bin/bench_decode_ab.rs",
+        calls: &[SyncWorkCall {
+            kind: SyncWorkKind::Metal {
+                initial_assignments: 2,
+            },
+            ..sync_metal_call(
+                "src/bin/bench_decode_ab.rs",
+                "run",
+                "metal",
+                "chat_completion",
+                2,
+            )
+        }],
+    },
+    SyncWorkTarget {
+        path: "src/bin/bench_lora_mixture.rs",
+        calls: &[
+            sync_metal_call(
+                "src/bin/bench_lora_mixture.rs",
+                "run_gpu_decode_bench",
+                "metal",
+                "generate_with_lora_mixture",
+                2,
+            ),
+            sync_metal_call(
+                "src/bin/bench_lora_mixture.rs",
+                "run_gpu_decode_bench",
+                "metal",
+                "load_lora_adapter",
+                2,
+            ),
+            sync_metal_call(
+                "src/bin/bench_lora_mixture.rs",
+                "run_gpu_decode_bench",
+                "metal",
+                "unload_lora_adapter",
+                3,
+            ),
+        ],
+    },
+    SyncWorkTarget {
+        path: "src/bin/gramperf_profile.rs",
+        calls: &[sync_metal_call(
+            "src/bin/gramperf_profile.rs",
+            "run",
+            "metal",
+            "generate",
+            3,
+        )],
+    },
+    SyncWorkTarget {
+        path: "src/bin/ppl_metal.rs",
+        calls: &[sync_metal_call(
+            "src/bin/ppl_metal.rs",
+            "main",
+            "metal",
+            "compute_perplexity",
+            1,
+        )],
     },
 ];
 
@@ -3343,29 +3573,57 @@ fn state_driven_metal_measurement_targets_use_live_lock_bindings() {
     );
 }
 
-struct GenerateWorkSyntax<'a> {
-    receiver: &'a str,
+struct SyncWorkSyntax {
     function_depth: usize,
     deferred: bool,
-    sites: Vec<usize>,
+    sites: Vec<(usize, String, String)>,
+    bindings: Vec<(usize, String)>,
+    assignments: Vec<(usize, String)>,
     error: Option<String>,
 }
 
-impl<'ast> Visit<'ast> for GenerateWorkSyntax<'_> {
+impl<'ast> Visit<'ast> for SyncWorkSyntax {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        if call.method == "generate" {
-            self.sites.push(call.method.span().byte_range().start);
+        let method = call.method.to_string();
+        if SYNC_WORK_METHODS.contains(&method.as_str()) {
             if self.deferred {
-                self.error =
-                    Some("deferred generate work is not covered by a lexical guard".into());
-            } else if !matches!(&*call.receiver, syn::Expr::Path(path)
-                if path.attrs.is_empty() && path.qself.is_none()
-                    && path.path.is_ident(self.receiver))
+                self.error = Some(format!(
+                    "deferred {method} work is not covered by a lexical guard"
+                ));
+            }
+            if let syn::Expr::Path(path) = &*call.receiver
+                && path.attrs.is_empty()
+                && path.qself.is_none()
+                && let Some(receiver) = path.path.get_ident()
             {
-                self.error = Some("generate work must use the reviewed bare receiver".into());
+                self.sites.push((
+                    call.method.span().byte_range().start,
+                    receiver.to_string(),
+                    method,
+                ));
+            } else {
+                self.error = Some("synchronous work must use the reviewed bare receiver".into());
             }
         }
         syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_pat_ident(&mut self, binding: &'ast syn::PatIdent) {
+        self.bindings.push((
+            binding.ident.span().byte_range().start,
+            binding.ident.to_string(),
+        ));
+        syn::visit::visit_pat_ident(self, binding);
+    }
+
+    fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+        if let syn::Expr::Path(path) = &*assignment.left
+            && let Some(receiver) = path.path.get_ident()
+        {
+            self.assignments
+                .push((receiver.span().byte_range().start, receiver.to_string()));
+        }
+        syn::visit::visit_expr_assign(self, assignment);
     }
 
     fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
@@ -3399,33 +3657,125 @@ impl<'ast> Visit<'ast> for GenerateWorkSyntax<'_> {
     }
 }
 
-fn validate_generate_work(
-    sources: &[ParsedModuleSource],
-    contract: &GenerateWorkTarget,
+fn sync_source_sha256(source: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(source.as_bytes()))
+}
+
+fn validate_sync_other_backend(
+    parsed: &StructuredSource,
+    syntax: &syn::File,
+    owner: &str,
+    source_sha256: &str,
+    function_sha256: &str,
 ) -> Result<(), String> {
-    let mut count = 0;
+    // The source boundary also pins names imported outside the reviewed function.
+    if sync_source_sha256(&parsed.source) != source_sha256 {
+        return Err("other-backend source provenance changed; re-review its receiver type".into());
+    }
+    let functions = syntax
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == owner => Some(function),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [function] = functions.as_slice() else {
+        return Err("other-backend evidence requires one reviewed top-level function".into());
+    };
+    let start = function.sig.fn_token.span.byte_range().start;
+    let end = function.block.brace_token.span.close().byte_range().end;
+    let function_source = parsed
+        .source
+        .get(start..end)
+        .ok_or("other-backend function source span could not be resolved")?;
+    if sync_source_sha256(function_source) != function_sha256 {
+        return Err(
+            "other-backend function provenance changed; re-review its receiver type".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_sync_work(
+    sources: &[ParsedModuleSource],
+    contract: &SyncWorkTarget<'_>,
+) -> Result<(), String> {
+    let mut keys = BTreeSet::new();
+    if contract.calls.is_empty()
+        || !contract
+            .calls
+            .iter()
+            .any(|call| matches!(call.kind, SyncWorkKind::Metal { .. }))
+    {
+        return Err("synchronous target requires nonempty guarded work".into());
+    }
+    for call in contract.calls {
+        if call.count == 0 || !SYNC_WORK_METHODS.contains(&call.method) {
+            return Err("unsupported or empty synchronous work contract".into());
+        }
+        if !keys.insert((call.source, call.owner, call.receiver, call.method)) {
+            return Err("duplicate synchronous work contract".into());
+        }
+        if let SyncWorkKind::OtherBackend { reason, .. } = call.kind
+            && reason.trim().is_empty()
+        {
+            return Err("other-backend occurrence requires a reviewed reason".into());
+        }
+    }
+    let mut counts = vec![0; contract.calls.len()];
     for source in sources {
         let parsed = &source.parsed;
-        let sites = parsed.call_sites(
-            0..parsed.tokens.len(),
-            CallSelector::Method("generate"),
-            true,
-        )?;
+        let mut sites = Vec::new();
+        for method in SYNC_WORK_METHODS {
+            sites.extend(parsed.call_sites(
+                0..parsed.tokens.len(),
+                CallSelector::Method(method),
+                true,
+            )?);
+        }
+        sites.sort_unstable();
         if sites.is_empty() {
             continue;
         }
-        if source.relative != contract.path {
+        if !contract
+            .calls
+            .iter()
+            .any(|call| call.source == source.relative)
+        {
             return Err(format!(
-                "generate work moved to unreviewed source {}",
+                "synchronous work moved to unreviewed source {}",
                 source.relative
             ));
         }
         let syntax = syn::parse_file(&parsed.source).map_err(|reason| reason.to_string())?;
-        let mut shape = GenerateWorkSyntax {
-            receiver: contract.receiver,
+        for call in contract
+            .calls
+            .iter()
+            .filter(|call| call.source == source.relative)
+        {
+            if let SyncWorkKind::OtherBackend {
+                source_sha256,
+                function_sha256,
+                ..
+            } = call.kind
+            {
+                validate_sync_other_backend(
+                    parsed,
+                    &syntax,
+                    call.owner,
+                    source_sha256,
+                    function_sha256,
+                )?;
+            }
+        }
+        let mut shape = SyncWorkSyntax {
             function_depth: 0,
             deferred: false,
             sites: Vec::new(),
+            bindings: Vec::new(),
+            assignments: Vec::new(),
             error: None,
         };
         shape.visit_file(&syntax);
@@ -3437,32 +3787,106 @@ fn validate_generate_work(
             .iter()
             .map(|site| parsed.tokens[*site].offset)
             .collect::<Vec<_>>();
-        if shape.sites != offsets {
-            return Err("generate work has unsupported syntax outside parsed method calls".into());
+        if shape
+            .sites
+            .iter()
+            .map(|(offset, _, _)| *offset)
+            .collect::<Vec<_>>()
+            != offsets
+        {
+            return Err(
+                "synchronous work has unsupported syntax outside parsed method calls".into(),
+            );
         }
-        for site in &sites {
+        let mut guarded = Vec::new();
+        let mut receivers = BTreeMap::new();
+        for (site, (_, receiver, method)) in sites.iter().zip(&shape.sites) {
             let owner = parsed.enclosing_function_path(*site);
-            if owner != contract.owner {
-                return Err(format!("generate work has unreviewed owner {owner}"));
-            }
+            let Some((index, call)) = contract.calls.iter().enumerate().find(|(_, call)| {
+                call.source == source.relative
+                    && call.owner == owner
+                    && call.receiver == receiver
+                    && call.method == method
+            }) else {
+                return Err(format!(
+                    "unreviewed owner/receiver/method {owner}/{receiver}/{method}; expected reviewed bare receiver"
+                ));
+            };
             if !parsed.formula_at(*site)?.satisfiable()? {
-                return Err("generate work includes an inactive Metal call site".into());
+                return Err("synchronous work includes an inactive Metal call site".into());
+            }
+            counts[index] += 1;
+            if let SyncWorkKind::Metal {
+                initial_assignments,
+            } = call.kind
+            {
+                guarded.push(*site);
+                let entry = receivers
+                    .entry((call.owner, call.receiver))
+                    .or_insert((parsed.tokens[*site].offset, initial_assignments));
+                if entry.1 != initial_assignments {
+                    return Err("receiver has inconsistent initialization contracts".into());
+                }
             }
         }
-        parsed.validate_work_sites(&sites, SHARED_LOCK_SELECTOR, GuardRequirement::Lexical)?;
-        count += sites.len();
+        for ((owner, receiver), (first_work, expected_assignments)) in receivers {
+            let belongs = |offset: usize, name: &str| {
+                name == receiver
+                    && parsed
+                        .tokens
+                        .iter()
+                        .position(|token| token.offset == offset)
+                        .is_some_and(|token| parsed.enclosing_function_path(token) == owner)
+            };
+            let bindings = shape
+                .bindings
+                .iter()
+                .filter(|(offset, name)| belongs(*offset, name))
+                .collect::<Vec<_>>();
+            let assignments = shape
+                .assignments
+                .iter()
+                .filter(|(offset, name)| belongs(*offset, name))
+                .collect::<Vec<_>>();
+            if bindings.len() != 1
+                || bindings[0].0 >= first_work
+                || assignments.len() != expected_assignments
+                || assignments.iter().any(|(offset, _)| *offset >= first_work)
+            {
+                return Err(format!(
+                    "reviewed receiver {owner}/{receiver} was rebound or its initialization changed"
+                ));
+            }
+        }
+        if !guarded.is_empty() {
+            parsed.validate_work_sites(
+                &guarded,
+                SHARED_LOCK_SELECTOR,
+                GuardRequirement::Lexical,
+            )?;
+        }
     }
-    if count != contract.calls {
-        return Err(format!(
-            "generate work count changed: expected {}, found {count}",
-            contract.calls
-        ));
+    for (call, count) in contract.calls.iter().zip(counts) {
+        if count != call.count {
+            return Err(format!(
+                "synchronous work count changed for {}/{}/{}: expected {}, found {count}",
+                call.owner, call.receiver, call.method, call.count
+            ));
+        }
     }
     Ok(())
 }
 
+fn dispatch_sync_work(
+    sources: &[ParsedModuleSource],
+    contract: &SyncWorkTarget<'_>,
+) -> Result<&'static str, String> {
+    validate_sync_work(sources, contract)?;
+    Ok(contract.path)
+}
+
 #[test]
-fn reviewed_metal_generate_targets_use_live_lock_bindings() {
+fn reviewed_synchronous_metal_targets_use_live_lock_bindings() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let already_owned = RAW_HARNESS_ENTRYPOINTS
         .iter()
@@ -3470,18 +3894,18 @@ fn reviewed_metal_generate_targets_use_live_lock_bindings() {
         .map(|(path, _)| *path)
         .chain(TARGETS_WITH_STATE_DRIVEN_WORK.iter().copied())
         .collect::<BTreeSet<_>>();
-    let expected = GENERATE_WORK_TARGETS
+    let expected = SYNC_WORK_TARGETS
         .iter()
         .map(|target| target.path)
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected.len(),
-        GENERATE_WORK_TARGETS.len(),
-        "duplicate generate work target"
+        SYNC_WORK_TARGETS.len(),
+        "duplicate synchronous work target"
     );
     assert!(
         expected.is_disjoint(&already_owned),
-        "generate work target already has an owner"
+        "synchronous work target already has an owner"
     );
     assert!(
         expected
@@ -3496,29 +3920,34 @@ fn reviewed_metal_generate_targets_use_live_lock_bindings() {
             .strip_prefix(manifest_dir)
             .expect("source under manifest directory")
             .to_string_lossy();
-        let Some(contract) = GENERATE_WORK_TARGETS
+        let Some(contract) = SYNC_WORK_TARGETS
             .iter()
             .find(|target| target.path == relative.as_ref())
         else {
             continue;
         };
-        actual.insert(contract.path);
         let sources = parsed_module_closure(manifest_dir, &path, false)
             .unwrap_or_else(|reason| panic!("{reason}"));
-        validate_generate_work(&sources, contract)
-            .unwrap_or_else(|reason| panic!("{}: {reason}", contract.path));
+        actual.insert(
+            dispatch_sync_work(&sources, contract)
+                .unwrap_or_else(|reason| panic!("{}: {reason}", contract.path)),
+        );
     }
     assert_eq!(
         actual, expected,
-        "reviewed generate work target is no longer a Cargo root"
+        "reviewed synchronous work target is no longer a Cargo root"
     );
 }
 
-const GENERATE_WORK_FIXTURE: GenerateWorkTarget = GenerateWorkTarget {
+const GENERATE_WORK_FIXTURE: SyncWorkTarget<'static> = SyncWorkTarget {
     path: "examples/generate_fixture.rs",
-    owner: "run",
-    receiver: "metal",
-    calls: 2,
+    calls: &[sync_metal_call(
+        "examples/generate_fixture.rs",
+        "run",
+        "metal",
+        "generate",
+        2,
+    )],
 };
 const GENERATE_WORK_SOURCE: &str = r#"
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -3533,12 +3962,16 @@ fn run() {
 "#;
 
 fn generate_work_fixture(source: &str) -> Result<(), String> {
-    validate_generate_work(
+    sync_work_fixture(source, &GENERATE_WORK_FIXTURE)
+}
+
+fn sync_work_fixture(source: &str, contract: &SyncWorkTarget<'_>) -> Result<(), String> {
+    validate_sync_work(
         &[ParsedModuleSource {
-            relative: GENERATE_WORK_FIXTURE.path.into(),
-            parsed: StructuredSource::parse(GENERATE_WORK_FIXTURE.path, source, false)?,
+            relative: contract.path.into(),
+            parsed: StructuredSource::parse(contract.path, source, false)?,
         }],
-        &GENERATE_WORK_FIXTURE,
+        contract,
     )
 }
 
@@ -3683,11 +4116,416 @@ fn generate_wrapper_rejects_unreviewed_or_deferred_work() {
         relative: "examples/other.rs".into(),
         parsed: StructuredSource::parse("moved fixture", GENERATE_WORK_SOURCE, false).unwrap(),
     };
-    let error = validate_generate_work(&[source], &GENERATE_WORK_FIXTURE)
+    let error = validate_sync_work(&[source], &GENERATE_WORK_FIXTURE)
         .expect_err("work moved to an unreviewed module");
     assert!(
         error.contains("unreviewed source"),
         "wrong failure: {error}"
+    );
+}
+
+#[test]
+fn synchronous_wrappers_check_every_supported_method_and_streaming_callback() {
+    for &method in SYNC_WORK_METHODS {
+        let calls = [SyncWorkCall {
+            method,
+            ..GENERATE_WORK_FIXTURE.calls[0]
+        }];
+        let contract = SyncWorkTarget {
+            calls: &calls,
+            ..GENERATE_WORK_FIXTURE
+        };
+        let source = GENERATE_WORK_SOURCE.replace(".generate(", &format!(".{method}("));
+        sync_work_fixture(&source, &contract).unwrap_or_else(|reason| panic!("{method}: {reason}"));
+        let without_guard = source.replace(SHARED_LOCK_CALL, "fake_lock()");
+        assert!(
+            sync_work_fixture(&without_guard, &contract).is_err(),
+            "{method}"
+        );
+        let unsupported = [SyncWorkCall {
+            method: "unsupported_selector",
+            ..calls[0]
+        }];
+        let unsupported = SyncWorkTarget {
+            calls: &unsupported,
+            ..contract
+        };
+        assert!(
+            sync_work_fixture(&source, &unsupported).is_err(),
+            "{method}"
+        );
+    }
+    let calls = [sync_metal_call(
+        GENERATE_WORK_FIXTURE.path,
+        "run",
+        "metal",
+        "generate_streaming_with_cancel",
+        2,
+    )];
+    let contract = SyncWorkTarget {
+        calls: &calls,
+        ..GENERATE_WORK_FIXTURE
+    };
+    let source = GENERATE_WORK_SOURCE
+        .replace(".generate(", ".generate_streaming_with_cancel(")
+        .replace("\"warmup\");", "\"warmup\", |token| record(token));");
+    sync_work_fixture(&source, &contract)
+        .expect("callback argument does not defer its enclosing call");
+    let moved = source.replace(
+        "record(token)",
+        "metal.generate_streaming_with_cancel(token)",
+    );
+    assert!(
+        sync_work_fixture(&moved, &contract)
+            .unwrap_err()
+            .contains("deferred")
+    );
+}
+
+#[test]
+fn synchronous_wrappers_reject_guard_lifetime_and_cfg_mutations() {
+    generate_work_fixture(GENERATE_WORK_SOURCE).unwrap();
+    for (label, before, after) in [
+        (
+            "drop",
+            "metal.generate(\"warmup\");",
+            "drop(_gpu_lock); metal.generate(\"warmup\");",
+        ),
+        (
+            "move",
+            "metal.generate(\"warmup\");",
+            "consume(_gpu_lock); metal.generate(\"warmup\");",
+        ),
+        (
+            "shadow guard",
+            "metal.generate(\"warmup\");",
+            "let _gpu_lock = (); metal.generate(\"warmup\");",
+        ),
+        ("wildcard", "let _gpu_lock =", "let _ ="),
+        ("fake", SHARED_LOCK_CALL, "fake_lock()"),
+        (
+            "weaker cfg",
+            "let _gpu_lock =",
+            "#[cfg(feature = \"extra\")] let _gpu_lock =",
+        ),
+        (
+            "inactive guard",
+            "let _gpu_lock =",
+            "#[cfg(any())] let _gpu_lock =",
+        ),
+        (
+            "inactive call",
+            "metal.generate(\"warmup\");",
+            "#[cfg(any())] { metal.generate(\"warmup\"); }",
+        ),
+    ] {
+        assert_eq!(GENERATE_WORK_SOURCE.matches(before).count(), 1, "{label}");
+        let source = GENERATE_WORK_SOURCE.replace(before, after);
+        assert!(generate_work_fixture(&source).is_err(), "{label}");
+    }
+    let source = GENERATE_WORK_SOURCE
+        .replace(
+            "let _gpu_lock = lattice_inference::measurement::gpu_test_lock();",
+            "{ let _gpu_lock = lattice_inference::measurement::gpu_test_lock(); }",
+        )
+        .replace(
+            "metal.generate(prompt);",
+            "metal.generate(prompt); let _later = lattice_inference::measurement::gpu_test_lock();",
+        );
+    assert!(
+        generate_work_fixture(&source).is_err(),
+        "later reacquisition cannot protect earlier work"
+    );
+    let source = GENERATE_WORK_SOURCE
+        .replace(
+            "metal.generate(\"warmup\");",
+            "#[cfg(any())] { metal.generate(\"warmup\"); }",
+        )
+        .replace(
+            "let _gpu_lock = lattice_inference::measurement::gpu_test_lock();",
+            "",
+        );
+    assert!(
+        generate_work_fixture(&source).is_err(),
+        "inactive decoy cannot hide live unguarded work"
+    );
+}
+
+#[test]
+fn synchronous_wrappers_reject_receiver_alias_shadow_and_reassignment() {
+    for (label, replacement) in [
+        (
+            "alias",
+            "let alias = &mut metal; alias.generate(\"warmup\");",
+        ),
+        (
+            "shadow",
+            "let mut metal = other; metal.generate(\"warmup\");",
+        ),
+        ("assignment", "metal = other; metal.generate(\"warmup\");"),
+        (
+            "late assignment",
+            "metal.generate(\"warmup\"); metal = other;",
+        ),
+        (
+            "method alias",
+            "let invoke = State::generate; invoke(&mut metal, \"warmup\");",
+        ),
+    ] {
+        let source = GENERATE_WORK_SOURCE.replace("metal.generate(\"warmup\");", replacement);
+        assert!(generate_work_fixture(&source).is_err(), "{label}");
+    }
+    let source = GENERATE_WORK_SOURCE.replace(
+        "let mut metal = MetalQwen35State::from_q4_dir();",
+        "let mut metal; if q4 { metal = State::from_q4_dir(); } else { metal = State::new(); }",
+    );
+    let calls = [SyncWorkCall {
+        kind: SyncWorkKind::Metal {
+            initial_assignments: 2,
+        },
+        ..GENERATE_WORK_FIXTURE.calls[0]
+    }];
+    let contract = SyncWorkTarget {
+        calls: &calls,
+        ..GENERATE_WORK_FIXTURE
+    };
+    sync_work_fixture(&source, &contract)
+        .expect("reviewed initialization alternatives precede all work");
+    let source = source.replace(
+        "metal.generate(prompt);",
+        "metal = State::new(); metal.generate(prompt);",
+    );
+    assert!(sync_work_fixture(&source, &contract).is_err());
+}
+
+#[test]
+fn synchronous_mixed_backend_occurrences_are_closed_and_exact() {
+    let source = format!("{GENERATE_WORK_SOURCE}\nfn cpu() {{ model.generate(\"CPU\"); }}\n");
+    let calls = [
+        GENERATE_WORK_FIXTURE.calls[0],
+        SyncWorkCall {
+            source: GENERATE_WORK_FIXTURE.path,
+            owner: "cpu",
+            receiver: "model",
+            method: "generate",
+            count: 1,
+            kind: SyncWorkKind::OtherBackend {
+                reason: "reviewed CPU-only fixture receiver",
+                source_sha256: "c9cf9c1d6930bb58f68dd9ce55ccf80983c9e9383dc5ec74e75ae472c84a8c09",
+                function_sha256: "0bbbb28236d45f2020f621ba694014f10d6e9b105660bd483c4e82f70683db22",
+            },
+        },
+    ];
+    let contract = SyncWorkTarget {
+        calls: &calls,
+        ..GENERATE_WORK_FIXTURE
+    };
+    sync_work_fixture(&source, &contract).expect("exact other-backend row needs no Metal guard");
+    for (label, before, after) in [
+        (
+            "extra other-backend occurrence",
+            "model.generate(\"CPU\");",
+            "model.generate(\"CPU\"); model.generate(\"extra\");",
+        ),
+        (
+            "unknown receiver",
+            "model.generate(\"CPU\");",
+            "another.generate(\"CPU\");",
+        ),
+        ("unknown owner", "fn cpu()", "fn another()"),
+        (
+            "new method",
+            "model.generate(\"CPU\");",
+            "model.generate(\"CPU\"); model.encode(\"extra\");",
+        ),
+    ] {
+        assert!(
+            sync_work_fixture(&source.replace(before, after), &contract).is_err(),
+            "{label}"
+        );
+    }
+    assert!(
+        generate_work_fixture(&source).is_err(),
+        "removing an exemption cannot suppress its calls"
+    );
+    let mut malformed = calls;
+    malformed[1].kind = SyncWorkKind::OtherBackend {
+        reason: " ",
+        source_sha256: "c9cf9c1d6930bb58f68dd9ce55ccf80983c9e9383dc5ec74e75ae472c84a8c09",
+        function_sha256: "0bbbb28236d45f2020f621ba694014f10d6e9b105660bd483c4e82f70683db22",
+    };
+    assert!(
+        sync_work_fixture(
+            &source,
+            &SyncWorkTarget {
+                calls: &malformed,
+                ..contract
+            }
+        )
+        .is_err()
+    );
+    let duplicate = [calls[0], calls[0], calls[1]];
+    assert!(
+        sync_work_fixture(
+            &source,
+            &SyncWorkTarget {
+                calls: &duplicate,
+                ..contract
+            }
+        )
+        .is_err()
+    );
+    let stale = [
+        calls[0],
+        SyncWorkCall {
+            count: 2,
+            ..calls[1]
+        },
+    ];
+    assert!(
+        sync_work_fixture(
+            &source,
+            &SyncWorkTarget {
+                calls: &stale,
+                ..contract
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn synchronous_other_backend_receivers_require_reviewed_provenance() {
+    for (owner, receiver, method, function, source_hash, function_hash, before, after) in [
+        (
+            "cpu",
+            "model",
+            "generate",
+            "fn cpu(model: &lattice_inference::model::qwen35::Qwen35Model) { model.generate(\"CPU\", &config); }",
+            "a5ad1d96a2d1a578a8cc6d9513f295cfbef015d28fe88bbb03976f4ffade4086",
+            "38b5188d4898743e359631338a1923e1d251b0d26e105c4cd822cca39125df37",
+            "lattice_inference::model::qwen35::Qwen35Model",
+            "lattice_inference::forward::metal_qwen35::MetalQwen35State",
+        ),
+        (
+            "tokenize",
+            "tokenizer",
+            "encode",
+            "fn tokenize(tokenizer: &tokenizers::Tokenizer) { tokenizer.encode(\"CPU\", true); }",
+            "382ad104fa160ff8aadd48f9a69500729172facd83a38b1234542ae27c79125c",
+            "fee1034261162b88b3db6ca0e27939e4aab2b3c2012cb57543442a64fd9c454e",
+            "tokenizers::Tokenizer",
+            "lattice_inference::QwenModel",
+        ),
+    ] {
+        let source = format!("{GENERATE_WORK_SOURCE}\n{function}\n");
+        let calls = [
+            GENERATE_WORK_FIXTURE.calls[0],
+            SyncWorkCall {
+                source: GENERATE_WORK_FIXTURE.path,
+                owner,
+                receiver,
+                method,
+                count: 1,
+                kind: SyncWorkKind::OtherBackend {
+                    reason: "reviewed non-Metal receiver type in source fixture",
+                    source_sha256: source_hash,
+                    function_sha256: function_hash,
+                },
+            },
+        ];
+        let contract = SyncWorkTarget {
+            calls: &calls,
+            ..GENERATE_WORK_FIXTURE
+        };
+        sync_work_fixture(&source, &contract).expect("reviewed receiver provenance");
+        assert_eq!(source.matches(before).count(), 1);
+        let changed = source.replace(before, after);
+        let selector = format!(".{method}(");
+        assert_eq!(
+            source.matches(&selector).count(),
+            changed.matches(&selector).count()
+        );
+        assert!(
+            sync_work_fixture(&changed, &contract)
+                .unwrap_err()
+                .contains("provenance"),
+            "receiver type changed without changing owner/receiver/method/count"
+        );
+
+        let rebound_namespace = format!("use crate::metal_backend as lattice_inference;\n{source}");
+        assert!(
+            sync_work_fixture(&rebound_namespace, &contract)
+                .unwrap_err()
+                .contains("source provenance"),
+            "outer namespace binding changed with identical function bytes"
+        );
+        let mut wrong_function = calls;
+        wrong_function[1].kind = SyncWorkKind::OtherBackend {
+            reason: "reviewed non-Metal receiver type in source fixture",
+            source_sha256: source_hash,
+            function_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        };
+        assert!(
+            sync_work_fixture(
+                &source,
+                &SyncWorkTarget {
+                    calls: &wrong_function,
+                    ..contract
+                }
+            )
+            .unwrap_err()
+            .contains("function provenance")
+        );
+    }
+}
+
+#[test]
+fn synchronous_method_rows_cannot_remove_protected_work_from_discovery() {
+    let source = GENERATE_WORK_SOURCE.replace(
+        "metal.generate(prompt);",
+        "metal.generate(prompt); metal.encode_profiled(prompt);",
+    );
+    let calls = [
+        GENERATE_WORK_FIXTURE.calls[0],
+        sync_metal_call(
+            GENERATE_WORK_FIXTURE.path,
+            "run",
+            "metal",
+            "encode_profiled",
+            1,
+        ),
+    ];
+    let contract = SyncWorkTarget {
+        calls: &calls,
+        ..GENERATE_WORK_FIXTURE
+    };
+    sync_work_fixture(&source, &contract).unwrap();
+    assert!(
+        generate_work_fixture(&source).is_err(),
+        "deleted method row must leave an unclassified occurrence"
+    );
+    let no_work = SyncWorkTarget {
+        calls: &[],
+        ..GENERATE_WORK_FIXTURE
+    };
+    assert!(sync_work_fixture(GENERATE_WORK_SOURCE, &no_work).is_err());
+}
+
+#[test]
+fn synchronous_dispatch_refuses_unvalidated_sources() {
+    let make_source = |source: &str| ParsedModuleSource {
+        relative: GENERATE_WORK_FIXTURE.path.into(),
+        parsed: StructuredSource::parse(GENERATE_WORK_FIXTURE.path, source, false).unwrap(),
+    };
+    assert_eq!(
+        dispatch_sync_work(&[make_source(GENERATE_WORK_SOURCE)], &GENERATE_WORK_FIXTURE).unwrap(),
+        GENERATE_WORK_FIXTURE.path
+    );
+    let unguarded = GENERATE_WORK_SOURCE.replace(SHARED_LOCK_CALL, "fake_lock()");
+    assert!(
+        dispatch_sync_work(&[make_source(&unguarded)], &GENERATE_WORK_FIXTURE).is_err(),
+        "removing validator invocation must not certify a target"
     );
 }
 
@@ -4842,6 +5680,11 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
             validate_bench_harness_sources(&sources, contract)
                 .unwrap_or_else(|reason| panic!("{}: {reason}", contract.path));
         }
+        let worker_owned = target_relative == measurement_worker::TARGET;
+        if worker_owned {
+            measurement_worker::validate_target(&sources)
+                .unwrap_or_else(|reason| panic!("{target_relative}: {reason}"));
+        }
         for source in &sources {
             let site_prefix = format!("{}:{}:{}", target.kind, target.name, target_relative);
             let mut ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
@@ -4897,7 +5740,7 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
                 ) else {
                     continue;
                 };
-                if caller_owned.is_some() {
+                if caller_owned.is_some() || worker_owned {
                     // The same gate verifies the exact construction inventory,
                     // all caller edges, live owner guards, and registration.
                     tally.classified.insert(site);
