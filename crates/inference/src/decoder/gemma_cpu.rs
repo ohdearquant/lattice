@@ -1,12 +1,9 @@
 //! `GemmaCpuSession`: the Gemma 4 E2B text CPU concrete [`super::DecoderSession`]
 //! (ADR-090 row R04), the Gemma sibling of [`super::qwen_cpu::QwenCpuSession`].
 //!
-//! Wraps `Gemma4Model`'s per-token `forward_step`
-//! (`crates/inference/src/model/gemma4_model.rs`) behind the object-safe session
-//! boundary D1 introduces. Unlike Qwen, Gemma has no batched-prefill fallback
-//! ladder to reproduce: sequential prefill via `forward_step` is explicitly
-//! permitted for this row (ADR-090 D2, "current Gemma text prefill may remain
-//! sequential").
+//! Wraps `Gemma4Model`'s bounded prompt prefill and per-token `forward_step`
+//! behind the object-safe session boundary D1 introduces. Short or invalid-ID
+//! prompts retain sequential prefill; eligible prompts commit complete chunks.
 //!
 //! **Owned state**: a fresh [`Gemma4KvCache`] and [`Gemma4Scratch`] per request
 //! (mirroring what [`Gemma4Model::generate_greedy_with_probe`] itself allocates
@@ -120,36 +117,20 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         &CAPABILITIES
     }
 
-    /// Sequential prefill over `self.prompt_ids` via `Gemma4Model::forward_step`,
-    /// one token at a time (ADR-090 D2 explicitly permits this for Gemma;
-    /// there is no batched-prefill fallback ladder to reproduce here, unlike
-    /// `QwenCpuSession::prefill`). Advances `self.position` by one per token.
+    /// Prefill over `self.prompt_ids`, committing only complete tokens or chunks.
     /// Does not sample: the last position's logits are left in
     /// `self.scratch.logits` for the first `select` to read, exactly like
     /// `Gemma4Model::generate_greedy`'s own prefill loop. `prediction: None`
     /// in the returned `StepStamp` reflects that nothing has been opened in
     /// the ledger yet.
     fn prefill(&mut self, cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
-        if cancel.is_cancelled() {
-            return Err(InferenceError::Inference("cancelled before prefill".into()));
-        }
-
-        let prompt_len = self.prompt_ids.len();
-        for i in 0..prompt_len {
-            if cancel.is_cancelled() {
-                return Err(InferenceError::Inference("cancelled during prefill".into()));
-            }
-            let token_id = self.prompt_ids[i];
-            self.model.forward_step_impl(
-                token_id,
-                self.position,
-                &mut self.cache,
-                &mut self.scratch,
-                &[],
-                i + 1 == prompt_len,
-            )?;
-            self.position += 1;
-        }
+        self.model.prefill_prompt(
+            &self.prompt_ids,
+            &mut self.position,
+            &mut self.cache,
+            &mut self.scratch,
+            cancel,
+        )?;
 
         Ok(StepStamp {
             evaluated_len: self.position,
@@ -623,6 +604,175 @@ mod tests {
         );
     }
 
+    mod batch_prefill_controls {
+        use super::*;
+        use std::cell::Cell;
+
+        fn prompt(len: usize) -> Vec<u32> {
+            (0..len).map(|i| 2 + (i % 13) as u32).collect()
+        }
+
+        fn close(actual: &[f32], expected: &[f32]) {
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&a, &b)) in actual.iter().zip(expected).enumerate() {
+                assert!(a.is_finite() && b.is_finite(), "nonfinite at {index}");
+                assert!(
+                    (a - b).abs() <= 5e-5 + 5e-5 * a.abs().max(b.abs()),
+                    "value {index}: {a} != {b}"
+                );
+            }
+        }
+
+        #[test]
+        fn long_session_matches_scalar_prefill_and_two_selections() {
+            let model = tiny_nonzero_model();
+            let config = GenerateConfig {
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                ..Default::default()
+            };
+            for len in [63, 64, 65, 127, 128, 129] {
+                let ids = prompt(len);
+                let mut actual =
+                    GemmaCpuSession::new(&model, ids.clone(), 0.0, Some(7), len + 2).unwrap();
+                let mut expected =
+                    GemmaCpuSession::new(&model, ids.clone(), 0.0, Some(7), len + 2).unwrap();
+                for (position, &token) in ids.iter().enumerate() {
+                    model
+                        .forward_step(
+                            token,
+                            position,
+                            &mut expected.cache,
+                            &mut expected.scratch,
+                            &[],
+                        )
+                        .unwrap();
+                    expected.position += 1;
+                }
+                actual.scratch.logits.fill(f32::NAN);
+                let stamp = actual.prefill(&|| false).unwrap();
+                assert_eq!(stamp.evaluated_len, len);
+                assert_eq!(stamp.prediction, None);
+                let mut history = ids;
+                for step in 0..=2 {
+                    assert_eq!(actual.position, len + step);
+                    assert_eq!(actual.position, expected.position);
+                    close(&actual.scratch.logits, &expected.scratch.logits);
+                    close(
+                        actual.cache.k_view(0).unwrap(),
+                        expected.cache.k_view(0).unwrap(),
+                    );
+                    close(
+                        actual.cache.v_view(0).unwrap(),
+                        expected.cache.v_view(0).unwrap(),
+                    );
+                    if step == 2 {
+                        break;
+                    }
+                    let request = SelectionRequest {
+                        config: &config,
+                        history: &history,
+                        grammar_mask: None,
+                    };
+                    let SelectOutcome::Candidate(a) = actual.select(&request).unwrap() else {
+                        panic!("unconstrained selection");
+                    };
+                    let SelectOutcome::Candidate(b) = expected.select(&request).unwrap() else {
+                        panic!("unconstrained selection");
+                    };
+                    assert_eq!(a.candidate_id, b.candidate_id);
+                    actual
+                        .decode(
+                            &AcceptedToken {
+                                final_id: a.candidate_id,
+                                prediction: a.prediction,
+                            },
+                            &|| false,
+                        )
+                        .unwrap();
+                    expected
+                        .decode(
+                            &AcceptedToken {
+                                final_id: b.candidate_id,
+                                prediction: b.prediction,
+                            },
+                            &|| false,
+                        )
+                        .unwrap();
+                    history.push(a.candidate_id);
+                }
+            }
+        }
+
+        #[test]
+        fn long_session_enters_batch_before_advancing_position() {
+            let model = tiny_nonzero_model();
+            let mut session = GemmaCpuSession::new(&model, prompt(65), 0.0, Some(7), 67).unwrap();
+            session.scratch.logits.fill(1234.0);
+            let polls = Cell::new(0);
+            let cancel = || {
+                let poll = polls.get();
+                polls.set(poll + 1);
+                poll == 2
+            };
+            assert!(session.prefill_interruptible(&cancel).unwrap().is_none());
+            assert_eq!(polls.get(), 3);
+            assert_eq!(session.position, 0);
+            assert_eq!(session.cache.seq_len(0).unwrap(), 0);
+            assert!(session.scratch.logits.iter().all(|&value| value == 1234.0));
+        }
+
+        #[test]
+        fn long_invalid_tail_keeps_scalar_prefix_and_cancellation_precedence() {
+            let model = tiny_nonzero_model();
+            let mut ids = prompt(129);
+            ids[65] = model.config.vocab_size as u32;
+            for cancel_after in [Some(0), Some(3), Some(65), None] {
+                let mut session =
+                    GemmaCpuSession::new(&model, ids.clone(), 0.0, Some(7), 131).unwrap();
+                session.scratch.logits.fill(1234.0);
+                let polls = Cell::new(0);
+                let cancel = || {
+                    let poll = polls.get();
+                    polls.set(poll + 1);
+                    cancel_after.is_some_and(|completed| poll > completed)
+                };
+                let error = session.prefill(&cancel).unwrap_err();
+                let completed = cancel_after.unwrap_or(65);
+                if cancel_after.is_some() {
+                    assert!(error.to_string().contains("cancelled during prefill"));
+                } else {
+                    assert!(matches!(error, InferenceError::InvalidInput(_)));
+                }
+                assert_eq!(session.position, completed);
+                assert_eq!(session.cache.seq_len(0).unwrap(), completed);
+                assert_eq!(polls.get(), completed + 2);
+                assert!(session.scratch.logits.iter().all(|&value| value == 1234.0));
+                let mut cache = model.new_cache(131).unwrap();
+                let mut scratch = Gemma4Scratch::new(&model.config);
+                for (position, &token) in ids[..completed].iter().enumerate() {
+                    model
+                        .forward_step(token, position, &mut cache, &mut scratch, &[])
+                        .unwrap();
+                }
+                assert_eq!(session.cache.k_view(0).unwrap(), cache.k_view(0).unwrap());
+                assert_eq!(session.cache.v_view(0).unwrap(), cache.v_view(0).unwrap());
+            }
+        }
+
+        #[test]
+        fn public_greedy_uses_batch_and_preserves_probe_continuation() {
+            let model = tiny_nonzero_model();
+            let ids = prompt(129);
+            let actual = model.generate_greedy(&ids, 2, 131).unwrap();
+            let (expected, _, _) = model
+                .generate_greedy_with_probe(&ids, 2, 131, &[0])
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), 2);
+        }
+    }
+
     mod driver_lifecycle_regressions {
         use super::*;
         use crate::decoder::driver;
@@ -747,6 +897,73 @@ mod tests {
                 || panic!("incomplete prefill must not report completion"),
                 || panic!("incomplete prefill must not flush a tail"),
             )
+        }
+
+        mod batch_prefill_controls {
+            use super::*;
+
+            #[test]
+            fn every_batch_cancel_boundary_poisoned_once_without_output() {
+                let model = tiny_nonzero_model();
+                let ids: Vec<u32> = (0..65).map(|i| 2 + (i % 13) as u32).collect();
+                let mut probe =
+                    GemmaCpuSession::new(&model, ids.clone(), 0.0, Some(7), 67).unwrap();
+                let total = Cell::new(0);
+                probe
+                    .prefill(&|| {
+                        total.set(total.get() + 1);
+                        false
+                    })
+                    .unwrap();
+                // Session polls: initial; each chunk entry; kernel/layer/query; publication.
+                // Driver adds its own initial poll before the interruptible adapter.
+                let mut partial_chunk = false;
+                let mut completed_chunk = false;
+                for fail_cleanup in [false, true] {
+                    for cancelled_poll in 1..=total.get() {
+                        let mut session = RecordingGemmaSession::new(&model, vec![2], fail_cleanup);
+                        session.inner =
+                            GemmaCpuSession::new(&model, ids.clone(), 0.0, Some(7), 67).unwrap();
+                        session.inner.scratch.logits.fill(1234.0);
+                        let polls = Cell::new(0);
+                        let cancel = || {
+                            let poll = polls.get();
+                            polls.set(poll + 1);
+                            poll == cancelled_poll
+                        };
+                        let mut text = String::new();
+                        let mut offsets = Vec::new();
+                        let result =
+                            run_prefill_only(&mut session, &ids, &cancel, &mut text, &mut offsets);
+                        if fail_cleanup {
+                            let Err(error) = result else {
+                                panic!("failed cleanup must preserve its error");
+                            };
+                            assert!(error.to_string().contains("synthetic cleanup failure"));
+                        } else {
+                            let result = result.unwrap();
+                            assert_eq!(result.stop_reason, StopReason::Interrupt);
+                            assert!(result.generated_ids.is_empty());
+                            assert!(result.token_logprobs.is_empty());
+                        }
+                        assert!(text.is_empty() && offsets.is_empty());
+                        assert_eq!(polls.get(), cancelled_poll + 1);
+                        assert_eq!(session.finishes, vec![FinishDisposition::Poisoned]);
+                        assert_eq!(session.interruptible_prefill_calls, 1);
+                        assert_eq!(session.plain_prefill_calls, 0);
+                        assert_eq!(session.select_calls, 0);
+                        assert_eq!(session.decode_calls, 0);
+                        assert_eq!(session.metadata_calls, 0);
+                        assert!(session.inner.scratch.logits.iter().all(|&v| v == 1234.0));
+                        assert!(matches!(session.inner.position, 0 | 64));
+                        let cached = session.inner.cache.seq_len(0).unwrap();
+                        partial_chunk |= cached > session.inner.position;
+                        completed_chunk |= session.inner.position == 64;
+                    }
+                }
+                assert!(partial_chunk, "must cancel after an actual donor append");
+                assert!(completed_chunk, "must cancel after one completed chunk");
+            }
         }
 
         #[test]

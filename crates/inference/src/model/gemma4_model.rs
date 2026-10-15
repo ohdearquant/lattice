@@ -3,9 +3,8 @@
 //! Assembles the already-merged stages: config/loader preflight (#996),
 //! text math kernels with per-op HF goldens (#999, [`super::gemma4_ops`]),
 //! and the donor-slot shared-KV cache (#1002, [`super::gemma4_cache`]).
-//! Single-token-at-a-time forward (`forward_step`), called in a loop for
-//! both prompt prefill and greedy decode -- the same shape as
-//! `qwen35::forward::forward_step`. This is CPU-only, f32 throughout, no
+//! Bounded batched prompt prefill and single-token decode (`forward_step`).
+//! Short prompts retain the sequential path. This is CPU-only, f32 throughout, no
 //! Metal wiring (ADR-082's stage ladder gates Metal on CPU parity landing
 //! first).
 //!
@@ -17,6 +16,11 @@
 //! unconditionally, verified directly against the pinned reference source
 //! rather than assumed) -- a materially different convention from this
 //! crate's Qwen3.5 GQA attention, so that kernel is not reused here.
+
+#[path = "gemma4_prefill.rs"]
+mod prefill;
+
+const PREFILL_CHUNK_TOKENS: usize = 64;
 
 use super::gemma4_cache::Gemma4KvCache;
 use super::gemma4_config::{Gemma4Config, resolve_stop_token_ids};
@@ -675,10 +679,73 @@ impl Gemma4Model {
         Ok(identity)
     }
 
+    /// Evaluate prompt chunks, retaining scalar cancellation precedence for invalid inputs.
+    pub(crate) fn prefill_prompt(
+        &self,
+        prompt_ids: &[u32],
+        position: &mut usize,
+        cache: &mut Gemma4KvCache,
+        scratch: &mut Gemma4Scratch,
+        cancel: &dyn Cancellation,
+    ) -> Result<(), InferenceError> {
+        if cancel.is_cancelled() {
+            return Err(InferenceError::Inference("cancelled before prefill".into()));
+        }
+        // Invalid IDs keep the sequential prefix/error and cancellation precedence.
+        if prompt_ids.len() < PREFILL_CHUNK_TOKENS
+            || prompt_ids
+                .iter()
+                .any(|&id| id as usize >= self.config.vocab_size)
+        {
+            for (i, &token_id) in prompt_ids.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    return Err(InferenceError::Inference("cancelled during prefill".into()));
+                }
+                self.forward_step_impl(
+                    token_id,
+                    *position,
+                    cache,
+                    scratch,
+                    &[],
+                    i + 1 == prompt_ids.len(),
+                )?;
+                *position += 1;
+            }
+            return Ok(());
+        }
+
+        let end = position.checked_add(prompt_ids.len()).ok_or_else(|| {
+            InferenceError::InvalidInput("gemma4 prefill: absolute position overflow".into())
+        })?;
+        let mut batch = prefill::Gemma4PrefillScratch::default();
+        for tokens in prompt_ids.chunks(PREFILL_CHUNK_TOKENS) {
+            if cancel.is_cancelled() {
+                return Err(InferenceError::Inference("cancelled during prefill".into()));
+            }
+            let next = position.checked_add(tokens.len()).ok_or_else(|| {
+                InferenceError::InvalidInput("gemma4 prefill: absolute position overflow".into())
+            })?;
+            if !prefill::forward_chunk(
+                self,
+                tokens,
+                *position,
+                cache,
+                &mut batch,
+                scratch,
+                next == end,
+                cancel,
+            )? {
+                return Err(InferenceError::Inference("cancelled during prefill".into()));
+            }
+            cache.finish_prefill_chunk();
+            *position = next;
+        }
+        Ok(())
+    }
+
     /// **Unstable**: greedy-decode `max_new_tokens` continuation tokens for
-    /// `prompt_ids` (already tokenized, BOS included by the caller). Runs
-    /// prefill and decode through the same single-token `Self::forward_step`
-    /// loop.
+    /// `prompt_ids` (already tokenized, BOS included by the caller). Uses bounded
+    /// prompt chunks and the single-token `Self::forward_step` decode path.
     ///
     /// # Errors
     /// Propagates `Self::forward_step` errors (invalid token id, cache
@@ -694,17 +761,9 @@ impl Gemma4Model {
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut position = 0usize;
 
-        for (i, &tok) in prompt_ids.iter().enumerate() {
-            self.forward_step_impl(
-                tok,
-                position,
-                &mut cache,
-                &mut scratch,
-                &[],
-                i + 1 == prompt_ids.len(),
-            )?;
-            position += 1;
-        }
+        self.prefill_prompt(prompt_ids, &mut position, &mut cache, &mut scratch, &|| {
+            false
+        })?;
 
         for _ in 0..max_new_tokens {
             let next = argmax(&scratch.logits[..self.config.vocab_size]);

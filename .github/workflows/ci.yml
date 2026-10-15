@@ -274,6 +274,110 @@ jobs:
           pin-cargo-path: true
           shared-key: feature-matrix
           cache-on-failure: true
+      - name: inference — Gemma batched prefill controls
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          run_gemma_controls() {
+            local log="$1"
+            shift
+            if "$@" >"$log" 2>&1; then
+              cat "$log"
+            else
+              local status=$?
+              cat "$log"
+              return "$status"
+            fi
+          }
+          expected_tests=(
+            decoder::gemma_cpu::tests::batch_prefill_controls::long_invalid_tail_keeps_scalar_prefix_and_cancellation_precedence
+            decoder::gemma_cpu::tests::batch_prefill_controls::long_session_enters_batch_before_advancing_position
+            decoder::gemma_cpu::tests::batch_prefill_controls::long_session_matches_scalar_prefill_and_two_selections
+            decoder::gemma_cpu::tests::batch_prefill_controls::public_greedy_uses_batch_and_preserves_probe_continuation
+            decoder::gemma_cpu::tests::cancelled_before_prefill_returns_error_and_advances_nothing
+            decoder::gemma_cpu::tests::cancelled_decode_consumes_nothing_and_finish_poisoned_invalidates
+            decoder::gemma_cpu::tests::declared_capabilities_are_honestly_all_false
+            decoder::gemma_cpu::tests::driver_lifecycle_regressions::batch_prefill_controls::every_batch_cancel_boundary_poisoned_once_without_output
+            decoder::gemma_cpu::tests::driver_lifecycle_regressions::real_partial_prefill_cancel_finishes_poisoned_once
+            decoder::gemma_cpu::tests::driver_lifecycle_regressions::real_prefill_error_survives_optional_cleanup_failure
+            decoder::gemma_cpu::tests::finish_invalidates_the_prediction_for_every_disposition
+            decoder::gemma_cpu::tests::full_step_lifecycle_over_tiny_zero_model
+            decoder::gemma_cpu::tests::interruptible_prefill_preserves_forward_errors
+            decoder::gemma_cpu::tests::mid_prefill_cancellation_does_not_evaluate_an_invalid_tail
+            decoder::gemma_cpu::tests::prefill_checks_cancellation_before_each_gemma_forward
+            decoder::gemma_cpu::tests::prefill_preserves_invalid_token_position_without_projecting_prefix
+            decoder::gemma_cpu::tests::uncancelled_prefill_matches_raw_gemma_steps
+            model::gemma4_cache::tests::all_layers_shared_errors_no_donor_available
+            model::gemma4_cache::tests::chunk_boundary_publishes_retained_tail_plus_whole_chunk
+            model::gemma4_cache::tests::e2b_slot_map_matches_amendment_1
+            model::gemma4_cache::tests::global_slot_capacity_exceeded_errors
+            model::gemma4_cache::tests::heterogeneous_slot_width_uses_global_head_dim_for_global_slots
+            model::gemma4_cache::tests::out_of_bounds_layer_index_errors_on_every_accessor
+            model::gemma4_cache::tests::overflowing_kv_dim_errors
+            model::gemma4_cache::tests::prefill_completion::completed_chunks_and_next_decode_match_scalar_appends
+            model::gemma4_cache::tests::prefill_completion::completion_is_idempotent_for_empty_short_and_full_views
+            model::gemma4_cache::tests::prefill_completion::completion_trims_every_sliding_owner_and_preserves_global_aliases
+            model::gemma4_cache::tests::shared_layer_view_matches_donor_after_every_append
+            model::gemma4_cache::tests::shared_layer_with_no_same_type_donor_errors
+            model::gemma4_cache::tests::shared_layer_write_rejected_with_error
+            model::gemma4_cache::tests::sliding_prefill_publishes_full_chunk_then_retains_window_minus_one
+            model::gemma4_cache::tests::undersized_layer_types_errors
+            model::gemma4_cache::tests::zero_dimension_fields_error_before_allocation
+            model::gemma4_cache::tests::zero_max_seq_len_errors
+            model::gemma4_cache::tests::zero_num_hidden_layers_errors
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_attention_excludes_future_and_expired_poison
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_attention_preserves_visible_nonfinite_policy
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_comparison_rejects_nonfinite_operands
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_controller_matches_scalar_across_chunk_boundaries
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_fixture_has_observable_ple_ffn_and_layer_scalars
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_kernel_preflight_preserves_all_caller_state
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_matches_scalar_layers_logits_cache_and_two_decodes
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_prepare_refuses_geometry_before_mutation
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_refuses_bad_positions_without_cache_or_logits
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_reuses_poisoned_scratch_across_grow_and_shrink
+            model::gemma4_model::prefill::tests::gemma_batched_prefill_uses_multirow_work_and_one_final_vocab_projection
+            model::gemma4_model::tests::deferred_prefill_logits_preserve_cache_trace_and_final_bits
+            model::gemma4_model::tests::greedy_prefill_matches_full_projection_reference
+            model::gemma4_model::tests::greedy_prefill_preserves_invalid_token_errors_at_every_position
+            model::gemma4_weights::prefill_rows::scaled_row_into_matches_allocating_rows_bitwise
+            model::gemma4_weights::prefill_rows::scaled_row_into_rejects_invalid_rows_without_writes
+            model::gemma4_weights::prefill_rows::scaled_row_into_rejects_nonexact_output_without_writes
+          )
+          log="gemma_batched_prefill_controls.log"
+          run_gemma_controls "$log" cargo test --locked -p lattice-inference \
+            --no-default-features --features f16 --lib -- \
+            decoder::gemma_cpu::tests:: \
+            model::gemma4_cache::tests:: \
+            model::gemma4_weights::prefill_rows:: \
+            model::gemma4_model::prefill::tests:: \
+            model::gemma4_model::tests::deferred_prefill_logits_preserve_cache_trace_and_final_bits \
+            model::gemma4_model::tests::greedy_prefill_matches_full_projection_reference \
+            model::gemma4_model::tests::greedy_prefill_preserves_invalid_token_errors_at_every_position \
+            --skip model::gemma4_model::prefill::tests::gemma_batched_prefill_real_controller_matches_scalar_at_2512 \
+            --skip model::gemma4_model::prefill::tests::gemma_batched_prefill_real_controller_matches_scalar_at_511_512_513 \
+            --color never
+          python3 - "$log" "${expected_tests[@]}" <<'PY'
+          import collections
+          from pathlib import Path
+          import re
+          import sys
+
+          text = Path(sys.argv[1]).read_text(errors="replace")
+          names = sys.argv[2:]
+          assert names and len(names) == len(set(names)), "empty or duplicate expectations"
+          records = re.findall(r"^test (\S+) \.\.\. ok$", text, re.MULTILINE)
+          assert collections.Counter(records) == collections.Counter(names), "test-name census mismatch"
+          assert len(re.findall(r"^test (?!result:)", text, re.MULTILINE)) == len(names), "unexpected test record"
+          assert len(re.findall(r"^\s*Running unittests src/lib\.rs \([^\n]+\)$", text, re.MULTILINE)) == 1, "one lib harness required"
+          assert re.findall(r"^running [0-9]+ tests?$", text, re.MULTILINE) == [f"running {len(names)} tests"], "wrong running count"
+          summaries = re.findall(r"^test result:.*$", text, re.MULTILINE)
+          expected = rf"test result: ok\. {len(names)} passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(?:\.[0-9]+)?s"
+          assert len(summaries) == 1 and re.fullmatch(expected, summaries[0]), "one exact passing summary required"
+          print(f"Gemma prefill control census: {len(names)} named passes")
+          PY
+      - name: inference — Gemma f16 CPU lint
+        run: cargo clippy --locked -p lattice-inference --no-default-features --features f16 --lib --tests -- -D warnings
       # The `--no-run` step compiles every test target under these features
       # (lib, integration tests, feature-gated bins) and executes none of them,
       # so a lib test that panicked on every run still passed it (#1375). Keep
