@@ -169,6 +169,27 @@ enum Command {
         /// different artifact (ADR-096 decision 5).
         #[arg(long)]
         router_pin: Option<String>,
+        /// Serve the router artifact's own recorded policy, including the
+        /// exploration draw it records (ADR-096 decision 3, under the ruling
+        /// that ADR-091 decision 5 gates the flip of the DEFAULT policy and not
+        /// an explicitly enabled learning mode).
+        ///
+        /// Off by default, and with it off an artifact recording a learned
+        /// policy FAILS the startup rather than being served uniform: serving
+        /// it uniform would make one version label name two behaviours, and the
+        /// operator would see a learned version number on a server that never
+        /// ran it.
+        ///
+        /// Given over an artifact that records a uniform policy, or none at
+        /// all, it fails too. The flag asks for a learned policy and there is
+        /// not one, and reporting learning as enabled would then be true of the
+        /// flag and false of the behaviour.
+        ///
+        /// Enabling this on a serving host is ADR-091 decision 5's
+        /// qualification run: its kill threshold, decision rule and host belong
+        /// in the run record before the process starts.
+        #[arg(long)]
+        router_learn: bool,
         /// Directory to load the embedding model from, instead of the served
         /// model's own directory (ADR-094 decision 1, amendment 2).
         ///
@@ -307,6 +328,7 @@ async fn main() {
             preload_vision,
             router_state,
             router_pin,
+            router_learn,
             embedding_model: embedding_model_dir,
             embedding_model_id,
         } => {
@@ -460,10 +482,11 @@ async fn main() {
             // incident would get a server that reports success and routes
             // nothing.
             #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-            if router_state.is_some() || router_pin.is_some() {
+            if router_state.is_some() || router_pin.is_some() || router_learn {
                 eprintln!(
-                    "Error: --router-state and --router-pin require a macOS Metal build; adapter \
-                     routing selects resident adapters, which this build cannot load."
+                    "Error: --router-state, --router-pin and --router-learn require a macOS Metal \
+                     build; adapter routing selects resident adapters, which this build cannot \
+                     load."
                 );
                 std::process::exit(1);
             }
@@ -551,6 +574,7 @@ async fn main() {
                             *resolved,
                             &embedder_identity,
                             embedder.dimensions(),
+                            router_learn,
                         ) {
                             Ok(served) => {
                                 eprintln!(
@@ -1020,6 +1044,34 @@ mod preload_vision_cli_tests {
     #[test]
     fn preload_vision_flag_present_is_true() {
         assert!(parse_preload_vision(&["--preload-vision"]));
+    }
+}
+
+/// The enable for the artifact's recorded policy is opt-in and spelled as the
+/// documents say it is.
+#[cfg(test)]
+mod router_learn_cli_tests {
+    use super::*;
+
+    fn parse_router_learn(args: &[&str]) -> bool {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)
+            .expect("fixed --model arg always parses")
+            .command
+        {
+            Command::Serve { router_learn, .. } => router_learn,
+            _ => panic!("expected Command::Serve"),
+        }
+    }
+
+    /// Off by default. If it ever acquired a default of `true`, every server
+    /// would try to install a learned policy, and the uniform baseline this
+    /// server has always served would become a mode nobody selected.
+    #[test]
+    fn enabling_learning_is_absent_unless_asked_for() {
+        assert!(!parse_router_learn(&[]));
+        assert!(parse_router_learn(&["--router-learn"]));
     }
 }
 

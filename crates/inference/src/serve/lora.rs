@@ -163,6 +163,13 @@ pub fn lora_list_body(
                 // A legacy artifact answers "unrecorded", never "bootstrap":
                 // it may well have been trained, and nothing wrote down which.
                 "training_state": report.artifact.provenance.training_state(),
+                // The policy requests are ACTUALLY served under, read from the
+                // live router rather than from the artifact beside it. A server
+                // that declined to enable a recorded learned policy would
+                // otherwise report the recorded one and serve a different one,
+                // and an operator watching a qualification run has no other
+                // surface that says which of the two is happening.
+                "policy": report.applied_policy,
             })
         }
     };
@@ -566,12 +573,110 @@ mod tests {
                 artifact: served,
                 pinned: false,
             };
-            let body = lora_list_body(&index, Some(resolved.report("qwen3.5-0.8b")));
+            let body = lora_list_body(
+                &index,
+                Some(resolved.report(
+                    "qwen3.5-0.8b",
+                    crate::router_state::AppliedPolicy {
+                        kind: "uniform".to_string(),
+                        tau: None,
+                        epsilon: 0.0,
+                        exploration_scale: None,
+                        learning_enabled: false,
+                    },
+                )),
+            );
             assert_eq!(
                 body["router"]["training_state"], expected,
                 "the three provenances must not report the same thing"
             );
         }
+    }
+
+    /// The body says what requests are served under, not what the file records.
+    /// A server that declined to enable a recorded learned policy reports the
+    /// uniform one it is running, and this is the only surface an operator has
+    /// for telling the two apart during a qualification run.
+    #[test]
+    fn the_body_reports_the_policy_in_force() {
+        let index = AdapterIndex {
+            adapters: Vec::new(),
+            applied: Vec::new(),
+            blend_refusal: None,
+        };
+        use crate::router_state::{
+            RouterArtifact, RouterLineage, RouterPolicy, RouterProvenance, TrainedRepresentation,
+        };
+
+        let resolved = crate::router_state::ResolvedRouter {
+            artifact: RouterArtifact {
+                version: 1,
+                adapter_names: vec!["technical".into()],
+                representation: TrainedRepresentation {
+                    embedding_model: "qwen3.5-0.8b".into(),
+                    pooling: "mean_visual".into(),
+                    prompt_source: "last_user_message".into(),
+                    loader_format: "qwen35-f16-decoder".into(),
+                    input_width: 8,
+                },
+                gate_bytes: vec![1, 2, 3],
+                provenance: RouterProvenance::recorded(
+                    RouterPolicy {
+                        kind: "softmax".into(),
+                        tau: Some(0.7),
+                        epsilon: 0.05,
+                        tau_floor: 0.1,
+                        entropy_floor: 0.35,
+                        max_consecutive_collapsed: 3,
+                        training_state: "learned".into(),
+                        objective_version: Some("whole-mixture-v1".into()),
+                        exploration_scale: Some(0.5),
+                    },
+                    RouterLineage {
+                        schema_id: "schema-1".into(),
+                        base_model: "qwen3.5-0.8b".into(),
+                        parent: None,
+                        admission_record: None,
+                    },
+                ),
+            },
+            pinned: false,
+        };
+        let body = lora_list_body(
+            &index,
+            Some(resolved.report(
+                "qwen3.5-0.8b",
+                crate::router_state::AppliedPolicy {
+                    kind: "softmax".to_string(),
+                    tau: Some(0.7),
+                    epsilon: 0.05,
+                    exploration_scale: Some(0.5),
+                    learning_enabled: true,
+                },
+            )),
+        );
+        assert_eq!(body["router"]["policy"]["kind"], "softmax");
+        assert_eq!(body["router"]["policy"]["tau"], 0.7);
+        assert_eq!(body["router"]["policy"]["exploration_scale"], 0.5);
+        assert_eq!(body["router"]["policy"]["learning_enabled"], true);
+        // The control that makes the four above about the policy and not about
+        // the fixture: a deterministic server reports its own values under the
+        // same keys, and they differ.
+        let deterministic = lora_list_body(
+            &index,
+            Some(resolved.report(
+                "qwen3.5-0.8b",
+                crate::router_state::AppliedPolicy {
+                    kind: "uniform".to_string(),
+                    tau: None,
+                    epsilon: 0.0,
+                    exploration_scale: None,
+                    learning_enabled: false,
+                },
+            )),
+        );
+        assert_eq!(deterministic["router"]["policy"]["kind"], "uniform");
+        assert_eq!(deterministic["router"]["policy"]["learning_enabled"], false);
     }
 
     #[test]
