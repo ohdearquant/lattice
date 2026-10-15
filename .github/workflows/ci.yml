@@ -554,6 +554,51 @@ jobs:
         run: cargo clippy -p lattice-inference --all-targets -- -D warnings
       - name: inference — bench-internals clippy without f16
         run: cargo clippy -p lattice-inference --all-targets --features bench-internals -- -D warnings
+      - name: inference CPU prefill phase arena and sequential parity
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo test --locked -p lattice-inference --lib forward::batch_prefill:: -- --skip forward::batch_prefill::tests::bench_prefill_vs_sequential --color never >"$log" 2>&1 || {
+            status=$?
+            cat "$log"
+            exit "$status"
+          }
+          cat "$log"
+          python3 - "$log" <<'PY'
+          import collections, pathlib, re, sys
+          text = re.sub(r"\x1b\[[0-9;]*m", "", pathlib.Path(sys.argv[1]).read_text())
+          expected = """
+          forward::batch_prefill::tests::test_softplus_prefill_matches_gdn_softplus
+          forward::batch_prefill::tests::test_prefill_matches_sequential
+          forward::batch_prefill::tests::test_prefill_matches_sequential_untied_lm_head
+          forward::batch_prefill::tests::test_batch_prefill_rejects_moe_without_panic
+          forward::batch_prefill::tests::inactive_lora_projections_skip_every_row
+          forward::batch_prefill::tests::final_norm_only_changes_the_last_prompt_row
+          forward::batch_prefill::tests::test_lora_hook_changes_prefill_output
+          forward::batch_prefill::tests::test_lora_hook_changes_decode_output
+          forward::batch_prefill::tests::test_lora_hook_prefill_decode_agreement
+          forward::batch_prefill::tests::test_batch_prefill_lora_hook_invoked_at_every_projection
+          forward::batch_prefill::tests::causal_tiled_attention_head_nan_key_fails_closed
+          forward::batch_prefill::scratch_tests::phase_layout_matches_independent_full_gdn_ffn_lengths
+          forward::batch_prefill::scratch_tests::new_scratch_capacity_uses_largest_phase_not_the_sum
+          forward::batch_prefill::scratch_tests::phase_views_are_disjoint_at_exact_offsets_and_share_the_arena
+          forward::batch_prefill::scratch_tests::phase_arena_grows_then_reuses_capacity_and_pointer_when_prompts_shrink
+          forward::batch_prefill::scratch_tests::poisoned_reused_scratch_matches_sequential_mixed_prefill
+          forward::batch_prefill::scratch_tests::scratch_dimension_overflow_refuses_without_mutating_reused_buffers
+          forward::batch_prefill::scratch_tests::prefill_dimension_overflow_refuses_before_state_cache_or_scratch_mutation
+          forward::batch_prefill::scratch_tests::allclose_rejects_nonfinite_values_in_either_operand
+          """.split()
+          runs = re.findall(r"^ *Running unittests src/lib\.rs \(", text, re.M)
+          assert len(runs) == 1, runs
+          actual = re.findall(r"^test (forward::batch_prefill::[\w:]+) \.\.\. ok$", text, re.M)
+          assert collections.Counter(actual) == collections.Counter(expected), (actual, expected)
+          summaries = re.findall(r"^test result: .*$", text, re.M)
+          assert len(summaries) == 1, summaries
+          assert re.fullmatch(rf"test result: ok\. {len(expected)} passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s", summaries[0]), summaries
+          print(f"Verified {len(expected)} named CPU prefill tests")
+          PY
       # The R03 golden gate (`crates/inference/tests/cpu_pre_migration_greedy_golden.rs`)
       # and the row D allocation arm (`crates/inference/tests/decoder_allocation_arm.rs`)
       # are both declared `test = false`, which keeps them out of

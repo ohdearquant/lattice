@@ -24,6 +24,172 @@ use crate::model::qwen35::{
 };
 use crate::model::qwen35_config::Qwen35Config;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PhaseLayout {
+    full: [usize; 5],
+    gdn: [usize; 5],
+    ffn: [usize; 3],
+    len: usize,
+}
+
+fn prefill_shape_error() -> InferenceError {
+    InferenceError::InvalidInput(
+        "batched prefill scratch dimensions exceed addressable storage".into(),
+    )
+}
+
+fn checked_f32_len(len: usize) -> Result<usize, InferenceError> {
+    if len > isize::MAX as usize / size_of::<f32>() {
+        return Err(prefill_shape_error());
+    }
+    Ok(len)
+}
+
+fn checked_prefill_product(a: usize, b: usize) -> Result<usize, InferenceError> {
+    checked_f32_len(a.checked_mul(b).ok_or_else(prefill_shape_error)?)
+}
+
+fn checked_phase_sum(lengths: &[usize]) -> Result<usize, InferenceError> {
+    let total = lengths.iter().try_fold(0usize, |total, &len| {
+        total.checked_add(len).ok_or_else(prefill_shape_error)
+    })?;
+    checked_f32_len(total)
+}
+
+impl PhaseLayout {
+    fn new(cfg: &Qwen35Config, seq_len: usize) -> Result<Self, InferenceError> {
+        let q_dim = cfg.checked_full_q_dim()?;
+        let kv_dim = cfg.checked_full_kv_dim()?;
+        let q_proj_dim = checked_prefill_product(2, q_dim)?;
+        let qkv_dim = cfg.checked_linear_qkv_dim()?;
+        let output_dim = cfg.checked_linear_output_dim()?;
+        // The tiling heuristic considers two 64-row tiles on each side.
+        cfg.head_dim
+            .checked_mul(256)
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(prefill_shape_error)?;
+        let full = [
+            checked_prefill_product(seq_len, q_proj_dim)?,
+            checked_prefill_product(seq_len, q_dim)?,
+            checked_prefill_product(seq_len, kv_dim)?,
+            checked_prefill_product(seq_len, kv_dim)?,
+            checked_prefill_product(seq_len, q_dim)?,
+        ];
+        let gdn = [
+            checked_prefill_product(seq_len, qkv_dim)?,
+            checked_prefill_product(seq_len, output_dim)?,
+            checked_prefill_product(seq_len, cfg.linear_num_value_heads())?,
+            checked_prefill_product(seq_len, cfg.linear_num_value_heads())?,
+            checked_prefill_product(seq_len, output_dim)?,
+        ];
+        let ffn = [
+            checked_prefill_product(seq_len, cfg.intermediate_size)?,
+            checked_prefill_product(seq_len, cfg.intermediate_size)?,
+            checked_prefill_product(seq_len, cfg.hidden_size)?,
+        ];
+        // These allocations remain independent of the mutually exclusive phases.
+        for len in [
+            cfg.vocab_size,
+            qkv_dim,
+            output_dim,
+            cfg.linear_key_head_dim,
+            cfg.linear_value_head_dim,
+            cfg.head_dim,
+        ] {
+            checked_f32_len(len)?;
+        }
+        let len = checked_phase_sum(&full)?
+            .max(checked_phase_sum(&gdn)?)
+            .max(checked_phase_sum(&ffn)?);
+        Ok(Self {
+            full,
+            gdn,
+            ffn,
+            len,
+        })
+    }
+}
+
+struct PhaseArena {
+    values: Vec<f32>,
+    layout: PhaseLayout,
+}
+
+struct FullPhase<'a> {
+    q_batch: &'a mut [f32],
+    gate_z_batch: &'a mut [f32],
+    k_batch: &'a mut [f32],
+    v_batch: &'a mut [f32],
+    context_batch: &'a mut [f32],
+}
+
+struct GdnPhase<'a> {
+    gdn_qkv_batch: &'a mut [f32],
+    gdn_z_batch: &'a mut [f32],
+    gdn_beta_batch: &'a mut [f32],
+    gdn_alpha_batch: &'a mut [f32],
+    gdn_out_batch: &'a mut [f32],
+}
+
+struct FfnPhase<'a> {
+    gate_batch: &'a mut [f32],
+    up_batch: &'a mut [f32],
+    ffn_batch: &'a mut [f32],
+}
+
+impl PhaseArena {
+    fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            layout: PhaseLayout::default(),
+        }
+    }
+
+    fn full(&mut self) -> FullPhase<'_> {
+        let [q, gate, k, v, context] = self.layout.full;
+        let (q_batch, rest) = self.values.split_at_mut(q);
+        let (gate_z_batch, rest) = rest.split_at_mut(gate);
+        let (k_batch, rest) = rest.split_at_mut(k);
+        let (v_batch, rest) = rest.split_at_mut(v);
+        let (context_batch, _) = rest.split_at_mut(context);
+        FullPhase {
+            q_batch,
+            gate_z_batch,
+            k_batch,
+            v_batch,
+            context_batch,
+        }
+    }
+
+    fn gdn(&mut self) -> GdnPhase<'_> {
+        let [qkv, z, beta, alpha, out] = self.layout.gdn;
+        let (gdn_qkv_batch, rest) = self.values.split_at_mut(qkv);
+        let (gdn_z_batch, rest) = rest.split_at_mut(z);
+        let (gdn_beta_batch, rest) = rest.split_at_mut(beta);
+        let (gdn_alpha_batch, rest) = rest.split_at_mut(alpha);
+        let (gdn_out_batch, _) = rest.split_at_mut(out);
+        GdnPhase {
+            gdn_qkv_batch,
+            gdn_z_batch,
+            gdn_beta_batch,
+            gdn_alpha_batch,
+            gdn_out_batch,
+        }
+    }
+
+    fn ffn(&mut self) -> FfnPhase<'_> {
+        let [gate, up, out] = self.layout.ffn;
+        let (gate_batch, rest) = self.values.split_at_mut(gate);
+        let (up_batch, rest) = rest.split_at_mut(up);
+        let (ffn_batch, _) = rest.split_at_mut(out);
+        FfnPhase {
+            gate_batch,
+            up_batch,
+            ffn_batch,
+        }
+    }
+}
+
 /// Scratch buffers reused across batched prompt prefill.
 ///
 /// Large tensors are stored row-major as flattened `[seq_len, dim]` buffers.
@@ -37,40 +203,8 @@ struct PrefillScratch {
     /// Attention output: `[seq_len, hidden_size]`.
     attn_out: Vec<f32>,
 
-    // ----- Full-attention batched buffers -----
-    /// Raw Q projection output: `[seq_len, 2 * q_dim]`.
-    ///
-    /// After unpacking, the first `q_dim` values of each row hold the compact
-    /// Q vectors; the second half of each row is left as scratch.
-    q_batch: Vec<f32>,
-    /// Packed output gates: `[seq_len, q_dim]`.
-    gate_z_batch: Vec<f32>,
-    /// K projection output: `[seq_len, kv_dim]`.
-    k_batch: Vec<f32>,
-    /// V projection output: `[seq_len, kv_dim]`.
-    v_batch: Vec<f32>,
-    /// Context vectors before output projection: `[seq_len, q_dim]`.
-    context_batch: Vec<f32>,
-
-    // ----- GatedDeltaNet batched projection buffers -----
-    /// QKV projection output: `[seq_len, qkv_dim]`.
-    gdn_qkv_batch: Vec<f32>,
-    /// Output-gate projection: `[seq_len, output_dim]`.
-    gdn_z_batch: Vec<f32>,
-    /// Beta / update-rate projection: `[seq_len, num_heads]`.
-    gdn_beta_batch: Vec<f32>,
-    /// Alpha / decay-input projection: `[seq_len, num_heads]`.
-    gdn_alpha_batch: Vec<f32>,
-    /// Gated RMSNorm output before the shared out-proj: `[seq_len, output_dim]`.
-    gdn_out_batch: Vec<f32>,
-
-    // ----- MLP batched buffers -----
-    /// Gate projection output: `[seq_len, intermediate]`.
-    gate_batch: Vec<f32>,
-    /// Up projection output: `[seq_len, intermediate]`.
-    up_batch: Vec<f32>,
-    /// FFN output after down projection: `[seq_len, hidden_size]`.
-    ffn_batch: Vec<f32>,
+    // Attention, recurrence, and FFN phases never overlap in the layer schedule.
+    phase: PhaseArena,
 
     // ----- Attention tiling config -----
     /// Tiling configuration for full-attention prompt prefill.
@@ -108,19 +242,7 @@ impl PrefillScratch {
             hidden: Vec::new(),
             residual: Vec::new(),
             attn_out: Vec::new(),
-            q_batch: Vec::new(),
-            gate_z_batch: Vec::new(),
-            k_batch: Vec::new(),
-            v_batch: Vec::new(),
-            context_batch: Vec::new(),
-            gdn_qkv_batch: Vec::new(),
-            gdn_z_batch: Vec::new(),
-            gdn_beta_batch: Vec::new(),
-            gdn_alpha_batch: Vec::new(),
-            gdn_out_batch: Vec::new(),
-            gate_batch: Vec::new(),
-            up_batch: Vec::new(),
-            ffn_batch: Vec::new(),
+            phase: PhaseArena::new(),
             tiled_config: TiledAttentionConfig::new(
                 cfg.num_attention_heads,
                 cfg.num_key_value_heads,
@@ -140,51 +262,34 @@ impl PrefillScratch {
     }
 
     /// Ensure all scratch tensors can hold a prompt of length `seq_len`.
-    fn ensure_capacity(&mut self, cfg: &Qwen35Config, seq_len: usize) {
-        let hidden = cfg.hidden_size;
-        let q_dim = cfg.full_q_dim();
-        let kv_dim = cfg.full_kv_dim();
-        let inter = cfg.intermediate_size;
-        let qkv_dim = cfg.linear_qkv_dim();
-        let output_dim = cfg.linear_output_dim();
-        let num_linear_value_heads = cfg.linear_num_value_heads();
-        let key_dim = cfg.linear_key_head_dim;
-        let value_dim = cfg.linear_value_head_dim;
+    fn ensure_capacity(
+        &mut self,
+        cfg: &Qwen35Config,
+        seq_len: usize,
+    ) -> Result<(), InferenceError> {
+        let layout = PhaseLayout::new(cfg, seq_len)?;
+        let token_hidden = checked_prefill_product(seq_len, cfg.hidden_size)?;
+        let qkv_dim = cfg.checked_linear_qkv_dim()?;
+        let output_dim = cfg.checked_linear_output_dim()?;
+        let tile_scores = checked_f32_len(self.tiled_config.tile_size_kv.max(1))?;
 
-        resize(&mut self.hidden, seq_len * hidden);
-        resize(&mut self.residual, seq_len * hidden);
-        resize(&mut self.attn_out, seq_len * hidden);
-
-        resize(&mut self.q_batch, seq_len * 2 * q_dim);
-        resize(&mut self.gate_z_batch, seq_len * q_dim);
-        resize(&mut self.k_batch, seq_len * kv_dim);
-        resize(&mut self.v_batch, seq_len * kv_dim);
-        resize(&mut self.context_batch, seq_len * q_dim);
-
-        resize(&mut self.gdn_qkv_batch, seq_len * qkv_dim);
-        resize(&mut self.gdn_z_batch, seq_len * output_dim);
-        resize(&mut self.gdn_beta_batch, seq_len * num_linear_value_heads);
-        resize(&mut self.gdn_alpha_batch, seq_len * num_linear_value_heads);
-        resize(&mut self.gdn_out_batch, seq_len * output_dim);
-
-        resize(&mut self.gate_batch, seq_len * inter);
-        resize(&mut self.up_batch, seq_len * inter);
-        resize(&mut self.ffn_batch, seq_len * hidden);
-
+        resize(&mut self.hidden, token_hidden);
+        resize(&mut self.residual, token_hidden);
+        resize(&mut self.attn_out, token_hidden);
+        resize(&mut self.phase.values, layout.len);
+        self.phase.layout = layout;
         resize(&mut self.logits, cfg.vocab_size);
 
         resize(&mut self.gdn_conv_token, qkv_dim);
         resize(&mut self.gdn_output_heads, output_dim);
-        resize(&mut self.gdn_q_tmp, key_dim);
-        resize(&mut self.gdn_k_tmp, key_dim);
-        resize(&mut self.gdn_kv_mem, value_dim);
-        resize(&mut self.gdn_delta, value_dim);
+        resize(&mut self.gdn_q_tmp, cfg.linear_key_head_dim);
+        resize(&mut self.gdn_k_tmp, cfg.linear_key_head_dim);
+        resize(&mut self.gdn_kv_mem, cfg.linear_value_head_dim);
+        resize(&mut self.gdn_delta, cfg.linear_value_head_dim);
 
         resize(&mut self.attn_acc, cfg.head_dim);
-        resize(
-            &mut self.attn_tile_scores,
-            self.tiled_config.tile_size_kv.max(1),
-        );
+        resize(&mut self.attn_tile_scores, tile_scores);
+        Ok(())
     }
 }
 
@@ -217,7 +322,7 @@ impl Qwen35Model {
         debug_assert_eq!(kv_cache.seq_len, 0);
         debug_assert_eq!(gdn_states.len(), cfg.num_linear_attention_layers());
 
-        scratch.ensure_capacity(cfg, seq_len);
+        scratch.ensure_capacity(cfg, seq_len)?;
 
         // Embedding lookup for the full prompt.
         for (t, &token_id) in prompt_ids.iter().enumerate() {
@@ -282,8 +387,9 @@ impl Qwen35Model {
             self.ffn_batch_from_hidden(common, scratch, seq_len, lora, layer_i)?;
 
             // Residual add.
+            let ffn = scratch.phase.ffn();
             for i in 0..token_hidden {
-                scratch.hidden[i] = scratch.residual[i] + scratch.ffn_batch[i];
+                scratch.hidden[i] = scratch.residual[i] + ffn.ffn_batch[i];
             }
         }
 
@@ -331,7 +437,8 @@ impl Qwen35Model {
                 "MoE batch prefill is not yet implemented".into(),
             ));
         }
-        let kv_dim = self.config.full_kv_dim();
+        PhaseLayout::new(&self.config, prompt_ids.len())?;
+        let kv_dim = self.config.checked_full_kv_dim()?;
         kv_cache.reserve(prompt_ids.len(), kv_dim);
         let mut scratch = PrefillScratch::new(&self.config);
         self.prefill_prompt(
@@ -370,11 +477,13 @@ impl Qwen35Model {
         debug_assert!(kv_cache.k[cache_idx].is_empty());
         debug_assert!(kv_cache.v[cache_idx].is_empty());
 
+        let phase = scratch.phase.full();
+
         // Batched projections.
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.q_proj,
-            &mut scratch.q_batch[..seq_len * q_proj_dim],
+            &mut phase.q_batch[..seq_len * q_proj_dim],
             seq_len,
             hidden,
             q_proj_dim,
@@ -384,14 +493,14 @@ impl Qwen35Model {
             layer_idx,
             "q_proj",
             &scratch.hidden[..seq_len * hidden],
-            &mut scratch.q_batch[..seq_len * q_proj_dim],
+            &mut phase.q_batch[..seq_len * q_proj_dim],
             hidden,
             q_proj_dim,
         );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.k_proj,
-            &mut scratch.k_batch[..seq_len * kv_dim],
+            &mut phase.k_batch[..seq_len * kv_dim],
             seq_len,
             hidden,
             kv_dim,
@@ -401,14 +510,14 @@ impl Qwen35Model {
             layer_idx,
             "k_proj",
             &scratch.hidden[..seq_len * hidden],
-            &mut scratch.k_batch[..seq_len * kv_dim],
+            &mut phase.k_batch[..seq_len * kv_dim],
             hidden,
             kv_dim,
         );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.v_proj,
-            &mut scratch.v_batch[..seq_len * kv_dim],
+            &mut phase.v_batch[..seq_len * kv_dim],
             seq_len,
             hidden,
             kv_dim,
@@ -418,7 +527,7 @@ impl Qwen35Model {
             layer_idx,
             "v_proj",
             &scratch.hidden[..seq_len * hidden],
-            &mut scratch.v_batch[..seq_len * kv_dim],
+            &mut phase.v_batch[..seq_len * kv_dim],
             hidden,
             kv_dim,
         );
@@ -426,8 +535,8 @@ impl Qwen35Model {
         // Unpack interleaved [Q_h, gate_h] blocks into compact Q rows plus a
         // separate gate buffer, matching the decode path exactly.
         for t in 0..seq_len {
-            let row = &mut scratch.q_batch[t * q_proj_dim..(t + 1) * q_proj_dim];
-            let gate_row = &mut scratch.gate_z_batch[t * q_dim..(t + 1) * q_dim];
+            let row = &mut phase.q_batch[t * q_proj_dim..(t + 1) * q_proj_dim];
+            let gate_row = &mut phase.gate_z_batch[t * q_dim..(t + 1) * q_dim];
             for h in 0..num_q_heads {
                 let src = h * head_dim * 2;
                 let q_dst = h * head_dim;
@@ -442,7 +551,7 @@ impl Qwen35Model {
         // Per-head Q/K RMSNorm and partial RoPE.
         for t in 0..seq_len {
             let position = t;
-            let q_row = &mut scratch.q_batch[t * q_proj_dim..t * q_proj_dim + q_dim];
+            let q_row = &mut phase.q_batch[t * q_proj_dim..t * q_proj_dim + q_dim];
             for h in 0..num_q_heads {
                 let start = h * head_dim;
                 qwen35_rms_norm(
@@ -454,7 +563,7 @@ impl Qwen35Model {
                 self.apply_partial_rope(&mut q_row[start..start + head_dim], position, rope_dim);
             }
 
-            let k_row = &mut scratch.k_batch[t * kv_dim..(t + 1) * kv_dim];
+            let k_row = &mut phase.k_batch[t * kv_dim..(t + 1) * kv_dim];
             for h in 0..num_kv_heads {
                 let start = h * head_dim;
                 qwen35_rms_norm(
@@ -468,11 +577,11 @@ impl Qwen35Model {
         }
 
         // Cache all prompt K/V vectors in one append.
-        kv_cache.k[cache_idx].extend_from_slice(&scratch.k_batch[..seq_len * kv_dim]);
-        kv_cache.v[cache_idx].extend_from_slice(&scratch.v_batch[..seq_len * kv_dim]);
+        kv_cache.k[cache_idx].extend_from_slice(&phase.k_batch[..seq_len * kv_dim]);
+        kv_cache.v[cache_idx].extend_from_slice(&phase.v_batch[..seq_len * kv_dim]);
 
         // Batched causal attention per Q head.
-        scratch.context_batch[..seq_len * q_dim].fill(0.0);
+        phase.context_batch[..seq_len * q_dim].fill(0.0);
         let tile_scores_len = scratch.tiled_config.tile_size_kv.max(1);
         for qh in 0..num_q_heads {
             let kvh = qh / groups;
@@ -480,10 +589,10 @@ impl Qwen35Model {
             let kv_head_offset = kvh * head_dim;
 
             causal_tiled_attention_head(
-                &scratch.q_batch[..seq_len * q_proj_dim],
-                &scratch.k_batch[..seq_len * kv_dim],
-                &scratch.v_batch[..seq_len * kv_dim],
-                &mut scratch.context_batch[..seq_len * q_dim],
+                &phase.q_batch[..seq_len * q_proj_dim],
+                &phase.k_batch[..seq_len * kv_dim],
+                &phase.v_batch[..seq_len * kv_dim],
+                &mut phase.context_batch[..seq_len * q_dim],
                 seq_len,
                 q_stride,
                 kv_dim,
@@ -501,12 +610,12 @@ impl Qwen35Model {
 
         // Output gating.
         for i in 0..seq_len * q_dim {
-            scratch.context_batch[i] *= sigmoid(scratch.gate_z_batch[i]);
+            phase.context_batch[i] *= sigmoid(phase.gate_z_batch[i]);
         }
 
         // Batched output projection.
         matmul_bt(
-            &scratch.context_batch[..seq_len * q_dim],
+            &phase.context_batch[..seq_len * q_dim],
             &weights.o_proj,
             &mut scratch.attn_out[..seq_len * hidden],
             seq_len,
@@ -517,7 +626,7 @@ impl Qwen35Model {
             lora,
             layer_idx,
             "o_proj",
-            &scratch.context_batch[..seq_len * q_dim],
+            &phase.context_batch[..seq_len * q_dim],
             &mut scratch.attn_out[..seq_len * hidden],
             q_dim,
             hidden,
@@ -551,11 +660,13 @@ impl Qwen35Model {
         let s_size = key_dim * value_dim;
         let retrieval_scale = 1.0 / (key_dim as f32).sqrt();
 
+        let phase = scratch.phase.gdn();
+
         // Batched projections.
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_qkv,
-            &mut scratch.gdn_qkv_batch[..seq_len * qkv_dim],
+            &mut phase.gdn_qkv_batch[..seq_len * qkv_dim],
             seq_len,
             hidden,
             qkv_dim,
@@ -565,14 +676,14 @@ impl Qwen35Model {
             layer_idx,
             "in_proj_qkv",
             &scratch.hidden[..seq_len * hidden],
-            &mut scratch.gdn_qkv_batch[..seq_len * qkv_dim],
+            &mut phase.gdn_qkv_batch[..seq_len * qkv_dim],
             hidden,
             qkv_dim,
         );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_z,
-            &mut scratch.gdn_z_batch[..seq_len * output_dim],
+            &mut phase.gdn_z_batch[..seq_len * output_dim],
             seq_len,
             hidden,
             output_dim,
@@ -582,14 +693,14 @@ impl Qwen35Model {
             layer_idx,
             "in_proj_z",
             &scratch.hidden[..seq_len * hidden],
-            &mut scratch.gdn_z_batch[..seq_len * output_dim],
+            &mut phase.gdn_z_batch[..seq_len * output_dim],
             hidden,
             output_dim,
         );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_b,
-            &mut scratch.gdn_beta_batch[..seq_len * value_heads],
+            &mut phase.gdn_beta_batch[..seq_len * value_heads],
             seq_len,
             hidden,
             value_heads,
@@ -599,14 +710,14 @@ impl Qwen35Model {
             layer_idx,
             "in_proj_b",
             &scratch.hidden[..seq_len * hidden],
-            &mut scratch.gdn_beta_batch[..seq_len * value_heads],
+            &mut phase.gdn_beta_batch[..seq_len * value_heads],
             hidden,
             value_heads,
         );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_a,
-            &mut scratch.gdn_alpha_batch[..seq_len * value_heads],
+            &mut phase.gdn_alpha_batch[..seq_len * value_heads],
             seq_len,
             hidden,
             value_heads,
@@ -616,23 +727,23 @@ impl Qwen35Model {
             layer_idx,
             "in_proj_a",
             &scratch.hidden[..seq_len * hidden],
-            &mut scratch.gdn_alpha_batch[..seq_len * value_heads],
+            &mut phase.gdn_alpha_batch[..seq_len * value_heads],
             hidden,
             value_heads,
         );
 
         // Sigmoid(beta) exactly as in the decode path.
-        for beta in &mut scratch.gdn_beta_batch[..seq_len * value_heads] {
+        for beta in &mut phase.gdn_beta_batch[..seq_len * value_heads] {
             *beta = sigmoid(*beta);
         }
 
         // Sequential recurrence over prompt positions.
         for t in 0..seq_len {
-            let qkv_row = &scratch.gdn_qkv_batch[t * qkv_dim..(t + 1) * qkv_dim];
-            let z_row = &scratch.gdn_z_batch[t * output_dim..(t + 1) * output_dim];
-            let beta_row = &scratch.gdn_beta_batch[t * value_heads..(t + 1) * value_heads];
-            let alpha_row = &scratch.gdn_alpha_batch[t * value_heads..(t + 1) * value_heads];
-            let out_row = &mut scratch.gdn_out_batch[t * output_dim..(t + 1) * output_dim];
+            let qkv_row = &phase.gdn_qkv_batch[t * qkv_dim..(t + 1) * qkv_dim];
+            let z_row = &phase.gdn_z_batch[t * output_dim..(t + 1) * output_dim];
+            let beta_row = &phase.gdn_beta_batch[t * value_heads..(t + 1) * value_heads];
+            let alpha_row = &phase.gdn_alpha_batch[t * value_heads..(t + 1) * value_heads];
+            let out_row = &mut phase.gdn_out_batch[t * output_dim..(t + 1) * output_dim];
 
             apply_causal_conv1d_prefill(
                 qkv_row,
@@ -732,7 +843,7 @@ impl Qwen35Model {
 
         // Shared batched output projection.
         matmul_bt(
-            &scratch.gdn_out_batch[..seq_len * output_dim],
+            &phase.gdn_out_batch[..seq_len * output_dim],
             &weights.out_proj,
             &mut scratch.attn_out[..seq_len * hidden],
             seq_len,
@@ -743,7 +854,7 @@ impl Qwen35Model {
             lora,
             layer_idx,
             "out_proj",
-            &scratch.gdn_out_batch[..seq_len * output_dim],
+            &phase.gdn_out_batch[..seq_len * output_dim],
             &mut scratch.attn_out[..seq_len * hidden],
             output_dim,
             hidden,
@@ -783,10 +894,12 @@ impl Qwen35Model {
         let hidden = cfg.hidden_size;
         let inter = cfg.intermediate_size;
 
+        let phase = scratch.phase.ffn();
+
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &dense.gate_proj,
-            &mut scratch.gate_batch[..seq_len * inter],
+            &mut phase.gate_batch[..seq_len * inter],
             seq_len,
             hidden,
             inter,
@@ -796,14 +909,14 @@ impl Qwen35Model {
             layer_idx,
             "gate_proj",
             &scratch.hidden[..seq_len * hidden],
-            &mut scratch.gate_batch[..seq_len * inter],
+            &mut phase.gate_batch[..seq_len * inter],
             hidden,
             inter,
         );
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &dense.up_proj,
-            &mut scratch.up_batch[..seq_len * inter],
+            &mut phase.up_batch[..seq_len * inter],
             seq_len,
             hidden,
             inter,
@@ -813,21 +926,21 @@ impl Qwen35Model {
             layer_idx,
             "up_proj",
             &scratch.hidden[..seq_len * hidden],
-            &mut scratch.up_batch[..seq_len * inter],
+            &mut phase.up_batch[..seq_len * inter],
             hidden,
             inter,
         );
 
-        silu_inplace(&mut scratch.gate_batch[..seq_len * inter]);
+        silu_inplace(&mut phase.gate_batch[..seq_len * inter]);
         elementwise_mul(
-            &mut scratch.gate_batch[..seq_len * inter],
-            &scratch.up_batch[..seq_len * inter],
+            &mut phase.gate_batch[..seq_len * inter],
+            &phase.up_batch[..seq_len * inter],
         );
 
         matmul_bt(
-            &scratch.gate_batch[..seq_len * inter],
+            &phase.gate_batch[..seq_len * inter],
             &dense.down_proj,
-            &mut scratch.ffn_batch[..seq_len * hidden],
+            &mut phase.ffn_batch[..seq_len * hidden],
             seq_len,
             inter,
             hidden,
@@ -836,8 +949,8 @@ impl Qwen35Model {
             lora,
             layer_idx,
             "down_proj",
-            &scratch.gate_batch[..seq_len * inter],
-            &mut scratch.ffn_batch[..seq_len * hidden],
+            &phase.gate_batch[..seq_len * inter],
+            &mut phase.ffn_batch[..seq_len * hidden],
             inter,
             hidden,
         );
@@ -1013,6 +1126,10 @@ fn compute_decay_gate_prefill(a_log: f32, alpha: f32, dt_bias: f32) -> f32 {
 fn softplus_prefill(x: f32) -> f32 {
     softplus(x)
 }
+
+#[cfg(test)]
+#[path = "batch_prefill_scratch_tests.rs"]
+mod scratch_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1465,7 +1582,7 @@ mod tests {
     }
 
     /// Execute the legacy token-by-token prompt prefill path.
-    fn run_sequential_prefill(
+    pub(super) fn run_sequential_prefill(
         model: &Qwen35Model,
         prompt_ids: &[u32],
     ) -> (Vec<f32>, Vec<GatedDeltaNetState>, KvCache) {
@@ -1523,7 +1640,7 @@ mod tests {
     }
 
     /// Assert that two float slices are equal within an absolute tolerance.
-    fn assert_allclose(name: &str, lhs: &[f32], rhs: &[f32], tol: f32) {
+    pub(super) fn assert_allclose(name: &str, lhs: &[f32], rhs: &[f32], tol: f32) {
         assert_eq!(
             lhs.len(),
             rhs.len(),
@@ -1532,6 +1649,10 @@ mod tests {
             rhs.len()
         );
         for (i, (&a, &b)) in lhs.iter().zip(rhs.iter()).enumerate() {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "{name}: nonfinite value at index {i}"
+            );
             let diff = (a - b).abs();
             if diff > tol {
                 panic!(
@@ -1542,7 +1663,7 @@ mod tests {
     }
 
     /// Small model configuration used by the correctness test.
-    fn tiny_test_config() -> Qwen35Config {
+    pub(super) fn tiny_test_config() -> Qwen35Config {
         make_test_config(64, 128, 97, 8)
     }
 
@@ -1621,7 +1742,7 @@ mod tests {
     }
 
     /// Construct a synthetic model with deterministic random weights.
-    fn build_random_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
+    pub(super) fn build_random_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
         let mut rng = seed.max(1);
 
         let embed_tokens = random_vec(&mut rng, cfg.vocab_size * cfg.hidden_size, 0.02);
