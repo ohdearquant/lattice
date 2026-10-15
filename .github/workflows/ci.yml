@@ -769,9 +769,11 @@ jobs:
       # gate to examples, benches, and #[cfg(test)] modules — the same surface
       # where a second wave of lint debt (manual_let_else, approx_constant,
       # dead bench fields) had silently accumulated past the lib+bins gate.
-      - name: inference — metal-gpu clippy (macOS only)
+      # The router subcommand also requires mixture; separate Metal and mixture
+      # builds leave their combined production branch uncompiled.
+      - name: inference — metal-gpu + mixture clippy (macOS only)
         if: runner.os == 'macOS'
-        run: cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings
+        run: cargo clippy --locked -p lattice-inference --all-targets --features f16,metal-gpu,mixture -- -D warnings
       # `bench-internals` gates the bench binaries under `src/bin/` (e.g.
       # `bench_vision_prefill_ab`) and their `bench_support` module — without
       # it in this feature list, `--all-targets` never compiles that surface,
@@ -886,7 +888,8 @@ jobs:
           # -> generate_streaming_with_cancel composition; without it here
           # that test would silently not compile/run under this job.
           # Same if/else form as lattice_serve above, same `-e` reasoning.
-          if cargo test -p lattice-inference --bin lattice --features f16,metal-gpu,test-utils > lattice_test.log 2>&1; then
+          # Router feedback and census handlers additionally require mixture.
+          if cargo test --locked -p lattice-inference --bin lattice --features f16,metal-gpu,mixture,test-utils -- --color never > lattice_test.log 2>&1; then
             cat lattice_test.log
           else
             lattice_status=$?
@@ -895,6 +898,15 @@ jobs:
             exit "$lattice_status"
           fi
           check_test_utils_modules_ran lattice_test.log lattice
+          for test_name in \
+            serve::tests::the_feedback_handler_separates_its_three_outcomes_and_two_refusals \
+            serve::tests::the_episode_census_publishes_unjudged_separately_from_judged
+          do
+            if ! grep -Fxq "test ${test_name} ... ok" lattice_test.log; then
+              echo "::error::lattice: ${test_name} did not run; check Metal, mixture and test-utils feature gates"
+              exit 1
+            fi
+          done
       # The standalone server's startup routing, Gemma refusals and unchanged
       # startup errors run against the shipped `lattice_serve` binary with stub
       # model directories. The two real-checkpoint cases report
