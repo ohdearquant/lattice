@@ -12,6 +12,7 @@ use crate::error::{Result, TuneError};
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum LRSchedule {
     /// Constant learning rate
     Constant,

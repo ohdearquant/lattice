@@ -13,6 +13,8 @@
 
 #![cfg(feature = "serve")]
 
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -45,7 +47,7 @@ fn qwen_config() -> Vec<u8> {
 fn checkpoint_dir(config: &[u8], weights_file: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp model dir");
     std::fs::write(dir.path().join("config.json"), config).expect("write config.json");
-    std::fs::write(dir.path().join(weights_file), b"stub").expect("write stub weights");
+    common::stub_weights(&dir.path().join(weights_file));
     dir
 }
 
@@ -129,7 +131,7 @@ fn qwen_safetensors_directory_keeps_the_qwen_cpu_route() {
 #[test]
 fn a_directory_with_no_config_is_still_routed_to_qwen() {
     let dir = tempfile::tempdir().expect("temp model dir");
-    std::fs::write(dir.path().join("model.safetensors"), b"stub").expect("write stub weights");
+    common::stub_weights(&dir.path().join("model.safetensors"));
     let run = serve(dir.path());
     assert!(
         run.stderr

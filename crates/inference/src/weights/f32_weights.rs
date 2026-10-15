@@ -1235,7 +1235,7 @@ pub(crate) const MAX_WEIGHT_MAP_ENTRIES: usize = 1_000_000;
 /// available memory via plain `push` is not a `Result` calling code can recover
 /// from, so the input-side byte cap is what keeps retained parser state bounded,
 /// not error handling downstream of the allocation.
-const MAX_SAFETENSORS_HEADER_BYTES: usize = 4_194_304;
+pub(crate) const MAX_SAFETENSORS_HEADER_BYTES: usize = 4_194_304;
 
 /// Crate-private compatibility ceiling for dormant prepared framing checks.
 pub(crate) const fn max_safetensors_header_bytes() -> usize {

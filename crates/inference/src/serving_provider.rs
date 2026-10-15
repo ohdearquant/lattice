@@ -314,6 +314,16 @@ mod tests {
         FormatFixture::Empty,
     ];
 
+    /// One F32 tensor `w` of shape `[1]`: the smallest file format
+    /// detection reads as an unquantized safetensors checkpoint.
+    fn write_minimal_safetensors(path: &Path) {
+        let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[0u8; 4]);
+        fs::write(path, bytes).expect("write minimal safetensors");
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum FormatFixture {
         SafetensorsFile,
@@ -337,18 +347,23 @@ mod tests {
         fn write(self, directory: &Path) {
             match self {
                 Self::SafetensorsFile => {
-                    fs::write(directory.join("model.safetensors"), b"sentinel")
-                        .expect("write safetensors sentinel");
+                    write_minimal_safetensors(&directory.join("model.safetensors"));
                 }
                 Self::SafetensorsIndex => {
-                    fs::write(directory.join("model.safetensors.index.json"), b"{}")
-                        .expect("write safetensors index sentinel");
+                    write_minimal_safetensors(&directory.join("model-00001-of-00001.safetensors"));
+                    fs::write(
+                        directory.join("model.safetensors.index.json"),
+                        br#"{"weight_map":{"w":"model-00001-of-00001.safetensors"}}"#,
+                    )
+                    .expect("write safetensors index");
                 }
                 Self::BothSafetensorsSentinels => {
-                    fs::write(directory.join("model.safetensors"), b"sentinel")
-                        .expect("write safetensors sentinel");
-                    fs::write(directory.join("model.safetensors.index.json"), b"{}")
-                        .expect("write safetensors index sentinel");
+                    write_minimal_safetensors(&directory.join("model.safetensors"));
+                    fs::write(
+                        directory.join("model.safetensors.index.json"),
+                        br#"{"weight_map":{"w":"model.safetensors"}}"#,
+                    )
+                    .expect("write safetensors index");
                     fs::write(directory.join("weights.q4"), b"q4").expect("write q4 sentinel");
                 }
                 Self::Q4Only => {
@@ -500,8 +515,7 @@ mod tests {
             br#"{"model_type":"gemma4","text_config":{}}"#.as_slice(),
         ] {
             let temp = tempfile::tempdir().expect("create checkpoint tempdir");
-            fs::write(temp.path().join("model.safetensors"), b"sentinel")
-                .expect("write safetensors sentinel");
+            write_minimal_safetensors(&temp.path().join("model.safetensors"));
             fs::write(temp.path().join("config.json"), config).expect("write Gemma config");
             let selected = select(inspect_checkpoint(temp.path()), ServingEntry::Lattice)
                 .expect("identity claim does not validate the Gemma profile");

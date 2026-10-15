@@ -69,11 +69,27 @@ pub fn qwen_config() -> Vec<u8> {
     br#"{"model_type":"qwen3_5","text_config":{}}"#.to_vec()
 }
 
+/// Stub weights a loader cannot use. A `.safetensors` stub carries one F32
+/// tensor `w` under a valid header, because format detection reads the header
+/// and refuses a file that has none.
+pub fn stub_weights(path: &Path) {
+    let bytes = if path.extension().is_some_and(|ext| ext == "safetensors") {
+        let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[0u8; 4]);
+        bytes
+    } else {
+        b"stub".to_vec()
+    };
+    std::fs::write(path, bytes).expect("write stub weights");
+}
+
 pub fn write_model_dir(dir: &Path, config: &[u8], weights_file: Option<&str>) {
     std::fs::create_dir_all(dir).expect("create model directory");
     std::fs::write(dir.join("config.json"), config).expect("write config.json");
     if let Some(weights_file) = weights_file {
-        std::fs::write(dir.join(weights_file), b"stub").expect("write stub weights");
+        stub_weights(&dir.join(weights_file));
     }
 }
 
