@@ -10,6 +10,39 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+### Added
+
+- Serialized, create-only router publication with synced staging outside the
+  selectable namespace. Bootstrap commits its durable HEAD before returning.
+  A failure after HEAD replacement reports an uncertain commit for startup
+  recovery, without authorizing live activation.
+- Historical format-5 receipts preserve the exact previous HEAD before an
+  advance. Explicit format-5 pins require current HEAD or such a receipt.
+
+### Changed
+
+- Format-5 pins require the canonical counter plus 16 hexadecimal characters,
+  or the full 64-character hash. Historical artifacts without commit proof
+  refuse with their identity and fresh-directory bootstrap migration guidance.
+- Headless format-5 and mixed directories refuse startup selection. Pure
+  format-4 directories retain highest-counter selection; malformed or unknown
+  lower manifests now also refuse because they cannot establish legacy format.
+- Legacy publication refuses existing gate or manifest paths across both
+  formats, including orphan gates. Bootstrap refuses all prior state remnants.
+- Router readers use a shared persistent lock when available. Older read-only
+  directories remain readable without creating a lock; cooperating publishers
+  create the lock before publication and never replace or remove its inode.
+
+### Deprecated
+
+- `write_artifact` accepts only format 4; use `write_legacy_artifact` or
+  `router_init::init_directory` for a fresh format-5 bootstrap.
+- `commit_head` refuses caller-supplied publication authority; use
+  `router_init::init_directory` for a fresh bootstrap. Learned admission has no
+  production publication entry point yet.
+- `load_latest` now delegates to `load_selected`, honoring committed HEAD and
+  the format rules above. Use `read_artifact` for raw artifact inspection.
+
 ## [0.12.1] - 2026-10-14
 
 Documentation and package metadata only; no code changes.
