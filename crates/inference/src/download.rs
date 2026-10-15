@@ -89,20 +89,9 @@ fn ensure_model_files_inner_with_checksums(
     {
         create_model_dir(&model_dir)?;
 
-        let hf_model_id = match model_name {
-            "bge-small-en-v1.5" => "BAAI/bge-small-en-v1.5",
-            "bge-base-en-v1.5" => "BAAI/bge-base-en-v1.5",
-            "bge-large-en-v1.5" => "BAAI/bge-large-en-v1.5",
-            "multilingual-e5-small" => "intfloat/multilingual-e5-small",
-            "multilingual-e5-base" => "intfloat/multilingual-e5-base",
-            "all-minilm-l6-v2" => "sentence-transformers/all-MiniLM-L6-v2",
-            "paraphrase-multilingual-minilm-l12-v2" => {
-                "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-            }
-            other => return Err(InferenceError::UnsupportedModel(other.to_string())),
-        };
+        let (hf_model_id, revision) = hf_source(model_name)?;
 
-        let base_url = format!("https://huggingface.co/{hf_model_id}/resolve/main");
+        let base_url = format!("https://huggingface.co/{hf_model_id}/resolve/{revision}");
 
         if !safetensors_path.exists() {
             let url = format!("{base_url}/model.safetensors");
@@ -133,6 +122,45 @@ fn ensure_model_files_inner_with_checksums(
             expected,
         )?;
         Ok(model_dir)
+    }
+}
+
+// The Hugging Face repository and pinned commit for each supported model.
+// Each revision is the commit whose files match `expected_checksums`. Fetching a
+// branch name instead would turn any upstream change into a checksum refusal on
+// first download, so a revision moves only together with its checksums.
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn hf_source(model_name: &str) -> Result<(&'static str, &'static str), InferenceError> {
+    match model_name {
+        "bge-small-en-v1.5" => Ok((
+            "BAAI/bge-small-en-v1.5",
+            "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+        )),
+        "bge-base-en-v1.5" => Ok((
+            "BAAI/bge-base-en-v1.5",
+            "a5beb1e3e68b9ab74eb54cfd186867f64f240e1a",
+        )),
+        "bge-large-en-v1.5" => Ok((
+            "BAAI/bge-large-en-v1.5",
+            "d4aa6901d3a41ba39fb536a557fa166f842b0e09",
+        )),
+        "multilingual-e5-small" => Ok((
+            "intfloat/multilingual-e5-small",
+            "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+        )),
+        "multilingual-e5-base" => Ok((
+            "intfloat/multilingual-e5-base",
+            "d128750597153bb5987e10b1c3493a34e5a4502a",
+        )),
+        "all-minilm-l6-v2" => Ok((
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+        )),
+        "paraphrase-multilingual-minilm-l12-v2" => Ok((
+            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+            "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
+        )),
+        other => Err(InferenceError::UnsupportedModel(other.to_string())),
     }
 }
 
@@ -403,6 +431,42 @@ mod tests {
     const TOKENIZER_FIXTURE: &[u8] = b"tokenizer fixture";
     const TOKENIZER_FIXTURE_SHA256: &str =
         "c882d95b612f23378308ac1207596a83cf97ed59d57e1b18e12a7085a10bf8e2";
+
+    #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+    #[test]
+    fn every_supported_model_downloads_from_a_pinned_commit_with_checksums() {
+        const MODELS: [&str; 7] = [
+            "bge-small-en-v1.5",
+            "bge-base-en-v1.5",
+            "bge-large-en-v1.5",
+            "multilingual-e5-small",
+            "multilingual-e5-base",
+            "all-minilm-l6-v2",
+            "paraphrase-multilingual-minilm-l12-v2",
+        ];
+        for name in MODELS {
+            assert_eq!(canonical_model_name(name).expect("supported"), name);
+            let (repo, revision) = hf_source(name).expect("source");
+            assert_eq!(canonical_model_name(repo).expect("repo alias"), name);
+            assert!(
+                revision.len() == 40
+                    && revision
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{name}: revision {revision:?} is not a commit id"
+            );
+            let checksums = expected_checksums(name);
+            assert!(
+                checksums.model_safetensors.is_some(),
+                "{name}: no model checksum"
+            );
+            assert!(
+                checksums.tokenizer.is_some(),
+                "{name}: no tokenizer checksum"
+            );
+        }
+        assert!(hf_source("not-a-model").is_err());
+    }
 
     #[cfg(all(unix, feature = "download", not(target_arch = "wasm32")))]
     #[test]
