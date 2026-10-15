@@ -102,4 +102,5 @@ cargo build -p lattice-inference --no-default-features --features std,download
 
 The `lattice-inference` crate carries `#[allow(dead_code)]` annotations on functions
 retained for reference (superseded BLAS fallbacks, alternative attention paths). They
-will be removed once the replacement paths are confirmed stable in production.
+will be removed once the replacement paths are confirmed stable in production. No tracking
+issue is open for them yet.
