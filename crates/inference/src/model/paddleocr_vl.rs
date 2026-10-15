@@ -36,7 +36,9 @@
 use std::path::Path;
 
 use crate::error::InferenceError;
-use crate::model::ernie45::{Ernie45Config, Ernie45KvCache, Ernie45Model, Ernie45Weights};
+use crate::model::ernie45::{
+    Ernie45Config, Ernie45DecodeScratch, Ernie45KvCache, Ernie45Model, Ernie45Weights,
+};
 use crate::tokenizer::common::Tokenizer;
 use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use crate::vision::paddleocr_preprocess::{
@@ -408,10 +410,12 @@ impl PaddleOcrVlModel {
         }
         let hidden = self.decoder_cfg.hidden_size;
         let (prefill, last_logits) = self.greedy_prefill(tokenizer, rgb, h, w, text)?;
+        let first = argmax_u32(&last_logits);
+        drop(last_logits);
 
         let mut embeds = prefill.spliced_embeds;
         let mut positions = prefill.positions;
-        greedy_tokens(last_logits, max_new_tokens, |next| {
+        greedy_tokens(first, max_new_tokens, |next| {
             let embed_len = embeds.len();
             embeds.resize(embed_len + hidden, 0.0);
             embeds[embed_len..]
@@ -421,7 +425,9 @@ impl PaddleOcrVlModel {
                 .fold(0u32, |m, r| m.max(r[0]).max(r[1]).max(r[2]))
                 + 1;
             positions.push([p, p, p]);
-            self.decoder.forward_embeds_last_logits(&embeds, &positions)
+            self.decoder
+                .forward_embeds_last_logits(&embeds, &positions)
+                .map(|logits| argmax_u32(&logits))
         })
     }
 
@@ -446,6 +452,19 @@ impl PaddleOcrVlModel {
         w: usize,
         text: &str,
         max_new_tokens: usize,
+    ) -> Result<Vec<u32>, InferenceError> {
+        self.generate_greedy_observed(tokenizer, rgb, h, w, text, max_new_tokens, |_| {})
+    }
+
+    fn generate_greedy_observed(
+        &self,
+        tokenizer: &GemmaBpeTokenizer,
+        rgb: &[u8],
+        h: usize,
+        w: usize,
+        text: &str,
+        max_new_tokens: usize,
+        mut observe_decode: impl FnMut(&Ernie45DecodeScratch),
     ) -> Result<Vec<u32>, InferenceError> {
         if max_new_tokens == 0 {
             return Ok(Vec::new());
@@ -478,11 +497,25 @@ impl PaddleOcrVlModel {
             .positions
             .iter()
             .fold(0u32, |m, r| m.max(r[0]).max(r[1]).max(r[2]));
-        greedy_tokens(last_logits, max_new_tokens, |next| {
+        let first = argmax_u32(&last_logits);
+        drop(last_logits);
+        if first == EOS_ID || max_new_tokens == 1 {
+            return Ok(vec![first]);
+        }
+        let mut scratch = Ernie45DecodeScratch::new(&self.decoder_cfg, capacity)?;
+        greedy_tokens(first, max_new_tokens, |next| {
             max_pos += 1;
             let position = [max_pos, max_pos, max_pos];
             let embed = &self.decoder.embed_tokens()[next as usize * hidden..][..hidden];
-            self.decoder.kv_decode_step(embed, position, &mut cache)
+            let logits = self.decoder.kv_decode_step_with_scratch(
+                embed,
+                position,
+                &mut cache,
+                &mut scratch,
+            )?;
+            let next = argmax_u32(logits);
+            observe_decode(&scratch);
+            Ok(next)
         })
     }
 
@@ -496,18 +529,17 @@ impl PaddleOcrVlModel {
 }
 
 fn greedy_tokens(
-    mut last_logits: Vec<f32>,
+    mut next: u32,
     max_new_tokens: usize,
-    mut decode: impl FnMut(u32) -> Result<Vec<f32>, InferenceError>,
+    mut decode: impl FnMut(u32) -> Result<u32, InferenceError>,
 ) -> Result<Vec<u32>, InferenceError> {
     let mut generated = Vec::with_capacity(max_new_tokens);
     for _ in 0..max_new_tokens {
-        let next = argmax_u32(&last_logits);
         generated.push(next);
         if next == EOS_ID || generated.len() == max_new_tokens {
             break;
         }
-        last_logits = decode(next)?;
+        next = decode(next)?;
     }
     Ok(generated)
 }
@@ -523,6 +555,10 @@ pub fn argmax_u32(row: &[f32]) -> u32 {
     }
     best as u32
 }
+
+#[cfg(test)]
+#[path = "paddleocr_vl/decode_scratch_tests.rs"]
+mod decode_scratch_tests;
 
 #[cfg(test)]
 #[path = "paddleocr_vl/decode_scratch_bench.rs"]
@@ -555,10 +591,10 @@ mod tests {
     fn greedy_budget_only_decodes_between_emitted_tokens() {
         for budget in [2usize, 0, 1, 5] {
             let mut decode_calls = 0;
-            let generated = greedy_tokens(vec![0.0, 1.0, 0.0], budget, |token| {
+            let generated = greedy_tokens(1, budget, |token| {
                 assert_eq!(token, 1);
                 decode_calls += 1;
-                Ok(vec![0.0, 1.0, 0.0])
+                Ok(1)
             })
             .expect("budget-limited decode");
             assert_eq!(generated, vec![1; budget]);
@@ -568,17 +604,15 @@ mod tests {
 
     #[test]
     fn greedy_eos_is_emitted_without_forwarding_it() {
-        let generated = greedy_tokens(vec![0.0, 0.0, 1.0], 5, |_| {
-            panic!("EOS must not be decoded")
-        })
-        .expect("EOS from prefill");
+        let generated = greedy_tokens(EOS_ID, 5, |_| panic!("EOS must not be decoded"))
+            .expect("EOS from prefill");
         assert_eq!(generated, [EOS_ID]);
 
         let mut decode_calls = 0;
-        let generated = greedy_tokens(vec![0.0, 1.0, 0.0], 5, |token| {
+        let generated = greedy_tokens(1, 5, |token| {
             assert_eq!(token, 1);
             decode_calls += 1;
-            Ok(vec![0.0, 0.0, 1.0])
+            Ok(EOS_ID)
         })
         .expect("EOS from decode");
         assert_eq!(generated, [1, EOS_ID]);
@@ -587,7 +621,7 @@ mod tests {
 
     #[test]
     fn greedy_propagates_errors_from_required_decode_steps() {
-        let result = greedy_tokens(vec![0.0, 1.0, 0.0], 2, |_| {
+        let result = greedy_tokens(1, 2, |_| {
             Err(InferenceError::Inference("decode failed".into()))
         });
         assert!(

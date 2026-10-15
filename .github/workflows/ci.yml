@@ -274,6 +274,116 @@ jobs:
           pin-cargo-path: true
           shared-key: feature-matrix
           cache-on-failure: true
+      - name: inference - ERNIE cached decode scratch and caller regressions
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess, sys
+
+          SUITES = [
+            {
+              "selector": "model::ernie45::tests::",
+              "names": [
+                "model::ernie45::tests::validate_accepts_shipped_values_and_each_documented_cap",
+                "model::ernie45::tests::validate_rejects_zero_dimensions",
+                "model::ernie45::tests::load_tensor_preflights_wrong_shape_without_materialization",
+                "model::ernie45::tests::load_tensor_preflights_missing_tensor_without_materialization",
+                "model::ernie45::tests::model_new_rejects_mismatched_weight_lengths",
+                "model::ernie45::tests::config_rejects_section_layout_that_does_not_tile_half_dim",
+                "model::ernie45::tests::config_rejects_nonzero_mrope_sections_beyond_three",
+                "model::ernie45::tests::mrope_table_equals_1d_rope_when_rows_agree",
+                "model::ernie45::tests::mrope_table_section_rows_follow_pinned_layout",
+                "model::ernie45::tests::forward_trace_matches_embedding_forward_on_arange_positions",
+                "model::ernie45::tests::forward_embeds_trace_rejects_wrong_lengths",
+                "model::ernie45::tests::forward_rejects_sequence_over_max_before_allocating_buffers",
+                "model::ernie45::tests::forward_embeds_last_logits_matches_trace_last_row_s1",
+                "model::ernie45::tests::forward_embeds_last_logits_matches_trace_last_row_s5",
+                "model::ernie45::tests::forward_embeds_last_logits_rejects_empty_input",
+                "model::ernie45::tests::forward_embeds_last_logits_rejects_wrong_embeds_length",
+                "model::ernie45::tests::forward_embeds_last_logits_rejects_non_finite_embeds",
+                "model::ernie45::tests::kv_cleared_cache_is_indistinguishable_from_a_fresh_one",
+                "model::ernie45::tests::kv_truncate_rolls_back_and_refuses_to_grow",
+                "model::ernie45::tests::kv_model_bound_cache_matches_the_hand_built_layout",
+                "model::ernie45::tests::kv_prefill_last_logits_bit_exact_vs_uncached",
+                "model::ernie45::tests::kv_cached_decode_sequence_matches_uncached",
+                "model::ernie45::tests::kv_decode_step_uses_its_own_mrope_position_rows",
+                "model::ernie45::tests::kv_prefill_rejects_empty_sequence",
+                "model::ernie45::tests::kv_prefill_rejects_over_capacity_before_filling",
+                "model::ernie45::tests::kv_prefill_rejects_non_empty_cache",
+                "model::ernie45::tests::kv_prefill_rejects_wrong_embeds_length",
+                "model::ernie45::tests::kv_prefill_rejects_non_finite_embeds",
+                "model::ernie45::tests::kv_decode_step_rejects_empty_cache",
+                "model::ernie45::tests::kv_decode_step_rejects_full_cache",
+                "model::ernie45::tests::kv_entries_reject_mismatched_cache_shape",
+                "model::ernie45::tests::kv_decode_step_rejects_wrong_embeds_length",
+                "model::ernie45::tests::kv_decode_step_rejects_non_finite_embeds",
+                "model::ernie45::tests::kv_greedy_sequence_matches_uncached_on_committed_fixture",
+                "model::ernie45::tests::kv_cache_new_rejects_zero_dimensions_and_overflow"
+              ]
+            },
+            {
+              "selector": "model::paddleocr_vl::tests::",
+              "names": [
+                "model::paddleocr_vl::tests::greedy_budget_only_decodes_between_emitted_tokens",
+                "model::paddleocr_vl::tests::greedy_eos_is_emitted_without_forwarding_it",
+                "model::paddleocr_vl::tests::greedy_propagates_errors_from_required_decode_steps",
+                "model::paddleocr_vl::tests::prompt_assembly_matches_hf_input_ids",
+                "model::paddleocr_vl::tests::rope_index_matches_hf_golden_positions",
+                "model::paddleocr_vl::tests::rope_index_hand_computed_small_cases",
+                "model::paddleocr_vl::tests::rope_index_rejects_zero_grid_dimensions",
+                "model::paddleocr_vl::tests::rope_index_rejects_bad_placeholder_shapes",
+                "model::paddleocr_vl::tests::build_prompt_ids_rejects_grid_not_a_multiple_of_merge",
+                "model::paddleocr_vl::tests::argmax_breaks_ties_to_lowest_id",
+                "model::paddleocr_vl::tests::splice_layout_matches_placeholder_positions"
+              ]
+            },
+            {
+              "selector": "model::ernie45::decode_scratch_tests::",
+              "names": [
+                "model::ernie45::decode_scratch_tests::ernie_decode_scratch_matches_frozen_allocating_core_full_logits_and_cache",
+                "model::ernie45::decode_scratch_tests::ernie_decode_scratch_reuses_all_nineteen_buffers_with_poisoned_tails",
+                "model::ernie45::decode_scratch_tests::ernie_decode_scratch_recomputes_rope_for_changed_model_semantics",
+                "model::ernie45::decode_scratch_tests::ernie_decode_scratch_rejects_mismatched_geometry_before_mutation",
+                "model::ernie45::decode_scratch_tests::ernie_decode_scratch_preserves_original_preflight_error_ordering",
+                "model::ernie45::decode_scratch_tests::ernie_decode_scratch_constructor_refuses_invalid_or_unaddressable_geometry",
+                "model::ernie45::decode_scratch_tests::ernie_decode_scratch_public_wrapper_matches_frozen_owned_outputs",
+                "model::ernie45::decode_scratch_tests::ernie_decode_scratch_bit_comparison_rejects_nonfinite_inputs"
+              ]
+            },
+            {
+              "selector": "model::paddleocr_vl::decode_scratch_tests::",
+              "names": [
+                "model::paddleocr_vl::decode_scratch_tests::cached_request_reuses_all_nineteen_buffers",
+                "model::paddleocr_vl::decode_scratch_tests::cached_request_starts_fresh_scratch_for_each_sequence",
+                "model::paddleocr_vl::decode_scratch_tests::zero_budget_skips_prompt_and_scratch",
+                "model::paddleocr_vl::decode_scratch_tests::prefill_eos_and_single_token_budget_do_not_decode",
+                "model::paddleocr_vl::decode_scratch_tests::invalid_image_fails_before_decode_observation",
+                "model::paddleocr_vl::decode_scratch_tests::greedy_token_decisions_preserve_ties_and_stop_order"
+              ]
+            }
+          ]
+
+          def validate(text, expected):
+              records = re.findall(r"^test (?!result:)(\S+) \.\.\. (\S+)$", text, re.MULTILINE)
+              assert sorted(records) == sorted((name, "ok") for name in expected), "exact passing test population"
+              assert len(re.findall(r"^test (?!result:)", text, re.MULTILINE)) == len(expected), "unparsed test record"
+              assert re.findall(r"^running \d+ tests?$", text, re.MULTILINE) == [f"running {len(expected)} tests"]
+              summaries = re.findall(r"^test result:.*$", text, re.MULTILINE)
+              pattern = rf"test result: ok\. {len(expected)} passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in [0-9]+(?:\.[0-9]+)?s"
+              assert len(summaries) == 1 and re.fullmatch(pattern, summaries[0]), "exact successful summary"
+              assert len(re.findall(r"^\s*Running unittests src/lib\.rs \(.+\)$", text, re.MULTILINE)) == 1, "one library harness"
+              assert not re.search(r"^error(?:\[|:)", text, re.MULTILINE), "compile error"
+
+          env = dict(os.environ, CARGO_TERM_COLOR="never")
+          for index, suite in enumerate(SUITES):
+              command = ["cargo", "test", "--locked", "-p", "lattice-inference", "--lib", suite["selector"], "--", "--test-threads=1", "--color", "never"]
+              result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              pathlib.Path(f"ernie-decode-scratch-{index}.log").write_text(result.stdout)
+              print(result.stdout, end="", flush=True)
+              if result.returncode:
+                  sys.exit(result.returncode)
+              validate(result.stdout, suite["names"])
+          print("ERNIE_DECODE_SCRATCH_GATE passed=" + str(sum(len(suite["names"]) for suite in SUITES)) + " suites=4")
+          PY
       # The `--no-run` step compiles every test target under these features
       # (lib, integration tests, feature-gated bins) and executes none of them,
       # so a lib test that panicked on every run still passed it (#1375). Keep

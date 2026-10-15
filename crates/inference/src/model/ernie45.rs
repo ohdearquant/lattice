@@ -800,6 +800,29 @@ impl Ernie45Model {
         position: [u32; 3],
         cache: &mut Ernie45KvCache,
     ) -> Result<Vec<f32>, InferenceError> {
+        let kv_dim = self.validate_kv_decode_input(embeds, cache)?;
+        let mut scratch = Ernie45DecodeScratch::new(&self.cfg, cache.len() + 1)?;
+        self.kv_decode_core(embeds, position, cache, kv_dim, &mut scratch)?;
+        Ok(scratch.logits)
+    }
+
+    pub(crate) fn kv_decode_step_with_scratch<'s>(
+        &self,
+        embeds: &[f32],
+        position: [u32; 3],
+        cache: &mut Ernie45KvCache,
+        scratch: &'s mut Ernie45DecodeScratch,
+    ) -> Result<&'s [f32], InferenceError> {
+        let kv_dim = self.validate_kv_decode_input(embeds, cache)?;
+        scratch.check_compatible(&self.cfg, cache.len() + 1)?;
+        self.kv_decode_core(embeds, position, cache, kv_dim, scratch)
+    }
+
+    fn validate_kv_decode_input(
+        &self,
+        embeds: &[f32],
+        cache: &Ernie45KvCache,
+    ) -> Result<usize, InferenceError> {
         let h = self.cfg.hidden_size;
         let len = cache.len();
         if len == 0 {
@@ -828,18 +851,19 @@ impl Ernie45Model {
                 "ernie45 kv step: embeds carry a non-finite value".into(),
             ));
         }
-        self.kv_decode_core(embeds, position, cache, kv_dim)
+        Ok(kv_dim)
     }
 
     /// The cached decode kernel: one token through every layer, attention
     /// reading keys/values from `cache` rows `0..=cache.len()`.
-    fn kv_decode_core(
+    fn kv_decode_core<'s>(
         &self,
         embeds: &[f32],
         position: [u32; 3],
         cache: &mut Ernie45KvCache,
         kv_dim: usize,
-    ) -> Result<Vec<f32>, InferenceError> {
+        scratch: &'s mut Ernie45DecodeScratch,
+    ) -> Result<&'s [f32], InferenceError> {
         let cfg = &self.cfg;
         let w = &self.weights;
         let h = cfg.hidden_size;
@@ -858,39 +882,41 @@ impl Ernie45Model {
         let hd_keys = checked_product(cfg.head_dim, keys, "kv step transposed value buffer size")?;
         let hd = cfg.head_dim;
 
-        let mut x = embeds.to_vec();
-        let (cos, sin) = mrope_cos_sin_table(cfg, &[position]);
-
         let heads = cfg.num_attention_heads;
         let kv_heads = cfg.num_key_value_heads;
         let groups = heads / kv_heads;
         let scale = 1.0 / (hd as f32).sqrt();
         let cap_kv = checked_product(cache.capacity, kv_dim, "kv cache per-layer capacity")?;
 
-        let mut normed = vec![0f32; s_h];
-        let mut q = vec![0f32; s_q_dim];
-        let mut k = vec![0f32; s_kv_dim];
-        let mut v = vec![0f32; s_kv_dim];
-        let mut attn_out = vec![0f32; s_q_dim];
-        let mut proj = vec![0f32; s_h];
-        let mut gate = vec![0f32; s_intermediate];
-        let mut up = vec![0f32; s_intermediate];
-        let mut scores = vec![0f32; s_keys];
-        let mut q_h = vec![0f32; hd];
-        let mut k_h = vec![0f32; keys_hd];
-        let mut v_t = vec![0f32; hd_keys];
-        let mut out_h = vec![0f32; hd];
+        scratch.fill_mrope(cfg, position);
+        let x = &mut scratch.x[..s_h];
+        x.copy_from_slice(embeds);
+        let cos = &scratch.cos[..hd];
+        let sin = &scratch.sin[..hd];
+        let normed = &mut scratch.normed[..s_h];
+        let q = &mut scratch.q[..s_q_dim];
+        let k = &mut scratch.k[..s_kv_dim];
+        let v = &mut scratch.v[..s_kv_dim];
+        let attn_out = &mut scratch.attn_out[..s_q_dim];
+        let proj = &mut scratch.proj[..s_h];
+        let gate = &mut scratch.gate[..s_intermediate];
+        let up = &mut scratch.up[..s_intermediate];
+        let scores = &mut scratch.scores[..s_keys];
+        let q_h = &mut scratch.q_h[..hd];
+        let k_h = &mut scratch.k_h[..keys_hd];
+        let v_t = &mut scratch.v_t[..hd_keys];
+        let out_h = &mut scratch.out_h[..hd];
 
         for (layer_idx, layer) in w.layers.iter().enumerate() {
             // Attention block: same norm/projection/RoPE calls as
             // `forward_embeds_core` at s == 1.
-            normed.copy_from_slice(&x);
-            rms_norm(&mut normed, &layer.input_layernorm, h, cfg.rms_norm_eps);
-            matmul_bt(&normed, &layer.q_proj, &mut q, 1, h, q_dim);
-            matmul_bt(&normed, &layer.k_proj, &mut k, 1, h, kv_dim);
-            matmul_bt(&normed, &layer.v_proj, &mut v, 1, h, kv_dim);
-            gemma4_apply_rope(&mut q, &cos, &sin, 1, heads, hd);
-            gemma4_apply_rope(&mut k, &cos, &sin, 1, kv_heads, hd);
+            normed.copy_from_slice(x);
+            rms_norm(normed, &layer.input_layernorm, h, cfg.rms_norm_eps);
+            matmul_bt(normed, &layer.q_proj, q, 1, h, q_dim);
+            matmul_bt(normed, &layer.k_proj, k, 1, h, kv_dim);
+            matmul_bt(normed, &layer.v_proj, v, 1, h, kv_dim);
+            gemma4_apply_rope(q, cos, sin, 1, heads, hd);
+            gemma4_apply_rope(k, cos, sin, 1, kv_heads, hd);
 
             // Append this token's rows to the cache at row `len`, in the
             // same `[token, kv_head, head_dim]` layout the kernel's own
@@ -900,8 +926,8 @@ impl Ernie45Model {
                 kv_dim,
                 "kv cache row offset",
             )? + checked_product(len, kv_dim, "kv cache row offset")?;
-            cache.layer_k[row_base..row_base + kv_dim].copy_from_slice(&k);
-            cache.layer_v[row_base..row_base + kv_dim].copy_from_slice(&v);
+            cache.layer_k[row_base..row_base + kv_dim].copy_from_slice(k);
+            cache.layer_v[row_base..row_base + kv_dim].copy_from_slice(v);
 
             // Causal GQA attention over the cached keys. Every cached key
             // is at or before this token's position, so there is no
@@ -921,66 +947,44 @@ impl Ernie45Model {
                 for qh in kvh * groups..(kvh + 1) * groups {
                     let q_row = &q[qh * hd..(qh + 1) * hd];
                     q_h.copy_from_slice(q_row);
-                    matmul_bt(&q_h, &k_h, &mut scores, 1, hd, keys);
+                    matmul_bt(q_h, k_h, scores, 1, hd, keys);
                     for score in &mut scores[..keys] {
                         *score *= scale;
                     }
                     softmax_row_fail_closed(&mut scores[..keys]);
-                    matmul_bt(&scores, &v_t, &mut out_h, 1, keys, hd);
-                    attn_out[qh * hd..(qh + 1) * hd].copy_from_slice(&out_h);
+                    matmul_bt(scores, v_t, out_h, 1, keys, hd);
+                    attn_out[qh * hd..(qh + 1) * hd].copy_from_slice(out_h);
                 }
             }
-            matmul_bt(&attn_out, &layer.o_proj, &mut proj, 1, q_dim, h);
+            matmul_bt(attn_out, &layer.o_proj, proj, 1, q_dim, h);
             for (xi, pi) in x.iter_mut().zip(proj.iter()) {
                 *xi += pi;
             }
 
             // MLP block: identical calls to `forward_embeds_core` at s == 1.
-            normed.copy_from_slice(&x);
-            rms_norm(
-                &mut normed,
-                &layer.post_attention_layernorm,
-                h,
-                cfg.rms_norm_eps,
-            );
-            matmul_bt(
-                &normed,
-                &layer.gate_proj,
-                &mut gate,
-                1,
-                h,
-                cfg.intermediate_size,
-            );
-            matmul_bt(
-                &normed,
-                &layer.up_proj,
-                &mut up,
-                1,
-                h,
-                cfg.intermediate_size,
-            );
-            silu_inplace(&mut gate);
+            normed.copy_from_slice(x);
+            rms_norm(normed, &layer.post_attention_layernorm, h, cfg.rms_norm_eps);
+            matmul_bt(normed, &layer.gate_proj, gate, 1, h, cfg.intermediate_size);
+            matmul_bt(normed, &layer.up_proj, up, 1, h, cfg.intermediate_size);
+            silu_inplace(gate);
             for (g, &u) in gate.iter_mut().zip(up.iter()) {
                 *g *= u;
             }
-            matmul_bt(
-                &gate,
-                &layer.down_proj,
-                &mut proj,
-                1,
-                cfg.intermediate_size,
-                h,
-            );
+            matmul_bt(gate, &layer.down_proj, proj, 1, cfg.intermediate_size, h);
             for (xi, pi) in x.iter_mut().zip(proj.iter()) {
                 *xi += pi;
             }
         }
 
-        let mut final_normed = x;
-        rms_norm(&mut final_normed, &w.final_norm, h, cfg.rms_norm_eps);
-        let mut logits = vec![0f32; cfg.vocab_size];
-        matmul_bt(&final_normed, &w.lm_head, &mut logits, 1, h, cfg.vocab_size);
+        let final_normed = x;
+        rms_norm(final_normed, &w.final_norm, h, cfg.rms_norm_eps);
+        let logits = &mut scratch.logits[..cfg.vocab_size];
+        matmul_bt(final_normed, &w.lm_head, logits, 1, h, cfg.vocab_size);
         cache.len = len + 1;
+        #[cfg(test)]
+        {
+            scratch.decode_calls += 1;
+        }
         Ok(logits)
     }
 
@@ -1244,6 +1248,221 @@ struct Ernie45CoreOut {
     logits: Vec<f32>,
 }
 
+struct Ernie45DecodeLayout {
+    hidden: usize,
+    intermediate: usize,
+    layers: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    vocab: usize,
+    max_keys: usize,
+}
+
+impl Ernie45DecodeLayout {
+    fn new(cfg: &Ernie45Config, max_keys: usize) -> Result<(Self, [usize; 19]), InferenceError> {
+        cfg.validate()?;
+        if max_keys == 0 {
+            return Err(InferenceError::Inference(
+                "ernie45 kv scratch: max_keys must be positive".into(),
+            ));
+        }
+        let q_dim = cfg.q_dim()?;
+        let kv_dim = cfg.kv_dim()?;
+        let keys_hd = checked_product(max_keys, cfg.head_dim, "kv scratch key head size")?;
+        let hd_keys = checked_product(cfg.head_dim, max_keys, "kv scratch value head size")?;
+        let lengths = [
+            cfg.hidden_size,
+            cfg.hidden_size,
+            q_dim,
+            kv_dim,
+            kv_dim,
+            q_dim,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            cfg.intermediate_size,
+            max_keys,
+            cfg.head_dim,
+            keys_hd,
+            hd_keys,
+            cfg.head_dim,
+            cfg.vocab_size,
+            cfg.head_dim / 2,
+            cfg.head_dim,
+            cfg.head_dim,
+            cfg.head_dim,
+        ];
+        for (index, &len) in lengths.iter().enumerate() {
+            let element_size = if index == 16 {
+                std::mem::size_of::<usize>()
+            } else {
+                std::mem::size_of::<f32>()
+            };
+            let bytes = checked_product(len, element_size, "kv scratch buffer byte size")?;
+            if bytes > isize::MAX as usize {
+                return Err(InferenceError::Inference(
+                    "ernie45 kv scratch: buffer exceeds isize::MAX bytes".into(),
+                ));
+            }
+        }
+        Ok((
+            Self {
+                hidden: cfg.hidden_size,
+                intermediate: cfg.intermediate_size,
+                layers: cfg.num_hidden_layers,
+                heads: cfg.num_attention_heads,
+                kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                vocab: cfg.vocab_size,
+                max_keys,
+            },
+            lengths,
+        ))
+    }
+}
+
+fn decode_buffer<T: Clone + Default>(len: usize) -> Result<Vec<T>, InferenceError> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(len)
+        .map_err(|error| reserve_error("kv scratch buffer", error))?;
+    buffer.resize(len, T::default());
+    Ok(buffer)
+}
+
+pub(crate) struct Ernie45DecodeScratch {
+    layout: Ernie45DecodeLayout,
+    x: Vec<f32>,
+    normed: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn_out: Vec<f32>,
+    proj: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    scores: Vec<f32>,
+    q_h: Vec<f32>,
+    k_h: Vec<f32>,
+    v_t: Vec<f32>,
+    out_h: Vec<f32>,
+    logits: Vec<f32>,
+    inv_freq: Vec<f32>,
+    lane_row: Vec<usize>,
+    cos: Vec<f32>,
+    sin: Vec<f32>,
+    #[cfg(test)]
+    decode_calls: usize,
+}
+
+impl Ernie45DecodeScratch {
+    pub(crate) fn new(cfg: &Ernie45Config, max_keys: usize) -> Result<Self, InferenceError> {
+        let (layout, lengths) = Ernie45DecodeLayout::new(cfg, max_keys)?;
+        Ok(Self {
+            layout,
+            x: decode_buffer(lengths[0])?,
+            normed: decode_buffer(lengths[1])?,
+            q: decode_buffer(lengths[2])?,
+            k: decode_buffer(lengths[3])?,
+            v: decode_buffer(lengths[4])?,
+            attn_out: decode_buffer(lengths[5])?,
+            proj: decode_buffer(lengths[6])?,
+            gate: decode_buffer(lengths[7])?,
+            up: decode_buffer(lengths[8])?,
+            scores: decode_buffer(lengths[9])?,
+            q_h: decode_buffer(lengths[10])?,
+            k_h: decode_buffer(lengths[11])?,
+            v_t: decode_buffer(lengths[12])?,
+            out_h: decode_buffer(lengths[13])?,
+            logits: decode_buffer(lengths[14])?,
+            inv_freq: decode_buffer(lengths[15])?,
+            lane_row: decode_buffer(lengths[16])?,
+            cos: decode_buffer(lengths[17])?,
+            sin: decode_buffer(lengths[18])?,
+            #[cfg(test)]
+            decode_calls: 0,
+        })
+    }
+
+    fn check_compatible(&self, cfg: &Ernie45Config, keys: usize) -> Result<(), InferenceError> {
+        let layout = &self.layout;
+        if layout.hidden != cfg.hidden_size
+            || layout.intermediate != cfg.intermediate_size
+            || layout.layers != cfg.num_hidden_layers
+            || layout.heads != cfg.num_attention_heads
+            || layout.kv_heads != cfg.num_key_value_heads
+            || layout.head_dim != cfg.head_dim
+            || layout.vocab != cfg.vocab_size
+        {
+            return Err(InferenceError::Inference(
+                "ernie45 kv scratch: incompatible model geometry".into(),
+            ));
+        }
+        if keys > layout.max_keys {
+            return Err(InferenceError::Inference(format!(
+                "ernie45 kv scratch: {keys} active keys exceed prepared capacity {}",
+                layout.max_keys
+            )));
+        }
+        Ok(())
+    }
+
+    fn fill_mrope(&mut self, cfg: &Ernie45Config, position: [u32; 3]) {
+        let head_dim = cfg.head_dim;
+        let half = head_dim / 2;
+        // Geometry can match a different model's theta or section mapping.
+        for i in 0..half {
+            self.inv_freq[i] = (1.0 / cfg.rope_theta.powf(2.0 * i as f64 / head_dim as f64)) as f32;
+        }
+        let mut j = 0;
+        for _rep in 0..2 {
+            for (row, &size) in cfg.rope_scaling.mrope_section.iter().enumerate() {
+                for _ in 0..size {
+                    self.lane_row[j] = row;
+                    j += 1;
+                }
+            }
+        }
+        assert_eq!(j, head_dim);
+        for j in 0..head_dim {
+            let angle = position[self.lane_row[j]] as f32 * self.inv_freq[j % half];
+            let (sn, cs) = angle.sin_cos();
+            self.cos[j] = cs;
+            self.sin[j] = sn;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_storage_snapshot(&self) -> Vec<(usize, usize)> {
+        vec![
+            (self.x.as_ptr() as usize, self.x.capacity()),
+            (self.normed.as_ptr() as usize, self.normed.capacity()),
+            (self.q.as_ptr() as usize, self.q.capacity()),
+            (self.k.as_ptr() as usize, self.k.capacity()),
+            (self.v.as_ptr() as usize, self.v.capacity()),
+            (self.attn_out.as_ptr() as usize, self.attn_out.capacity()),
+            (self.proj.as_ptr() as usize, self.proj.capacity()),
+            (self.gate.as_ptr() as usize, self.gate.capacity()),
+            (self.up.as_ptr() as usize, self.up.capacity()),
+            (self.scores.as_ptr() as usize, self.scores.capacity()),
+            (self.q_h.as_ptr() as usize, self.q_h.capacity()),
+            (self.k_h.as_ptr() as usize, self.k_h.capacity()),
+            (self.v_t.as_ptr() as usize, self.v_t.capacity()),
+            (self.out_h.as_ptr() as usize, self.out_h.capacity()),
+            (self.logits.as_ptr() as usize, self.logits.capacity()),
+            (self.inv_freq.as_ptr() as usize, self.inv_freq.capacity()),
+            (self.lane_row.as_ptr() as usize, self.lane_row.capacity()),
+            (self.cos.as_ptr() as usize, self.cos.capacity()),
+            (self.sin.as_ptr() as usize, self.sin.capacity()),
+        ]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_decode_calls(&self) -> usize {
+        self.decode_calls
+    }
+}
+
 /// Caller-owned KV cache for the ERNIE-4.5 decoder's cached decode:
 /// `kv_prefill` fills it with the prompt's post-RoPE keys and values, and
 /// `kv_decode_step` appends one row per step.
@@ -1254,11 +1473,9 @@ struct Ernie45CoreOut {
 /// code reads cached rows with the same indexing and no second layout.
 /// The two stores are sized for `capacity` tokens in [`Self::new`] and
 /// are only ever written into afterwards, so the cache itself never
-/// reallocates or grows as the sequence advances. That is a statement
-/// about the cache, not about the step: [`Ernie45Model::kv_decode_step`]
-/// still allocates its own per-call scratch buffers, exactly as the
-/// uncached kernel does, and reusing those across steps is a separate
-/// change.
+/// reallocates or grows as the sequence advances. The owned-output
+/// [`Ernie45Model::kv_decode_step`] allocates temporary scratch; cached
+/// greedy generation retains its scratch for the request.
 ///
 /// The cache is opaque and explicit — [`Ernie45Model`] keeps no hidden
 /// state, and every entry point re-validates the cache's shape before
@@ -1400,6 +1617,10 @@ impl Ernie45KvCache {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "ernie45/decode_scratch_tests.rs"]
+mod decode_scratch_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1825,7 +2046,7 @@ mod tests {
     /// Deterministic (seeded) pseudo-random f32 values in `[-1, 1)`, used to
     /// build non-trivial weights/embeds so equivalence tests can't pass by
     /// every row collapsing to the same value.
-    fn pseudo_random_vec(len: usize, seed: u64) -> Vec<f32> {
+    pub(super) fn pseudo_random_vec(len: usize, seed: u64) -> Vec<f32> {
         let mut state = seed | 1;
         (0..len)
             .map(|_| {
@@ -1857,7 +2078,7 @@ mod tests {
         }
     }
 
-    fn equiv_weights(cfg: &Ernie45Config) -> Ernie45Weights {
+    pub(super) fn equiv_weights(cfg: &Ernie45Config) -> Ernie45Weights {
         let h = cfg.hidden_size;
         let q_dim = cfg.q_dim().unwrap();
         let kv_dim = cfg.kv_dim().unwrap();
