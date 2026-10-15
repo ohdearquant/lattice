@@ -85,7 +85,7 @@ negligible next to the projections. A general-length or SIMD FFT is added only w
 
 Upstream checkpoints are PyTorch pickles. Lattice reads only safetensors (ADR-003): conversion happens in a separate step
 that checks each checkpoint's sha256 against its pin (D8), loads it with `weights_only=True` under a pinned torch
-version, drops the upstream FFT-convolution library's `flashfftconv.*` entries (the reference model loads strictly
+version of at least 2.6.0 (the first release whose `weights_only` load is not open to CVE-2025-32434), drops the upstream FFT-convolution library's `flashfftconv.*` entries (the reference model loads strictly
 without them), and writes f32 tensors under the reference state-dict names. The golden generator loads checkpoints the same way. Loading requires every tensor the configuration needs, at its exact shape, and refuses any tensor left over. A
 leftover tensor means the configuration and the checkpoint disagree. The upstream torch-native Reverso port drops the
 output position embedding that the full checkpoint was trained with and cannot load that checkpoint strictly, so this
@@ -120,6 +120,12 @@ degenerate distribution, as its reference evaluation does.
   `7ad57992b268deb8f1d4c1cff23db6383b1924d7880ba8edf28002ec4613f389` (`reverso_nano`). The benchmark data and metric
   code are pinned the same way: GIFT-Eval code at commit `577a65cfa3acb812405c00d989230bf59f7f8a3d` with its lockfile,
   and the `Salesforce/GiftEval` dataset at revision `30841734ac5cfddbd0c3bad6d09d2b6b32becbb0`.
+- **Release status.** As read on 2026-10-15 from the README at the pinned commit, only `reverso_small` is marked
+  available; `reverso` (2.6M) and `reverso_nano` are marked "Coming soon", although all three checkpoint files are
+  present at that commit and match the pins above. The first port converts and tests all three. The score check below
+  targets the 2.6M model, the one the published GIFT-Eval row reports. If a pinned checkpoint stops being retrievable
+  at its pin, or its bytes no longer match, work that depends on it waits: no other checkpoint or model is substituted
+  and no score target is moved to a different model.
 - **Goldens.** Each port is tested against reference outputs generated from the pinned source and checkpoints: every
   layer's output, one forward call, an autoregressive rollout, the rollout of the negated series, the sign-flip
   averaged prediction, and the context preparation on missing-value, short and constant inputs. Thresholds are
