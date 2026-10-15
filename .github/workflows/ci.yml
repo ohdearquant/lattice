@@ -895,6 +895,28 @@ jobs:
             exit "$lattice_status"
           fi
           check_test_utils_modules_ran lattice_test.log lattice
+      # The target is excluded from default tests because its other cases load checkpoints.
+      - name: inference - CPU logprobs golden comparator controls
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/serve-cpu-logprobs-contract.log"
+          if cargo test --locked -p lattice-inference --test serve_cpu_isolation --features serve \
+            -- logprobs_contract_ --nocapture --color never >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          for test_name in \
+            logprobs_contract_accepts_cpu_drift \
+            logprobs_contract_rejects_bad_numeric_leaves \
+            logprobs_contract_rejects_structure_changes
+          do
+            grep -Fx "test ${test_name} ... ok" "$log"
+          done
+          test "$(grep -c '^test result: ' "$log")" -eq 1
+          grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$' "$log"
       # The standalone server's startup routing, Gemma refusals and unchanged
       # startup errors run against the shipped `lattice_serve` binary with stub
       # model directories. The two real-checkpoint cases report
