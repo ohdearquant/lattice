@@ -23,7 +23,7 @@
 //! [`select_route`]: crate::serve::route::select_route
 //! [`select_standalone_route`]: crate::serve::route::select_standalone_route
 
-use crate::model_format::{ModelFamily, ModelFormat, unrecognized_format_message};
+use crate::model_format::{ModelFamily, ModelFormat, unloadable_format_message};
 use std::path::Path;
 
 /// Stable code carried by the refusal of a Gemma 4 checkpoint on Metal.
@@ -126,7 +126,7 @@ impl RouteRefusal {
     /// one `lattice serve` printed before routing existed.
     pub fn message(&self, dir: &Path) -> String {
         match self {
-            Self::UnrecognizedFormat => unrecognized_format_message(dir),
+            Self::UnrecognizedFormat => unloadable_format_message(dir),
             Self::GemmaMetalUnsupported => format!(
                 "{GEMMA_METAL_UNSUPPORTED_CODE}: '{}' is a Gemma 4 checkpoint in the native Q4 \
                  format, which only the Metal backend reads, and Gemma 4 is served on the CPU \
@@ -214,6 +214,7 @@ impl DriverEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_format::unrecognized_format_message;
 
     #[test]
     fn format_picks_the_backend_and_config_picks_the_family() {

@@ -346,6 +346,9 @@ fn format_name(format: ModelFormat) -> &'static str {
     match format {
         ModelFormat::Safetensors => "safetensors",
         ModelFormat::Q4 => "q4",
+        ModelFormat::MlxQuantized => "mlx-quantized",
+        ModelFormat::Gguf => "gguf",
+        ModelFormat::Refused => "refused",
         _ => "unknown",
     }
 }
@@ -993,7 +996,7 @@ fn report_stderr(cfg: &Config, lines: &[String], requests: usize) {
 
 fn run(cfg: &Config) -> Result<(), Refusal> {
     let format = detect_format(&cfg.model_dir);
-    if !cfg.model_dir.is_dir() || format == ModelFormat::Unknown {
+    if !cfg.model_dir.is_dir() || !matches!(format, ModelFormat::Safetensors | ModelFormat::Q4) {
         return Err(Refusal::ModelAbsent(format!(
             "model_dir={} format={}",
             cfg.model_dir.display(),
@@ -1071,7 +1074,11 @@ mod tests {
 
     fn model_dir_with_weights() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("model.safetensors"), b"").unwrap();
+        let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[0u8; 4]);
+        std::fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
         dir
     }
 

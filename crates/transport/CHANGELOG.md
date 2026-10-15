@@ -10,6 +10,16 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `DriftReport` is `#[non_exhaustive]`. Code outside the crate can no longer
+  build it with a struct literal or destructure it without `..`; reading its fields is unchanged.
+  A report comes from `detect_drift_memories` or `detect_drift_records`; the crate has no other
+  constructor. It gained a field in 0.11.0, and the attribute lets later fields arrive without
+  breaking struct literals or patterns again. It does not cover serialized reports: `DriftReport`
+  derives `Deserialize` with no field defaults, so JSON written by an earlier version does not
+  deserialize into a version that adds a required field.
+
 ## [0.12.1] - 2026-10-14
 
 Documentation and package metadata only; no code changes.

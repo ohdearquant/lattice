@@ -255,8 +255,9 @@ enum RouterCommand {
 // directory (`model.safetensors` or a sharded index). Native Q4 quantized
 // directories (per-tensor `.q4` files, the output of `quantize_q4`) route to
 // the Metal GPU forward pass instead. Safetensors directories are completely
-// unaffected: `detect_format` returns `Safetensors` for them exactly as
-// before, and the safetensors load path is untouched.
+// unaffected: `detect_format` returns `Safetensors` for a readable,
+// unquantized safetensors directory, and the safetensors load path is
+// untouched.
 //
 // The detector itself (`ModelFormat` + `detect_format` + the two error
 // message helpers) now lives in `lattice_inference::model_format` (ADR-080
@@ -344,10 +345,7 @@ async fn main() {
                 }
             };
             let Some(route) = selected.legacy_route() else {
-                eprintln!(
-                    "Error: {}",
-                    backend::unrecognized_format_message(model_path)
-                );
+                eprintln!("Error: {}", backend::unloadable_format_message(model_path));
                 std::process::exit(1);
             };
             eprintln!("{}", route.selection_marker(format));
@@ -585,6 +583,8 @@ async fn main() {
                 cpu_generation_admission: Arc::new(Semaphore::new(max_cpu_generations)),
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: router_artifact,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                episodes: serve::episode_store(),
             };
 
             let app = serve::router(state);

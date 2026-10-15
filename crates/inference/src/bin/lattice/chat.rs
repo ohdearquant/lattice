@@ -183,7 +183,7 @@ pub(crate) fn run_chat(
         // the same way as `Unknown`: report it and exit, rather than
         // silently guessing a loader.
         _ => {
-            eprintln!("Error: {}", backend::unrecognized_format_message(path));
+            eprintln!("Error: {}", backend::unloadable_format_message(path));
             std::process::exit(1);
         }
     };
