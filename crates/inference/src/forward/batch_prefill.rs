@@ -24,6 +24,9 @@ use crate::model::qwen35::{
 };
 use crate::model::qwen35_config::Qwen35Config;
 
+#[path = "batch_prefill_attention.rs"]
+mod blocked_attention;
+
 #[cfg(test)]
 #[path = "batch_prefill_attention_bench.rs"]
 mod attention_bench;
@@ -79,7 +82,7 @@ struct PrefillScratch {
     // ----- Attention tiling config -----
     /// Tiling configuration for full-attention prompt prefill.
     tiled_config: TiledAttentionConfig,
-    /// Placeholder for compatibility with the existing flash-attention API.
+    /// Reused packed Q/K/V, score and online-softmax tiles.
     tiled_buffers: TiledAttentionBuffers,
 
     /// Logits for the last prompt token only: `[vocab_size]`.
@@ -221,6 +224,7 @@ impl Qwen35Model {
         debug_assert_eq!(kv_cache.seq_len, 0);
         debug_assert_eq!(gdn_states.len(), cfg.num_linear_attention_layers());
 
+        blocked_attention::prepare_buffers(&scratch.tiled_config, &mut scratch.tiled_buffers)?;
         scratch.ensure_capacity(cfg, seq_len);
 
         // Embedding lookup for the full prompt.
@@ -874,102 +878,26 @@ fn causal_tiled_attention_head(
     head_dim: usize,
     scale: f32,
     config: &TiledAttentionConfig,
-    _buffers: &mut TiledAttentionBuffers,
-    acc: &mut [f32],
-    tile_scores: &mut [f32],
+    buffers: &mut TiledAttentionBuffers,
+    _acc: &mut [f32],
+    _tile_scores: &mut [f32],
 ) {
-    let tile_q = config.tile_size_q.max(1);
-    let tile_kv = config.tile_size_kv.max(1);
-
-    debug_assert!(acc.len() >= head_dim);
-    debug_assert!(tile_scores.len() >= tile_kv);
-
-    for q_start in (0..seq_len).step_by(tile_q) {
-        let q_end = (q_start + tile_q).min(seq_len);
-
-        for q_row in q_start..q_end {
-            let q_off = q_row * q_stride + q_head_offset;
-            let q_vec = &q[q_off..q_off + head_dim];
-
-            acc[..head_dim].fill(0.0);
-            let mut running_max = f32::NEG_INFINITY;
-            let mut running_sum = 0.0f32;
-            // ADR-080 C1 (#780): tracked independently of the `local_max`/
-            // `running_max` folds because `if score > local_max` is `false`
-            // for a NaN operand (IEEE 754), silently dropping it from the
-            // max the same way `f32::max` does. This is the online-softmax
-            // single-row analogue of `flash_causal.rs`'s `block_has_poison`.
-            let mut row_poisoned = false;
-
-            let max_kv_pos = q_row + 1;
-            for kv_start in (0..max_kv_pos).step_by(tile_kv) {
-                let kv_end = (kv_start + tile_kv).min(max_kv_pos);
-                let tile_len = kv_end - kv_start;
-
-                let mut local_max = f32::NEG_INFINITY;
-                for (local_idx, kv_pos) in (kv_start..kv_end).enumerate() {
-                    let k_off = kv_pos * kv_stride + kv_head_offset;
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        dot += q_vec[d] * k[k_off + d];
-                    }
-                    let score = dot * scale;
-                    if score.is_nan() || score == f32::INFINITY {
-                        row_poisoned = true;
-                    }
-                    tile_scores[local_idx] = score;
-                    if score > local_max {
-                        local_max = score;
-                    }
-                }
-
-                let new_max = running_max.max(local_max);
-                let alpha = if running_sum == 0.0 {
-                    0.0
-                } else {
-                    (running_max - new_max).exp()
-                };
-
-                for a in acc[..head_dim].iter_mut() {
-                    *a *= alpha;
-                }
-                running_sum *= alpha;
-
-                for (local_idx, &ts) in tile_scores[..tile_len].iter().enumerate() {
-                    let weight = (ts - new_max).exp();
-                    running_sum += weight;
-
-                    let kv_pos = kv_start + local_idx;
-                    let v_off = kv_pos * kv_stride + kv_head_offset;
-                    for d in 0..head_dim {
-                        acc[d] += weight * v[v_off + d];
-                    }
-                }
-
-                running_max = new_max;
-            }
-
-            let out_off = q_row * out_stride + q_head_offset;
-            // ADR-080 C1 (#780): RED before the fix, `running_sum.max(f32::MIN_POSITIVE)`
-            // silently replaced a NaN `running_sum` with a tiny-but-positive
-            // finite value instead of failing closed, so `1.0 / running_sum`
-            // became an enormous (~8.5e37) finite number and the output row
-            // exploded into huge finite garbage rather than zero. Structurally
-            // distinct from `attention::softmax_row::finalize_row` (this
-            // online algorithm writes into a separate `acc` accumulator, not
-            // an in-place score row), so this is an inline contract-conformant
-            // fix rather than a call to the shared helper: fail closed on a
-            // poisoned row OR a non-positive/non-finite denominator.
-            if row_poisoned || !running_sum.is_finite() || running_sum <= 0.0 {
-                output[out_off..out_off + head_dim].fill(0.0);
-            } else {
-                let inv_sum = 1.0 / running_sum;
-                for d in 0..head_dim {
-                    output[out_off + d] = acc[d] * inv_sum;
-                }
-            }
-        }
-    }
+    blocked_attention::causal_attention_head(
+        q,
+        k,
+        v,
+        output,
+        seq_len,
+        q_stride,
+        kv_stride,
+        out_stride,
+        q_head_offset,
+        kv_head_offset,
+        head_dim,
+        scale,
+        config,
+        buffers,
+    );
 }
 
 /// Local copy of the private causal depthwise conv1d used by GatedDeltaNet.
@@ -1536,10 +1464,70 @@ mod tests {
             rhs.len()
         );
         for (i, (&a, &b)) in lhs.iter().zip(rhs.iter()).enumerate() {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "{name}: non-finite value at index {i}: lhs={a}, rhs={b}"
+            );
             let diff = (a - b).abs();
             if diff > tol {
                 panic!(
                     "{name}: mismatch at index {i}: lhs={a:.8}, rhs={b:.8}, diff={diff:.8}, tol={tol:.8}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allclose_rejects_nonfinite_attention_parity_operands() {
+        for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for (lhs, rhs) in [
+                ([nonfinite], [1.0]),
+                ([1.0], [nonfinite]),
+                ([nonfinite], [nonfinite]),
+            ] {
+                assert!(
+                    std::panic::catch_unwind(|| {
+                        assert_allclose("nonfinite control", &lhs, &rhs, 1e-5)
+                    })
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_prefill_blocked_attention_crosses_tiles() {
+        let cfg = tiny_test_config();
+        let model = build_random_model(cfg.clone(), 0x1234_5678_9abc_def0);
+        for len in [65, 97, 129] {
+            let prompt: Vec<u32> = (0..len)
+                .map(|index| ((index * 7 + 3) % cfg.vocab_size) as u32)
+                .collect();
+            let (seq_logits, seq_states, seq_kv) = run_sequential_prefill(&model, &prompt);
+            let (batch_logits, batch_states, batch_kv) = run_batched_prefill(&model, &prompt);
+            assert_eq!(seq_kv.seq_len, len);
+            assert_eq!(batch_kv.seq_len, len);
+            assert!(seq_logits.iter().any(|value| value.abs() > 1e-8));
+            assert_allclose("blocked logits", &seq_logits, &batch_logits, 1e-5);
+            assert_eq!(seq_kv.k.len(), batch_kv.k.len());
+            assert_eq!(seq_kv.v.len(), batch_kv.v.len());
+            for i in 0..seq_kv.k.len() {
+                assert_allclose("blocked kv.k", &seq_kv.k[i], &batch_kv.k[i], 1e-5);
+                assert_allclose("blocked kv.v", &seq_kv.v[i], &batch_kv.v[i], 1e-5);
+            }
+            assert_eq!(seq_states.len(), batch_states.len());
+            for i in 0..seq_states.len() {
+                assert_allclose(
+                    "blocked gdn state",
+                    &seq_states[i].s_matrices,
+                    &batch_states[i].s_matrices,
+                    1e-5,
+                );
+                assert_allclose(
+                    "blocked gdn convolution",
+                    &seq_states[i].conv_buffer,
+                    &batch_states[i].conv_buffer,
+                    1e-5,
                 );
             }
         }
@@ -1802,6 +1790,7 @@ mod tests {
         let mut output = vec![1.0f32; seq_len * out_stride]; // nonzero: prove overwrite
         let config = TiledAttentionConfig::new(1, 1, head_dim);
         let mut buffers = TiledAttentionBuffers::default();
+        blocked_attention::prepare_buffers(&config, &mut buffers).unwrap();
         let mut acc = vec![0.0f32; head_dim];
         let mut tile_scores = vec![0.0f32; config.tile_size_kv.max(1).max(seq_len)];
 
