@@ -266,44 +266,23 @@ pub struct RouteOutcome {
 /// Default floor on the softmax temperature `tau` (ADR-091 Decision 3,
 /// [`AdapterRouter::set_tau_floor`]).
 ///
-/// Below this, `exp((score - max_score) / tau)` underflows toward zero in
-/// `f32` for any score gap of a couple of units, so the softmax is already
-/// an argmax in floating point, not merely "practically" one. `1e-2` is a
-/// round, conservative number rather than one derived from a specific score
-/// scale — gate scores have no calibrated magnitude (see the module doc) —
-/// chosen far enough above numerical underflow that it catches near-collapse
-/// well before floating point would. It is a policy default, not a proof:
-/// the Decision 5 evidence run is what should move it.
-pub const DEFAULT_TAU_FLOOR: f32 = 1e-2;
+/// Re-exported rather than defined here: see
+/// [`crate::router_state::DEFAULT_TAU_FLOOR`] for the value and why it is
+/// enforced at both the artifact and the router.
+pub use crate::router_state::DEFAULT_TAU_FLOOR;
 
 /// Default entropy floor, in nats, below which a refit round's mean
 /// weight-entropy counts as collapsed (ADR-091 Decision 3,
 /// [`AdapterRouter::submit_refit`]).
 ///
-/// At `k = 2` (the smallest, most common selection width) this is roughly a
-/// 97.7 / 2.3 split — sharp enough to already read as collapse rather than a
-/// confident, healthy preference. Entropy's scale depends on `k`, and this
-/// guard compares every round against one static floor regardless of `k`;
-/// a deployment mixing very different `k` across rounds should treat this as
-/// a known limitation, not a tuned-away one. As the ADR states: this floor
-/// cannot tell collapse from a correctly sharp distribution — a router that
-/// has genuinely learned to prefer one adapter produces the same low-entropy
-/// weight vector as one that has collapsed under sparse reward. It is a
-/// guard on refits, not a guard on truth: it decides which gate gets
-/// reloaded, not whether the resulting policy is good. A rejected refit
-/// whose held-out metric (Decision 5) was improving is the stated falsifier
-/// for the floor value — that observation, not intuition about the number,
-/// is what should move it.
-pub const DEFAULT_ENTROPY_FLOOR: f32 = 0.1;
+/// Re-exported: see [`crate::router_state::DEFAULT_ENTROPY_FLOOR`].
+pub use crate::router_state::DEFAULT_ENTROPY_FLOOR;
 
 /// Default number of consecutive collapsed rounds tolerated before
 /// [`AdapterRouter::submit_refit`] rejects a refit (ADR-091 Decision 3).
 ///
-/// `3` tolerates a single noisy round — one round at or above the floor
-/// resets the count — while still catching a sustained collapse within a
-/// small, bounded number of refit cycles. Policy, not derivation; see
-/// [`DEFAULT_ENTROPY_FLOOR`].
-pub const DEFAULT_MAX_CONSECUTIVE_COLLAPSED: usize = 3;
+/// Re-exported: see [`crate::router_state::DEFAULT_MAX_CONSECUTIVE_COLLAPSED`].
+pub use crate::router_state::DEFAULT_MAX_CONSECUTIVE_COLLAPSED;
 
 /// Smallest exploration scale [`AdapterRouter::route_explored`] accepts.
 ///
@@ -475,9 +454,16 @@ impl AdapterRouter {
     /// disables the floor, since no weight then compares less than it.
     ///
     /// A change advances [`policy_epoch`](Self::policy_epoch); re-applying the
-    /// same value does not.
+    /// same value does not. Values are compared bit for bit rather than by
+    /// `==`, and that is what makes "the same value" true for a NaN: a NaN
+    /// compares false against everything, itself included, so `!=` would read
+    /// every re-application of the same disabling NaN as a policy change and
+    /// advance the epoch on each call -- ending the epoch of the samples a
+    /// server that re-applies its configuration per request is trying to
+    /// accumulate. `to_bits` compares the payload, so the first NaN is a
+    /// change and every identical one after it is not.
     pub fn set_epsilon(&mut self, epsilon: f32) {
-        if self.epsilon != epsilon {
+        if self.epsilon.to_bits() != epsilon.to_bits() {
             self.epsilon = epsilon;
             self.policy_epoch = self.policy_epoch.saturating_add(1);
         }
@@ -506,6 +492,14 @@ impl AdapterRouter {
         self.weight_policy
     }
 
+    /// The `epsilon` floor this router currently applies, for the same reason
+    /// [`weight_policy`](Self::weight_policy) is reported: a surface that says
+    /// what a request runs under has to read the value in force rather than
+    /// the value a file records.
+    pub fn epsilon(&self) -> f32 {
+        self.epsilon
+    }
+
     /// Set the floor below which [`route`](Self::route) refuses `tau` for
     /// [`WeightPolicy::Softmax`], returning [`RouterError::TauBelowFloor`]
     /// (ADR-091 Decision 3).
@@ -519,9 +513,12 @@ impl AdapterRouter {
     /// [`DEFAULT_TAU_FLOOR`].
     ///
     /// A change advances [`policy_epoch`](Self::policy_epoch); re-applying the
-    /// same value does not.
+    /// same value does not. Compared by bit pattern for the same reason
+    /// [`set_epsilon`](Self::set_epsilon) is: a NaN floor is accepted and
+    /// disables the check, and `!=` would charge an epoch bump to every
+    /// identical re-application of it.
     pub fn set_tau_floor(&mut self, floor: f32) {
-        if self.tau_floor != floor {
+        if self.tau_floor.to_bits() != floor.to_bits() {
             self.tau_floor = floor;
             self.policy_epoch = self.policy_epoch.saturating_add(1);
         }
@@ -1016,6 +1013,35 @@ pub enum RefitOutcome {
         /// The consecutive-collapsed-round count that triggered rejection.
         consecutive_collapsed_rounds: usize,
     },
+}
+
+/// Derive the exploration seed a completion draws with, from its id.
+///
+/// The seed is part of the recorded evidence, so it has to be reproducible by
+/// anyone holding the episode: given the completion id, this function and the
+/// artifact, the draw replays exactly. That rules out a randomly generated
+/// seed, which would be recorded truthfully and reproducible by nobody, and it
+/// rules out `DefaultHasher`, whose output Rust explicitly does not promise to
+/// keep stable across releases -- a recorded seed that a later toolchain maps
+/// differently makes every stored episode unreplayable with no error anywhere.
+///
+/// FNV-1a over the id's bytes, then one `splitmix64` round to spread the low
+/// bits FNV leaves correlated for inputs sharing a suffix. The three constants
+/// here are as much part of the format as the field names are: changing any of
+/// them invalidates replay for every episode already recorded.
+pub fn seed_from_completion_id(completion_id: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in completion_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    // `splitmix64` advances its argument and returns the mixed value, so the
+    // call site reads oddly here: the mixed output is what we want, and the
+    // advanced state is discarded.
+    let mut state = hash;
+    splitmix64(&mut state)
 }
 
 /// Advance `state` and return one 64-bit value: the SplitMix64 finalizer.
@@ -2466,5 +2492,149 @@ mod tests {
             matches!(outcome, RefitOutcome::Rejected { .. }),
             "a raised floor and M=1 must reject on the first round, got {outcome:?}"
         );
+    }
+
+    /// The seed is a reproducibility contract, so these values are pinned.
+    ///
+    /// They were produced by an independent reimplementation of FNV-1a plus
+    /// `splitmix64` rather than by running this function and pasting what it
+    /// said, which would pin the code to itself and pass through any change to
+    /// either constant.
+    #[test]
+    fn the_completion_seed_is_pinned_and_id_specific() {
+        assert_eq!(
+            seed_from_completion_id("chatcmpl-1789991322-0"),
+            0x03f4_6001_3651_6fde
+        );
+        assert_eq!(
+            seed_from_completion_id("chatcmpl-1789991322-1"),
+            0x39d7_2029_2048_2ee4
+        );
+        // The empty id is not special-cased anywhere, so it has a value like
+        // any other; pinned so that a future guard against it is a deliberate
+        // change rather than a silent one.
+        assert_eq!(seed_from_completion_id(""), 0xc381_7c01_6ba4_ff30);
+
+        // Ids differing in one trailing character must not land near each
+        // other: FNV alone leaves those correlated in the low bits, which is
+        // what the splitmix round is for. Sequential ids are the ONLY shape
+        // this server mints, so this is the case that matters.
+        let seeds: Vec<u64> = (0..64)
+            .map(|i| seed_from_completion_id(&format!("chatcmpl-1789991322-{i}")))
+            .collect();
+        let unique: std::collections::HashSet<u64> = seeds.iter().copied().collect();
+        assert_eq!(unique.len(), seeds.len(), "sequential ids collided");
+        let close = seeds
+            .windows(2)
+            .filter(|w| w[0].abs_diff(w[1]) < (1u64 << 48))
+            .count();
+        assert!(
+            close <= 1,
+            "{close} adjacent id pairs produced seeds within 2^48 of each other"
+        );
+    }
+
+    /// The `router init --tau` claim, measured rather than asserted in prose:
+    /// over a ZERO gate a softmax bootstrap serves exactly the same mixture a
+    /// uniform one does, and a draw over it still moves the weights.
+    ///
+    /// Both halves are load-bearing and they pull in opposite directions. If
+    /// the first failed, minting a softmax bootstrap would silently change what
+    /// a baseline serves. If the second failed, the flag would mint an artifact
+    /// whose exploration record described variation the action never had -- the
+    /// exact defect `a_draw_that_cannot_change_the_action_is_refused` exists to
+    /// prevent, arriving through a different door.
+    #[test]
+    fn a_softmax_over_a_zero_gate_serves_uniform_and_is_still_explorable() {
+        let pool: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let context = [1.0, 0.5];
+        let k = pool.len();
+
+        let mut uniform = AdapterRouter::new(scored_gate(2, &[0.0, 0.0, 0.0]));
+        let baseline = uniform.route(&context, &pool, k).unwrap();
+
+        let mut softmax = AdapterRouter::new(scored_gate(2, &[0.0, 0.0, 0.0]));
+        softmax.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        let served = softmax.route(&context, &pool, k).unwrap();
+
+        assert_eq!(baseline.len(), served.len());
+        for ((left_id, left), (right_id, right)) in baseline.iter().zip(served.iter()) {
+            assert_eq!(left_id, right_id);
+            assert!(
+                (left - right).abs() < 1e-6,
+                "a softmax over equal logits must serve 1/k: {left} vs {right}"
+            );
+        }
+
+        // And the draw reaches it. Distinct weight vectors across seeds, on the
+        // same gate, at the same k that the uniform policy refuses.
+        let mut distinct = std::collections::HashSet::new();
+        for seed in 0..32u64 {
+            let outcome = softmax
+                .route_explored(&context, &pool, k, Some(Exploration { scale: 1.0, seed }))
+                .expect("a softmax draw at k == n is reachable");
+            let shape: Vec<String> = outcome
+                .weights
+                .iter()
+                .map(|(id, w)| format!("{id}:{w:.6}"))
+                .collect();
+            distinct.insert(shape.join(","));
+        }
+        assert!(
+            distinct.len() > 1,
+            "the draw must move the weights, got one shape across 32 seeds"
+        );
+
+        // The control the claim rests on: the same k on the uniform policy is
+        // refused, so the reachability above is the policy's doing and not the
+        // seed's.
+        assert!(
+            uniform
+                .route_explored(
+                    &context,
+                    &pool,
+                    k,
+                    Some(Exploration {
+                        scale: 1.0,
+                        seed: 0
+                    })
+                )
+                .is_err()
+        );
+    }
+
+    /// Re-applying a NaN floor is not a policy change, and neither is
+    /// re-applying any other identical floor. `!=` would charge a bump to every
+    /// repeat of a NaN because NaN compares unequal to itself, which ends the
+    /// epoch of the samples a server that re-applies its configuration per
+    /// request is trying to accumulate.
+    #[test]
+    fn re_applying_a_nan_floor_does_not_advance_the_epoch() {
+        for setter in [
+            AdapterRouter::set_epsilon as fn(&mut AdapterRouter, f32),
+            AdapterRouter::set_tau_floor as fn(&mut AdapterRouter, f32),
+        ] {
+            let mut router = make_router(2, 2);
+            let start = router.policy_epoch();
+            setter(&mut router, f32::NAN);
+            assert_eq!(
+                router.policy_epoch(),
+                start + 1,
+                "the first NaN is a change from whatever was there before"
+            );
+            setter(&mut router, f32::NAN);
+            setter(&mut router, f32::NAN);
+            assert_eq!(
+                router.policy_epoch(),
+                start + 1,
+                "re-applying the same NaN must not advance the epoch again"
+            );
+            // A different value is still a change, so the comparison did not
+            // simply stop noticing.
+            setter(&mut router, 0.25);
+            assert_eq!(router.policy_epoch(), start + 2);
+            setter(&mut router, 0.25);
+            assert_eq!(router.policy_epoch(), start + 2);
+        }
     }
 }

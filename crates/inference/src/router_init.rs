@@ -24,7 +24,10 @@
 
 use std::path::PathBuf;
 
-use crate::router_state::{RouterArtifactError, RouterPolicy, TrainedRepresentation};
+use crate::router_state::{
+    DEFAULT_ENTROPY_FLOOR, DEFAULT_MAX_CONSECUTIVE_COLLAPSED, DEFAULT_TAU_FLOOR,
+    MIN_EXPLORATION_SCALE, RouterArtifactError, RouterPolicy, TrainedRepresentation,
+};
 
 // The two functions below are the only part of this module that needs a gate
 // network, and `lattice-fann` arrives with either of these features. The
@@ -79,32 +82,57 @@ pub enum RouterInitError {
     Artifact(#[from] RouterArtifactError),
 }
 
-/// The policy a bootstrap carries: uniform, with nothing learned.
+/// The policy a bootstrap carries: nothing learned, and either shape.
 ///
-/// Every guard field is present and zero rather than absent. A bootstrap has
-/// no collapse history to bound and no temperature to floor, and recording
-/// that as an absence would make the artifact's policy shape depend on how it
-/// was produced -- which is the one thing a hashed contract must not do,
-/// because then two policies that serve identically hash differently.
-pub fn bootstrap_policy() -> RouterPolicy {
+/// With `tau` absent this is the original uniform bootstrap, field for field.
+/// Every guard field is present and zero rather than absent, because a uniform
+/// policy has no collapse history to bound and no temperature to floor, and
+/// recording that as an absence would make the artifact's policy shape depend
+/// on how it was produced -- which is the one thing a hashed contract must not
+/// do, because then two policies that serve identically hash differently.
+///
+/// With `tau` present the kind is `softmax` and the three guard fields carry
+/// the router's own defaults rather than zero. That difference is the whole
+/// point: on a softmax policy those fields ARE read, and zero in them is
+/// ADR-091 decision 3's guard recorded as disabled. The uniform bootstrap's
+/// zeros are correct because nothing reads them; copying them here would be
+/// the same bytes meaning the opposite thing.
+///
+/// `training_state` stays `bootstrap` either way. A softmax bootstrap over a
+/// zero gate has learned exactly as much as a uniform one -- nothing -- and
+/// serves exactly the same mixture, because a softmax over equal logits IS
+/// `1/k`. What changes is that the mixture is now a function of the scores, so
+/// a perturbation of the scores can reach it. That is what makes the artifact
+/// explorable, and it is not evidence of learning.
+pub fn bootstrap_policy(tau: Option<f64>, exploration_scale: Option<f64>) -> RouterPolicy {
+    let learned_shape = tau.is_some();
     RouterPolicy {
-        kind: "uniform".to_string(),
+        kind: if learned_shape { "softmax" } else { "uniform" }.to_string(),
         // Refused by `validate()` on a uniform policy, and that is the point:
-        // nothing reads a tau here, so recording one would be a number an
+        // nothing reads a tau there, so recording one would be a number an
         // operator could change with no effect.
-        tau: None,
+        tau,
         epsilon: 0.0,
-        tau_floor: 0.0,
-        entropy_floor: 0.0,
-        max_consecutive_collapsed: 0,
+        tau_floor: if learned_shape {
+            f64::from(DEFAULT_TAU_FLOOR)
+        } else {
+            0.0
+        },
+        entropy_floor: if learned_shape {
+            f64::from(DEFAULT_ENTROPY_FLOOR)
+        } else {
+            0.0
+        },
+        max_consecutive_collapsed: if learned_shape {
+            DEFAULT_MAX_CONSECUTIVE_COLLAPSED as u32
+        } else {
+            0
+        },
         training_state: "bootstrap".to_string(),
         // No objective was optimised. An empty string here would read as a
         // recorded objective with an unprintable name.
         objective_version: None,
-        // A bootstrap is deterministic: it serves the same mixture for every
-        // request, and recording a scale would claim it explores. Absence, not
-        // zero -- zero is a scale, and `validate()` refuses it.
-        exploration_scale: None,
+        exploration_scale,
     }
 }
 
@@ -121,6 +149,12 @@ pub struct BootstrapSpec {
     pub schema_id: String,
     /// The base model the adapters attach to.
     pub base_model: String,
+    /// The softmax temperature, when the bootstrap is to be minted in the shape
+    /// a learning run can use. Absent mints the original uniform bootstrap.
+    pub tau: Option<f64>,
+    /// The exploration scale the artifact records, when one is to be recorded.
+    /// Requires `tau`: see [`BootstrapSpec::validate`].
+    pub exploration_scale: Option<f64>,
 }
 
 impl BootstrapSpec {
@@ -162,6 +196,41 @@ impl BootstrapSpec {
         if self.base_model.trim().is_empty() {
             return Err(bad("the base model is empty".to_string()));
         }
+        // The three checks below duplicate refusals `RouterPolicy::validate`
+        // already makes, deliberately. That one runs at write time and names
+        // the policy; this one runs here and names the flags the operator
+        // typed, which is this module's stated rule for every other field.
+        // Without it, `bootstrap_artifact` -- which does not write -- returns
+        // an artifact whose policy is invalid, and the callers that never write
+        // it (tests, and any future dry run) get no refusal at all.
+        if let Some(tau) = self.tau {
+            if !tau.is_finite() || tau <= 0.0 {
+                return Err(bad(format!(
+                    "tau {tau} must be finite and greater than 0.0"
+                )));
+            }
+            if tau < f64::from(DEFAULT_TAU_FLOOR) {
+                return Err(bad(format!(
+                    "tau {tau} is below the floor {DEFAULT_TAU_FLOOR} this bootstrap records, \
+                     so the artifact would refuse at every startup"
+                )));
+            }
+        }
+        if let Some(scale) = self.exploration_scale {
+            if self.tau.is_none() {
+                return Err(bad(format!(
+                    "--exploration-scale requires --tau: a scale {scale} was given without a \
+                     tau, so the policy would be uniform, the serving path would select every \
+                     trained column, and a draw could not change a decision that is 1/k \
+                     whatever the scores are"
+                )));
+            }
+            if !scale.is_finite() || scale < MIN_EXPLORATION_SCALE {
+                return Err(bad(format!(
+                    "exploration scale {scale} must be finite and at least {MIN_EXPLORATION_SCALE}"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -201,7 +270,7 @@ pub fn bootstrap_artifact(spec: &BootstrapSpec) -> Result<RouterArtifact, Router
         representation: spec.representation.clone(),
         gate_bytes: network.to_bytes(),
         provenance: RouterProvenance::recorded(
-            bootstrap_policy(),
+            bootstrap_policy(spec.tau, spec.exploration_scale),
             RouterLineage {
                 schema_id: spec.schema_id.clone(),
                 base_model: spec.base_model.clone(),
@@ -261,6 +330,18 @@ mod tests {
             representation: representation(1024),
             schema_id: "schema-tech-casual-v1".into(),
             base_model: "qwen3.5-0.8b".into(),
+            tau: None,
+            exploration_scale: None,
+        }
+    }
+
+    /// The same lineage in the shape a learning run can use: the zero gate
+    /// under a softmax policy, recorded with a scale to explore at.
+    fn explorable_spec() -> BootstrapSpec {
+        BootstrapSpec {
+            tau: Some(1.0),
+            exploration_scale: Some(1.0),
+            ..spec()
         }
     }
 
@@ -269,7 +350,7 @@ mod tests {
     /// constructor and the validator are two statements about the same shape.
     #[test]
     fn the_bootstrap_policy_is_a_valid_uniform_policy_with_nothing_learned() {
-        let policy = bootstrap_policy();
+        let policy = bootstrap_policy(None, None);
         policy
             .validate()
             .expect("the bootstrap policy must validate");
@@ -277,6 +358,103 @@ mod tests {
         assert_eq!(policy.training_state, "bootstrap");
         assert_eq!(policy.tau, None);
         assert_eq!(policy.objective_version, None);
+    }
+
+    /// The softmax bootstrap is the same `bootstrap` training state, and its
+    /// guard fields carry the router's own floors rather than the uniform
+    /// bootstrap's zeros -- because on a softmax policy those fields ARE read,
+    /// and a zero there is ADR-091 decision 3's guard recorded as disabled.
+    #[test]
+    fn the_softmax_bootstrap_records_the_router_floors_and_stays_untrained() {
+        let policy = bootstrap_policy(Some(1.0), Some(0.5));
+        policy
+            .validate()
+            .expect("the softmax bootstrap policy must validate");
+        assert_eq!(policy.kind, "softmax");
+        assert_eq!(policy.tau, Some(1.0));
+        assert_eq!(policy.training_state, "bootstrap");
+        assert_eq!(policy.tau_floor, f64::from(DEFAULT_TAU_FLOOR));
+        assert_eq!(policy.entropy_floor, f64::from(DEFAULT_ENTROPY_FLOOR));
+        assert_eq!(
+            policy.max_consecutive_collapsed,
+            DEFAULT_MAX_CONSECUTIVE_COLLAPSED as u32
+        );
+        assert_eq!(policy.exploration_scale, Some(0.5));
+
+        // The uniform bootstrap is untouched: same shape, zeros in the guard
+        // fields, no scale. A softmax bootstrap that changed this one too would
+        // be a default, and ADR-091 decision 5 gates the default.
+        let uniform = bootstrap_policy(None, None);
+        assert_eq!(uniform.kind, "uniform");
+        assert_eq!(uniform.tau_floor, 0.0);
+        assert_eq!(uniform.entropy_floor, 0.0);
+        assert_eq!(uniform.max_consecutive_collapsed, 0);
+        assert_eq!(uniform.exploration_scale, None);
+    }
+
+    /// The refusals that make `--tau` / `--exploration-scale` a pair, plus the
+    /// boundary cases each flag carries. Refused here, at the specification,
+    /// rather than at the first startup that loads the directory.
+    #[test]
+    fn the_learning_shapes_are_refused_at_the_flags_that_produced_them() {
+        let cases: Vec<(&str, BootstrapSpec)> = vec![
+            (
+                "a scale with no tau",
+                BootstrapSpec {
+                    exploration_scale: Some(1.0),
+                    ..spec()
+                },
+            ),
+            (
+                "a tau below the floor the artifact itself records",
+                BootstrapSpec {
+                    tau: Some(f64::from(DEFAULT_TAU_FLOOR) / 2.0),
+                    ..spec()
+                },
+            ),
+            (
+                "a non-positive tau",
+                BootstrapSpec {
+                    tau: Some(0.0),
+                    ..spec()
+                },
+            ),
+            (
+                "a NaN tau",
+                BootstrapSpec {
+                    tau: Some(f64::NAN),
+                    ..spec()
+                },
+            ),
+            (
+                "a scale below the router's own minimum",
+                BootstrapSpec {
+                    tau: Some(1.0),
+                    exploration_scale: Some(MIN_EXPLORATION_SCALE / 2.0),
+                    ..spec()
+                },
+            ),
+            (
+                "a NaN scale",
+                BootstrapSpec {
+                    tau: Some(1.0),
+                    exploration_scale: Some(f64::NAN),
+                    ..spec()
+                },
+            ),
+        ];
+        for (name, bad) in cases {
+            assert!(
+                matches!(bad.validate(), Err(RouterInitError::InvalidSpec { .. })),
+                "{name} should be refused"
+            );
+        }
+        // The control, in the same test: the shape these differ from is
+        // accepted, so the refusals above are about the field and not about the
+        // learning shape being rejected wholesale.
+        explorable_spec()
+            .validate()
+            .expect("the explorable specification must be accepted");
     }
 
     /// Each way a specification can be unusable, with a must-match control in
@@ -493,6 +671,52 @@ mod tests {
             init_directory(&dir, &spec()).expect("init");
             assert!(dir.exists());
 
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The two bootstraps differ in their recorded policy and nowhere
+        /// else: same adapters, same gate bytes, different content hash. If the
+        /// hash did not cover the policy, an operator could not tell a served
+        /// uniform baseline from a served explorable one by version label,
+        /// which is the only thing `GET /v1/lora` reports.
+        #[test]
+        fn the_explorable_bootstrap_differs_from_the_uniform_one_only_in_its_policy() {
+            let uniform = bootstrap_artifact(&spec()).expect("build uniform");
+            let learned = bootstrap_artifact(&explorable_spec()).expect("build explorable");
+
+            assert_eq!(uniform.gate_bytes, learned.gate_bytes);
+            assert_eq!(uniform.adapter_names, learned.adapter_names);
+            assert_ne!(uniform.content_hash(), learned.content_hash());
+
+            let policy = learned
+                .provenance
+                .policy()
+                .expect("a bootstrap records its policy");
+            assert_eq!(policy.kind, "softmax");
+            assert_eq!(policy.exploration_scale, Some(1.0));
+        }
+
+        /// A learnable directory can actually be minted and read back through
+        /// the same path a server uses. The refusal being guarded against is an
+        /// artifact that validates in memory and is rejected on load.
+        #[test]
+        fn an_explorable_directory_round_trips_through_the_serving_reader() {
+            let dir = scratch("explorable-roundtrip");
+            init_directory(&dir, &explorable_spec()).expect("init");
+            let disposition = crate::router_state::resolve_startup(Some(&dir), None)
+                .expect("the serving path must resolve the directory it just minted");
+            let crate::router_state::StartupDisposition::Loaded(resolved) = disposition else {
+                panic!("a minted directory must resolve to a loaded gate");
+            };
+            let policy = resolved
+                .artifact
+                .provenance
+                .policy()
+                .expect("a bootstrap records its policy");
+            assert_eq!(policy.kind, "softmax");
+            assert_eq!(policy.tau, Some(1.0));
+            assert_eq!(policy.exploration_scale, Some(1.0));
+            assert_eq!(policy.training_state, "bootstrap");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
