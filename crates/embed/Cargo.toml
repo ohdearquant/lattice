@@ -95,6 +95,7 @@ wasm-bindgen = { version = "=0.2.105", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 
 [dev-dependencies]
+lattice-inference = { version = "0.13.0", path = "../inference", default-features = false, features = ["std", "test-utils"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 simsimd = "6"
