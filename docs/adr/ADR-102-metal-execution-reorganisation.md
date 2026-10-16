@@ -9,8 +9,8 @@
 
 ## Decision summary
 
-The Qwen3.5 Metal implementation is split by responsibility into private modules until every file is at most 3000
-lines. After that, small Metal mechanisms that two models demonstrably share move into a crate-private
+The Qwen3.5 Metal implementation is split by responsibility into private modules until every one of its Rust files is at
+most 3000 lines. After that, small Metal mechanisms that two models demonstrably share move into a crate-private
 `forward::metal_runtime` module, and the remaining generation routes move onto the existing backend-independent
 decoder. A CI gate caps every maintained file at 3000 lines; files already over the cap are frozen at their current size
 and may only shrink. No public plugin interface, no universal layer trait and no new crate are introduced. Public paths
@@ -23,13 +23,13 @@ rollout rows R15 to R17 and keep that ADR's order and acceptance; this ADR exten
 
 | #  | Fact                                                                                                                                                                                                                                                                                                                                                                                                          | Pointer                                                                                                                        |
 | -- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| C1 | `metal_qwen35.rs` is 47,220 lines: 15,879 lines of production code and 31,341 lines in 35 items gated on `cfg(test)`. One of those items, the inline `mod tests` inside `mod inner`, spans 27,760 lines. A separate pure-move change takes its topic sections into 21 files, leaving 22,550 lines: the same 15,879 production lines and 6,671 test lines, of which the remaining inline test parent is 3,090. | `crates/inference/src/forward/metal_qwen35.rs`, counted by brace depth over each `cfg(test)`-gated item                        |
+| C1 | `metal_qwen35.rs` is 47,220 lines: 15,879 lines of production code and 31,341 lines in 35 items gated on `cfg(test)`. One of those items, the inline `mod tests` inside `mod inner`, spans 27,760 lines. A separate pure-move change takes its topic sections into 21 files, leaving 22,550 lines: the same 15,879 production lines and 6,671 test lines, of which the remaining inline test parent is 3,090. | `crates/inference/src/forward/metal_qwen35.rs`, brace depth over each `cfg(test)`-gated item with comments and literals masked (a plain search for `cfg(test)` also matches three comments) |
 | C2 | A backend-independent decoding boundary already exists: `DecoderSession` for ordinary token loops and `SpeculativeSession` for verified rounds. The driver takes `&mut dyn DecoderSession`.                                                                                                                                                                                                                   | `decoder.rs` (`trait DecoderSession`, `trait SpeculativeSession`), `decoder/driver.rs` (`fn run`)                              |
 | C3 | Qwen3.5 direct, streaming and prefix-cache generation already run through that driver, as do sequential MTP and self-speculation.                                                                                                                                                                                                                                                                             | `decoder/qwen_metal.rs` (calls to `driver::run`, `run_speculative_direct`)                                                     |
 | C4 | Four generation routes still run their own loop inside the model state: batch-GEMM MTP, text-plus-patch multimodal, vision generation, and the n-gram speculation entry. CI asserts the multimodal and vision bypasses explicitly.                                                                                                                                                                            | `metal_qwen35.rs` (`generate_greedy_mtp`, the multimodal and vision `generate` loops, `generate_with_speculation`)             |
 | C5 | The ERNIE 4.5 and EmbeddingGemma 2 Metal paths contain near-identical allocation, binding and element-dispatch helpers, but their contracts differ in detail: ERNIE allocates exactly `bytes`, EmbeddingGemma 2 allocates `bytes.max(4)`, and the error prefixes differ. Qwen3.5's helpers return `Buffer` where the other two return `Result`.                                                               | `forward/metal_ernie45/state.rs` (`fn allocate`), `forward/metal_embeddinggemma2/state.rs` (`fn allocate`)                     |
 | C6 | Hybrid-model state is not a plain KV cache. Speculative rollback restores GatedDeltaNet checkpoints, may replay a repair token and repairs the MTP cache position. M-RoPE separates the physical cache position from the rotary coordinate.                                                                                                                                                                   | `metal_qwen35.rs` (rollback and M-RoPE prefill paths)                                                                          |
-| C7 | Declared Metal benches execute Qwen3.5 forward and generation code. A production move inside `metal_qwen35` is therefore reachable from measured targets.                                                                                                                                                                                                                                                     | `crates/inference/Cargo.toml` (`metal_decode_bench`, `mtp_decode`, `cross_turn_prefix_cache_bench`, `bench_vision_prefill_ab`) |
+| C7 | Declared Metal measurement targets, three bench targets and one measurement binary, execute Qwen3.5 forward and generation code. A production move inside `metal_qwen35` is therefore reachable from measured targets.                                                                                                                                                                                                                                                     | `crates/inference/Cargo.toml` (`[[bench]]` `metal_decode_bench`, `mtp_decode`, `cross_turn_prefix_cache_bench`; `[[bin]]` `bench_vision_prefill_ab`) |
 | C8 | 39 tracked files exceed 3000 lines: 21 Rust or Metal source files, 4 Python files, 13 data files (tokenizers, manifests, recorded results) and `Cargo.lock`.                                                                                                                                                                                                                                                  | `git ls-tree -r` at `main`, counted with `wc -l`                                                                               |
 
 ### What ADR-090 already decides about this file
@@ -37,8 +37,11 @@ rollout rows R15 to R17 and keep that ADR's order and acceptance; this ADR exten
 ADR-090 (Accepted) owns the first part of this work, and this ADR extends it rather than replacing it:
 
 - **Order.** D9 establishes the shared route before the tree is reorganised. Its rollout ledger (`R00-ROLLOUT.md`)
-  puts the R13 serving milestone before any extraction, then portable tests (R15), then the inner test families one per
-  change starting with `rms_reduce_854_parity` (R16), then engine construction (R17).
+  puts both live CPU results (R03 for Qwen, R04 for Gemma E2B) and the R13 serving milestone before any extraction
+  row: Gemma folder grouping (R14), portable tests (R15), the inner test families one per change starting with
+  `rms_reduce_854_parity` (R16), engine construction (R17), and then one documentation row (R18) for the remaining
+  per-responsibility manifests. ADR-090's amendment of 2026-10-16 lets a pure test move land before R13 under
+  stated conditions; production moves keep this order.
 - **Acceptance of every extraction.** Before any R14 to R17 extraction is accepted, the source guards' hand-maintained
   searched population is replaced by a derived, checked population over the parent and every file under
   `forward/metal_qwen35/`. The seven parent self-source probes listed in the ledger each get a before/after population
@@ -108,34 +111,44 @@ requests) stay in force.
 ### D3. Order: split, then share, then migrate routes
 
 1. **Split** `metal_qwen35` by responsibility into private modules (phases M1 to M8 below), each a move with no
-   semantic change, until every Qwen3.5 file is at most 3000 lines.
+   semantic change, until every `metal_qwen35` Rust file is at most 3000 lines.
 2. **Share**: extract the ERNIE and EmbeddingGemma 2 helpers into `forward::metal_runtime` (S1 to S3), then adopt them
    in Qwen3.5 only where a small adapter keeps its contract (S4).
 3. **Migrate** the remaining generation routes onto the decoder (D1 to D4 below).
 
-The split starts only after ADR-090's R13 milestone, and every move phase carries ADR-090 D9's derived-population
+Production moves start only after both of ADR-090's live CPU results (R03, R04) and its R13 milestone; a pure test
+move may land earlier under that ADR's 2026-10-16 amendment. Every move phase carries ADR-090 D9's derived-population
 check (row G1 below) and its documentation rule in its acceptance.
 
 A move change never contains an extraction, and an extraction never contains a route migration, so a regression can be
-attributed to one kind of change. No shared extraction and no new Metal model architecture merges while the split's
-file-size exceptions remain.
+attributed to one kind of change. No shared extraction and no new Metal model architecture merges while any `metal_qwen35`
+Rust file keeps a manifest entry.
 
 ### D4. A 3000-line cap per file, with a ratchet for existing files
 
-A CI script counts physical lines (LF-delimited, plus a final unterminated line) in every tracked maintained file:
-Rust, Metal, Python, shell, workflow definitions and Markdown, tests and benches included. Comments and blank lines
-count. Formatting checks stay on, so packing code onto fewer lines is not a way to pass.
+A CI script counts physical lines (the number of LF bytes, plus one for a final unterminated line) in every text file
+git tracks at the change's head; a file with a NUL byte in its first 8 KiB is binary and is not counted. A file is
+maintained when its extension is `.rs`, `.metal`, `.py`, `.sh`, `.bash` or `.md`, or when it is a workflow
+definition directly under `.github/workflows/`. Tests and benches are included, and comments and blank lines count.
+Formatting checks stay on, so packing code onto fewer lines is not a way to pass.
 
-- **New files**: at most 3000 lines.
-- **Existing oversized files**: listed in a manifest with their count at the introducing commit. A change may not raise
-  a listed file above both its recorded ceiling and its count at the change's base. A decrease lowers the ceiling. A
-  file at or under 3000 lines leaves the manifest and cannot return. A rename carries its entry explicitly.
-- **Data**: tokenizer files, recorded fixtures and results, and `Cargo.lock` are listed by exact path as data, not
-  excluded by directory.
-- **The manifest is not regenerated by CI.** Any added or raised entry fails the gate.
+- **New files**: a maintained file without a manifest entry has at most 3000 lines.
+- **Existing oversized files**: each has a ratchet entry whose ceiling is its count at the introducing commit. The
+  head count may exceed neither the recorded ceiling nor the file's count at the change's base. A change that shrinks
+  a listed file lowers its ceiling to the new count in the same change, and a ceiling left above the file's count
+  fails the gate, so a file cannot shrink and later regrow to a stale ceiling. A file at or under 3000 lines leaves
+  the manifest in the same change and cannot return. A rename carries its entry explicitly, naming the old path, and
+  the ceiling rules apply against the old path's count at the base.
+- **Data**: any other tracked text file over 3000 lines (tokenizer files, recorded fixtures and results,
+  `Cargo.lock`) has a data entry naming its exact path. Globs and directories are refused, a maintained path cannot
+  be listed as data, and an entry whose file is gone or no longer over 3000 lines fails as stale.
+- **The manifest is not regenerated by CI.** A new ratchet entry or a raised ceiling fails the gate; a new data entry
+  does not.
 
-Each Qwen3.5 entry names the phase that retires it. The other oversized source files are frozen by the same ratchet;
-retiring them is separate work, scheduled outside this ADR.
+Each `metal_qwen35` Rust entry names the phase that retires it. The Qwen3.5 shader source
+`forward/shaders/qwen35.metal` (3,311 lines) and the other oversized files are frozen by the same ratchet. Splitting
+the shader changes the compiled shader source and is not part of this plan; retiring those entries is separate work,
+scheduled outside this ADR.
 
 A cohesive family of methods on one state can be split across private submodules with several `impl` blocks, and
 shared test fixtures go to a test support module. No trait or crate is invented only to cross a file boundary.
@@ -157,8 +170,9 @@ grammar and logprobs keep requiring dense readback.
 `forward/` stays. Shared helpers go in a new crate-private `forward::metal_runtime` (buffers, pipeline construction,
 dispatch helpers, and later KV storage, GPU sampling routes and LoRA storage when two consumers justify them). The name
 `forward::metal` already belongs to the Qwen3 path and is not reused. Qwen3.5 code moves under
-`forward/metal_qwen35/inner/` (engine, session, buffers, pipelines, `weights/`, forward step, `prefill/`, `layers/`,
-`speculative/`, LoRA, prefix cache, `generation/`, diagnostics, `tests/`), created only as each phase lands.
+`forward/metal_qwen35/inner/`, which already holds the dispatch helpers, GDN state, `layers/` and some test modules.
+The remaining parts (engine, session, buffers, pipelines, `weights/`, forward step, `prefill/`, `speculative/`, LoRA,
+prefix cache, `generation/`, diagnostics) are added as each phase lands.
 `metal_qwen35.rs` becomes a facade that keeps the public items, non-Metal stubs and bench-gated exports.
 
 `metal_runtime` must not import Qwen3.5 types or call generation wrappers. The public path
@@ -169,6 +183,8 @@ dispatch helpers, and later KV storage, GPU sampling routes and LoRA storage whe
 Each row is one pull request. Every row passes the file-size gate. The 15,879 production lines need at least six
 files at the cap; the plan lands eleven to fourteen production files, most well under it, plus the facade. The planned counts
 below are estimates: each phase's pull request fixes its exact item list and file count from the code at its own base.
+An acceptance cell names what is specific to its row. The measurement rule below applies to every row that moves or
+changes production code, whether or not its cell repeats it.
 
 | Phase | Change                                                                     | Files (planned)   | Acceptance                                                                                                                                    |
 | ----- | -------------------------------------------------------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -181,7 +197,7 @@ below are estimates: each phase's pull request fixes its exact item list and fil
 | M5    | Forward-step orchestration and its preflight checks                        | 1                 | Move evidence and measurement; Q4/Q8 decode, LoRA path, dispatch markers, error-before-mutation checks                                        |
 | M6    | Prefill orchestration (dense, full attention, GDN, chunked)                | 2                 | Move evidence and measurement; chunk-boundary state agreement, hidden and logit capture, MoE refusal                                          |
 | M7    | Speculative execution, verifier and checkpoint mechanics                   | 2                 | Move evidence and measurement; sequential MTP, self-speculation and batch-GEMM routes unchanged and distinguishable                           |
-| M8    | Generation wrappers, prefix cache, diagnostics, bench support              | 2-3               | Every Qwen3.5 file at most 3000 lines and its manifest entries removed; shared extraction may start                                           |
+| M8    | Generation wrappers, prefix cache, diagnostics, bench support              | 2-3               | Every `metal_qwen35` Rust file at most 3000 lines and its manifest entries removed; measurement; shared extraction may start |
 | S1    | ERNIE and EmbeddingGemma 2 binding, scalar and element-dispatch helpers    | 1                 | Both callers on one implementation; same thread geometry and scalar layout; parity and measurement                                            |
 | S2    | Their checked allocation and upload                                        | 1                 | Both zero-length policies, overflow and device-limit checks, error context preserved; parity and measurement                                  |
 | S3    | Common pipeline construction                                               | 1                 | Same shader sources, function names, constants, compile options and failure behaviour; measurement                                            |
