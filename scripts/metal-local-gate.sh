@@ -8,7 +8,7 @@
 #
 # THE LIB ARM IS FILTERED, AND THE FILTER IS THE POINT. An unfiltered
 # `cargo test -p lattice-inference --features f16,metal-gpu --lib` ends in the
-# `forward::metal_qwen35::inner::tests::generate_multimodal_vision_*` oracle
+# `forward::metal_qwen35::inner::tests::multimodal_vision::generate_multimodal_vision_*` oracle
 # tests, which load a real checkpoint. Measured 2026-09-16: that run reached
 # 36 GB resident and drove the kernel's memory pressure to level 4 (critical),
 # starving another build on the same machine. The suite is not wrong; a laptop
@@ -55,7 +55,7 @@ run() {
 run "clippy-default" \
     cargo clippy -p lattice-inference --all-targets -- -D warnings
 run "clippy-metal" \
-    cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings
+    cargo clippy --locked -p lattice-inference --all-targets --features f16,metal-gpu,mixture -- -D warnings
 run "clippy-metal-bench-release" \
     cargo clippy --release -p lattice-inference --all-targets \
     --features f16,metal-gpu,bench-internals -- -D warnings
@@ -63,7 +63,7 @@ run "test-bin-lattice_serve" \
     cargo test --locked -p lattice-inference --features f16,metal-gpu,test-utils \
     --bin lattice_serve
 run "test-bin-lattice" \
-    cargo test --locked -p lattice-inference --features f16,metal-gpu,test-utils \
+    cargo test --locked -p lattice-inference --features f16,metal-gpu,mixture,test-utils \
     --bin lattice
 # See the header: scoped on purpose, and `--test-threads=1` because these are
 # Metal tests sharing one GPU lock.

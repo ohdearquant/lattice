@@ -10,6 +10,15 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+### Changed
+
+- **Behavior change:** LoRA adapter load and unload (`/v1/lora/load`, `/v1/lora/unload`) on both
+  `lattice serve` and `lattice_serve` now answer 413 `request_body_too_large` for a request body
+  over the 1 MiB limit, instead of 400.
+- **Behavior change:** under `lattice serve`, a LoRA load whose body cannot be read for any other
+  reason now answers 400 `invalid_request` (previously `invalid_request_body`), the same code
+  `lattice_serve` already used.
+
 ## [0.12.1] - 2026-10-14
 
 Documentation and package metadata only; no code changes.
