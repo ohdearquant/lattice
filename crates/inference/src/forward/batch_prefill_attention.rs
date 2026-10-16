@@ -165,6 +165,11 @@ fn causal_attention_head_with_observer<O: WorkObserver>(
                 let valid = kv_rows.min(q_row + 1 - kv_start);
                 let scores = &mut s_tile[qi * kv_rows..qi * kv_rows + valid];
                 let mut local_max = f32::NEG_INFINITY;
+                // ADR-080 C1 (#780): tracked independently of the `local_max`/
+                // `row_max` folds because `if score > local_max` is `false`
+                // for a NaN operand (IEEE 754), silently dropping it from the
+                // max the same way `f32::max` does. This is the online-softmax
+                // single-row analogue of `flash_causal.rs`'s `block_has_poison`.
                 let mut poisoned = false;
                 for score in scores.iter_mut() {
                     *score *= scale;
@@ -214,6 +219,16 @@ fn causal_attention_head_with_observer<O: WorkObserver>(
         for qi in 0..q_rows {
             let out_start = (q_start + qi) * out_stride + q_head_offset;
             let out = &mut output[out_start..out_start + head_dim];
+            // ADR-080 C1 (#780): RED before the fix, `row_sum[qi].max(f32::MIN_POSITIVE)`
+            // silently replaced a NaN `row_sum[qi]` with a tiny-but-positive
+            // finite value instead of failing closed, so `1.0 / row_sum[qi]`
+            // became an enormous (~8.5e37) finite number and the output row
+            // exploded into huge finite garbage rather than zero. Structurally
+            // distinct from `attention::softmax_row::finalize_row` (this
+            // online algorithm writes into a separate `acc` accumulator, not
+            // an in-place score row), so this is an inline contract-conformant
+            // fix rather than a call to the shared helper: fail closed on a
+            // poisoned row OR a non-positive/non-finite denominator.
             if !row_sum[qi].is_finite() || row_sum[qi] <= 0.0 {
                 out.fill(0.0);
             } else {

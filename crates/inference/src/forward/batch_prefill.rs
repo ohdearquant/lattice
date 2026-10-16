@@ -101,11 +101,6 @@ struct PrefillScratch {
     gdn_kv_mem: Vec<f32>,
     /// Temporary update delta for one head: `[value_dim]`.
     gdn_delta: Vec<f32>,
-
-    /// Online-softmax accumulator for one full-attention row: `[head_dim]`.
-    attn_acc: Vec<f32>,
-    /// Tile-local score buffer for one KV tile: `[tile_size_kv]`.
-    attn_tile_scores: Vec<f32>,
 }
 
 impl PrefillScratch {
@@ -141,8 +136,6 @@ impl PrefillScratch {
             gdn_k_tmp: Vec::new(),
             gdn_kv_mem: Vec::new(),
             gdn_delta: Vec::new(),
-            attn_acc: Vec::new(),
-            attn_tile_scores: Vec::new(),
         }
     }
 
@@ -186,12 +179,6 @@ impl PrefillScratch {
         resize(&mut self.gdn_k_tmp, key_dim);
         resize(&mut self.gdn_kv_mem, value_dim);
         resize(&mut self.gdn_delta, value_dim);
-
-        resize(&mut self.attn_acc, cfg.head_dim);
-        resize(
-            &mut self.attn_tile_scores,
-            self.tiled_config.tile_size_kv.max(1),
-        );
     }
 }
 
@@ -481,7 +468,6 @@ impl Qwen35Model {
 
         // Batched causal attention per Q head.
         scratch.context_batch[..seq_len * q_dim].fill(0.0);
-        let tile_scores_len = scratch.tiled_config.tile_size_kv.max(1);
         for qh in 0..num_q_heads {
             let kvh = qh / groups;
             let q_head_offset = qh * head_dim;
@@ -502,8 +488,6 @@ impl Qwen35Model {
                 scale,
                 &scratch.tiled_config,
                 &mut scratch.tiled_buffers,
-                &mut scratch.attn_acc[..head_dim],
-                &mut scratch.attn_tile_scores[..tile_scores_len],
             );
         }
 
@@ -879,8 +863,6 @@ fn causal_tiled_attention_head(
     scale: f32,
     config: &TiledAttentionConfig,
     buffers: &mut TiledAttentionBuffers,
-    _acc: &mut [f32],
-    _tile_scores: &mut [f32],
 ) {
     blocked_attention::causal_attention_head(
         q,
@@ -1791,8 +1773,6 @@ mod tests {
         let config = TiledAttentionConfig::new(1, 1, head_dim);
         let mut buffers = TiledAttentionBuffers::default();
         blocked_attention::prepare_buffers(&config, &mut buffers).unwrap();
-        let mut acc = vec![0.0f32; head_dim];
-        let mut tile_scores = vec![0.0f32; config.tile_size_kv.max(1).max(seq_len)];
 
         causal_tiled_attention_head(
             &q,
@@ -1809,8 +1789,6 @@ mod tests {
             1.0,
             &config,
             &mut buffers,
-            &mut acc,
-            &mut tile_scores,
         );
 
         let row0 = &output[0..head_dim];

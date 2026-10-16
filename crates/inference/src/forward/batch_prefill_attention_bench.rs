@@ -30,8 +30,6 @@ fn bench_causal_prefill_attention() {
             let mut output = vec![0.0; seq_len * out_stride];
             let config = TiledAttentionConfig::new(2, 1, head_dim);
             let mut buffers = TiledAttentionBuffers::new(seq_len, &config);
-            let mut acc = vec![0.0; head_dim];
-            let mut scores = vec![0.0; config.tile_size_kv.max(1)];
             let scale = 1.0 / (head_dim as f32).sqrt();
             let mut run = || {
                 causal_tiled_attention_head(
@@ -49,8 +47,6 @@ fn bench_causal_prefill_attention() {
                     scale,
                     &config,
                     &mut buffers,
-                    &mut acc,
-                    &mut scores,
                 );
                 black_box(&output);
             };
