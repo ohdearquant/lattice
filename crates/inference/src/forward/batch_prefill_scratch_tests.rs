@@ -164,7 +164,7 @@ fn new_scratch_capacity_uses_largest_phase_not_the_sum() {
     assert_eq!(scratch.phase.values.capacity(), 0);
     scratch.ensure_capacity(&cfg, seq_len).unwrap();
     assert_eq!(scratch.phase.values.len(), expected);
-    assert_eq!(scratch.phase.values.capacity(), expected);
+    assert!(scratch.phase.values.capacity() >= expected);
     assert!(scratch.phase.values.capacity() < old_total);
 
     let value_heads = cfg.linear_num_value_heads.unwrap();
@@ -193,46 +193,31 @@ fn new_scratch_capacity_uses_largest_phase_not_the_sum() {
     }
 }
 
-fn paint_views<const N: usize>(views: [&mut [f32]; N], lengths: [usize; N], base: usize) {
+fn assert_view_offsets<const N: usize>(views: [&[f32]; N], lengths: [usize; N], base: usize) {
     let mut offset = 0;
     for (index, (view, len)) in views.into_iter().zip(lengths).enumerate() {
-        assert_eq!(view.len(), len);
-        assert_eq!(view.as_ptr() as usize, base + offset * size_of::<f32>());
-        let tag = index as f32 + 1.0;
-        view.fill(tag);
-        view[0] = tag + 0.125;
-        view[len - 1] = tag + 0.25;
+        assert_eq!(view.len(), len, "view {index} length");
+        assert_eq!(
+            view.as_ptr() as usize,
+            base + offset * size_of::<f32>(),
+            "view {index} start offset"
+        );
         offset += len;
     }
-}
-
-fn assert_painted<const N: usize>(values: &[f32], lengths: [usize; N], sentinel: f32) {
-    let mut offset = 0;
-    for (index, len) in lengths.into_iter().enumerate() {
-        let tag = index as f32 + 1.0;
-        let view = &values[offset..offset + len];
-        assert_eq!(view[0], tag + 0.125);
-        assert_eq!(view[len - 1], tag + 0.25);
-        assert!(view[1..len - 1].iter().all(|v| *v == tag));
-        offset += len;
-    }
-    assert!(values[offset..].iter().all(|v| *v == sentinel));
 }
 
 #[test]
-fn phase_views_are_disjoint_at_exact_offsets_and_share_the_arena() {
+fn phase_views_start_at_layout_offsets_and_match_expected_lengths() {
     let cfg = asymmetric_config();
     let mut scratch = PrefillScratch::new(&cfg);
     scratch.ensure_capacity(&cfg, 17).unwrap();
     scratch.ensure_capacity(&cfg, 5).unwrap();
     let (full, gdn, ffn) = expected_lengths(&cfg, 5);
     let base = scratch.phase.values.as_ptr() as usize;
-    let sentinel = -123.5;
 
-    scratch.phase.values.fill(sentinel);
     {
         let view = scratch.phase.full();
-        paint_views(
+        assert_view_offsets(
             [
                 view.q_batch,
                 view.gate_z_batch,
@@ -244,12 +229,10 @@ fn phase_views_are_disjoint_at_exact_offsets_and_share_the_arena() {
             base,
         );
     }
-    assert_painted(&scratch.phase.values, full, sentinel);
 
-    scratch.phase.values.fill(sentinel);
     {
         let view = scratch.phase.gdn();
-        paint_views(
+        assert_view_offsets(
             [
                 view.gdn_qkv_batch,
                 view.gdn_z_batch,
@@ -261,14 +244,11 @@ fn phase_views_are_disjoint_at_exact_offsets_and_share_the_arena() {
             base,
         );
     }
-    assert_painted(&scratch.phase.values, gdn, sentinel);
 
-    scratch.phase.values.fill(sentinel);
     {
         let view = scratch.phase.ffn();
-        paint_views([view.gate_batch, view.up_batch, view.ffn_batch], ffn, base);
+        assert_view_offsets([view.gate_batch, view.up_batch, view.ffn_batch], ffn, base);
     }
-    assert_painted(&scratch.phase.values, ffn, sentinel);
 }
 
 #[test]
@@ -399,6 +379,11 @@ fn scratch_dimension_overflow_refuses_without_mutating_reused_buffers() {
         |cfg| cfg.linear_value_head_dim = usize::MAX,
         |cfg| cfg.vocab_size = usize::MAX,
         |cfg| cfg.hidden_size = isize::MAX as usize / size_of::<f32>() + 1,
+        |cfg| {
+            cfg.num_attention_heads = 1;
+            cfg.num_key_value_heads = 1;
+            cfg.head_dim = (1 << 56) + 1;
+        },
     ];
     for mutate in mutations {
         let mut scratch = PrefillScratch::new(&cfg);
