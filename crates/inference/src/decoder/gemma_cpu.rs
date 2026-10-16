@@ -117,12 +117,17 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         &CAPABILITIES
     }
 
-    /// Prefill over `self.prompt_ids`, committing only complete tokens or chunks.
-    /// Does not sample: the last position's logits are left in
-    /// `self.scratch.logits` for the first `select` to read, exactly like
-    /// `Gemma4Model::generate_greedy`'s own prefill loop. `prediction: None`
-    /// in the returned `StepStamp` reflects that nothing has been opened in
-    /// the ledger yet.
+    /// Prefill over `self.prompt_ids` through `Gemma4Model::prefill_prompt`:
+    /// a prompt of at least its chunk size whose ids are all in the vocabulary
+    /// runs in bounded chunks, any other prompt one token at a time through
+    /// `Gemma4Model::forward_step_impl`. Either way the vocabulary projection
+    /// runs only for the last prompt token, so `self.scratch.logits` is
+    /// untouched until then, and `self.position` advances only past complete
+    /// tokens or chunks. Does not sample: the last position's logits are left
+    /// in `self.scratch.logits` for the first `select` to read, exactly like
+    /// `Gemma4Model::generate_greedy`'s own prefill. `prediction: None` in the
+    /// returned `StepStamp` reflects that nothing has been opened in the
+    /// ledger yet.
     fn prefill(&mut self, cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
         self.model.prefill_prompt(
             &self.prompt_ids,

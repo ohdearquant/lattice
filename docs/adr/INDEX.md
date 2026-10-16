@@ -136,6 +136,8 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [098](ADR-098-decision-readout.md)                            | A multi-slot decision read-out and a `/v1/systemone` endpoint                                                | Proposed (2026-10-10) | Extends ADR-097                                                                |
 | [099](ADR-099-linux-cpu-embedding-gemm-threading-budget.md)   | Linux CPU Embedding GEMM, Parallel Execution, and Resource Budgets                                           | Proposed (2026-10-12) | ADR-070, ADR-081, ADR-087, ADR-088                                             |
 | [100](ADR-100-foreign-quantized-checkpoints.md)               | Loading foreign quantized checkpoints without a foreign runtime                                              | Proposed (2026-10-14) | ADR-072                                                                        |
+| [101](ADR-101-time-series-forecasting.md)                     | Time-series forecasting models in lattice-inference                                                          | Proposed (2026-10-15) | ADR-003, ADR-096                                                               |
+| [102](ADR-102-metal-execution-reorganisation.md)              | Reorganising Metal execution around shared mechanisms and typed model sessions                               | Proposed (2026-10-16) | Extends ADR-090; ADR-074, ADR-087                                              |
 
 ## informational
 

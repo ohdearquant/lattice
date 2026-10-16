@@ -84,6 +84,8 @@ train-backward = []
 # lattice-fann too (issue #615), but that dep is already pulled in by
 # `metal-gpu` itself, so this feature only adds the routing module.
 mixture = ["dep:lattice-fann"]
+# Enables the bounded router trainer for qualification; serving remains opt-in.
+router-learning = ["mixture", "lattice-fann/online-router"]
 # GDN state-traffic byte counters (issue #422, measure-first for ADR-058).
 # Opt-in only: the default decode path stays byte-identical when this is off.
 gdn-state-counters = []

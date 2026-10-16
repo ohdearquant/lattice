@@ -97,10 +97,12 @@ pub(crate) struct Gemma4Scratch {
     /// attention head width across sliding/global layers and reused every
     /// layer instead of allocating a fresh `vec![1.0; head_w]` per call.
     v_norm_ones: Vec<f32>,
-    /// Post-softcap logits, `[vocab_size]`. `forward_step` writes here
-    /// instead of returning an owned vector; callers that need an owned
-    /// copy across the generation boundary clone out of this once, not on
-    /// every token.
+    /// Post-softcap logits, `[vocab_size]`, written only by steps that emit
+    /// logits: `forward_step`, and `forward_step_impl` with `emit_logits =
+    /// true`. A step with `emit_logits = false` leaves whatever an earlier
+    /// emitting step wrote in this buffer. `forward_step` writes here instead
+    /// of returning an owned vector; callers that need an owned copy across
+    /// the generation boundary clone out of this once, not on every token.
     pub(crate) logits: Vec<f32>,
 }
 
@@ -328,6 +330,18 @@ impl Gemma4Model {
         self.forward_step_impl(token_id, position, cache, scratch, capture_layers, true)
     }
 
+    /// **Unstable**: [`Self::forward_step`] with the final projection made
+    /// optional. With `emit_logits = false` the step still updates every
+    /// layer and the KV cache, but returns before the final norm, the
+    /// vocabulary projection and the softcap, so `scratch.logits` keeps
+    /// whatever an earlier step wrote and is valid only after a step with
+    /// `emit_logits = true`. `capture_layers` behaves exactly as in
+    /// [`Self::forward_step`].
+    ///
+    /// # Errors
+    /// Same as [`Self::forward_step`]: propagates any [`Gemma4KvCache`] error
+    /// (out-of-bounds layer, shared-layer write, or capacity overflow) and
+    /// fails closed if `token_id` is out of the configured vocabulary.
     pub(crate) fn forward_step_impl(
         &self,
         token_id: u32,
@@ -744,12 +758,18 @@ impl Gemma4Model {
     }
 
     /// **Unstable**: greedy-decode `max_new_tokens` continuation tokens for
-    /// `prompt_ids` (already tokenized, BOS included by the caller). Uses bounded
-    /// prompt chunks and the single-token `Self::forward_step` decode path.
+    /// `prompt_ids` (already tokenized, BOS included by the caller). Prefill
+    /// runs through `Self::prefill_prompt` (bounded prompt chunks, or one token
+    /// at a time for a short prompt or one with an out-of-vocabulary id) and
+    /// projects vocabulary logits only at the last prompt token; decode then
+    /// runs through the single-token `Self::forward_step` loop.
     ///
     /// # Errors
-    /// Propagates `Self::forward_step` errors (invalid token id, cache
-    /// bounds/capacity).
+    /// Propagates the per-token forward pass errors from both loops: an
+    /// out-of-range `token_id` or a cache error (out-of-bounds layer,
+    /// shared-layer write, capacity overflow) as
+    /// [`InferenceError::InvalidInput`], and a non-shared layer missing its
+    /// `k_proj`/`v_proj`/`k_norm` weights as [`InferenceError::Inference`].
     pub fn generate_greedy(
         &self,
         prompt_ids: &[u32],
@@ -783,6 +803,12 @@ impl Gemma4Model {
     /// `layer_scalar` multiply, before the final norm) -- equivalent to
     /// HF's `output_hidden_states=True` trace entry `hidden_states[layer +
     /// 1]` at the prompt's last position.
+    ///
+    /// Runs `Self::forward_step` for every prompt token, so it still projects
+    /// vocabulary logits at every prompt position; that full projection is
+    /// kept deliberately as the reference `Self::generate_greedy` is checked
+    /// against, so its prefill loop is not interchangeable with
+    /// `Self::generate_greedy`'s deferred-projection loop.
     ///
     /// # Errors
     /// Propagates any cache error (out-of-bounds layer, shared-layer write,
@@ -1249,6 +1275,15 @@ pub(crate) fn tiny_zero_model() -> Gemma4Model {
     tiny_zero_model_with_vocab(16)
 }
 
+/// [`tiny_zero_model`] with deterministic non-zero weights filled in. Unlike
+/// the all-zero fixture, here the logits depend on the input, so a test that
+/// asserts bit-identity between two logit-producing paths has a real signal to
+/// compare rather than two all-zero outputs that match trivially -- the
+/// all-zero fixture's greedy pick is always token 0 for the same reason. The
+/// `fill` closure writes the repeating value `((i * 7 % 19) - 9) / 32` into
+/// `embed_tokens`, `q_proj`, `k_proj`, `v_proj` and `o_proj`; the norm weight
+/// vectors `norm`, `input_layernorm`, `post_attention_layernorm`, `q_norm` and
+/// `k_norm` are instead filled with `1.0`.
 #[cfg(test)]
 pub(crate) fn tiny_nonzero_model() -> Gemma4Model {
     let mut model = tiny_zero_model();
