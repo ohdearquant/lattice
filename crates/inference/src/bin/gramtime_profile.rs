@@ -17,6 +17,11 @@
 //!      grammar or state — so timing it directly measures exactly the cost
 //!      `GrammarEngine::new` pays for it (`GrammarEngine::trie_build_ns`).
 //!
+//! With `bench-internals` and `GRAMTIME_MEMBERSHIP_PROFILE=1`, it also
+//! reports raw BFS membership-scan intervals, separate empty-clock controls
+//! and actual comparison counts. This mode requires an explicit real tokenizer
+//! file, and its profiled traversal includes instrumentation overhead.
+//!
 //! `deep_schema` is the issue #734 profiling repro (also used by
 //! `gramperf_profile.rs`): 4 levels of nested objects, 3 arrays, 6
 //! string-enum fields. `simple_schema` was tuned against the real
@@ -35,10 +40,15 @@
 //! consumed by hand to write up the findings. Not a bench-gate harness
 //! (no Criterion, no `make bench-compare`).
 
+#[cfg(feature = "bench-internals")]
+use lattice_inference::grammar::engine::{BfsDedupProfile, GrammarError, profile_reachable_states};
 use lattice_inference::grammar::engine::{last_build_profile, probe_reachable_states};
 use lattice_inference::grammar::trie::ByteTrie;
 use lattice_inference::grammar::vocab_partition::MAX_GRAMMAR_STATES;
 use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
+use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::time::Instant;
 
 /// Qwen3's tokenizer vocabulary size, per the doc comment under measurement.
@@ -59,6 +69,102 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+fn membership_requested(
+    value: Option<&OsStr>,
+    available: bool,
+    probe_only: bool,
+) -> Result<bool, String> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    if value != "1" {
+        return Err("GRAMTIME_MEMBERSHIP_PROFILE must be absent or exactly 1".into());
+    }
+    if !available {
+        return Err("GRAMTIME_MEMBERSHIP_PROFILE=1 requires bench-internals".into());
+    }
+    if probe_only {
+        return Err("GRAMTIME_MEMBERSHIP_PROFILE=1 conflicts with GRAMTIME_PROBE_ONLY".into());
+    }
+    Ok(true)
+}
+
+fn profile_usize(value: Option<&OsStr>, name: &str, default: usize) -> Result<usize, String> {
+    let parsed = match value {
+        None => default,
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| format!("{name} must be a positive integer"))?,
+    };
+    if parsed == 0 {
+        return Err(format!("{name} must be a positive integer"));
+    }
+    Ok(parsed)
+}
+
+struct ProfileInput {
+    vocab: Vec<Vec<u8>>,
+    path: PathBuf,
+    sha256: String,
+}
+
+fn load_profile_input(path: Option<&OsStr>, vocab_size: usize) -> Result<ProfileInput, String> {
+    let path = path
+        .filter(|path| !path.is_empty())
+        .ok_or("diagnostic mode requires explicit GRAMTIME_TOKENIZER_JSON")?;
+    let path = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("diagnostic tokenizer path: {error}"))?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("diagnostic tokenizer {}: {error}", path.display()))?;
+    let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let tokenizer = lattice_inference::BpeTokenizer::from_tokenizer_json_str(&text)
+        .map_err(|error| format!("diagnostic tokenizer {}: {error}", path.display()))?;
+    let vocab = tokenizer
+        .vocab_bytes(vocab_size)
+        .map_err(|error| format!("diagnostic vocabulary: {error}"))?;
+    Ok(ProfileInput {
+        vocab,
+        path,
+        sha256,
+    })
+}
+
+fn membership_enabled_record(input: &ProfileInput, reps: usize, probe_cap: usize) -> String {
+    format!(
+        "GRAMTIME_MEMBERSHIP_PROFILE_ENABLED {}",
+        serde_json::json!({
+            "schema": 1,
+            "feature": "bench-internals",
+            "real_or_synthetic": "real",
+            "tokenizer_path": input.path,
+            "tokenizer_sha256": input.sha256,
+            "vocab_size": input.vocab.len(),
+            "reps": reps,
+            "probe_cap": probe_cap,
+            "schemas": ["simple", "deep"],
+            "clock_overhead_subtracted": false,
+        })
+    )
+}
+
+fn membership_complete_record(reps: usize, completed: [usize; 2]) -> Result<String, String> {
+    if reps == 0 || completed != [reps, reps] {
+        return Err("membership profiling did not complete every schema repetition".into());
+    }
+    Ok(format!(
+        "GRAMTIME_MEMBERSHIP_PROFILE_COMPLETE {}",
+        serde_json::json!({
+            "schema": 1,
+            "schemas": ["simple", "deep"],
+            "reps": reps,
+            "completed_reps": completed,
+            "clock_overhead_subtracted": false,
+        })
+    ))
 }
 
 /// A bare 3-member string enum, no object wrapper: `probe_reachable_states`
@@ -223,13 +329,83 @@ fn stats(mut xs: Vec<u64>) -> (u64, u64, f64, u64) {
     (min, max, mean, median)
 }
 
+#[cfg(feature = "bench-internals")]
+fn measure_dedup(
+    spec: &GrammarSpec,
+    vocab: &[Vec<u8>],
+    expected_states: usize,
+) -> Result<(usize, BfsDedupProfile), GrammarError> {
+    let (states, profile) = profile_reachable_states(spec, vocab, MAX_GRAMMAR_STATES)?;
+    if states != expected_states {
+        return Err(GrammarError(format!(
+            "profiled BFS found {states} states, unprofiled BFS found {expected_states}"
+        )));
+    }
+    if profile.membership_checks == 0 {
+        return Err(GrammarError(
+            "BFS dedup instrument did not exercise a membership scan".into(),
+        ));
+    }
+    Ok((states, profile))
+}
+
+#[cfg(feature = "bench-internals")]
+fn dedup_rep_record(
+    label: &str,
+    rep: usize,
+    unprofiled_states: usize,
+    profiled_states: usize,
+    profile: BfsDedupProfile,
+) -> String {
+    format!(
+        "RESULT kind=bfs_dedup_rep label={label} rep={rep} \
+         unprofiled_states_raw={unprofiled_states} profiled_states_raw={profiled_states} \
+         effective_states={} profiled_bfs_ns={} dedup_ns={} empty_interval_ns={} \
+         membership_checks={} state_comparisons={} duplicate_states={}",
+        profiled_states.min(MAX_GRAMMAR_STATES),
+        profile.bfs_ns,
+        profile.dedup_ns,
+        profile.empty_interval_ns,
+        profile.membership_checks,
+        profile.state_comparisons,
+        profile.duplicate_states,
+    )
+}
+
+#[cfg(feature = "bench-internals")]
+struct DedupMeasurements {
+    profiled_bfs_ns: Vec<u64>,
+    dedup_ns: Vec<u64>,
+    empty_interval_ns: Vec<u64>,
+}
+
+#[cfg(feature = "bench-internals")]
+impl DedupMeasurements {
+    fn new(reps: usize) -> Self {
+        Self {
+            profiled_bfs_ns: Vec::with_capacity(reps),
+            dedup_ns: Vec::with_capacity(reps),
+            empty_interval_ns: Vec::with_capacity(reps),
+        }
+    }
+}
+
 fn measure_schema(
     label: &str,
     schema: serde_json::Value,
     vocab: &[Vec<u8>],
     reps: usize,
     probe_cap: usize,
-) {
+    profile_membership: bool,
+    probe_only: bool,
+) -> Result<usize, String> {
+    #[cfg(not(feature = "bench-internals"))]
+    if profile_membership {
+        return Err("membership profiling requires bench-internals".into());
+    }
+    if profile_membership && probe_only {
+        return Err("membership profiling cannot use probe-only mode".into());
+    }
     let spec = GrammarSpec::JsonSchema(schema);
 
     let probe_t0 = Instant::now();
@@ -238,16 +414,18 @@ fn measure_schema(
     let probe_ns = probe_t0.elapsed().as_nanos() as u64;
     let probe_truncated = probed_states >= probe_cap;
 
-    if std::env::var("GRAMTIME_PROBE_ONLY").is_ok() {
+    if probe_only {
         println!(
             "RESULT kind=probe_only label={label} probed_states={probed_states} \
              probe_truncated={probe_truncated} probe_ns={probe_ns}"
         );
-        return;
+        return Ok(0);
     }
 
     let mut partition_ns = Vec::with_capacity(reps);
     let mut bfs_ns = Vec::with_capacity(reps);
+    #[cfg(feature = "bench-internals")]
+    let mut dedup = profile_membership.then(|| DedupMeasurements::new(reps));
     // `BuildProfile::reachable_states` is `enumerate_grammar_states`'s raw
     // `visited.len()`, which can overshoot `MAX_GRAMMAR_STATES`: the BFS
     // only rechecks its while-condition between states, so expanding one
@@ -281,6 +459,20 @@ fn measure_schema(
             bp.partition_build_ns,
             bp.bfs_ns,
         );
+        #[cfg(feature = "bench-internals")]
+        if let Some(measurements) = &mut dedup {
+            let (states, profile) =
+                measure_dedup(&spec, vocab, bp.reachable_states).map_err(|error| error.0)?;
+            measurements.profiled_bfs_ns.push(profile.bfs_ns);
+            measurements.dedup_ns.push(profile.dedup_ns);
+            measurements
+                .empty_interval_ns
+                .push(profile.empty_interval_ns);
+            println!(
+                "{}",
+                dedup_rep_record(label, rep, bp.reachable_states, states, profile)
+            );
+        }
     }
     let effective_states = reachable_raw.min(MAX_GRAMMAR_STATES);
 
@@ -300,6 +492,27 @@ fn measure_schema(
          ns_per_state_token_pair={ns_per_pair:.6}",
         vocab.len(),
     );
+    #[cfg(feature = "bench-internals")]
+    if let Some(measurements) = dedup {
+        let completed = measurements.profiled_bfs_ns.len();
+        let (pb_min, pb_max, pb_mean, pb_median) = stats(measurements.profiled_bfs_ns);
+        let (d_min, d_max, d_mean, d_median) = stats(measurements.dedup_ns);
+        let (e_min, e_max, e_mean, e_median) = stats(measurements.empty_interval_ns);
+        println!(
+            "RESULT kind=bfs_dedup label={label} reachable_states_raw={reachable_raw} \
+             effective_states={effective_states} vocab_size={} reps={reps} \
+             profiled_bfs_ns_min={pb_min} profiled_bfs_ns_max={pb_max} \
+             profiled_bfs_ns_mean={pb_mean:.1} profiled_bfs_ns_median={pb_median} \
+             dedup_ns_min={d_min} dedup_ns_max={d_max} \
+             dedup_ns_mean={d_mean:.1} dedup_ns_median={d_median} \
+             empty_interval_ns_min={e_min} empty_interval_ns_max={e_max} \
+             empty_interval_ns_mean={e_mean:.1} empty_interval_ns_median={e_median} \
+             clock_overhead_subtracted=false",
+            vocab.len(),
+        );
+        return Ok(completed);
+    }
+    Ok(0)
 }
 
 /// Default location of a real Qwen3.5 tokenizer, if present on this
@@ -344,20 +557,66 @@ fn load_vocab(vocab_size: usize) -> (Vec<Vec<u8>>, &'static str, String) {
     (synthetic_vocab(vocab_size), "synthetic", String::new())
 }
 
-fn main() {
-    let vocab_size = env_usize("GRAMTIME_VOCAB_SIZE", DEFAULT_VOCAB_SIZE);
-    let reps = env_usize("GRAMTIME_REPS", DEFAULT_REPS);
-    let probe_cap = env_usize("GRAMTIME_PROBE_CAP", DEFAULT_PROBE_CAP);
+fn run() -> Result<(), String> {
+    let profile_membership = membership_requested(
+        std::env::var_os("GRAMTIME_MEMBERSHIP_PROFILE").as_deref(),
+        cfg!(feature = "bench-internals"),
+        std::env::var_os("GRAMTIME_PROBE_ONLY").is_some(),
+    )?;
+    let setting = |name, default| {
+        if profile_membership {
+            profile_usize(std::env::var_os(name).as_deref(), name, default)
+        } else {
+            Ok(env_usize(name, default))
+        }
+    };
+    let vocab_size = setting("GRAMTIME_VOCAB_SIZE", DEFAULT_VOCAB_SIZE)?;
+    let reps = setting("GRAMTIME_REPS", DEFAULT_REPS)?;
+    let probe_cap = setting("GRAMTIME_PROBE_CAP", DEFAULT_PROBE_CAP)?;
 
     eprintln!("[gramtime] loading vocab: {vocab_size} tokens");
-    let (vocab, real_or_synthetic, source) = load_vocab(vocab_size);
+    let (vocab, real_or_synthetic, source, enabled_record) = if profile_membership {
+        let input = load_profile_input(
+            std::env::var_os("GRAMTIME_TOKENIZER_JSON").as_deref(),
+            vocab_size,
+        )?;
+        let record = membership_enabled_record(&input, reps, probe_cap);
+        (
+            input.vocab,
+            "real",
+            input.path.display().to_string(),
+            Some(record),
+        )
+    } else {
+        let (vocab, kind, source) = load_vocab(vocab_size);
+        (vocab, kind, source, None)
+    };
     println!(
         "RESULT kind=vocab vocab_size={} real_or_synthetic={real_or_synthetic} source={source:?}",
         vocab.len()
     );
+    if let Some(record) = enabled_record {
+        println!("{record}");
+    }
 
-    measure_schema("simple", simple_schema(), &vocab, reps, probe_cap);
-    measure_schema("deep", deep_schema(), &vocab, reps, probe_cap);
+    let simple_completed = measure_schema(
+        "simple",
+        simple_schema(),
+        &vocab,
+        reps,
+        probe_cap,
+        profile_membership,
+        std::env::var("GRAMTIME_PROBE_ONLY").is_ok(),
+    )?;
+    let deep_completed = measure_schema(
+        "deep",
+        deep_schema(),
+        &vocab,
+        reps,
+        probe_cap,
+        profile_membership,
+        std::env::var("GRAMTIME_PROBE_ONLY").is_ok(),
+    )?;
 
     // ByteTrie::build depends only on vocab_bytes — no grammar, no state — so
     // timing it directly, independent of any schema, measures exactly what
@@ -378,4 +637,232 @@ fn main() {
          trie_build_ns_mean={t_mean:.1} trie_build_ns_median={t_median}",
         vocab.len(),
     );
+    if profile_membership {
+        println!(
+            "{}",
+            membership_complete_record(reps, [simple_completed, deep_completed])?
+        );
+    }
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("[gramtime] {error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKENIZER: &str = r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]}}"#;
+    const TOKENIZER_SHA256: &str =
+        "aec3c8efa003f166de201b117c1cc0081b39bed7c7443fc1e5e9e26f099b42df";
+
+    #[test]
+    fn membership_request_selection_is_explicit() {
+        for available in [false, true] {
+            for probe_only in [false, true] {
+                assert!(!membership_requested(None, available, probe_only).unwrap());
+            }
+        }
+        assert!(membership_requested(Some(OsStr::new("1")), true, false).unwrap());
+        assert_eq!(
+            membership_requested(Some(OsStr::new("1")), false, false).unwrap_err(),
+            "GRAMTIME_MEMBERSHIP_PROFILE=1 requires bench-internals"
+        );
+        assert_eq!(
+            membership_requested(Some(OsStr::new("1")), true, true).unwrap_err(),
+            "GRAMTIME_MEMBERSHIP_PROFILE=1 conflicts with GRAMTIME_PROBE_ONLY"
+        );
+        for value in ["", "0", "true", " 1", "1 ", "2"] {
+            assert_eq!(
+                membership_requested(Some(OsStr::new(value)), true, false).unwrap_err(),
+                "GRAMTIME_MEMBERSHIP_PROFILE must be absent or exactly 1"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(membership_requested(Some(OsStr::from_bytes(&[0xff])), true, false).is_err());
+        }
+    }
+
+    #[test]
+    fn membership_settings_require_positive_integers() {
+        assert_eq!(profile_usize(None, "SETTING", 7).unwrap(), 7);
+        assert_eq!(
+            profile_usize(Some(OsStr::new("3")), "SETTING", 7).unwrap(),
+            3
+        );
+        for value in ["", "0", "-1", "3.0", " 3", "3 ", "184467440737095516160"] {
+            assert_eq!(
+                profile_usize(Some(OsStr::new(value)), "SETTING", 7).unwrap_err(),
+                "SETTING must be a positive integer"
+            );
+        }
+        assert!(profile_usize(None, "SETTING", 0).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(profile_usize(Some(OsStr::from_bytes(&[0xff])), "SETTING", 7).is_err());
+        }
+    }
+
+    #[test]
+    fn membership_input_refuses_missing_invalid_and_undersized_vocab() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tokenizer.json");
+        assert!(load_profile_input(None, 2).is_err());
+        assert!(load_profile_input(Some(OsStr::new("")), 2).is_err());
+        assert!(load_profile_input(Some(path.as_os_str()), 2).is_err());
+        std::fs::write(&path, "not JSON").unwrap();
+        assert!(load_profile_input(Some(path.as_os_str()), 2).is_err());
+        std::fs::write(&path, TOKENIZER).unwrap();
+        assert!(load_profile_input(Some(path.as_os_str()), 1).is_err());
+        assert_eq!(
+            load_profile_input(Some(path.as_os_str()), 2).unwrap().vocab,
+            [b"a".to_vec(), b"b".to_vec()]
+        );
+    }
+
+    #[test]
+    fn membership_input_binding_uses_loaded_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tokenizer.json");
+        std::fs::write(&path, TOKENIZER).unwrap();
+        let input = load_profile_input(Some(path.as_os_str()), 2).unwrap();
+        assert_eq!(input.path, path.canonicalize().unwrap());
+        assert_eq!(input.sha256, TOKENIZER_SHA256);
+        assert_eq!(input.vocab, [b"a".to_vec(), b"b".to_vec()]);
+        let record = membership_enabled_record(&input, 3, 512);
+        let fields: serde_json::Value = serde_json::from_str(
+            record
+                .strip_prefix("GRAMTIME_MEMBERSHIP_PROFILE_ENABLED ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fields,
+            serde_json::json!({
+                "schema": 1,
+                "feature": "bench-internals",
+                "real_or_synthetic": "real",
+                "tokenizer_path": input.path,
+                "tokenizer_sha256": TOKENIZER_SHA256,
+                "vocab_size": 2,
+                "reps": 3,
+                "probe_cap": 512,
+                "schemas": ["simple", "deep"],
+                "clock_overhead_subtracted": false,
+            })
+        );
+        std::fs::write(&path, format!("{TOKENIZER}\n")).unwrap();
+        let changed = load_profile_input(Some(path.as_os_str()), 2).unwrap();
+        assert_eq!(changed.vocab, input.vocab);
+        assert_ne!(changed.sha256, input.sha256);
+    }
+
+    #[test]
+    fn membership_completion_requires_both_schema_populations() {
+        for (reps, completed) in [
+            (0, [0, 0]),
+            (2, [0, 0]),
+            (2, [2, 1]),
+            (2, [1, 2]),
+            (2, [3, 2]),
+        ] {
+            assert_eq!(
+                membership_complete_record(reps, completed).unwrap_err(),
+                "membership profiling did not complete every schema repetition"
+            );
+        }
+        let record = membership_complete_record(2, [2, 2]).unwrap();
+        let fields: serde_json::Value = serde_json::from_str(
+            record
+                .strip_prefix("GRAMTIME_MEMBERSHIP_PROFILE_COMPLETE ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fields,
+            serde_json::json!({
+                "schema": 1,
+                "schemas": ["simple", "deep"],
+                "reps": 2,
+                "completed_reps": [2, 2],
+                "clock_overhead_subtracted": false,
+            })
+        );
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn dedup_report_keeps_raw_time_and_clock_control_separate() {
+        let profile = BfsDedupProfile {
+            bfs_ns: 31,
+            dedup_ns: 7,
+            empty_interval_ns: 9,
+            membership_checks: 2,
+            state_comparisons: 3,
+            duplicate_states: 1,
+        };
+        assert_eq!(
+            dedup_rep_record("deep", 1, 257, 257, profile),
+            "RESULT kind=bfs_dedup_rep label=deep rep=1 unprofiled_states_raw=257 profiled_states_raw=257 effective_states=256 profiled_bfs_ns=31 dedup_ns=7 empty_interval_ns=9 membership_checks=2 state_comparisons=3 duplicate_states=1"
+        );
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn dedup_measurement_requires_real_scan_and_matching_state_count() {
+        let spec = GrammarSpec::Gbnf("root ::= \"a\"".into());
+        let vocab = vec![b"a".to_vec(), b"a".to_vec()];
+        let expected = probe_reachable_states(&spec, &vocab, MAX_GRAMMAR_STATES).unwrap();
+        assert_eq!(expected, 2);
+        let (actual, profile) = measure_dedup(&spec, &vocab, expected).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(profile.membership_checks, 2);
+        assert_eq!(profile.state_comparisons, 3);
+        assert_eq!(profile.duplicate_states, 1);
+        assert_eq!(
+            measure_dedup(&spec, &vocab, expected + 1).unwrap_err().0,
+            "profiled BFS found 2 states, unprofiled BFS found 3"
+        );
+        assert_eq!(
+            measure_dedup(&spec, &[b"z".to_vec()], 1).unwrap_err().0,
+            "BFS dedup instrument did not exercise a membership scan"
+        );
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn membership_schema_route_requires_actual_profile_work() {
+        let vocab = synthetic_vocab(300);
+        let simple =
+            measure_schema("simple", simple_schema(), &vocab, 2, 512, true, false).unwrap();
+        let deep = measure_schema("deep", deep_schema(), &vocab, 2, 512, true, false).unwrap();
+        assert_eq!([simple, deep], [2, 2]);
+        assert!(membership_complete_record(2, [simple, deep]).is_ok());
+        assert_eq!(
+            measure_schema("simple", simple_schema(), &vocab, 1, 512, false, false).unwrap(),
+            0
+        );
+        assert_eq!(
+            measure_schema("simple", serde_json::Value::Null, &[], 1, 512, true, true).unwrap_err(),
+            "membership profiling cannot use probe-only mode"
+        );
+    }
+
+    #[cfg(not(feature = "bench-internals"))]
+    #[test]
+    fn membership_unavailable_route_refuses_before_schema_work() {
+        assert_eq!(
+            measure_schema("simple", serde_json::Value::Null, &[], 1, 512, true, false)
+                .unwrap_err(),
+            "membership profiling requires bench-internals"
+        );
+    }
 }
