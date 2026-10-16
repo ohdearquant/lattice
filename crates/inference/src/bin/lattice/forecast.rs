@@ -5,7 +5,8 @@
 //!
 //! Input line: `{"id": <any, optional>, "target": [number | null, ...], "horizon": N,
 //! "downsample": N (optional, default 1), "flip": bool (optional, default false)}`; `null` marks
-//! a missing value. `downsample` and `flip` are Reverso options and are refused for Chronos-2.
+//! a missing value. `downsample` and `flip` are Reverso options: Chronos-2 refuses a `downsample`
+//! other than 1 and `flip: true`.
 //! Output line, in input order: `{"id": <echoed>, "forecast": [number, ...]}`, where the forecast
 //! is Reverso's point forecast or Chronos-2's median; Chronos-2 lines also carry
 //! `"quantile_levels": [...]` and `"quantiles": [[...] per level]`. Any malformed line or failed
