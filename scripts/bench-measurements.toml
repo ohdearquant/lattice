@@ -200,10 +200,6 @@ path = "crates/inference/src/bin/lattice_serve.rs"
 reason = "Long-running server process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice_serve/bert_pooling_tests.rs"
-reason = "Test-only HTTP embedding correctness/parity controls using a generated BERT fixture and CPU encoding; no timing, no Criterion, no Metal dispatch. Included only in the server's cfg(test) module."
-
-[[non_measurement_surface]]
 path = "crates/inference/src/bin/dump_quarot_q4_golden.rs"
 reason = "Golden/correctness dump utility, not a timed benchmark."
 
