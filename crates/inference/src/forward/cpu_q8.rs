@@ -762,7 +762,7 @@ fn cache_idx_of(full_idx: usize) -> usize {
 /// Generate text from a prompt using Q8 weight matrices.
 ///
 /// Equivalent to `Qwen35Model::generate` but runs the shared decoder driver over a
-/// standalone CPU session whose forward step is `forward_step_q8`. The tokenizer,
+/// standalone CPU session whose forward step is `forward_step_q8_with_scratch`. The tokenizer,
 /// RoPE table, and generate config are passed explicitly since we operate as
 /// standalone functions rather than methods on the model struct.
 pub fn generate_q8(

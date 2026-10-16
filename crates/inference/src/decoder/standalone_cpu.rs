@@ -84,6 +84,26 @@ pub(crate) struct StandaloneCpuSession<'w> {
     prefilled: bool,
 }
 
+/// Resolves the Q8 matmul scratch column bound for `cfg` without allocating. The
+/// constructor sizes the request scratch from this, and `generate_with_trace` runs it
+/// ahead of `StandaloneCpuSession::new` so an overflowing config surfaces as a typed
+/// error instead of the panic the infallible constructor would raise.
+fn q8_scratch_max_cols(
+    cfg: &Qwen35Config,
+    model: &Q8ModelWeights,
+) -> Result<usize, InferenceError> {
+    let mut max_cols = cfg.hidden_size.max(cfg.intermediate_size);
+    for (attention, _) in model.layers.iter().take(cfg.num_hidden_layers) {
+        // Matrix metadata is checked later; it must not enlarge this early allocation.
+        let columns = match attention {
+            Q8AttentionWeights::Linear(_) => cfg.checked_linear_output_dim(),
+            Q8AttentionWeights::Full(_) => cfg.checked_full_q_dim(),
+        };
+        max_cols = max_cols.max(columns?);
+    }
+    Ok(max_cols)
+}
+
 impl<'w> StandaloneCpuSession<'w> {
     /// Allocates fresh recurrent state, KV cache and scratch for the planned prompt. The RNG
     /// state comes from the plan, which already normalized the request's seed.
@@ -102,18 +122,12 @@ impl<'w> StandaloneCpuSession<'w> {
 
         let mut q8_scratch = Q8MatmulScratch::default();
         if let StandaloneWeights::Q8(model) = weights {
-            let mut max_cols = cfg.hidden_size.max(cfg.intermediate_size);
-            for (attention, _) in model.layers.iter().take(cfg.num_hidden_layers) {
-                // Matrix metadata is checked later; it must not enlarge this early allocation.
-                let columns = match attention {
-                    Q8AttentionWeights::Linear(_) => cfg.checked_linear_output_dim(),
-                    Q8AttentionWeights::Full(_) => cfg.checked_full_q_dim(),
-                };
-                match columns {
-                    Ok(columns) => max_cols = max_cols.max(columns),
-                    Err(error) => panic!("{error}"),
-                }
-            }
+            // `generate_with_trace` resolves this first and propagates the typed error;
+            // reaching the panic here means a caller built a session outside that entry.
+            let max_cols = match q8_scratch_max_cols(cfg, model) {
+                Ok(max_cols) => max_cols,
+                Err(error) => panic!("{error}"),
+            };
             if cfg.num_hidden_layers != 0
                 && !model.layers.is_empty()
                 && let Err(error) = q8_scratch.prepare(1, max_cols)
@@ -338,6 +352,11 @@ pub(crate) fn generate_with_trace(
     };
     let prompt_ids = plan.prompt_ids.clone();
     let prompt_len = plan.prompt_len;
+    if let StandaloneWeights::Q8(model) = weights {
+        // Validate the scratch sizing before the infallible constructor, which would
+        // otherwise turn an overflowing config into the panic inside `new`.
+        q8_scratch_max_cols(cfg, model)?;
+    }
     let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan);
 
     let never_cancel = || false;

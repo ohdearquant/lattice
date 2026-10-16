@@ -212,6 +212,12 @@ impl Q8MatmulScratch {
     pub(crate) fn prepare(&mut self, max_m: usize, max_k: usize) -> Result<(), InferenceError> {
         #[cfg(target_os = "macos")]
         {
+            // The tile scratch buffers are sized by `TILE_N * k` and `m * TILE_N`,
+            // which are NOT covered by the `m*k` / `n*k` / `m*n` guards in the
+            // caller: when `n < TILE_N` (including `n == 0`) these products can
+            // overflow while the guarded ones do not, and a wrapped size would
+            // under-allocate the scratch and drive an OOB scatter below. Guard
+            // them on the same fail-closed contract.
             let b_len = TILE_N.checked_mul(max_k).ok_or_else(|| {
                 InferenceError::InvalidInput("matmul shape overflow: TILE_N*k".into())
             })?;
@@ -1625,9 +1631,8 @@ mod tests {
     /// Overflow guard for the macOS tile-scratch size `TILE_N * k`. With
     /// `m=0, k=MAX, n=0` every earlier product (`m*k`, `n*k`, `m*n`) and every
     /// length assert is zero/empty, so control reaches the tile block; `TILE_N*k`
-    /// then overflows and must be rejected with a dedicated message rather than
-    /// letting the `vec![0.0f32; TILE_N * k]` allocation panic with a generic
-    /// "capacity overflow".
+    /// then overflows and `Q8MatmulScratch::prepare` must reject it with the
+    /// dedicated message rather than silently wrapping the scratch length.
     #[cfg(target_os = "macos")]
     #[test]
     #[should_panic(expected = "matmul shape overflow: TILE_N*k")]
