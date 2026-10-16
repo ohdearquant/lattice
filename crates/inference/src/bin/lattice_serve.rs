@@ -247,6 +247,60 @@ mod imp {
         admission: Arc<Semaphore>,
     }
 
+    fn load_embedding_state(
+        embedding_model_dir: &std::path::Path,
+        pooling_override: Option<&str>,
+    ) -> Result<Arc<EmbeddingState>, String> {
+        if !embedding_model_dir.exists() {
+            return Err(format!(
+                "embedding model directory not found: {}",
+                embedding_model_dir.display()
+            ));
+        }
+        eprintln!(
+            "[lattice_serve] loading embedding model from {} ...",
+            embedding_model_dir.display()
+        );
+        let mut model = BertModel::from_directory(embedding_model_dir).map_err(|e| {
+            format!(
+                "embedding model load failed ({}): {e}",
+                embedding_model_dir.display()
+            )
+        })?;
+        let embedding_model_id: Arc<str> = embedding_model_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("embedding")
+            .into();
+        // Auto-select the same default `--embedding-pooling` would
+        // otherwise force the operator to pass explicitly. See
+        // `lattice_inference::pool::default_bert_pooling_for_model_name`
+        // for the rule and its agreement test against
+        // `lattice-embed`'s `EmbeddingModel::bert_pooling` table.
+        model.set_pooling(
+            lattice_inference::pool::default_bert_pooling_for_model_name(&embedding_model_id),
+        );
+        match pooling_override {
+            None => {}
+            Some("mean") => model.set_pooling(BertPooling::Mean),
+            Some("cls") => model.set_pooling(BertPooling::CLS),
+            Some(other) => {
+                return Err(format!(
+                    "invalid --embedding-pooling '{other}'; expected 'mean' or 'cls'"
+                ));
+            }
+        }
+        eprintln!(
+            "[lattice_serve] embedding model '{embedding_model_id}' ready (dimensions={})",
+            model.dimensions()
+        );
+        Ok(Arc::new(EmbeddingState {
+            model,
+            model_id: embedding_model_id,
+            admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+        }))
+    }
+
     /// See [`EmbeddingState::admission`].
     const EMBEDDING_MAX_CONCURRENT_JOBS: usize = 4;
 
@@ -3785,59 +3839,10 @@ mod imp {
             None => None,
             Some(embedding_model_arg) => {
                 let embedding_model_dir = resolve_model_dir(&embedding_model_arg);
-                if !embedding_model_dir.exists() {
-                    return Err(format!(
-                        "embedding model directory not found: {}",
-                        embedding_model_dir.display()
-                    )
-                    .into());
-                }
-                eprintln!(
-                    "[lattice_serve] loading embedding model from {} ...",
-                    embedding_model_dir.display()
-                );
-                let mut model = BertModel::from_directory(&embedding_model_dir).map_err(|e| {
-                    format!(
-                        "embedding model load failed ({}): {e}",
-                        embedding_model_dir.display()
-                    )
-                })?;
-                let embedding_model_id: Arc<str> = embedding_model_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("embedding")
-                    .into();
-                // Auto-select the same default `--embedding-pooling` would
-                // otherwise force the operator to pass explicitly. See
-                // `lattice_inference::pool::default_bert_pooling_for_model_name`
-                // for the rule and its agreement test against
-                // `lattice-embed`'s `EmbeddingModel::bert_pooling` table.
-                model.set_pooling(
-                    lattice_inference::pool::default_bert_pooling_for_model_name(
-                        &embedding_model_id,
-                    ),
-                );
-                match parse_arg(&args, "--embedding-pooling").as_deref() {
-                    None => {}
-                    Some("mean") => model.set_pooling(BertPooling::Mean),
-                    Some("cls") => model.set_pooling(BertPooling::CLS),
-                    Some(other) => {
-                        return Err(format!(
-                            "invalid --embedding-pooling '{other}'; expected 'mean' or 'cls'"
-                        )
-                        .into());
-                    }
-                }
-                eprintln!(
-                    "[lattice_serve] embedding model '{embedding_model_id}' ready \
-                     (dimensions={})",
-                    model.dimensions()
-                );
-                Some(Arc::new(EmbeddingState {
-                    model,
-                    model_id: embedding_model_id,
-                    admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
-                }))
+                Some(load_embedding_state(
+                    &embedding_model_dir,
+                    parse_arg(&args, "--embedding-pooling").as_deref(),
+                )?)
             }
         };
 
@@ -3883,6 +3888,287 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        mod bert_pooling_tests {
+            use super::*;
+            use lattice_inference::bert_pooling_fixture::{
+                DIMENSIONS, INPUTS, MAX_POSITIONS, checkpoint_hashes, write_checkpoint,
+            };
+            use std::path::{Path, PathBuf};
+            use tower::ServiceExt as _;
+
+            const MODELS: [(&str, BertPooling); 2] = [
+                ("bge-small-en-v1.5", BertPooling::CLS),
+                ("all-minilm-l6-v2", BertPooling::Mean),
+            ];
+
+            fn fixture(parent: &Path, name: &str) -> PathBuf {
+                let path = parent.join(name);
+                write_checkpoint(&path).expect("deterministic BERT checkpoint must be written");
+                path
+            }
+
+            fn valid_vector(vector: &[f32]) -> bool {
+                vector.len() == DIMENSIONS
+                    && vector.iter().all(|value| value.is_finite())
+                    && vector.iter().any(|&value| value != 0.0)
+            }
+
+            fn assert_vector(actual: &[f32], expected: &[f32]) {
+                assert!(valid_vector(actual), "invalid actual embedding");
+                assert!(valid_vector(expected), "invalid expected embedding");
+                for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                    let tolerance = 1e-5 + 1e-5 * actual.abs().max(expected.abs());
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "embedding lane {index}: {actual} != {expected}"
+                    );
+                }
+            }
+
+            fn distance(left: &[f32], right: &[f32]) -> f64 {
+                assert!(valid_vector(left) && valid_vector(right));
+                left.iter()
+                    .zip(right)
+                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            }
+
+            fn reference(path: &Path, pooling: BertPooling) -> (Vec<f32>, Vec<Vec<f32>>) {
+                let mut model =
+                    BertModel::from_directory(path).expect("reference checkpoint must load");
+                model.set_pooling(pooling);
+                let single = model
+                    .encode(INPUTS[0])
+                    .expect("reference single must encode");
+                let batch = model
+                    .encode_batch(&INPUTS)
+                    .expect("reference batch must encode");
+                let opposite = match pooling {
+                    BertPooling::CLS => BertPooling::Mean,
+                    BertPooling::Mean => BertPooling::CLS,
+                    _ => panic!("fixture must use one of the two registered pooling modes"),
+                };
+                model.set_pooling(opposite);
+                let wrong_single = model
+                    .encode(INPUTS[0])
+                    .expect("opposite single must encode");
+                let wrong_batch = model
+                    .encode_batch(&INPUTS)
+                    .expect("opposite batch must encode");
+                assert!(distance(&single, &wrong_single) >= 1e-3);
+                assert_eq!(batch.len(), INPUTS.len());
+                assert_eq!(wrong_batch.len(), INPUTS.len());
+                for (expected, wrong) in batch.iter().zip(&wrong_batch) {
+                    assert!(
+                        distance(expected, wrong) >= 1e-3,
+                        "pooling fixture is vacuous"
+                    );
+                }
+                for first in 0..batch.len() {
+                    for second in first + 1..batch.len() {
+                        assert!(distance(&batch[first], &batch[second]) >= 1e-3);
+                    }
+                }
+                (single, batch)
+            }
+
+            async fn request(embedding: Arc<EmbeddingState>, input: Value) -> Response {
+                let model_id = embedding.model_id.to_string();
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"input": input, "model": model_id}).to_string(),
+                    ))
+                    .expect("request must build");
+                router(test_app_state_with_embedding(embedding))
+                    .oneshot(request)
+                    .await
+                    .expect("actual router must respond")
+            }
+
+            async fn vectors(
+                response: Response,
+                name: &str,
+                expected_count: usize,
+            ) -> Vec<Vec<f32>> {
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["object"], "list");
+                assert_eq!(value["model"], name);
+                assert!(value["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+                assert_eq!(
+                    value["usage"]["prompt_tokens"],
+                    value["usage"]["total_tokens"]
+                );
+                let rows = value["data"].as_array().unwrap();
+                assert_eq!(rows.len(), expected_count);
+                rows.iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        assert_eq!(row["object"], "embedding");
+                        assert_eq!(row["index"].as_u64().unwrap(), index as u64);
+                        let vector: Vec<f32> =
+                            serde_json::from_value(row["embedding"].clone()).unwrap();
+                        assert!(valid_vector(&vector));
+                        vector
+                    })
+                    .collect()
+            }
+
+            async fn compare_route(
+                embedding: Arc<EmbeddingState>,
+                name: &str,
+                single: &[f32],
+                batch: &[Vec<f32>],
+            ) {
+                let actual =
+                    vectors(request(embedding.clone(), json!(INPUTS[0])).await, name, 1).await;
+                assert_vector(&actual[0], single);
+                let actual =
+                    vectors(request(embedding, json!(INPUTS)).await, name, INPUTS.len()).await;
+                assert_eq!(actual.len(), batch.len());
+                for (actual, expected) in actual.iter().zip(batch) {
+                    assert_vector(actual, expected);
+                }
+            }
+
+            #[tokio::test]
+            async fn embeddings_default_pooling_matches_library_for_single_and_batch() {
+                let temp = tempfile::tempdir().unwrap();
+                let mut hashes = None;
+                for (name, pooling) in MODELS {
+                    let path = fixture(temp.path(), name);
+                    let current = checkpoint_hashes(&path).unwrap();
+                    if let Some(expected) = hashes.as_ref() {
+                        assert_eq!(&current, expected);
+                    }
+                    hashes = Some(current);
+                    let (single, batch) = reference(&path, pooling);
+                    let embedding = load_embedding_state(&path, None).unwrap();
+                    assert_eq!(embedding.model.pooling(), pooling);
+                    compare_route(embedding, name, &single, &batch).await;
+                }
+            }
+
+            #[tokio::test]
+            async fn embeddings_explicit_pooling_override_matches_library() {
+                let temp = tempfile::tempdir().unwrap();
+                for (name, _) in MODELS {
+                    let path = fixture(temp.path(), name);
+                    for (argument, pooling) in
+                        [("cls", BertPooling::CLS), ("mean", BertPooling::Mean)]
+                    {
+                        let (single, batch) = reference(&path, pooling);
+                        let embedding = load_embedding_state(&path, Some(argument)).unwrap();
+                        assert_eq!(embedding.model.pooling(), pooling);
+                        compare_route(embedding, name, &single, &batch).await;
+                    }
+                }
+            }
+
+            #[test]
+            fn embedding_startup_preserves_load_and_override_errors() {
+                let temp = tempfile::tempdir().unwrap();
+                let missing = temp.path().join("missing");
+                assert_eq!(
+                    load_embedding_state(&missing, Some("invalid"))
+                        .err()
+                        .unwrap(),
+                    format!("embedding model directory not found: {}", missing.display())
+                );
+                let malformed = temp.path().join("malformed");
+                std::fs::create_dir(&malformed).unwrap();
+                let load_error = load_embedding_state(&malformed, Some("invalid"))
+                    .err()
+                    .unwrap();
+                assert!(load_error.starts_with(&format!(
+                    "embedding model load failed ({}): ",
+                    malformed.display()
+                )));
+                let path = fixture(temp.path(), MODELS[0].0);
+                assert_eq!(
+                    load_embedding_state(&path, Some("invalid")).err().unwrap(),
+                    "invalid --embedding-pooling 'invalid'; expected 'mean' or 'cls'"
+                );
+            }
+
+            // Regression: the context-window guard used to measure each item's
+            // *post-truncation* token count (`WordPieceTokenizer` truncates to its own
+            // `max_seq_len` during tokenization), and `BertModel::from_directory` derives
+            // that cap as `max_position_embeddings.min(2048)`. For every checkpoint whose
+            // config sets `max_position_embeddings` at or below that 2048 cap -- including
+            // the synthetic fixture below, whose config sets it to `MAX_POSITIONS` (16)
+            // with no `tokenizer_config.json` to raise it -- the two limits are equal by
+            // construction. A post-truncation count can never exceed `max_seq_len`, so the
+            // old `count > max_position_embeddings` test was unsatisfiable and an
+            // over-limit input was silently truncated and embedded instead of rejected.
+            // The `assert_eq!` below pins the fixture in exactly that collision case
+            // (`tokenizer.max_seq_len() == config.max_position_embeddings`), and the
+            // `pre_truncation_len` assertions pin the token counts the guard must compare.
+            // This is a generated checkpoint, not a real `bge-small-en-v1.5` download.
+            pub(super) async fn check_context_window_route() {
+                let temp = tempfile::tempdir().unwrap();
+                let path = fixture(temp.path(), MODELS[0].0);
+                let embedding = load_embedding_state(&path, None).unwrap();
+                assert_eq!(
+                    embedding.model.config().max_position_embeddings,
+                    MAX_POSITIONS
+                );
+                assert_eq!(embedding.model.tokenizer().max_seq_len(), MAX_POSITIONS);
+                let at_limit = "hello ".repeat(MAX_POSITIONS - 2);
+                let over_limit = "hello ".repeat(MAX_POSITIONS - 1);
+                let at_tokens = embedding.model.tokenizer().tokenize(&at_limit);
+                let over_tokens = embedding.model.tokenizer().tokenize(&over_limit);
+                assert_eq!(at_tokens.real_length, MAX_POSITIONS);
+                assert_eq!(at_tokens.pre_truncation_len, MAX_POSITIONS);
+                assert_eq!(over_tokens.real_length, MAX_POSITIONS);
+                assert_eq!(over_tokens.pre_truncation_len, MAX_POSITIONS + 1);
+                let expected = embedding.model.encode(&at_limit).unwrap();
+                let actual = vectors(
+                    request(embedding.clone(), json!(at_limit)).await,
+                    MODELS[0].0,
+                    1,
+                )
+                .await;
+                assert_vector(&actual[0], &expected);
+                let (status, code) =
+                    error_code_of(request(embedding, json!(over_limit)).await).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(code, "context_length_exceeded");
+            }
+
+            #[test]
+            fn pooling_comparison_rejects_nonfinite_wrong_shape_and_wrong_values() {
+                let expected = vec![0.25; DIMENSIONS];
+                assert_vector(&expected, &expected);
+                for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5] {
+                    let mut wrong = expected.clone();
+                    wrong[DIMENSIONS - 1] = value;
+                    assert!(std::panic::catch_unwind(|| assert_vector(&wrong, &expected)).is_err());
+                    assert!(std::panic::catch_unwind(|| assert_vector(&expected, &wrong)).is_err());
+                }
+                assert!(
+                    std::panic::catch_unwind(|| assert_vector(
+                        &expected[..DIMENSIONS - 1],
+                        &expected
+                    ))
+                    .is_err()
+                );
+                assert!(
+                    std::panic::catch_unwind(|| assert_vector(
+                        &expected,
+                        &expected[..DIMENSIONS - 1]
+                    ))
+                    .is_err()
+                );
+            }
+        }
+
         fn input_message(role: String, content: MessageContent) -> InMsg {
             let mut message: InMsg = serde_json::from_str(r#"{"role":"","content":""}"#).unwrap();
             message.role = role;
@@ -5485,44 +5771,10 @@ mod imp {
             assert_eq!(code, "model_not_found");
         }
 
-        // Regression: the context-window guard used to measure each item's
-        // *post-truncation* token count (`WordPieceTokenizer` truncates to
-        // its own `max_seq_len` during tokenization), and `BertModel::
-        // from_directory` sets `max_seq_len = max_position_embeddings.min(
-        // 2048)`, so for every real BERT checkpoint loaded that way the two
-        // are equal by construction. A post-truncation count can never
-        // exceed `max_seq_len`, so the old `count > max_position_embeddings`
-        // test was unsatisfiable and an over-limit input was silently
-        // truncated and embedded instead of rejected. This fixture (a real
-        // `bge-small-en-v1.5` checkpoint, `max_position_embeddings: 512`,
-        // no `tokenizer_config.json` to set a different `model_max_length`)
-        // sits exactly in that collision case -- see the `assert_eq!` below.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
-        #[ignore = "requires LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR"]
         async fn embeddings_item_over_context_window_400() {
-            let Some(embedding) = test_embedding_state() else {
-                return;
-            };
-            assert_eq!(
-                embedding.model.tokenizer().max_seq_len(),
-                embedding.model.config().max_position_embeddings,
-                "fixture must sit in the collision case (tokenizer max_seq_len == \
-                 model max_position_embeddings) or this regression guards nothing"
-            );
-            // Comfortably above the 512-token window regardless of the
-            // loaded checkpoint's exact vocabulary.
-            let over_limit_text = "hello ".repeat(600);
-            let body = Body::from(serde_json::json!({ "input": over_limit_text }).to_string());
-            let response = embeddings(
-                State(test_app_state_with_embedding(embedding)),
-                test_json_headers(),
-                body,
-            )
-            .await;
-            let (status, code) = error_code_of(response).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(code, "context_length_exceeded");
+            bert_pooling_tests::check_context_window_route().await;
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
