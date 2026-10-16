@@ -192,6 +192,10 @@ path = "crates/inference/src/bin/lattice/doctor.rs"
 reason = "`lattice doctor` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/forecast.rs"
+reason = "`lattice forecast` product subcommand: reads series as JSON lines, writes point forecasts, and exits. Forecast values only; no timing, no Criterion, no Metal dispatch."
+
+[[non_measurement_surface]]
 path = "crates/inference/src/bin/lattice/prune_score.rs"
 reason = "`lattice prune-score` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
