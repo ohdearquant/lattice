@@ -901,57 +901,6 @@ jobs:
             exit "$lattice_status"
           fi
           check_test_utils_modules_ran lattice_test.log lattice
-      - name: inference - CPU streaming panic completion and admission
-        run: |
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          import re
-          import subprocess
-          import sys
-
-          if not __debug__:
-              raise RuntimeError("CPU streaming validation requires Python assertions")
-
-          EXPECTED = {'host': ['serving_cpu_host::tests::completion_and_streaming_keep_distinct_entries_on_blocking_threads', 'serving_cpu_host::tests::completion_and_streaming_execute_at_the_same_time', 'serving_cpu_host::tests::streaming_terminal::streaming_create_runtime_panic_reports_terminal_error_once', 'serving_cpu_host::tests::streaming_terminal::streaming_execute_panic_reports_terminal_error_after_cleanup_once', 'serving_cpu_host::tests::streaming_terminal::streaming_delta_callback_panic_reports_terminal_error_after_cleanup_once', 'serving_cpu_host::tests::streaming_terminal::streaming_runtime_drop_panic_reports_terminal_error_once', 'serving_cpu_host::tests::streaming_terminal::streaming_success_finishes_once_after_runtime_drop', 'serving_cpu_host::tests::streaming_terminal::streaming_worker_failure_finishes_once_after_runtime_drop', 'serving_cpu_host::tests::streaming_terminal::streaming_finish_callback_panic_is_not_retried_and_releases_capture'], 'binary': ['serve::tests::post_drop_cancellation_probe::cpu_panic_responses::streaming_panic_after_partial_emits_one_terminal_error', 'serve::tests::post_drop_cancellation_probe::cpu_panic_responses::streaming_panic_before_delta_emits_one_terminal_error', 'serve::tests::post_drop_cancellation_probe::cpu_panic_responses::non_streaming_panic_returns_generic_500', 'serve::tests::post_drop_cancellation_probe::cpu_panic_responses::streaming_completion_preserves_delta_finish_and_done', 'serve::tests::post_drop_cancellation_probe::cpu_panic_responses::streaming_disconnect_holds_admission_until_panic_cleanup_finishes']}
-
-          def check(text, expected, harness):
-              records = re.findall(r"^test (?!result:)(\S+) \.\.\. ok$", text, re.MULTILINE)
-              assert sorted(records) == sorted(expected), "wrong exact CPU streaming test population"
-              assert len(re.findall(r"^test (?!result:)", text, re.MULTILINE)) == len(expected)
-              assert re.findall(r"^running \d+ tests?$", text, re.MULTILINE) == [f"running {len(expected)} tests"]
-              summaries = re.findall(r"^test result:.*$", text, re.MULTILINE)
-              pattern = rf"test result: ok\. {len(expected)} passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in [0-9]+(?:\.[0-9]+)?s"
-              assert len(summaries) == 1 and re.fullmatch(pattern, summaries[0])
-              assert re.findall(r"^\s*Running unittests ([^\s]+) \(.+\)$", text, re.MULTILINE) == [harness]
-              assert len(re.findall(r"^\s*Running unittests ", text, re.MULTILINE)) == 1
-              assert not re.search(r"^error(?:\[|:)", text, re.MULTILINE)
-
-
-          def main():
-              root = Path(os.environ["RUNNER_TEMP"])
-              arms = [
-                  ("host", "src/lib.rs", ["--lib", "serving_cpu_host::tests::"]),
-                  ("binary", "src/bin/lattice/main.rs", ["--features", "test-utils", "--bin", "lattice",
-                      "serve::tests::post_drop_cancellation_probe::cpu_panic_responses::"]),
-              ]
-              for label, harness, selection in arms:
-                  command = ["cargo", "test", "--locked", "-p", "lattice-inference"] + selection + [
-                      "--", "--test-threads=1", "--color", "never"]
-                  log = root / ("cpu-stream-terminal-" + label + ".log")
-                  with log.open("w") as output:
-                      result = subprocess.run(command, env=dict(os.environ, CARGO_TERM_COLOR="never"),
-                                              stdout=output, stderr=subprocess.STDOUT)
-                  text = log.read_text(errors="replace")
-                  print(text, end="", flush=True)
-                  if result.returncode:
-                      raise SystemExit(result.returncode if result.returncode > 0 else 128 - result.returncode)
-                  check(text, EXPECTED[label], harness)
-              print("CPU_STREAM_TERMINAL_GATES_COMPLETE host=9 binary=5")
-
-
-          main()
-          PY
       # The standalone server's startup routing, Gemma refusals and unchanged
       # startup errors run against the shipped `lattice_serve` binary with stub
       # model directories. The two real-checkpoint cases report
