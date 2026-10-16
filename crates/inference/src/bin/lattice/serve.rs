@@ -5674,6 +5674,47 @@ mod tests {
         }
     }
 
+    /// Builds an `AppState` whose CPU streaming generation is the
+    /// injected `generate` closure instead of the real tiny model's
+    /// decode loop, via the host's test generator. Tokenizer/
+    /// context-window behavior still comes from a real tiny model
+    /// (`tiny_zero_model()`), so request validation ahead of the
+    /// streaming branch is unchanged from the other HTTP-level
+    /// tests in this file.
+    #[cfg(feature = "test-utils")]
+    pub(super) fn tiny_state_with_test_generator(
+        max_tokens_cap: usize,
+        generate: impl Fn(
+            &str,
+            &lattice_inference::GenerateConfig,
+            &mut dyn FnMut(&str) -> bool,
+            &mut dyn FnMut() -> bool,
+        ) -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> AppState {
+        let model = Arc::new(lattice_inference::model::qwen35::test_support::tiny_zero_model());
+        AppState {
+            model: ModelBackend::Cpu(
+                lattice_inference::serving_cpu_host::SharedCpuHandle::with_qwen_generator_for_test(
+                    model, generate,
+                ),
+            ),
+            default_max_tokens: max_tokens_cap,
+            max_tokens_cap,
+            model_id: "test-model".to_string(),
+            request_counter: Arc::new(AtomicU64::new(0)),
+            embedding_model: None,
+            embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+            cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            router_state: None,
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            episodes: episode_store(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Post-drop generator-side cancellation probe (ADR-080 C2):
     // `chat_completions_streaming_
@@ -5706,8 +5747,6 @@ mod tests {
         use std::sync::Mutex;
         use std::sync::mpsc::RecvTimeoutError;
         use std::time::Duration;
-
-        include!("serve_cpu_panic_tests.rs");
 
         /// One real delta, then a bounded should_cancel-only poll loop.
         const MAX_POLLS: usize = 4000;
@@ -5829,46 +5868,6 @@ mod tests {
             /// signature (an unthreaded/replaced predicate that can
             /// never observe the drop).
             ExhaustedWithoutCancel,
-        }
-
-        /// Builds an `AppState` whose CPU streaming generation is the
-        /// injected `generate` closure instead of the real tiny model's
-        /// decode loop, via the host's test generator. Tokenizer/
-        /// context-window behavior still comes from a real tiny model
-        /// (`tiny_zero_model()`), so request validation ahead of the
-        /// streaming branch is unchanged from the other HTTP-level
-        /// tests in this file.
-        fn tiny_state_with_test_generator(
-            max_tokens_cap: usize,
-            generate: impl Fn(
-                &str,
-                &lattice_inference::GenerateConfig,
-                &mut dyn FnMut(&str) -> bool,
-                &mut dyn FnMut() -> bool,
-            )
-                -> Result<GenerateOutput, lattice_inference::error::InferenceError>
-            + Send
-            + Sync
-            + 'static,
-        ) -> AppState {
-            let model = Arc::new(lattice_inference::model::qwen35::test_support::tiny_zero_model());
-            AppState {
-                model: ModelBackend::Cpu(
-                    lattice_inference::serving_cpu_host::SharedCpuHandle::
-                        with_qwen_generator_for_test(model, generate),
-                ),
-                default_max_tokens: max_tokens_cap,
-                max_tokens_cap,
-                model_id: "test-model".to_string(),
-                request_counter: Arc::new(AtomicU64::new(0)),
-                embedding_model: None,
-                embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
-                cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
-                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-                router_state: None,
-                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-                episodes: episode_store(),
-            }
         }
 
         #[tokio::test]
@@ -7028,3 +7027,12 @@ mod tests {
         }
     }
 }
+
+// The CPU-panic HTTP/SSE response tests live in their own file so that rustfmt
+// formats them: rustfmt does not follow `include!`. Declaring the file as a
+// module (rather than splicing its tokens into `post_drop_cancellation_probe`)
+// also gives the tests their own namespace instead of the unrelated probe's.
+// `#[path]` is relative to this file's own directory; the file sits beside it.
+#[cfg(all(test, feature = "test-utils"))]
+#[path = "serve_cpu_panic_tests.rs"]
+mod cpu_panic_tests;

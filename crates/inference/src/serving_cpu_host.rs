@@ -102,8 +102,13 @@ impl SharedCpuHandle {
                 Ok(result) => (result, None),
                 Err(payload) => (Err("inference failed".to_owned()), Some(payload)),
             };
-            // Keep completion and its admission permit on the blocking task, outside
-            // the catch: a panicking callback may already have sent its terminal event.
+            // The `spawn_blocking` JoinHandle is discarded, so a panic that
+            // unwound out of the closure passed to `catch_unwind` would end
+            // this task before `finish` ran, and the client would never
+            // receive the failure event; `catch_unwind` turns that unwind into
+            // the `Err` arm above so `finish` still runs. `finish` stays
+            // outside the catch because a panicking token callback may already
+            // have sent its terminal event.
             finish(result);
             // A custom panic payload can itself panic when dropped.
             drop(panic_payload);
