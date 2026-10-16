@@ -1,5 +1,6 @@
 use criterion::black_box;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -77,11 +78,72 @@ pub(crate) struct AllocationDelta {
     pub(crate) bytes_allocated: u64,
 }
 
+// The executor a counted sample runs on: one rayon thread, never the ambient pool.
+//
+// The counting allocator is process-wide, so a sampled call counts the allocations of every
+// rayon worker that runs any part of it. Which worker that is, and therefore which lazily
+// sized per-worker structure grows during which sample, is a scheduling decision: on an
+// 8-thread pool the retained samples of one call can disagree by an allocation or a few
+// hundred bytes even after a warm-up. `ThreadPool::install` puts the sampled call on a pool
+// with one thread, and rayon resolves the pool from the current worker, so the parallel
+// iterators the sampled code calls (the split `matmul_bt` for one) also run there, one thread
+// at a time, instead of spreading over the ambient pool. Worker identity, split count, job
+// order and touched state are then the same in every sample. Only counted samples are
+// affected; the caller's timed work never enters this pool.
+//
+// The pool is built once and lived in for the process, so per-pool and per-worker state that
+// grows on first use is paid for by the first sampled call, and its own warm-up, not by a
+// retained sample. It is built before the first snapshot of that call, because building it
+// allocates.
+static COUNTED_SAMPLE_EXECUTOR: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+#[allow(dead_code)]
+pub(crate) fn counted_sample_executor() -> &'static rayon::ThreadPool {
+    COUNTED_SAMPLE_EXECUTOR.get_or_init(|| {
+        let pool = match rayon::ThreadPoolBuilder::new().num_threads(1).build() {
+            Ok(pool) => pool,
+            Err(error) => panic!(
+                "could not build the one-thread executor for counted samples, and the ambient \
+                 pool cannot be used instead because its per-worker allocations differ between \
+                 samples: {error}"
+            ),
+        };
+        // `build` returns once the worker thread has been spawned, not once it has finished
+        // starting, and that start-up allocates. Entering the pool here runs it to completion
+        // before the first sampled call, so no retained sample can be the one that pays for
+        // per-worker state set up on first entry. Nothing is printed here: the caller's own
+        // measurement must not carry an unexpected stderr line.
+        pool.install(|| {});
+        pool
+    })
+}
+
+// Runs one discarded warm-up call and the three retained samples on the one-thread executor.
+//
+// The executor is entered with `ThreadPool::install`, which requires `Send`, rather than
+// adopted with `ThreadPoolBuilder::use_current_thread`, which requires nothing: adopting the
+// calling thread binds that thread to this one-thread pool for the rest of the process
+// (rayon leaks the adopted worker, and no public API clears it), and the calling thread is
+// the thread the caller's own timed work runs on, so every later rayon call there would
+// silently move onto the one-thread pool. Entering the executor leaves the calling thread on
+// its own pool. Pool construction happens in `counted_sample_executor`, before any snapshot.
 pub(crate) fn sample_allocations(
-    run_fn: &mut impl FnMut() -> AllocationDelta,
+    run_fn: &mut (impl FnMut() -> AllocationDelta + Send),
 ) -> [AllocationDelta; 3] {
-    let _ = run_fn();
-    [run_fn(), run_fn(), run_fn()]
+    counted_sample_executor().install(|| {
+        assert_eq!(
+            rayon::current_num_threads(),
+            1,
+            "counted samples must run on the one-thread executor, not on the ambient pool"
+        );
+        assert_eq!(
+            rayon::current_thread_index(),
+            Some(0),
+            "counted samples must run on the executor's own worker thread"
+        );
+        let _ = run_fn();
+        [run_fn(), run_fn(), run_fn()]
+    })
 }
 
 // Builds the stderr heading for one allocation report. The suite is the caller's
@@ -125,7 +187,7 @@ pub(crate) fn allocation_count_print(
     label: &str,
     phase: &str,
     tokens: usize,
-    run_fn: &mut impl FnMut() -> AllocationDelta,
+    run_fn: &mut (impl FnMut() -> AllocationDelta + Send),
 ) {
     assert_zeroed_allocation_is_counted();
     let heading = allocation_report_heading(suite, label, phase);
@@ -170,7 +232,7 @@ pub(crate) fn allocation_count_report(
     label: &str,
     phase: &str,
     tokens: usize,
-    run_fn: &mut impl FnMut() -> AllocationDelta,
+    run_fn: &mut (impl FnMut() -> AllocationDelta + Send),
 ) {
     assert_zeroed_allocation_is_counted();
     let heading = allocation_report_heading(suite, label, phase);

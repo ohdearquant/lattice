@@ -18,12 +18,12 @@ use std::time::Duration;
 
 #[path = "support/allocation_counts.rs"]
 mod allocation_counts;
-#[cfg(feature = "bench-internals")]
-use allocation_counts::{
-    AllocationDelta, AllocationSnapshot, allocation_count_print, allocation_count_report,
-};
 #[cfg(all(feature = "bench-internals", feature = "test-utils"))]
-use allocation_counts::{allocation_report_heading, assert_zeroed_allocation_is_counted};
+use allocation_counts::{
+    AllocationDelta, allocation_report_heading, assert_zeroed_allocation_is_counted,
+};
+#[cfg(feature = "bench-internals")]
+use allocation_counts::{AllocationSnapshot, allocation_count_print, allocation_count_report};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group};
 use lattice_inference::forward::cpu::matmul_bt;
@@ -2994,9 +2994,13 @@ fn main() {
             let mut criterion = Criterion::default().configure_from_args();
             bench_forward_with_cache(&mut criterion);
             // Reading the pool size earlier would initialize Rayon before the measured warmup.
+            // The counted executor's size is reported from the pool object itself: every counted
+            // sample already asserts, on the thread that runs it, that this is the pool it is in.
             eprintln!(
-                "ALLOCATION_SMOKE mode=generate_forward_with_cache rayon_threads={}",
-                rayon::current_num_threads()
+                "ALLOCATION_SMOKE mode=generate_forward_with_cache rayon_threads={} \
+                 counted_executor_threads={}",
+                rayon::current_num_threads(),
+                allocation_counts::counted_sample_executor().current_num_threads(),
             );
         }
     } else {

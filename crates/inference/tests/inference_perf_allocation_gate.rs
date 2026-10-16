@@ -1,6 +1,7 @@
 use std::hint::black_box;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[path = "../benches/support/allocation_counts.rs"]
 mod allocation_counts;
@@ -13,6 +14,19 @@ use allocation_counts::{
 const SUITE: &str = "allocation_gate_controls";
 const CHILD_ARGUMENT: &str = "--stable-allocation-print-child";
 
+/// Elements of the parallel body in [`Work::AllocateOnWorker`]; each one allocates once.
+const WORKER_ALLOCATION_ELEMENTS: usize = 4;
+/// Bytes per worker allocation. Non-zero, so the body exercises `alloc` rather than the
+/// zeroed entry point `zeroed_allocator_is_live` already covers.
+const WORKER_ALLOCATION_BYTES: usize = 1024;
+
+/// Bodies of the parallel region that ran at all, so a region that never executed cannot pass.
+static WORKER_ALLOCATION_BODIES: AtomicUsize = AtomicUsize::new(0);
+/// Bodies that observed themselves running on a rayon worker thread. The measured claim is
+/// that an allocation made *there* lands in the delta, so a body that ran elsewhere would
+/// leave the claim untested.
+static WORKER_ALLOCATION_BODIES_ON_WORKER: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Clone, Copy)]
 enum Policy {
     Print,
@@ -20,7 +34,7 @@ enum Policy {
 }
 
 impl Policy {
-    fn invoke(self, label: &str, run: &mut impl FnMut() -> AllocationDelta) {
+    fn invoke(self, label: &str, run: &mut (impl FnMut() -> AllocationDelta + Send)) {
         match self {
             Self::Print => allocation_count_print(SUITE, label, "decode", 2, run),
             Self::Report => allocation_count_report(SUITE, label, "decode", 2, run),
@@ -33,11 +47,31 @@ enum Work {
     Zero,
     Allocate,
     AllocateOnCall(usize),
+    AllocateOnWorker,
     Reallocate,
 }
 
 impl Work {
     fn measure(self, call: usize) -> AllocationDelta {
+        if matches!(self, Self::AllocateOnWorker) {
+            use rayon::prelude::*;
+
+            WORKER_ALLOCATION_BODIES.store(0, Ordering::Relaxed);
+            WORKER_ALLOCATION_BODIES_ON_WORKER.store(0, Ordering::Relaxed);
+            let before = AllocationSnapshot::capture();
+            (0..WORKER_ALLOCATION_ELEMENTS)
+                .into_par_iter()
+                .for_each(|_| {
+                    WORKER_ALLOCATION_BODIES.fetch_add(1, Ordering::Relaxed);
+                    if rayon::current_thread_index().is_some() {
+                        WORKER_ALLOCATION_BODIES_ON_WORKER.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let bytes = vec![0x5a_u8; black_box(WORKER_ALLOCATION_BYTES)];
+                    black_box(&bytes);
+                });
+            return AllocationSnapshot::delta_since(&before);
+        }
+
         if matches!(self, Self::Reallocate) {
             let mut bytes = vec![0x5a_u8; black_box(64)];
             black_box(&mut bytes);
@@ -50,7 +84,7 @@ impl Work {
         let allocate = match self {
             Self::Allocate => true,
             Self::AllocateOnCall(index) => call == index,
-            Self::Zero | Self::Reallocate => false,
+            Self::Zero | Self::AllocateOnWorker | Self::Reallocate => false,
         };
         let before = AllocationSnapshot::capture();
         if allocate {
@@ -206,6 +240,50 @@ fn per_call_reallocation_report_is_rejected() {
     }
 }
 
+/// A parallel body runs on a rayon worker thread, not on the thread that entered the executor,
+/// and it may run part of its work on a second task the same worker later pops. The counting
+/// allocator is process-wide, so the allocations of every one of those bodies must still land in
+/// the delta. A design that measured only the entering thread would report this region as zero,
+/// which is the shape of "the executor stopped counting worker allocations" and would leave the
+/// real benchmarks reporting a fall they did not measure.
+fn worker_allocation_counted() {
+    let deltas = rejected(
+        Policy::Report,
+        "worker_allocation",
+        Work::AllocateOnWorker,
+        "allocation gate failed for ",
+    );
+    assert_eq!(
+        WORKER_ALLOCATION_BODIES.load(Ordering::Relaxed),
+        WORKER_ALLOCATION_ELEMENTS,
+        "the parallel region did not run its body once per element"
+    );
+    assert_eq!(
+        WORKER_ALLOCATION_BODIES_ON_WORKER.load(Ordering::Relaxed),
+        WORKER_ALLOCATION_ELEMENTS,
+        "the parallel region did not run on a rayon worker thread, so this control would not \
+         have tested worker-side counting"
+    );
+    for delta in deltas {
+        assert!(
+            delta.alloc_calls >= WORKER_ALLOCATION_ELEMENTS as u64,
+            "allocations made on a rayon worker were not counted: {delta:?}"
+        );
+        assert_eq!(
+            delta.realloc_calls, 0,
+            "the parallel body allocates and never reallocates: {delta:?}"
+        );
+        assert!(
+            delta.bytes_allocated >= (WORKER_ALLOCATION_ELEMENTS * WORKER_ALLOCATION_BYTES) as u64,
+            "bytes allocated on a rayon worker were not counted: {delta:?}"
+        );
+        assert_eq!(
+            delta, deltas[0],
+            "worker allocations differ between samples"
+        );
+    }
+}
+
 fn retained_sample_drift_is_rejected(policy: Policy, retained_sample: usize) {
     assert!(retained_sample < 3);
     let changed_call = retained_sample + 1;
@@ -306,6 +384,11 @@ fn main() {
         );
     }
     pass(
+        "worker_allocation_counted",
+        worker_allocation_counted,
+        &mut completed,
+    );
+    pass(
         "zero_warm_report_accepted",
         zero_warm_report_is_accepted,
         &mut completed,
@@ -315,6 +398,6 @@ fn main() {
         zeroed_allocator_is_live,
         &mut completed,
     );
-    assert_eq!(completed, 13);
-    println!("allocation-controls: 13 passed; 0 failed");
+    assert_eq!(completed, 14);
+    println!("allocation-controls: 14 passed; 0 failed");
 }
