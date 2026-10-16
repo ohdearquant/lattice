@@ -215,6 +215,16 @@ measurement waiver. Every M, S and D phase that touches production code carries 
 of the reachable targets, scoped to the affected groups. Only test-only changes, after the full declared-target
 population has been searched, may use the structural unreachability disposition.
 
+This narrows ADR-087 D2 for the production phases of this plan: a pure intra-crate move here is still measured. D2
+condition 1 says module boundaries are not codegen boundaries because the compiler sees the whole crate. Its
+eligibility claim holds: a move within a crate does not change which functions may be inlined. Its partitioning claim
+does not. The workspace sets no build profile, so release and bench builds split each crate into 16 codegen units with
+thin-local LTO, and the default partitioning groups items by module. Thin-local LTO inlines across units only through
+its own import heuristics, which differ from inlining within a unit, so moving thousands of lines into new modules can
+regroup units and change what is inlined. The narrowing rests on that partitioning effect, not on eligibility. The
+moved code is also reachable from declared measurement targets (C7), so the measurement is available. ADR-087 itself
+is unchanged.
+
 ## Alternatives considered
 
 | Alternative                                                       | Why not                                                                                                                    |
