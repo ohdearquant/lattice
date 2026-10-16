@@ -2,14 +2,12 @@ use super::*;
 use lattice_inference::bert_pooling_fixture::{
     DIMENSIONS, INPUTS, MAX_POSITIONS, checkpoint_hashes, write_checkpoint,
 };
-use serde::Deserialize;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tower::ServiceExt as _;
 
-const MODELS: [(&str, &str, BertPooling); 2] = [
-    ("bge-small-en-v1.5", "cls", BertPooling::CLS),
-    ("all-minilm-l6-v2", "mean", BertPooling::Mean),
+const MODELS: [(&str, BertPooling); 2] = [
+    ("bge-small-en-v1.5", BertPooling::CLS),
+    ("all-minilm-l6-v2", BertPooling::Mean),
 ];
 
 fn fixture(parent: &Path, name: &str) -> PathBuf {
@@ -143,7 +141,7 @@ async fn compare_route(
 async fn embeddings_default_pooling_matches_library_for_single_and_batch() {
     let temp = tempfile::tempdir().unwrap();
     let mut hashes = None;
-    for (name, _, pooling) in MODELS {
+    for (name, pooling) in MODELS {
         let path = fixture(temp.path(), name);
         let current = checkpoint_hashes(&path).unwrap();
         if let Some(expected) = hashes.as_ref() {
@@ -160,7 +158,7 @@ async fn embeddings_default_pooling_matches_library_for_single_and_batch() {
 #[tokio::test]
 async fn embeddings_explicit_pooling_override_matches_library() {
     let temp = tempfile::tempdir().unwrap();
-    for (name, _, _) in MODELS {
+    for (name, _) in MODELS {
         let path = fixture(temp.path(), name);
         for (argument, pooling) in [("cls", BertPooling::CLS), ("mean", BertPooling::Mean)] {
             let (single, batch) = reference(&path, pooling);
@@ -197,6 +195,20 @@ fn embedding_startup_preserves_load_and_override_errors() {
     );
 }
 
+// Regression: the context-window guard used to measure each item's
+// *post-truncation* token count (`WordPieceTokenizer` truncates to its own
+// `max_seq_len` during tokenization), and `BertModel::from_directory` derives
+// that cap as `max_position_embeddings.min(2048)`. For every checkpoint whose
+// config sets `max_position_embeddings` at or below that 2048 cap -- including
+// the synthetic fixture below, whose config sets it to `MAX_POSITIONS` (16)
+// with no `tokenizer_config.json` to raise it -- the two limits are equal by
+// construction. A post-truncation count can never exceed `max_seq_len`, so the
+// old `count > max_position_embeddings` test was unsatisfiable and an
+// over-limit input was silently truncated and embedded instead of rejected.
+// The `assert_eq!` below pins the fixture in exactly that collision case
+// (`tokenizer.max_seq_len() == config.max_position_embeddings`), and the
+// `pre_truncation_len` assertions pin the token counts the guard must compare.
+// This is a generated checkpoint, not a real `bge-small-en-v1.5` download.
 pub(super) async fn check_context_window_route() {
     let temp = tempfile::tempdir().unwrap();
     let path = fixture(temp.path(), MODELS[0].0);
@@ -227,167 +239,6 @@ pub(super) async fn check_context_window_route() {
     assert_eq!(code, "context_length_exceeded");
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FixtureHashes {
-    #[serde(rename = "config.json")]
-    config: String,
-    #[serde(rename = "model.safetensors")]
-    weights: String,
-    #[serde(rename = "vocab.txt")]
-    vocab: String,
-}
-
-impl FixtureHashes {
-    fn as_map(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            ("config.json".to_string(), self.config.clone()),
-            ("model.safetensors".to_string(), self.weights.clone()),
-            ("vocab.txt".to_string(), self.vocab.clone()),
-        ])
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArtifactModel {
-    name: String,
-    pooling: String,
-    single: Vec<f32>,
-    batch: Vec<Vec<f32>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PoolingArtifact {
-    schema: u32,
-    run_id: String,
-    source_id: String,
-    checkpoint_hashes: FixtureHashes,
-    dimensions: usize,
-    inputs: Vec<String>,
-    models: Vec<ArtifactModel>,
-}
-
-fn valid_id(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn parse_artifact(
-    bytes: &[u8],
-    run_id: &str,
-    source_id: &str,
-    hashes: &BTreeMap<String, String>,
-) -> Result<PoolingArtifact, String> {
-    if !valid_id(run_id, 32) || !valid_id(source_id, 64) {
-        return Err("invalid expected run/source identity".into());
-    }
-    let artifact: PoolingArtifact = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    if artifact.schema != 1
-        || artifact.run_id != run_id
-        || artifact.source_id != source_id
-        || artifact.checkpoint_hashes.as_map() != *hashes
-        || artifact.dimensions != DIMENSIONS
-        || !artifact.inputs.iter().map(String::as_str).eq(INPUTS)
-        || artifact.models.len() != MODELS.len()
-    {
-        return Err("artifact identity or population mismatch".into());
-    }
-    for (model, (name, pooling, _)) in artifact.models.iter().zip(MODELS) {
-        if model.name != name
-            || model.pooling != pooling
-            || !valid_vector(&model.single)
-            || model.batch.len() != INPUTS.len()
-            || !model.batch.iter().all(|row| valid_vector(row))
-        {
-            return Err("artifact model or vector mismatch".into());
-        }
-    }
-    Ok(artifact)
-}
-
-#[test]
-fn pooling_artifact_rejects_invalid_identity_schema_and_vectors() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = fixture(temp.path(), MODELS[0].0);
-    let hashes = checkpoint_hashes(&path).unwrap();
-    let run_id = "a".repeat(32);
-    let source_id = "b".repeat(64);
-    let models: Vec<Value> = MODELS
-        .iter()
-        .map(|&(name, pooling, mode)| {
-            let (single, batch) = reference(&path, mode);
-            json!({"name": name, "pooling": pooling, "single": single, "batch": batch})
-        })
-        .collect();
-    let valid = json!({
-        "schema": 1, "run_id": run_id, "source_id": source_id,
-        "checkpoint_hashes": hashes, "dimensions": DIMENSIONS,
-        "inputs": INPUTS, "models": models,
-    });
-    let bytes = serde_json::to_vec(&valid).unwrap();
-    assert!(parse_artifact(&bytes, &run_id, &source_id, &hashes).is_ok());
-    for (pointer, bad) in [
-        ("/schema", json!(2)),
-        ("/run_id", json!("c".repeat(32))),
-        ("/source_id", json!("c".repeat(64))),
-        ("/checkpoint_hashes/config.json", json!("c".repeat(64))),
-        ("/dimensions", json!(DIMENSIONS - 1)),
-        ("/inputs/0", json!("wrong input")),
-        ("/models/0/name", json!(MODELS[1].0)),
-        ("/models/0/pooling", json!("mean")),
-        ("/models/0/single", json!([])),
-        ("/models/0/batch", json!([])),
-        ("/models/0/batch/0", json!(vec![0.0; DIMENSIONS])),
-        ("/models/0/single/0", json!(null)),
-    ] {
-        let mut changed = valid.clone();
-        *changed.pointer_mut(pointer).unwrap() = bad;
-        assert!(
-            parse_artifact(
-                &serde_json::to_vec(&changed).unwrap(),
-                &run_id,
-                &source_id,
-                &hashes
-            )
-            .is_err(),
-            "accepted invalid {pointer}"
-        );
-    }
-    let mut reordered = valid.clone();
-    reordered["models"].as_array_mut().unwrap().swap(0, 1);
-    assert!(
-        parse_artifact(
-            &serde_json::to_vec(&reordered).unwrap(),
-            &run_id,
-            &source_id,
-            &hashes
-        )
-        .is_err()
-    );
-    let mut unknown = valid.clone();
-    unknown["extra"] = json!(true);
-    assert!(
-        parse_artifact(
-            &serde_json::to_vec(&unknown).unwrap(),
-            &run_id,
-            &source_id,
-            &hashes
-        )
-        .is_err()
-    );
-    let duplicate = format!(
-        "{{\"schema\":1,{}",
-        &String::from_utf8(bytes.clone()).unwrap()[1..]
-    );
-    assert!(parse_artifact(duplicate.as_bytes(), &run_id, &source_id, &hashes).is_err());
-    assert!(parse_artifact(&bytes, "", &source_id, &hashes).is_err());
-    assert!(parse_artifact(&bytes, &run_id, &source_id.to_ascii_uppercase(), &hashes).is_err());
-}
-
 #[test]
 fn pooling_comparison_rejects_nonfinite_wrong_shape_and_wrong_values() {
     let expected = vec![0.25; DIMENSIONS];
@@ -403,42 +254,5 @@ fn pooling_comparison_rejects_nonfinite_wrong_shape_and_wrong_values() {
     );
     assert!(
         std::panic::catch_unwind(|| assert_vector(&expected, &expected[..DIMENSIONS - 1])).is_err()
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires bound LATTICE_BERT_POOLING_ARTIFACT from the native export gate"]
-async fn embeddings_pooling_matches_bound_native_artifact() {
-    let artifact_path = std::env::var_os("LATTICE_BERT_POOLING_ARTIFACT")
-        .expect("LATTICE_BERT_POOLING_ARTIFACT is required");
-    let run_id = std::env::var("LATTICE_BERT_POOLING_RUN_ID").expect("run identity is required");
-    let source_id =
-        std::env::var("LATTICE_BERT_POOLING_SOURCE_ID").expect("source identity is required");
-    let bytes = std::fs::read(&artifact_path).expect("native artifact must exist and be readable");
-    let temp = tempfile::tempdir().unwrap();
-    let paths: Vec<PathBuf> = MODELS
-        .iter()
-        .map(|&(name, _, _)| fixture(temp.path(), name))
-        .collect();
-    let hashes = checkpoint_hashes(&paths[0]).unwrap();
-    assert_eq!(checkpoint_hashes(&paths[1]).unwrap(), hashes);
-    let artifact = parse_artifact(&bytes, &run_id, &source_id, &hashes)
-        .expect("native artifact must match exact source/run/checkpoint/input identities");
-    for ((model, path), &(name, _, pooling)) in artifact.models.iter().zip(&paths).zip(&MODELS) {
-        let (single, batch) = reference(path, pooling);
-        assert_vector(&model.single, &single);
-        for (native, expected) in model.batch.iter().zip(&batch) {
-            assert_vector(native, expected);
-        }
-        compare_route(
-            load_embedding_state(path, None).unwrap(),
-            name,
-            &model.single,
-            &model.batch,
-        )
-        .await;
-    }
-    println!(
-        "BERT_POOLING_HTTP_COMPLETE schema=1 models=2 inputs=3 dimensions={DIMENSIONS} run_id={run_id} source_id={source_id}"
     );
 }

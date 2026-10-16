@@ -272,6 +272,11 @@ mod imp {
             .and_then(|n| n.to_str())
             .unwrap_or("embedding")
             .into();
+        // Auto-select the same default `--embedding-pooling` would
+        // otherwise force the operator to pass explicitly. See
+        // `lattice_inference::pool::default_bert_pooling_for_model_name`
+        // for the rule and its agreement test against
+        // `lattice-embed`'s `EmbeddingModel::bert_pooling` table.
         model.set_pooling(
             lattice_inference::pool::default_bert_pooling_for_model_name(&embedding_model_id),
         );

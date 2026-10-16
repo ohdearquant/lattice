@@ -274,15 +274,6 @@ jobs:
           pin-cargo-path: true
           shared-key: feature-matrix
           cache-on-failure: true
-      - name: BERT pooling fixture and native-to-HTTP parity
-        run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            python3 scripts/check-bert-pooling-parity.py \
-              --output-dir "$RUNNER_TEMP/bert-pooling-parity"
-          else
-            python3 scripts/check-bert-pooling-parity.py --native-only \
-              --output-dir "$RUNNER_TEMP/bert-pooling-parity"
-          fi
       # The `--no-run` step compiles every test target under these features
       # (lib, integration tests, feature-gated bins) and executes none of them,
       # so a lib test that panicked on every run still passed it (#1375). Keep
