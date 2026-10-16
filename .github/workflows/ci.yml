@@ -813,6 +813,24 @@ jobs:
           fi
           grep -q 'test serve::metal_worker::tests::owner_shutdown_deadline_covers_blocking_thread_local_destructor ... ok' "$log"
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # The measurement guard moves the shared GPU lock onto the worker thread
+      # so a detached worker keeps it through model construction, every queued
+      # request and runtime destruction. These three tests exercise that
+      # lifetime with plain threads and normal locks, so they need no Metal
+      # device and run wherever the module compiles. The selector filter can
+      # match zero tests without failing, so the passed count is checked
+      # explicitly (at least the three named cases must actually run).
+      - name: inference - measurement worker guard lifetime (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/measurement-worker-guard-lifetime-test.log"
+          cargo test --locked -p lattice-inference --features f16,metal-gpu \
+            --lib serve::metal_worker::tests::measurement_worker_guard_ \
+            -- --test-threads=1 2>&1 | tee "$log"
+          passed=$(grep -Eo 'test result: ok\. [0-9]+ passed' "$log" | grep -Eo '[0-9]+' | tail -n 1)
+          test -n "$passed"
+          test "$passed" -ge 3
       - name: embed — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-embed --features metal-gpu -- -D warnings

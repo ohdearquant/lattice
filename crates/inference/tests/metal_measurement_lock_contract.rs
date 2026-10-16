@@ -516,6 +516,16 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
         reason: "run_bench QwenModel::from_directory is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
     },
     ConstructionExemption {
+        site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::new()#1",
+        recorded_position: "examples/bench_serve_prepare.rs:690:47",
+        reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
+    },
+    ConstructionExemption {
+        site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::from_q4_dir()#1",
+        recorded_position: "examples/bench_serve_prepare.rs:700:47",
+        reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
+    },
+    ConstructionExemption {
         site: "bin:backfill_qwen3:src/bin/backfill_qwen3.rs=>src/bin/backfill_qwen3.rs::main::QwenModel::from_directory()#1",
         recorded_position: "src/bin/backfill_qwen3.rs:37:28",
         reason: "one-time DB embedding migration over an unbounded row count belongs to a long-running batch process outside the bounded measurement-harness contract",
