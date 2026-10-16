@@ -234,7 +234,7 @@ name) in the cited surface's own binary (or, for behavior shared by both binarie
 `lattice_inference::serve::metal_worker` owner, that shared module -- #832), or carry an explicit
 **NOT-TESTABLE-YET** justification. `scripts/check-capability-matrix.sh` (wired into
 `make lint-docs`) greps `crates/inference/src/bin/{lattice,lattice_serve,chat_metal}.rs` and
-`crates/inference/src/serve/metal_worker.rs` for `fn <fixture id>` and fails the build if a cited
+`crates/inference/src/serve/metal_worker.rs` (with its `metal_worker/tests.rs`) for `fn <fixture id>` and fails the build if a cited
 ID no longer exists, or if a row has no fixture cell at all -- so a row that goes stale (a fixture
 renamed/removed without updating this table) fails closed instead of silently drifting.
 
