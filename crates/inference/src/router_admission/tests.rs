@@ -197,7 +197,6 @@ fn fixture_with(
     }
     let mut reordered: Vec<_> = episodes
         .ordered_on_policy_samples(source.identity().epoch)
-        .into_iter()
         .map(|(event, signal)| (event.clone(), signal))
         .collect();
     reordered.sort_by_key(|(event, _)| {
@@ -704,7 +703,6 @@ fn absent_heldout_evidence_and_constant_rewards_cannot_pass() {
     let records: Vec<_> = fixture
         .episodes
         .ordered_on_policy_samples(fixture.source.identity().epoch)
-        .into_iter()
         .map(|(event, _)| event.clone())
         .collect();
     for event in &records {

@@ -290,7 +290,7 @@ pub struct CandidateOutput {
 /// Candidate bytes and diagnostics. This value carries no admission authority.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefitCandidate {
-    source: SourceKey,
+    source: Box<SourceKey>,
     admission_contract_hash: Option<String>,
     gate_bytes: Vec<u8>,
     round: RefitRound,
@@ -304,7 +304,7 @@ impl RefitCandidate {
     }
 
     pub(crate) fn matches_source(&self, source: &RefitSource) -> bool {
-        self.source == source.key
+        *self.source == source.key
     }
 
     /// The candidate network, which has not been published or activated.
@@ -557,7 +557,7 @@ impl RefitBuilder {
                 ));
             }
             RefitVerdict::Candidate(RefitCandidate {
-                source: source.key.clone(),
+                source: Box::new(source.key.clone()),
                 admission_contract_hash: self
                     .admission
                     .as_ref()
