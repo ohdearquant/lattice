@@ -1440,7 +1440,7 @@ impl Qwen35Config {
                     .unwrap_or_default();
                 (flat, "text_config.")
             };
-            if rp.rope_theta > 0.0 {
+            if rp.rope_theta != 0.0 {
                 match flat.rope_theta.filter(|&t| t != 0.0) {
                     Some(t) if t != rp.rope_theta => {
                         return Err(InferenceError::Inference(format!(
@@ -6130,3 +6130,7 @@ mod tests {
         assert_eq!(raw.num_hidden_layers, validated.num_hidden_layers);
     }
 }
+
+#[cfg(test)]
+#[path = "qwen35_config_rope_tests.rs"]
+mod nested_theta_tests;
