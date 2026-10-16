@@ -550,23 +550,58 @@ jobs:
       - name: inference backward forced scalar clippy
         run: cargo clippy --locked -p lattice-inference --no-default-features --features train-backward,test-utils --lib --tests --bench backward_stage0 -- -D warnings
       # The backward module compiles only under train-backward, so no other step runs these tests.
+      # A `--lib` filter that selects no test still exits 0, so each filter's run is also required
+      # to report the exact number of tests it must select.
       - name: inference backward forced scalar tests
         run: |
-          set -eu
-          for filter in backward::simd:: backward::ops::tests:: backward::attention_gqa::tests:: attention::gdn_backward::tests::; do
-            cargo test --locked -p lattice-inference --no-default-features \
-              --features train-backward,test-utils --lib "$filter"
-          done
-      # A filter that matches no case passes vacuously, so the step also requires the 16 tiny cases
-      # (8 ordinary, 8 forced) to have run.
+          set -euo pipefail
+          log_dir="${RUNNER_TEMP:-/tmp}"
+          check_filter() {
+            filter="$1"
+            expected="$2"
+            log="$log_dir/backward-forced-$(printf '%s' "$filter" | tr -c 'a-zA-Z0-9' '-').log"
+            if cargo test --locked -p lattice-inference --no-default-features \
+              --features train-backward,test-utils --lib "$filter" >"$log" 2>&1; then
+              cat "$log"
+            else
+              status=$?
+              cat "$log"
+              exit "$status"
+            fi
+            summary="test result: ok. $expected passed; 0 failed; 0 ignored;"
+            if ! grep -qF "$summary" "$log"; then
+              found=$(grep -F 'test result:' "$log" | tail -n 1 || true)
+              echo "filter $filter: expected summary '$summary' but the run reported '${found:-<none>}'" >&2
+              exit 1
+            fi
+          }
+          check_filter 'backward::simd::' 36
+          check_filter 'backward::ops::tests::' 9
+          check_filter 'backward::attention_gqa::tests::' 11
+          check_filter 'attention::gdn_backward::tests::' 8
+      # A filter that matches no case passes vacuously, so the step requires exactly the 16 tiny
+      # cases (8 ordinary, 8 forced) to have run, and requires one scalar-backend marker from each
+      # of the 8 forced operations, which proves the forced scalar path actually executed.
       - name: inference backward_stage0 bench smoke (tiny cases)
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/backward-stage0-smoke.log"
-          cargo bench --locked -p lattice-inference --no-default-features --features train-backward,test-utils \
-            --bench backward_stage0 -- --test '^backward_stage0/.*/tiny$' 2>&1 | tee "$log"
+          if cargo bench --locked -p lattice-inference --no-default-features --features train-backward,test-utils \
+            --bench backward_stage0 -- --test '^backward_stage0/.*/tiny$' >"$log" 2>&1; then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
           n=$(grep -c '^Testing backward_stage0/' "$log" || true)
-          [ "$n" -ge 16 ] || { echo "expected at least 16 backward_stage0 tiny cases, ran $n" >&2; exit 1; }
+          [ "$n" -eq 16 ] || { echo "expected exactly 16 backward_stage0 tiny cases, ran $n" >&2; exit 1; }
+          for operation in cross_entropy_backward linear_vjp lora_vjp rmsnorm_backward \
+            rope_backward swiglu_backward gqa_backward gdn_backward; do
+            marker="BACKWARD_FORCED operation=$operation backend=Scalar"
+            m=$(grep -cF "$marker" "$log" || true)
+            [ "$m" -eq 1 ] || { echo "expected exactly one '$marker' line, found $m" >&2; exit 1; }
+          done
       # wgpu-gpu is excluded from default builds and was silently broken under
       # --all-features (gpu/inner module-resolution rot) until #194. Build it on
       # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
