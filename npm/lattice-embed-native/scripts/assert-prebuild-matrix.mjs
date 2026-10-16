@@ -69,7 +69,9 @@ for (const wiring of [
   'scripts/plan-prebuild-matrix.mjs',
   'include: ${{ fromJSON(needs.plan.outputs.include) }}',
   'PLANNED_SUFFIXES: ${{ needs.plan.outputs.suffixes }}',
-  'for suffix in $PLANNED_SUFFIXES; do'
+  'for suffix in $PLANNED_SUFFIXES; do',
+  'PLANNED_NAPI_CONFIG: ${{ needs.plan.outputs.napi_config }}',
+  'npm run artifacts -- --config-path "$RUNNER_TEMP/napi-planned.json"'
 ]) {
   assert.ok(workflow.includes(wiring), `the prebuild workflow is missing: ${wiring}`)
 }

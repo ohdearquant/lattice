@@ -75,6 +75,7 @@ jobs:
     outputs:
       include: ${{ steps.plan.outputs.include }}
       suffixes: ${{ steps.plan.outputs.suffixes }}
+      napi_config: ${{ steps.plan.outputs.napi_config }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
@@ -193,9 +194,14 @@ jobs:
         shell: bash
         env:
           PLANNED_SUFFIXES: ${{ needs.plan.outputs.suffixes }}
+          PLANNED_NAPI_CONFIG: ${{ needs.plan.outputs.napi_config }}
         run: |
           set -euo pipefail
-          npm run artifacts
+          # The planned targets replace napi.targets for this step only, so a
+          # pull request's Linux-only build is assembled without the targets
+          # it did not build. Push and dispatch plan every target.
+          printf '%s\n' "$PLANNED_NAPI_CONFIG" > "$RUNNER_TEMP/napi-planned.json"
+          npm run artifacts -- --config-path "$RUNNER_TEMP/napi-planned.json"
           planned=0
           for suffix in $PLANNED_SUFFIXES; do
             planned=$((planned + 1))

@@ -19,6 +19,9 @@ if (planned.length === 0) {
 const include = planned.map(({ runner, target, args }) => ({ runner, target, args }))
 console.log(`include=${JSON.stringify(include)}`)
 console.log(`suffixes=${planned.map(row => row.suffix).join(' ')}`)
+// `napi artifacts` refuses when any configured target lacks a binary, so the
+// package job hands it a config naming only the planned targets.
+console.log(`napi_config=${JSON.stringify({ targets: planned.map(row => row.target) })}`)
 console.error(
   `planned ${planned.length} of ${rows.length} prebuild targets for ${event}: ` +
     planned.map(row => row.target).join(', ')
