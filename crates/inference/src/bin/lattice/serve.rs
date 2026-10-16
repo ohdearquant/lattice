@@ -5707,6 +5707,8 @@ mod tests {
         use std::sync::mpsc::RecvTimeoutError;
         use std::time::Duration;
 
+        include!("serve_cpu_panic_tests.rs");
+
         /// One real delta, then a bounded should_cancel-only poll loop.
         const MAX_POLLS: usize = 4000;
         const POLL_INTERVAL: Duration = Duration::from_millis(5);
