@@ -33,12 +33,12 @@
 //! | 3 | `forward::cpu_f16::generate_f16` | this file |
 //! | 4 | `forward::cpu_q8::generate_q8` | this file |
 //! | 5 | `forward::neon_forward::generate_q8_neon` | this file |
-//! | 6 | Metal `generate` (plain, no MTP/self-spec) | `forward::metal_qwen35::inner::tests` |
-//! | 7 | Metal `generate` with `LATTICE_MTP=1` | `forward::metal_qwen35::inner::tests` + `mtp_greedy_round_tests` |
-//! | 8 | Metal `generate` with `LATTICE_SELF_SPEC=1` | `forward::metal_qwen35::inner::tests` + `self_spec_eos_tests` |
-//! | 9 | Metal `generate_streaming` | `forward::metal_qwen35::inner::tests` |
-//! | 10 | Metal `generate_streaming_with_prefix_cache` | `forward::metal_qwen35::inner::tests` |
-//! | 11 | Metal `generate_multimodal` | `forward::metal_qwen35::inner::tests` |
+//! | 6 | Metal `generate` (plain, no MTP/self-spec) | `forward::metal_qwen35::inner::tests::stop_token_sweep` |
+//! | 7 | Metal `generate` with `LATTICE_MTP=1` | `forward::metal_qwen35::inner::tests::stop_token_sweep` + `mtp_greedy_round_tests` |
+//! | 8 | Metal `generate` with `LATTICE_SELF_SPEC=1` | `forward::metal_qwen35::inner::tests::stop_token_sweep` + `self_spec_eos_tests` |
+//! | 9 | Metal `generate_streaming` | `forward::metal_qwen35::inner::tests::stop_token_sweep` |
+//! | 10 | Metal `generate_streaming_with_prefix_cache` | `forward::metal_qwen35::inner::tests::stop_token_sweep` |
+//! | 11 | Metal `generate_multimodal` | `forward::metal_qwen35::inner::tests::stop_token_sweep` |
 //!
 //! Entry 11 (`generate_multimodal`) has its own independent sampling loop —
 //! it does not call `generate`/`generate_streaming` internally — and was
