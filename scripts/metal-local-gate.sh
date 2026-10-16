@@ -55,7 +55,7 @@ run() {
 run "clippy-default" \
     cargo clippy -p lattice-inference --all-targets -- -D warnings
 run "clippy-metal" \
-    cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings
+    cargo clippy --locked -p lattice-inference --all-targets --features f16,metal-gpu,mixture -- -D warnings
 run "clippy-metal-bench-release" \
     cargo clippy --release -p lattice-inference --all-targets \
     --features f16,metal-gpu,bench-internals -- -D warnings
@@ -63,7 +63,7 @@ run "test-bin-lattice_serve" \
     cargo test --locked -p lattice-inference --features f16,metal-gpu,test-utils \
     --bin lattice_serve
 run "test-bin-lattice" \
-    cargo test --locked -p lattice-inference --features f16,metal-gpu,test-utils \
+    cargo test --locked -p lattice-inference --features f16,metal-gpu,mixture,test-utils \
     --bin lattice
 # See the header: scoped on purpose, and `--test-threads=1` because these are
 # Metal tests sharing one GPU lock.
