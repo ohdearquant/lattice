@@ -12,7 +12,7 @@ workspace version; the workspace release notes are in
 
 ### Added
 
-- Forced scalar execution for the eight backward Stage 0 operations under `test-utils`, with operation-specific completion evidence and checked caller-buffer entry points for six primitives (#1392).
+- Forced scalar execution for the eight backward Stage 0 operations under `train-backward` with `test-utils`, with operation-specific completion evidence and checked caller-buffer entry points for six primitives (#1392).
 
 ### Changed
 
