@@ -453,7 +453,7 @@ impl PaddleOcrVlModel {
         text: &str,
         max_new_tokens: usize,
     ) -> Result<Vec<u32>, InferenceError> {
-        self.generate_greedy_observed(tokenizer, rgb, h, w, text, max_new_tokens, |_| {})
+        self.generate_greedy_observed(tokenizer, rgb, h, w, text, max_new_tokens, |_, _| {})
     }
 
     fn generate_greedy_observed(
@@ -464,7 +464,7 @@ impl PaddleOcrVlModel {
         w: usize,
         text: &str,
         max_new_tokens: usize,
-        mut observe_decode: impl FnMut(&Ernie45DecodeScratch),
+        mut observe_decode: impl FnMut(&Ernie45DecodeScratch, [u32; 3]),
     ) -> Result<Vec<u32>, InferenceError> {
         if max_new_tokens == 0 {
             return Ok(Vec::new());
@@ -514,7 +514,7 @@ impl PaddleOcrVlModel {
                 &mut scratch,
             )?;
             let next = argmax_u32(logits);
-            observe_decode(&scratch);
+            observe_decode(&scratch, position);
             Ok(next)
         })
     }

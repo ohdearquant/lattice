@@ -137,10 +137,24 @@ fn cached_request_reuses_all_nineteen_buffers() {
     let rgb = image();
     let mut storage = None;
     let mut calls = 0;
+    let mut positions: Vec<[u32; 3]> = Vec::new();
     let actual = model
-        .generate_greedy_observed(&tokenizer, &rgb, 4, 4, "OCR:", 5, |scratch| {
+        .generate_greedy_observed(&tokenizer, &rgb, 4, 4, "OCR:", 5, |scratch, position| {
             calls += 1;
             assert_eq!(scratch.test_decode_calls(), calls);
+            // A generated token is text, so its three mrope rows share one
+            // position (`rope_index`'s text-after rule). The cached loop
+            // must reproduce that; a row that drifts from the other two is
+            // a position-assembly defect the emitted tokens cannot show.
+            assert_eq!(
+                position[0], position[1],
+                "decode rows must share a position"
+            );
+            assert_eq!(
+                position[1], position[2],
+                "decode rows must share a position"
+            );
+            positions.push(position);
             let current = scratch.test_storage_snapshot();
             assert_eq!(current.len(), 19);
             assert!(
@@ -159,6 +173,17 @@ fn cached_request_reuses_all_nineteen_buffers() {
     assert_eq!(
         calls, 4,
         "only the transitions between emitted tokens decode"
+    );
+    // The generated tokens continue the prompt's text-after positions, one
+    // row per step. A decode step that reused the previous position (or dropped
+    // the increment) would leave a zero delta here even though the emitted
+    // tokens stayed `[7; 5]`.
+    assert_eq!(positions.len(), 4);
+    assert!(
+        positions
+            .windows(2)
+            .all(|pair| pair[1][0] == pair[0][0] + 1),
+        "every decode step must advance the position row by exactly one: {positions:?}"
     );
     let reference = model
         .generate_greedy_uncached(&tokenizer, &rgb, 4, 4, "OCR:", 5)
@@ -181,7 +206,7 @@ fn cached_request_starts_fresh_scratch_for_each_sequence() {
     for budget in [4, 2, 6] {
         let mut calls = 0;
         let output = model
-            .generate_greedy_observed(&tokenizer, &rgb, 4, 4, "OCR:", budget, |scratch| {
+            .generate_greedy_observed(&tokenizer, &rgb, 4, 4, "OCR:", budget, |scratch, _| {
                 calls += 1;
                 assert_eq!(scratch.test_decode_calls(), calls);
             })
@@ -194,7 +219,7 @@ fn cached_request_starts_fresh_scratch_for_each_sequence() {
 #[test]
 fn zero_budget_skips_prompt_and_scratch() {
     let output = model(7)
-        .generate_greedy_observed(&tokenizer(), &[], 0, 0, "", 0, |_| {
+        .generate_greedy_observed(&tokenizer(), &[], 0, 0, "", 0, |_, _| {
             panic!("zero budget cannot decode")
         })
         .unwrap();
@@ -207,7 +232,7 @@ fn prefill_eos_and_single_token_budget_do_not_decode() {
     let rgb = image();
     for (winner, budget) in [(EOS_ID, 5), (7, 1)] {
         let output = model(winner)
-            .generate_greedy_observed(&tokenizer, &rgb, 4, 4, "OCR:", budget, |_| {
+            .generate_greedy_observed(&tokenizer, &rgb, 4, 4, "OCR:", budget, |_, _| {
                 panic!("prefill already satisfied generation")
             })
             .unwrap();
@@ -217,7 +242,7 @@ fn prefill_eos_and_single_token_budget_do_not_decode() {
 
 #[test]
 fn invalid_image_fails_before_decode_observation() {
-    let result = model(7).generate_greedy_observed(&tokenizer(), &[], 4, 4, "OCR:", 3, |_| {
+    let result = model(7).generate_greedy_observed(&tokenizer(), &[], 4, 4, "OCR:", 3, |_, _| {
         panic!("invalid image cannot decode")
     });
     assert!(result.is_err());
