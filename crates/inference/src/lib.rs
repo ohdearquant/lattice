@@ -77,6 +77,10 @@ pub(crate) mod decoder;
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub use decoder::bench_support as decoder_bench_support;
+/// Synthetic checkpoint support for repository regression tests.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod bert_pooling_fixture;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
 /// Crate error taxonomy; see [`InferenceError`].

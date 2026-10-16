@@ -77,12 +77,12 @@ fn ensure_model_files_inner_with_checksums(
     // `lattice-inference/download` resolve download-free instead of failing.
     #[cfg(not(all(feature = "download", not(target_arch = "wasm32"))))]
     {
-        return Err(InferenceError::ModelNotFound(format!(
+        Err(InferenceError::ModelNotFound(format!(
             "model files not found at {} and automatic download is unavailable in this \
              build (the `download` feature is off, or this is a wasm target). Pre-fetch \
              the model files into the cache.",
             model_dir.display()
-        )));
+        )))
     }
 
     #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
