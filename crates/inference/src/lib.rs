@@ -81,6 +81,9 @@ pub use decoder::bench_support as decoder_bench_support;
 pub mod download;
 /// Crate error taxonomy; see [`InferenceError`].
 pub mod error;
+/// Time-series forecasting: context preparation and native forecasting models. See
+/// [`forecast::Reverso`].
+pub mod forecast;
 /// Neutral generation types shared by every decoder path: request configuration and
 /// result struct, independent of model family. See [`GenerateConfig`] and
 /// [`GenerateOutput`].
