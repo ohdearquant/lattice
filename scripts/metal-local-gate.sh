@@ -8,7 +8,7 @@
 #
 # THE LIB ARM IS FILTERED, AND THE FILTER IS THE POINT. An unfiltered
 # `cargo test -p lattice-inference --features f16,metal-gpu --lib` ends in the
-# `forward::metal_qwen35::inner::tests::generate_multimodal_vision_*` oracle
+# `forward::metal_qwen35::inner::tests::multimodal_vision::generate_multimodal_vision_*` oracle
 # tests, which load a real checkpoint. Measured 2026-09-16: that run reached
 # 36 GB resident and drove the kernel's memory pressure to level 4 (critical),
 # starving another build on the same machine. The suite is not wrong; a laptop

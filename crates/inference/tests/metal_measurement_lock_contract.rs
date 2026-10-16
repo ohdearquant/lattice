@@ -459,16 +459,16 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
 const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
     "src/forward/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
     "src/forward/metal_qwen35.rs::test_gemv_decode_numerical",
-    "src/forward/metal_qwen35.rs::test_gpu_argmax_parity_k1",
-    "src/forward/metal_qwen35.rs::decode_attention_reference_fails_closed_on_nan_q",
-    "src/forward/metal_qwen35.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
-    "src/forward/metal_qwen35.rs::gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries",
-    "src/forward/metal_qwen35.rs::gemm_q3_tiled_differential_fails_closed_on_nan_scale",
-    "src/forward/metal_qwen35.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
-    "src/forward/metal_qwen35.rs::lora_gemv_kernel_matches_cpu_reference",
-    "src/forward/metal_qwen35.rs::load_adapter_and_dispatch_lora_if_active",
-    "src/forward/metal_qwen35.rs::lora_rows_dispatch_matches_cpu_reference_across_rows_ranks_and_strides",
-    "src/forward/metal_qwen35.rs::forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference",
+    "src/forward/metal_qwen35/inner/tests/decode_attention.rs::test_gpu_argmax_parity_k1",
+    "src/forward/metal_qwen35/inner/tests/gdn_chunked_scan.rs::decode_attention_reference_fails_closed_on_nan_q",
+    "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
+    "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries",
+    "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_differential_fails_closed_on_nan_scale",
+    "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
+    "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::lora_gemv_kernel_matches_cpu_reference",
+    "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::load_adapter_and_dispatch_lora_if_active",
+    "src/forward/metal_qwen35/inner/tests/lora.rs::lora_rows_dispatch_matches_cpu_reference_across_rows_ranks_and_strides",
+    "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference",
     "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
     "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::gemv_q4_decode_honours_negative_scales",
     "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::lm_head_block_topk_q4_honours_negative_scales",
@@ -3754,9 +3754,8 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
     );
 }
 
-fn assert_helper_mediated_test_holds_function_lifetime_lock(function_name: &str) {
+fn assert_helper_mediated_test_holds_function_lifetime_lock(relative: &str, function_name: &str) {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let relative = "src/forward/metal_qwen35.rs";
     let source = std::fs::read_to_string(manifest_dir.join(relative))
         .expect("read helper-mediated Metal tests");
     let parsed = StructuredSource::parse(relative, &source, true)
@@ -3782,6 +3781,7 @@ fn assert_helper_mediated_test_holds_function_lifetime_lock(function_name: &str)
 #[test]
 fn mtp_draft_logit_equivalence_test_holds_a_function_lifetime_lock() {
     assert_helper_mediated_test_holds_function_lifetime_lock(
+        "src/forward/metal_qwen35/inner/tests/decode_attention.rs",
         "mtp_draft_logit_equivalence_with_quarot_counter_rotation",
     );
 }
@@ -3789,6 +3789,7 @@ fn mtp_draft_logit_equivalence_test_holds_a_function_lifetime_lock() {
 #[test]
 fn metal_engine_session_isolation_test_holds_a_function_lifetime_lock() {
     assert_helper_mediated_test_holds_function_lifetime_lock(
+        "src/forward/metal_qwen35/inner/tests/mtp_verify.rs",
         "test_metal_qwen35_engine_session_isolation",
     );
 }
