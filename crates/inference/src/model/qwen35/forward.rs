@@ -471,14 +471,13 @@ impl Qwen35Model {
             );
 
             let ctx_off = qh * head_dim;
-            for d in 0..head_dim {
-                let mut sum = 0.0f32;
-                for t in 0..cur_seq_len {
-                    let v_off = t * kv_dim + kvh * head_dim;
-                    sum += scratch.scores[scores_start + t] * v_cache[v_off + d];
-                }
-                scratch.context[ctx_off + d] = sum;
-            }
+            crate::attention::decode::accumulate_value_row(
+                &mut scratch.context[ctx_off..ctx_off + head_dim],
+                &scratch.scores[scores_start..scores_start + cur_seq_len],
+                v_cache,
+                kv_dim,
+                kvh * head_dim,
+            );
         }
         let _ = q_dim; // used by caller for gate_z
     }
@@ -596,6 +595,45 @@ fn decode_context_softmax_row(row: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contiguous_value_qwen_matches_scalar_with_gqa_and_reused_scratch() {
+        use crate::attention::decode::value_test_support as support;
+
+        let model = crate::model::qwen35::test_support::tiny_zero_model();
+        let cfg = &model.config;
+        let mut scratch = ForwardScratch::new();
+        for seq_len in [257, 5, 1] {
+            let mut cache = support::cache(cfg, seq_len);
+            cache.k[1].extend(vec![f32::NAN; cfg.full_kv_dim()]);
+            cache.v[1].extend(vec![f32::NAN; cfg.full_kv_dim()]);
+            support::reset_scratch(&mut scratch, cfg);
+            for (i, q) in scratch.q_buf.iter_mut().enumerate() {
+                *q = ((i * 7 + 3) % 19) as f32 * 0.015625;
+            }
+            model.compute_attention_context(
+                &cache,
+                1,
+                &mut scratch,
+                seq_len,
+                cfg.full_q_dim(),
+                cfg.full_kv_dim(),
+                cfg.head_dim,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+            );
+            support::assert_context(
+                &scratch.context,
+                &scratch.scores,
+                &cache.v[1],
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                seq_len,
+                None,
+            );
+        }
+    }
 
     /// RED before the fix: the bare `1.0 / sum_exp` had no guard, so a
     /// NaN-poisoned cached score propagated NaN into every lane instead of

@@ -748,14 +748,13 @@ fn full_attention_step_q8_neon(
 
         // Weighted sum of V
         let ctx_off = qh * head_dim;
-        for d in 0..head_dim {
-            let mut sum = 0.0f32;
-            for t in 0..cur_seq_len {
-                let v_off = t * kv_dim + kvh * head_dim;
-                sum += scratch.scores[scores_start + t] * v_cache[v_off + d];
-            }
-            scratch.context[ctx_off + d] = sum;
-        }
+        crate::attention::decode::accumulate_value_row(
+            &mut scratch.context[ctx_off..ctx_off + head_dim],
+            &scratch.scores[scores_start..scores_start + cur_seq_len],
+            v_cache,
+            kv_dim,
+            kvh * head_dim,
+        );
     }
 
     // Output gating: attn_output *= sigmoid(gate)
@@ -1060,7 +1059,7 @@ pub mod bench_support {
                 layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
                 layer_mask: vec![true; 2],
                 eos_token_id: 8191,
-                max_position_embeddings: 512,
+                max_position_embeddings: 4096,
                 mtp_num_hidden_layers: 0,
                 mtp_use_dedicated_embeddings: false,
                 quarot_rotation_seed: None,
@@ -1331,6 +1330,36 @@ pub mod bench_support {
             }
         }
 
+        /// Copy recurrent state and cached tokens, allocating fresh reserved scratch.
+        ///
+        /// The forward step overwrites every live temporary before reading it; only
+        /// GDN state and K/V rows carry information between tokens. This avoids
+        /// replaying the entire warm prefix in every long-context benchmark setup.
+        pub fn fork_with_fresh_scratch(
+            &self,
+            source: &Q8ForwardBenchState,
+            measured_tokens: usize,
+        ) -> Q8ForwardBenchState {
+            let mut state = self
+                .state_with_capacity(0, source.kv_cache.seq_len.saturating_add(measured_tokens));
+            state.gdn_states.clone_from(&source.gdn_states);
+            for (dst, src) in state.kv_cache.k.iter_mut().zip(&source.kv_cache.k) {
+                dst.extend_from_slice(src);
+            }
+            for (dst, src) in state.kv_cache.v.iter_mut().zip(&source.kv_cache.v) {
+                dst.extend_from_slice(src);
+            }
+            state.kv_cache.seq_len = source.kv_cache.seq_len;
+            state.scratch.gdn_scratch.ensure_capacity(
+                self.cfg.linear_qkv_dim(),
+                self.cfg.linear_output_dim(),
+                self.cfg.linear_num_value_heads(),
+                self.cfg.linear_key_head_dim,
+                self.cfg.linear_value_head_dim,
+            );
+            state
+        }
+
         /// Run one `forward_step_q8_neon` and advance the sequence position.
         /// Returns `scratch.logits[0]` for `black_box` without exposing scratch types.
         pub fn step(&self, state: &mut Q8ForwardBenchState, token_id: u32) -> f32 {
@@ -1349,6 +1378,48 @@ pub mod bench_support {
             state.scratch.logits[0]
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn contiguous_value_bench_fresh_scratch_preserves_warmed_state() {
+            let fixture = Q8ForwardBenchFixture::synthetic_2layer();
+            let mut warmed = fixture.state_with_capacity(5, 2);
+            let mut forked = fixture.fork_with_fresh_scratch(&warmed, 2);
+            assert!(warmed.gdn_states[0].s_matrices.iter().any(|x| *x != 0.0));
+            assert!(forked.scratch.context.iter().all(|x| *x == 0.0));
+            assert!(forked.kv_cache.k[0].capacity() >= 7 * fixture.cfg.full_kv_dim());
+            assert!(forked.kv_cache.v[0].capacity() >= 7 * fixture.cfg.full_kv_dim());
+            assert_eq!(
+                forked.scratch.gdn_scratch.qkv_proj.len(),
+                fixture.cfg.linear_qkv_dim()
+            );
+            let bits = |values: &[f32]| values.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            for token in [42, 43] {
+                fixture.step(&mut warmed, token);
+                fixture.step(&mut forked, token);
+                assert!(forked.scratch.logits.iter().all(|x| x.is_finite()));
+                assert_eq!(bits(&forked.scratch.logits), bits(&warmed.scratch.logits));
+                assert_eq!(forked.kv_cache.seq_len, warmed.kv_cache.seq_len);
+                for layer in 0..warmed.kv_cache.k.len() {
+                    assert_eq!(
+                        bits(&forked.kv_cache.k[layer]),
+                        bits(&warmed.kv_cache.k[layer])
+                    );
+                    assert_eq!(
+                        bits(&forked.kv_cache.v[layer]),
+                        bits(&warmed.kv_cache.v[layer])
+                    );
+                }
+                for (actual, expected) in forked.gdn_states.iter().zip(&warmed.gdn_states) {
+                    assert_eq!(bits(&actual.s_matrices), bits(&expected.s_matrices));
+                    assert_eq!(bits(&actual.conv_buffer), bits(&expected.conv_buffer));
+                }
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1361,6 +1432,60 @@ mod tests {
     use crate::decoder::standalone_cpu::parity;
     use crate::model::qwen35_config::LayerType;
     use crate::stop_reason::StopReason;
+
+    #[test]
+    fn contiguous_value_q8_neon_matches_scalar_with_gqa_and_reused_scratch() {
+        use crate::attention::decode::value_test_support as support;
+
+        let cfg = support::config();
+        let hidden = cfg.hidden_size;
+        let q_dim = cfg.full_q_dim();
+        let kv_dim = cfg.full_kv_dim();
+        let (q, k, v) = support::projections(&cfg);
+        let rope = RopeTable::new(cfg.rope_dim(), 512, cfg.rope_theta);
+        let weights = Q8NeonFullAttnWeights {
+            q_proj_packed: pack_weights_q8(&q, 2 * q_dim, hidden).unwrap(),
+            q_proj_rows: 2 * q_dim,
+            q_proj_cols: hidden,
+            k_proj_packed: pack_weights_q8(&k, kv_dim, hidden).unwrap(),
+            k_proj_rows: kv_dim,
+            k_proj_cols: hidden,
+            v_proj_packed: pack_weights_q8(&v, kv_dim, hidden).unwrap(),
+            v_proj_rows: kv_dim,
+            v_proj_cols: hidden,
+            o_proj_packed: zero_packed(hidden, q_dim),
+            o_proj_rows: hidden,
+            o_proj_cols: q_dim,
+            q_norm: vec![0.0; cfg.head_dim],
+            k_norm: vec![0.0; cfg.head_dim],
+        };
+        let gates = vec![0.0; q_dim];
+        let mut scratch = ForwardScratch::new();
+        for position in [5, 0, 2] {
+            let mut cache = support::cache(&cfg, position);
+            support::reset_scratch(&mut scratch, &cfg);
+            full_attention_step_q8_neon(
+                &weights,
+                1,
+                position,
+                &mut cache,
+                &mut scratch,
+                &cfg,
+                &rope,
+                hidden,
+            );
+            support::assert_context(
+                &scratch.context,
+                &scratch.scores,
+                &cache.v[1],
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                position + 1,
+                Some(&gates),
+            );
+        }
+    }
 
     /// Helper: create a zero Q8_0 packed weight buffer for [n, k].
     fn zero_packed(n: usize, k: usize) -> Vec<u8> {

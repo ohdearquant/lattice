@@ -1247,14 +1247,13 @@ impl<'a> MtpVerifier<'a> {
 
             // Weighted sum of V
             let ctx_off = qh * head_dim;
-            for d in 0..head_dim {
-                let mut val = 0.0f32;
-                for t in 0..cur_seq_len {
-                    let v_off = t * kv_dim + kvh * head_dim;
-                    val += self.scratch.scores[scores_start + t] * v_all[v_off + d];
-                }
-                self.scratch.context[ctx_off + d] = val;
-            }
+            crate::attention::decode::accumulate_value_row(
+                &mut self.scratch.context[ctx_off..ctx_off + head_dim],
+                &self.scratch.scores[scores_start..scores_start + cur_seq_len],
+                v_all,
+                kv_dim,
+                kvh * head_dim,
+            );
         }
 
         // Output gate: sigmoid(gate_z) applied elementwise to context
@@ -5748,6 +5747,62 @@ mod tests {
             norm_weight: ones(h),
             pre_fc_norm_embedding_weight: ones(h),
             pre_fc_norm_hidden_weight: ones(h),
+        }
+    }
+
+    #[test]
+    fn contiguous_value_mtp_matches_scalar_after_cache_rollback() {
+        use crate::attention::decode::value_test_support as support;
+
+        let mut cfg = tiny_mtp_config();
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 2;
+        let weights = tiny_mtp_weights(&cfg);
+        let hidden = cfg.hidden_size;
+        let q_dim = cfg.num_attention_heads * cfg.head_dim;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let embed: Vec<f32> = (0..cfg.vocab_size * hidden)
+            .map(|i| (i as f32 + 1.0) * 0.01)
+            .collect();
+        let prev_hidden = vec![0.125; hidden];
+        let mut verifier = MtpVerifier::new(cfg.clone(), &weights, &embed, &embed, 12).unwrap();
+        for position in 0..6 {
+            verifier.append_kv_row(1, position, &prev_hidden).unwrap();
+        }
+        for position in [5, 2, 0] {
+            verifier.rollback_cache_to(position).unwrap();
+            for t in 0..position {
+                for h in 0..cfg.num_key_value_heads {
+                    for d in 0..cfg.head_dim {
+                        let i = t * kv_dim + h * cfg.head_dim + d;
+                        verifier.cache.k_buffer_mut(0)[i] =
+                            half::f16::from_f32((t + 1) as f32 * (1 + h + d % 3) as f32 * 0.01);
+                        verifier.cache.v_buffer_mut(0)[i] =
+                            half::f16::from_f32((t * 7 + h * 31 + d) as f32 * 0.125 - 4.0);
+                    }
+                }
+            }
+            verifier.cache.k_buffer_mut(0)[(position + 1) * kv_dim..].fill(half::f16::NAN);
+            verifier.cache.v_buffer_mut(0)[(position + 1) * kv_dim..].fill(half::f16::NAN);
+            verifier.scratch.cached_v_f32.fill(f32::NAN);
+            verifier
+                .scratch
+                .context
+                .resize(q_dim + 7, support::SENTINEL);
+            verifier.scratch.context.fill(support::SENTINEL);
+            verifier.scratch.scores.fill(f32::NAN);
+            verifier.forward_one(2, position, &prev_hidden).unwrap();
+            assert_eq!(verifier.cache.seq_len(), position + 1);
+            support::assert_context(
+                &verifier.scratch.context,
+                &verifier.scratch.scores,
+                &verifier.scratch.cached_v_f32,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                position + 1,
+                Some(&verifier.scratch.gate_z),
+            );
         }
     }
 

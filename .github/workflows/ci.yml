@@ -571,6 +571,37 @@ jobs:
         run: cargo clippy -p lattice-inference --all-targets -- -D warnings
       - name: inference — bench-internals clippy without f16
         run: cargo clippy -p lattice-inference --all-targets --features bench-internals -- -D warnings
+      - name: inference — contiguous CPU attention value controls
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-contiguous-value-tests.log"
+          if cargo test --locked -p lattice-inference --no-default-features --features f16,bench-internals \
+            --lib contiguous_value -- --nocapture --test-threads=1 --color never >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          assert_ran() {
+            grep -Fxq "test $1 ... ok" "$log" || {
+              echo "GUARD FAILED: $1 did not run and pass."
+              exit 1
+            }
+          }
+          assert_ran model::qwen35::forward::tests::contiguous_value_qwen_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran forward::cpu_f16::tests::contiguous_value_f16_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran forward::cpu_q8::tests::contiguous_value_q8_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran forward::neon_forward::tests::contiguous_value_q8_neon_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran speculative::tests::contiguous_value_mtp_matches_scalar_after_cache_rollback
+          assert_ran attention::decode::tests::contiguous_value_row_matches_ordered_scalar_and_preserves_tails
+          assert_ran attention::decode::tests::contiguous_value_row_keeps_zero_products_and_token_order
+          assert_ran forward::neon_forward::bench_support::tests::contiguous_value_bench_fresh_scratch_preserves_warmed_state
+          count=$(grep -Ec '^test result: ok\. 8 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
+          if [ "$count" -ne 1 ]; then
+            echo "GUARD FAILED: expected one complete eight-test CPU attention result."
+            exit 1
+          fi
       # The R03 golden gate (`crates/inference/tests/cpu_pre_migration_greedy_golden.rs`)
       # and the row D allocation arm (`crates/inference/tests/decoder_allocation_arm.rs`)
       # are both declared `test = false`, which keeps them out of

@@ -409,14 +409,13 @@ fn full_attention_step_f16(
 
         // Weighted sum of V
         let ctx_off = qh * head_dim;
-        for d in 0..head_dim {
-            let mut sum = 0.0f32;
-            for t in 0..cur_seq_len {
-                let v_off = t * kv_dim + kvh * head_dim;
-                sum += scratch.scores[scores_start + t] * v_cache[v_off + d];
-            }
-            scratch.context[ctx_off + d] = sum;
-        }
+        crate::attention::decode::accumulate_value_row(
+            &mut scratch.context[ctx_off..ctx_off + head_dim],
+            &scratch.scores[scores_start..scores_start + cur_seq_len],
+            v_cache,
+            kv_dim,
+            kvh * head_dim,
+        );
     }
 
     // Output gating: attn_output *= sigmoid(gate)
@@ -1586,6 +1585,57 @@ pub fn embed_text_vlm_f16(
 mod tests {
     use super::*;
     use crate::decoder::standalone_cpu::parity;
+
+    #[test]
+    fn contiguous_value_f16_matches_scalar_with_gqa_and_reused_scratch() {
+        use crate::attention::decode::value_test_support as support;
+
+        let cfg = support::config();
+        let hidden = cfg.hidden_size;
+        let q_dim = cfg.full_q_dim();
+        let (q, k, v) = support::projections(&cfg);
+        let rope = RopeTable::new(cfg.rope_dim(), 512, cfg.rope_theta);
+        let to_f16 = |source: &[f32]| {
+            let mut target = vec![0u16; source.len()];
+            crate::weights::f16_weights::f32_to_f16_slice(source, &mut target);
+            target
+        };
+        let weights = F16FullAttentionLayerWeights {
+            q_proj: to_f16(&q),
+            k_proj: to_f16(&k),
+            v_proj: to_f16(&v),
+            o_proj: to_f16(&vec![0.0; hidden * q_dim]),
+            q_norm: vec![0.0; cfg.head_dim],
+            k_norm: vec![0.0; cfg.head_dim],
+        };
+        let gates = vec![0.0; q_dim];
+        let mut scratch = ForwardScratch::new();
+        for position in [5, 0, 2] {
+            let mut cache = support::cache(&cfg, position);
+            support::reset_scratch(&mut scratch, &cfg);
+            full_attention_step_f16(
+                &weights,
+                1,
+                position,
+                &mut cache,
+                &mut scratch,
+                &cfg,
+                &rope,
+                hidden,
+                None,
+            );
+            support::assert_context(
+                &scratch.context,
+                &scratch.scores,
+                &cache.v[1],
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                position + 1,
+                Some(&gates),
+            );
+        }
+    }
 
     #[test]
     #[allow(clippy::type_complexity)]

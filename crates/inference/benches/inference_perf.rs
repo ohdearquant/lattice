@@ -774,6 +774,18 @@ fn bench_q8_neon_forward(c: &mut Criterion) {
             );
         });
 
+        group.bench_function("forward_step_synthetic_2layer_warm_seq2048", |b| {
+            let warmed = fixture.state_with_capacity(2048, 1);
+            b.iter_batched(
+                || fixture.fork_with_fresh_scratch(&warmed, 1),
+                |mut state| {
+                    let value = black_box(fixture.step(&mut state, 42));
+                    (state, value)
+                },
+                BatchSize::LargeInput,
+            );
+        });
+
         group.finish();
     }
     #[cfg(not(feature = "bench-internals"))]
