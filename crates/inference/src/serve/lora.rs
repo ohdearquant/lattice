@@ -492,6 +492,14 @@ async fn adapter_request_bytes(
 ///
 /// Build refusal precedes reading the request; runtime resolution follows parsing.
 /// Backend callbacks provide preparation and submission without owning HTTP policy.
+///
+/// Ordering rule (ADR-095 decision 4). A refusal that is a property of the
+/// build answers before anything is read, because it is true of every request:
+/// there is no request this build could have accepted, so reading one only
+/// decides which wrong answer to give. A refusal that is a property of the
+/// runtime answers after content type, body cap and parse, so a malformed
+/// request gets the malformed-request answer whatever the runtime state
+/// happens to be. `unload_request` follows the same rule.
 pub async fn load_request<B, P>(
     headers: axum::http::HeaderMap,
     body: axum::body::Body,

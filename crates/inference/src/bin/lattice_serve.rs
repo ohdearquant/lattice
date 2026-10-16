@@ -3525,6 +3525,13 @@ mod imp {
         resolve_backend: impl FnOnce() -> Result<B, lattice_inference::serve::ApiError>,
         snapshot: impl FnOnce(B) -> lattice_inference::serve::lora::AdapterIndex,
     ) -> Response {
+        // Assembled by the shared helper so this binary and `lattice serve`
+        // cannot answer the same route with different shapes (ADR-095
+        // decision 4, item 4).
+        //
+        // `None` because this binary has no `--router-state` yet, so it
+        // reports `{"enabled": false}`: the same shape, honestly filled. The
+        // flags are the next step, not a silent omission.
         match lattice_inference::serve::lora::list_request(Ok(()), resolve_backend, snapshot, None)
         {
             Ok(response) => response,
