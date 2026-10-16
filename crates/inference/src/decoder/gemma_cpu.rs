@@ -120,15 +120,18 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         &CAPABILITIES
     }
 
-    /// Sequential prefill over `self.prompt_ids` via `Gemma4Model::forward_step`,
-    /// one token at a time (ADR-090 D2 explicitly permits this for Gemma;
-    /// there is no batched-prefill fallback ladder to reproduce here, unlike
-    /// `QwenCpuSession::prefill`). Advances `self.position` by one per token.
-    /// Does not sample: the last position's logits are left in
-    /// `self.scratch.logits` for the first `select` to read, exactly like
-    /// `Gemma4Model::generate_greedy`'s own prefill loop. `prediction: None`
-    /// in the returned `StepStamp` reflects that nothing has been opened in
-    /// the ledger yet.
+    /// Sequential prefill over `self.prompt_ids` via
+    /// `Gemma4Model::forward_step_impl`, one token at a time (ADR-090 D2
+    /// explicitly permits this for Gemma; there is no batched-prefill fallback
+    /// ladder to reproduce here, unlike `QwenCpuSession::prefill`). Each token
+    /// runs with `emit_logits = false` except the last, so the vocabulary
+    /// projection is deferred to the final prompt position and
+    /// `self.scratch.logits` is untouched at every earlier position. Advances
+    /// `self.position` by one per token. Does not sample: the last position's
+    /// logits are left in `self.scratch.logits` for the first `select` to
+    /// read, exactly like `Gemma4Model::generate_greedy`'s own prefill loop.
+    /// `prediction: None` in the returned `StepStamp` reflects that nothing
+    /// has been opened in the ledger yet.
     fn prefill(&mut self, cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
         if cancel.is_cancelled() {
             return Err(InferenceError::Inference("cancelled before prefill".into()));
