@@ -563,9 +563,9 @@ jobs:
               exit 1
             }
           done
-          count=$(grep -Ec '^test result: ok\. 42 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
+          count=$(grep -Ec '^test result: ok\. 47 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
           if [ "$count" -ne 1 ]; then
-            echo "GUARD FAILED: expected one complete 42-test router admission result."
+            echo "GUARD FAILED: expected one complete 47-test router admission result."
             exit 1
           fi
       - name: inference router admission Metal integration clippy

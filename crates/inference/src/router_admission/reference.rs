@@ -312,6 +312,48 @@ mod scoring {
         Ok(())
     }
 
+    /// Refuse reference input whose lower-bound token count already exceeds a limit.
+    ///
+    /// `max_token_bytes` is the longest span of input bytes any single produced token
+    /// can cover, so `ceil(bytes / max_token_bytes)` never exceeds the real token count.
+    /// Every count here is checked, and an overflow is a refusal like any other.
+    fn check_token_byte_bound(
+        bounds: ReferenceBounds,
+        max_context: usize,
+        max_token_bytes: usize,
+        lengths: &[(usize, usize)],
+    ) -> Result<(), ReferenceError> {
+        if max_token_bytes == 0 {
+            return Err(invalid(
+                "reference tokenizer cannot bound a token count from bytes",
+            ));
+        }
+        let mut bounded_tokens = 0usize;
+        for &(rendered, completion) in lengths {
+            let bytes = rendered
+                .checked_add(completion)
+                .ok_or(ReferenceError::Count("reference input bytes"))?;
+            let tokens = bytes
+                .checked_add(max_token_bytes - 1)
+                .ok_or(ReferenceError::Count("reference bounded tokens"))?
+                / max_token_bytes;
+            if tokens > max_context {
+                return Err(invalid(
+                    "reference sequence exceeds model context by its byte bound",
+                ));
+            }
+            bounded_tokens = bounded_tokens
+                .checked_add(tokens)
+                .ok_or(ReferenceError::Count("reference bounded token total"))?;
+        }
+        if bounded_tokens > bounds.max_tokens {
+            return Err(invalid(
+                "reference population exceeds explicit token bounds by its byte bound",
+            ));
+        }
+        Ok(())
+    }
+
     fn completion_tokens<'a>(prompt: &[u32], full: &'a [u32]) -> Result<&'a [u32], ReferenceError> {
         if prompt.is_empty() {
             return Err(invalid("reference prompt has no tokens"));
@@ -633,6 +675,30 @@ mod scoring {
                 ));
             }
             check_bounds(bounds, examples.len(), 0)?;
+            // Size refusals come before hashing or tokenizing: the byte bound is a lower
+            // bound on the token count, so an oversized example is refused here without
+            // doing work proportional to its length.
+            let mut byte_spans = Vec::with_capacity(examples.len());
+            for example in examples {
+                if example
+                    .user_prompt
+                    .len()
+                    .checked_add(2)
+                    .is_none_or(|n| n > embedder.max_context())
+                {
+                    return Err(invalid(
+                        "raw reference prompt exceeds conservative embedder byte bound",
+                    ));
+                }
+                let rendered = format_chat_template(&[ChatMessage::user(&example.user_prompt)]);
+                byte_spans.push((rendered.len(), example.completion.len()));
+            }
+            check_token_byte_bound(
+                bounds,
+                state.max_context(),
+                tokenizer.max_token_byte_span(),
+                &byte_spans,
+            )?;
             let reference_hash = reference_content_hash(examples)?;
             let repr = source.representation();
             if repr.embedding_model != embedder_identity.as_str()
@@ -943,6 +1009,7 @@ mod scoring {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::tokenizer::bpe::BpeTokenizer;
         struct Fake {
             rows: std::collections::VecDeque<Result<Vec<f32>, ReferenceError>>,
             calls: Vec<(Vec<u32>, Option<usize>)>,
@@ -1101,6 +1168,92 @@ mod scoring {
             };
             assert_ne!(original, reference_content_hash(&examples).unwrap());
             assert!(reference_content_hash(&[]).is_err());
+        }
+        fn byte_bound_tokenizer() -> BpeTokenizer {
+            let json = r#"{
+                "model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":["a b"]}
+            }"#;
+            BpeTokenizer::from_tokenizer_json_str(json).unwrap()
+        }
+        #[test]
+        fn reference_scoring_refuses_a_byte_bounded_oversized_completion() {
+            let span = byte_bound_tokenizer().max_token_byte_span();
+            assert!(span > 0);
+            assert!(
+                check_token_byte_bound(
+                    ReferenceBounds {
+                        max_examples: 1,
+                        max_tokens: 16
+                    },
+                    1 << 24,
+                    span,
+                    &[(8, 1 << 20)]
+                )
+                .is_err()
+            );
+            assert!(
+                check_token_byte_bound(
+                    ReferenceBounds {
+                        max_examples: 1,
+                        max_tokens: 16
+                    },
+                    4096,
+                    0,
+                    &[(8, 8)]
+                )
+                .is_err()
+            );
+        }
+        #[test]
+        fn reference_scoring_accepts_an_example_within_the_byte_bound() {
+            let span = byte_bound_tokenizer().max_token_byte_span();
+            assert!(
+                check_token_byte_bound(
+                    ReferenceBounds {
+                        max_examples: 1,
+                        max_tokens: 16
+                    },
+                    4096,
+                    span,
+                    &[(8, 8)]
+                )
+                .is_ok()
+            );
+        }
+        #[test]
+        fn reference_scoring_refuses_context_overflow_the_token_total_would_allow() {
+            let span = byte_bound_tokenizer().max_token_byte_span();
+            let bounds = ReferenceBounds {
+                max_examples: 1,
+                max_tokens: 16,
+            };
+            let lengths = [(5 * span, 0usize)];
+            assert!(check_token_byte_bound(bounds, 5, span, &lengths).is_ok());
+            assert!(check_token_byte_bound(bounds, 4, span, &lengths).is_err());
+        }
+        #[test]
+        fn reference_scoring_byte_bound_is_exact_at_the_limit_multiple() {
+            let span = byte_bound_tokenizer().max_token_byte_span();
+            let bounds = ReferenceBounds {
+                max_examples: 1,
+                max_tokens: 4,
+            };
+            let exact = 4 * span;
+            assert!(check_token_byte_bound(bounds, exact, span, &[(exact, 0)]).is_ok());
+            assert!(check_token_byte_bound(bounds, exact, span, &[(exact + 1, 0)]).is_err());
+        }
+        #[test]
+        fn reference_scoring_token_byte_span_includes_special_token_content() {
+            let json = r#"{
+                "model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]},
+                "added_tokens":[{"id":2,"content":"<|long_control_marker|>","special":true}]
+            }"#;
+            let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+            assert_eq!(
+                tokenizer.max_token_byte_span(),
+                "<|long_control_marker|>".len()
+            );
+            assert!("<|long_control_marker|>".len() > 1);
         }
     }
 }

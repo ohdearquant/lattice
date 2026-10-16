@@ -655,6 +655,46 @@ impl BpeTokenizer {
         true
     }
 
+    /// Largest number of input-text bytes a single produced token can cover.
+    ///
+    /// Lets a caller lower-bound a token count from a raw byte length without
+    /// tokenizing: no produced token spans more than this, so the token count is at
+    /// least `ceil(bytes / span)`. Base vocabulary entries are measured by decoded
+    /// byte length; special and added tokens are measured by their content string
+    /// length instead, because `match_special` consumes the matched literal text
+    /// while the token id itself may decode to fewer bytes than that (a control
+    /// token marked special decodes to none at all).
+    #[cfg(any(
+        test,
+        all(
+            feature = "serve",
+            feature = "f16",
+            feature = "router-learning",
+            target_os = "macos",
+            feature = "metal-gpu"
+        )
+    ))]
+    pub(crate) fn max_token_byte_span(&self) -> usize {
+        let byte_decoder = byte_decoder();
+        let mut span = 0usize;
+        let mut bytes = Vec::new();
+        for id in 0..self.inner.id_to_token.len() {
+            bytes.clear();
+            if self.append_token_bytes(id as u32, &byte_decoder, &mut bytes) {
+                span = span.max(bytes.len());
+            }
+        }
+        for content in self
+            .inner
+            .special_tokens
+            .keys()
+            .chain(self.inner.added_render.values())
+        {
+            span = span.max(content.len());
+        }
+        span
+    }
+
     #[cfg(test)]
     fn tokenize_to_ids(&self, text: &str) -> Vec<u32> {
         let mut scratch = TokenizeScratch::default();
@@ -1786,6 +1826,28 @@ mod tests {
             );
             assert!(engine.advance(&mut state, token_id).unwrap());
         }
+    }
+
+    #[test]
+    fn max_token_byte_span_covers_special_and_added_token_content() {
+        let json = r#"{
+            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+            "added_tokens":[
+                {"id":1,"content":"<|control|>","special":true},
+                {"id":2,"content":"<|rendered extra|>","special":false}
+            ]
+        }"#;
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+        assert_eq!(
+            tokenizer.max_token_byte_span(),
+            "<|rendered extra|>".len(),
+            "the longest special or added token's content must set the span"
+        );
+        let plain = BpeTokenizer::from_tokenizer_json_str(
+            r#"{"model":{"type":"BPE","vocab":{"a":0,"ab":1},"merges":["a b"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(plain.max_token_byte_span(), 2);
     }
 
     #[test]
