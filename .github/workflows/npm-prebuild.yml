@@ -62,35 +62,44 @@ jobs:
       - name: Self-test the npm publish preflight
         run: bash scripts/publish-npm-preflight-selftest.sh
 
+  # The full target list lives in npm/lattice-embed-native/scripts/prebuild-matrix.json.
+  # A pull request builds the targets marked for it there (the Linux targets);
+  # push and workflow_dispatch build every target, so a release is always
+  # assembled from the full matrix.
+  plan:
+    name: plan prebuild targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      include: ${{ steps.plan.outputs.include }}
+      suffixes: ${{ steps.plan.outputs.suffixes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Validate the configured matrix
+        run: node npm/lattice-embed-native/scripts/assert-prebuild-matrix.mjs
+
+      - name: Plan targets for this event
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+        run: node npm/lattice-embed-native/scripts/plan-prebuild-matrix.mjs >> "$GITHUB_OUTPUT"
+
   build:
     name: build (${{ matrix.target }})
+    needs: plan
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: macos-latest
-            target: aarch64-apple-darwin
-            args: ''
-          - runner: macos-latest
-            target: x86_64-apple-darwin
-            args: ''
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            args: '--use-napi-cross'
-          - runner: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            args: '--use-napi-cross'
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            args: '-x'
-          - runner: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            args: '-x'
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            args: ''
+        include: ${{ fromJSON(needs.plan.outputs.include) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
@@ -148,7 +157,7 @@ jobs:
 
   package:
     name: package prebuilds
-    needs: build
+    needs: [plan, build]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -182,17 +191,14 @@ jobs:
       - name: Assemble and verify platform packages
         working-directory: npm/lattice-embed-native
         shell: bash
+        env:
+          PLANNED_SUFFIXES: ${{ needs.plan.outputs.suffixes }}
         run: |
           set -euo pipefail
           npm run artifacts
-          for suffix in \
-            darwin-arm64 \
-            darwin-x64 \
-            linux-x64-gnu \
-            linux-x64-musl \
-            linux-arm64-gnu \
-            linux-arm64-musl \
-            win32-x64-msvc; do
+          planned=0
+          for suffix in $PLANNED_SUFFIXES; do
+            planned=$((planned + 1))
             binary="npm/$suffix/lattice-embed-native.$suffix.node"
             if [ ! -f "$binary" ]; then
               echo "::error::missing prebuilt binary: $binary"
@@ -207,6 +213,13 @@ jobs:
             # in the actual release preflight (scripts/publish-npm.sh).
             (cd "npm/$suffix" && npm pack --dry-run --json | node ../../scripts/assert-platform-packlist.mjs)
           done
+          # Exactly the planned binaries: none missing (checked above) and none
+          # extra, so an empty plan or a stray artifact cannot read as complete.
+          found=$(find npm -type f -name '*.node' | wc -l)
+          if [ "$planned" -eq 0 ] || [ "$found" -ne "$planned" ]; then
+            echo "::error::$found prebuilt binaries packaged for $planned planned targets"
+            exit 1
+          fi
 
       - name: Upload assembled platform packages
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
