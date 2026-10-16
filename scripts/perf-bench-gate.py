@@ -340,17 +340,30 @@ def load_phase_load_summaries(path: Path, floor_pct: float) -> list[dict]:
             raise ValueError(f"invalid in-phase load summary for {arm}")
         foreign = record.get("foreign_max_pct")
         floor = record.get("floor_pct")
+        # The implied figure is load the idle reading saw but `ps` could not
+        # attribute to a process (a PID namespace hides the host's processes,
+        # so foreign reads 0.0 however busy the machine is). It is absent from
+        # streams written before the implied rule existed; 0.0 there restores
+        # the foreign-only verdict exactly.
+        implied = record.get("implied_foreign_max_pct", 0.0)
         try:
             finite_foreign = math.isfinite(foreign)
         except (TypeError, OverflowError):
             finite_foreign = False
+        try:
+            finite_implied = math.isfinite(implied)
+        except (TypeError, OverflowError):
+            finite_implied = False
         if (isinstance(foreign, bool) or not isinstance(foreign, (int, float))
                 or not finite_foreign or foreign < 0
+                or isinstance(implied, bool) or not isinstance(implied, (int, float))
+                or not finite_implied or implied < 0
                 or isinstance(floor, bool) or not isinstance(floor, (int, float))
                 or floor != floor_pct):
             raise ValueError(f"invalid in-phase load figures for {arm}")
         verdict = record.get("verdict")
-        if verdict != ("LOUD" if foreign > 100.0 - floor else "ok"):
+        ceiling = 100.0 - floor
+        if verdict != ("LOUD" if foreign > ceiling or implied > ceiling else "ok"):
             raise ValueError(f"inconsistent in-phase load verdict for {arm}")
         summaries.append({
             "arm": arm,
