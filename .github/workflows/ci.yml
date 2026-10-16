@@ -230,53 +230,6 @@ jobs:
       - run: ./scripts/ci.sh
         env:
           LATTICE_REQUIRE_DENO: '1'
-      - name: inference - batch admission lifecycle
-        run: |
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          import re
-          import subprocess
-          import sys
-
-          if not __debug__:
-              raise RuntimeError("batch admission validation requires Python assertions")
-
-          EXPECTED = ['batch::worker::admission_tests::capacity_one_reuses_slots_after_each_completion', 'batch::worker::admission_tests::capacity_sized_queue_admits_each_request_once', 'batch::worker::admission_tests::over_capacity_queue_preserves_fifo_without_duplicate_prefill', 'batch::worker::admission_tests::chunked_prefill_interleaves_with_decode_at_exact_positions', 'batch::worker::admission_tests::low_page_reserve_defers_queued_work_until_pages_return', 'batch::worker::admission_tests::eos_and_length_finishes_release_admission_slots', 'batch::worker::admission_tests::zero_budget_never_enters_admission_or_forward', 'batch::worker::admission_tests::missing_queued_sequence_does_not_allocate_a_slot', 'batch::worker::admission_tests::decoding_queued_sequence_is_not_prefilled', 'batch::worker::admission_tests::finished_queued_sequence_is_not_prefilled', 'batch::worker::admission_tests::empty_queued_prompt_does_not_allocate_a_slot']
-
-          def check(text, expected, harness):
-              records = re.findall(r"^test (?!result:)(\S+) \.\.\. ok$", text, re.MULTILINE)
-              assert sorted(records) == sorted(expected), "wrong exact batch admission test population"
-              assert len(re.findall(r"^test (?!result:)", text, re.MULTILINE)) == len(expected)
-              assert re.findall(r"^running \d+ tests?$", text, re.MULTILINE) == [f"running {len(expected)} tests"]
-              summaries = re.findall(r"^test result:.*$", text, re.MULTILINE)
-              pattern = rf"test result: ok\. {len(expected)} passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in [0-9]+(?:\.[0-9]+)?s"
-              assert len(summaries) == 1 and re.fullmatch(pattern, summaries[0])
-              assert re.findall(r"^\s*Running unittests ([^\s]+) \(.+\)$", text, re.MULTILINE) == [harness]
-              assert len(re.findall(r"^\s*Running unittests ", text, re.MULTILINE)) == 1
-              assert not re.search(r"^error(?:\[|:)", text, re.MULTILINE)
-
-
-          def main():
-              root = Path(os.environ["RUNNER_TEMP"])
-              arms = [("admission", "src/lib.rs", ["--lib", "batch::worker::admission_tests::"])]
-              for label, harness, selection in arms:
-                  command = ["cargo", "test", "--locked", "-p", "lattice-inference"] + selection + [
-                      "--", "--test-threads=1", "--color", "never"]
-                  log = root / ("batch-admission-" + label + ".log")
-                  with log.open("w") as output:
-                      result = subprocess.run(command, env=dict(os.environ, CARGO_TERM_COLOR="never"),
-                                              stdout=output, stderr=subprocess.STDOUT)
-                  text = log.read_text(errors="replace")
-                  print(text, end="", flush=True)
-                  if result.returncode:
-                      raise SystemExit(result.returncode if result.returncode > 0 else 128 - result.returncode)
-                  check(text, EXPECTED, harness)
-              print("BATCH_ADMISSION_GATE_COMPLETE tests=11")
-
-
-          main()
-          PY
       # `scripts/ci.sh` already runs `cargo test --workspace`, so this target
       # executes there in the default configuration too -- but that never runs
       # the Metal feature configuration the ADR names (see the macOS-only step
