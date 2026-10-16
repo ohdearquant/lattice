@@ -752,6 +752,41 @@ pub(crate) fn render_text_prompt_within_window(
 pub mod bench_support {
     use super::{ApiError, ContextWindowPolicy, GenerateConfig};
 
+    /// Start a measurement worker whose own thread holds the GPU lock through
+    /// model construction, every queued request, and runtime destruction.
+    /// The lock remains held if the caller's bounded shutdown detaches it.
+    /// The returned load duration excludes waiting for the measurement lock.
+    pub fn spawn_with_measurement_lock(
+        factory: super::ServingFactory,
+        max_pending: usize,
+        residency_limits: super::ResidencyLimits,
+    ) -> Result<
+        (
+            super::MetalWorkerOwner,
+            super::MetalWorkerClient,
+            super::WorkerMetadata,
+            super::PreparationHandle,
+            std::time::Duration,
+        ),
+        super::StartupError,
+    > {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (owner, client, metadata, preparation) = super::MetalWorker::spawn_with_guard(
+            factory,
+            max_pending,
+            residency_limits,
+            move || {
+                let guard = crate::measurement::gpu_test_lock();
+                let _ = started_tx.send(std::time::Instant::now());
+                guard
+            },
+        )?;
+        let started = started_rx
+            .recv()
+            .map_err(|_| super::StartupError::ThreadExited)?;
+        Ok((owner, client, metadata, preparation, started.elapsed()))
+    }
+
     /// The worker's context-window admission check, exactly as the Metal
     /// worker applies it to a rendered, tokenized prompt before generation.
     pub fn check_prompt_fits_window(
@@ -1373,6 +1408,11 @@ pub(crate) fn classify_job(messages: &[ChatMessage]) -> Result<JobRoute, WorkerF
 /// `spawn_worker` free function both had with "the Metal worker".
 pub struct MetalWorker;
 
+fn run_guarded_worker<G>(acquire_guard: impl FnOnce() -> G, work: impl FnOnce()) {
+    let _measurement_guard = acquire_guard();
+    work();
+}
+
 impl MetalWorker {
     /// Spawn the dedicated thread that owns the `!Send` Metal state for the
     /// whole process lifetime. `loader` runs ON the worker thread itself --
@@ -1425,6 +1465,23 @@ impl MetalWorker {
         ),
         StartupError,
     > {
+        Self::spawn_with_guard(factory, max_pending, residency_limits, || ())
+    }
+
+    fn spawn_with_guard<G>(
+        factory: ServingFactory,
+        max_pending: usize,
+        residency_limits: ResidencyLimits,
+        acquire_guard: impl FnOnce() -> G + Send + 'static,
+    ) -> Result<
+        (
+            MetalWorkerOwner,
+            MetalWorkerClient,
+            WorkerMetadata,
+            PreparationHandle,
+        ),
+        StartupError,
+    > {
         if residency_limits.max_adapters == 0 || residency_limits.max_bytes == 0 {
             return Err(StartupError::InvalidResidencyLimits {
                 limits: residency_limits,
@@ -1445,33 +1502,35 @@ impl MetalWorker {
         let adapters = Arc::new(RwLock::new(AdapterIndex::default()));
         let worker_index = Arc::clone(&adapters);
         let join_handle = std::thread::spawn(move || {
-            match factory.build(worker_index, residency_limits) {
-                Ok((runtime, metadata, preparation)) => {
-                    let vision_supported = runtime.vision_supported();
-                    let _ = ready_tx.send(Ok((metadata, preparation, vision_supported)));
-                    // The non-Send runtime was built after the spawn and never
-                    // crosses back. The loop lends it to one callback at a
-                    // time, so these mutable borrows cannot overlap.
-                    let runtime = RefCell::new(runtime);
-                    run_worker_loop_with_lora(
-                        job_rx,
-                        |messages, cfg, lora, stream, on_token, should_cancel| {
-                            runtime.borrow_mut().generate(
-                                messages,
-                                cfg,
-                                lora,
-                                stream,
-                                on_token,
-                                should_cancel,
-                            )
-                        },
-                        |command| runtime.borrow_mut().control(command),
-                    );
+            run_guarded_worker(acquire_guard, move || {
+                match factory.build(worker_index, residency_limits) {
+                    Ok((runtime, metadata, preparation)) => {
+                        let vision_supported = runtime.vision_supported();
+                        let _ = ready_tx.send(Ok((metadata, preparation, vision_supported)));
+                        // The non-Send runtime was built after the spawn and never
+                        // crosses back. The loop lends it to one callback at a
+                        // time, so these mutable borrows cannot overlap.
+                        let runtime = RefCell::new(runtime);
+                        run_worker_loop_with_lora(
+                            job_rx,
+                            |messages, cfg, lora, stream, on_token, should_cancel| {
+                                runtime.borrow_mut().generate(
+                                    messages,
+                                    cfg,
+                                    lora,
+                                    stream,
+                                    on_token,
+                                    should_cancel,
+                                )
+                            },
+                            |command| runtime.borrow_mut().control(command),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                    }
                 }
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error));
-                }
-            }
+            });
         });
         let owner = MetalWorkerOwner::from_handle(join_handle);
         match ready_rx.recv() {
@@ -1773,6 +1832,107 @@ mod tests {
         drop_timeout: Duration,
     ) -> MetalWorkerOwner {
         MetalWorkerOwner::from_handle_with_timeout(join_handle, drop_timeout)
+    }
+
+    #[test]
+    fn measurement_worker_guard_stays_on_the_worker_after_owner_timeout() {
+        let lock = Arc::new(Mutex::new(()));
+        let worker_lock = Arc::clone(&lock);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let caller = std::thread::current().id();
+        let handle = std::thread::spawn(move || {
+            run_guarded_worker(
+                || {
+                    assert_ne!(std::thread::current().id(), caller);
+                    worker_lock.lock().unwrap()
+                },
+                || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                },
+            );
+            done_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let owner = test_owner(handle, Duration::from_millis(20));
+        assert_eq!(
+            owner._inner.wait_for_exit(Duration::from_millis(20)),
+            WorkerShutdown::TimedOut,
+        );
+        assert!(matches!(
+            lock.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn measurement_worker_guard_outlives_work_capture_destruction_and_unwind() {
+        struct WorkDrop(Arc<AtomicBool>);
+        impl Drop for WorkDrop {
+            fn drop(&mut self) {
+                assert!(self.0.load(Ordering::SeqCst));
+            }
+        }
+        struct GuardDrop(Arc<AtomicBool>);
+        impl Drop for GuardDrop {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        for panic_in_work in [false, true] {
+            let held = Arc::new(AtomicBool::new(false));
+            let work_capture = WorkDrop(Arc::clone(&held));
+            let result = std::panic::catch_unwind(|| {
+                run_guarded_worker(
+                    || {
+                        held.store(true, Ordering::SeqCst);
+                        GuardDrop(Arc::clone(&held))
+                    },
+                    move || {
+                        let _capture = work_capture;
+                        assert!(!panic_in_work, "injected worker failure");
+                    },
+                );
+            });
+            assert_eq!(result.is_err(), panic_in_work);
+            assert!(!held.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn measurement_worker_guard_releases_after_a_real_factory_load_error() {
+        struct GuardDrop(Arc<AtomicBool>);
+        impl Drop for GuardDrop {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let held = Arc::new(AtomicBool::new(false));
+        let guard_state = Arc::clone(&held);
+        let loader_state = Arc::clone(&held);
+        let caller = std::thread::current().id();
+        let factory = ServingFactory::qwen_metal(
+            move || {
+                assert!(loader_state.load(Ordering::SeqCst));
+                Err("injected load failure".into())
+            },
+            VisionRuntime::unsupported(),
+        );
+        let result =
+            MetalWorker::spawn_with_guard(factory, 1, ResidencyLimits::default(), move || {
+                assert_ne!(std::thread::current().id(), caller);
+                guard_state.store(true, Ordering::SeqCst);
+                GuardDrop(guard_state)
+            });
+        assert!(
+            matches!(result, Err(StartupError::Load(ref message)) if message == "injected load failure")
+        );
+        assert!(!held.load(Ordering::SeqCst));
     }
 
     fn tiny_tokenizer() -> BpeTokenizer {

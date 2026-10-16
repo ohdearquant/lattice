@@ -16,6 +16,12 @@ workspace version; the workspace release notes are in
 
 ### Changed
 
+- **Behavior change:** LoRA adapter load and unload (`/v1/lora/load`, `/v1/lora/unload`) on both
+  `lattice serve` and `lattice_serve` now answer 413 `request_body_too_large` for a request body
+  over the 1 MiB limit, instead of 400.
+- **Behavior change:** under `lattice serve`, a LoRA load whose body cannot be read for any other
+  reason now answers 400 `invalid_request` (previously `invalid_request_body`), the same code
+  `lattice_serve` already used.
 - The `backward_stage0` benchmark requires `train-backward,test-utils`, adds matched scalar cases, and initializes fixtures only for selected cases (#1392).
 - `ForcedDispatch::mark_executed` is deprecated and always refuses manual attestation; call an arithmetic method and `verify_for` instead. A probe is single-use, and failed or repeated execution invalidates its evidence (#1392).
 

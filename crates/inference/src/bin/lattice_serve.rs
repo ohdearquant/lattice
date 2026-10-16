@@ -247,6 +247,60 @@ mod imp {
         admission: Arc<Semaphore>,
     }
 
+    fn load_embedding_state(
+        embedding_model_dir: &std::path::Path,
+        pooling_override: Option<&str>,
+    ) -> Result<Arc<EmbeddingState>, String> {
+        if !embedding_model_dir.exists() {
+            return Err(format!(
+                "embedding model directory not found: {}",
+                embedding_model_dir.display()
+            ));
+        }
+        eprintln!(
+            "[lattice_serve] loading embedding model from {} ...",
+            embedding_model_dir.display()
+        );
+        let mut model = BertModel::from_directory(embedding_model_dir).map_err(|e| {
+            format!(
+                "embedding model load failed ({}): {e}",
+                embedding_model_dir.display()
+            )
+        })?;
+        let embedding_model_id: Arc<str> = embedding_model_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("embedding")
+            .into();
+        // Auto-select the same default `--embedding-pooling` would
+        // otherwise force the operator to pass explicitly. See
+        // `lattice_inference::pool::default_bert_pooling_for_model_name`
+        // for the rule and its agreement test against
+        // `lattice-embed`'s `EmbeddingModel::bert_pooling` table.
+        model.set_pooling(
+            lattice_inference::pool::default_bert_pooling_for_model_name(&embedding_model_id),
+        );
+        match pooling_override {
+            None => {}
+            Some("mean") => model.set_pooling(BertPooling::Mean),
+            Some("cls") => model.set_pooling(BertPooling::CLS),
+            Some(other) => {
+                return Err(format!(
+                    "invalid --embedding-pooling '{other}'; expected 'mean' or 'cls'"
+                ));
+            }
+        }
+        eprintln!(
+            "[lattice_serve] embedding model '{embedding_model_id}' ready (dimensions={})",
+            model.dimensions()
+        );
+        Ok(Arc::new(EmbeddingState {
+            model,
+            model_id: embedding_model_id,
+            admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+        }))
+    }
+
     /// See [`EmbeddingState::admission`].
     const EMBEDDING_MAX_CONCURRENT_JOBS: usize = 4;
 
@@ -3364,24 +3418,16 @@ mod imp {
     /// file of their choosing. The startup warning covers it; an allow-root is the
     /// obvious next control and is deliberately not invented here.
     async fn lora_list(State(s): State<AppState>) -> Response {
-        if !adapters_supported(&s) {
-            return lattice_inference::serve::prepare::lora_unsupported_backend().into_response();
-        }
-        // Assembled by the shared helper so this binary and `lattice serve`
-        // cannot answer the same route with different shapes. They already
-        // did: this returned the bare residency snapshot while the other had
-        // gained the `router` key, and nothing caught it -- the route was
-        // registered correctly in both, which is all a route-table mechanism
-        // can see (ADR-095 decision 4, item 4).
-        //
-        // `None` because this binary has no `--router-state` yet, so it
-        // reports `{"enabled": false}`: the same shape, honestly filled. The
-        // flags are the next step, not a silent omission.
-        Json(lattice_inference::serve::lora::lora_list_body(
-            &s.jobs.adapter_index(),
-            None,
-        ))
-        .into_response()
+        lora_list_with_backend(
+            || {
+                if adapters_supported(&s) {
+                    Ok(&s.jobs)
+                } else {
+                    Err(lattice_inference::serve::prepare::lora_unsupported_backend())
+                }
+            },
+            lattice_inference::serve::metal_worker::MetalWorkerClient::adapter_index,
+        )
     }
 
     /// Whether the loaded model takes runtime LoRA adapters. A worker with no
@@ -3405,92 +3451,21 @@ mod imp {
         body: Body,
         supports_adapters: impl FnOnce(&AppState) -> bool,
     ) -> Response {
-        let timer = Instant::now();
-        const ROUTE: &str = "/v1/lora/load";
-        // `err_response` collapses every status it was not taught into 400, so each
-        // non-400 answer below is built from its `ApiError` variant directly and
-        // reported to telemetry from the same value.
-        let fail = |err: lattice_inference::serve::ApiError| -> Response {
-            let response = err.into_response();
-            emit_serve_event(
-                &s.metrics,
-                "POST",
-                ROUTE,
-                response.status().as_u16(),
-                None,
-                None,
-                timer.elapsed().as_secs_f64() * 1000.0,
-                false,
-                None,
-            );
-            response
-        };
-        if let Err(err) = lattice_inference::serve::require_json_content_type(&headers) {
-            return fail(err);
-        }
-        let Ok(bytes) = to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await else {
-            return fail(lattice_inference::serve::ApiError::BadRequest {
-                message: "invalid request body".to_string(),
-                code: "invalid_request",
-            });
-        };
-        let (path, name) = match lattice_inference::serve::lora::parse_lora_load(&bytes) {
-            Ok(path) => path,
-            Err(err) => return fail(err),
-        };
-        if !supports_adapters(&s) {
-            return fail(lattice_inference::serve::prepare::lora_unsupported_backend());
-        }
-
-        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-        {
-            let prepared = match lattice_inference::serve::lora::prepare_adapter_load(&path, &name)
-            {
-                Ok(prepared) => prepared,
-                Err(err) => return fail(err),
-            };
-            let receiver = match s.jobs.submit_adapter_command(prepared.command) {
-                Ok(receiver) => receiver,
-                Err(err) => return fail(err),
-            };
-            match receiver.await {
-                Ok(Ok(lattice_inference::serve::lora::AdapterControlResult::Loaded(adapter))) => {
-                    emit_serve_event(
-                        &s.metrics,
-                        "POST",
-                        ROUTE,
-                        200,
-                        None,
-                        None,
-                        timer.elapsed().as_secs_f64() * 1000.0,
-                        false,
-                        None,
-                    );
-                    Json(lattice_inference::serve::lora::load_success_body(
-                        adapter.id,
-                        &adapter.name,
-                        &adapter.path,
-                        adapter.rank,
-                        adapter.layers,
-                    ))
-                    .into_response()
+        lora_load_with_backend(
+            &s.metrics,
+            headers,
+            body,
+            || {
+                if supports_adapters(&s) {
+                    Ok(&s.jobs)
+                } else {
+                    Err(lattice_inference::serve::prepare::lora_unsupported_backend())
                 }
-                Ok(Err(error)) => fail(error.into()),
-                Ok(Ok(_)) => fail(lattice_inference::serve::lora::worker_unavailable(
-                    "unexpected adapter command reply",
-                )),
-                Err(_) => fail(lattice_inference::serve::lora::worker_unavailable(
-                    "the inference worker is not running; the adapter was not loaded",
-                )),
-            }
-        }
-        #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-        {
-            let _ = (path, name);
-            fail(lattice_inference::serve::lora::worker_unavailable(
-                "adapter loading requires a macOS Metal build of this server",
-            ))
-        }
+            },
+            lattice_inference::serve::lora::prepare_adapter_load,
+            |client, prepared| client.submit_adapter_command(prepared.command),
+        )
+        .await
     }
 
     /// Remove one resident identifier, refusing unknown ids.
@@ -3504,67 +3479,117 @@ mod imp {
         body: Body,
         supports_adapters: impl FnOnce(&AppState) -> bool,
     ) -> Response {
+        lora_unload_with_backend(
+            &s.metrics,
+            headers,
+            body,
+            || {
+                if supports_adapters(&s) {
+                    Ok(&s.jobs)
+                } else {
+                    Err(lattice_inference::serve::prepare::lora_unsupported_backend())
+                }
+            },
+            |client, id| {
+                client.submit_adapter_command(
+                    lattice_inference::serve::metal_worker::AdapterCommand::Unload { id },
+                )
+            },
+        )
+        .await
+    }
+
+    async fn lora_load_with_backend<B, P>(
+        metrics: &ServeMetrics,
+        headers: HeaderMap,
+        body: Body,
+        resolve_backend: impl FnOnce() -> Result<B, lattice_inference::serve::ApiError>,
+        prepare_load: impl FnOnce(&str, &str) -> Result<P, lattice_inference::serve::ApiError>,
+        submit_load: impl FnOnce(
+            B,
+            P,
+        ) -> Result<
+            lattice_inference::serve::lora::AdapterControlReceiver,
+            lattice_inference::serve::ApiError,
+        >,
+    ) -> Response {
         let timer = Instant::now();
-        const ROUTE: &str = "/v1/lora/unload";
-        let fail = |err: lattice_inference::serve::ApiError| -> Response {
-            let response = err.into_response();
-            emit_serve_event(
-                &s.metrics,
-                "POST",
-                ROUTE,
-                response.status().as_u16(),
-                None,
-                None,
-                timer.elapsed().as_secs_f64() * 1000.0,
-                false,
-                None,
-            );
-            response
+        let result = lattice_inference::serve::lora::load_request(
+            headers,
+            body,
+            Ok(()),
+            resolve_backend,
+            prepare_load,
+            submit_load,
+        )
+        .await;
+        lora_post_response(metrics, "/v1/lora/load", timer, result)
+    }
+
+    async fn lora_unload_with_backend<B>(
+        metrics: &ServeMetrics,
+        headers: HeaderMap,
+        body: Body,
+        resolve_backend: impl FnOnce() -> Result<B, lattice_inference::serve::ApiError>,
+        submit_unload: impl FnOnce(
+            B,
+            u32,
+        ) -> Result<
+            lattice_inference::serve::lora::AdapterControlReceiver,
+            lattice_inference::serve::ApiError,
+        >,
+    ) -> Response {
+        let timer = Instant::now();
+        let result = lattice_inference::serve::lora::unload_request(
+            headers,
+            body,
+            Ok(()),
+            resolve_backend,
+            submit_unload,
+        )
+        .await;
+        lora_post_response(metrics, "/v1/lora/unload", timer, result)
+    }
+
+    fn lora_post_response(
+        metrics: &ServeMetrics,
+        route: &str,
+        timer: Instant,
+        result: Result<Response, lattice_inference::serve::ApiError>,
+    ) -> Response {
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
         };
-        if let Err(err) = lattice_inference::serve::require_json_content_type(&headers) {
-            return fail(err);
-        }
-        let Ok(bytes) = to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await else {
-            return fail(lattice_inference::serve::ApiError::BadRequest {
-                message: "invalid request body".into(),
-                code: "invalid_request",
-            });
-        };
-        let id = match lattice_inference::serve::lora::parse_lora_unload(&bytes) {
-            Ok(id) => id,
-            Err(err) => return fail(err),
-        };
-        if !supports_adapters(&s) {
-            return fail(lattice_inference::serve::prepare::lora_unsupported_backend());
-        }
-        let receiver = match s.jobs.submit_adapter_command(
-            lattice_inference::serve::metal_worker::AdapterCommand::Unload { id },
-        ) {
-            Ok(receiver) => receiver,
-            Err(err) => return fail(err),
-        };
-        match receiver.await {
-            Ok(Ok(lattice_inference::serve::lora::AdapterControlResult::Unloaded(id))) => {
-                emit_serve_event(
-                    &s.metrics,
-                    "POST",
-                    ROUTE,
-                    200,
-                    None,
-                    None,
-                    timer.elapsed().as_secs_f64() * 1000.0,
-                    false,
-                    None,
-                );
-                Json(lattice_inference::serve::lora::unload_success_body(id)).into_response()
-            }
-            Ok(Err(error)) => fail(error.into()),
-            Ok(Ok(_)) => fail(lattice_inference::serve::lora::worker_unavailable(
-                "unexpected adapter command reply",
-            )),
-            Err(_) => fail(lattice_inference::serve::lora::worker_unavailable(
-                "the inference worker is not running; no adapter was unloaded",
-            )),
+        emit_serve_event(
+            metrics,
+            "POST",
+            route,
+            response.status().as_u16(),
+            None,
+            None,
+            timer.elapsed().as_secs_f64() * 1000.0,
+            false,
+            None,
+        );
+        response
+    }
+
+    fn lora_list_with_backend<B>(
+        resolve_backend: impl FnOnce() -> Result<B, lattice_inference::serve::ApiError>,
+        snapshot: impl FnOnce(B) -> lattice_inference::serve::lora::AdapterIndex,
+    ) -> Response {
+        // Assembled by the shared helper so this binary and `lattice serve`
+        // cannot answer the same route with different shapes (ADR-095
+        // decision 4, item 4).
+        //
+        // `None` because this binary has no `--router-state` yet, so it
+        // reports `{"enabled": false}`: the same shape, honestly filled. The
+        // flags are the next step, not a silent omission.
+        match lattice_inference::serve::lora::list_request(Ok(()), resolve_backend, snapshot, None)
+        {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
         }
     }
 
@@ -3814,59 +3839,10 @@ mod imp {
             None => None,
             Some(embedding_model_arg) => {
                 let embedding_model_dir = resolve_model_dir(&embedding_model_arg);
-                if !embedding_model_dir.exists() {
-                    return Err(format!(
-                        "embedding model directory not found: {}",
-                        embedding_model_dir.display()
-                    )
-                    .into());
-                }
-                eprintln!(
-                    "[lattice_serve] loading embedding model from {} ...",
-                    embedding_model_dir.display()
-                );
-                let mut model = BertModel::from_directory(&embedding_model_dir).map_err(|e| {
-                    format!(
-                        "embedding model load failed ({}): {e}",
-                        embedding_model_dir.display()
-                    )
-                })?;
-                let embedding_model_id: Arc<str> = embedding_model_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("embedding")
-                    .into();
-                // Auto-select the same default `--embedding-pooling` would
-                // otherwise force the operator to pass explicitly. See
-                // `lattice_inference::pool::default_bert_pooling_for_model_name`
-                // for the rule and its agreement test against
-                // `lattice-embed`'s `EmbeddingModel::bert_pooling` table.
-                model.set_pooling(
-                    lattice_inference::pool::default_bert_pooling_for_model_name(
-                        &embedding_model_id,
-                    ),
-                );
-                match parse_arg(&args, "--embedding-pooling").as_deref() {
-                    None => {}
-                    Some("mean") => model.set_pooling(BertPooling::Mean),
-                    Some("cls") => model.set_pooling(BertPooling::CLS),
-                    Some(other) => {
-                        return Err(format!(
-                            "invalid --embedding-pooling '{other}'; expected 'mean' or 'cls'"
-                        )
-                        .into());
-                    }
-                }
-                eprintln!(
-                    "[lattice_serve] embedding model '{embedding_model_id}' ready \
-                     (dimensions={})",
-                    model.dimensions()
-                );
-                Some(Arc::new(EmbeddingState {
-                    model,
-                    model_id: embedding_model_id,
-                    admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
-                }))
+                Some(load_embedding_state(
+                    &embedding_model_dir,
+                    parse_arg(&args, "--embedding-pooling").as_deref(),
+                )?)
             }
         };
 
@@ -3912,6 +3888,287 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        mod bert_pooling_tests {
+            use super::*;
+            use lattice_inference::bert_pooling_fixture::{
+                DIMENSIONS, INPUTS, MAX_POSITIONS, checkpoint_hashes, write_checkpoint,
+            };
+            use std::path::{Path, PathBuf};
+            use tower::ServiceExt as _;
+
+            const MODELS: [(&str, BertPooling); 2] = [
+                ("bge-small-en-v1.5", BertPooling::CLS),
+                ("all-minilm-l6-v2", BertPooling::Mean),
+            ];
+
+            fn fixture(parent: &Path, name: &str) -> PathBuf {
+                let path = parent.join(name);
+                write_checkpoint(&path).expect("deterministic BERT checkpoint must be written");
+                path
+            }
+
+            fn valid_vector(vector: &[f32]) -> bool {
+                vector.len() == DIMENSIONS
+                    && vector.iter().all(|value| value.is_finite())
+                    && vector.iter().any(|&value| value != 0.0)
+            }
+
+            fn assert_vector(actual: &[f32], expected: &[f32]) {
+                assert!(valid_vector(actual), "invalid actual embedding");
+                assert!(valid_vector(expected), "invalid expected embedding");
+                for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                    let tolerance = 1e-5 + 1e-5 * actual.abs().max(expected.abs());
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "embedding lane {index}: {actual} != {expected}"
+                    );
+                }
+            }
+
+            fn distance(left: &[f32], right: &[f32]) -> f64 {
+                assert!(valid_vector(left) && valid_vector(right));
+                left.iter()
+                    .zip(right)
+                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            }
+
+            fn reference(path: &Path, pooling: BertPooling) -> (Vec<f32>, Vec<Vec<f32>>) {
+                let mut model =
+                    BertModel::from_directory(path).expect("reference checkpoint must load");
+                model.set_pooling(pooling);
+                let single = model
+                    .encode(INPUTS[0])
+                    .expect("reference single must encode");
+                let batch = model
+                    .encode_batch(&INPUTS)
+                    .expect("reference batch must encode");
+                let opposite = match pooling {
+                    BertPooling::CLS => BertPooling::Mean,
+                    BertPooling::Mean => BertPooling::CLS,
+                    _ => panic!("fixture must use one of the two registered pooling modes"),
+                };
+                model.set_pooling(opposite);
+                let wrong_single = model
+                    .encode(INPUTS[0])
+                    .expect("opposite single must encode");
+                let wrong_batch = model
+                    .encode_batch(&INPUTS)
+                    .expect("opposite batch must encode");
+                assert!(distance(&single, &wrong_single) >= 1e-3);
+                assert_eq!(batch.len(), INPUTS.len());
+                assert_eq!(wrong_batch.len(), INPUTS.len());
+                for (expected, wrong) in batch.iter().zip(&wrong_batch) {
+                    assert!(
+                        distance(expected, wrong) >= 1e-3,
+                        "pooling fixture is vacuous"
+                    );
+                }
+                for first in 0..batch.len() {
+                    for second in first + 1..batch.len() {
+                        assert!(distance(&batch[first], &batch[second]) >= 1e-3);
+                    }
+                }
+                (single, batch)
+            }
+
+            async fn request(embedding: Arc<EmbeddingState>, input: Value) -> Response {
+                let model_id = embedding.model_id.to_string();
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"input": input, "model": model_id}).to_string(),
+                    ))
+                    .expect("request must build");
+                router(test_app_state_with_embedding(embedding))
+                    .oneshot(request)
+                    .await
+                    .expect("actual router must respond")
+            }
+
+            async fn vectors(
+                response: Response,
+                name: &str,
+                expected_count: usize,
+            ) -> Vec<Vec<f32>> {
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["object"], "list");
+                assert_eq!(value["model"], name);
+                assert!(value["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+                assert_eq!(
+                    value["usage"]["prompt_tokens"],
+                    value["usage"]["total_tokens"]
+                );
+                let rows = value["data"].as_array().unwrap();
+                assert_eq!(rows.len(), expected_count);
+                rows.iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        assert_eq!(row["object"], "embedding");
+                        assert_eq!(row["index"].as_u64().unwrap(), index as u64);
+                        let vector: Vec<f32> =
+                            serde_json::from_value(row["embedding"].clone()).unwrap();
+                        assert!(valid_vector(&vector));
+                        vector
+                    })
+                    .collect()
+            }
+
+            async fn compare_route(
+                embedding: Arc<EmbeddingState>,
+                name: &str,
+                single: &[f32],
+                batch: &[Vec<f32>],
+            ) {
+                let actual =
+                    vectors(request(embedding.clone(), json!(INPUTS[0])).await, name, 1).await;
+                assert_vector(&actual[0], single);
+                let actual =
+                    vectors(request(embedding, json!(INPUTS)).await, name, INPUTS.len()).await;
+                assert_eq!(actual.len(), batch.len());
+                for (actual, expected) in actual.iter().zip(batch) {
+                    assert_vector(actual, expected);
+                }
+            }
+
+            #[tokio::test]
+            async fn embeddings_default_pooling_matches_library_for_single_and_batch() {
+                let temp = tempfile::tempdir().unwrap();
+                let mut hashes = None;
+                for (name, pooling) in MODELS {
+                    let path = fixture(temp.path(), name);
+                    let current = checkpoint_hashes(&path).unwrap();
+                    if let Some(expected) = hashes.as_ref() {
+                        assert_eq!(&current, expected);
+                    }
+                    hashes = Some(current);
+                    let (single, batch) = reference(&path, pooling);
+                    let embedding = load_embedding_state(&path, None).unwrap();
+                    assert_eq!(embedding.model.pooling(), pooling);
+                    compare_route(embedding, name, &single, &batch).await;
+                }
+            }
+
+            #[tokio::test]
+            async fn embeddings_explicit_pooling_override_matches_library() {
+                let temp = tempfile::tempdir().unwrap();
+                for (name, _) in MODELS {
+                    let path = fixture(temp.path(), name);
+                    for (argument, pooling) in
+                        [("cls", BertPooling::CLS), ("mean", BertPooling::Mean)]
+                    {
+                        let (single, batch) = reference(&path, pooling);
+                        let embedding = load_embedding_state(&path, Some(argument)).unwrap();
+                        assert_eq!(embedding.model.pooling(), pooling);
+                        compare_route(embedding, name, &single, &batch).await;
+                    }
+                }
+            }
+
+            #[test]
+            fn embedding_startup_preserves_load_and_override_errors() {
+                let temp = tempfile::tempdir().unwrap();
+                let missing = temp.path().join("missing");
+                assert_eq!(
+                    load_embedding_state(&missing, Some("invalid"))
+                        .err()
+                        .unwrap(),
+                    format!("embedding model directory not found: {}", missing.display())
+                );
+                let malformed = temp.path().join("malformed");
+                std::fs::create_dir(&malformed).unwrap();
+                let load_error = load_embedding_state(&malformed, Some("invalid"))
+                    .err()
+                    .unwrap();
+                assert!(load_error.starts_with(&format!(
+                    "embedding model load failed ({}): ",
+                    malformed.display()
+                )));
+                let path = fixture(temp.path(), MODELS[0].0);
+                assert_eq!(
+                    load_embedding_state(&path, Some("invalid")).err().unwrap(),
+                    "invalid --embedding-pooling 'invalid'; expected 'mean' or 'cls'"
+                );
+            }
+
+            // Regression: the context-window guard used to measure each item's
+            // *post-truncation* token count (`WordPieceTokenizer` truncates to its own
+            // `max_seq_len` during tokenization), and `BertModel::from_directory` derives
+            // that cap as `max_position_embeddings.min(2048)`. For every checkpoint whose
+            // config sets `max_position_embeddings` at or below that 2048 cap -- including
+            // the synthetic fixture below, whose config sets it to `MAX_POSITIONS` (16)
+            // with no `tokenizer_config.json` to raise it -- the two limits are equal by
+            // construction. A post-truncation count can never exceed `max_seq_len`, so the
+            // old `count > max_position_embeddings` test was unsatisfiable and an
+            // over-limit input was silently truncated and embedded instead of rejected.
+            // The `assert_eq!` below pins the fixture in exactly that collision case
+            // (`tokenizer.max_seq_len() == config.max_position_embeddings`), and the
+            // `pre_truncation_len` assertions pin the token counts the guard must compare.
+            // This is a generated checkpoint, not a real `bge-small-en-v1.5` download.
+            pub(super) async fn check_context_window_route() {
+                let temp = tempfile::tempdir().unwrap();
+                let path = fixture(temp.path(), MODELS[0].0);
+                let embedding = load_embedding_state(&path, None).unwrap();
+                assert_eq!(
+                    embedding.model.config().max_position_embeddings,
+                    MAX_POSITIONS
+                );
+                assert_eq!(embedding.model.tokenizer().max_seq_len(), MAX_POSITIONS);
+                let at_limit = "hello ".repeat(MAX_POSITIONS - 2);
+                let over_limit = "hello ".repeat(MAX_POSITIONS - 1);
+                let at_tokens = embedding.model.tokenizer().tokenize(&at_limit);
+                let over_tokens = embedding.model.tokenizer().tokenize(&over_limit);
+                assert_eq!(at_tokens.real_length, MAX_POSITIONS);
+                assert_eq!(at_tokens.pre_truncation_len, MAX_POSITIONS);
+                assert_eq!(over_tokens.real_length, MAX_POSITIONS);
+                assert_eq!(over_tokens.pre_truncation_len, MAX_POSITIONS + 1);
+                let expected = embedding.model.encode(&at_limit).unwrap();
+                let actual = vectors(
+                    request(embedding.clone(), json!(at_limit)).await,
+                    MODELS[0].0,
+                    1,
+                )
+                .await;
+                assert_vector(&actual[0], &expected);
+                let (status, code) =
+                    error_code_of(request(embedding, json!(over_limit)).await).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(code, "context_length_exceeded");
+            }
+
+            #[test]
+            fn pooling_comparison_rejects_nonfinite_wrong_shape_and_wrong_values() {
+                let expected = vec![0.25; DIMENSIONS];
+                assert_vector(&expected, &expected);
+                for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5] {
+                    let mut wrong = expected.clone();
+                    wrong[DIMENSIONS - 1] = value;
+                    assert!(std::panic::catch_unwind(|| assert_vector(&wrong, &expected)).is_err());
+                    assert!(std::panic::catch_unwind(|| assert_vector(&expected, &wrong)).is_err());
+                }
+                assert!(
+                    std::panic::catch_unwind(|| assert_vector(
+                        &expected[..DIMENSIONS - 1],
+                        &expected
+                    ))
+                    .is_err()
+                );
+                assert!(
+                    std::panic::catch_unwind(|| assert_vector(
+                        &expected,
+                        &expected[..DIMENSIONS - 1]
+                    ))
+                    .is_err()
+                );
+            }
+        }
+
         fn input_message(role: String, content: MessageContent) -> InMsg {
             let mut message: InMsg = serde_json::from_str(r#"{"role":"","content":""}"#).unwrap();
             message.role = role;
@@ -4510,6 +4767,403 @@ mod imp {
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        mod lora_orchestration {
+            use super::*;
+            use lattice_inference::serve::lora::{
+                AdapterControlError, AdapterControlReceiver, AdapterControlResult, AdapterIndex,
+                AdapterMetadata, LoraSelection,
+            };
+            use std::cell::Cell;
+
+            fn confirmed_adapter() -> AdapterMetadata {
+                AdapterMetadata {
+                    id: 41,
+                    name: "confirmed-name".into(),
+                    path: "confirmed-path".into(),
+                    rank: 3,
+                    layers: 5,
+                }
+            }
+
+            fn reply_receiver(
+                reply: Option<Result<AdapterControlResult, AdapterControlError>>,
+            ) -> AdapterControlReceiver {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                if let Some(reply) = reply {
+                    sender.send(reply).unwrap();
+                }
+                receiver
+            }
+
+            fn error_body(status: StatusCode, code: &str, message: &str) -> Value {
+                json!({"error": {
+                    "message": message,
+                    "type": if status == StatusCode::SERVICE_UNAVAILABLE {
+                        "server_error"
+                    } else {
+                        "invalid_request_error"
+                    },
+                    "code": code,
+                    "param": null,
+                }})
+            }
+
+            async fn assert_post(
+                response: Response,
+                metrics: &ServeMetrics,
+                route: &str,
+                status: StatusCode,
+                expected: Value,
+            ) {
+                assert_eq!(response.status(), status);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
+                let rendered = metrics.render("test-model", 0);
+                let requests: Vec<_> = rendered
+                    .lines()
+                    .filter(|line| line.starts_with("lattice_http_requests_total{"))
+                    .collect();
+                let request = format!(
+                    "lattice_http_requests_total{{method=\"POST\",route=\"{route}\",status=\"{}\",model=\"test-model\"}} 1",
+                    status.as_u16(),
+                );
+                assert_eq!(requests, [request.as_str()], "{rendered}");
+                let durations: Vec<_> = rendered
+                    .lines()
+                    .filter(|line| line.starts_with("lattice_http_request_duration_seconds_count{"))
+                    .collect();
+                let duration = format!(
+                    "lattice_http_request_duration_seconds_count{{route=\"{route}\",model=\"test-model\"}} 1"
+                );
+                assert_eq!(durations, [duration.as_str()], "{rendered}");
+                assert!(
+                    !rendered
+                        .lines()
+                        .any(|line| line.starts_with("lattice_errors_total{")),
+                    "{rendered}"
+                );
+            }
+
+            async fn run_load(
+                body: Body,
+                failure_stage: &str,
+                reply: Option<Result<AdapterControlResult, AdapterControlError>>,
+            ) -> (Response, ServeMetrics, [usize; 3]) {
+                let metrics = ServeMetrics::default();
+                let calls = [Cell::new(0), Cell::new(0), Cell::new(0)];
+                let response = lora_load_with_backend(
+                    &metrics,
+                    test_json_headers(),
+                    body,
+                    || {
+                        calls[0].set(calls[0].get() + 1);
+                        if failure_stage == "runtime" {
+                            Err(ApiError::BadRequest {
+                                code: "lora_unsupported_backend",
+                                message: "runtime refused".into(),
+                            })
+                        } else {
+                            Ok(7)
+                        }
+                    },
+                    |path, name| {
+                        calls[1].set(calls[1].get() + 1);
+                        assert_eq!((path, name), ("requested-path", "requested-name"));
+                        if failure_stage == "prepare" {
+                            Err(ApiError::BadRequest {
+                                code: "lora_load_failed",
+                                message: "preparation refused".into(),
+                            })
+                        } else {
+                            Ok(("prepared-path", "prepared-name"))
+                        }
+                    },
+                    |backend, prepared| {
+                        calls[2].set(calls[2].get() + 1);
+                        assert_eq!(backend, 7);
+                        assert_eq!(prepared, ("prepared-path", "prepared-name"));
+                        if failure_stage == "submit" {
+                            Err(ApiError::ServiceUnavailable {
+                                message: "control slot occupied".into(),
+                            })
+                        } else {
+                            Ok(reply_receiver(reply))
+                        }
+                    },
+                )
+                .await;
+                (response, metrics, calls.map(|calls| calls.get()))
+            }
+
+            async fn run_unload(
+                failure_stage: &str,
+                reply: Option<Result<AdapterControlResult, AdapterControlError>>,
+            ) -> (Response, ServeMetrics, [usize; 2]) {
+                let metrics = ServeMetrics::default();
+                let calls = [Cell::new(0), Cell::new(0)];
+                let response = lora_unload_with_backend(
+                    &metrics,
+                    test_json_headers(),
+                    Body::from(r#"{"id":7}"#),
+                    || {
+                        calls[0].set(calls[0].get() + 1);
+                        if failure_stage == "runtime" {
+                            Err(ApiError::BadRequest {
+                                code: "lora_unsupported_backend",
+                                message: "runtime refused".into(),
+                            })
+                        } else {
+                            Ok(3)
+                        }
+                    },
+                    |backend, id| {
+                        calls[1].set(calls[1].get() + 1);
+                        assert_eq!((backend, id), (3, 7));
+                        if failure_stage == "submit" {
+                            Err(ApiError::ServiceUnavailable {
+                                message: "control slot occupied".into(),
+                            })
+                        } else {
+                            Ok(reply_receiver(reply))
+                        }
+                    },
+                )
+                .await;
+                (response, metrics, calls.map(|calls| calls.get()))
+            }
+
+            fn load_body() -> Body {
+                Body::from(r#"{"path":"requested-path","name":"requested-name"}"#)
+            }
+
+            #[tokio::test]
+            async fn lora_load_wrapper_preserves_success_and_failures() {
+                const ROUTE: &str = "/v1/lora/load";
+                let (response, metrics, calls) = run_load(
+                    load_body(),
+                    "",
+                    Some(Ok(AdapterControlResult::Loaded(confirmed_adapter()))),
+                )
+                .await;
+                assert_eq!(calls, [1, 1, 1]);
+                assert_post(
+                    response,
+                    &metrics,
+                    ROUTE,
+                    StatusCode::OK,
+                    json!({"object":"lora.adapter","status":"loaded","id":41,
+                        "name":"confirmed-name","path":"confirmed-path","rank":3,"layers":5}),
+                )
+                .await;
+                let (response, metrics, calls) =
+                    run_load(load_body(), "", Some(Err(AdapterControlError::NotFound(7)))).await;
+                assert_eq!(calls, [1, 1, 1]);
+                assert_post(
+                    response,
+                    &metrics,
+                    ROUTE,
+                    StatusCode::BAD_REQUEST,
+                    error_body(
+                        StatusCode::BAD_REQUEST,
+                        "lora_adapter_not_found",
+                        "unknown LoRA adapter id 7",
+                    ),
+                )
+                .await;
+                for (stage, reply, message) in [
+                    (
+                        "",
+                        Some(Ok(AdapterControlResult::Unloaded(99))),
+                        "unexpected adapter command reply",
+                    ),
+                    (
+                        "",
+                        None,
+                        "the inference worker is not running; the adapter was not loaded",
+                    ),
+                    ("submit", None, "control slot occupied"),
+                ] {
+                    let (response, metrics, calls) = run_load(load_body(), stage, reply).await;
+                    assert_eq!(calls, [1, 1, 1]);
+                    assert_post(
+                        response,
+                        &metrics,
+                        ROUTE,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        error_body(StatusCode::SERVICE_UNAVAILABLE, "server_busy", message),
+                    )
+                    .await;
+                }
+                for (stage, calls, code, message) in [
+                    (
+                        "runtime",
+                        [1, 0, 0],
+                        "lora_unsupported_backend",
+                        "runtime refused",
+                    ),
+                    (
+                        "prepare",
+                        [1, 1, 0],
+                        "lora_load_failed",
+                        "preparation refused",
+                    ),
+                ] {
+                    let (response, metrics, observed) = run_load(load_body(), stage, None).await;
+                    assert_eq!(observed, calls);
+                    assert_post(
+                        response,
+                        &metrics,
+                        ROUTE,
+                        StatusCode::BAD_REQUEST,
+                        error_body(StatusCode::BAD_REQUEST, code, message),
+                    )
+                    .await;
+                }
+            }
+
+            #[tokio::test]
+            async fn lora_unload_wrapper_preserves_success_and_failures() {
+                const ROUTE: &str = "/v1/lora/unload";
+                let (response, metrics, calls) =
+                    run_unload("", Some(Ok(AdapterControlResult::Unloaded(41)))).await;
+                assert_eq!(calls, [1, 1]);
+                assert_post(
+                    response,
+                    &metrics,
+                    ROUTE,
+                    StatusCode::OK,
+                    json!({"object":"lora.adapter","status":"unloaded","id":41}),
+                )
+                .await;
+                let (response, metrics, calls) =
+                    run_unload("", Some(Err(AdapterControlError::NotFound(7)))).await;
+                assert_eq!(calls, [1, 1]);
+                assert_post(
+                    response,
+                    &metrics,
+                    ROUTE,
+                    StatusCode::BAD_REQUEST,
+                    error_body(
+                        StatusCode::BAD_REQUEST,
+                        "lora_adapter_not_found",
+                        "unknown LoRA adapter id 7",
+                    ),
+                )
+                .await;
+                for (stage, reply, message) in [
+                    (
+                        "",
+                        Some(Ok(AdapterControlResult::Loaded(confirmed_adapter()))),
+                        "unexpected adapter command reply",
+                    ),
+                    (
+                        "",
+                        None,
+                        "the inference worker is not running; no adapter was unloaded",
+                    ),
+                    ("submit", None, "control slot occupied"),
+                ] {
+                    let (response, metrics, calls) = run_unload(stage, reply).await;
+                    assert_eq!(calls, [1, 1]);
+                    assert_post(
+                        response,
+                        &metrics,
+                        ROUTE,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        error_body(StatusCode::SERVICE_UNAVAILABLE, "server_busy", message),
+                    )
+                    .await;
+                }
+                let (response, metrics, calls) = run_unload("runtime", None).await;
+                assert_eq!(calls, [1, 0]);
+                assert_post(
+                    response,
+                    &metrics,
+                    ROUTE,
+                    StatusCode::BAD_REQUEST,
+                    error_body(
+                        StatusCode::BAD_REQUEST,
+                        "lora_unsupported_backend",
+                        "runtime refused",
+                    ),
+                )
+                .await;
+            }
+
+            #[tokio::test]
+            async fn lora_list_wrapper_preserves_confirmed_snapshot() {
+                let calls = [Cell::new(0), Cell::new(0)];
+                let response = lora_list_with_backend(
+                    || {
+                        calls[0].set(calls[0].get() + 1);
+                        Ok(7)
+                    },
+                    |backend| {
+                        calls[1].set(calls[1].get() + 1);
+                        assert_eq!(backend, 7);
+                        AdapterIndex {
+                            adapters: vec![confirmed_adapter()],
+                            applied: vec![
+                                serde_json::from_value::<LoraSelection>(json!({
+                                    "id": 41,
+                                    "scale": 0.25,
+                                }))
+                                .unwrap(),
+                            ],
+                            blend_refusal: None,
+                        }
+                    },
+                );
+                assert_eq!(calls.map(|calls| calls.get()), [1, 1]);
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
+                    json!({"adapters":[{"id":41,"name":"confirmed-name","path":"confirmed-path",
+                        "rank":3,"layers":5}],"applied":[{"id":41,"scale":0.25}],
+                        "router":{"enabled":false}}),
+                );
+                let snapshot_calls = Cell::new(0);
+                let response = lora_list_with_backend(
+                    || {
+                        Err::<(), _>(ApiError::BadRequest {
+                            code: "lora_unsupported_backend",
+                            message: "runtime refused".into(),
+                        })
+                    },
+                    |_| {
+                        snapshot_calls.set(snapshot_calls.get() + 1);
+                        AdapterIndex::default()
+                    },
+                );
+                assert_eq!(snapshot_calls.get(), 0);
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
+                    error_body(
+                        StatusCode::BAD_REQUEST,
+                        "lora_unsupported_backend",
+                        "runtime refused"
+                    )
+                );
+                let state = test_app_state();
+                assert_eq!(
+                    lora_list(State(state.clone())).await.status(),
+                    StatusCode::OK
+                );
+                let metrics = state.metrics.render(&state.model_id, 0);
+                assert!(
+                    !metrics
+                        .lines()
+                        .any(|line| line.starts_with("lattice_http_requests_total{")
+                            || line.starts_with("lattice_http_request_duration_seconds_count{")),
+                    "{metrics}"
+                );
+            }
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         mod adapter_runtime_admission_order {
             use super::*;
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4630,7 +5284,12 @@ mod imp {
                             "unsupported_media_type",
                             "Content-Type must be application/json".to_string(),
                         ),
-                        "oversize" | "stream_failure" => (
+                        "oversize" => (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "request_body_too_large",
+                            "request body exceeds 1 MiB limit".into(),
+                        ),
+                        "stream_failure" => (
                             StatusCode::BAD_REQUEST,
                             "invalid_request",
                             "invalid request body".into(),
@@ -5112,44 +5771,10 @@ mod imp {
             assert_eq!(code, "model_not_found");
         }
 
-        // Regression: the context-window guard used to measure each item's
-        // *post-truncation* token count (`WordPieceTokenizer` truncates to
-        // its own `max_seq_len` during tokenization), and `BertModel::
-        // from_directory` sets `max_seq_len = max_position_embeddings.min(
-        // 2048)`, so for every real BERT checkpoint loaded that way the two
-        // are equal by construction. A post-truncation count can never
-        // exceed `max_seq_len`, so the old `count > max_position_embeddings`
-        // test was unsatisfiable and an over-limit input was silently
-        // truncated and embedded instead of rejected. This fixture (a real
-        // `bge-small-en-v1.5` checkpoint, `max_position_embeddings: 512`,
-        // no `tokenizer_config.json` to set a different `model_max_length`)
-        // sits exactly in that collision case -- see the `assert_eq!` below.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
-        #[ignore = "requires LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR"]
         async fn embeddings_item_over_context_window_400() {
-            let Some(embedding) = test_embedding_state() else {
-                return;
-            };
-            assert_eq!(
-                embedding.model.tokenizer().max_seq_len(),
-                embedding.model.config().max_position_embeddings,
-                "fixture must sit in the collision case (tokenizer max_seq_len == \
-                 model max_position_embeddings) or this regression guards nothing"
-            );
-            // Comfortably above the 512-token window regardless of the
-            // loaded checkpoint's exact vocabulary.
-            let over_limit_text = "hello ".repeat(600);
-            let body = Body::from(serde_json::json!({ "input": over_limit_text }).to_string());
-            let response = embeddings(
-                State(test_app_state_with_embedding(embedding)),
-                test_json_headers(),
-                body,
-            )
-            .await;
-            let (status, code) = error_code_of(response).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(code, "context_length_exceeded");
+            bert_pooling_tests::check_context_window_route().await;
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
