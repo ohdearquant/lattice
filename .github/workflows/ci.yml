@@ -1046,7 +1046,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-prefill-gdn-refusal.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1067,7 +1067,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-prefix-cache-grammar-rejection.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_saves_consistent_boundary' \
+            'forward::metal_qwen35::inner::tests::grammar::generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_saves_consistent_boundary' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1115,7 +1115,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-gdn-qk-eps-scale.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::gdn_850_failclosed::gdn_qk_l2_norm_is_not_scale_invariant_1583' \
+            'forward::metal_qwen35::inner::tests::gdn_chunked_scan::gdn_850_failclosed::gdn_qk_l2_norm_is_not_scale_invariant_1583' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1132,7 +1132,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-gdn-qk-eps-cliff.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::gdn_850_failclosed::gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583' \
+            'forward::metal_qwen35::inner::tests::gdn_chunked_scan::gdn_850_failclosed::gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1176,7 +1176,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-mtp-cursor-preflight.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::mtp_verifier_boundaries_reject_mismatched_live_cursor' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::mtp_verifier_boundaries_reject_mismatched_live_cursor' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1195,7 +1195,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-raw-step-cursor-preflight.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::raw_step_with_mtp_rejects_stale_live_cursor_without_mutation' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::raw_step_with_mtp_rejects_stale_live_cursor_without_mutation' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1214,7 +1214,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-raw-prefill-fresh-session.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::raw_prefills_with_mtp_reject_live_session_without_mutation' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::raw_prefills_with_mtp_reject_live_session_without_mutation' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1235,7 +1235,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-bench-prefill-cursor-preflight.log"
           if cargo test -p lattice-inference --features f16,metal-gpu,bench-internals --lib \
-            'forward::metal_qwen35::inner::tests::bench_prefill_helpers_reject_stale_cursor_without_mutation' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::bench_prefill_helpers_reject_stale_cursor_without_mutation' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1258,7 +1258,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-step-proof.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1275,7 +1275,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-prefill-proof.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1295,7 +1295,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-hybrid-gdn-proof.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
