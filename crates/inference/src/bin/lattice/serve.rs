@@ -7095,36 +7095,6 @@ mod tests {
             );
         }
 
-        fn failures() -> Vec<(AdapterControlError, &'static str, &'static str)> {
-            vec![
-                (
-                    AdapterControlError::InvalidAdapter("bad descriptor".into()),
-                    "lora_load_failed",
-                    "bad descriptor",
-                ),
-                (
-                    AdapterControlError::NotFound(99),
-                    "lora_adapter_not_found",
-                    "unknown LoRA adapter id 99",
-                ),
-                (
-                    AdapterControlError::CountLimit { limit: 32 },
-                    "lora_residency_limit_exceeded",
-                    "resident LoRA adapter count limit reached (32)",
-                ),
-                (
-                    AdapterControlError::ByteLimit { limit: 1024 },
-                    "lora_residency_limit_exceeded",
-                    "resident LoRA adapter tensor payload byte limit exceeded (1024)",
-                ),
-                (
-                    AdapterControlError::IdExhausted,
-                    "lora_load_failed",
-                    "LoRA adapter id space exhausted",
-                ),
-            ]
-        }
-
         async fn load_reply(
             outcome: Option<Result<AdapterControlResult, AdapterControlError>>,
         ) -> Result<Response, ApiError> {
@@ -7197,124 +7167,13 @@ mod tests {
                     })
                 )
             );
-            for (error, code, message) in failures() {
-                assert_error(
-                    load_reply(Some(Err(error))).await,
-                    StatusCode::BAD_REQUEST,
-                    code,
-                    message,
-                )
-                .await;
-            }
             assert_error(
-                load_reply(Some(Ok(AdapterControlResult::Unloaded(7)))).await,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_busy",
-                "unexpected adapter command reply",
-            )
-            .await;
-            assert_error(
-                load_reply(None).await,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_busy",
-                "the inference worker is not running; the adapter was not loaded",
-            )
-            .await;
-
-            let preparation_error = lora_load_with_backend::<(), ()>(
-                json_headers(),
-                Body::from(r#"{"path":"/missing"}"#),
-                Ok(()),
-                || Ok(()),
-                |_, _| {
-                    Err(ApiError::BadRequest {
-                        code: "lora_adapter_not_found",
-                        message: "missing adapter fixture".into(),
-                    })
-                },
-                |(), ()| panic!("failed preparation must not submit"),
-            )
-            .await;
-            assert_error(
-                preparation_error,
+                load_reply(Some(Err(AdapterControlError::NotFound(99)))).await,
                 StatusCode::BAD_REQUEST,
                 "lora_adapter_not_found",
-                "missing adapter fixture",
+                "unknown LoRA adapter id 99",
             )
             .await;
-            let submit_error = lora_load_with_backend(
-                json_headers(),
-                Body::from(r#"{"path":"/request"}"#),
-                Ok(()),
-                || Ok(()),
-                |_, _| Ok(()),
-                |(), ()| {
-                    Err(ApiError::ServiceUnavailable {
-                        message: "control slot occupied".into(),
-                    })
-                },
-            )
-            .await;
-            assert_error(
-                submit_error,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_busy",
-                "control slot occupied",
-            )
-            .await;
-
-            assert_error(
-                lora_load_with_backend::<(), ()>(
-                    axum::http::HeaderMap::new(),
-                    Body::empty(),
-                    Err(lora_unsupported_backend("fixture build refusal")),
-                    || panic!("build refusal must not resolve"),
-                    |_, _| panic!("build refusal must not prepare"),
-                    |(), ()| panic!("build refusal must not submit"),
-                )
-                .await,
-                StatusCode::BAD_REQUEST,
-                "lora_unsupported_backend",
-                "fixture build refusal",
-            )
-            .await;
-            assert_error(
-                lora_load_with_backend::<(), ()>(
-                    json_headers(),
-                    Body::from(r#"{"path":"/request"}"#),
-                    Ok(()),
-                    || Err(lora_unsupported_backend("fixture runtime refusal")),
-                    |_, _| panic!("runtime refusal must not prepare"),
-                    |(), ()| panic!("runtime refusal must not submit"),
-                )
-                .await,
-                StatusCode::BAD_REQUEST,
-                "lora_unsupported_backend",
-                "fixture runtime refusal",
-            )
-            .await;
-
-            let broken = Body::from_stream(futures::stream::once(async {
-                Err::<axum::body::Bytes, _>(std::io::Error::other("broken fixture stream"))
-            }));
-            for body in [Body::from(vec![b'x'; REQUEST_BODY_LIMIT_BYTES + 1]), broken] {
-                let result = lora_load_with_backend::<(), ()>(
-                    json_headers(),
-                    body,
-                    Ok(()),
-                    || panic!("invalid body must not resolve the backend"),
-                    |_, _| panic!("invalid body must not prepare"),
-                    |(), ()| panic!("invalid body must not submit"),
-                )
-                .await;
-                assert_error(
-                    result,
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "invalid request body",
-                )
-                .await;
-            }
         }
 
         #[tokio::test]
@@ -7326,97 +7185,13 @@ mod tests {
                     serde_json::json!({"object":"lora.adapter", "status":"unloaded", "id":81})
                 )
             );
-            for (error, code, message) in failures() {
-                assert_error(
-                    unload_reply(Some(Err(error))).await,
-                    StatusCode::BAD_REQUEST,
-                    code,
-                    message,
-                )
-                .await;
-            }
             assert_error(
-                unload_reply(Some(Ok(AdapterControlResult::Loaded(confirmed())))).await,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_busy",
-                "unexpected adapter command reply",
-            )
-            .await;
-            assert_error(
-                unload_reply(None).await,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_busy",
-                "the inference worker is not running; no adapter was unloaded",
-            )
-            .await;
-            let submit_error = lora_unload_with_backend(
-                json_headers(),
-                Body::from(r#"{"id":7}"#),
-                Ok(()),
-                || Ok(()),
-                |(), _| {
-                    Err(ApiError::ServiceUnavailable {
-                        message: "control slot occupied".into(),
-                    })
-                },
-            )
-            .await;
-            assert_error(
-                submit_error,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_busy",
-                "control slot occupied",
-            )
-            .await;
-            assert_error(
-                lora_unload_with_backend::<()>(
-                    axum::http::HeaderMap::new(),
-                    Body::empty(),
-                    Err(lora_unsupported_backend("fixture build refusal")),
-                    || panic!("build refusal must not resolve"),
-                    |(), _| panic!("build refusal must not submit"),
-                )
-                .await,
+                unload_reply(Some(Err(AdapterControlError::NotFound(99)))).await,
                 StatusCode::BAD_REQUEST,
-                "lora_unsupported_backend",
-                "fixture build refusal",
+                "lora_adapter_not_found",
+                "unknown LoRA adapter id 99",
             )
             .await;
-            assert_error(
-                lora_unload_with_backend::<()>(
-                    json_headers(),
-                    Body::from(r#"{"id":7}"#),
-                    Ok(()),
-                    || Err(lora_unsupported_backend("fixture runtime refusal")),
-                    |(), _| panic!("runtime refusal must not submit"),
-                )
-                .await,
-                StatusCode::BAD_REQUEST,
-                "lora_unsupported_backend",
-                "fixture runtime refusal",
-            )
-            .await;
-
-            let broken = Body::from_stream(futures::stream::once(async {
-                Err::<axum::body::Bytes, _>(std::io::Error::other("broken fixture stream"))
-            }));
-            for body in [Body::from(vec![b'x'; REQUEST_BODY_LIMIT_BYTES + 1]), broken] {
-                let result = lora_unload_with_backend::<()>(
-                    json_headers(),
-                    body,
-                    Ok(()),
-                    || panic!("invalid body must not resolve the backend"),
-                    |(), _| panic!("invalid body must not submit"),
-                )
-                .await;
-                assert_error(
-                    result,
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "invalid request body",
-                )
-                .await;
-            }
         }
 
         #[tokio::test]

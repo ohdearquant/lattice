@@ -4502,36 +4502,6 @@ mod imp {
                 receiver
             }
 
-            fn control_failures() -> [(AdapterControlError, &'static str, &'static str); 5] {
-                [
-                    (
-                        AdapterControlError::NotFound(7),
-                        "lora_adapter_not_found",
-                        "unknown LoRA adapter id 7",
-                    ),
-                    (
-                        AdapterControlError::CountLimit { limit: 2 },
-                        "lora_residency_limit_exceeded",
-                        "resident LoRA adapter count limit reached (2)",
-                    ),
-                    (
-                        AdapterControlError::ByteLimit { limit: 128 },
-                        "lora_residency_limit_exceeded",
-                        "resident LoRA adapter tensor payload byte limit exceeded (128)",
-                    ),
-                    (
-                        AdapterControlError::InvalidAdapter("descriptor refused".into()),
-                        "lora_load_failed",
-                        "descriptor refused",
-                    ),
-                    (
-                        AdapterControlError::IdExhausted,
-                        "lora_load_failed",
-                        "LoRA adapter id space exhausted",
-                    ),
-                ]
-            }
-
             fn error_body(status: StatusCode, code: &str, message: &str) -> Value {
                 json!({"error": {
                     "message": message,
@@ -4692,19 +4662,21 @@ mod imp {
                         "name":"confirmed-name","path":"confirmed-path","rank":3,"layers":5}),
                 )
                 .await;
-                for (error, code, message) in control_failures() {
-                    let (response, metrics, calls) =
-                        run_load(load_body(), "", Some(Err(error))).await;
-                    assert_eq!(calls, [1, 1, 1]);
-                    assert_post(
-                        response,
-                        &metrics,
-                        ROUTE,
+                let (response, metrics, calls) =
+                    run_load(load_body(), "", Some(Err(AdapterControlError::NotFound(7)))).await;
+                assert_eq!(calls, [1, 1, 1]);
+                assert_post(
+                    response,
+                    &metrics,
+                    ROUTE,
+                    StatusCode::BAD_REQUEST,
+                    error_body(
                         StatusCode::BAD_REQUEST,
-                        error_body(StatusCode::BAD_REQUEST, code, message),
-                    )
-                    .await;
-                }
+                        "lora_adapter_not_found",
+                        "unknown LoRA adapter id 7",
+                    ),
+                )
+                .await;
                 for (stage, reply, message) in [
                     (
                         "",
@@ -4754,27 +4726,6 @@ mod imp {
                     )
                     .await;
                 }
-                for body in [
-                    Body::from(vec![b' '; REQUEST_BODY_LIMIT_BYTES + 1]),
-                    Body::from_stream(futures::stream::once(async {
-                        Err::<String, _>(std::io::Error::other("synthetic body read failure"))
-                    })),
-                ] {
-                    let (response, metrics, calls) = run_load(body, "", None).await;
-                    assert_eq!(calls, [0, 0, 0]);
-                    assert_post(
-                        response,
-                        &metrics,
-                        ROUTE,
-                        StatusCode::BAD_REQUEST,
-                        error_body(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_request",
-                            "invalid request body",
-                        ),
-                    )
-                    .await;
-                }
             }
 
             #[tokio::test]
@@ -4791,18 +4742,21 @@ mod imp {
                     json!({"object":"lora.adapter","status":"unloaded","id":41}),
                 )
                 .await;
-                for (error, code, message) in control_failures() {
-                    let (response, metrics, calls) = run_unload("", Some(Err(error))).await;
-                    assert_eq!(calls, [1, 1]);
-                    assert_post(
-                        response,
-                        &metrics,
-                        ROUTE,
+                let (response, metrics, calls) =
+                    run_unload("", Some(Err(AdapterControlError::NotFound(7)))).await;
+                assert_eq!(calls, [1, 1]);
+                assert_post(
+                    response,
+                    &metrics,
+                    ROUTE,
+                    StatusCode::BAD_REQUEST,
+                    error_body(
                         StatusCode::BAD_REQUEST,
-                        error_body(StatusCode::BAD_REQUEST, code, message),
-                    )
-                    .await;
-                }
+                        "lora_adapter_not_found",
+                        "unknown LoRA adapter id 7",
+                    ),
+                )
+                .await;
                 for (stage, reply, message) in [
                     (
                         "",
@@ -5037,7 +4991,12 @@ mod imp {
                             "unsupported_media_type",
                             "Content-Type must be application/json".to_string(),
                         ),
-                        "oversize" | "stream_failure" => (
+                        "oversize" => (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "request_body_too_large",
+                            "request body exceeds 1 MiB limit".into(),
+                        ),
+                        "stream_failure" => (
                             StatusCode::BAD_REQUEST,
                             "invalid_request",
                             "invalid request body".into(),

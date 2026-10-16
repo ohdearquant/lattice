@@ -472,9 +472,19 @@ async fn adapter_request_bytes(
     super::require_json_content_type(headers)?;
     axum::body::to_bytes(body, super::REQUEST_BODY_LIMIT_BYTES)
         .await
-        .map_err(|_| ApiError::BadRequest {
-            message: "invalid request body".into(),
-            code: "invalid_request",
+        .map_err(|err| {
+            let is_length_limit = std::error::Error::source(&err)
+                .is_some_and(<dyn std::error::Error>::is::<http_body_util::LengthLimitError>);
+            if is_length_limit {
+                return ApiError::PayloadTooLarge {
+                    message: "request body exceeds 1 MiB limit".into(),
+                };
+            }
+            eprintln!("invalid request body: {err}");
+            ApiError::BadRequest {
+                message: "invalid request body".into(),
+                code: "invalid_request",
+            }
         })
 }
 
@@ -1104,22 +1114,34 @@ mod orchestration_tests {
     }
 
     #[tokio::test]
-    async fn body_failures_precede_backend_and_keep_the_shared_error() {
+    async fn an_oversized_body_precedes_backend_and_is_refused_as_too_large() {
         for load in [true, false] {
             let oversized = Body::from(vec![b' '; super::super::REQUEST_BODY_LIMIT_BYTES + 1]);
+            let error = before_backend(load, json_headers(), oversized, Ok(())).await;
+            assert_error(
+                error,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_body_too_large",
+                "request body exceeds 1 MiB limit",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broken_body_precedes_backend_and_keeps_the_shared_error() {
+        for load in [true, false] {
             let broken = Body::from_stream(futures::stream::once(async {
                 Err::<Bytes, _>(std::io::Error::other("broken body"))
             }));
-            for body in [oversized, broken] {
-                let error = before_backend(load, json_headers(), body, Ok(())).await;
-                assert_error(
-                    error,
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "invalid request body",
-                )
-                .await;
-            }
+            let error = before_backend(load, json_headers(), broken, Ok(())).await;
+            assert_error(
+                error,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invalid request body",
+            )
+            .await;
         }
     }
 

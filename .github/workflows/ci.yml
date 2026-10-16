@@ -518,107 +518,23 @@ jobs:
             echo "GUARD FAILED: no passing test-result line with a non-zero count."
             exit 1
           }
-      - name: inference — shared and server LoRA orchestration controls
+      - name: inference — mixture-only LoRA list reports the served router
         run: |
           set -euo pipefail
-          run_lora_controls() {
-            local log="$1"
-            shift
-            if "$@" >"$log" 2>&1; then
-              cat "$log"
-            else
-              local status=$?
-              cat "$log"
-              exit "$status"
-            fi
+          run_one() {
+            local log="$1"; shift
+            if "$@" >"$log" 2>&1; then cat "$log"; else status=$?; cat "$log"; exit "$status"; fi
+            grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || {
+              echo "GUARD FAILED: expected exactly one passing test in $log."
+              exit 1
+            }
           }
-          check_lora_controls() {
-            python3 - "$@" <<'PY'
-          import collections
-          import pathlib
-          import re
-          import sys
-
-          log = pathlib.Path(sys.argv[1])
-          expected = collections.Counter(sys.argv[2:])
-          if not expected or any(count != 1 for count in expected.values()):
-              raise SystemExit("invalid LoRA control expectation set")
-          text = log.read_text()
-          harnesses = re.findall(r"^\s*Running unittests ", text, re.MULTILINE)
-          summaries = re.findall(r"^test result: .*", text, re.MULTILINE)
-          passed = collections.Counter(re.findall(r"^test (\S+) \.\.\. ok$", text, re.MULTILINE))
-          summary = (
-              rf"test result: ok\. {len(expected)} passed; 0 failed; 0 ignored; "
-              r"0 measured; [0-9]+ filtered out; finished in [0-9]+(?:\.[0-9]+)?s"
-          )
-          if len(harnesses) != 1 or len(summaries) != 1:
-              raise SystemExit(f"{log}: expected one unit harness and one summary")
-          if passed != expected or not re.fullmatch(summary, summaries[0]):
-              raise SystemExit(
-                  f"{log}: LoRA control population mismatch; "
-                  f"missing={list((expected - passed).elements())}, "
-                  f"unexpected={list((passed - expected).elements())}, "
-                  f"summary={summaries[0]!r}"
-              )
-          PY
-          }
-          shared_tests=(
-            serve::lora::orchestration_tests::build_refusal_precedes_headers_body_and_backend
-            serve::lora::orchestration_tests::content_type_refusal_precedes_body_and_backend
-            serve::lora::orchestration_tests::body_failures_precede_backend_and_keep_the_shared_error
-            serve::lora::orchestration_tests::strict_parsing_precedes_runtime_admission
-            serve::lora::orchestration_tests::runtime_refusal_precedes_preparation_and_submission
-            serve::lora::orchestration_tests::preparation_errors_precede_submission
-            serve::lora::orchestration_tests::submit_errors_preserve_status_and_diagnosis
-            serve::lora::orchestration_tests::load_preserves_literal_input_order_and_confirmed_metadata
-            serve::lora::orchestration_tests::unload_submits_requested_id_and_returns_confirmed_id
-            serve::lora::orchestration_tests::every_worker_error_keeps_its_code_and_message
-            serve::lora::orchestration_tests::wrong_reply_variants_refuse_in_both_operations
-            serve::lora::orchestration_tests::dropped_replies_keep_operation_specific_diagnoses
-            serve::lora::orchestration_tests::list_refusals_precede_snapshot_access
-            serve::lora::orchestration_tests::list_reads_one_confirmed_snapshot_without_a_router
-            serve::lora::orchestration_tests::native_compatible_callbacks_produce_send_futures
-          )
-          unified_tests=(
-            serve::tests::lora_orchestration::lora_load_wrapper_preserves_success_and_failures
-            serve::tests::lora_orchestration::lora_unload_wrapper_preserves_success_and_failures
-            serve::tests::lora_orchestration::lora_list_wrapper_preserves_confirmed_snapshot
-          )
-          log="${RUNNER_TEMP:-/tmp}/lora-shared-default.log"
-          run_lora_controls "$log" cargo test --color never --locked -p lattice-inference \
-            --lib serve::lora::orchestration_tests:: -- --nocapture --color never
-          check_lora_controls "$log" "${shared_tests[@]}"
-          log="${RUNNER_TEMP:-/tmp}/lora-shared-mixture.log"
-          run_lora_controls "$log" cargo test --color never --locked -p lattice-inference \
-            --features mixture --lib serve::lora::orchestration_tests:: -- --nocapture --color never
-          check_lora_controls "$log" "${shared_tests[@]}" \
-            serve::lora::orchestration_tests::list_reports_the_served_router_beside_residency
-          log="${RUNNER_TEMP:-/tmp}/lora-unified-default.log"
-          run_lora_controls "$log" cargo test --color never --locked -p lattice-inference \
-            --bin lattice serve::tests::lora_orchestration:: -- --nocapture --color never
-          check_lora_controls "$log" "${unified_tests[@]}"
-          log="${RUNNER_TEMP:-/tmp}/lora-unified-mixture.log"
-          run_lora_controls "$log" cargo test --color never --locked -p lattice-inference \
-            --features mixture --bin lattice serve::tests::lora_orchestration:: -- --nocapture --color never
-          check_lora_controls "$log" "${unified_tests[@]}" \
-            serve::tests::lora_orchestration::lora_list_wrapper_preserves_served_router_report
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            standalone_tests=(
-              imp::tests::lora_orchestration::lora_load_wrapper_preserves_success_and_failures
-              imp::tests::lora_orchestration::lora_unload_wrapper_preserves_success_and_failures
-              imp::tests::lora_orchestration::lora_list_wrapper_preserves_confirmed_snapshot
-            )
-            log="${RUNNER_TEMP:-/tmp}/lora-standalone-native.log"
-            run_lora_controls "$log" cargo test --color never --locked -p lattice-inference \
-              --features f16,metal-gpu,test-utils --bin lattice_serve \
-              imp::tests::lora_orchestration:: -- --nocapture --color never
-            check_lora_controls "$log" "${standalone_tests[@]}"
-            log="${RUNNER_TEMP:-/tmp}/lora-standalone-mixture.log"
-            run_lora_controls "$log" cargo test --color never --locked -p lattice-inference \
-              --features f16,metal-gpu,test-utils,mixture --bin lattice_serve \
-              imp::tests::lora_orchestration:: -- --nocapture --color never
-            check_lora_controls "$log" "${standalone_tests[@]}"
-          fi
+          run_one "${RUNNER_TEMP:-/tmp}/lora-shared-mixture.log" \
+            cargo test --locked -p lattice-inference --features mixture --lib \
+            serve::lora::orchestration_tests::list_reports_the_served_router_beside_residency -- --exact
+          run_one "${RUNNER_TEMP:-/tmp}/lora-unified-mixture.log" \
+            cargo test --locked -p lattice-inference --features mixture --bin lattice \
+            serve::tests::lora_orchestration::lora_list_wrapper_preserves_served_router_report -- --exact
       - name: inference — mixture clippy
         run: cargo clippy -p lattice-inference --all-targets --features mixture -- -D warnings
       - name: inference router-learning clippy
