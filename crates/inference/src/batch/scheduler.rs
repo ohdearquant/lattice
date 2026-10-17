@@ -26,8 +26,10 @@ pub struct SchedulerDecision {
     /// Sequences whose next prefill chunk should run this iteration.
     ///
     /// Each entry is `(seq_id, chunk_start, chunk_len)` where `chunk_start`
-    /// is the token index into the original prompt at which to begin, and
-    /// `chunk_len` is the number of tokens to process.
+    /// is the token index into the original prompt at which to begin, or
+    /// `usize::MAX` to use the cursor from sequence state. `FifoScheduler`
+    /// uses zero for new admissions and `usize::MAX` for continuations.
+    /// `chunk_len` is the maximum number of prompt tokens to process.
     pub prefill: Vec<(SeqId, usize, usize)>,
 
     /// Sequences ready for a single decode step.
@@ -56,8 +58,9 @@ pub trait Scheduler: Send {
     ///
     /// # Arguments
     ///
-    /// * `waiting` — Sequence IDs in `Prefilling` state (not yet decoding).
-    /// * `running` — Sequence IDs in `Decoding` state.
+    /// * `waiting` — Already admitted sequence IDs in `Prefilling` state,
+    ///   each holding a GDN slot. Excludes IDs still in the admission queue.
+    /// * `running` — Admitted sequence IDs in `Decoding` state, holding GDN slots.
     /// * `kv_free_pages` — Number of unallocated KV cache pages.
     /// * `gdn_free_slots` — Number of unallocated GDN state slots.
     fn select_batch(
@@ -81,11 +84,11 @@ pub trait Scheduler: Send {
 /// # Policy
 ///
 /// - Decode slots fill first (bandwidth-bound, low latency impact).
-/// - One prefill chunk is admitted per waiting sequence per iteration,
+/// - One prefill chunk is scheduled per admitted prefilling sequence per iteration,
 ///   bounded by `config.chunk_size`.
 /// - New sequences are admitted only when:
 ///   1. `running + waiting < max_batch_size`
-///   2. `kv_free_pages >= prefill_reserve_pages`
+///   2. `kv_free_pages >= prefill_reserve_pages` or no sequences are active
 ///   3. a GDN state slot is free (one new admission consumes exactly one slot)
 /// - No eviction in Phase 1: when capacity is low, the waiting queue grows.
 ///
@@ -155,8 +158,8 @@ impl Scheduler for FifoScheduler {
         };
         for _ in 0..admit_limit {
             if let Some(seq_id) = self.admission_queue.pop_front() {
-                // The worker is responsible for actually transitioning the sequence
-                // into the manager; we just indicate it should start this iteration.
+                // The worker already tracks the request and allocates its GDN slot
+                // when this first prefill chunk executes.
                 decision.prefill.push((seq_id, 0, self.config.chunk_size));
             } else {
                 break;
@@ -173,24 +176,14 @@ impl Scheduler for FifoScheduler {
             decision.decode.push(seq_id);
         }
 
-        // Schedule remaining chunks for sequences already in prefilling state.
-        // These are sequences the worker told us are still chunked-prefilling.
-        // The worker passes their current `chunk_start` via `waiting`; here we
-        // produce the (seq_id, chunk_start, chunk_len) tuple.
-        //
-        // Note: `waiting` contains seq_ids whose chunk_start is tracked by the
-        // worker (in SequenceManager). The scheduler provides chunk_size; the
-        // worker computes the actual chunk extent.
-        //
-        // We avoid re-adding newly-admitted sequences (they are already in
-        // `decision.prefill`). Newly admitted IDs came from `admission_queue`,
-        // not from `waiting`.
+        // Continuations already hold slots, so admission pressure must not
+        // prevent them from advancing and eventually releasing those slots.
         let admitted_ids: std::collections::HashSet<SeqId> =
             decision.prefill.iter().map(|&(id, _, _)| id).collect();
 
         for &seq_id in waiting {
             if !admitted_ids.contains(&seq_id) {
-                // chunk_start is unknown to the scheduler; use 0 as a sentinel.
+                // chunk_start is unknown to the scheduler; use usize::MAX as a sentinel.
                 // The worker substitutes the real chunk_start from SequenceManager.
                 decision
                     .prefill

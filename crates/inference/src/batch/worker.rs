@@ -6,12 +6,11 @@
 //! GDN state for one concurrent sequence.
 //!
 //! [`BatchWorker`] drives the iteration loop:
-//! 1. Drain evictions notified by the scheduler.
-//! 2. Admit newly enqueued sequences into [`SequenceManager`].
-//! 3. Call [`Scheduler::select_batch`] with current state counts.
-//! 4. Execute one prefill chunk per prefilling sequence.
-//! 5. Execute one decode step per decoding sequence.
-//! 6. Evict finished sequences and return their KV pages to the pool.
+//! 1. Call [`Scheduler::select_batch`] with admitted prefilling and decoding IDs.
+//! 2. Drain evictions notified by the scheduler.
+//! 3. Allocate GDN slots for new admissions and execute the selected prefill chunks.
+//! 4. Execute one decode step per decoding sequence.
+//! 5. Evict finished sequences and return their KV pages to the pool.
 //!
 //! The actual forward pass (transformer layers, KV cache writes, logit
 //! projection) is provided by a caller-supplied `ForwardFn` closure, keeping
@@ -367,7 +366,7 @@ impl BatchWorker {
     /// Submit a new inference request.
     ///
     /// Returns the [`SeqId`] assigned to this request. The actual forward pass
-    /// will begin on the next call to `step`.
+    /// begins on a later call to `step` when admission capacity allows.
     ///
     /// Returns `None` if the request is invalid (empty prompt, exceeds
     /// `max_seq_len`).
@@ -422,6 +421,9 @@ impl BatchWorker {
     ) -> Vec<InferenceToken> {
         // 1. Collect current waiting / running IDs.
         let mut waiting = self.seq_manager.ids_in_state_prefilling();
+        // Submitted requests are already in the manager, but only slot owners
+        // have left the admission queue and may receive continuation chunks.
+        waiting.retain(|&seq_id| self.gdn_pool.slot_of(seq_id).is_some());
         let mut running = self.seq_manager.ids_decoding();
 
         // Sort for deterministic ordering.
@@ -443,28 +445,21 @@ impl BatchWorker {
 
         // 4. Process prefill entries.
         //    Entries from newly admitted sequences have chunk_start = 0.
-        //    Entries for sequences already in the manager have chunk_start = usize::MAX
+        //    Entries for admitted prefilling sequences have chunk_start = usize::MAX
         //    (sentinel from FifoScheduler) — we substitute the real value from the manager.
         for (seq_id, sentinel_start, chunk_len) in &decision.prefill {
             let seq_id = *seq_id;
 
-            // Ensure a GDN slot exists for this sequence.
-            if self.gdn_pool.slot_of(seq_id).is_none() && self.gdn_pool.alloc(seq_id).is_none() {
-                // No GDN slot available: skip this sequence this iteration.
-                continue;
-            }
-
-            // Determine the real chunk start from the sequence manager.
+            // Stale or empty entries must not consume an admission slot.
             let (real_start, real_len) = {
                 let Some(seq) = self.seq_manager.get(seq_id) else {
                     continue;
                 };
+                let SequenceState::Prefilling { chunk_start } = seq.state else {
+                    continue;
+                };
                 let start = if *sentinel_start == usize::MAX {
-                    // Continuation chunk: read from sequence state.
-                    match seq.state {
-                        SequenceState::Prefilling { chunk_start } => chunk_start,
-                        _ => continue, // already decoding or finished
-                    }
+                    chunk_start
                 } else {
                     *sentinel_start
                 };
@@ -475,6 +470,12 @@ impl BatchWorker {
             };
 
             if real_len == 0 {
+                continue;
+            }
+
+            // Ensure a GDN slot exists for this sequence.
+            if self.gdn_pool.slot_of(seq_id).is_none() && self.gdn_pool.alloc(seq_id).is_none() {
+                // No GDN slot available: skip this sequence this iteration.
                 continue;
             }
 
@@ -603,7 +604,7 @@ impl BatchWorker {
         self.output_buffer.drain(..).collect()
     }
 
-    /// Number of active sequences (prefilling + decoding).
+    /// Number of tracked sequences, including requests waiting for admission.
     #[inline]
     pub fn active_count(&self) -> usize {
         self.seq_manager.len()
@@ -1132,3 +1133,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "admission_tests.rs"]
+mod admission_tests;

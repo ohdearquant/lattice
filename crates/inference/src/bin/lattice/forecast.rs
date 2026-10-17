@@ -5,8 +5,8 @@
 //!
 //! Input line: `{"id": <any, optional>, "target": [number | null, ...], "horizon": N,
 //! "group": <any, optional>, "downsample": N (optional, default 1), "flip": bool (optional,
-//! default false)}`; `null` marks a missing value. `downsample` and `flip` are Reverso options and
-//! are refused for the others.
+//! default false)}`; `null` marks a missing value. `downsample` and `flip` are Reverso options:
+//! the other models refuse a `downsample` other than 1 and `flip: true`.
 //!
 //! Chronos-2 and Toto 2.0 also forecast series jointly. A `target` given as a list of lists is one
 //! multivariate series whose variates attend to each other, and every line carrying the same

@@ -1301,6 +1301,18 @@ mod detection_tests {
         assert_refused(quantized.path(), "declares a quantization");
     }
 
+    /// `hf_quant_config.json` is a declaration of its own: an unreadable
+    /// `config.json` beside it cannot hide it, whatever the tensors are.
+    #[test]
+    fn an_unreadable_config_does_not_hide_hf_quant_config() {
+        for tensors in [&[("w", "BF16")][..], &AFFINE[..]] {
+            let dir = dir_with(tensors, None);
+            fs::write(dir.path().join("config.json"), b"{").unwrap();
+            fs::write(dir.path().join("hf_quant_config.json"), b"{}").unwrap();
+            assert_refused(dir.path(), "hf_quant_config.json");
+        }
+    }
+
     #[test]
     fn unloadable_message_names_the_format_or_the_refusal() {
         let mlx = dir_with(&AFFINE, Some(mlx_config()));

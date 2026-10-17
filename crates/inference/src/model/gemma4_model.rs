@@ -93,10 +93,12 @@ pub(crate) struct Gemma4Scratch {
     /// attention head width across sliding/global layers and reused every
     /// layer instead of allocating a fresh `vec![1.0; head_w]` per call.
     v_norm_ones: Vec<f32>,
-    /// Post-softcap logits, `[vocab_size]`. `forward_step` writes here
-    /// instead of returning an owned vector; callers that need an owned
-    /// copy across the generation boundary clone out of this once, not on
-    /// every token.
+    /// Post-softcap logits, `[vocab_size]`, written only by steps that emit
+    /// logits: `forward_step`, and `forward_step_impl` with `emit_logits =
+    /// true`. A step with `emit_logits = false` leaves whatever an earlier
+    /// emitting step wrote in this buffer. `forward_step` writes here instead
+    /// of returning an owned vector; callers that need an owned copy across
+    /// the generation boundary clone out of this once, not on every token.
     pub(crate) logits: Vec<f32>,
 }
 
@@ -320,6 +322,30 @@ impl Gemma4Model {
         cache: &mut Gemma4KvCache,
         scratch: &mut Gemma4Scratch,
         capture_layers: &[usize],
+    ) -> Result<LayerProbeTrace, InferenceError> {
+        self.forward_step_impl(token_id, position, cache, scratch, capture_layers, true)
+    }
+
+    /// **Unstable**: [`Self::forward_step`] with the final projection made
+    /// optional. With `emit_logits = false` the step still updates every
+    /// layer and the KV cache, but returns before the final norm, the
+    /// vocabulary projection and the softcap, so `scratch.logits` keeps
+    /// whatever an earlier step wrote and is valid only after a step with
+    /// `emit_logits = true`. `capture_layers` behaves exactly as in
+    /// [`Self::forward_step`].
+    ///
+    /// # Errors
+    /// Same as [`Self::forward_step`]: propagates any [`Gemma4KvCache`] error
+    /// (out-of-bounds layer, shared-layer write, or capacity overflow) and
+    /// fails closed if `token_id` is out of the configured vocabulary.
+    pub(crate) fn forward_step_impl(
+        &self,
+        token_id: u32,
+        position: usize,
+        cache: &mut Gemma4KvCache,
+        scratch: &mut Gemma4Scratch,
+        capture_layers: &[usize],
+        emit_logits: bool,
     ) -> Result<LayerProbeTrace, InferenceError> {
         let cfg = &self.config;
         let hidden_size = cfg.hidden_size;
@@ -585,6 +611,10 @@ impl Gemma4Model {
             }
         }
 
+        if !emit_logits {
+            return Ok(captured);
+        }
+
         gemma4_rms_norm(
             &mut scratch.hidden[..hidden_size],
             &self.weights.norm,
@@ -660,13 +690,17 @@ impl Gemma4Model {
     }
 
     /// **Unstable**: greedy-decode `max_new_tokens` continuation tokens for
-    /// `prompt_ids` (already tokenized, BOS included by the caller). Runs
-    /// prefill and decode through the same single-token `Self::forward_step`
-    /// loop.
+    /// `prompt_ids` (already tokenized, BOS included by the caller). Prefill
+    /// runs each prompt token through `Self::forward_step_impl` and projects
+    /// vocabulary logits only at the last prompt token; decode then runs
+    /// through the single-token `Self::forward_step` loop.
     ///
     /// # Errors
-    /// Propagates `Self::forward_step` errors (invalid token id, cache
-    /// bounds/capacity).
+    /// Propagates the per-token forward pass errors from both loops: an
+    /// out-of-range `token_id` or a cache error (out-of-bounds layer,
+    /// shared-layer write, capacity overflow) as
+    /// [`InferenceError::InvalidInput`], and a non-shared layer missing its
+    /// `k_proj`/`v_proj`/`k_norm` weights as [`InferenceError::Inference`].
     pub fn generate_greedy(
         &self,
         prompt_ids: &[u32],
@@ -678,8 +712,15 @@ impl Gemma4Model {
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut position = 0usize;
 
-        for &tok in prompt_ids {
-            self.forward_step(tok, position, &mut cache, &mut scratch, &[])?;
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            self.forward_step_impl(
+                tok,
+                position,
+                &mut cache,
+                &mut scratch,
+                &[],
+                i + 1 == prompt_ids.len(),
+            )?;
             position += 1;
         }
 
@@ -701,6 +742,12 @@ impl Gemma4Model {
     /// `layer_scalar` multiply, before the final norm) -- equivalent to
     /// HF's `output_hidden_states=True` trace entry `hidden_states[layer +
     /// 1]` at the prompt's last position.
+    ///
+    /// Runs `Self::forward_step` for every prompt token, so it still projects
+    /// vocabulary logits at every prompt position; that full projection is
+    /// kept deliberately as the reference `Self::generate_greedy` is checked
+    /// against, so its prefill loop is not interchangeable with
+    /// `Self::generate_greedy`'s deferred-projection loop.
     ///
     /// # Errors
     /// Propagates any cache error (out-of-bounds layer, shared-layer write,
@@ -1167,6 +1214,37 @@ pub(crate) fn tiny_zero_model() -> Gemma4Model {
     tiny_zero_model_with_vocab(16)
 }
 
+/// [`tiny_zero_model`] with deterministic non-zero weights filled in. Unlike
+/// the all-zero fixture, here the logits depend on the input, so a test that
+/// asserts bit-identity between two logit-producing paths has a real signal to
+/// compare rather than two all-zero outputs that match trivially -- the
+/// all-zero fixture's greedy pick is always token 0 for the same reason. The
+/// `fill` closure writes the repeating value `((i * 7 % 19) - 9) / 32` into
+/// `embed_tokens`, `q_proj`, `k_proj`, `v_proj` and `o_proj`; the norm weight
+/// vectors `norm`, `input_layernorm`, `post_attention_layernorm`, `q_norm` and
+/// `k_norm` are instead filled with `1.0`.
+#[cfg(test)]
+pub(crate) fn tiny_nonzero_model() -> Gemma4Model {
+    let mut model = tiny_zero_model();
+    let fill = |values: &mut [f32]| {
+        for (i, value) in values.iter_mut().enumerate() {
+            *value = ((i * 7 % 19) as f32 - 9.0) / 32.0;
+        }
+    };
+    fill(&mut model.weights.embed_tokens);
+    model.weights.norm.fill(1.0);
+    let layer = &mut model.weights.layers[0];
+    layer.input_layernorm.fill(1.0);
+    layer.post_attention_layernorm.fill(1.0);
+    layer.q_norm.fill(1.0);
+    layer.k_norm.as_mut().unwrap().fill(1.0);
+    fill(&mut layer.q_proj);
+    fill(layer.k_proj.as_mut().unwrap());
+    fill(layer.v_proj.as_mut().unwrap());
+    fill(&mut layer.o_proj);
+    model
+}
+
 /// [`tiny_zero_model`] with a caller-chosen `vocab_size`: the same
 /// single-layer zero-weight model, whose embedding tables grow with the
 /// vocabulary. A test that feeds it prompts rendered and tokenized with the
@@ -1277,6 +1355,76 @@ mod tests {
     use crate::decoder::ExecutionCapabilities;
     use crate::grammar::{GrammarEngine, GrammarSpec};
     use crate::model::gemma4_weights::per_layer_embeddings_from_bits;
+
+    #[test]
+    fn deferred_prefill_logits_preserve_cache_trace_and_final_bits() {
+        let model = tiny_nonzero_model();
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for prompt in [vec![2], vec![2, 3, 4], vec![2, 3, 4, 5, 6, 7, 8, 9]] {
+            let mut cache = model.new_cache(16).unwrap();
+            let mut reference_cache = model.new_cache(16).unwrap();
+            let mut scratch = Gemma4Scratch::new(&model.config);
+            let mut reference = Gemma4Scratch::new(&model.config);
+            scratch.logits.fill(1234.0);
+            for (position, &token) in prompt.iter().enumerate() {
+                let last = position + 1 == prompt.len();
+                let trace = model
+                    .forward_step_impl(token, position, &mut cache, &mut scratch, &[0], last)
+                    .unwrap();
+                let expected = model
+                    .forward_step(token, position, &mut reference_cache, &mut reference, &[0])
+                    .unwrap();
+                assert_eq!(trace.len(), 1);
+                assert_eq!(bits(&trace[0].1), bits(&expected[0].1));
+                assert_eq!(cache.seq_len(0).unwrap(), position + 1);
+                assert_eq!(
+                    bits(cache.k_view(0).unwrap()),
+                    bits(reference_cache.k_view(0).unwrap())
+                );
+                assert_eq!(
+                    bits(cache.v_view(0).unwrap()),
+                    bits(reference_cache.v_view(0).unwrap())
+                );
+                if last {
+                    assert!(reference.logits.iter().any(|&value| value != 0.0));
+                    assert_eq!(bits(&scratch.logits), bits(&reference.logits));
+                } else {
+                    assert!(scratch.logits.iter().all(|&value| value == 1234.0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn greedy_prefill_matches_full_projection_reference() {
+        let model = tiny_nonzero_model();
+        for prompt in [vec![], vec![2], vec![2, 3, 4], vec![2, 3, 4, 5, 6, 7, 8, 9]] {
+            for count in [0, 1, 4] {
+                let expected = model
+                    .generate_greedy_with_probe(&prompt, count, 16, &[])
+                    .unwrap()
+                    .0;
+                assert_eq!(model.generate_greedy(&prompt, count, 16).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn greedy_prefill_preserves_invalid_token_errors_at_every_position() {
+        let model = tiny_nonzero_model();
+        for invalid_at in 0..3 {
+            let mut prompt = vec![2, 3, 4];
+            prompt[invalid_at] = model.config.vocab_size as u32;
+            for count in [0, 1] {
+                let expected = model
+                    .generate_greedy_with_probe(&prompt, count, 16, &[])
+                    .unwrap_err();
+                let actual = model.generate_greedy(&prompt, count, 16).unwrap_err();
+                assert!(matches!(actual, InferenceError::InvalidInput(_)));
+                assert_eq!(actual.to_string(), expected.to_string());
+            }
+        }
+    }
 
     fn lcg_stream(len: usize, seed: u32) -> Vec<u32> {
         let mut state = seed;
