@@ -581,6 +581,14 @@ jobs:
             serve::tests::lora_orchestration::lora_list_wrapper_preserves_served_router_report -- --exact
       - name: inference — mixture clippy
         run: cargo clippy -p lattice-inference --all-targets --features mixture -- -D warnings
+      # Bin-linked fixtures need test-utils; mixture also changes which fixture
+      # fields compile, so lint the portable surface with and without it.
+      - name: inference - test-utils clippy (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p lattice-inference --all-targets --features test-utils -- -D warnings
+      - name: inference - mixture + test-utils clippy (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p lattice-inference --all-targets --features mixture,test-utils -- -D warnings
       - name: inference — router storage and selection (CPU, no default features)
         run: |
           log="${RUNNER_TEMP:-/tmp}/inference-router-storage-tests.log"
@@ -969,6 +977,11 @@ jobs:
       - name: inference — metal-gpu + mixture clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy --locked -p lattice-inference --all-targets --features f16,metal-gpu,mixture -- -D warnings
+      # Linux cannot lint Metal-gated serving fixtures. Keep the feature-off
+      # step above as well: some integration fixtures exclude test-utils.
+      - name: inference - metal-gpu + mixture + test-utils clippy (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo clippy --locked -p lattice-inference --all-targets --features f16,metal-gpu,mixture,test-utils -- -D warnings
       # `bench-internals` gates the bench binaries under `src/bin/` (e.g.
       # `bench_vision_prefill_ab`) and their `bench_support` module — without
       # it in this feature list, `--all-targets` never compiles that surface,
