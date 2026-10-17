@@ -672,6 +672,11 @@ jobs:
         run: cargo clippy -p lattice-inference --all-targets -- -D warnings
       - name: inference — bench-internals clippy without f16
         run: cargo clippy -p lattice-inference --all-targets --features bench-internals -- -D warnings
+      # The qwen_cpu_driver_allocations group in inference_perf compiles only with both
+      # bench-internals and test-utils, a pair no other step enables, so a change to the
+      # shared allocation support could break it without any check going red.
+      - name: inference — bench-internals,test-utils clippy for inference_perf
+        run: cargo clippy --locked -p lattice-inference --features bench-internals,test-utils --bench inference_perf -- -D warnings
       # The control target runs without libtest and exits non-zero unless all of its controls pass.
       - name: inference allocation sampler controls
         run: cargo test --locked -p lattice-inference --no-default-features --features bench-internals --test inference_perf_allocation_gate
