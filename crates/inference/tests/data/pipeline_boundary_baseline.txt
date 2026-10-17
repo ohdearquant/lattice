@@ -87,7 +87,6 @@ src/serve/metal_worker.rs	crate::forward::metal_qwen35::push_chat_turn_open
 src/serve/metal_worker.rs	crate::model::qwen35_config::Qwen35Config
 src/serve/metal_worker.rs	crate::model::qwen35_config::VisionModelConfig
 src/serve/mod.rs	crate::forward::metal_qwen35::ChatMessage
-src/serve/mod.rs	crate::forward::metal_qwen35::ChatRole
 src/serve/mod.rs	crate::forward::metal_qwen35::format_chat_template_parts
 src/serve/prepare.rs	crate::forward::metal_qwen35::ChatMessage
 src/serve/prompt_adapter.rs	crate::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID
