@@ -3917,17 +3917,6 @@ mod tests {
     // `#[cfg(test)]`-only fixtures across the bin/lib compilation
     // boundary, only a real Cargo feature crosses it.
     // -----------------------------------------------------------------------
-    /// ADR-095 decision 4: every entry in the shared route list is registered
-    /// in THIS binary. A route added to the list and forgotten here reds this
-    /// test.
-    ///
-    /// The assertion is only that the response is not 404. A 405 or a 4xx from
-    /// validation both count as registered -- the test asks whether the route
-    /// exists and nothing else, because anything more would need the state the
-    /// two binaries do not share. Asserting a specific status would make this
-    /// a behaviour test that passes or fails for reasons unrelated to
-    /// registration.
-
     /// The feedback handler's three successes and three refusals, against a
     /// store this test populates directly.
     ///
@@ -4175,6 +4164,16 @@ mod tests {
         );
     }
 
+    /// ADR-095 decision 4: every entry in the shared route list is registered
+    /// in THIS binary. A route added to the list and forgotten here reds this
+    /// test.
+    ///
+    /// The assertion is only that the response is not 404. A 405 or a 4xx from
+    /// validation both count as registered -- the test asks whether the route
+    /// exists and nothing else, because anything more would need the state the
+    /// two binaries do not share. Asserting a specific status would make this
+    /// a behaviour test that passes or fails for reasons unrelated to
+    /// registration.
     #[cfg(feature = "test-utils")]
     #[tokio::test]
     async fn every_shared_lora_route_is_registered_in_this_binary() {
