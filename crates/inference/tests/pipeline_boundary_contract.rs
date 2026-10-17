@@ -2944,7 +2944,7 @@ fn pipeline_boundary_matches_recorded_baseline() {
     // crossings and look like a completed migration.
     let known_positive_roots = [
         crate_dir.join("src/serve/mod.rs"),
-        crate_dir.join("src/bin/lattice_serve.rs"),
+        crate_dir.join("src/bin/lattice_serve/main.rs"),
     ];
     for root in &known_positive_roots {
         let canonical =
