@@ -1,23 +1,9 @@
-// Shared source-analysis machinery for this crate's structural guards: Cargo
-// target discovery, the cfg formula evaluator, macro-completeness classification,
-// and the module-graph walker that follows `#[path]` destinations.
+// Shared source-analysis machinery for Cargo target discovery, cfg formulas,
+// macro completeness, and Rust module source closures.
 //
-// Moved verbatim out of metal_measurement_lock_contract.rs. The only edit is a
-// `pub(crate)` on each top-level declaration, which a private item needs to be
-// visible to the target that declares this module.
-//
-// `include!` would have avoided even that edit, and this crate's own guard refuses
-// it: `unclassifiable_include` below rejects every `include!` unconditionally,
-// which is the fail-closed behaviour it is supposed to have. The machinery being
-// shared forbids the cheapest way to share it.
-//
-// One wart, stated rather than pre-generalised: `macro_tokens_name_protected_work`
-// names Metal selectors, and it is here because `unclassifiable_macro` calls it and
-// the macro tier is structurally built on that call. Parameterising the predicate
-// is the right move when a second consumer with a different predicate exists, not
-// before.
-//
-// Consumers: metal_measurement_lock_contract.rs.
+// Population closures follow literal `include!` paths and fail when a destination
+// cannot be resolved. Callers that cannot analyze included macro content can still
+// reject `include!` through `unclassifiable_include`.
 
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -275,8 +261,15 @@ impl CfgFormula {
     }
 
     pub(crate) fn satisfiable(&self) -> Result<bool, String> {
+        self.satisfiable_with_test(None)
+    }
+
+    pub(crate) fn satisfiable_with_test(&self, test_cfg: Option<bool>) -> Result<bool, String> {
         let mut atoms = BTreeSet::new();
         self.collect_atoms(&mut atoms);
+        if test_cfg.is_some() {
+            atoms.remove("test");
+        }
         if atoms.len() > 16 {
             return Err(format!(
                 "cfg expression has {} independent atoms; refusing an unbounded classification",
@@ -285,11 +278,14 @@ impl CfgFormula {
         }
         let atoms = atoms.into_iter().collect::<Vec<_>>();
         for assignment in 0usize..(1usize << atoms.len()) {
-            let values = atoms
+            let mut values = atoms
                 .iter()
                 .enumerate()
                 .map(|(index, atom)| (atom.clone(), assignment & (1 << index) != 0))
                 .collect::<std::collections::BTreeMap<_, _>>();
+            if let Some(value) = test_cfg {
+                values.insert("test".to_string(), value);
+            }
             if self.evaluate(&values) {
                 return Ok(true);
             }
@@ -577,14 +573,25 @@ pub(crate) fn syn_cfg_predicate(
     test_cfg: bool,
     context: &str,
 ) -> Result<CfgFormula, String> {
+    syn_cfg_predicate_with_test(meta, Some(test_cfg), context)
+}
+
+fn syn_cfg_predicate_with_test(
+    meta: &Meta,
+    test_cfg: Option<bool>,
+    context: &str,
+) -> Result<CfgFormula, String> {
     match meta {
         Meta::Path(path) => {
             let label = path_label(path);
             Ok(match label.as_str() {
-                "test" if test_cfg => CfgFormula::True,
-                "test" => CfgFormula::False,
-                "unix" => CfgFormula::True,
-                "windows" => CfgFormula::False,
+                "test" => match test_cfg {
+                    Some(true) => CfgFormula::True,
+                    Some(false) => CfgFormula::False,
+                    None => CfgFormula::Atom(label),
+                },
+                "unix" if test_cfg.is_some() => CfgFormula::True,
+                "windows" if test_cfg.is_some() => CfgFormula::False,
                 _ => CfgFormula::Atom(label),
             })
         }
@@ -601,6 +608,9 @@ pub(crate) fn syn_cfg_predicate(
                 ));
             };
             let value = value.value();
+            if test_cfg.is_none() {
+                return Ok(CfgFormula::Atom(format!("{label}={value}")));
+            }
             Ok(match (label.as_str(), value.as_str()) {
                 ("target_os", "macos") | ("target_family", "unix") => CfgFormula::True,
                 ("target_os", _) | ("target_family", "windows") => CfgFormula::False,
@@ -615,22 +625,24 @@ pub(crate) fn syn_cfg_predicate(
                 "all" => Ok(CfgFormula::all(
                     arguments
                         .iter()
-                        .map(|argument| syn_cfg_predicate(argument, test_cfg, context))
+                        .map(|argument| syn_cfg_predicate_with_test(argument, test_cfg, context))
                         .collect::<Result<Vec<_>, _>>()?,
                 )),
                 "any" => Ok(CfgFormula::any(
                     arguments
                         .iter()
-                        .map(|argument| syn_cfg_predicate(argument, test_cfg, context))
+                        .map(|argument| syn_cfg_predicate_with_test(argument, test_cfg, context))
                         .collect::<Result<Vec<_>, _>>()?,
                 )),
-                "not" if arguments.len() == 1 => Ok(CfgFormula::not(syn_cfg_predicate(
+                "not" if arguments.len() == 1 => Ok(CfgFormula::not(syn_cfg_predicate_with_test(
                     &arguments[0],
                     test_cfg,
                     context,
                 )?)),
                 "not" => Err(format!("{context}: cfg(not(...)) needs one predicate")),
-                _ => Ok(CfgFormula::Atom(name)),
+                _ => Err(format!(
+                    "{context}: unsupported cfg predicate `{name}(...)`"
+                )),
             }
         }
     }
@@ -639,6 +651,14 @@ pub(crate) fn syn_cfg_predicate(
 pub(crate) fn syn_cfg_effect(
     meta: &Meta,
     test_cfg: bool,
+    context: &str,
+) -> Result<CfgFormula, String> {
+    syn_cfg_effect_with_test(meta, Some(test_cfg), context)
+}
+
+fn syn_cfg_effect_with_test(
+    meta: &Meta,
+    test_cfg: Option<bool>,
     context: &str,
 ) -> Result<CfgFormula, String> {
     let Meta::List(list) = meta else {
@@ -655,7 +675,10 @@ pub(crate) fn syn_cfg_effect(
         if arguments.len() != 1 {
             return Err(format!("{context}: cfg attribute needs one predicate"));
         }
-        return syn_cfg_predicate(&arguments[0], test_cfg, context);
+        return match test_cfg {
+            Some(test_cfg) => syn_cfg_predicate(&arguments[0], test_cfg, context),
+            None => syn_cfg_predicate_with_test(&arguments[0], None, context),
+        };
     }
     if name != "cfg_attr" {
         return Ok(CfgFormula::True);
@@ -665,7 +688,10 @@ pub(crate) fn syn_cfg_effect(
             "{context}: cfg_attr attribute needs a predicate and emitted attribute"
         ));
     }
-    let predicate = syn_cfg_predicate(&arguments[0], test_cfg, context)?;
+    let predicate = match test_cfg {
+        Some(test_cfg) => syn_cfg_predicate(&arguments[0], test_cfg, context)?,
+        None => syn_cfg_predicate_with_test(&arguments[0], None, context)?,
+    };
     Ok(CfgFormula::all(
         arguments
             .iter()
@@ -673,7 +699,7 @@ pub(crate) fn syn_cfg_effect(
             .map(|emitted| {
                 Ok(CfgFormula::any([
                     CfgFormula::not(predicate.clone()),
-                    syn_cfg_effect(emitted, test_cfg, context)?,
+                    syn_cfg_effect_with_test(emitted, test_cfg, context)?,
                 ]))
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -689,6 +715,19 @@ pub(crate) fn syn_attributes_formula(
         attributes
             .iter()
             .map(|attribute| syn_cfg_effect(&attribute.meta, test_cfg, context))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
+pub(crate) fn syn_attributes_formula_with_test(
+    attributes: &[Attribute],
+    test_cfg: Option<bool>,
+    context: &str,
+) -> Result<CfgFormula, String> {
+    Ok(CfgFormula::all(
+        attributes
+            .iter()
+            .map(|attribute| syn_cfg_effect_with_test(&attribute.meta, test_cfg, context))
             .collect::<Result<Vec<_>, _>>()?,
     ))
 }
@@ -739,10 +778,150 @@ pub(crate) fn literal_module_path(
     Ok(None)
 }
 
+pub(crate) fn item_attributes(item: &syn::Item) -> &[Attribute] {
+    match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        syn::Item::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+struct IncludeTarget {
+    path: PathBuf,
+    cfg: CfgFormula,
+}
+
+struct IncludeCollector<'a> {
+    test_cfg: Option<bool>,
+    context: &'a str,
+    inherited_cfg: CfgFormula,
+    targets: Vec<IncludeTarget>,
+    error: Option<String>,
+}
+
+impl IncludeCollector<'_> {
+    fn with_attributes(&mut self, attributes: &[Attribute], visit: impl FnOnce(&mut Self)) {
+        if self.error.is_some() {
+            return;
+        }
+        let local_cfg =
+            match syn_attributes_formula_with_test(attributes, self.test_cfg, self.context) {
+                Ok(cfg) => cfg,
+                Err(reason) => {
+                    self.error = Some(reason);
+                    return;
+                }
+            };
+        let previous = self.inherited_cfg.clone();
+        self.inherited_cfg = CfgFormula::all([previous.clone(), local_cfg]);
+        match self.inherited_cfg.satisfiable() {
+            Ok(true) => visit(self),
+            Ok(false) => {}
+            Err(reason) => self.error = Some(format!("{}: {reason}", self.context)),
+        }
+        self.inherited_cfg = previous;
+    }
+}
+
+impl<'ast> Visit<'ast> for IncludeCollector<'_> {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        self.with_attributes(item_attributes(item), |collector| {
+            syn::visit::visit_item(collector, item);
+        });
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        let attributes: &[Attribute] = match item {
+            syn::ImplItem::Const(item) => &item.attrs,
+            syn::ImplItem::Fn(item) => &item.attrs,
+            syn::ImplItem::Type(item) => &item.attrs,
+            syn::ImplItem::Macro(item) => &item.attrs,
+            syn::ImplItem::Verbatim(_) => &[],
+            _ => &[],
+        };
+        self.with_attributes(attributes, |collector| {
+            syn::visit::visit_impl_item(collector, item);
+        });
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        let attributes: &[Attribute] = match item {
+            syn::TraitItem::Const(item) => &item.attrs,
+            syn::TraitItem::Fn(item) => &item.attrs,
+            syn::TraitItem::Type(item) => &item.attrs,
+            syn::TraitItem::Macro(item) => &item.attrs,
+            syn::TraitItem::Verbatim(_) => &[],
+            _ => &[],
+        };
+        self.with_attributes(attributes, |collector| {
+            syn::visit::visit_trait_item(collector, item);
+        });
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        let attributes: &[Attribute] = match item {
+            syn::ForeignItem::Fn(item) => &item.attrs,
+            syn::ForeignItem::Static(item) => &item.attrs,
+            syn::ForeignItem::Type(item) => &item.attrs,
+            syn::ForeignItem::Macro(item) => &item.attrs,
+            syn::ForeignItem::Verbatim(_) => &[],
+            _ => &[],
+        };
+        self.with_attributes(attributes, |collector| {
+            syn::visit::visit_foreign_item(collector, item);
+        });
+    }
+
+    fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+        self.with_attributes(&node.attrs, |collector| {
+            syn::visit::visit_expr_macro(collector, node);
+        });
+    }
+
+    fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+        self.with_attributes(&node.attrs, |collector| {
+            syn::visit::visit_stmt_macro(collector, node);
+        });
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if !mac.path.is_ident("include") || self.error.is_some() {
+            return;
+        }
+        match syn::parse2::<syn::LitStr>(mac.tokens.clone()) {
+            Ok(path) => self.targets.push(IncludeTarget {
+                path: PathBuf::from(path.value()),
+                cfg: self.inherited_cfg.clone(),
+            }),
+            Err(reason) => {
+                self.error = Some(format!(
+                    "{}: include! path is not a string literal: {reason}",
+                    self.context
+                ));
+            }
+        }
+    }
+}
+
 pub(crate) struct ModuleGraph<'a> {
     pub(crate) manifest_dir: &'a Path,
     pub(crate) manifest_canonical: PathBuf,
-    pub(crate) test_cfg: bool,
+    pub(crate) test_cfg: Option<bool>,
+    pub(crate) follow_includes: bool,
     pub(crate) sources: BTreeMap<PathBuf, CfgFormula>,
     pub(crate) visiting: BTreeSet<PathBuf>,
 }
@@ -788,18 +967,21 @@ impl ModuleGraph<'_> {
         })?;
         let file_cfg = CfgFormula::all([
             inherited_cfg,
-            syn_attributes_formula(&syntax.attrs, self.test_cfg, &context)?,
+            syn_attributes_formula_with_test(&syntax.attrs, self.test_cfg, &context)?,
         ]);
         if !file_cfg.satisfiable()? {
             self.visiting.remove(&canonical);
             return Ok(());
         }
         if let Some(existing) = self.sources.get_mut(&canonical) {
-            *existing = CfgFormula::any([existing.clone(), file_cfg]);
-            self.visiting.remove(&canonical);
-            return Ok(());
+            if file_cfg.implies(existing)? {
+                self.visiting.remove(&canonical);
+                return Ok(());
+            }
+            *existing = CfgFormula::any([existing.clone(), file_cfg.clone()]);
+        } else {
+            self.sources.insert(canonical.clone(), file_cfg.clone());
         }
-        self.sources.insert(canonical.clone(), file_cfg.clone());
         self.walk_items(
             &syntax.items,
             &canonical,
@@ -826,13 +1008,31 @@ impl ModuleGraph<'_> {
             .into_owned();
         for item in items {
             let syn::Item::Mod(module) = item else {
+                if self.follow_includes {
+                    let mut collector = IncludeCollector {
+                        test_cfg: self.test_cfg,
+                        context: &context,
+                        inherited_cfg: inherited_cfg.clone(),
+                        targets: Vec::new(),
+                        error: None,
+                    };
+                    collector.visit_item(item);
+                    if let Some(reason) = collector.error {
+                        return Err(reason);
+                    }
+                    for include in collector.targets {
+                        let containing_dir = source_path.parent().unwrap_or(self.manifest_dir);
+                        let target = containing_dir.join(include.path);
+                        self.load(&target, module_dir, include.cfg)?;
+                    }
+                }
                 continue;
             };
             // A raw identifier (`mod r#loop;`) names the file `loop.rs`, not `r#loop.rs`.
             let module_name = module.ident.unraw().to_string();
             let module_cfg = CfgFormula::all([
                 inherited_cfg.clone(),
-                syn_attributes_formula(&module.attrs, self.test_cfg, &context)?,
+                syn_attributes_formula_with_test(&module.attrs, self.test_cfg, &context)?,
             ]);
             if !module_cfg.satisfiable()? {
                 continue;
@@ -859,14 +1059,18 @@ impl ModuleGraph<'_> {
                     (false, true) => nested,
                     (true, true) => {
                         return Err(format!(
-                            "{context}: ambiguous compiler-selected module `{}`",
-                            module.ident
+                            "{context}: ambiguous compiler-selected module `{}` at {} and {}",
+                            module.ident,
+                            flat.display(),
+                            nested.display()
                         ));
                     }
                     (false, false) => {
                         return Err(format!(
-                            "{context}: compiler-selected module `{}` could not be resolved",
-                            module.ident
+                            "{context}: compiler-selected module `{}` could not be resolved at {} or {}",
+                            module.ident,
+                            flat.display(),
+                            nested.display()
                         ));
                     }
                 }
@@ -898,6 +1102,34 @@ pub(crate) fn module_source_closure(
     root: &Path,
     test_cfg: bool,
 ) -> Result<Vec<ModuleSource>, String> {
+    let module_dir = root
+        .parent()
+        .ok_or_else(|| format!("target root {} has no parent", root.display()))?;
+    module_source_closure_with_mode(manifest_dir, root, module_dir, Some(test_cfg), false)
+}
+
+/// Returns a source closure with symbolic configuration predicates and literal includes enabled.
+/// The supplied module directory is the directory Rust uses for external modules declared by
+/// `root`, which differs from `root.parent()` when the root is itself a module file.
+#[allow(
+    dead_code,
+    reason = "Shared support is compiled by separate integration test targets"
+)]
+pub(crate) fn module_source_population_closure(
+    manifest_dir: &Path,
+    root: &Path,
+    root_module_dir: &Path,
+) -> Result<Vec<ModuleSource>, String> {
+    module_source_closure_with_mode(manifest_dir, root, root_module_dir, None, true)
+}
+
+fn module_source_closure_with_mode(
+    manifest_dir: &Path,
+    root: &Path,
+    root_module_dir: &Path,
+    test_cfg: Option<bool>,
+    follow_includes: bool,
+) -> Result<Vec<ModuleSource>, String> {
     let manifest_canonical = std::fs::canonicalize(manifest_dir).map_err(|reason| {
         format!(
             "could not resolve crate boundary {}: {reason}",
@@ -908,13 +1140,11 @@ pub(crate) fn module_source_closure(
         manifest_dir,
         manifest_canonical,
         test_cfg,
+        follow_includes,
         sources: BTreeMap::new(),
         visiting: BTreeSet::new(),
     };
-    let module_dir = root
-        .parent()
-        .ok_or_else(|| format!("target root {} has no parent", root.display()))?;
-    graph.load(root, module_dir, CfgFormula::True)?;
+    graph.load(root, root_module_dir, CfgFormula::True)?;
     Ok(graph
         .sources
         .into_iter()
