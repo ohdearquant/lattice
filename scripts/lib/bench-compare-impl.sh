@@ -1098,7 +1098,10 @@ reconcile_criterion_groups() {
   local target="$1" criterion_root="$2" bench_source="$3"
   local declared actual stray
 
-  declared="$(declared_groups_from_source "$bench_source")"
+  # A source declaring no literal group makes the grep exit 1, and under pipefail a
+  # failing substitution would end the script here with no message. Let the empty
+  # result reach the refusal below, which names the file and the reason.
+  declared="$(declared_groups_from_source "$bench_source" || true)"
   if [ -z "$declared" ]; then
     echo "bench-compare: $target: found zero declared Criterion groups in" \
          "$bench_source — refusing. An empty declared set would let every" \
