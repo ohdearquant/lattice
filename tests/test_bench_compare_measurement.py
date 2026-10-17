@@ -1668,6 +1668,49 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"{inference_first} vs {inference_second}",
         )
 
+    def test_bench_source_without_literal_group_names_refuses_with_its_reason(self):
+        """A head bench source that names its groups only through expressions
+        (``benchmark_group(if forced { "a" } else { "b" })``) gives the declared-group
+        parser nothing to match. The run must reach the zero-groups refusal, exit 2
+        and say why.
+
+        Mutation-sensitive: drop the ``|| true`` on the declared-group substitution
+        in bench-compare-impl.sh and the empty grep fails the substitution under
+        pipefail. The run then exits 1 with no refusal message.
+        """
+        def name_groups_by_expression(root):
+            path = root / "crates" / "inference" / "benches" / "elementwise_cpu_bench.rs"
+            path.write_text(
+                'let mut group = c.benchmark_group(if forced { "rms_norm_forced" } '
+                'else { "rms_norm" });\n'
+            )
+            subprocess.run([*GIT, "-C", str(root), "add", "-f", str(path)], check=True)
+            subprocess.run(
+                [*GIT, "-C", str(root), "commit", "-qm", "name groups by expression"],
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                },
+            )
+
+        result = _run(
+            [],
+            stub_cargo=STALE_CHANGE_CARGO,
+            emit_criterion_home=True,
+            setup=name_groups_by_expression,
+        )
+        self.assertEqual(
+            result.returncode, 2,
+            f"expected exit 2 (zero declared groups), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn(
+            "elementwise_cpu_bench: found zero declared Criterion groups in",
+            result.stderr,
+        )
+
     def test_embed_bench_target_honors_caller_override(self):
         """BENCHES_EMBED selects an existing embed target for the whole run.
 
