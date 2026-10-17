@@ -840,10 +840,11 @@ mod scoring {
         #[cfg(test)]
         mod tests {
             use super::*;
+            use crate::measurement::gpu_test_lock;
 
             #[test]
             fn reference_scoring_metal_blend_changes_nll_and_cleans_up() {
-                let _gpu = crate::measurement::gpu_test_lock();
+                let _gpu = gpu_test_lock();
                 let (cfg, weights) = crate::forward::metal_qwen35::reference_scoring_fixture();
                 let mut state = MetalQwen35State::new(&weights, &cfg, 8)
                     .expect("reference witness requires a real Metal device");
