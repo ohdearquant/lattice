@@ -18,7 +18,7 @@ Same trap as `docs/serve-http-api.md` and `docs/cross-turn-cache.md` describe --
   -- when a row below says "supported" for this column via HTTP, it means `lattice serve`'s
   router, not `lattice chat`. Citations into the binary name the split files under
   `crates/inference/src/bin/lattice/` (shortened to `bin/lattice/<file>`).
-- **`lattice_serve`** (`crates/inference/src/bin/lattice_serve.rs`) -- a separate, standalone
+- **`lattice_serve`** (`crates/inference/src/bin/lattice_serve/main.rs`) -- a separate, standalone
   binary purpose-built as the HTTP daemon the macOS Lattice Studio app spawns and talks to
   (introduced PR #435). Metal-GPU-only, its own fixed route list, its own request struct.
 

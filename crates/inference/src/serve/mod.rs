@@ -1,6 +1,6 @@
 //! Shared HTTP serving contract for the `lattice` unified server
 //! (`crates/inference/src/bin/lattice.rs`) and the `lattice_serve` daemon
-//! (`crates/inference/src/bin/lattice_serve.rs`) -- ADR-080 cluster C2 (#782).
+//! (`crates/inference/src/bin/lattice_serve/main.rs`) -- ADR-080 cluster C2 (#782).
 //!
 //! Both binaries speak a subset of the OpenAI chat-completions wire format,
 //! and both previously carried independent copies of: the error envelope
@@ -1842,7 +1842,7 @@ mod tests {
             include_str!("../bin/lattice/doctor.rs"),
             include_str!("../bin/lattice/serve.rs"),
         );
-        let lattice_serve = include_str!("../bin/lattice_serve.rs");
+        let lattice_serve = include_str!("../bin/lattice_serve/main.rs");
         for (name, source) in [("lattice", lattice), ("lattice_serve", lattice_serve)] {
             assert!(
                 source.contains("serve::serve_until_shutdown(listener, app)"),

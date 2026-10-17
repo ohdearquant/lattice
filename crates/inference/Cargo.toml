@@ -177,7 +177,7 @@ required-features = ["f16", "metal-gpu"]
 
 [[bin]]
 name = "lattice_serve"
-path = "src/bin/lattice_serve.rs"
+path = "src/bin/lattice_serve/main.rs"
 required-features = ["f16", "metal-gpu", "serve"]
 
 [[test]]
