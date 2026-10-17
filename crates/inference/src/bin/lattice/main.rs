@@ -31,6 +31,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Chat interactively or generate one response to --prompt
+    #[command(after_help = r#"Examples:
+  lattice chat --model /models/qwen3.5-0.8b
+  lattice chat --model /models/qwen3.5-0.8b -p "Hello" --max-tokens 32 --temperature 0
+
+Use an existing local Qwen checkpoint directory. Native Q4 checkpoints require
+a macOS Metal build. Add --tokenizer-dir when the Q4 directory lacks tokenizer.json.
+With -p, the prompt is used literally and stdin is not read."#)]
     Chat {
         /// Path to model directory (SafeTensors, or a native Q4 quantized
         /// directory produced by `quantize_q4`)
@@ -52,6 +59,13 @@ enum Command {
         tokenizer_dir: Option<String>,
     },
     /// Start HTTP server with OpenAI-compatible API
+    #[command(after_help = r#"Examples:
+  lattice serve --model /models/qwen3.5-0.8b --port 8080
+  lattice serve --model /models/qwen3.5-0.8b-q4 \
+    --tokenizer-dir /models/qwen3.5-0.8b --port 8080
+
+Use an existing local checkpoint directory. Native Q4 checkpoints require
+a macOS Metal build. The default bind address is 127.0.0.1."#)]
     Serve {
         /// Path to model directory (SafeTensors, or a native Q4 quantized
         /// directory produced by `quantize_q4`). If this directory is a
@@ -225,6 +239,13 @@ enum Command {
     },
     /// Preflight check: memory fit and artifact compatibility, without
     /// loading any model weights (config + tensor index inspection only).
+    #[command(after_help = r#"Examples:
+  lattice doctor --model /models/qwen3.5-0.8b
+  lattice doctor --model /models/qwen3.5-0.8b --context 4096
+  lattice doctor --model /models/qwen3.5-0.8b-q4 --tokenizer-dir /models/qwen3.5-0.8b
+
+Inspects existing Qwen checkpoint files without loading model weights.
+A failed inspection or an unusable configuration returns a nonzero exit status."#)]
     Doctor {
         /// Path to model directory (SafeTensors, or a native Q4 quantized
         /// directory produced by `quantize_q4`)
@@ -246,16 +267,38 @@ enum Command {
     /// prompt, not the per-token-averaged metric that
     /// `lattice_inference::pruning::BlockInfluenceAccumulator` implements. The
     /// output artifact's `method` field names the estimator actually used.
+    #[command(after_help = r#"Example:
+  lattice prune-score --q4-dir /models/qwen3.5-0.8b-q4 \
+    --tokenizer-dir /models/qwen3.5-0.8b \
+    --calibration-corpus calibration.txt --validation-corpus validation.txt \
+    --prune-layers 1 --output pruning-plan.json
+
+Requires macOS, a build with metal-gpu, and an existing native Q4 Qwen checkpoint.
+Calibration and validation must be separate UTF-8 files.
+The command writes a pruning plan; a failed perplexity gate returns a nonzero exit status."#)]
     PruneScore {
         #[command(flatten)]
         args: prune_score::Args,
     },
     /// Point forecasts for univariate series read as JSON lines.
+    #[command(after_help = r#"Examples:
+  lattice forecast --model /models/chronos-2 --input series.jsonl --output forecasts.jsonl
+  lattice forecast --model /models/chronos-2 --input series.jsonl
+
+Use an existing Chronos-2, Toto 2.0, or Reverso checkpoint directory.
+Each input line is a JSON object with target values and a horizon, for example:
+  {"target":[1.0,2.0,3.0,4.0],"horizon":2}
+Input and output default to stdin and stdout; use "-" explicitly for either."#)]
     Forecast {
         #[command(flatten)]
         args: forecast::Args,
     },
     /// Provision and inspect a router state directory.
+    #[command(after_help = r#"Example:
+  lattice router init --help
+
+The init subcommand provisions an untrained router state directory.
+It requires macOS and a build with metal-gpu and mixture."#)]
     Router {
         #[command(subcommand)]
         command: RouterCommand,
@@ -270,6 +313,15 @@ enum RouterCommand {
     /// uniform policy with nothing learned. It is legitimate to serve as a
     /// baseline and is not evidence of learning: the artifact says so, and
     /// `GET /v1/lora` reports it. Initialising does not enable learning.
+    #[command(after_help = r#"Example:
+  lattice router init --state ./router-state --adapters adapter-a,adapter-b \
+    --schema-id example-v1 --base-model qwen3.5-0.8b \
+    --embedding-model /models/gme-qwen35
+
+Requires macOS and a build with metal-gpu and mixture.
+The embedding checkpoint must be a supported local Qwen3.5 vision-language
+safetensors directory. An existing router artifact is refused.
+This creates an untrained uniform bootstrap; it does not enable learning."#)]
     Init {
         #[command(flatten)]
         args: router::InitArgs,
