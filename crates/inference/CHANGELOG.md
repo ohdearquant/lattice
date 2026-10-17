@@ -10,23 +10,43 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-18
+
+### Breaking
+
+- `router_init::bootstrap_policy` takes the tau and the exploration scale, and `BootstrapSpec` gains `tau` and `exploration_scale` (#1958).
+- `ResolvedRouter::report` takes the applied policy; `RouterReport` gains `applied_policy` and no longer derives `Copy` (#1958).
+- `ServingRouter::new` and `ServedRouter::new` take `learning: bool` (#1958). `ServingRouter::route` and `ServedRouter::route` take the context vector by value and return `RoutedRequest` (#1949), and take the completion id (#1958).
+
 ### Added
 
+- Reverso time-series forecasting on the CPU (nano, small and full), the `forecast` module and the `lattice forecast` subcommand (#1962); Chronos-2 quantile forecasting (#1983) and Toto 2.0 forecasting (#1984) on the CPU.
+- Opt-in Metal path for the EmbeddingGemma 2 vision tower (macOS, `metal-gpu`) (#1940), on the simdgroup-matrix kernels `gemm_f32_sg` and `eg2_attention_sg_hd64` (Apple7 family or later) (#1943), with each layer's attention block in one command buffer (#1944).
+- Model-format detection from safetensors headers and `config.json`: `ModelFormat` gains `MlxQuantized`, `Gguf` and `Refused`, and `inspect_format` returns the reason for a refusal (#1957).
+- `lattice chat -p/--prompt <text>`: generate once, write the reply to stdout and exit (#1905).
+- Routed-completion episodes (`router_episode`) and `POST /v1/router/feedback` (#1949).
+- `lattice serve --router-learn`, off by default, with exploration draws seeded from the completion id (`mixture::seed_from_completion_id`); `lattice router init --tau` and `--exploration-scale` (#1958).
+- `router-learning` feature, not in the default set, for the bounded router trainer (#1964), and bounded candidate construction behind it (`router_refit`), fitting diagnostics only (#1974).
+- Router admission over a registered held-out population (ADR-096 decision 5): admission evidence only, with nothing published or activated (#1975).
 - Serialized, create-only router publication with synced staging outside the
   selectable namespace. Bootstrap commits its durable HEAD before returning.
   A failure after HEAD replacement or legacy artifact publication reports an
   uncertain commit for startup recovery, without authorizing live activation.
 - Historical format-5 receipts preserve the exact previous HEAD before an
-  advance. Explicit format-5 pins require current HEAD or such a receipt.
+  advance. Explicit format-5 pins require current HEAD or such a receipt (#1970).
 
 ### Changed
 
+- Q4 ingress admits a block with a negative scale; a zero or non-finite scale or bias is still refused (#1954).
+- `WordPieceTokenizer::tokenize_batch` runs batches of more than 16 texts on the current rayon pool (#1929).
+- Gemma 4 CPU prefill projects to vocabulary logits only for the last prompt token (#1965).
+- Model downloads resolve at a pinned commit per repository instead of `main` (#1961).
 - **Behavior change:** LoRA adapter load and unload (`/v1/lora/load`, `/v1/lora/unload`) on both
   `lattice serve` and `lattice_serve` now answer 413 `request_body_too_large` for a request body
   over the 1 MiB limit, instead of 400.
 - **Behavior change:** under `lattice serve`, a LoRA load whose body cannot be read for any other
   reason now answers 400 `invalid_request` (previously `invalid_request_body`), the same code
-  `lattice_serve` already used.
+  `lattice_serve` already used (#1985).
 - Format-5 pins require the canonical counter plus 16 hexadecimal characters,
   or the full 64-character hash. Historical artifacts without commit proof
   refuse with their identity and fresh-directory bootstrap migration guidance.
@@ -39,7 +59,18 @@ workspace version; the workspace release notes are in
   directories remain readable without creating a lock; cooperating publishers
   create the lock before publication and never replace or remove its inode.
 - Directory initialization synchronizes the target and newly created ancestry
-  through its first existing parent, without opening unrelated higher ancestors.
+  through its first existing parent, without opening unrelated higher ancestors (#1970).
+
+### Fixed
+
+- Decoder sessions always reach `finish` after a cancelled or failed prefill, and `finish(Reusable)` invalidates the live prediction on the Qwen and Gemma CPU sessions (#1902).
+- EmbeddingGemma 2 Metal shared-buffer copies refuse a count past the allocation in every build profile (#1942).
+- Measurement lock files have their times refreshed on acquire, so macOS no longer deletes a held lock file (#1903).
+- Downloaded models create directories `0755` and files `0644`, so a group-writable umask no longer makes them unloadable (#1951).
+- A Qwen `config.json` with a negative nested `rope_parameters.rope_theta` is refused (#1993).
+- A worker panic during a CPU streaming completion ends the stream with its error event and `[DONE]` (#1990).
+- Batch admission at full capacity keeps FIFO order instead of treating a queued request as admitted (#1991).
+- `rustls` 0.23.46 in `Cargo.lock` for RUSTSEC-2026-0346 to 0349 (#1950).
 
 ### Deprecated
 
@@ -49,7 +80,7 @@ workspace version; the workspace release notes are in
   `router_init::init_directory` for a fresh bootstrap. Learned admission has no
   production publication entry point yet.
 - `load_latest` now delegates to `load_selected`, honoring committed HEAD and
-  the format rules above. Use `read_artifact` for raw artifact inspection.
+  the format rules above. Use `read_artifact` for raw artifact inspection (#1970).
 
 ## [0.12.1] - 2026-10-14
 

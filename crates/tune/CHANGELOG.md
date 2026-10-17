@@ -10,6 +10,8 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-18
+
 ### Changed
 
 - **Breaking:** `LRSchedule` is `#[non_exhaustive]`. A `match` on it outside the crate needs a
