@@ -20,7 +20,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "file_size_gate.py"
-MANIFEST = "scripts/file-size-manifest.toml"
+MANIFEST = "file-size-manifest.toml"
 
 SPEC = importlib.util.spec_from_file_location("file_size_gate", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None

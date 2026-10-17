@@ -39,7 +39,7 @@ EXIT_VIOLATION = 1
 EXIT_REFUSAL = 2
 
 LINE_CAP = 3000
-MANIFEST_PATH = "scripts/file-size-manifest.toml"
+MANIFEST_PATH = "file-size-manifest.toml"
 ZERO_SHA = "0" * 40
 BINARY_PROBE_BYTES = 8192
 
