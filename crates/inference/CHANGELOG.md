@@ -40,6 +40,8 @@ workspace version; the workspace release notes are in
 - Q4 ingress admits a block with a negative scale; a zero or non-finite scale or bias is still refused (#1954).
 - `WordPieceTokenizer::tokenize_batch` runs batches of more than 16 texts on the current rayon pool (#1929).
 - Gemma 4 CPU prefill projects to vocabulary logits only for the last prompt token (#1965).
+- Qwen CPU requests reserve KV cache and attention scratch for their token budget before prefill, and reuse one buffer for text deltas (#1966).
+- Standalone Q8 generation keeps its macOS tile buffers across a request (#1982).
 - Model downloads resolve at a pinned commit per repository instead of `main` (#1961).
 - **Behavior change:** LoRA adapter load and unload (`/v1/lora/load`, `/v1/lora/unload`) on both
   `lattice serve` and `lattice_serve` now answer 413 `request_body_too_large` for a request body
