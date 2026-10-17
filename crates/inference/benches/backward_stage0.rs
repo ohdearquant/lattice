@@ -248,11 +248,11 @@ fn preflight<T: OutputParity>(
 fn bench_cross_entropy_backward(c: &mut Criterion) {
     for forced in [false, true] {
         let operation = Operation::CrossEntropyBackward;
-        let mut group = c.benchmark_group(if forced {
-            "backward_stage0/cross_entropy_backward_forced_scalar"
+        let mut group = if forced {
+            c.benchmark_group("backward_stage0/cross_entropy_backward_forced_scalar")
         } else {
-            "backward_stage0/cross_entropy_backward"
-        });
+            c.benchmark_group("backward_stage0/cross_entropy_backward")
+        };
         for (name, seq_len, vocab_size, completion_start) in
             [(TINY, 4, 128, 2), (QWEN35_08B, 8, 248_320, 4)]
         {
@@ -329,11 +329,11 @@ fn bench_cross_entropy_backward(c: &mut Criterion) {
 fn bench_linear_vjp(c: &mut Criterion) {
     for forced in [false, true] {
         let operation = Operation::LinearVjp;
-        let mut group = c.benchmark_group(if forced {
-            "backward_stage0/linear_vjp_forced_scalar"
+        let mut group = if forced {
+            c.benchmark_group("backward_stage0/linear_vjp_forced_scalar")
         } else {
-            "backward_stage0/linear_vjp"
-        });
+            c.benchmark_group("backward_stage0/linear_vjp")
+        };
         let lm_head = Qwen35Config::qwen35_0_8b();
         for (name, d_in, d_out) in [
             (TINY, 64, 192),
@@ -383,11 +383,11 @@ fn bench_linear_vjp(c: &mut Criterion) {
 fn bench_lora_vjp(c: &mut Criterion) {
     for forced in [false, true] {
         let operation = Operation::LoraVjp;
-        let mut group = c.benchmark_group(if forced {
-            "backward_stage0/lora_vjp_forced_scalar"
+        let mut group = if forced {
+            c.benchmark_group("backward_stage0/lora_vjp_forced_scalar")
         } else {
-            "backward_stage0/lora_vjp"
-        });
+            c.benchmark_group("backward_stage0/lora_vjp")
+        };
         let lm_head = Qwen35Config::qwen35_0_8b();
         for (name, rank, d_in, d_out) in [
             (TINY, 4, 64, 192),
@@ -490,11 +490,11 @@ fn bench_lora_vjp(c: &mut Criterion) {
 fn bench_rmsnorm_backward(c: &mut Criterion) {
     for forced in [false, true] {
         let operation = Operation::RmsnormBackward;
-        let mut group = c.benchmark_group(if forced {
-            "backward_stage0/rmsnorm_backward_forced_scalar"
+        let mut group = if forced {
+            c.benchmark_group("backward_stage0/rmsnorm_backward_forced_scalar")
         } else {
-            "backward_stage0/rmsnorm_backward"
-        });
+            c.benchmark_group("backward_stage0/rmsnorm_backward")
+        };
         for (name, dim) in [(TINY, 64), (QWEN35_08B, 1024)] {
             let mut fixture = None;
             let mut checked = false;
@@ -565,11 +565,11 @@ fn bench_rmsnorm_backward(c: &mut Criterion) {
 fn bench_rope_backward(c: &mut Criterion) {
     for forced in [false, true] {
         let operation = Operation::RopeBackward;
-        let mut group = c.benchmark_group(if forced {
-            "backward_stage0/rope_backward_forced_scalar"
+        let mut group = if forced {
+            c.benchmark_group("backward_stage0/rope_backward_forced_scalar")
         } else {
-            "backward_stage0/rope_backward"
-        });
+            c.benchmark_group("backward_stage0/rope_backward")
+        };
         for (name, head_dim, rope_dim) in [(TINY, 64, 32), (QWEN35_08B, 256, 64)] {
             let mut fixture = None;
             let mut checked = false;
@@ -638,11 +638,11 @@ fn bench_rope_backward(c: &mut Criterion) {
 fn bench_swiglu_backward(c: &mut Criterion) {
     for forced in [false, true] {
         let operation = Operation::SwigluBackward;
-        let mut group = c.benchmark_group(if forced {
-            "backward_stage0/swiglu_backward_forced_scalar"
+        let mut group = if forced {
+            c.benchmark_group("backward_stage0/swiglu_backward_forced_scalar")
         } else {
-            "backward_stage0/swiglu_backward"
-        });
+            c.benchmark_group("backward_stage0/swiglu_backward")
+        };
         for (name, hidden, inter) in [(TINY, 64, 192), (QWEN35_08B, 1024, 3584)] {
             let mut fixture = None;
             let mut checked = false;
@@ -837,11 +837,11 @@ fn make_gqa_fixture(shape: GqaShape) -> GqaFixture {
 fn bench_gqa_backward(c: &mut Criterion) {
     for forced in [false, true] {
         let operation = Operation::GqaBackward;
-        let mut group = c.benchmark_group(if forced {
-            "backward_stage0/gqa_backward_forced_scalar"
+        let mut group = if forced {
+            c.benchmark_group("backward_stage0/gqa_backward_forced_scalar")
         } else {
-            "backward_stage0/gqa_backward"
-        });
+            c.benchmark_group("backward_stage0/gqa_backward")
+        };
         for shape in [
             GqaShape {
                 name: TINY,
@@ -1078,11 +1078,11 @@ fn make_gdn_fixture(shape: GdnShape) -> GdnFixture {
 fn bench_gdn_backward(c: &mut Criterion) {
     for forced in [false, true] {
         let operation = Operation::GdnBackward;
-        let mut group = c.benchmark_group(if forced {
-            "backward_stage0/gdn_backward_forced_scalar"
+        let mut group = if forced {
+            c.benchmark_group("backward_stage0/gdn_backward_forced_scalar")
         } else {
-            "backward_stage0/gdn_backward"
-        });
+            c.benchmark_group("backward_stage0/gdn_backward")
+        };
         for shape in [
             GdnShape {
                 name: TINY,
