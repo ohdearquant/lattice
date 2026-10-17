@@ -23,12 +23,18 @@ lattice_bin_main_rs="$repo_root/crates/inference/src/bin/lattice/main.rs"
 lattice_bin_chat_rs="$repo_root/crates/inference/src/bin/lattice/chat.rs"
 lattice_bin_doctor_rs="$repo_root/crates/inference/src/bin/lattice/doctor.rs"
 lattice_bin_serve_rs="$repo_root/crates/inference/src/bin/lattice/serve.rs"
-lattice_serve_rs="$repo_root/crates/inference/src/bin/lattice_serve.rs"
+lattice_serve_rs="$repo_root/crates/inference/src/bin/lattice_serve/main.rs"
+# lattice_serve's unit tests live in `imp/tests.rs` (declared by `mod tests;`
+# inside `mod imp`) and in that module's own child files under `imp/tests/`.
+lattice_serve_tests_rs="$repo_root/crates/inference/src/bin/lattice_serve/imp/tests.rs"
+lattice_serve_tests_dir="$repo_root/crates/inference/src/bin/lattice_serve/imp/tests"
 chat_metal_rs="$repo_root/crates/inference/src/bin/chat_metal.rs"
 # Shared Metal worker owner (#832): the cancellation/window-check fixtures
 # that used to live in lattice_serve.rs's own #[cfg(test)] mod now live here
 # instead, ported verbatim and shared by both `lattice` and `lattice_serve`.
 metal_worker_rs="$repo_root/crates/inference/src/serve/metal_worker.rs"
+# Its unit tests live in a sibling file declared by `mod tests;`.
+metal_worker_tests_rs="$repo_root/crates/inference/src/serve/metal_worker/tests.rs"
 
 # Fixture IDs always start with one of these prefixes (the naming convention
 # every `#[test] fn` added for #654, plus the pre-existing per-surface test
@@ -60,8 +66,12 @@ all_test_fns="$(
         extract_test_fn_names "$lattice_bin_doctor_rs"
         extract_test_fn_names "$lattice_bin_serve_rs"
         extract_test_fn_names "$lattice_serve_rs"
+        for f in "$lattice_serve_tests_rs" "$lattice_serve_tests_dir"/*.rs; do
+            extract_test_fn_names "$f"
+        done
         extract_test_fn_names "$chat_metal_rs"
         extract_test_fn_names "$metal_worker_rs"
+        extract_test_fn_names "$metal_worker_tests_rs"
     } | sort -u
 )"
 
@@ -118,7 +128,7 @@ check_doc() {
         cited="$cited $tok"
 
         if ! is_real_test_fn "$tok"; then
-            [ "$quiet" = "1" ] || echo "check-capability-matrix: fixture '$tok' is cited in $doc but no #[test]/#[tokio::test] fn named '$tok' exists in lattice.rs, lattice_serve.rs, chat_metal.rs, or serve/metal_worker.rs" >&2
+            [ "$quiet" = "1" ] || echo "check-capability-matrix: fixture '$tok' is cited in $doc but no #[test]/#[tokio::test] fn named '$tok' exists in lattice.rs, lattice_serve.rs, chat_metal.rs, serve/metal_worker.rs, or serve/metal_worker/tests.rs" >&2
             fail=1
         fi
     done
@@ -180,7 +190,7 @@ fi
 # families added before #654's Fixture manifest section don't need every
 # single test enumerated by name on day one. Reuses $tokens, set by the
 # check_doc call above.
-for f in "$lattice_bin_main_rs" "$lattice_bin_chat_rs" "$lattice_bin_doctor_rs" "$lattice_bin_serve_rs" "$lattice_serve_rs" "$chat_metal_rs" "$metal_worker_rs"; do
+for f in "$lattice_bin_main_rs" "$lattice_bin_chat_rs" "$lattice_bin_doctor_rs" "$lattice_bin_serve_rs" "$lattice_serve_rs" "$lattice_serve_tests_rs" "$lattice_serve_tests_dir"/*.rs "$chat_metal_rs" "$metal_worker_rs" "$metal_worker_tests_rs"; do
     extract_test_fn_names "$f" | while read -r name; do
         matched_prefix=0
         for p in $prefixes; do

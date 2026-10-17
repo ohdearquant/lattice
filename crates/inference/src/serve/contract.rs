@@ -1692,7 +1692,10 @@ mod tests {
         );
         for (name, source) in [
             ("lattice", lattice_source),
-            ("lattice_serve", include_str!("../bin/lattice_serve.rs")),
+            (
+                "lattice_serve",
+                include_str!("../bin/lattice_serve/main.rs"),
+            ),
         ] {
             for literal in [
                 "temperature: 0.7",

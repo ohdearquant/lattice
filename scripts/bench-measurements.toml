@@ -184,6 +184,10 @@ path = "crates/inference/src/bin/lattice/serve.rs"
 reason = "`lattice serve` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/serve_cpu_panic_tests.rs"
+reason = "Test-only CPU generation panic, HTTP/SSE and admission correctness controls using a synthetic generator; timeout deadlines bound hangs and do not produce timing measurements. No Criterion or Metal dispatch; included only under cfg(test) and test-utils."
+
+[[non_measurement_surface]]
 path = "crates/inference/src/bin/lattice/doctor.rs"
 reason = "`lattice doctor` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
@@ -200,7 +204,7 @@ path = "crates/inference/src/bin/lattice/router.rs"
 reason = "`lattice router` subcommand module of the product CLI; `router init` provisions a router state directory once and exits, loading the embedding model only to measure the gate's input width through the serving path's own loader. No timing, no Criterion, no Metal dispatch."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice_serve.rs"
+path = "crates/inference/src/bin/lattice_serve/main.rs"
 reason = "Long-running server process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]

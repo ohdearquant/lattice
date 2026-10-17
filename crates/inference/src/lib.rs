@@ -56,10 +56,16 @@ pub mod weights;
 /// and [`model`].
 pub mod batch;
 pub(crate) mod bounded_read;
+/// Registered held-out evidence for router candidate admission.
+#[cfg(feature = "router-learning")]
+pub mod router_admission;
 pub mod router_episode;
 /// Provisioning a router state directory with an untrained bootstrap
 /// (ADR-096 decision 2).
 pub mod router_init;
+/// Bounded construction of router candidates from recorded feedback.
+#[cfg(feature = "router-learning")]
+pub mod router_refit;
 /// The on-disk router gate artifact: version, trained-adapter names, payload.
 /// Deliberately free of the `mixture` gate — see the module doc comment.
 pub mod router_state;
