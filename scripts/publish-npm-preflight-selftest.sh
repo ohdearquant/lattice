@@ -356,16 +356,18 @@ echo "=== publish-npm.sh platform matrix completeness guard self-test (real asse
 # this run's evidence for whether napi.targets, optionalDependencies, and the
 # CI build workflow agree today -- see (h6).
 REAL_PREBUILD_MATRIX_ASSERT="$REPO/npm/lattice-embed-native/scripts/assert-prebuild-matrix.mjs"
+REAL_PREBUILD_MATRIX_ROWS="$REPO/npm/lattice-embed-native/scripts/prebuild-matrix.json"
 REAL_PREBUILD_WORKFLOW="$REPO/.github/workflows/npm-prebuild.yml"
 REAL_NATIVE_PKGJSON="$REPO/npm/lattice-embed-native/package.json"
-for f in "$REAL_PREBUILD_MATRIX_ASSERT" "$REAL_PREBUILD_WORKFLOW" "$REAL_NATIVE_PKGJSON"; do
+for f in "$REAL_PREBUILD_MATRIX_ASSERT" "$REAL_PREBUILD_MATRIX_ROWS" "$REAL_PREBUILD_WORKFLOW" "$REAL_NATIVE_PKGJSON"; do
   if [ ! -f "$f" ]; then
     echo "FATAL: $f not found -- has it moved?" >&2
     exit 1
   fi
 done
 
-# Build a fixture tree with the REAL assert-prebuild-matrix.mjs and the REAL
+# Build a fixture tree with the REAL assert-prebuild-matrix.mjs, the REAL
+# prebuild-matrix.json target list beside it, and the REAL
 # npm-prebuild.yml workflow at the same relative depth
 # assert-prebuild-matrix.mjs resolves them at (three directories up from
 # itself: scripts/ -> lattice-embed-native/ -> npm/ -> root), so the
@@ -376,6 +378,7 @@ build_prebuild_matrix_fixture_root() {  # $1=fixture root
   native="$root/npm/lattice-embed-native"
   mkdir -p "$native/scripts" "$root/.github/workflows"
   cp "$REAL_PREBUILD_MATRIX_ASSERT" "$native/scripts/assert-prebuild-matrix.mjs"
+  cp "$REAL_PREBUILD_MATRIX_ROWS" "$native/scripts/prebuild-matrix.json"
   cp "$REAL_PREBUILD_WORKFLOW" "$root/.github/workflows/npm-prebuild.yml"
 }
 
