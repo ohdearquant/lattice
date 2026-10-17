@@ -383,6 +383,21 @@ pub struct AdapterRouter {
 }
 
 impl AdapterRouter {
+    #[cfg(feature = "router-learning")]
+    pub(crate) fn replay_recorded_logits(
+        &self,
+        logits: &[f32],
+        available: &[AdapterId],
+        exploration: Exploration,
+    ) -> Result<RouteOutcome, RouterError> {
+        let mut layer =
+            lattice_fann::Layer::zeros(1, logits.len(), lattice_fann::Activation::Linear)?;
+        layer.biases_mut().copy_from_slice(logits);
+        let mut replay = self.refit_snapshot();
+        replay.gate = Network::new(vec![layer])?;
+        replay.route_explored(&[0.0], available, available.len(), Some(exploration))
+    }
+
     #[cfg(all(feature = "router-learning", feature = "serve"))]
     pub(crate) fn gate_bytes(&self) -> Vec<u8> {
         self.gate.to_bytes()

@@ -46,9 +46,9 @@ unsafe impl GlobalAlloc for CountingAlloc {
 
 #[allow(dead_code)]
 pub(crate) struct AllocationSnapshot {
-    alloc_calls: u64,
-    realloc_calls: u64,
-    bytes_allocated: u64,
+    pub(crate) alloc_calls: u64,
+    pub(crate) realloc_calls: u64,
+    pub(crate) bytes_allocated: u64,
 }
 
 #[allow(dead_code)]

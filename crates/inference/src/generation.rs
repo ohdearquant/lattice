@@ -791,7 +791,7 @@ impl DecodePolicy {
         grammar_advance: impl FnMut(u32) -> Result<bool, InferenceError>,
         is_eos: impl FnMut(u32) -> bool,
         push: impl FnMut(u32),
-        decode_delta: impl FnMut(u32) -> String,
+        mut decode_delta: impl FnMut(u32) -> String,
         text: &mut String,
         token_logprob_end_offsets: &mut Vec<usize>,
         emit_confirmed: impl FnMut(&str, u32) -> bool,
@@ -804,7 +804,8 @@ impl DecodePolicy {
             is_eos,
             push,
             |token_id, top_n| Ok(compute_step_logprobs(logits, token_id, temperature, top_n)),
-            decode_delta,
+            |id, out| *out = decode_delta(id),
+            &mut String::new(),
             text,
             token_logprob_end_offsets,
             emit_confirmed,
@@ -821,6 +822,7 @@ impl DecodePolicy {
     /// longer a `DecoderSession` method) and `record_metadata` routes through
     /// `DecoderSession::metadata`.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
     pub(crate) fn transition_with_metadata(
         &mut self,
         token_logprobs: &mut Vec<TokenLogprob>,
@@ -830,7 +832,40 @@ impl DecodePolicy {
         is_eos: impl FnMut(u32) -> bool,
         push: impl FnMut(u32),
         record_metadata: impl FnMut(u32, usize) -> Result<(f32, Vec<TopLogprob>), InferenceError>,
-        decode_delta: impl FnMut(u32) -> String,
+        mut decode_delta: impl FnMut(u32) -> String,
+        text: &mut String,
+        token_logprob_end_offsets: &mut Vec<usize>,
+        emit_confirmed: impl FnMut(&str, u32) -> bool,
+    ) -> Result<StepOutcome, InferenceError> {
+        self.transition_inner(
+            token_logprobs,
+            sampled_id,
+            generated_len_before,
+            grammar_advance,
+            is_eos,
+            push,
+            record_metadata,
+            |id, out| *out = decode_delta(id),
+            &mut String::new(),
+            text,
+            token_logprob_end_offsets,
+            emit_confirmed,
+        )
+    }
+
+    /// Metadata transition with a caller-owned delta buffer reused across tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transition_with_metadata_into(
+        &mut self,
+        token_logprobs: &mut Vec<TokenLogprob>,
+        sampled_id: u32,
+        generated_len_before: usize,
+        grammar_advance: impl FnMut(u32) -> Result<bool, InferenceError>,
+        is_eos: impl FnMut(u32) -> bool,
+        push: impl FnMut(u32),
+        record_metadata: impl FnMut(u32, usize) -> Result<(f32, Vec<TopLogprob>), InferenceError>,
+        decode_delta: impl FnMut(u32, &mut String),
+        delta: &mut String,
         text: &mut String,
         token_logprob_end_offsets: &mut Vec<usize>,
         emit_confirmed: impl FnMut(&str, u32) -> bool,
@@ -844,6 +879,7 @@ impl DecodePolicy {
             push,
             record_metadata,
             decode_delta,
+            delta,
             text,
             token_logprob_end_offsets,
             emit_confirmed,
@@ -869,7 +905,8 @@ impl DecodePolicy {
         mut is_eos: impl FnMut(u32) -> bool,
         mut push: impl FnMut(u32),
         mut record_metadata: impl FnMut(u32, usize) -> Result<(f32, Vec<TopLogprob>), InferenceError>,
-        mut decode_delta: impl FnMut(u32) -> String,
+        mut decode_delta: impl FnMut(u32, &mut String),
+        delta: &mut String,
         text: &mut String,
         token_logprob_end_offsets: &mut Vec<usize>,
         mut emit_confirmed: impl FnMut(&str, u32) -> bool,
@@ -899,12 +936,13 @@ impl DecodePolicy {
         }
         self.capture_reasoning_end(generated_len_after);
 
-        let delta = decode_delta(next_id);
+        delta.clear();
+        decode_delta(next_id, delta);
         let stop_outcome = self.stop_check(
             token_logprobs,
             text,
             token_logprob_end_offsets,
-            &delta,
+            delta,
             |s| emit_confirmed(s, next_id),
         );
         match stop_outcome {

@@ -21,7 +21,7 @@
 //! file always wins over a `.q4` tensor file, and an unreadable or
 //! non-matching directory fails closed to [`ModelFormat::Unknown`](crate::model_format::ModelFormat::Unknown)) was
 //! implemented independently in `bin/lattice.rs` (`backend::detect_format`,
-//! enum-valued, with its own unit tests), `bin/lattice_serve.rs`
+//! enum-valued, with its own unit tests), `bin/lattice_serve/main.rs`
 //! (`detect_q4`, bool-valued), and `bin/chat_metal.rs` (`is_q4_dir`,
 //! bool-valued, plus a fourth, partial decision site that only re-checked
 //! safetensors absence inside the non-Q4 branch). All three binaries now
