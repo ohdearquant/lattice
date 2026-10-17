@@ -30,6 +30,7 @@ comput = "comput" # bibliographic abbreviation, "SIAM J. Sci. Comput."
 oll = "oll"     # ollama shell/plot variable abbreviation in bench scripts
 yhat = "yhat"   # statistics notation (predicted value)
 unparseable = "unparseable" # accepted alternate spelling (cf. Java ParseException)
+alse = "alse"   # a `false` fragment ("f" + "alse") in grammar-engine tokenizer vocab fixtures
 
 # Short local-variable and struct-field abbreviations the checker treats as
 # misspelled English words:

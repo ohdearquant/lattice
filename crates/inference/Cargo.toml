@@ -177,7 +177,7 @@ required-features = ["f16", "metal-gpu"]
 
 [[bin]]
 name = "lattice_serve"
-path = "src/bin/lattice_serve.rs"
+path = "src/bin/lattice_serve/main.rs"
 required-features = ["f16", "metal-gpu", "serve"]
 
 [[test]]
@@ -259,6 +259,12 @@ test = false
 [[test]]
 name = "decoder_allocation_arm"
 test = false
+
+# The shared benchmark allocator needs a standalone, single-threaded control process.
+[[test]]
+name = "inference_perf_allocation_gate"
+harness = false
+required-features = ["bench-internals"]
 
 [[bin]]
 name = "bench_decode_ab"

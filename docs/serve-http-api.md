@@ -17,7 +17,7 @@ This codebase has **two** separately built HTTP servers with confusingly similar
   history (unified-CLI ADR-063, SSE streaming, stop sequences, native Q4 checkpoint support,
   `lattice doctor` preflight). **This document is about `lattice serve`.**
 - **`lattice_serve`** — a separate, standalone binary
-  (`crates/inference/src/bin/lattice_serve.rs`), purpose-built as the internal HTTP daemon the
+  (`crates/inference/src/bin/lattice_serve/main.rs`), purpose-built as the internal HTTP daemon the
   macOS Lattice Studio app spawns and talks to (introduced in PR #435). It has its own, narrower
   route set (`GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`,
   `POST /v1/embeddings`, `GET /v1/lora`, `POST /v1/lora/load`, `POST /v1/lora/unload`,
@@ -181,7 +181,7 @@ per unit time.
   the only cap on this backend: `--max-cpu-generations` does not apply to it. Both `lattice serve`
   and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
   default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/inference/src/bin/lattice/main.rs`,
-  `crates/inference/src/bin/lattice_serve.rs`). A request submitted while the cap is already full
+  `crates/inference/src/bin/lattice_serve/main.rs`). A request submitted while the cap is already full
   is rejected at the worker's admission boundary (`MetalWorkerClient::submit_with_lora`'s
   `try_acquire_owned`, `crates/inference/src/serve/metal_worker.rs`) before any Metal
   generation work happens — the HTTP handler has already tokenized the rendered prompt during

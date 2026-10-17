@@ -30,9 +30,8 @@
 //! no router compiled in, and the gate payload is opaque bytes here — nothing
 //! in this file needs a `lattice-fann` type to read or write it.
 //!
-//! Scope: this is the write and read half. Choosing WHICH version a server
-//! loads is startup's job, not this module's; artifacts are kept beside each
-//! other under their own versions precisely so that choice stays external.
+//! Scope: durable artifact publication and startup selection. Live activation
+//! is performed by the serving layer after publication succeeds.
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +39,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::bounded_read::{BoundedReadError, read_bytes_bounded};
+
+mod storage;
+
+#[cfg(any(feature = "mixture", feature = "metal-gpu"))]
+pub(crate) use storage::publish_bootstrap;
 
 /// On-disk format revision written for an artifact that records its own
 /// policy and lineage (ADR-096 decision 5). Bumped only for a change that an
@@ -121,17 +125,55 @@ pub enum RouterArtifactError {
         problem: String,
     },
 
-    /// The head record is present but could not be read or parsed. This is an
-    /// error and never an absence: an absent head selects by counter, so a
+    /// The head record could not be inspected, read, or parsed. This is an
+    /// error and never an absence: an absent legacy head selects by counter, so a
     /// truncated head that read as absent would silently reinstate the rule
     /// the head exists to replace, and it would do it on the one artifact
     /// whose admission was interrupted.
-    #[error("head record {path} is present but unreadable: {message}")]
+    #[error("head record {path} could not be read: {message}")]
     HeadUnreadable {
         /// The head record's path.
         path: PathBuf,
         /// The reader's or parser's own message.
         message: String,
+    },
+
+    /// The head's revision or content hash is not a supported identity.
+    #[error("head record {path} is invalid: {problem}")]
+    InvalidHead {
+        /// The head record's path.
+        path: PathBuf,
+        /// The identity field that failed validation.
+        problem: String,
+    },
+
+    /// A recorded artifact cannot be selected by counter without a head.
+    #[error(
+        "router directory {dir} contains format-5 version {version} but has no \
+         committed head (identity {version}:{content_sha256}); startup cannot select it by counter; \
+         rerun bootstrap into a fresh directory, or use later admission when available"
+    )]
+    MissingHead {
+        /// The state directory.
+        dir: PathBuf,
+        /// A recorded version that requires a head.
+        version: u64,
+        /// The full identity declared by that manifest.
+        content_sha256: String,
+    },
+
+    /// An existing or proposed head and its artifact disagree on the revision.
+    #[error(
+        "head record {path} names format {head_format}, but its artifact uses \
+         format {artifact_format}; the head must identify the stored revision"
+    )]
+    HeadFormatMismatch {
+        /// The head record's path.
+        path: PathBuf,
+        /// The revision named by the head.
+        head_format: u32,
+        /// The revision read from the artifact.
+        artifact_format: u32,
     },
 
     /// The head names a version that is not in the directory. The artifact was
@@ -149,21 +191,18 @@ pub enum RouterArtifactError {
         version: u64,
     },
 
-    /// The head names a version whose content hash is not the one it recorded.
-    /// The counter was reused: a later write of the same number produced a
-    /// different artifact, and the head is now pointing at something that was
-    /// never admitted.
+    /// An existing or proposed head names a different artifact at this counter.
     #[error(
         "head record {path} names version {version} with content hash \
-         {head_hash}, but that version now hashes to {artifact_hash}; the \
-         admitted artifact was replaced under a live head"
+         {head_hash}, but that version hashes to {artifact_hash}; the \
+         head identity must match the stored artifact"
     )]
     HeadDisagreesWithArtifact {
         /// The head record's path.
         path: PathBuf,
         /// The version named.
         version: u64,
-        /// The hash the head recorded at admission.
+        /// The hash the existing or proposed head names.
         head_hash: String,
         /// The hash the artifact on disk has now.
         artifact_hash: String,
@@ -262,6 +301,62 @@ pub enum RouterArtifactError {
         /// The path whose write failed.
         path: PathBuf,
         /// The underlying error's message.
+        message: String,
+    },
+
+    /// An operation needs the bootstrap authority rather than caller-supplied bytes.
+    #[error(
+        "format-5 router {identity} cannot be published through this API; use router_init::init_directory for a bootstrap in a fresh directory; learned admission is not available"
+    )]
+    PublicationAuthorityRequired {
+        /// The exact counter and content hash that were refused.
+        identity: String,
+    },
+
+    /// A canonical publication destination already exists and cannot be replaced.
+    #[error("router publication refuses to replace existing path {path}")]
+    AlreadyExists {
+        /// The occupied destination, including orphan gates and symlinks.
+        path: PathBuf,
+    },
+
+    /// The publisher's expected previous head is stale.
+    #[error("router head changed before publication: expected {expected:?}, found {actual:?}")]
+    StaleHead {
+        /// The exact head used to prepare the transaction.
+        expected: Option<HeadRecord>,
+        /// The head observed while holding the publication lock.
+        actual: Option<HeadRecord>,
+    },
+
+    /// A lock could not be inspected, opened, or acquired.
+    #[error("router lock {path}: {message}")]
+    Lock {
+        /// The persistent lock path.
+        path: PathBuf,
+        /// The filesystem or locking failure.
+        message: String,
+    },
+
+    /// A format-5 identity has no usable durable publication proof.
+    #[error(
+        "format-5 router {identity} has no usable committed proof: {problem}; rerun bootstrap into a fresh directory, or use later admission when available"
+    )]
+    MissingCommitProof {
+        /// The exact counter and full content hash.
+        identity: String,
+        /// Why neither current HEAD nor a historical receipt authorizes it.
+        problem: String,
+    },
+
+    /// A version became selectable, but its final durability could not be confirmed.
+    #[error(
+        "router commit outcome is uncertain for {identity}: {message}; do not activate from this result; recover by reopening the state directory"
+    )]
+    CommitUncertain {
+        /// The proposed counter and full content hash.
+        identity: String,
+        /// The failure after HEAD replacement or legacy artifact publication.
         message: String,
     },
 
@@ -887,6 +982,11 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+fn is_lowercase_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 /// Path of the manifest for `version` in `dir`.
 pub fn manifest_path(dir: &Path, version: u64) -> PathBuf {
     dir.join(format!("router-{version}.json"))
@@ -912,7 +1012,7 @@ pub fn head_path(dir: &Path) -> PathBuf {
     dir.join(ROUTER_HEAD_FILE)
 }
 
-/// What a state directory says is currently admitted.
+/// What a state directory says is currently committed.
 ///
 /// The hash is here rather than only in the manifest because the head has to
 /// name an artifact, not a filename. A counter can be written twice; the pair
@@ -928,18 +1028,82 @@ pub struct HeadRecord {
     pub content_sha256: String,
 }
 
+impl HeadRecord {
+    fn validate(&self, path: &Path) -> Result<(), RouterArtifactError> {
+        let problem = if self.format != ROUTER_ARTIFACT_FORMAT {
+            Some(format!(
+                "format {} cannot have a head; only format {ROUTER_ARTIFACT_FORMAT} uses committed heads",
+                self.format
+            ))
+        } else if self.content_sha256.len() != 64 || !is_lowercase_hex(&self.content_sha256) {
+            Some("the content hash must be exactly 64 lowercase hexadecimal characters".to_string())
+        } else {
+            None
+        };
+        match problem {
+            Some(problem) => Err(RouterArtifactError::InvalidHead {
+                path: path.to_path_buf(),
+                problem,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn check_artifact(
+        &self,
+        path: &Path,
+        artifact: &RouterArtifact,
+    ) -> Result<(), RouterArtifactError> {
+        let artifact_format = artifact.provenance.format();
+        if self.format != artifact_format {
+            return Err(RouterArtifactError::HeadFormatMismatch {
+                path: path.to_path_buf(),
+                head_format: self.format,
+                artifact_format,
+            });
+        }
+        let artifact_hash = artifact.content_hash();
+        if self.content_sha256 != artifact_hash {
+            return Err(RouterArtifactError::HeadDisagreesWithArtifact {
+                path: path.to_path_buf(),
+                version: self.version,
+                head_hash: self.content_sha256.clone(),
+                artifact_hash,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Read the committed head, if there is one.
 ///
-/// `Ok(None)` means no head record exists, which is the format-4 state
-/// directory ADR-095 described and is selected by counter. Every other outcome
+/// `Ok(None)` means no head record exists; [`load_selected`] checks that the
+/// directory is legacy before selecting by counter. Every other outcome
 /// is an `Err`, including a head that is present and unparseable: those two
 /// answers pick different artifacts, so collapsing them would make an
 /// interrupted admission look like a directory that had never been admitted
 /// into.
 pub fn read_head(dir: &Path) -> Result<Option<HeadRecord>, RouterArtifactError> {
+    storage::with_read_lock(dir, || read_head_unlocked(dir))
+}
+
+fn read_head_unlocked(dir: &Path) -> Result<Option<HeadRecord>, RouterArtifactError> {
     let path = head_path(dir);
-    if !path.exists() {
-        return Ok(None);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(RouterArtifactError::HeadUnreadable {
+                path,
+                message: "the head must be a regular file".to_string(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RouterArtifactError::HeadUnreadable {
+                path,
+                message: error.to_string(),
+            });
+        }
     }
     let raw = read_bytes_bounded(&path, MAX_ROUTER_HEAD_LEN).map_err(|e| {
         let display: BoundedReadErrorDisplay = e.into();
@@ -953,59 +1117,36 @@ pub fn read_head(dir: &Path) -> Result<Option<HeadRecord>, RouterArtifactError> 
             path: path.clone(),
             message: e.to_string(),
         })?;
+    head.validate(&path)?;
     Ok(Some(head))
 }
 
-/// Commit `artifact` as the directory's head.
+/// Former direct head writer. Caller-supplied format-5 artifacts are refused.
 ///
-/// Written to a temporary file in the same directory and renamed into place,
-/// so a reader sees either the previous head or this one and never a partial
-/// record. A same-directory rename is what makes that atomic; a temp file
-/// elsewhere would be a copy across filesystems with no such guarantee.
-///
-/// The artifact must already be on disk. Committing a head for a version that
-/// was never written produces a directory that refuses every unpinned startup,
-/// which is worse than the rejection it was trying to record.
+/// Use `crate::router_init::init_directory` (with a gate backend enabled) to
+/// construct and durably commit a bootstrap into a fresh directory. Learned
+/// admission has no production entry point yet. Format 4 never has a head.
+#[deprecated(note = "use router_init::init_directory for fresh bootstrap publication")]
 pub fn commit_head(dir: &Path, artifact: &RouterArtifact) -> Result<PathBuf, RouterArtifactError> {
-    let manifest_file = manifest_path(dir, artifact.version);
-    if !manifest_file.exists() {
-        return Err(RouterArtifactError::HeadNamesAbsentVersion {
-            path: head_path(dir),
-            version: artifact.version,
-        });
-    }
-    let head = HeadRecord {
+    HeadRecord {
         format: artifact.provenance.format(),
         version: artifact.version,
         content_sha256: artifact.content_hash(),
-    };
-    let json = serde_json::to_vec_pretty(&head).map_err(|e| RouterArtifactError::Write {
-        path: head_path(dir),
-        message: e.to_string(),
-    })?;
-
-    let path = head_path(dir);
-    let staged = dir.join(format!("{ROUTER_HEAD_FILE}.staged-{}", artifact.version));
-    std::fs::write(&staged, &json).map_err(|e| RouterArtifactError::Write {
-        path: staged.clone(),
-        message: e.to_string(),
-    })?;
-    std::fs::rename(&staged, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&staged);
-        RouterArtifactError::Write {
-            path: path.clone(),
-            message: e.to_string(),
-        }
-    })?;
-    Ok(path)
+    }
+    .validate(&head_path(dir))?;
+    Err(RouterArtifactError::PublicationAuthorityRequired {
+        identity: format!("{}:{}", artifact.version, artifact.content_hash()),
+    })
 }
 
-/// A `--router-pin` value: a counter, optionally with the hash prefix that
-/// identifies which artifact that counter is supposed to be.
+/// A `--router-pin` value: a legacy counter or a counter with content identity.
 ///
 /// The bare counter is ADR-095's pin and stays exactly as written, which is
 /// what a format-4 directory can answer. The pair is the new revision's full
-/// version identity, and it is the form that survives a counter being reused.
+/// version identity: the canonical 16-hex label or the full 64-hex content hash.
+/// Resolution validates that form for format 5, including directly constructed
+/// values. Format-5 resolution also requires the matching current HEAD or a
+/// historical receipt created before that HEAD advanced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouterPin {
     /// The version counter.
@@ -1015,8 +1156,9 @@ pub struct RouterPin {
 }
 
 impl RouterPin {
-    /// Parse `<version>` or `<version>:<hash-prefix>`, the same two spellings
-    /// `version_label()` produces and an operator reads off a running server.
+    /// Parse `<version>` or `<version>:<hash-prefix>`. Format-5 resolution
+    /// requires a canonical 16-hex label or the full 64-hex hash; a bare
+    /// counter remains usable for format 4.
     pub fn parse(text: &str) -> Result<Self, RouterArtifactError> {
         let malformed = |problem: &str| RouterArtifactError::PinMalformed {
             text: text.to_string(),
@@ -1027,14 +1169,11 @@ impl RouterPin {
             Some((counter, hash)) => {
                 if hash.is_empty() {
                     return Err(malformed(
-                        "a trailing colon with no hash names no identity; drop \
-                         the colon to pin by counter",
+                        "a trailing colon with no hash names no identity; provide \
+                         the identity, or drop the colon for a format-4 counter pin",
                     ));
                 }
-                if !hash
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-                {
+                if !is_lowercase_hex(hash) {
                     return Err(malformed(
                         "the hash half must be lowercase hex, as a version \
                          label prints it",
@@ -1049,6 +1188,21 @@ impl RouterPin {
         Ok(Self {
             version,
             hash_prefix,
+        })
+    }
+
+    fn validate_recorded_identity(&self) -> Result<(), RouterArtifactError> {
+        if self
+            .hash_prefix
+            .as_ref()
+            .is_some_and(|hash| matches!(hash.len(), 16 | 64) && is_lowercase_hex(hash))
+        {
+            return Ok(());
+        }
+        Err(RouterArtifactError::PinMalformed {
+            text: self.label(),
+            problem: "format 5 requires the counter and its canonical 16-hex identity or full 64-hex content hash"
+                .to_string(),
         })
     }
 
@@ -1069,43 +1223,41 @@ impl std::str::FromStr for RouterPin {
     }
 }
 
-/// Write `artifact` into `dir` under its own version, leaving any other
-/// version already there untouched.
+/// Compatibility writer for format-4 artifacts only.
 ///
-/// Versions live beside each other rather than overwriting a single current
-/// file, so the previous gate is still on disk after a refit and a rollback
-/// does not need a backup that someone remembered to take.
-///
-/// The payload is written before the manifest. A crash between the two leaves
-/// a payload with no manifest, which every reader here treats as absent; the
-/// reverse order would leave a manifest promising a payload that is not there,
-/// which reads as corruption of a version that was never written.
+/// Use [`write_legacy_artifact`] for legacy publication, or
+/// `router_init::init_directory` for a fresh format-5 bootstrap. Arbitrary
+/// format-5 bytes cannot acquire publication authority through this API.
+#[deprecated(note = "use write_legacy_artifact or router_init::init_directory")]
 pub fn write_artifact(
     dir: &Path,
     artifact: &RouterArtifact,
 ) -> Result<PathBuf, RouterArtifactError> {
-    // Before anything is created. A refused policy must leave no payload
-    // behind: `versions()` counts a version present when its MANIFEST exists,
-    // so an orphan payload is invisible to every reader and would be silently
-    // overwritten by the next write of the same counter.
+    write_legacy_artifact(dir, artifact)
+}
+
+/// Durably publish a legacy artifact without replacing any existing counter.
+///
+/// Gate and manifest destinations are create-only across both formats. The
+/// publisher serializes with bootstrap and readers, and never changes HEAD.
+/// Format-5 artifacts require the authority of `router_init::init_directory`.
+pub fn write_legacy_artifact(
+    dir: &Path,
+    artifact: &RouterArtifact,
+) -> Result<PathBuf, RouterArtifactError> {
+    storage::publish_legacy(dir, artifact)
+}
+
+fn manifest_bytes(artifact: &RouterArtifact, path: &Path) -> Result<Vec<u8>, RouterArtifactError> {
     if let Some(policy) = artifact.provenance.policy() {
         policy.validate()?;
     }
-
-    std::fs::create_dir_all(dir).map_err(|e| RouterArtifactError::Write {
-        path: dir.to_path_buf(),
-        message: e.to_string(),
-    })?;
-
-    let gate = gate_path(dir, artifact.version);
-    std::fs::write(&gate, &artifact.gate_bytes).map_err(|e| RouterArtifactError::Write {
-        path: gate.clone(),
-        message: e.to_string(),
-    })?;
-
     let (policy, lineage) = match &artifact.provenance {
         RouterProvenance::Legacy => (None, None),
-        RouterProvenance::Recorded(r) => (Some(r.policy.clone()), Some(r.lineage.clone())),
+        RouterProvenance::Recorded(recorded) => (
+            Some(recorded.policy.clone()),
+            Some(recorded.lineage.clone()),
+        ),
     };
     let manifest = Manifest {
         format: artifact.provenance.format(),
@@ -1117,17 +1269,10 @@ pub fn write_artifact(
         policy,
         lineage,
     };
-    let json = serde_json::to_vec_pretty(&manifest).map_err(|e| RouterArtifactError::Write {
-        path: manifest_path(dir, artifact.version),
-        message: e.to_string(),
-    })?;
-
-    let path = manifest_path(dir, artifact.version);
-    std::fs::write(&path, &json).map_err(|e| RouterArtifactError::Write {
-        path: path.clone(),
-        message: e.to_string(),
-    })?;
-    Ok(path)
+    serde_json::to_vec_pretty(&manifest).map_err(|error| RouterArtifactError::Write {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })
 }
 
 /// The versions present in `dir`, ascending.
@@ -1318,17 +1463,25 @@ pub fn resolve_startup(
             }),
         };
     };
+    storage::with_read_lock(dir, || resolve_startup_unlocked(dir, pin))
+}
+
+fn resolve_startup_unlocked(
+    dir: &Path,
+    pin: Option<&RouterPin>,
+) -> Result<StartupDisposition, RouterArtifactError> {
     let resolved = match pin {
         // A pinned version that is absent refuses. Falling back to the latest
         // is the failure this rejects: the pin is reached for precisely when
         // the latest is the thing misbehaving, so a silent fallback serves the
         // artifact the operator was trying to get away from.
         //
-        // The head is not consulted here, and that is the whole point of a
-        // pin under the new revision: a head advancing while a pin is in force
-        // changes the served gate for nobody until the pin is lifted.
+        // A historical receipt keeps an exact pin usable after HEAD advances.
         Some(pin) => {
             let artifact = read_artifact(dir, pin.version)?;
+            if artifact.provenance.format() == ROUTER_ARTIFACT_FORMAT {
+                pin.validate_recorded_identity()?;
+            }
             if let Some(prefix) = &pin.hash_prefix {
                 let hash = artifact.content_hash();
                 if !hash.starts_with(prefix.as_str()) {
@@ -1339,12 +1492,15 @@ pub fn resolve_startup(
                     });
                 }
             }
+            if artifact.provenance.format() == ROUTER_ARTIFACT_FORMAT {
+                storage::require_commit_proof(dir, &artifact)?;
+            }
             ResolvedRouter {
                 artifact,
                 pinned: true,
             }
         }
-        None => match load_selected(dir)? {
+        None => match load_selected_unlocked(dir)? {
             Some(artifact) => ResolvedRouter {
                 artifact,
                 pinned: false,
@@ -1371,14 +1527,18 @@ pub fn resolve_startup(
 /// reachable by pin, which is what keeps a rollback target available across
 /// the revision boundary.
 ///
-/// No head record means a format-4 directory, and ADR-095's rule applies
-/// unchanged: the highest counter present wins. Nothing writes a head into
-/// such a directory, so a reader looking for one would find an absence it
-/// could not tell from a truncated write -- which is why `read_head` refuses
-/// an unreadable head instead of reporting it absent.
+/// Without a head, every canonical manifest is inspected within the read cap
+/// before applying the format-4 highest-counter rule. Any format-5 manifest
+/// requires a head, even below a higher legacy counter. This also refuses a
+/// malformed or unknown-format lower manifest that the old counter-only scan
+/// ignored; an unreadable revision cannot establish a legacy directory.
 pub fn load_selected(dir: &Path) -> Result<Option<RouterArtifact>, RouterArtifactError> {
-    let Some(head) = read_head(dir)? else {
-        return load_latest(dir);
+    storage::with_read_lock(dir, || load_selected_unlocked(dir))
+}
+
+fn load_selected_unlocked(dir: &Path) -> Result<Option<RouterArtifact>, RouterArtifactError> {
+    let Some(head) = read_head_unlocked(dir)? else {
+        return load_legacy_selected(dir);
     };
     if !manifest_path(dir, head.version).exists() {
         return Err(RouterArtifactError::HeadNamesAbsentVersion {
@@ -1387,41 +1547,86 @@ pub fn load_selected(dir: &Path) -> Result<Option<RouterArtifact>, RouterArtifac
         });
     }
     let artifact = read_artifact(dir, head.version)?;
-    // The counter can be written twice; the pair cannot. A disagreement here
-    // says the admitted artifact was replaced under a live head, which reads
-    // on disk exactly like an ordinary refit and is not one.
-    let hash = artifact.content_hash();
-    if hash != head.content_sha256 {
-        return Err(RouterArtifactError::HeadDisagreesWithArtifact {
-            path: head_path(dir),
-            version: head.version,
-            head_hash: head.content_sha256,
-            artifact_hash: hash,
+    head.check_artifact(&head_path(dir), &artifact)?;
+    Ok(Some(artifact))
+}
+
+fn load_legacy_selected(dir: &Path) -> Result<Option<RouterArtifact>, RouterArtifactError> {
+    #[derive(Deserialize)]
+    struct Revision {
+        format: u32,
+        #[serde(default)]
+        content_sha256: String,
+    }
+
+    let present = versions(dir)?;
+    for &version in &present {
+        let path = manifest_path(dir, version);
+        let raw = read_bytes_bounded(&path, MAX_ROUTER_MANIFEST_LEN).map_err(|error| {
+            RouterArtifactError::Read {
+                path: path.clone(),
+                source: error.into(),
+            }
+        })?;
+        let revision: Revision =
+            serde_json::from_slice(&raw).map_err(|error| RouterArtifactError::Malformed {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        match revision.format {
+            ROUTER_ARTIFACT_FORMAT_LEGACY => {}
+            ROUTER_ARTIFACT_FORMAT => {
+                if revision.content_sha256.len() != 64
+                    || !is_lowercase_hex(&revision.content_sha256)
+                {
+                    return Err(RouterArtifactError::Malformed {
+                        path,
+                        message: "format-5 manifest has no valid full content identity".to_string(),
+                    });
+                }
+                return Err(RouterArtifactError::MissingHead {
+                    dir: dir.to_path_buf(),
+                    version,
+                    content_sha256: revision.content_sha256,
+                });
+            }
+            found => {
+                return Err(RouterArtifactError::UnknownFormat {
+                    path,
+                    found,
+                    known: format!("{ROUTER_ARTIFACT_FORMAT_LEGACY} and {ROUTER_ARTIFACT_FORMAT}"),
+                });
+            }
+        }
+    }
+    let Some(&version) = present.last() else {
+        return Ok(None);
+    };
+    let artifact = read_artifact(dir, version)?;
+    // Also guard the unlocked compatibility snapshot against changed input.
+    if artifact.provenance.format() == ROUTER_ARTIFACT_FORMAT {
+        return Err(RouterArtifactError::MissingHead {
+            dir: dir.to_path_buf(),
+            version,
+            content_sha256: artifact.content_hash(),
         });
     }
     Ok(Some(artifact))
 }
 
-/// Load the highest version present in `dir`, by counter.
+/// Compatibility selection entry point; delegates to [`load_selected`].
 ///
-/// This is ADR-095's rule and stays exactly as written. It is the rule a
-/// format-4 directory answers to; unpinned startup reaches it through
-/// [`load_selected`], which applies it only when there is no committed head.
-///
-/// `Ok(None)` means the directory holds no artifact at all, which is a server
-/// that has never been given a gate. Every other failure is an `Err`: a
-/// directory that holds an artifact which will not load must stop a startup,
-/// not degrade it to no-router, because those two states serve differently
-/// and only one of them was asked for.
+/// A wholly legacy directory still selects its highest counter. Format 5 now
+/// requires committed HEAD selection, and mixed headless directories refuse.
+/// Use [`read_artifact`] for raw inspection without selection authority.
+#[deprecated(note = "use load_selected; raw inspection uses read_artifact")]
 pub fn load_latest(dir: &Path) -> Result<Option<RouterArtifact>, RouterArtifactError> {
-    match versions(dir)?.last() {
-        None => Ok(None),
-        Some(&version) => read_artifact(dir, version).map(Some),
-    }
+    load_selected(dir)
 }
 
 /// Read the artifact for `version` from `dir`, refusing anything whose
-/// contents do not hash to what its manifest recorded.
+/// contents do not hash to what its manifest recorded. This is raw inspection;
+/// it does not establish that a format-5 artifact was committed or is selectable.
 pub fn read_artifact(dir: &Path, version: u64) -> Result<RouterArtifact, RouterArtifactError> {
     let manifest_file = manifest_path(dir, version);
     if !manifest_file.exists() {

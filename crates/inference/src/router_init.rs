@@ -35,9 +35,7 @@ use crate::router_state::{
 // build without a gate backend still refuses a bad specification rather than
 // having no opinion about one.
 #[cfg(any(feature = "mixture", feature = "metal-gpu"))]
-use crate::router_state::{
-    RouterArtifact, RouterLineage, RouterProvenance, commit_head, versions, write_artifact,
-};
+use crate::router_state::{RouterArtifact, RouterLineage, RouterProvenance, publish_bootstrap};
 #[cfg(any(feature = "mixture", feature = "metal-gpu"))]
 use std::path::Path;
 
@@ -285,29 +283,15 @@ pub fn bootstrap_artifact(spec: &BootstrapSpec) -> Result<RouterArtifact, Router
 
 /// Provision `dir` with the bootstrap for `spec`, refusing an occupied one.
 ///
-/// The head is committed after the artifact is on disk, in that order, so a
-/// crash between the two leaves a directory with an artifact and no head --
-/// which selects by counter and finds the same artifact. The reverse order
-/// would leave a head naming a version that is not there, and every unpinned
-/// startup would refuse.
+/// Publication is serialized and create-only. The bootstrap is constructed
+/// internally, staged outside the selectable namespace, then its synced files
+/// and committed HEAD are published in order. A crash before HEAD leaves no
+/// selectable format-5 bootstrap; retry initialization in a fresh directory.
+/// An error after HEAD replacement reports an uncertain commit and requires
+/// recovery through normal startup selection before any activation.
 #[cfg(any(feature = "mixture", feature = "metal-gpu"))]
 pub fn init_directory(dir: &Path, spec: &BootstrapSpec) -> Result<PathBuf, RouterInitError> {
-    let artifact = bootstrap_artifact(spec)?;
-
-    // Checked after the spec and before anything is written. `versions()`
-    // answers an empty list for a directory that does not exist, which is the
-    // ordinary case here and not an error.
-    let present = versions(dir)?;
-    if !present.is_empty() {
-        return Err(RouterInitError::Occupied {
-            dir: dir.to_path_buf(),
-            present,
-        });
-    }
-
-    let path = write_artifact(dir, &artifact)?;
-    commit_head(dir, &artifact)?;
-    Ok(path)
+    publish_bootstrap(dir, spec)
 }
 
 #[cfg(test)]
@@ -597,6 +581,7 @@ mod tests {
 
         /// The head is committed, so the directory selects under the new rule
         /// from its first artifact rather than falling back to the counter.
+        #[cfg(unix)]
         #[test]
         fn init_writes_the_artifact_and_commits_the_head() {
             let dir = scratch("fresh");
@@ -623,6 +608,7 @@ mod tests {
         /// Initialising over an occupied directory would discard a served
         /// history, and a mistyped destination is exactly the case where the
         /// permissive form looks like it worked.
+        #[cfg(unix)]
         #[test]
         fn init_refuses_an_occupied_directory_and_changes_nothing() {
             let dir = scratch("occupied");
@@ -654,6 +640,7 @@ mod tests {
 
         /// A refused specification must not leave a half-provisioned
         /// directory: the validation runs before anything is created.
+        #[cfg(unix)]
         #[test]
         fn a_refused_specification_creates_nothing() {
             let dir = scratch("refused");
@@ -699,6 +686,7 @@ mod tests {
         /// A learnable directory can actually be minted and read back through
         /// the same path a server uses. The refusal being guarded against is an
         /// artifact that validates in memory and is rejected on load.
+        #[cfg(unix)]
         #[test]
         fn an_explorable_directory_round_trips_through_the_serving_reader() {
             let dir = scratch("explorable-roundtrip");
@@ -718,6 +706,100 @@ mod tests {
             assert_eq!(policy.exploration_scale, Some(1.0));
             assert_eq!(policy.training_state, "bootstrap");
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn concurrent_initializers_serialize_and_only_one_commits() {
+            use std::sync::{Arc, Barrier, mpsc};
+            let temporary = tempfile::tempdir().unwrap();
+            let dir = temporary.path().join("router");
+            let barrier = Arc::new(Barrier::new(3));
+            let (completed_tx, completed_rx) = mpsc::channel();
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let barrier = Arc::clone(&barrier);
+                let dir = dir.clone();
+                let completed_tx = completed_tx.clone();
+                workers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    let outcome = init_directory(&dir, &spec());
+                    completed_tx.send(outcome).unwrap();
+                }));
+            }
+            drop(completed_tx);
+            barrier.wait();
+            let outcomes: Vec<_> = (0..2)
+                .map(|_| {
+                    completed_rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("concurrent initialization must finish before joining workers")
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|result| matches!(result, Err(RouterInitError::Occupied { .. })))
+                    .count(),
+                1
+            );
+            let selected = crate::router_state::load_selected(&dir).unwrap().unwrap();
+            assert_eq!(selected, bootstrap_artifact(&spec()).unwrap());
+            assert!(dir.join(".router.lock").is_file());
+            assert!(!dir.join(".committed").exists());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn initialization_refuses_head_receipt_staging_and_orphan_remnants() {
+            for name in [
+                "HEAD.json",
+                ".committed",
+                ".staging",
+                "router-1.gate",
+                "unrelated-data",
+            ] {
+                let temporary = tempfile::tempdir().unwrap();
+                let dir = temporary.path();
+                let path = dir.join(name);
+                std::fs::write(&path, b"retained evidence").unwrap();
+                assert!(matches!(
+                    init_directory(dir, &spec()),
+                    Err(RouterInitError::Artifact(
+                        RouterArtifactError::AlreadyExists { .. }
+                    ))
+                ));
+                assert_eq!(std::fs::read(&path).unwrap(), b"retained evidence");
+                assert!(!crate::router_state::manifest_path(dir, 1).exists());
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[allow(deprecated)]
+        fn a_modified_bootstrap_value_cannot_bypass_the_constructor_authority() {
+            let temporary = tempfile::tempdir().unwrap();
+            let dir = temporary.path().join("router");
+            let mut changed = bootstrap_artifact(&spec()).unwrap();
+            changed.gate_bytes[0] ^= 0xff;
+            assert!(matches!(
+                crate::router_state::write_artifact(&dir, &changed),
+                Err(RouterArtifactError::PublicationAuthorityRequired { .. })
+            ));
+            assert!(matches!(
+                crate::router_state::commit_head(&dir, &changed),
+                Err(RouterArtifactError::PublicationAuthorityRequired { .. })
+            ));
+            assert!(!dir.exists());
+            init_directory(&dir, &spec()).unwrap();
+            assert_eq!(
+                crate::router_state::load_selected(&dir).unwrap().unwrap(),
+                bootstrap_artifact(&spec()).unwrap()
+            );
         }
     }
 }
