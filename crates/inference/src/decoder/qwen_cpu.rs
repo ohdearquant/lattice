@@ -139,6 +139,13 @@ impl<'model> QwenCpuSession<'model> {
         }
     }
 
+    /// Reserve the request's full context before entering prefill and decode.
+    pub(crate) fn reserve_generation(&mut self, required_capacity: usize) {
+        let cfg = &self.model.config;
+        self.kv_cache.reserve(required_capacity, cfg.full_kv_dim());
+        self.scratch.ensure_capacity(cfg, required_capacity);
+    }
+
     /// Capacity, in `f32` elements, of layer 0's key cache. A measurement seam for the
     /// allocation instrument's initial-cache-capacity column; absent from default builds.
     #[cfg(feature = "bench-internals")]
@@ -379,6 +386,73 @@ mod tests {
     fn tokenize(model: &Qwen35Model, text: &str) -> Vec<u32> {
         let input = model.tokenizer.tokenize(text);
         input.input_ids[..input.real_length].to_vec()
+    }
+
+    #[test]
+    fn request_buffers_keep_kv_capacity() {
+        let model = tiny_zero_model();
+        let prompt_ids = tokenize(&model, "abc");
+        let max_new_tokens = 16;
+        let required = prompt_ids.len() + max_new_tokens;
+        let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7));
+        session.reserve_generation(required);
+        let kv_needed = required * model.config.full_kv_dim();
+        for store in session.kv_cache.k.iter().chain(&session.kv_cache.v) {
+            assert!(store.capacity() >= kv_needed);
+            assert!(store.is_empty());
+        }
+        let score_capacity = session.scratch.scores.capacity();
+        assert!(session.scratch.scores.len() >= model.config.num_attention_heads * (required + 1));
+        let pointers: Vec<_> = session
+            .kv_cache
+            .k
+            .iter()
+            .chain(&session.kv_cache.v)
+            .map(|store| (store.as_ptr(), store.capacity()))
+            .collect();
+        let cancel = cancel_false();
+        session.prefill(&cancel).unwrap();
+        let config = GenerateConfig {
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            max_new_tokens,
+            ..Default::default()
+        };
+        let mut history = prompt_ids;
+        for _ in 0..max_new_tokens {
+            let selected = session
+                .select(&SelectionRequest {
+                    config: &config,
+                    history: &history,
+                    grammar_mask: None,
+                })
+                .unwrap();
+            let SelectOutcome::Candidate(candidate) = selected else {
+                panic!("unconstrained fixture must select");
+            };
+            session
+                .decode(
+                    &AcceptedToken {
+                        final_id: candidate.candidate_id,
+                        prediction: candidate.prediction,
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            history.push(candidate.candidate_id);
+            for (store, &(pointer, capacity)) in session
+                .kv_cache
+                .k
+                .iter()
+                .chain(&session.kv_cache.v)
+                .zip(&pointers)
+            {
+                assert_eq!(store.as_ptr(), pointer);
+                assert_eq!(store.capacity(), capacity);
+            }
+            assert_eq!(session.scratch.scores.capacity(), score_capacity);
+        }
+        assert_eq!(session.kv_cache.seq_len, required);
     }
 
     // -----------------------------------------------------------------
