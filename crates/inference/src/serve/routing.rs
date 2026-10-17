@@ -380,6 +380,22 @@ fn as_served_f32(value: f64) -> f32 {
 
 #[cfg(feature = "mixture")]
 impl ServingRouter {
+    /// Capture the producing gate and policy for a bounded candidate round.
+    ///
+    /// Take a fresh snapshot for every round, then release the serving lock
+    /// before building. Construction does not admit or activate a candidate.
+    #[cfg(feature = "router-learning")]
+    pub fn refit_source(
+        &self,
+    ) -> Result<crate::router_refit::RefitSource, crate::router_refit::RefitError> {
+        crate::router_refit::RefitSource::from_serving(
+            self.artifact.clone(),
+            self.router.refit_snapshot(),
+            self.learning_enabled,
+            self.exploration_scale,
+        )
+    }
+
     /// Build a router from a loaded gate artifact.
     ///
     /// `learning` enables the artifact's recorded learned policy (ADR-096

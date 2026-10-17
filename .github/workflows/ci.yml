@@ -539,6 +539,23 @@ jobs:
         run: cargo clippy -p lattice-inference --all-targets --features mixture -- -D warnings
       - name: inference router-learning clippy
         run: cargo clippy --locked -p lattice-inference --all-targets --features router-learning -- -D warnings
+      - name: inference router-learning without serving
+        run: cargo clippy --locked -p lattice-inference --lib --no-default-features --features router-learning -- -D warnings
+      - name: inference router candidate construction
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-router-refit-tests.log"
+          if cargo test --locked -p lattice-inference --lib --features serve,router-learning router_refit::tests:: -- --nocapture >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -Eq '^test result: ok\. 16 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || {
+            echo "GUARD FAILED: expected all 16 router candidate construction tests."
+            exit 1
+          }
       - name: Router trainer artifact probe unit tests
         run: python3 tests/test_router_learning_artifacts.py -v
       - name: Router trainer feature isolation in emitted artifacts
