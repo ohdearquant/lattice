@@ -63,9 +63,42 @@ do not need to add it manually.
 | Qwen3.5/Qwen3.6 generation loader (`Qwen35Model::from_safetensors`)     |                    partial                    | Loads local single-file or sharded Qwen3.5/Qwen3.6 generation checkpoints. MTP fields are config/runtime-gated (experimental).                                                                                                                                               |
 | `Qwen35Config::qwen35_2b` preset                                        |                    shipped                    | 24 layers, 2 048 hidden, dense FFN, tied embeddings, 262 144 max positions.                                                                                                                                                                                                  |
 | `Qwen35Config::qwen35_0_8b` preset                                      |                    partial                    | 24 layers, 1 024 hidden, dense FFN, 1 MTP layer. Base decode wired; MTP experimental.                                                                                                                                                                                        |
-| `Qwen35Config::qwen36_35b_a3b` preset                                   |                    partial                    | 40 layers, MoE 256 experts top-8 plus shared expert. Config/weight loader supported; not a polished serving path.                                                                                                                                                            |
-| `Qwen35Config::qwen36_27b` preset                                       |                    shipped                    | 64 layers, 5 120 hidden, dense FFN. Served via `lattice chat`/`serve` from a native Q4 checkpoint on the Metal GPU build (verified: 18 GB Q4 loads in ~11 s, ~4 tok/s decode on M-series 32 GB). Safetensors path is loader-level only (bf16 27B exceeds local memory).      |
+| `Qwen35Config::qwen36_35b_a3b` preset                                   |                    partial                    | 40 layers, MoE 256 experts top-8 plus shared expert. Local text loaders and per-token decode exist; Metal prompt prefill has restrictions. See the Qwen3.6 matrix below.                                                                                                     |
+| `Qwen35Config::qwen36_27b` preset                                       |               shipped for text                | 64 layers, 5 120 hidden, dense FFN. Local safetensors CPU text path and native Q4 Metal text path; see the Qwen3.6 matrix below for limits and acceptance status.                                                                                                            |
 | BitNet b1.58 2B4T (`BitNetConfig::bitnet_2b4t`)                         |                 scaffold-only                 | Config preset exists; no `BitNetModel` loader is re-exported from `model/mod.rs`.                                                                                                                                                                                            |
+
+### Qwen3.6 generation support by variant
+
+Here **supported** means a callable path exists for the stated scope. **Degraded / limited**
+identifies a fallback or incomplete integration; **rejected** identifies an explicit refusal.
+These labels do not certify real-checkpoint parity. The deterministic 27B/35B acceptance work
+remains tracked in [#617](https://github.com/ohdearquant/lattice/issues/617).
+
+Native Q4 text generation requires macOS and a build with `f16,metal-gpu`. In `lattice chat`
+and `lattice serve`, safetensors text generation uses the CPU path and needs enough memory for
+its materialized weights; standalone `lattice_serve` also has a Metal safetensors route. Use the
+checkpoint's `config.json` and tokenizer; the Rust presets alone do not establish compatibility.
+
+| Variant                   | Supported paths                                                                                          | Degraded / limited                                                                                                                                                                               | Rejected paths                                                                                                                                                                                                                                         |
+| ------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Qwen3.6-27B (dense)**   | Local safetensors CPU text generation; native Q4 Metal text generation through `lattice chat` / `serve`. | Metal GDN prefill uses serial recurrence: the chunked-scan path only accepts the 0.8B geometry, not this model's 5 120 hidden width and 16 key / 48 value heads.                                 | QuaRot v0 conversion rejects the non-power-of-two hidden width.                                                                                                                                                                                        |
+| **Qwen3.6-35B-A3B (MoE)** | Local safetensors CPU text generation; native Q4 conversion, Metal loading and per-token `forward_step`. | Native Q4 routed experts use a bounded LRU cache. Loading and per-token decode do not provide general Metal chat/serve support: ordinary prompt prefill hits the restriction in the next column. | Multi-token Metal prefill without an active LoRA adapter returns `UnsupportedModel`. Q8 quantization rejects MoE; QuaRot v0 conversion also rejects MoE. Native Q4 loading refuses a memory budget too small for the minimum top-k expert-cache slots. |
+
+The MoE prefill refusal applies to the fallible request-facing paths. A single token or an active
+LoRA adapter can select per-token forward steps instead; these exceptions do not establish
+full-checkpoint parity. The legacy infallible `forward_prefill` wrapper can still panic on an
+unsupported input. Backend restrictions are implemented in the
+[Metal runtime](../crates/inference/src/forward/metal_qwen35.rs),
+[Q8 conversion](../crates/inference/src/weights/q8_weights.rs), and
+[QuaRot conversion](../crates/inference/src/quant/quarot/convert.rs).
+
+**Image input for chat completions is a separate capability.** CPU HTTP chat routes reject
+image requests. Metal HTTP chat routes require vision geometry, distinct valid image/start/end
+token IDs and compatible vision
+weights in the actual checkpoint. Both Qwen3.6 Rust presets are text-only. The chat image path
+accepts one inline PNG/JPEG per request and rejects streaming image requests; it does not imply
+27B/35B image parity. See [vision admission](../crates/inference/src/serve/metal_worker.rs) and
+[request validation](../crates/inference/src/serve/contract.rs).
 
 ### Model loading and cache
 
@@ -99,7 +132,7 @@ the current public API.
 but support is path-specific, not universal across all models:
 
 - **f16** — half-precision helpers; not a shipped f16 KV-cache path (see §3).
-- **Q8** — dense-only; panics on MoE configs.
+- **Q8** — standalone quantization is dense-only; MoE layers return `UnsupportedModel`.
 - **Q4** — available via the `quantize_q4` binary for supported paths.
 - **QuaRot Q4** — offline converter (`quantize_quarot` binary) + Metal direct-load path. Converter
   refuses non-power-of-two hidden dims and MoE configs.
@@ -147,7 +180,7 @@ KV cache — hence `supports_kv_cache = false`.
 | QuaRot INT4                 |      partial/shipped       | QuaRot module family, offline converter (`quantize_quarot` binary), and Metal direct Q4/F16 directory loader exist. Converter refuses non-power-of-two hidden dims and MoE configs.                                                                    |
 | Speculative decoding        |        experimental        | N-gram has a model-agnostic wrapper plus a state-owned Metal entry point (admission + prefill). Metal MTP/self-spec paths are greedy-only and disabled with grammar/compact sampling. Not a stable serving API.                                        |
 | Continuous batching         |   partial — library only   | `batch` module exports Phase-1 scheduler/worker structures with chunked prefill and FIFO policy. HTTP/gRPC serving integration is **not** in scope for the current branch (ADR-048 excludes it; ADR-063 defers serving to v0.4+).                      |
-| Serving / CLI               |      partial/proposed      | Standalone binaries exist (`chat_metal`, `qwen35_generate`, `quantize_q4`, `quantize_quarot`). There is **no** unified `lattice` binary, no HTTP server, no API compatibility layer. ADR-063 is a proposed target state, not current behavior.         |
+| Serving / CLI               |      partial/shipped       | Unified `lattice chat` and `lattice serve` exist. The HTTP server exposes OpenAI-compatible chat completions, embeddings and model-list routes; accepted options depend on the model and backend. See [API capabilities](capability-matrix.md).        |
 | Grammar / structured output | partial/shipped (unstable) | Grammar-constrained decoding supports a JSON Schema subset and GBNF escape hatch, compiled into `GrammarEngine`, masks logits, and is wired into the Metal generation loop. Grammar disables compact top-k and speculative paths.                      |
 | Metrics / profiling         |      partial/proposed      | Current observability is profiling structs, `encode_profiled()`, and env-gated Metal step profiling. ADR-061 `MetricsMode`/`ForwardCtx`/`MetricSink`/SQLite/JSONL infrastructure is proposed/design-only.                                              |
 
