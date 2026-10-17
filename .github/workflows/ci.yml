@@ -181,6 +181,50 @@ jobs:
             echo 'featureoslist=["ubuntu-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
             echo "→ full matrix including macOS"
           fi
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      # ADR-102 D4 file-size gate. This is the only job in the workflow that both
+      # checks out with `fetch-depth: 0` and has the base revision, and the gate
+      # needs the base to recompute each ratchet's effective ceiling and to read
+      # the manifest diff. The real check reads both revisions through git, so a
+      # dirty checkout cannot change its verdict.
+      #
+      # On a pull_request the checked-out HEAD is the merge ref, and
+      # `github.event.pull_request.base.sha` is the tip of main when the PR was
+      # last updated, which can be older than the main the merge ref was built
+      # on. A merge ref is built against current main, so its first parent is
+      # that main tip; using the event's base would diff in commits that main
+      # received after the PR was pushed and charge them to the PR, failing a
+      # gate over changes the PR never made. So the base is HEAD's first parent,
+      # and a HEAD that is not a two-parent merge commit is a hard error rather
+      # than a silently wrong comparison.
+      #
+      # On merge_group and push there is no merge ref: the base is the queue's
+      # base and the previously pushed tip respectively, the same expressions
+      # the change detector above uses.
+      - name: ADR-102 file-size gate
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            # `git rev-list --parents -n1 HEAD` prints "HEAD <parent> <parent>"
+            # for a merge commit, so three fields mean exactly two parents.
+            parents=$(git rev-list --parents -n1 HEAD | wc -w)
+            if [ "$parents" -ne 3 ]; then
+              echo "::error::pull_request checkout is not a two-parent merge commit: 'git rev-list --parents -n1 HEAD' printed $parents field(s), expected 3" >&2
+              exit 2
+            fi
+            base=$(git rev-parse HEAD^1)
+            head=$(git rev-parse HEAD)
+          else
+            base="$CI_BASE_SHA"
+            head="$CI_HEAD_SHA"
+          fi
+          python3 -m unittest tests.test_file_size_gate -v
+          python3 scripts/file_size_gate.py --base "$base" --head "$head"
 
   ci:
     name: CI
