@@ -163,12 +163,18 @@ fn alias_map(cache: &Gemma4KvCache) {
 fn cache_close(
     actual: &Gemma4KvCache,
     expected: &Gemma4KvCache,
-    layers: usize,
+    cfg: &crate::model::gemma4_config::Gemma4Config,
     abs: f32,
     rel: f32,
+    global_rel: f32,
 ) {
     assert_eq!(actual.num_slots(), expected.num_slots());
-    for layer in 0..layers {
+    for layer in 0..cfg.num_hidden_layers {
+        let rel = if cfg.is_global_layer(layer) {
+            global_rel
+        } else {
+            rel
+        };
         let owner = actual.layer_slot(layer).unwrap();
         assert_eq!(
             actual.k_view(layer).unwrap().as_ptr(),
@@ -343,13 +349,7 @@ fn two_decodes(
             super::super::argmax(&scratch.logits),
             super::super::argmax(&expected.logits)
         );
-        cache_close(
-            cache,
-            expected_cache,
-            model.config.num_hidden_layers,
-            abs,
-            rel,
-        );
+        cache_close(cache, expected_cache, &model.config, abs, rel, rel);
     }
 }
 
@@ -451,7 +451,7 @@ fn kernel_pair(
             );
         }
         cache.finish_prefill_chunk();
-        cache_close(&cache, &reference_cache, cfg.num_hidden_layers, ABS, REL);
+        cache_close(&cache, &reference_cache, cfg, ABS, REL, REL);
         alias_map(&cache);
         position += chunk.len();
     }
@@ -489,6 +489,7 @@ fn controller_pair(
     abs_logits: f32,
     abs_cache: f32,
     relative: f32,
+    cache_global_relative: f32,
 ) {
     let mut cache = model.new_cache(prompt.len() + 2).unwrap();
     let mut expected_cache = model.new_cache(prompt.len() + 2).unwrap();
@@ -512,9 +513,10 @@ fn controller_pair(
     cache_close(
         &cache,
         &expected_cache,
-        model.config.num_hidden_layers,
+        &model.config,
         abs_cache,
         relative,
+        cache_global_relative,
     );
     for step in 0..2 {
         let token = super::super::argmax(&expected.logits);
@@ -539,9 +541,10 @@ fn controller_pair(
         cache_close(
             &cache,
             &expected_cache,
-            model.config.num_hidden_layers,
+            &model.config,
             abs_cache,
             relative,
+            cache_global_relative,
         );
     }
 }
@@ -550,7 +553,7 @@ fn controller_pair(
 fn gemma_batched_prefill_controller_matches_scalar_across_chunk_boundaries() {
     let model = fixture();
     for length in [1, 63, 64, 65, 127, 128, 129] {
-        controller_pair(&model, &ids(length, 2), ABS, ABS, REL);
+        controller_pair(&model, &ids(length, 2), ABS, ABS, REL, REL);
     }
 }
 
@@ -1100,7 +1103,15 @@ fn real_controller_parity(lengths: &[usize]) {
                 case.name,
                 digest.finalize()
             );
-            controller_pair(&model, &case.input_ids, 1e-2, 1e-3, 0.0);
+            // Full-attention cache slots get a relative term. Both paths accumulate in f32 in
+            // different orders, and the difference grows with depth and attended length. Against an
+            // f64-accumulated matmul reference at 2512 tokens, the scalar path's deepest
+            // full-attention V is 2.9e-3 away and the batched path's 2.8e-3, past an absolute 1e-3.
+            // In every full-attention slot the batched path stays within 1.5x of the scalar path's
+            // distance from that reference. The largest relative term needed on this corpus was
+            // 5.0e-3, so 1e-2 keeps 2x headroom; sliding-window slots needed none. Logits and
+            // argmax remain the semantic check.
+            controller_pair(&model, &case.input_ids, 1e-2, 1e-3, 0.0, 1e-2);
         }
     }
     println!("GEMMA_PREFILL_PARITY_COMPLETE lengths={lengths:?}");
