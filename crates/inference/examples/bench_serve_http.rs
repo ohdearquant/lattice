@@ -118,6 +118,8 @@ const SERVER_MAX_TOKENS_CAP: usize = 4096;
 const STDERR_TAIL_LINES: usize = 20;
 const POLL: Duration = Duration::from_millis(25);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SPAWN_ATTEMPTS: usize = 10;
+const SPAWN_RETRY_PAUSE: Duration = Duration::from_millis(10);
 // The HTTP client's own whole-request deadline, set this much after the one this
 // example enforces. It only bounds a read that is already blocked when the
 // example's deadline passes (waiting for response headers, or a silent stall),
@@ -429,6 +431,26 @@ fn read_stderr(
     }
 }
 
+fn spawn_with_text_busy_retry<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+    mut pause: impl FnMut(Duration),
+) -> std::io::Result<T> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match spawn() {
+            Err(error)
+                if cfg!(target_os = "linux")
+                    && error.raw_os_error() == Some(26)
+                    && attempts < SPAWN_ATTEMPTS =>
+            {
+                pause(SPAWN_RETRY_PAUSE);
+            }
+            result => return result,
+        }
+    }
+}
+
 fn start_server(
     mut command: Command,
     timeout: Duration,
@@ -439,7 +461,8 @@ fn start_server(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let started = Instant::now();
-    let child = command.spawn().map_err(|e| Refusal::Spawn(e.to_string()))?;
+    let child = spawn_with_text_busy_retry(|| command.spawn(), std::thread::sleep)
+        .map_err(|e| Refusal::Spawn(e.to_string()))?;
     let mut server = Server {
         child,
         stderr: Arc::new(Mutex::new(Vec::new())),
@@ -1088,6 +1111,168 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn spawn_retry_immediate_success_does_not_pause() {
+        let mut attempts = 0;
+        let result = spawn_with_text_busy_retry(
+            || {
+                attempts += 1;
+                Ok::<_, std::io::Error>(37)
+            },
+            |_| panic!("successful spawn must not pause"),
+        );
+        assert_eq!(result.unwrap(), 37);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn spawn_retry_nonretryable_errors_are_returned_without_pausing() {
+        for errno in [2, 13, 11, 5] {
+            let mut attempts = 0;
+            let result = spawn_with_text_busy_retry(
+                || {
+                    attempts += 1;
+                    Err::<(), _>(std::io::Error::from_raw_os_error(errno))
+                },
+                |_| panic!("errno {errno} must not pause"),
+            );
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(errno));
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_retry_text_busy_recovers_on_the_last_attempt() {
+        let mut attempts = 0;
+        let mut pauses = Vec::new();
+        let result = spawn_with_text_busy_retry(
+            || {
+                attempts += 1;
+                if attempts < 10 {
+                    Err(std::io::Error::from_raw_os_error(26))
+                } else {
+                    Ok(37)
+                }
+            },
+            |delay| pauses.push(delay),
+        );
+        assert_eq!(result.unwrap(), 37);
+        assert_eq!(attempts, 10);
+        assert_eq!(pauses, vec![Duration::from_millis(10); 9]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_retry_text_busy_exhaustion_returns_the_final_error() {
+        let mut attempts = 0;
+        let mut pauses = Vec::new();
+        let result = spawn_with_text_busy_retry(
+            || {
+                attempts += 1;
+                Err::<(), _>(std::io::Error::from_raw_os_error(26))
+            },
+            |delay| pauses.push(delay),
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(26));
+        assert_eq!(attempts, 10);
+        assert_eq!(pauses, vec![Duration::from_millis(10); 9]);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn spawn_retry_text_busy_is_not_retried_off_linux() {
+        let mut attempts = 0;
+        let result = spawn_with_text_busy_retry(
+            || {
+                attempts += 1;
+                Err::<(), _>(std::io::Error::from_raw_os_error(26))
+            },
+            |_| panic!("non-Linux spawn must not pause"),
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(26));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn start_server_binds_retry_to_its_timed_spawn() {
+        let source = include_str!("bench_serve_http.rs");
+        let body = source
+            .split_once("\nfn start_server(\n")
+            .unwrap()
+            .1
+            .split_once("\nfn free_loopback_port()")
+            .unwrap()
+            .0;
+        let timer = body.find("let started = Instant::now();").unwrap();
+        let retry = body
+            .find("spawn_with_text_busy_retry(|| command.spawn(), std::thread::sleep)")
+            .unwrap();
+        assert!(timer < retry);
+        assert_eq!(body.matches("command.spawn()").count(), 1);
+        assert_eq!(body.matches("spawn_with_text_busy_retry(").count(), 1);
+        assert!(body.contains(".map_err(|e| Refusal::Spawn(e.to_string()))?;"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_retry_real_text_busy_exec_recovers_after_writer_closes() {
+        const CHILD: &str = "LATTICE_HTTP_SPAWN_BUSY_FIXTURE_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::spawn_retry_real_text_busy_exec_recovers_after_writer_closes",
+                    "--test-threads=1",
+                    "--color",
+                    "never",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "busy-exec child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")
+            );
+            return;
+        }
+
+        // Isolate the writer from unrelated tests' forks until it is closed.
+        let scratch = tempfile::tempdir().unwrap();
+        let bin = fake_binary(scratch.path(), "busy-exec", "exit 0");
+        let mut writer = Some(std::fs::OpenOptions::new().write(true).open(&bin).unwrap());
+        let mut command = Command::new(bin);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        assert_eq!(command.spawn().unwrap_err().raw_os_error(), Some(26));
+        let mut attempts = 0;
+        let mut pauses = 0;
+        let mut child = spawn_with_text_busy_retry(
+            || {
+                attempts += 1;
+                command.spawn()
+            },
+            |delay| {
+                assert_eq!(delay, Duration::from_millis(10));
+                pauses += 1;
+                drop(writer.take());
+            },
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(attempts, 2);
+        assert_eq!(pauses, 1);
+        assert!(writer.is_none());
     }
 
     fn data_chunk(text: &str, finish: Option<&str>) -> String {

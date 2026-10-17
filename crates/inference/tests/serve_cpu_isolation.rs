@@ -24,7 +24,12 @@ fn lattice_qwen_cpu_concurrent_greedy_requests_are_isolated_and_stream_disconnec
         return;
     };
     report_capture_identity(&model, "qwen35");
-    let server = Server::spawn(Binary::Lattice, &model, &[]);
+    // All four isolation requests must fit the admission cap.
+    let server = Server::spawn(
+        Binary::Lattice,
+        &model,
+        &["--max-cpu-generations".to_owned(), "4".to_owned()],
+    );
     observe_http_characterization(&server, "qwen35");
     assert_concurrent_greedy_results(
         &server,
@@ -772,17 +777,238 @@ fn observe_logprobs(server: &Server, family: &str) {
     let observed = wire_contract(&response);
     let repeated = wire_contract(&request_json(server, &body));
     assert_eq!(observed, repeated, "{family} logprobs repeat");
-    let expected = if family == "qwen35" {
-        expected_qwen_logprobs()
+    if family == "qwen35" {
+        compare_qwen_logprobs_contract(&observed, &expected_qwen_logprobs())
+            .expect("qwen35 logprobs response contract");
     } else {
-        expected_error_contract(
+        let expected = expected_error_contract(
             400,
             "unsupported_feature",
             "logprobs are not supported for this model",
-        )
-    };
-    assert_eq!(observed, expected, "{family} logprobs response contract");
+        );
+        assert_eq!(observed, expected, "{family} logprobs response contract");
+    }
     eprintln!("CPU logprobs family={family} {observed}");
+}
+
+const QWEN_LOGPROB_POINTERS: [&str; 6] = [
+    "/body/choices/0/logprobs/content/0/logprob",
+    "/body/choices/0/logprobs/content/0/top_logprobs/0/logprob",
+    "/body/choices/0/logprobs/content/0/top_logprobs/1/logprob",
+    "/body/choices/0/logprobs/content/1/logprob",
+    "/body/choices/0/logprobs/content/1/top_logprobs/0/logprob",
+    "/body/choices/0/logprobs/content/1/top_logprobs/1/logprob",
+];
+
+fn compare_qwen_logprobs_contract(observed: &Value, expected: &Value) -> Result<(), String> {
+    let mut normalized = observed.clone();
+    for pointer in QWEN_LOGPROB_POINTERS {
+        let actual = observed.pointer(pointer);
+        let golden = expected.pointer(pointer);
+        let Some((actual_number, golden_number)) = actual
+            .and_then(Value::as_f64)
+            .zip(golden.and_then(Value::as_f64))
+        else {
+            return Err(format!(
+                "{pointer}: expected finite logprob numbers, observed {actual:?}, expected {golden:?}"
+            ));
+        };
+        // CPU reduction order can differ across architectures; keep every other field exact.
+        if !actual_number.is_finite()
+            || !golden_number.is_finite()
+            || (actual_number - golden_number).abs() > 1e-5
+        {
+            return Err(format!(
+                "{pointer}: logprob exceeds absolute tolerance 1e-5 or is nonfinite: observed {actual_number}, expected {golden_number}"
+            ));
+        }
+        *normalized
+            .pointer_mut(pointer)
+            .expect("validated logprob pointer") =
+            golden.expect("validated golden logprob").clone();
+    }
+    if normalized == *expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "Qwen logprobs response structure differs: observed {normalized}, expected {expected}"
+        ))
+    }
+}
+
+#[test]
+fn logprobs_contract_accepts_cpu_drift() {
+    let expected = expected_qwen_logprobs();
+    assert_eq!(compare_qwen_logprobs_contract(&expected, &expected), Ok(()));
+
+    let mut reported = expected.clone();
+    *reported.pointer_mut(QWEN_LOGPROB_POINTERS[2]).unwrap() = json!(-9.10298);
+    for pointer in [QWEN_LOGPROB_POINTERS[3], QWEN_LOGPROB_POINTERS[5]] {
+        *reported.pointer_mut(pointer).unwrap() = json!(-0.9120007);
+    }
+    assert_eq!(compare_qwen_logprobs_contract(&reported, &expected), Ok(()));
+
+    let mut all_six = expected.clone();
+    for (index, pointer) in QWEN_LOGPROB_POINTERS.into_iter().enumerate() {
+        let golden = expected.pointer(pointer).unwrap().as_f64().unwrap();
+        let drift = if index % 2 == 0 { 5e-6 } else { -5e-6 };
+        *all_six.pointer_mut(pointer).unwrap() = json!(golden + drift);
+    }
+    assert_eq!(compare_qwen_logprobs_contract(&all_six, &expected), Ok(()));
+
+    let mut zero = expected.clone();
+    let mut boundary = expected.clone();
+    for (index, pointer) in QWEN_LOGPROB_POINTERS.into_iter().enumerate() {
+        *zero.pointer_mut(pointer).unwrap() = json!(0.0);
+        *boundary.pointer_mut(pointer).unwrap() = json!(if index % 2 == 0 { 1e-5 } else { -1e-5 });
+    }
+    assert_eq!(compare_qwen_logprobs_contract(&boundary, &zero), Ok(()));
+}
+
+#[test]
+fn logprobs_contract_rejects_bad_numeric_leaves() {
+    let expected = expected_qwen_logprobs();
+    for pointer in QWEN_LOGPROB_POINTERS {
+        let golden = expected.pointer(pointer).unwrap().as_f64().unwrap();
+        for drift in [-2e-5, 2e-5] {
+            let mut observed = expected.clone();
+            *observed.pointer_mut(pointer).unwrap() = json!(golden + drift);
+            assert!(
+                compare_qwen_logprobs_contract(&observed, &expected).is_err(),
+                "accepted excessive drift {drift} at {pointer}"
+            );
+        }
+        for malformed in [
+            Value::Null,
+            json!("NaN"),
+            json!("Infinity"),
+            json!("-Infinity"),
+            json!("-0.9"),
+            json!(true),
+            json!([]),
+            json!({}),
+        ] {
+            let mut observed = expected.clone();
+            *observed.pointer_mut(pointer).unwrap() = malformed.clone();
+            assert!(
+                compare_qwen_logprobs_contract(&observed, &expected).is_err(),
+                "accepted malformed observed leaf {malformed} at {pointer}"
+            );
+            assert!(
+                compare_qwen_logprobs_contract(&expected, &observed).is_err(),
+                "accepted malformed golden leaf {malformed} at {pointer}"
+            );
+        }
+        let mut missing = expected.clone();
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        missing
+            .pointer_mut(parent)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        assert!(
+            compare_qwen_logprobs_contract(&missing, &expected).is_err(),
+            "accepted missing observed leaf at {pointer}"
+        );
+        assert!(
+            compare_qwen_logprobs_contract(&expected, &missing).is_err(),
+            "accepted missing golden leaf at {pointer}"
+        );
+    }
+}
+
+#[test]
+fn logprobs_contract_rejects_structure_changes() {
+    let expected = expected_qwen_logprobs();
+    for (pointer, replacement) in [
+        ("/status", json!(200.000001)),
+        ("/content_type", json!("text/plain")),
+        ("/body/created", json!(0.000001)),
+        ("/body/model", json!("different-model")),
+        ("/body/object", json!("different-object")),
+        ("/body/choices/0/index", json!(0.000001)),
+        ("/body/choices/0/message/content", json!("different-text")),
+        ("/body/choices/0/finish_reason", json!("stop")),
+        (
+            "/body/choices/0/logprobs/content/0/token",
+            json!("different-token"),
+        ),
+        (
+            "/body/choices/0/logprobs/content/0/bytes/0",
+            json!(60.000001),
+        ),
+        ("/body/usage/completion_tokens", json!(2.000001)),
+    ] {
+        let mut observed = expected.clone();
+        *observed.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            compare_qwen_logprobs_contract(&observed, &expected).is_err(),
+            "accepted changed field {pointer}"
+        );
+    }
+
+    let mut reordered = expected.clone();
+    reordered["body"]["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+        .as_array_mut()
+        .unwrap()
+        .swap(0, 1);
+    for pointer in QWEN_LOGPROB_POINTERS {
+        *reordered.pointer_mut(pointer).unwrap() = expected.pointer(pointer).unwrap().clone();
+    }
+    assert!(compare_qwen_logprobs_contract(&reordered, &expected).is_err());
+
+    for pointer in [
+        "/body/choices",
+        "/body/choices/0/logprobs/content",
+        "/body/choices/0/logprobs/content/0/top_logprobs",
+    ] {
+        let mut extra = expected.clone();
+        let entries = extra.pointer_mut(pointer).unwrap().as_array_mut().unwrap();
+        entries.push(entries[0].clone());
+        assert!(
+            compare_qwen_logprobs_contract(&extra, &expected).is_err(),
+            "accepted extra array entry at {pointer}"
+        );
+        let mut missing = expected.clone();
+        missing
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(
+            compare_qwen_logprobs_contract(&missing, &expected).is_err(),
+            "accepted missing array entry at {pointer}"
+        );
+    }
+    for (pointer, key) in [
+        ("", "content_type"),
+        ("/body/choices/0/logprobs/content/0", "token"),
+    ] {
+        let mut extra = expected.clone();
+        extra
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), Value::Null);
+        assert!(
+            compare_qwen_logprobs_contract(&extra, &expected).is_err(),
+            "accepted extra key at {pointer}"
+        );
+        let mut missing = expected.clone();
+        missing
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        assert!(
+            compare_qwen_logprobs_contract(&missing, &expected).is_err(),
+            "accepted missing key {key} at {pointer}"
+        );
+    }
 }
 
 fn expected_qwen_logprobs() -> Value {

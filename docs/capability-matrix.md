@@ -12,7 +12,7 @@ Same trap as `docs/serve-http-api.md` and `docs/cross-turn-cache.md` describe --
   from a single `lattice.rs` file in #834) -- one binary, six subcommands: `lattice chat` (interactive
   REPL), `lattice serve` (an HTTP server, OpenAI-compatible), `lattice doctor` (preflight check, no
   model weights loaded), `lattice prune-score` (layer-importance scoring and a PPL-gated pruning
-  plan), `lattice forecast` (point forecasts for univariate series read as JSON lines) and
+  plan), `lattice forecast` (point and quantile forecasts for univariate series read as JSON lines) and
   `lattice router init` (provision a router state directory). This is the
   README-documented, actively developed surface. Its `serve` subcommand is itself an HTTP server
   -- when a row below says "supported" for this column via HTTP, it means `lattice serve`'s
@@ -42,7 +42,7 @@ longer exists fails that check closed (#654).
 | `serve`       | `--model` (required), `--host` (default 127.0.0.1), `--port` (default 8080), `--max-tokens` (default 256, per-request default), `--model-id`, `--tokenizer-dir`, `--max-pending` (default 32, Metal queue cap), `--max-cpu-generations` (CPU concurrency cap), `--max-resident-adapters`, `--max-resident-adapter-bytes`, `--preload-vision`, `--router-state`, `--router-pin`, `--router-learn`, `--embedding-model`, `--embedding-model-id` | `bin/lattice/main.rs:55-225`                                    |
 | `doctor`      | `--model` (required), `--context` (optional target length), `--tokenizer-dir`                                                                                                                                                                                                                                                                                                                                                                 | `bin/lattice/main.rs:228-242`                                   |
 | `prune-score` | `--q4-dir`, `--tokenizer-dir`, calibration and validation corpora, `--prune-layers`, `--output`, plus calibration/validation window, stride and PPL-delta limits                                                                                                                                                                                                                                                                              | `bin/lattice/main.rs:249-252`, `bin/lattice/prune_score.rs:20-` |
-| `forecast`    | `--model` (Reverso directory: `args.json` + `model.safetensors`), `--input` (JSON lines, default stdin), `--output` (JSON lines, default stdout)                                                                                                                                                                                                                                                                                              | `bin/lattice/main.rs:254-257`, `bin/lattice/forecast.rs:18-`    |
+| `forecast`    | `--model` (Reverso directory: `args.json` + `model.safetensors`; Chronos-2 directory: `config.json` + `model.safetensors`), `--input` (JSON lines, default stdin), `--output` (JSON lines, default stdout)                                                                                                                                                                                                                                    | `bin/lattice/main.rs:254-257`, `bin/lattice/forecast.rs:24-`    |
 | `router init` | `--state`, `--adapters` (comma-separated, required), `--schema-id`, `--base-model`, `--embedding-model`, `--embedding-model-id`                                                                                                                                                                                                                                                                                                               | `bin/lattice/main.rs:259-`, `bin/lattice/router.rs:21-`         |
 
 No `--lora`, `--reasoning-budget`, `--top-k`, or `--repetition-penalty` flags exist on any
@@ -234,7 +234,7 @@ name) in the cited surface's own binary (or, for behavior shared by both binarie
 `lattice_inference::serve::metal_worker` owner, that shared module -- #832), or carry an explicit
 **NOT-TESTABLE-YET** justification. `scripts/check-capability-matrix.sh` (wired into
 `make lint-docs`) greps `crates/inference/src/bin/{lattice,lattice_serve,chat_metal}.rs` and
-`crates/inference/src/serve/metal_worker.rs` for `fn <fixture id>` and fails the build if a cited
+`crates/inference/src/serve/metal_worker.rs` (with its `metal_worker/tests.rs`) for `fn <fixture id>` and fails the build if a cited
 ID no longer exists, or if a row has no fixture cell at all -- so a row that goes stale (a fixture
 renamed/removed without updating this table) fails closed instead of silently drifting.
 

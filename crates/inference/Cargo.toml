@@ -260,6 +260,12 @@ test = false
 name = "decoder_allocation_arm"
 test = false
 
+# The shared benchmark allocator needs a standalone, single-threaded control process.
+[[test]]
+name = "inference_perf_allocation_gate"
+harness = false
+required-features = ["bench-internals"]
+
 [[bin]]
 name = "bench_decode_ab"
 path = "src/bin/bench_decode_ab.rs"
