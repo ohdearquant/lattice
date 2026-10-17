@@ -1,0 +1,97 @@
+# ADR-102 D4 file-size manifest.
+#
+# A maintained file listed here may not exceed its recorded ceiling, and a
+# change may not raise that ceiling or add a new entry; a decrease must lower
+# the number in the same change. An entry leaves the manifest as soon as its
+# file fits under the 3000-line cap. Entries are sorted by path.
+#
+# The `data` table names non-maintained text files that are over the cap and
+# are read as data rather than source. Paths are exact: no globs, and no
+# directory entries.
+
+[[ratchet]]
+path = "crates/inference/benches/inference_perf.rs"
+ceiling = 3016
+
+[[ratchet]]
+path = "crates/inference/src/bin/lattice_serve/main.rs"
+ceiling = 3891
+
+[[ratchet]]
+path = "crates/inference/src/forward/metal_qwen35.rs"
+ceiling = 22565
+retired_by = "ADR-102 M8"
+
+[[ratchet]]
+path = "crates/inference/src/forward/shaders/qwen35.metal"
+ceiling = 3311
+
+[[ratchet]]
+path = "crates/inference/src/grammar/json_schema.rs"
+ceiling = 3286
+
+[[ratchet]]
+path = "crates/inference/tests/metal_measurement_lock_contract.rs"
+ceiling = 5026
+
+[[ratchet]]
+path = "crates/inference/tests/pipeline_boundary_contract.rs"
+ceiling = 3002
+
+[[ratchet]]
+path = "scripts/bench_decode_harness.py"
+ceiling = 3249
+
+[[ratchet]]
+path = "scripts/perf-bench-gate.py"
+ceiling = 3818
+
+[[ratchet]]
+path = "tests/test_bench_compare_measurement.py"
+ceiling = 3741
+
+[[ratchet]]
+path = "tests/test_bench_measurement_supervision.py"
+ceiling = 4426
+
+[[data]]
+path = "Cargo.lock"
+
+[[data]]
+path = "crates/embed/tests/fixtures/embed_parity_v1/qwen3_embedding_0_6b.json"
+
+[[data]]
+path = "crates/inference/tests/fixtures/gemma4/e2b_tensor_manifest.json"
+
+[[data]]
+path = "crates/inference/tests/fixtures/gemma4/stage5/e2e_golden.json"
+
+[[data]]
+path = "crates/inference/tests/fixtures/gemma4/tokenizer/tokenizer.json"
+
+[[data]]
+path = "crates/inference/tests/fixtures/paddleocr_vl/tokenizer/tokenizer.json"
+
+[[data]]
+path = "crates/inference/tests/fixtures/paddleocr_vl/tokenizer/tokenizer_config.json"
+
+[[data]]
+path = "crates/inference/tests/fixtures/tokenizers/bge-small-en-v1.5/tokenizer.json"
+
+[[data]]
+path = "crates/inference/tests/fixtures/tokenizers/gpt2-raw-bytelevel/merges.txt"
+
+[[data]]
+path = "crates/inference/tests/fixtures/tokenizers/multilingual-e5-small/tokenizer.json"
+
+[[data]]
+path = "crates/inference/tests/fixtures/tokenizers/qwen3-embedding-0.6b/tokenizer.json"
+
+[[data]]
+path = "docs/bench_results/wiki.test.raw"
+
+[[data]]
+path = "scripts/bench_evidence/pr882/report_ctx1024.json"
+
+[[data]]
+path = "scripts/bench_evidence/pr882/report_ctx512.json"
