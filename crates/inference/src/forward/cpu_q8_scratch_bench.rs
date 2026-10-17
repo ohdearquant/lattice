@@ -1,4 +1,4 @@
-use super::{make_nonzero_q8_generate_fixture, nonzero_fixture_tokenizer_q8};
+use super::tests::{make_nonzero_q8_generate_fixture, nonzero_fixture_tokenizer_q8};
 use crate::decoder::standalone_cpu::{StandaloneWeights, generate_with_trace};
 use crate::forward::cpu_q8::generate_q8;
 use crate::generation::{GenerateConfig, GenerateOutput};

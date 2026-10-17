@@ -789,6 +789,10 @@ pub fn generate_q8(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "cpu_q8_scratch_bench.rs"]
+mod scratch_bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::decoder::standalone_cpu::parity;
@@ -808,10 +812,6 @@ mod tests {
         crate::decoder::standalone_cpu::q8_scratch_checks::assert_q8_projection_widths(
             &weights, &cfg, &rope,
         );
-    }
-
-    mod scratch_bench {
-        include!("cpu_q8_scratch_bench.rs");
     }
 
     /// Regression test for #392: cpu Q8 RoPE must use stride-half pairing (i, half+i), not
@@ -1411,7 +1411,7 @@ mod tests {
     //     forward::cpu_q8::tests::print_q8_generate_goldens -- --ignored --nocapture
     // and copy the printed `token_ids`/`stop_reason`/`stopped`/`text` lines into
     // the four `#[test]` functions below.
-    fn make_nonzero_q8_generate_fixture() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
+    pub(super) fn make_nonzero_q8_generate_fixture() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
         use crate::model::qwen35_config::LayerType;
         use crate::weights::q8_weights::quantize_matrix;
 
@@ -1612,7 +1612,7 @@ mod tests {
     /// already rely on; the golden prompt `"world"` encodes to five of them. Ids 8..128 get
     /// distinct two-character printable tokens so every id the decode loop can
     /// produce has real text instead of falling through to an empty string.
-    fn nonzero_fixture_tokenizer_q8() -> BpeTokenizer {
+    pub(super) fn nonzero_fixture_tokenizer_q8() -> BpeTokenizer {
         use std::collections::HashMap;
         let mut vocab_map: HashMap<String, u32> = HashMap::new();
         for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
