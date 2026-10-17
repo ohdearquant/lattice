@@ -17,6 +17,7 @@ use lattice_fann::training::{
 use crate::mixture::{
     AdapterRouter, Exploration, RouteOutcome, seed_from_completion_id, weight_entropy,
 };
+use crate::router_admission::{AdmissionContract, Population};
 use crate::router_episode::{EpisodeSignal, EpisodeStore, PolicyIdentity, RouterEpisode};
 use crate::router_state::{RouterPolicy, TrainedRepresentation};
 
@@ -222,7 +223,23 @@ impl RefitSource {
         &self.policy
     }
 
-    fn policy_router(&self, gate_bytes: &[u8]) -> Result<AdapterRouter, RefitError> {
+    pub(crate) fn adapter_names(&self) -> &[String] {
+        &self.key.adapter_names
+    }
+
+    pub(crate) fn base_model(&self) -> &str {
+        &self.key.base_model
+    }
+
+    pub(crate) fn artifact_hash(&self) -> &str {
+        &self.key.artifact_hash
+    }
+
+    pub(crate) fn representation(&self) -> &TrainedRepresentation {
+        &self.key.representation
+    }
+
+    pub(crate) fn policy_router(&self, gate_bytes: &[u8]) -> Result<AdapterRouter, RefitError> {
         let mut router = self.router.refit_snapshot();
         router
             .reload(gate_bytes)
@@ -240,9 +257,11 @@ pub struct RefitPopulation {
     pub judged: usize,
     /// Judged episodes carrying no exploration draw.
     pub deterministic: usize,
+    /// Explored judgements reserved by the registered held-out split.
+    pub held_out: usize,
     /// Explored episodes already consumed by this builder.
     pub already_consumed: usize,
-    /// New explored judgements available, before applying the maximum.
+    /// New explored training judgements available, before applying the maximum.
     pub available: usize,
     /// The caller's required minimum.
     pub minimum: usize,
@@ -271,6 +290,8 @@ pub struct CandidateOutput {
 /// Candidate bytes and diagnostics. This value carries no admission authority.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefitCandidate {
+    source: Box<SourceKey>,
+    admission_contract_hash: Option<String>,
     gate_bytes: Vec<u8>,
     round: RefitRound,
     outputs: Vec<CandidateOutput>,
@@ -278,6 +299,14 @@ pub struct RefitCandidate {
 }
 
 impl RefitCandidate {
+    pub(crate) fn admission_contract_hash(&self) -> Option<&str> {
+        self.admission_contract_hash.as_deref()
+    }
+
+    pub(crate) fn matches_source(&self, source: &RefitSource) -> bool {
+        *self.source == source.key
+    }
+
     /// The candidate network, which has not been published or activated.
     pub fn gate_bytes(&self) -> &[u8] {
         &self.gate_bytes
@@ -324,10 +353,19 @@ pub struct RefitBuilder {
     trainer: RlooTrainer,
     source: Option<SourceKey>,
     consumed: HashSet<String>,
+    admission: Option<AdmissionBinding>,
+}
+
+struct AdmissionBinding {
+    contract: AdmissionContract,
+    hash: String,
 }
 
 impl RefitBuilder {
-    /// Validate explicit bounds and finite, nonnegative training coefficients.
+    /// Construct a diagnostic-only builder with no registered admission split.
+    ///
+    /// Validates explicit bounds and finite, nonnegative training coefficients.
+    /// Its candidates are unbound and cannot be used for admission.
     pub fn new(training: RlooConfig, config: RefitConfig) -> Result<Self, RefitError> {
         if config.minimum_round == 0 || config.maximum_round < config.minimum_round {
             return Err(RefitError::InvalidConfig(
@@ -351,14 +389,34 @@ impl RefitBuilder {
             training,
             source: None,
             consumed: HashSet::new(),
+            admission: None,
         })
+    }
+
+    /// Construct a builder with an immutable, validated admission contract.
+    ///
+    /// The same registered split applies to every round and epoch. Held-out
+    /// events never enter training, and candidates retain the contract's hash
+    /// for later evaluation. Construction itself grants no admission authority.
+    pub fn new_with_admission(
+        training: RlooConfig,
+        config: RefitConfig,
+        contract: AdmissionContract,
+    ) -> Result<Self, RefitError> {
+        let hash = contract
+            .hash()
+            .map_err(|error| RefitError::InvalidConfig(error.to_string()))?;
+        let mut builder = Self::new(training, config)?;
+        builder.admission = Some(AdmissionBinding { contract, hash });
+        Ok(builder)
     }
 
     /// Build one candidate from the oldest eligible, unconsumed judgements.
     ///
     /// Other epochs and absent feedback are excluded. Same-epoch identity
-    /// disagreements refuse. At most `maximum_round` episodes are replayed and
-    /// trained; population counting and ID pruning scan the bounded store.
+    /// disagreements refuse. A registered split excludes held-out events before
+    /// preparing gradients. At most `maximum_round` training episodes are replayed
+    /// and trained; population counting and ID pruning scan the bounded store.
     /// Every fallible operation completes before trainer history or consumed
     /// IDs change. Equal rewards still reach the trainer and observe traffic.
     pub fn build_candidate(
@@ -382,6 +440,7 @@ impl RefitBuilder {
             source: source.identity().clone(),
             judged: 0,
             deterministic: 0,
+            held_out: 0,
             already_consumed: 0,
             available: 0,
             minimum: self.config.minimum_round,
@@ -392,6 +451,15 @@ impl RefitBuilder {
             validate_identity(source, episode)?;
             if episode.exploration.is_none() {
                 population.deterministic += 1;
+            } else if self
+                .admission
+                .as_ref()
+                .map(|binding| binding.contract.split(&episode.completion_id))
+                .transpose()
+                .map_err(|error| invalid(episode, error.to_string()))?
+                == Some(Population::HeldOut)
+            {
+                population.held_out += 1;
             } else if consumed.contains(&episode.completion_id) {
                 population.already_consumed += 1;
             } else {
@@ -489,6 +557,11 @@ impl RefitBuilder {
                 ));
             }
             RefitVerdict::Candidate(RefitCandidate {
+                source: Box::new(source.key.clone()),
+                admission_contract_hash: self
+                    .admission
+                    .as_ref()
+                    .map(|binding| binding.hash.clone()),
                 gate_bytes,
                 round,
                 outputs,
@@ -826,6 +899,192 @@ mod tests {
             RefitVerdict::Candidate(candidate) => candidate,
             other => panic!("expected candidate, got {other:?}"),
         }
+    }
+
+    fn admission_contract() -> AdmissionContract {
+        AdmissionContract {
+            split_salt: "refit-partition-fixture".into(),
+            heldout_fraction: 0.5,
+            parent_logit_tolerance: 0.0,
+            bootstrap_replicates: 16,
+            bootstrap_seed: 7,
+            lower_quantile: 0.1,
+            regression_limit: 0.2,
+            min_heldout_events: 2,
+            min_effective_sample_size: 1.5,
+            min_reference_tokens: 2,
+        }
+    }
+
+    fn partition_ids(
+        contract: &AdmissionContract,
+        population: Population,
+        count: usize,
+    ) -> Vec<String> {
+        let ids: Vec<_> = (0..1024)
+            .map(|index| format!("partition-{index}"))
+            .filter(|id| contract.split(id).unwrap() == population)
+            .take(count)
+            .collect();
+        assert_eq!(ids.len(), count, "fixture must populate both partitions");
+        ids
+    }
+
+    fn registered_builder(contract: AdmissionContract) -> RefitBuilder {
+        RefitBuilder::new_with_admission(
+            training(),
+            RefitConfig {
+                minimum_round: 2,
+                maximum_round: 2,
+            },
+            contract,
+        )
+        .unwrap()
+    }
+
+    fn record_training_ids(source: &RefitSource, store: &mut EpisodeStore, ids: &[String]) {
+        for (index, id) in ids.iter().enumerate() {
+            let (context, signal) = if index % 2 == 0 {
+                (vec![0.4, -0.2], EpisodeSignal::Helpful)
+            } else {
+                (vec![-0.3, 0.8], EpisodeSignal::Unhelpful)
+            };
+            record(store, episode(source, id, context, 3), signal);
+        }
+    }
+
+    #[test]
+    fn admission_constructor_requires_a_valid_explicit_contract() {
+        let mut contract = admission_contract();
+        contract.heldout_fraction = f64::NAN;
+        assert!(matches!(
+            RefitBuilder::new_with_admission(
+                training(),
+                RefitConfig {
+                    minimum_round: 2,
+                    maximum_round: 2,
+                },
+                contract,
+            ),
+            Err(RefitError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn admission_heldout_events_never_enter_gradients_or_traffic_history() {
+        let source = source();
+        let contract = admission_contract();
+        let training_ids = partition_ids(&contract, Population::Training, 4);
+        let heldout_ids = partition_ids(&contract, Population::HeldOut, 2);
+        let mut mixed = EpisodeStore::new(6);
+        for id in &heldout_ids {
+            let mut heldout = episode(&source, id, vec![0.7, -0.8], 3);
+            // Only the later admission evaluator validates held-out numerics.
+            // Replaying this record during gradient preparation must fail.
+            heldout.context_vector[0] = f32::NAN;
+            record(&mut mixed, heldout, EpisodeSignal::Helpful);
+        }
+        record_training_ids(&source, &mut mixed, &training_ids);
+        let mut training_only = EpisodeStore::new(4);
+        record_training_ids(&source, &mut training_only, &training_ids);
+        let mut registered = registered_builder(contract.clone());
+        let mut diagnostic = builder(2, 2);
+        for round in 0..2 {
+            let actual = candidate(registered.build_candidate(&source, &mixed).unwrap());
+            let expected = candidate(diagnostic.build_candidate(&source, &training_only).unwrap());
+            assert_eq!(actual.gate_bytes(), expected.gate_bytes());
+            assert_eq!(actual.round().update, expected.round().update);
+            assert_eq!(actual.outputs(), expected.outputs());
+            assert_eq!(actual.round().population.held_out, 2);
+            assert_eq!(actual.round().population.available, 4 - round * 2);
+            assert_eq!(
+                actual.round().completion_ids,
+                training_ids[round * 2..round * 2 + 2]
+            );
+            assert!(
+                actual
+                    .round()
+                    .completion_ids
+                    .iter()
+                    .all(|id| { contract.split(id).unwrap() == Population::Training })
+            );
+        }
+        assert_eq!(registered.consumed, diagnostic.consumed);
+        assert!(
+            heldout_ids
+                .iter()
+                .all(|id| !registered.consumed.contains(id))
+        );
+    }
+
+    #[test]
+    fn admission_heldout_population_cannot_satisfy_the_training_minimum() {
+        let source = source();
+        let contract = admission_contract();
+        let heldout_ids = partition_ids(&contract, Population::HeldOut, 4);
+        let mut store = EpisodeStore::new(4);
+        record_training_ids(&source, &mut store, &heldout_ids);
+        let mut registered = registered_builder(contract);
+        match registered.build_candidate(&source, &store).unwrap() {
+            RefitVerdict::BelowMinimum(population) => {
+                assert_eq!(population.judged, 4);
+                assert_eq!(population.held_out, 4);
+                assert_eq!(population.available, 0);
+            }
+            other => panic!("held-out-only store produced a training round: {other:?}"),
+        }
+        assert!(registered.consumed.is_empty());
+    }
+
+    #[test]
+    fn admission_contract_binding_is_immutable_across_rounds_and_epochs() {
+        let source = source();
+        let mut contract = admission_contract();
+        let expected_hash = contract.hash().unwrap();
+        let training_ids = partition_ids(&contract, Population::Training, 4);
+        let mut registered = registered_builder(contract.clone());
+        contract.split_salt.push_str("-changed-outside-builder");
+        assert_ne!(contract.hash().unwrap(), expected_hash);
+        let mut store = EpisodeStore::new(4);
+        record_training_ids(&source, &mut store, &training_ids);
+        for _ in 0..2 {
+            let result = candidate(registered.build_candidate(&source, &store).unwrap());
+            assert_eq!(
+                result.admission_contract_hash(),
+                Some(expected_hash.as_str())
+            );
+            assert!(result.matches_source(&source));
+        }
+
+        let mut next = super::tests::source();
+        next.key.identity.epoch += 1;
+        let mut next_store = EpisodeStore::new(4);
+        record_training_ids(&next, &mut next_store, &training_ids);
+        let result = candidate(registered.build_candidate(&next, &next_store).unwrap());
+        assert_eq!(
+            result.admission_contract_hash(),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(result.round().completion_ids, training_ids[..2]);
+        assert_eq!(result.round().population.already_consumed, 0);
+        assert!(result.matches_source(&next));
+        assert!(!result.matches_source(&source));
+    }
+
+    #[test]
+    fn admission_legacy_candidates_remain_unbound_and_match_the_full_source() {
+        let source = source();
+        let result = candidate(
+            builder(2, 2)
+                .build_candidate(&source, &pair(&source, 2))
+                .unwrap(),
+        );
+        assert_eq!(result.admission_contract_hash(), None);
+        assert!(result.matches_source(&source));
+        let mut changed = super::tests::source();
+        changed.key.artifact_hash.push('x');
+        assert_eq!(changed.identity(), source.identity());
+        assert!(!result.matches_source(&changed));
     }
 
     #[test]

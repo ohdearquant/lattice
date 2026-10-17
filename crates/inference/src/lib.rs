@@ -56,6 +56,9 @@ pub mod weights;
 /// and [`model`].
 pub mod batch;
 pub(crate) mod bounded_read;
+/// Registered held-out evidence for router candidate admission.
+#[cfg(feature = "router-learning")]
+pub mod router_admission;
 pub mod router_episode;
 /// Provisioning a router state directory with an untrained bootstrap
 /// (ADR-096 decision 2).
