@@ -655,13 +655,11 @@ fn run_metal(
     use lattice_inference::serve::lora::ResidencyLimits;
     use lattice_inference::serve::metal_worker::bench_support::check_prompt_fits_window;
     use lattice_inference::serve::metal_worker::{
-        ContextWindowPolicy, MetalWorker, VisionRuntime, WorkerEvent, WorkerMetadata,
+        ContextWindowPolicy, VisionRuntime, WorkerEvent, WorkerMetadata,
     };
     use lattice_inference::serving_factory::ServingFactory;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use std::time::Instant;
-
-    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
 
     let binary = match route {
         Route::LatticeServe => "lattice_serve",
@@ -676,56 +674,65 @@ fn run_metal(
         _ => ContextWindowPolicy::PromptAndMaxTokens,
     };
 
-    let load = Instant::now();
-    let (owner, client, meta, preparation) = MetalWorker::spawn_with_vision(
-        ServingFactory::qwen_metal(
-            move || {
-                let tokenizer_path = loader_dir.join("tokenizer.json");
-                // `lattice serve` allocates its fixed 4096-token context;
-                // `lattice_serve` requests the checkpoint's configured window.
-                let state = match (route, format) {
-                    (Route::LatticeServe, ModelFormat::Safetensors) => {
-                        let model = Qwen35Model::from_safetensors(&loader_dir)
-                            .map_err(|e| format!("safetensors load failed: {e}"))?;
-                        let cfg = model.config().clone();
-                        let context = cfg.max_position_embeddings;
-                        MetalQwen35State::new(model.weights(), &cfg, context)
-                            .map_err(|e| format!("Metal init failed: {e}"))?
-                    }
-                    _ => {
-                        let cfg = Qwen35Config::from_model_dir(&loader_dir)
-                            .map_err(|e| format!("config.json load failed: {e}"))?;
-                        let context = match route {
-                            Route::LatticeServe => cfg.max_position_embeddings,
-                            _ => LATTICE_METAL_MAX_CONTEXT,
-                        };
-                        MetalQwen35State::from_q4_dir(&loader_dir, &tokenizer_path, &cfg, context)
+    let (owner, client, meta, preparation, load) =
+        lattice_inference::serve::metal_worker::bench_support::spawn_with_measurement_lock(
+            ServingFactory::qwen_metal(
+                move || {
+                    let tokenizer_path = loader_dir.join("tokenizer.json");
+                    // `lattice serve` allocates its fixed 4096-token context;
+                    // `lattice_serve` requests the checkpoint's configured window.
+                    let state = match (route, format) {
+                        (Route::LatticeServe, ModelFormat::Safetensors) => {
+                            let model = Qwen35Model::from_safetensors(&loader_dir)
+                                .map_err(|e| format!("safetensors load failed: {e}"))?;
+                            let cfg = model.config().clone();
+                            let context = cfg.max_position_embeddings;
+                            MetalQwen35State::new(model.weights(), &cfg, context)
+                                .map_err(|e| format!("Metal init failed: {e}"))?
+                        }
+                        _ => {
+                            let cfg = Qwen35Config::from_model_dir(&loader_dir)
+                                .map_err(|e| format!("config.json load failed: {e}"))?;
+                            let context = match route {
+                                Route::LatticeServe => cfg.max_position_embeddings,
+                                _ => LATTICE_METAL_MAX_CONTEXT,
+                            };
+                            MetalQwen35State::from_q4_dir(
+                                &loader_dir,
+                                &tokenizer_path,
+                                &cfg,
+                                context,
+                            )
                             .map_err(|e| format!("Q4 model load failed: {e}"))?
-                    }
-                };
-                let model_max_context = match route {
-                    Route::LatticeServe => state.max_context(),
-                    _ => LATTICE_METAL_MAX_CONTEXT,
-                };
-                Ok((
-                    state,
-                    worker_tokenizer,
-                    WorkerMetadata {
-                        format: format!("{format:?}"),
-                        model_max_context,
-                        context_window_policy: policy,
-                    },
-                ))
-            },
-            VisionRuntime::unsupported(),
-        ),
-        1,
-        ResidencyLimits::default(),
-    )
-    .map_err(|e| format!("worker start: {e}"))?;
+                        }
+                    };
+                    let model_max_context = match route {
+                        Route::LatticeServe => state.max_context(),
+                        _ => LATTICE_METAL_MAX_CONTEXT,
+                    };
+                    Ok((
+                        state,
+                        worker_tokenizer,
+                        WorkerMetadata {
+                            format: format!("{format:?}"),
+                            model_max_context,
+                            context_window_policy: policy,
+                        },
+                    ))
+                },
+                VisionRuntime::unsupported(),
+            ),
+            1,
+            ResidencyLimits::default(),
+        )
+        .map_err(|e| format!("worker start: {e}"))?;
     drop(owner);
     let model_max_context = meta.model_max_context;
-    println!("LOAD route={} load_ms={:.3}", route.name(), ms(load));
+    println!(
+        "LOAD route={} load_ms={:.3}",
+        route.name(),
+        load.as_secs_f64() * 1000.0
+    );
 
     let prepare = |body: &[u8]| -> Result<Result<EngineRequest, ApiError>, String> {
         let req = parse_body(body)?;

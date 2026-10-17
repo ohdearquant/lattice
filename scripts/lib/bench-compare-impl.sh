@@ -24,7 +24,12 @@
 # lattice#1515: each of the four ABBA arms is now sampled IN-PHASE (not just at
 # the three phase boundaries) for foreign (non-self) CPU load. Cadence is
 # PHASE_SAMPLE_INTERVAL seconds (default 5); the refusal ceiling is the same
-# BENCH_IDLE_FLOOR the boundary probes use (default 70, so ceiling 30% foreign):
+# BENCH_IDLE_FLOOR the boundary probes use (default 70, so ceiling 30% foreign).
+# An arm is refused when EITHER the sampled foreign figure OR an implied foreign
+# figure, max(0, 100 - idle - self), exceeds that ceiling. The two agree on an
+# ordinary host; inside a PID namespace the process walk sees only the
+# namespace's own processes and reads 0.0 however busy the host is, while idle
+# still spans the whole machine, so only the implied figure can see the load:
 #   PHASE_SAMPLE_INTERVAL=10 BENCH_IDLE_FLOOR=60 scripts/bench-compare.sh
 # Optional bench target selection:
 #   BENCHES_EMBED="embeddings" CARGO_FEATURES_EMBED="native" scripts/bench-compare.sh
