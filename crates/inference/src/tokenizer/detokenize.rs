@@ -87,13 +87,28 @@ impl IncrementalDetokenizer {
     /// Feed one token id; return the complete-UTF-8 text it reveals (which may be
     /// empty when the token only contributed continuation bytes of a codepoint
     /// still being assembled).
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
     pub(crate) fn push(&mut self, tokenizer: &BpeTokenizer, id: u32) -> String {
         append_token_bytes(tokenizer, id, &self.byte_decoder, &mut self.pending);
-        self.flush_complete()
+        let mut out = String::new();
+        self.flush_complete_into(&mut out);
+        out
     }
 
+    /// Append a token's complete UTF-8 prefix to a caller-owned delta buffer.
+    pub(crate) fn push_into(&mut self, tokenizer: &BpeTokenizer, id: u32, out: &mut String) {
+        append_token_bytes(tokenizer, id, &self.byte_decoder, &mut self.pending);
+        self.flush_complete_into(out);
+    }
+
+    #[cfg(test)]
     fn flush_complete(&mut self) -> String {
         let mut out = String::new();
+        self.flush_complete_into(&mut out);
+        out
+    }
+
+    fn flush_complete_into(&mut self, out: &mut String) {
         let mut consumed = 0usize;
 
         loop {
@@ -139,7 +154,6 @@ impl IncrementalDetokenizer {
             self.pending.drain(..consumed);
         }
         self.compact_pending_capacity();
-        out
     }
 
     /// Flush any trailing incomplete bytes lossily. Call once after the final
@@ -214,6 +228,41 @@ mod tests {
     use super::*;
     use crate::tokenizer::bpe::BpeTokenizer;
     use std::collections::HashMap;
+
+    #[test]
+    fn request_buffers_reuse_utf8_delta() {
+        let encoded = bytes_to_unicode();
+        let chunks: &[&[u8]] = &[b"hi", &[0xE5, 0xA5], &[0xBD], &[0x80], b"ok", &[0xF0, 0x9F]];
+        let vocab: HashMap<String, u32> = chunks
+            .iter()
+            .enumerate()
+            .map(|(id, bytes)| {
+                (
+                    bytes.iter().map(|&b| encoded[b as usize]).collect(),
+                    id as u32,
+                )
+            })
+            .collect();
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new()).unwrap();
+        let mut detok = IncrementalDetokenizer::new();
+        let mut delta = String::with_capacity(128);
+        let capacity = delta.capacity();
+        let pointer = delta.as_ptr();
+        let mut text = String::new();
+        for id in 0..chunks.len() as u32 {
+            delta.clear();
+            detok.push_into(&tokenizer, id, &mut delta);
+            assert_eq!(delta.capacity(), capacity);
+            assert_eq!(delta.as_ptr(), pointer);
+            text.push_str(&delta);
+        }
+        text.push_str(&detok.finish());
+        assert_eq!(
+            text,
+            decode_tokens(&tokenizer, &(0..chunks.len() as u32).collect::<Vec<_>>())
+        );
+        assert_eq!(text, "hi好\u{FFFD}ok\u{FFFD}");
+    }
 
     #[test]
     fn incremental_flush_reconstructs_split_codepoints() {

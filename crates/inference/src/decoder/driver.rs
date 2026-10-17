@@ -204,7 +204,43 @@ pub(crate) fn run(
     streaming: bool,
     cancel: &dyn Cancellation,
     on_push: impl FnMut(usize),
-    decode_delta: impl FnMut(u32) -> String,
+    mut decode_delta: impl FnMut(u32) -> String,
+    text: &mut String,
+    token_logprob_end_offsets: &mut Vec<usize>,
+    emit_confirmed: impl FnMut(&str, u32) -> bool,
+    on_prefill_end: impl FnMut(),
+    finish_tail: impl FnOnce() -> String,
+) -> Result<DriverResult, InferenceError> {
+    run_into(
+        session,
+        gen_cfg,
+        think_close_id,
+        prompt_ids,
+        eos_token_id,
+        streaming,
+        cancel,
+        on_push,
+        |id, out| *out = decode_delta(id),
+        text,
+        token_logprob_end_offsets,
+        emit_confirmed,
+        on_prefill_end,
+        finish_tail,
+    )
+}
+
+/// Drive generation while reusing a delta buffer through selection and stop policy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_into(
+    session: &mut dyn DecoderSession,
+    gen_cfg: &GenerateConfig,
+    think_close_id: Option<u32>,
+    prompt_ids: &[u32],
+    eos_token_id: u32,
+    streaming: bool,
+    cancel: &dyn Cancellation,
+    on_push: impl FnMut(usize),
+    decode_delta: impl FnMut(u32, &mut String),
     text: &mut String,
     token_logprob_end_offsets: &mut Vec<usize>,
     emit_confirmed: impl FnMut(&str, u32) -> bool,
@@ -252,7 +288,7 @@ fn run_inner(
     streaming: bool,
     cancel: &dyn Cancellation,
     mut on_push: impl FnMut(usize),
-    mut decode_delta: impl FnMut(u32) -> String,
+    mut decode_delta: impl FnMut(u32, &mut String),
     text: &mut String,
     token_logprob_end_offsets: &mut Vec<usize>,
     mut emit_confirmed: impl FnMut(&str, u32) -> bool,
@@ -366,7 +402,7 @@ fn run_inner(
     }
 
     let mut trace = DriverTrace::default();
-    let mut all_ids: Vec<u32> = prompt_ids.to_vec();
+    let mut all_ids = prompt_history(prompt_ids, gen_cfg);
     // Same reservation the earlier per-path decode loops made: the most tokens
     // this request can ever emit is fixed up front by `gen_cfg`, independent of
     // anything the session or policy decides later, so reserve it before the
@@ -485,12 +521,13 @@ fn run_inner(
     // above the `finish` call for why that one is dropped rather than decoded.
     let mut pending = candidate0.prediction;
 
-    let first_delta = decode_delta(candidate0.candidate_id);
+    let mut delta = String::new();
+    decode_delta(candidate0.candidate_id, &mut delta);
     match policy.check_initial_stop(
         &mut token_logprobs,
         text,
         token_logprob_end_offsets,
-        &first_delta,
+        &delta,
         |s| emit_confirmed(s, candidate0.candidate_id),
     ) {
         StopCheckOutcome::Stopped => {
@@ -591,7 +628,7 @@ fn run_inner(
 
             let generated_len_before = generated_ids.len();
             let candidate_prediction = candidate.prediction;
-            let outcome = policy.transition_with_metadata(
+            let outcome = policy.transition_with_metadata_into(
                 &mut token_logprobs,
                 candidate.candidate_id,
                 generated_len_before,
@@ -615,6 +652,7 @@ fn run_inner(
                         .map(|m| (m.final_logprob, m.top))
                 },
                 &mut decode_delta,
+                &mut delta,
                 text,
                 token_logprob_end_offsets,
                 |s, id| emit_confirmed(s, id),
@@ -758,6 +796,13 @@ fn run_inner(
         confirmed_stop_string_match,
         trace,
     })
+}
+
+fn prompt_history(prompt_ids: &[u32], gen_cfg: &GenerateConfig) -> Vec<u32> {
+    let cap = decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
+    let mut history = Vec::with_capacity(prompt_ids.len().saturating_add(cap));
+    history.extend_from_slice(prompt_ids);
+    history
 }
 
 /// Everything [`run_speculative`] produces. Logprobs and stop-string text are not
@@ -1178,6 +1223,84 @@ mod tests {
     // `gen_cfg.grammar` is set must be refused before any session method
     // past `capabilities` is ever called.
     // -----------------------------------------------------------------
+
+    #[test]
+    fn request_buffers_reserve_history() {
+        for (reasoning_budget, max_new_tokens) in [(None, 0), (None, 16), (Some(7), 16)] {
+            let config = GenerateConfig {
+                reasoning_budget,
+                enable_thinking: reasoning_budget.is_some(),
+                max_new_tokens,
+                ..Default::default()
+            };
+            let prompt = [1, 2, 3];
+            let cap = decode_cap(config.effective_reasoning_budget(), max_new_tokens);
+            let mut history = prompt_history(&prompt, &config);
+            assert_eq!(history, prompt);
+            assert!(history.capacity() >= prompt.len() + cap);
+            let pointer = history.as_ptr();
+            let capacity = history.capacity();
+            for _ in 0..cap {
+                history.push(4);
+                assert_eq!(history.capacity(), capacity);
+                assert_eq!(history.as_ptr(), pointer);
+            }
+        }
+    }
+
+    #[test]
+    fn request_buffers_reuse_driver_delta() {
+        let mut session = ScriptedSession {
+            caps: ExecutionCapabilities::default(),
+            ledger: PredictionLedger::new(),
+            script: vec![TEXT_TOKEN],
+            selects: 0,
+        };
+        let config = GenerateConfig {
+            max_new_tokens: 8,
+            ..Default::default()
+        };
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        let mut calls = 0;
+        let mut capacity = 0;
+        let mut pointer = std::ptr::null();
+        let result = run_into(
+            &mut session,
+            &config,
+            None,
+            &[0],
+            SCRIPTED_EOS,
+            true,
+            &|| false,
+            |_| {},
+            |_, delta| {
+                assert!(delta.is_empty());
+                if calls == 0 {
+                    delta.reserve(128);
+                    capacity = delta.capacity();
+                    pointer = delta.as_ptr();
+                } else {
+                    assert_eq!(delta.capacity(), capacity);
+                    assert_eq!(delta.as_ptr(), pointer);
+                }
+                delta.push('a');
+                calls += 1;
+            },
+            &mut text,
+            &mut offsets,
+            |delta, _| {
+                assert_eq!(delta, "a");
+                true
+            },
+            || {},
+            String::new,
+        )
+        .unwrap();
+        assert_eq!(calls, config.max_new_tokens);
+        assert_eq!(result.generated_ids.len(), calls);
+        assert_eq!(text, "a".repeat(calls));
+    }
 
     #[test]
     fn undeclared_grammar_capability_is_a_hard_error() {
