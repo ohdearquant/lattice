@@ -850,12 +850,15 @@ fn bench_q8_neon_forward_allocations(c: &mut Criterion) {
 // the push, inside the worker that executes the request, so it measures execution
 // and not enqueueing.
 //
-// Isolation: counters are process-wide because the CPU forward runs matmul on
+// Isolation: counters are process-wide because the CPU forward can run matmul on
 // rayon threads whose allocations belong to the request. The request therefore
-// runs alone in this process: one dedicated worker thread executes the warm-up and
-// every repeat, the calling thread is parked in `join`, and a quiet-process probe
-// precedes every arm. Unrelated concurrent allocation is rejected by the stability
-// gate, and a control with a deliberate noise thread proves the gate does so.
+// runs alone in this process: the worker of the one-thread counted-sample executor
+// executes the warm-up and every repeat, the calling thread is parked in `install`,
+// and a quiet-process probe precedes every arm. On a one-thread pool `matmul_bt`
+// does not split (the x86_64 row and column splits need at least two threads) and
+// takes its serial kernel, so the counts describe single-threaded execution, not a
+// multi-threaded caller. Unrelated concurrent allocation is rejected by the
+// stability gate, and a control with a deliberate noise thread proves the gate does so.
 //
 // Run (the group only runs when selected by name):
 //   RUSTC_WRAPPER="" cargo bench -p lattice-inference \
@@ -1148,18 +1151,21 @@ mod qwen_cpu_driver_allocations {
         );
     }
 
-    /// One worker executes the warm-up and every repeat; the caller is parked in join.
+    /// The one-thread executor's worker runs the warm-up and every repeat; the caller is
+    /// parked in `install`. On the ambient pool the matmul splits spread work over several
+    /// workers, and which repeat a worker's first-use allocation lands in varies between
+    /// runs, so exact repeat equality refused healthy runs (issue #2008). With one thread
+    /// the splits are off and every `matmul_bt` takes its serial kernel, so each repeat
+    /// executes the same way and the counts describe single-threaded execution.
     fn measure_unchecked(spec: &ArmSpec<'_>) -> Vec<Sample> {
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .name("alloc-instrument-worker".into())
-                .spawn_scoped(scope, || {
-                    let _warm_up = run_once(spec);
-                    (0..REPEATS).map(|_| run_once(spec)).collect::<Vec<_>>()
-                })
-                .expect("spawning the measurement worker")
-                .join()
-                .expect("the measurement worker panicked")
+        super::allocation_counts::counted_sample_executor().install(|| {
+            assert_eq!(
+                rayon::current_num_threads(),
+                1,
+                "the measurement must run on the one-thread executor, not on the ambient pool"
+            );
+            let _warm_up = run_once(spec);
+            (0..REPEATS).map(|_| run_once(spec)).collect::<Vec<_>>()
         })
     }
 
