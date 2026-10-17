@@ -852,8 +852,9 @@ fn bench_q8_neon_forward_allocations(c: &mut Criterion) {
 //
 // Isolation: counters are process-wide because the CPU forward runs matmul on
 // rayon threads whose allocations belong to the request. The request therefore
-// runs alone in this process: one dedicated worker thread executes the warm-up and
-// every repeat, the calling thread is parked in `join`, and a quiet-process probe
+// runs alone in this process: the worker of the one-thread counted-sample executor
+// executes the warm-up and every repeat, with the model's rayon loops on that same
+// worker, the calling thread is parked in `install`, and a quiet-process probe
 // precedes every arm. Unrelated concurrent allocation is rejected by the stability
 // gate, and a control with a deliberate noise thread proves the gate does so.
 //
@@ -1148,18 +1149,20 @@ mod qwen_cpu_driver_allocations {
         );
     }
 
-    /// One worker executes the warm-up and every repeat; the caller is parked in join.
+    /// The one-thread executor's worker runs the warm-up and every repeat; the caller is
+    /// parked in `install`. On the ambient pool the model's parallel loops spread over
+    /// several workers, and which repeat a worker's first-use allocation lands in varies
+    /// between runs, so exact repeat equality refused healthy runs (issue #2008). On the
+    /// executor those loops run on its single worker, the same way in every repeat.
     fn measure_unchecked(spec: &ArmSpec<'_>) -> Vec<Sample> {
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .name("alloc-instrument-worker".into())
-                .spawn_scoped(scope, || {
-                    let _warm_up = run_once(spec);
-                    (0..REPEATS).map(|_| run_once(spec)).collect::<Vec<_>>()
-                })
-                .expect("spawning the measurement worker")
-                .join()
-                .expect("the measurement worker panicked")
+        super::allocation_counts::counted_sample_executor().install(|| {
+            assert_eq!(
+                rayon::current_num_threads(),
+                1,
+                "the measurement must run on the one-thread executor, not on the ambient pool"
+            );
+            let _warm_up = run_once(spec);
+            (0..REPEATS).map(|_| run_once(spec)).collect::<Vec<_>>()
         })
     }
 
