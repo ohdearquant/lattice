@@ -8,8 +8,8 @@
 #   make wasm-parity
 #
 # Skip-graceful: if node, wasm-bindgen, the wasm32 target, or the bge-small /
-# all-MiniLM-L6-v2 model files (model.safetensors + config.json +
-# tokenizer.json under ~/.lattice/models/<name>/) are missing, this prints a
+# all-MiniLM-L6-v2 weights (model.safetensors under ~/.lattice/models/<name>/)
+# are missing, this prints a
 # one-line reason and exits 0 so a plain workspace build is unaffected.
 #
 # Fail-closed: set LATTICE_WASM_PARITY_ENFORCE=1 to turn every skip above into
@@ -20,8 +20,9 @@
 # model.safetensors and (vocab.txt or tokenizer.json, model-dependent) but
 # never config.json, and for WordPiece models (bge-small, MiniLM) never
 # tokenizer.json either; the wasm LatticeEmbedder constructor needs both, so
-# this script fetches them directly from the Hugging Face repo the same
-# --download-only step already resolved, into the same cache directory.
+# this script fetches them at the native downloader's pinned revisions and
+# verifies both cached and downloaded bytes against the WASM model registry.
+# Integrity and download errors always fail, including outside enforced CI.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -50,27 +51,75 @@ if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unkno
 fi
 
 # --- Model file prerequisites ------------------------------------------------
-# Each entry: <lattice cache dir name>|<HF repo id>
-
-MODEL_SPECS="bge-small-en-v1.5|BAAI/bge-small-en-v1.5
-all-minilm-l6-v2|sentence-transformers/all-MiniLM-L6-v2"
-
-echo "$MODEL_SPECS" | while IFS='|' read -r dir_name hf_id; do
+for dir_name in bge-small-en-v1.5 all-minilm-l6-v2; do
   model_dir="$MODELS_DIR/$dir_name"
   if [ ! -f "$model_dir/model.safetensors" ]; then
     echo "wasm-parity: MISSING $model_dir/model.safetensors, provision with:" >&2
     echo "  cargo run --release -p lattice-embed --bin embed -- --model $dir_name --download-only" >&2
-    exit 1
+    skip_or_fail "model weights missing for $dir_name"
   fi
-  for f in config.json tokenizer.json; do
-    if [ ! -f "$model_dir/$f" ]; then
-      echo "wasm-parity: fetching $f for $hf_id into $model_dir"
-      mkdir -p "$model_dir"
-      curl -fsSL -o "$model_dir/$f.tmp" "https://huggingface.co/$hf_id/resolve/main/$f"
-      mv "$model_dir/$f.tmp" "$model_dir/$f"
-    fi
-  done
-done || skip_or_fail "model weights or config/tokenizer files missing for bge-small-en-v1.5 / all-minilm-l6-v2 (see stderr above)"
+done
+
+# Keep integrity failures outside skip_or_fail so optional runs cannot hide them.
+node --input-type=module - "$REPO" "$MODELS_DIR" <<'JS'
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const [repo, modelsDir] = process.argv.slice(2);
+const { MODEL_REGISTRY } = await import(
+  pathToFileURL(join(repo, 'npm/lattice-embed-wasm/registry.mjs')).href
+);
+// These revisions match hf_source in crates/inference/src/download.rs.
+const sources = [
+  ['bge', 'BAAI/bge-small-en-v1.5', '5c38ec7c405ec4b44b94cc5a9bb96e735b38267a'],
+  ['minilm', 'sentence-transformers/all-MiniLM-L6-v2', '1110a243fdf4706b3f48f1d95db1a4f5529b4d41'],
+];
+
+function verify(bytes, expected, file) {
+  const actual = createHash('sha256').update(bytes).digest('hex');
+  if (actual !== expected) {
+    throw new Error(`wasm-parity: SHA-256 mismatch for ${file}: expected ${expected}, got ${actual}`);
+  }
+}
+
+for (const [name, hfId, revision] of sources) {
+  const model = MODEL_REGISTRY[name];
+  if (!model) throw new Error(`wasm-parity: missing model registry entry: ${name}`);
+  const modelDir = join(modelsDir, model.localDir);
+  for (const fileName of [model.files.config, model.files.tokenizer]) {
+    const file = join(modelDir, fileName);
+    let cached;
+    try {
+      cached = await readFile(file);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    if (cached !== undefined) {
+      verify(cached, model.sha256[fileName], file);
+      continue;
+    }
+
+    const url = `https://huggingface.co/${hfId}/resolve/${revision}/${fileName}`;
+    console.log(`wasm-parity: fetching ${fileName} for ${hfId} at ${revision}`);
+    const bytes = execFileSync('curl', ['-fsSL', '--max-time', '120', url], {
+      maxBuffer: 16 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'inherit'],
+    });
+    verify(bytes, model.sha256[fileName], file);
+    const temporaryDir = await mkdtemp(join(modelDir, '.wasm-parity-'));
+    try {
+      const temporaryFile = join(temporaryDir, fileName);
+      await writeFile(temporaryFile, bytes);
+      await rename(temporaryFile, file);
+    } finally {
+      await rm(temporaryDir, { recursive: true, force: true });
+    }
+  }
+}
+JS
 
 for dir_name in bge-small-en-v1.5 all-minilm-l6-v2; do
   model_dir="$MODELS_DIR/$dir_name"
