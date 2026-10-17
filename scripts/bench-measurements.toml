@@ -184,8 +184,16 @@ path = "crates/inference/src/bin/lattice/serve.rs"
 reason = "`lattice serve` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/serve_cpu_panic_tests.rs"
+reason = "Test-only CPU generation panic, HTTP/SSE and admission correctness controls using a synthetic generator; timeout deadlines bound hangs and do not produce timing measurements. No Criterion or Metal dispatch; included only under cfg(test) and test-utils."
+
+[[non_measurement_surface]]
 path = "crates/inference/src/bin/lattice/doctor.rs"
 reason = "`lattice doctor` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/forecast.rs"
+reason = "`lattice forecast` product subcommand: reads series as JSON lines, writes point forecasts, and exits. Forecast values only; no timing, no Criterion, no Metal dispatch."
 
 [[non_measurement_surface]]
 path = "crates/inference/src/bin/lattice/prune_score.rs"

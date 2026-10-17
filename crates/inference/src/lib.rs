@@ -83,10 +83,17 @@ pub(crate) mod decoder;
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub use decoder::bench_support as decoder_bench_support;
+/// Synthetic checkpoint support for repository regression tests.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod bert_pooling_fixture;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
 /// Crate error taxonomy; see [`InferenceError`].
 pub mod error;
+/// Time-series forecasting: context preparation and native forecasting models. See
+/// [`forecast::Reverso`].
+pub mod forecast;
 /// Neutral generation types shared by every decoder path: request configuration and
 /// result struct, independent of model family. See [`GenerateConfig`] and
 /// [`GenerateOutput`].
