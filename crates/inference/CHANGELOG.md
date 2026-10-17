@@ -10,6 +10,15 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+### Added
+
+- Forced scalar execution for the eight backward Stage 0 operations under `train-backward` with `test-utils`, with operation-specific completion evidence and checked caller-buffer entry points for six primitives (#1392).
+
+### Changed
+
+- The `backward_stage0` benchmark requires `train-backward,test-utils`, adds matched scalar cases, and initializes fixtures only for selected cases (#1392).
+- `ForcedDispatch::mark_executed` is deprecated and always refuses manual attestation; call an arithmetic method and `verify_for` instead. A probe is single-use, and failed or repeated execution invalidates its evidence (#1392).
+
 ## [0.13.0] - 2026-10-18
 
 ### Breaking
