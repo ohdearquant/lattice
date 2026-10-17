@@ -588,6 +588,28 @@ jobs:
         run: cargo clippy -p lattice-inference --all-targets -- -D warnings
       - name: inference — bench-internals clippy without f16
         run: cargo clippy -p lattice-inference --all-targets --features bench-internals -- -D warnings
+      # The control target runs without libtest and exits non-zero unless all of its controls pass.
+      - name: inference allocation sampler controls
+        run: cargo test --locked -p lattice-inference --no-default-features --features bench-internals --test inference_perf_allocation_gate
+      # Counted samples run on a one-thread pool, so the allocation gate holds on a multicore host; the bench prints
+      # the pool widths it saw.
+      - name: inference allocation sampler multicore smoke
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        env:
+          RAYON_NUM_THREADS: "8"
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/inference-allocation-smoke.log"
+          if cargo bench --locked -p lattice-inference --no-default-features --features bench-internals \
+            --bench inference_perf -- '^generate_forward_with_cache/(allocating_current|scratch_dispatch)$' --test >"$log" 2>&1; then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -q '^ALLOCATION_SMOKE mode=generate_forward_with_cache rayon_threads=8 counted_executor_threads=1$' "$log"
       # The R03 golden gate (`crates/inference/tests/cpu_pre_migration_greedy_golden.rs`)
       # and the row D allocation arm (`crates/inference/tests/decoder_allocation_arm.rs`)
       # are both declared `test = false`, which keeps them out of
