@@ -745,8 +745,8 @@ jobs:
             exit 1
           fi
           passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p')
-          if [ -z "$passed" ] || [ "$passed" -lt 32 ]; then
-            echo "expected at least 32 passing bench_serve_http tests, parsed '${passed:-<none>}'" >&2
+          if [ -z "$passed" ] || [ "$passed" -lt 48 ]; then
+            echo "expected at least 48 passing bench_serve_http tests, parsed '${passed:-<none>}'" >&2
             exit 1
           fi
       # The unit tests classify a missing checkpoint as a skip with exit code 2,
