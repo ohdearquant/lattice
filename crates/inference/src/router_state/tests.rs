@@ -1,5 +1,22 @@
 use super::*;
 
+fn raw_fixture_write(
+    dir: &Path,
+    artifact: &RouterArtifact,
+) -> Result<PathBuf, RouterArtifactError> {
+    let path = manifest_path(dir, artifact.version);
+    let json = manifest_bytes(artifact, &path)?;
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(gate_path(dir, artifact.version), &artifact.gate_bytes).unwrap();
+    std::fs::write(&path, json).unwrap();
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn commit_fixture(dir: &Path, artifact: &RouterArtifact) -> Result<PathBuf, RouterArtifactError> {
+    storage::commit_fixture(dir, artifact)
+}
+
 fn representation() -> TrainedRepresentation {
     TrainedRepresentation {
         embedding_model: "gme-qwen35".into(),
@@ -75,7 +92,7 @@ fn a_legacy_artifact_hashes_exactly_as_it_did_before_provenance_existed() {
 fn a_recorded_artifact_round_trips_and_is_written_as_the_new_revision() {
     let dir = scratch("recorded");
     let original = recorded();
-    write_artifact(&dir, &original).expect("write");
+    raw_fixture_write(&dir, &original).expect("write");
 
     let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read manifest");
     assert!(
@@ -93,7 +110,7 @@ fn a_legacy_manifest_carries_no_policy_keys_at_all() {
     // two `null`s it has never seen are a different document from the one
     // it was written against.
     let dir = scratch("legacyshape");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
     let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read manifest");
     assert!(
         !raw.contains("policy"),
@@ -112,7 +129,7 @@ fn the_declared_revision_and_the_recorded_policy_must_agree_in_both_directions()
     // Direction 1: the new revision without a policy. Defaulting one in is
     // exactly how a legacy gate would quietly become learner-eligible.
     let dir = scratch("missingpolicy");
-    write_artifact(&dir, &recorded()).expect("write");
+    raw_fixture_write(&dir, &recorded()).expect("write");
     let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read");
     let stripped: serde_json::Value = {
         let mut v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
@@ -136,7 +153,7 @@ fn the_declared_revision_and_the_recorded_policy_must_agree_in_both_directions()
     // Direction 2: the legacy revision carrying a policy. Dropping it would
     // serve the file while ignoring what it says about itself.
     let dir = scratch("extrapolicy");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
     let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read");
     let mut v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
     v.as_object_mut().expect("object").insert(
@@ -165,7 +182,7 @@ fn the_declared_revision_and_the_recorded_policy_must_agree_in_both_directions()
 #[test]
 fn an_invalid_policy_is_refused_on_read_and_not_only_at_write() {
     let dir = scratch("readbadpolicy");
-    write_artifact(&dir, &recorded()).expect("write");
+    raw_fixture_write(&dir, &recorded()).expect("write");
     assert_eq!(
         read_artifact(&dir, 7).expect("control: the fixture reads"),
         recorded()
@@ -350,7 +367,7 @@ fn an_inconsistent_policy_is_refused_at_write_and_leaves_no_payload() {
         ),
         ..artifact()
     };
-    match write_artifact(&dir, &bad) {
+    match raw_fixture_write(&dir, &bad) {
         Err(RouterArtifactError::InvalidPolicy { problem }) => {
             assert!(problem.contains("tau"), "{problem}");
         }
@@ -440,7 +457,7 @@ fn a_bootstrap_policy_records_no_exploration_scale() {
 #[test]
 fn an_artifact_that_does_not_say_its_scale_is_refused_at_load() {
     let dir = scratch("missing-scale");
-    write_artifact(&dir, &recorded()).expect("write");
+    raw_fixture_write(&dir, &recorded()).expect("write");
     // The control: the fixture reads before the field is removed.
     read_artifact(&dir, 7).expect("the fixture must read");
 
@@ -495,8 +512,8 @@ fn two_artifacts_that_differ_only_in_the_scale_hash_differently() {
         ),
         ..artifact()
     };
-    write_artifact(&dir, &deterministic).expect("write deterministic");
-    write_artifact(&dir, &sampled).expect("write sampled");
+    raw_fixture_write(&dir, &deterministic).expect("write deterministic");
+    raw_fixture_write(&dir, &sampled).expect("write sampled");
     let a = read_artifact(&dir, 7).expect("read deterministic");
     let b = read_artifact(&dir, 8).expect("read sampled");
     assert_ne!(a.content_hash(), b.content_hash());
@@ -622,23 +639,515 @@ fn recorded_at(version: u64) -> RouterArtifact {
     }
 }
 
+fn head_for(artifact: &RouterArtifact) -> HeadRecord {
+    HeadRecord {
+        format: artifact.provenance.format(),
+        version: artifact.version,
+        content_sha256: artifact.content_hash(),
+    }
+}
+
+fn write_head_fixture(dir: &Path, head: &HeadRecord) {
+    std::fs::create_dir_all(dir).expect("create fixture directory");
+    std::fs::write(
+        head_path(dir),
+        serde_json::to_vec(head).expect("serialize fixture head"),
+    )
+    .expect("write fixture head");
+}
+
+#[test]
+fn only_an_absent_head_is_reported_as_none() {
+    let dir = scratch("head-absence");
+    assert_eq!(read_head(&dir).expect("absent directory"), None);
+    std::fs::create_dir_all(&dir).expect("create directory");
+    assert_eq!(read_head(&dir).expect("absent head"), None);
+
+    std::fs::create_dir(head_path(&dir)).expect("put a directory at the head path");
+    assert!(matches!(
+        read_head(&dir),
+        Err(RouterArtifactError::HeadUnreadable { .. })
+    ));
+    std::fs::remove_dir(head_path(&dir)).expect("remove the invalid head");
+
+    let file = dir.join("not-a-directory");
+    std::fs::write(&file, b"file").expect("create a non-directory parent");
+    assert!(matches!(
+        read_head(&file),
+        Err(RouterArtifactError::Lock { .. })
+    ));
+
+    let expected = head_for(&recorded());
+    write_head_fixture(&dir, &expected);
+    assert_eq!(read_head(&dir).expect("valid head"), Some(expected));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_head_symlink_does_not_restore_counter_selection() {
+    let dir = scratch("head-dangling");
+    raw_fixture_write(&dir, &artifact()).expect("write a legacy version");
+    std::os::unix::fs::symlink(dir.join("missing-head"), head_path(&dir))
+        .expect("create a dangling head symlink");
+    assert!(matches!(
+        read_head(&dir),
+        Err(RouterArtifactError::HeadUnreadable { .. })
+    ));
+    assert!(matches!(
+        load_selected(&dir),
+        Err(RouterArtifactError::HeadUnreadable { .. })
+    ));
+
+    std::fs::remove_file(head_path(&dir)).expect("remove the symlink");
+    assert_eq!(read_head(&dir).expect("absent head"), None);
+    assert_eq!(
+        load_selected(&dir)
+            .expect("legacy selection")
+            .expect("artifact")
+            .version,
+        7
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_revision_and_full_hash_are_validated_before_selection() {
+    let dir = scratch("head-fields");
+    let original = recorded();
+    raw_fixture_write(&dir, &original).expect("write the recorded artifact");
+    let expected = head_for(&original);
+    for format in [0, ROUTER_ARTIFACT_FORMAT_LEGACY, ROUTER_ARTIFACT_FORMAT + 1] {
+        write_head_fixture(
+            &dir,
+            &HeadRecord {
+                format,
+                ..expected.clone()
+            },
+        );
+        assert!(matches!(
+            read_head(&dir),
+            Err(RouterArtifactError::InvalidHead { .. })
+        ));
+        assert!(matches!(
+            load_selected(&dir),
+            Err(RouterArtifactError::InvalidHead { .. })
+        ));
+    }
+    for content_sha256 in [
+        String::new(),
+        expected.content_sha256[..16].to_string(),
+        "a".repeat(63),
+        "a".repeat(65),
+        "A".repeat(64),
+        "g".repeat(64),
+    ] {
+        write_head_fixture(
+            &dir,
+            &HeadRecord {
+                content_sha256,
+                ..expected.clone()
+            },
+        );
+        assert!(matches!(
+            read_head(&dir),
+            Err(RouterArtifactError::InvalidHead { .. })
+        ));
+        assert!(matches!(
+            load_selected(&dir),
+            Err(RouterArtifactError::InvalidHead { .. })
+        ));
+    }
+    write_head_fixture(&dir, &expected);
+    assert_eq!(read_head(&dir).expect("valid head"), Some(expected));
+    assert_eq!(
+        load_selected(&dir)
+            .expect("valid selection")
+            .expect("artifact"),
+        original
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_head_must_match_the_stored_artifact_revision() {
+    let dir = scratch("head-revision-mismatch");
+    let legacy = artifact();
+    raw_fixture_write(&dir, &legacy).expect("write legacy");
+    write_head_fixture(
+        &dir,
+        &HeadRecord {
+            format: ROUTER_ARTIFACT_FORMAT,
+            ..head_for(&legacy)
+        },
+    );
+    assert!(matches!(
+        load_selected(&dir),
+        Err(RouterArtifactError::HeadFormatMismatch {
+            head_format: ROUTER_ARTIFACT_FORMAT,
+            artifact_format: ROUTER_ARTIFACT_FORMAT_LEGACY,
+            ..
+        })
+    ));
+    let before = std::fs::read(head_path(&dir)).expect("read head before refusal");
+    assert!(matches!(
+        commit_fixture(&dir, &recorded()),
+        Err(RouterArtifactError::HeadFormatMismatch { .. })
+    ));
+    assert_eq!(
+        std::fs::read(head_path(&dir)).expect("read unchanged head"),
+        before
+    );
+
+    let recorded = recorded();
+    raw_fixture_write(&dir, &recorded).expect("replace the fixture with recorded provenance");
+    std::fs::remove_file(head_path(&dir)).expect("remove the inconsistent fixture head");
+    commit_fixture(&dir, &recorded).expect("commit a matching revision");
+    assert_eq!(
+        load_selected(&dir).expect("select").expect("artifact"),
+        recorded
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_head_commit_rechecks_the_supplied_identity_against_disk() {
+    let dir = scratch("head-commit-identity");
+    let previous = recorded_at(1);
+    let stored = recorded_at(2);
+    raw_fixture_write(&dir, &previous).expect("write previous");
+    commit_fixture(&dir, &previous).expect("commit previous");
+    raw_fixture_write(&dir, &stored).expect("write next");
+    let before = std::fs::read(head_path(&dir)).expect("read previous head");
+    let mut supplied = stored.clone();
+    supplied.gate_bytes[0] ^= 0xff;
+    match commit_fixture(&dir, &supplied) {
+        Err(RouterArtifactError::HeadDisagreesWithArtifact {
+            version,
+            head_hash,
+            artifact_hash,
+            ..
+        }) => {
+            assert_eq!(version, 2);
+            assert_eq!(head_hash, supplied.content_hash());
+            assert_eq!(artifact_hash, stored.content_hash());
+        }
+        other => panic!("expected the proposed head to disagree, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(head_path(&dir)).expect("read unchanged head"),
+        before
+    );
+    assert!(!dir.join("HEAD.json.staged-2").exists());
+    assert_eq!(read_artifact(&dir, 2).expect("stored artifact"), stored);
+
+    commit_fixture(&dir, &stored).expect("commit the actual stored identity");
+    assert_eq!(read_head(&dir).expect("new head"), Some(head_for(&stored)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_head_commit_refuses_a_corrupt_payload_without_changing_the_head() {
+    let dir = scratch("head-commit-corrupt");
+    let previous = recorded_at(1);
+    let next = recorded_at(2);
+    raw_fixture_write(&dir, &previous).expect("write previous");
+    commit_fixture(&dir, &previous).expect("commit previous");
+    raw_fixture_write(&dir, &next).expect("write next");
+    let before = std::fs::read(head_path(&dir)).expect("read previous head");
+    let mut corrupt = next.gate_bytes.clone();
+    corrupt[0] ^= 0xff;
+    std::fs::write(gate_path(&dir, 2), corrupt).expect("corrupt the stored payload");
+    assert!(matches!(
+        commit_fixture(&dir, &next),
+        Err(RouterArtifactError::HashMismatch { version: 2, .. })
+    ));
+    assert_eq!(
+        std::fs::read(head_path(&dir)).expect("read unchanged head"),
+        before
+    );
+    assert!(!dir.join("HEAD.json.staged-2").exists());
+
+    std::fs::write(gate_path(&dir, 2), &next.gate_bytes).expect("restore fixture payload");
+    commit_fixture(&dir, &next).expect("commit the intact artifact");
+    assert_eq!(read_head(&dir).expect("new head"), Some(head_for(&next)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_format_4_artifact_cannot_create_or_replace_a_head() {
+    let dir = scratch("head-commit-legacy");
+    let legacy = artifact();
+    raw_fixture_write(&dir, &legacy).expect("write legacy");
+    assert!(matches!(
+        commit_fixture(&dir, &legacy),
+        Err(RouterArtifactError::InvalidHead { .. })
+    ));
+    assert!(!head_path(&dir).exists());
+    assert!(!dir.join("HEAD.json.staged-7").exists());
+
+    let recorded = recorded_at(1);
+    raw_fixture_write(&dir, &recorded).expect("write recorded");
+    commit_fixture(&dir, &recorded).expect("commit recorded");
+    let before = std::fs::read(head_path(&dir)).expect("read recorded head");
+    assert!(matches!(
+        commit_fixture(&dir, &legacy),
+        Err(RouterArtifactError::InvalidHead { .. })
+    ));
+    assert_eq!(
+        std::fs::read(head_path(&dir)).expect("read unchanged head"),
+        before
+    );
+    assert_eq!(
+        read_artifact(&dir, legacy.version).expect("legacy unchanged"),
+        legacy
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_headless_format_5_directory_refuses_counter_selection() {
+    let dir = scratch("headless-recorded");
+    let original = recorded();
+    raw_fixture_write(&dir, &original).expect("write recorded");
+    assert!(matches!(
+        load_selected(&dir),
+        Err(RouterArtifactError::MissingHead { version: 7, .. })
+    ));
+    assert!(matches!(
+        resolve_startup(Some(&dir), None),
+        Err(RouterArtifactError::MissingHead { version: 7, .. })
+    ));
+    assert_eq!(
+        read_artifact(&dir, 7).expect("the artifact is intact"),
+        original
+    );
+
+    commit_fixture(&dir, &original).expect("commit the head");
+    assert_eq!(
+        load_selected(&dir)
+            .expect("committed selection")
+            .expect("artifact"),
+        original
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_mixed_revisions_refuse_regardless_of_counter_order() {
+    for recorded_version in [3, 9] {
+        let dir = scratch(&format!("headless-mixed-{recorded_version}"));
+        let recorded = recorded_at(recorded_version);
+        let legacy = RouterArtifact {
+            version: if recorded_version == 3 { 9 } else { 3 },
+            ..artifact()
+        };
+        raw_fixture_write(&dir, &recorded).expect("write recorded");
+        raw_fixture_write(&dir, &legacy).expect("write legacy");
+        match load_selected(&dir) {
+            Err(RouterArtifactError::MissingHead { version, .. }) => {
+                assert_eq!(version, recorded_version);
+            }
+            other => panic!("expected a missing head for format 5, got {other:?}"),
+        }
+        commit_fixture(&dir, &recorded).expect("commit the recorded head");
+        assert_eq!(
+            load_selected(&dir)
+                .expect("committed selection")
+                .expect("artifact"),
+            recorded
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn headless_selection_refuses_a_malformed_lower_manifest() {
+    let dir = scratch("headless-malformed-lower");
+    let lower = RouterArtifact {
+        version: 3,
+        ..artifact()
+    };
+    raw_fixture_write(&dir, &lower).expect("write lower legacy version");
+    raw_fixture_write(&dir, &artifact()).expect("write higher legacy version");
+    let path = manifest_path(&dir, 3);
+    let intact = std::fs::read(&path).expect("read lower manifest");
+    std::fs::write(&path, b"{").expect("truncate lower manifest");
+    assert!(matches!(
+        load_selected(&dir),
+        Err(RouterArtifactError::Malformed { path: failed, .. }) if failed == path
+    ));
+    std::fs::write(&path, intact).expect("restore lower manifest");
+    assert_eq!(
+        load_selected(&dir)
+            .expect("legacy selection")
+            .expect("artifact")
+            .version,
+        7
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn headless_selection_refuses_an_unknown_lower_revision() {
+    let dir = scratch("headless-unknown-lower");
+    raw_fixture_write(&dir, &artifact()).expect("write higher legacy version");
+    std::fs::write(manifest_path(&dir, 3), br#"{"format":6}"#)
+        .expect("write an unknown lower revision");
+    assert!(matches!(
+        load_selected(&dir),
+        Err(RouterArtifactError::UnknownFormat { found: 6, .. })
+    ));
+    std::fs::remove_file(manifest_path(&dir, 3)).expect("remove unknown revision");
+    assert_eq!(
+        load_selected(&dir)
+            .expect("legacy selection")
+            .expect("artifact")
+            .version,
+        7
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn headless_revision_inspection_does_not_load_lower_gates() {
+    let dir = scratch("headless-lower-gate");
+    raw_fixture_write(
+        &dir,
+        &RouterArtifact {
+            version: 3,
+            ..artifact()
+        },
+    )
+    .expect("write lower legacy version");
+    raw_fixture_write(&dir, &artifact()).expect("write higher legacy version");
+    std::fs::remove_file(gate_path(&dir, 3)).expect("remove the unused lower gate");
+    assert!(read_artifact(&dir, 3).is_err());
+    assert_eq!(
+        load_selected(&dir)
+            .expect("legacy selection")
+            .expect("artifact")
+            .version,
+        7
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn headless_revision_inspection_obeys_the_manifest_read_cap() {
+    let dir = scratch("headless-manifest-cap");
+    raw_fixture_write(&dir, &artifact()).expect("write higher legacy version");
+    let path = manifest_path(&dir, 3);
+    let mut oversized = br#"{"format":4}"#.to_vec();
+    oversized.resize(MAX_ROUTER_MANIFEST_LEN as usize + 1, b' ');
+    std::fs::write(&path, oversized).expect("write oversized lower manifest");
+    assert!(matches!(
+        load_selected(&dir),
+        Err(RouterArtifactError::Read { path: failed, .. }) if failed == path
+    ));
+    std::fs::remove_file(path).expect("remove oversized manifest");
+    assert_eq!(
+        load_selected(&dir)
+            .expect("legacy selection")
+            .expect("artifact")
+            .version,
+        7
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn format_5_pins_require_the_canonical_label_or_full_hash() {
+    let dir = scratch("recorded-pin-shape");
+    let original = recorded();
+    raw_fixture_write(&dir, &original).expect("write recorded");
+    commit_fixture(&dir, &original).expect("commit the fixture identity");
+    let hash = original.content_hash();
+    for hash_prefix in [
+        None,
+        Some(String::new()),
+        Some(hash[..1].to_string()),
+        Some(hash[..15].to_string()),
+        Some(hash[..17].to_string()),
+        Some(hash[..63].to_string()),
+        Some(format!("{hash}a")),
+        Some("A".repeat(16)),
+        Some("g".repeat(64)),
+    ] {
+        let requested = RouterPin {
+            version: original.version,
+            hash_prefix,
+        };
+        assert!(
+            matches!(
+                resolve_startup(Some(&dir), Some(&requested)),
+                Err(RouterArtifactError::PinMalformed { .. })
+            ),
+            "invalid recorded identity was accepted: {requested:?}"
+        );
+    }
+    let parsed_short = RouterPin::parse(&format!("7:{}", &hash[..1])).expect("hex syntax");
+    assert!(matches!(
+        resolve_startup(Some(&dir), Some(&parsed_short)),
+        Err(RouterArtifactError::PinMalformed { .. })
+    ));
+    for label in [original.version_label(), format!("7:{hash}")] {
+        let requested = RouterPin::parse(&label).expect("identity pin");
+        match resolve_startup(Some(&dir), Some(&requested)).expect("matching identity") {
+            StartupDisposition::Loaded(resolved) => {
+                assert_eq!(resolved.artifact, original);
+                assert!(resolved.pinned);
+            }
+            other => panic!("expected the pinned artifact, got {other:?}"),
+        }
+    }
+    let wrong = format!(
+        "7:{}{}",
+        if hash.starts_with('0') { "1" } else { "0" },
+        &hash[1..16]
+    );
+    let requested = RouterPin::parse(&wrong).expect("valid identity syntax");
+    assert!(matches!(
+        resolve_startup(Some(&dir), Some(&requested)),
+        Err(RouterArtifactError::PinIdentityMismatch { .. })
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// With no head record the directory is a format-4 one and ADR-095's rule
 /// applies unchanged. The control is the same call on the same directory
 /// after a head is committed: if `load_selected` ignored the head, both
 /// halves would answer 9 and the test would pass while proving nothing.
+#[cfg(unix)]
 #[test]
 fn with_no_head_the_highest_counter_is_served_and_a_head_changes_that() {
     let dir = scratch("head-vs-counter");
-    write_artifact(&dir, &recorded_at(3)).expect("write 3");
-    write_artifact(&dir, &recorded_at(9)).expect("write 9");
+    for version in [3, 9] {
+        raw_fixture_write(
+            &dir,
+            &RouterArtifact {
+                version,
+                ..artifact()
+            },
+        )
+        .expect("write a legacy version");
+    }
 
     let by_counter = load_selected(&dir).expect("select").expect("an artifact");
     assert_eq!(by_counter.version, 9, "no head means the counter rule");
 
-    commit_head(&dir, &recorded_at(3)).expect("commit head at 3");
+    raw_fixture_write(&dir, &recorded_at(2)).expect("write recorded version 2");
+    commit_fixture(&dir, &recorded_at(2)).expect("commit head at 2");
     let by_head = load_selected(&dir).expect("select").expect("an artifact");
     assert_eq!(
-        by_head.version, 3,
+        by_head.version, 2,
         "a head governs unpinned selection even against a higher counter"
     );
 
@@ -648,12 +1157,13 @@ fn with_no_head_the_highest_counter_is_served_and_a_head_changes_that() {
 /// A staged or rejected candidate is exactly this shape on disk: a higher
 /// counter present, not named by the head. It must never be promoted by
 /// surviving a restart, which is what the write-then-scan rule would do.
+#[cfg(unix)]
 #[test]
 fn a_higher_counter_not_named_by_the_head_is_never_promoted() {
     let dir = scratch("rejected-candidate");
-    write_artifact(&dir, &recorded_at(1)).expect("write 1");
-    commit_head(&dir, &recorded_at(1)).expect("commit head at 1");
-    write_artifact(&dir, &recorded_at(2)).expect("write the candidate");
+    raw_fixture_write(&dir, &recorded_at(1)).expect("write 1");
+    commit_fixture(&dir, &recorded_at(1)).expect("commit head at 1");
+    raw_fixture_write(&dir, &recorded_at(2)).expect("write the candidate");
 
     for round in 0..2 {
         let served = load_selected(&dir).expect("select").expect("an artifact");
@@ -664,7 +1174,7 @@ fn a_higher_counter_not_named_by_the_head_is_never_promoted() {
     }
 
     // The control: the same directory once 2 is actually admitted.
-    commit_head(&dir, &recorded_at(2)).expect("admit 2");
+    commit_fixture(&dir, &recorded_at(2)).expect("admit 2");
     assert_eq!(
         load_selected(&dir)
             .expect("select")
@@ -679,12 +1189,13 @@ fn a_higher_counter_not_named_by_the_head_is_never_promoted() {
 /// A head naming a version that is not there refuses. Falling back to the
 /// next-highest is the promotion the head exists to prevent, and it would
 /// happen at the moment someone deleted the admitted artifact by hand.
+#[cfg(unix)]
 #[test]
 fn a_head_naming_an_absent_version_refuses_rather_than_falling_back() {
     let dir = scratch("head-absent");
-    write_artifact(&dir, &recorded_at(1)).expect("write 1");
-    write_artifact(&dir, &recorded_at(2)).expect("write 2");
-    commit_head(&dir, &recorded_at(2)).expect("commit head at 2");
+    raw_fixture_write(&dir, &recorded_at(1)).expect("write 1");
+    raw_fixture_write(&dir, &recorded_at(2)).expect("write 2");
+    commit_fixture(&dir, &recorded_at(2)).expect("commit head at 2");
 
     // The control, before the removal: this directory loads.
     assert_eq!(
@@ -710,11 +1221,12 @@ fn a_head_naming_an_absent_version_refuses_rather_than_falling_back() {
 /// the same number reads on disk exactly like an ordinary refit, and it is
 /// not one: the head is now pointing at an artifact that was never
 /// admitted.
+#[cfg(unix)]
 #[test]
 fn a_head_whose_hash_no_longer_matches_its_version_refuses() {
     let dir = scratch("head-hash");
-    write_artifact(&dir, &recorded_at(4)).expect("write 4");
-    commit_head(&dir, &recorded_at(4)).expect("commit head at 4");
+    raw_fixture_write(&dir, &recorded_at(4)).expect("write 4");
+    commit_fixture(&dir, &recorded_at(4)).expect("commit head at 4");
     assert_eq!(
         load_selected(&dir)
             .expect("select")
@@ -728,7 +1240,7 @@ fn a_head_whose_hash_no_longer_matches_its_version_refuses() {
         gate_bytes: vec![9, 9, 9],
         ..recorded_at(4)
     };
-    write_artifact(&dir, &replaced).expect("rewrite 4 with other content");
+    raw_fixture_write(&dir, &replaced).expect("rewrite 4 with other content");
     match load_selected(&dir) {
         Err(RouterArtifactError::HeadDisagreesWithArtifact {
             version,
@@ -750,12 +1262,13 @@ fn a_head_whose_hash_no_longer_matches_its_version_refuses() {
 /// would silently reinstate the counter rule on the one directory whose
 /// admission was interrupted, which is the directory where the counter
 /// rule is most likely to serve a rejected candidate.
+#[cfg(unix)]
 #[test]
 fn a_present_but_unparseable_head_is_an_error_not_an_absence() {
     let dir = scratch("head-garbage");
-    write_artifact(&dir, &recorded_at(1)).expect("write 1");
-    commit_head(&dir, &recorded_at(1)).expect("commit head at 1");
-    write_artifact(&dir, &recorded_at(2)).expect("write 2");
+    raw_fixture_write(&dir, &recorded_at(1)).expect("write 1");
+    commit_fixture(&dir, &recorded_at(1)).expect("commit head at 1");
+    raw_fixture_write(&dir, &recorded_at(2)).expect("write 2");
 
     std::fs::write(head_path(&dir), b"{\"format\": 5, \"vers").expect("truncate the head");
     match read_head(&dir) {
@@ -772,17 +1285,14 @@ fn a_present_but_unparseable_head_is_an_error_not_an_absence() {
         "a truncated head must not fall through to the counter rule and serve 2"
     );
 
-    // The control: an ABSENT head on the same directory is not an error,
-    // and it is what selects 2. The two states are distinguishable.
+    // Absence is distinguishable from corruption, but neither authorizes
+    // counter selection over these format-5 artifacts.
     std::fs::remove_file(head_path(&dir)).expect("remove the head");
     assert_eq!(read_head(&dir).expect("absent head"), None);
-    assert_eq!(
-        load_selected(&dir)
-            .expect("select")
-            .expect("an artifact")
-            .version,
-        2
-    );
+    assert!(matches!(
+        load_selected(&dir),
+        Err(RouterArtifactError::MissingHead { version: 1, .. })
+    ));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -790,12 +1300,13 @@ fn a_present_but_unparseable_head_is_an_error_not_an_absence() {
 /// Committing a head for a version that was never written produces a
 /// directory that refuses every unpinned startup. Refusing at the commit
 /// is the only place that state can still be avoided.
+#[cfg(unix)]
 #[test]
 fn a_head_cannot_be_committed_for_a_version_that_is_not_on_disk() {
     let dir = scratch("head-commit-absent");
-    write_artifact(&dir, &recorded_at(1)).expect("write 1");
+    raw_fixture_write(&dir, &recorded_at(1)).expect("write 1");
 
-    match commit_head(&dir, &recorded_at(2)) {
+    match commit_fixture(&dir, &recorded_at(2)) {
         Err(RouterArtifactError::HeadNamesAbsentVersion { version, .. }) => {
             assert_eq!(version, 2);
         }
@@ -807,7 +1318,7 @@ fn a_head_cannot_be_committed_for_a_version_that_is_not_on_disk() {
     );
 
     // The control: the version that IS on disk commits.
-    commit_head(&dir, &recorded_at(1)).expect("commit head at 1");
+    commit_fixture(&dir, &recorded_at(1)).expect("commit head at 1");
     assert!(head_path(&dir).exists());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -815,13 +1326,14 @@ fn a_head_cannot_be_committed_for_a_version_that_is_not_on_disk() {
 
 /// The head is renamed into place, so a reader sees one record or the
 /// other and the staging file does not survive the commit.
+#[cfg(unix)]
 #[test]
 fn committing_a_head_replaces_the_previous_one_and_leaves_nothing_staged() {
     let dir = scratch("head-replace");
-    write_artifact(&dir, &recorded_at(1)).expect("write 1");
-    write_artifact(&dir, &recorded_at(2)).expect("write 2");
-    commit_head(&dir, &recorded_at(1)).expect("commit 1");
-    commit_head(&dir, &recorded_at(2)).expect("commit 2");
+    raw_fixture_write(&dir, &recorded_at(1)).expect("write 1");
+    raw_fixture_write(&dir, &recorded_at(2)).expect("write 2");
+    commit_fixture(&dir, &recorded_at(1)).expect("commit 1");
+    commit_fixture(&dir, &recorded_at(2)).expect("commit 2");
 
     let head = read_head(&dir).expect("read").expect("a head");
     assert_eq!(head.version, 2);
@@ -842,14 +1354,16 @@ fn committing_a_head_replaces_the_previous_one_and_leaves_nothing_staged() {
 /// A pin does not consult the head, so a head advancing while a pin is in
 /// force changes the served gate for nobody until the pin is lifted. The
 /// control is the unpinned call on the same directory, which does move.
+#[cfg(unix)]
 #[test]
 fn a_pin_disables_promotion_and_a_head_advance_does_not_reach_it() {
     let dir = scratch("pin-vs-head");
-    write_artifact(&dir, &recorded_at(1)).expect("write 1");
-    write_artifact(&dir, &recorded_at(2)).expect("write 2");
-    commit_head(&dir, &recorded_at(1)).expect("commit 1");
+    raw_fixture_write(&dir, &recorded_at(1)).expect("write 1");
+    raw_fixture_write(&dir, &recorded_at(2)).expect("write 2");
+    commit_fixture(&dir, &recorded_at(1)).expect("commit 1");
 
-    let pinned = |dir: &Path| match resolve_startup(Some(dir), Some(&pin(1))) {
+    let requested = RouterPin::parse(&recorded_at(1).version_label()).expect("identity pin");
+    let pinned = |dir: &Path| match resolve_startup(Some(dir), Some(&requested)) {
         Ok(StartupDisposition::Loaded(r)) => {
             assert!(r.pinned);
             r.artifact.version
@@ -858,7 +1372,7 @@ fn a_pin_disables_promotion_and_a_head_advance_does_not_reach_it() {
     };
     assert_eq!(pinned(&dir), 1);
 
-    commit_head(&dir, &recorded_at(2)).expect("advance the head to 2");
+    commit_fixture(&dir, &recorded_at(2)).expect("advance the head to 2");
     assert_eq!(pinned(&dir), 1, "the head advance reached the pin");
     assert_eq!(
         load_selected(&dir)
@@ -873,14 +1387,14 @@ fn a_pin_disables_promotion_and_a_head_advance_does_not_reach_it() {
 }
 
 /// A pin naming a full identity is refused when that counter now holds a
-/// different artifact. The bare-counter pin in the same directory is the
-/// control: it still resolves, which is what makes the refusal a statement
-/// about the identity rather than about the version being unreadable.
+/// different artifact. A bare counter cannot bypass that refusal.
+#[cfg(unix)]
 #[test]
 fn a_pin_naming_an_identity_refuses_when_the_counter_holds_another_artifact() {
     let dir = scratch("pin-identity");
     let original = recorded_at(5);
-    write_artifact(&dir, &original).expect("write 5");
+    raw_fixture_write(&dir, &original).expect("write 5");
+    commit_fixture(&dir, &original).expect("commit the original identity");
     let label = original.version_label();
     let requested = RouterPin::parse(&label).expect("a label parses as a pin");
 
@@ -893,7 +1407,7 @@ fn a_pin_naming_an_identity_refuses_when_the_counter_holds_another_artifact() {
         gate_bytes: vec![7, 7],
         ..recorded_at(5)
     };
-    write_artifact(&dir, &replaced).expect("rewrite 5");
+    raw_fixture_write(&dir, &replaced).expect("rewrite 5");
     match resolve_startup(Some(&dir), Some(&requested)) {
         Err(RouterArtifactError::PinIdentityMismatch {
             version,
@@ -906,10 +1420,16 @@ fn a_pin_naming_an_identity_refuses_when_the_counter_holds_another_artifact() {
         }
         other => panic!("expected an identity mismatch, got {other:?}"),
     }
-    match resolve_startup(Some(&dir), Some(&pin(5))) {
-        Ok(StartupDisposition::Loaded(r)) => assert_eq!(r.artifact.version, 5),
-        other => panic!("control: a bare counter still resolves, got {other:?}"),
-    }
+    assert!(matches!(
+        resolve_startup(Some(&dir), Some(&pin(5))),
+        Err(RouterArtifactError::PinMalformed { .. })
+    ));
+    let replacement_pin =
+        RouterPin::parse(&replaced.version_label()).expect("the replacement identity");
+    assert!(matches!(
+        resolve_startup(Some(&dir), Some(&replacement_pin)),
+        Err(RouterArtifactError::MissingCommitProof { .. })
+    ));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -918,6 +1438,7 @@ fn a_pin_naming_an_identity_refuses_when_the_counter_holds_another_artifact() {
 /// pin. That is what keeps a rollback target available across the revision
 /// boundary, and it is the one path by which a legacy artifact can still
 /// be served from such a directory.
+#[cfg(unix)]
 #[test]
 fn a_format_4_version_stays_reachable_by_pin_beneath_a_head() {
     let dir = scratch("legacy-under-head");
@@ -925,9 +1446,9 @@ fn a_format_4_version_stays_reachable_by_pin_beneath_a_head() {
         version: 8,
         ..artifact()
     };
-    write_artifact(&dir, &legacy).expect("write the legacy artifact");
-    write_artifact(&dir, &recorded_at(2)).expect("write the admitted one");
-    commit_head(&dir, &recorded_at(2)).expect("commit the head at 2");
+    raw_fixture_write(&dir, &legacy).expect("write the legacy artifact");
+    raw_fixture_write(&dir, &recorded_at(2)).expect("write the admitted one");
+    commit_fixture(&dir, &recorded_at(2)).expect("commit the head at 2");
 
     assert_eq!(
         load_selected(&dir)
@@ -1003,7 +1524,7 @@ fn scratch(name: &str) -> PathBuf {
 fn a_written_artifact_reads_back_byte_identical() {
     let dir = scratch("roundtrip");
     let original = artifact();
-    write_artifact(&dir, &original).expect("write");
+    raw_fixture_write(&dir, &original).expect("write");
     let read = read_artifact(&dir, 7).expect("read");
     assert_eq!(read, original);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1012,7 +1533,7 @@ fn a_written_artifact_reads_back_byte_identical() {
 #[test]
 fn a_modified_payload_is_refused_rather_than_loaded() {
     let dir = scratch("payload");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
 
     // One byte, the smallest change a corrupt or edited payload can be.
     let mut bytes = std::fs::read(gate_path(&dir, 7)).expect("read gate");
@@ -1033,7 +1554,7 @@ fn editing_an_adapter_name_changes_the_version_and_is_refused() {
     // the unverifiable pairing one level up, in the manifest instead of in
     // the caller's slice.
     let dir = scratch("names");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
 
     let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read manifest");
     assert!(
@@ -1090,7 +1611,7 @@ fn writing_a_new_version_leaves_the_previous_one_readable() {
     // Rollback needs the previous gate to still be on disk, without anyone
     // having remembered to take a backup.
     let dir = scratch("versions");
-    write_artifact(&dir, &artifact()).expect("write v7");
+    raw_fixture_write(&dir, &artifact()).expect("write v7");
     let next = RouterArtifact {
         version: 8,
         adapter_names: vec!["legal".into(), "medical".into(), "code".into()],
@@ -1098,7 +1619,7 @@ fn writing_a_new_version_leaves_the_previous_one_readable() {
         gate_bytes: vec![6, 7, 8],
         provenance: RouterProvenance::Legacy,
     };
-    write_artifact(&dir, &next).expect("write v8");
+    raw_fixture_write(&dir, &next).expect("write v8");
 
     assert_eq!(
         read_artifact(&dir, 7).expect("v7 still readable"),
@@ -1111,7 +1632,7 @@ fn writing_a_new_version_leaves_the_previous_one_readable() {
 #[test]
 fn an_unknown_format_revision_is_refused_not_parsed_as_this_one() {
     let dir = scratch("format");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
     let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read manifest");
     // Bump from the revision the fixture actually wrote, which is the
     // legacy one because `artifact()` records no provenance. Writing
@@ -1146,7 +1667,7 @@ fn a_manifest_whose_version_disagrees_with_its_filename_is_refused() {
     // the same directory reading fine before the edit, so a refusal here
     // cannot come from a broken fixture.
     let dir = scratch("versionskew");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
     assert_eq!(read_artifact(&dir, 7).expect("control reads"), artifact());
 
     let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read manifest");
@@ -1175,7 +1696,7 @@ fn a_declared_payload_length_that_does_not_match_the_payload_is_refused() {
     // that belongs to a different payload passes the hash check whenever
     // the payload it describes is the one on disk.
     let dir = scratch("gatelen");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
     assert_eq!(read_artifact(&dir, 7).expect("control reads"), artifact());
 
     let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read manifest");
@@ -1201,7 +1722,7 @@ fn an_absent_version_is_not_found_rather_than_a_read_failure() {
     // been given a gate and one whose gate was truncated need different
     // operator responses.
     let dir = scratch("absent");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
     match read_artifact(&dir, 99) {
         Err(RouterArtifactError::NotFound { version, .. }) => assert_eq!(version, 99),
         other => panic!("expected NotFound, got {other:?}"),
@@ -1213,7 +1734,7 @@ fn an_absent_version_is_not_found_rather_than_a_read_failure() {
 fn versions_lists_what_is_there_ascending_and_load_latest_takes_the_highest() {
     let dir = scratch("select");
     for v in [3u64, 11, 7] {
-        write_artifact(
+        raw_fixture_write(
             &dir,
             &RouterArtifact {
                 version: v,
@@ -1226,7 +1747,7 @@ fn versions_lists_what_is_there_ascending_and_load_latest_takes_the_highest() {
         .expect("write");
     }
     assert_eq!(versions(&dir).expect("versions"), vec![3, 7, 11]);
-    let latest = load_latest(&dir).expect("load").expect("some");
+    let latest = load_selected(&dir).expect("load").expect("some");
     assert_eq!(
         latest.version, 11,
         "11 must win over 7, not sort as a string"
@@ -1239,9 +1760,9 @@ fn an_empty_or_absent_directory_is_none_not_an_error() {
     // A server that has never been given a gate is a state, not a failure.
     let dir = scratch("empty");
     assert_eq!(versions(&dir).expect("absent dir"), Vec::<u64>::new());
-    assert!(load_latest(&dir).expect("absent dir").is_none());
+    assert!(load_selected(&dir).expect("absent dir").is_none());
     std::fs::create_dir_all(&dir).expect("mkdir");
-    assert!(load_latest(&dir).expect("empty dir").is_none());
+    assert!(load_selected(&dir).expect("empty dir").is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1250,12 +1771,12 @@ fn a_directory_holding_an_unloadable_artifact_errors_rather_than_reading_as_no_r
     // The distinction step 2 rests on: "no gate configured" and "the gate
     // you configured is broken" must not both start a server quietly.
     let dir = scratch("broken");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
     let mut bytes = std::fs::read(gate_path(&dir, 7)).expect("read");
     bytes[0] ^= 0xff;
     std::fs::write(gate_path(&dir, 7), &bytes).expect("corrupt");
 
-    match load_latest(&dir) {
+    match load_selected(&dir) {
         Err(RouterArtifactError::HashMismatch { .. }) => {}
         Ok(None) => panic!("a corrupt artifact read as no-router, which is the bug"),
         other => panic!("expected a hash mismatch, got {other:?}"),
@@ -1271,7 +1792,7 @@ fn a_payload_without_its_manifest_is_invisible_to_both_readers() {
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(gate_path(&dir, 5), [1, 2, 3]).expect("orphan payload");
     assert_eq!(versions(&dir).expect("versions"), Vec::<u64>::new());
-    assert!(load_latest(&dir).expect("load").is_none());
+    assert!(load_selected(&dir).expect("load").is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1280,7 +1801,7 @@ fn only_the_exact_spelling_this_module_writes_counts_as_a_version() {
     // `router-007.json` would otherwise claim version 7 and shadow the
     // real one, with the shadowing decided by directory order.
     let dir = scratch("spelling");
-    write_artifact(&dir, &artifact()).expect("write v7");
+    raw_fixture_write(&dir, &artifact()).expect("write v7");
     std::fs::write(dir.join("router-007.json"), "{}").expect("decoy");
     std::fs::write(dir.join("router-x.json"), "{}").expect("decoy");
     std::fs::write(dir.join("router-7.json.bak"), "{}").expect("decoy");
@@ -1327,7 +1848,7 @@ fn a_configured_directory_with_a_corrupt_artifact_refuses_with_the_artifacts_own
     // Not a generic "could not start": the operator needs to know the hash
     // failed, because the remedy differs from an empty directory's.
     let dir = scratch("startup-corrupt");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
     let mut bytes = std::fs::read(gate_path(&dir, 7)).expect("read");
     bytes[0] ^= 0xff;
     std::fs::write(gate_path(&dir, 7), &bytes).expect("corrupt");
@@ -1363,8 +1884,8 @@ fn a_pin_selects_its_version_and_not_the_highest() {
     // just be the wrong one. Pinning to the highest version would pass
     // against both the correct and the broken implementation.
     let dir = scratch("startup-pin-selects");
-    write_artifact(&dir, &artifact()).expect("write v7");
-    write_artifact(
+    raw_fixture_write(&dir, &artifact()).expect("write v7");
+    raw_fixture_write(
         &dir,
         &RouterArtifact {
             version: 9,
@@ -1392,7 +1913,7 @@ fn an_absent_pinned_version_refuses_rather_than_falling_back_to_the_latest() {
     // deliberately HOLDS a loadable artifact, so a resolver that fell back
     // would succeed and look healthy.
     let dir = scratch("startup-pin-absent");
-    write_artifact(&dir, &artifact()).expect("write v7");
+    raw_fixture_write(&dir, &artifact()).expect("write v7");
     match resolve_startup(Some(&dir), Some(&pin(99))) {
         Err(RouterArtifactError::NotFound { version, .. }) => assert_eq!(version, 99),
         Ok(StartupDisposition::Loaded(r)) => panic!(
@@ -1410,7 +1931,7 @@ fn a_pinned_corrupt_artifact_refuses_with_the_hash_error_not_the_pin_error() {
     // real cause: the remedy for a corrupt artifact is not the remedy for
     // a mistyped version.
     let dir = scratch("startup-pin-corrupt");
-    write_artifact(&dir, &artifact()).expect("write");
+    raw_fixture_write(&dir, &artifact()).expect("write");
     let mut bytes = std::fs::read(gate_path(&dir, 7)).expect("read");
     bytes[0] ^= 0xff;
     std::fs::write(gate_path(&dir, 7), &bytes).expect("corrupt");
@@ -1424,8 +1945,8 @@ fn a_pinned_corrupt_artifact_refuses_with_the_hash_error_not_the_pin_error() {
 #[test]
 fn a_good_directory_loads_its_highest_version() {
     let dir = scratch("startup-good");
-    write_artifact(&dir, &artifact()).expect("write v7");
-    write_artifact(
+    raw_fixture_write(&dir, &artifact()).expect("write v7");
+    raw_fixture_write(
         &dir,
         &RouterArtifact {
             version: 9,

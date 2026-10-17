@@ -537,6 +537,58 @@ jobs:
             serve::tests::lora_orchestration::lora_list_wrapper_preserves_served_router_report -- --exact
       - name: inference — mixture clippy
         run: cargo clippy -p lattice-inference --all-targets --features mixture -- -D warnings
+      - name: inference — router storage and selection (CPU, no default features)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-router-storage-tests.log"
+          if cargo test --locked -p lattice-inference --no-default-features --lib router_state:: \
+            -- --nocapture --test-threads=1 --color never >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          for name in \
+            failure_after_head_replacement_reports_an_uncertain_commit \
+            legacy_post_link_sync_failure_reports_the_visible_uncertain_version \
+            directory_sync_stops_at_the_observed_creation_boundary \
+            publication_below_a_0711_ancestor_syncs_only_the_writable_boundary \
+            concurrent_existing_target_retries_only_its_failed_parent_sync
+          do
+            grep -Fxq "test router_state::storage::tests::${name} ... ok" "$log" || {
+              echo "GUARD FAILED: the storage control ${name} did not run and pass."
+              exit 1
+            }
+          done
+          count=$(grep -Ec '^test result: ok\. 95 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
+          if [ "$count" -ne 1 ]; then
+            echo "GUARD FAILED: expected one complete 95-test router-state result."
+            exit 1
+          fi
+      - name: inference — router bootstrap publication (CPU, mixture)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-router-bootstrap-tests.log"
+          if cargo test --locked -p lattice-inference --no-default-features --features mixture --lib router_init:: \
+            -- --nocapture --test-threads=1 --color never >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -Fxq 'test router_init::tests::with_a_gate_backend::concurrent_initializers_serialize_and_only_one_commits ... ok' "$log" || {
+            echo "GUARD FAILED: concurrent bootstrap initialization did not run and pass."
+            exit 1
+          }
+          count=$(grep -Ec '^test result: ok\. 15 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
+          if [ "$count" -ne 1 ]; then
+            echo "GUARD FAILED: expected one complete 15-test router-bootstrap result."
+            exit 1
+          fi
+      - name: inference — router storage clippy (no default features)
+        run: cargo clippy --locked -p lattice-inference --no-default-features --lib -- -D warnings
       - name: inference router-learning clippy
         run: cargo clippy --locked -p lattice-inference --all-targets --features router-learning -- -D warnings
       - name: inference router-learning without serving
