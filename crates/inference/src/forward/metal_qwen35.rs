@@ -11540,56 +11540,7 @@ mod inner {
     }
 
     #[cfg(test)]
-    mod min_p_compact_sampling_tests {
-        use super::{GenerateConfig, sample_from_candidates_impl};
-        use crate::sampling::Candidate;
-
-        #[test]
-        fn compact_metal_candidate_path_applies_min_p() {
-            let candidates = [
-                Candidate {
-                    token_id: 7,
-                    logit: 0.0,
-                },
-                Candidate {
-                    token_id: 8,
-                    logit: 0.49_f32.ln(),
-                },
-            ];
-            let disabled = GenerateConfig {
-                temperature: 1.0,
-                top_p: 1.0,
-                repetition_penalty: 1.0,
-                ..Default::default()
-            };
-            let mut saw_tail_without_min_p = false;
-
-            for seed in [0x1234_5678_9abc_def0, 0xabad_1dea_dead_beef] {
-                let mut control_rng = seed;
-                saw_tail_without_min_p |=
-                    sample_from_candidates_impl(&candidates, &disabled, &[], &mut control_rng, 0.0)
-                        == 8;
-
-                let mut filtered_rng = seed;
-                assert_eq!(
-                    sample_from_candidates_impl(
-                        &candidates,
-                        &disabled,
-                        &[],
-                        &mut filtered_rng,
-                        0.5,
-                    ),
-                    7,
-                    "compact Metal candidates below min_p * max_probability must be removed"
-                );
-            }
-
-            assert!(
-                saw_tail_without_min_p,
-                "control seeds must exercise the tail candidate or the min-p assertion is vacuous"
-            );
-        }
-    }
+    mod min_p_compact_sampling_tests;
 
     fn xorshift64(state: &mut u64) -> u64 {
         let mut x = *state;
