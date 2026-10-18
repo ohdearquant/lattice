@@ -59,6 +59,55 @@ fn gdn_pool_alloc_and_free() {
 }
 
 #[test]
+fn gdn_pool_alloc_duplicate_with_spare_capacity_returns_existing_slot() {
+    let mut pool = GdnStatePool::try_new(2, 4, 2).expect("valid pool geometry");
+    let slot = pool.alloc(SeqId(7)).expect("first allocation fits");
+    pool.s_matrix_mut(slot).fill(1.0);
+    pool.conv_buffer_mut(slot).fill(2.0);
+    assert_eq!(pool.free_count(), 1);
+
+    let duplicate = pool.alloc(SeqId(7));
+
+    assert_eq!(duplicate, Some(slot));
+    assert_eq!(pool.slot_of(SeqId(7)), Some(slot));
+    assert_eq!(pool.free_count(), 1);
+    assert!(pool.s_matrix_mut(slot).iter().all(|&x| x == 1.0));
+    assert!(pool.conv_buffer_mut(slot).iter().all(|&x| x == 2.0));
+}
+
+#[test]
+fn gdn_pool_alloc_duplicate_on_full_pool_returns_existing_slot() {
+    let mut pool = GdnStatePool::try_new(1, 4, 2).expect("valid pool geometry");
+    let slot = pool.alloc(SeqId(7)).expect("first allocation fits");
+    assert_eq!(pool.free_count(), 0);
+
+    let duplicate = pool.alloc(SeqId(7));
+
+    assert_eq!(duplicate, Some(slot));
+    assert_eq!(pool.slot_of(SeqId(7)), Some(slot));
+    assert_eq!(pool.free_count(), 0);
+}
+
+#[test]
+fn gdn_pool_all_slots_reusable_after_free() {
+    let mut pool = GdnStatePool::try_new(2, 4, 2).expect("valid pool geometry");
+    let first = pool.alloc(SeqId(7)).expect("first allocation fits");
+    let duplicate = pool.alloc(SeqId(7)).expect("duplicate allocation succeeds");
+    assert_eq!(duplicate, first);
+
+    pool.free(SeqId(7));
+
+    assert_eq!(pool.free_count(), pool.capacity());
+    let mut slots = [
+        pool.alloc(SeqId(8)).expect("first freed slot is reusable"),
+        pool.alloc(SeqId(9)).expect("second freed slot is reusable"),
+    ];
+    slots.sort_unstable();
+    assert_eq!(slots, [0, 1]);
+    assert_eq!(pool.free_count(), 0);
+}
+
+#[test]
 fn gdn_pool_free_zeroes_buffers() {
     let mut pool = GdnStatePool::try_new(1, 4, 2).expect("valid pool geometry");
     let slot = pool.alloc(SeqId(0)).unwrap();

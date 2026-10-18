@@ -149,8 +149,13 @@ impl GdnStatePool {
         Ok(Self::new(capacity, s_floats_per_slot, conv_floats_per_slot))
     }
 
-    /// Allocate a slot for a sequence. Returns `None` when the pool is full.
+    /// Allocate a slot for a sequence. If `seq_id` already holds a slot, returns
+    /// that slot without consuming capacity or touching its state. Returns `None`
+    /// when the pool is full.
     pub fn alloc(&mut self, seq_id: SeqId) -> Option<usize> {
+        if let Some(&slot) = self.seq_to_slot.get(&seq_id) {
+            return Some(slot);
+        }
         let slot = self.free_slots.pop_front()?;
         self.seq_to_slot.insert(seq_id, slot);
         Some(slot)
