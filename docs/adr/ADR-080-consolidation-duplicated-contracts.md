@@ -461,7 +461,7 @@ extension requires no second version boundary. `AdapterMetadata` and
 `AdapterIndex` remain exhaustive: they represent worker output, excluded from
 the input policy alongside the normalization outputs in the earlier amendment.
 
-### Amendment (2026-10-XX): reasoning-budget close lands on a line boundary (#1886)
+### Amendment (2026-10-18): reasoning-budget close lands on a line boundary (#1886)
 
 C3 moved reasoning-budget accounting into the shared decode policy, so every
 entry point that applies `reasoning_budget` closes the thinking block the same

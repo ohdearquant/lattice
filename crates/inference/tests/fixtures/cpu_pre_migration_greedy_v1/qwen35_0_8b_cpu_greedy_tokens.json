@@ -1,7 +1,7 @@
 {
   "artifact_kind": "lattice-cpu-pre-migration-greedy-token-golden",
   "captured_at_ref": "d5e757524e4f8bce21d416b8f8fe0a80aa00b8df",
-  "captured_at_ref_budgeted_cases": "199e2c0bb85d44e2136d0241f4aec56b95b0e48d",
+  "captured_at_ref_budgeted_cases": "1275b9aec08a2be7529c4e455b93b77496ca2a11",
   "cases": [
     {
       "expected_generated_ids": [
