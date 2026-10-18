@@ -43,6 +43,7 @@ workspace version; the workspace release notes are in
 - Qwen CPU requests reserve KV cache and attention scratch for their token budget before prefill, and reuse one buffer for text deltas (#1966).
 - Standalone Q8 generation keeps its macOS tile buffers across a request (#1982).
 - Model downloads resolve at a pinned commit per repository instead of `main` (#1961).
+- `lattice` subcommand `--help` output ends with example invocations and each command's platform and checkpoint requirements (#2027).
 - **Behavior change:** LoRA adapter load and unload (`/v1/lora/load`, `/v1/lora/unload`) on both
   `lattice serve` and `lattice_serve` now answer 413 `request_body_too_large` for a request body
   over the 1 MiB limit, instead of 400.
