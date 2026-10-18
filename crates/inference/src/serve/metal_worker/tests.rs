@@ -2830,3 +2830,5 @@ fn text_prompt_beyond_the_window_is_refused_with_its_full_token_count() {
         "expected a context-window refusal, got {terminal:?}"
     );
 }
+
+mod characterization;
