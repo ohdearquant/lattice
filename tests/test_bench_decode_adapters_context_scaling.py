@@ -12,6 +12,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import types
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ def _load_module(name: str, filename: str):
 
 harness = _load_module("bench_decode_harness", "bench_decode_harness.py")
 adapters = _load_module("bench_decode_adapters_context_scaling", "bench_decode_adapters_context_scaling.py")
+chart = adapters.chart
 
 DEFAULT_PROFILES_FILE = _SCRIPTS / "bench_decode_profiles.toml"
 
@@ -173,7 +175,7 @@ class LegacyTsvRenderingTest(unittest.TestCase):
         )
         slopes, medians = adapters.compute_context_scaling_aggregate(result)
         tsv = adapters.render_legacy_tsv(result, slopes, medians)
-        lines = tsv.strip("\n").split("\n")
+        lines = [line for line in tsv.strip("\n").split("\n") if not line.startswith("#")]
         self.assertEqual(lines[0], "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope")
         self.assertEqual(len(lines), 1 + len(slopes))
         for line in lines[1:]:
@@ -325,7 +327,7 @@ class ContextScalingEvenRunsLegacyMedianTest(unittest.TestCase):
         self.assertAlmostEqual(mlx_slope.slope_tok_per_s, 56 / 0.36, places=6)
 
         tsv = adapters.render_legacy_tsv(result, slopes, medians)
-        for line in tsv.strip("\n").split("\n")[1:]:
+        for line in [line for line in tsv.strip("\n").split("\n") if not line.startswith("#")][1:]:
             engine, _ctx, _slope, t1_ms, t2_ms, _runs, _scope = line.split("\t")
             if engine == "lattice":
                 self.assertAlmostEqual(float(t1_ms), 30.0, places=3)
@@ -364,12 +366,211 @@ class ContextScalingSkewedFiveSampleTsvTest(unittest.TestCase):
         )
         slopes, medians = adapters.compute_context_scaling_aggregate(result)
         tsv = adapters.render_legacy_tsv(result, slopes, medians)
-        line = tsv.strip("\n").split("\n")[1]
+        line = [line for line in tsv.strip("\n").split("\n") if not line.startswith("#")][1]
         _engine, _ctx, _slope, t1_ms, t2_ms, _runs, _scope = line.split("\t")
         self.assertAlmostEqual(float(t1_ms), 20.0, places=3)
         self.assertAlmostEqual(float(t2_ms), 205.0, places=3)
         self.assertNotAlmostEqual(float(t1_ms), 40.0, places=1)
         self.assertNotAlmostEqual(float(t2_ms), 322.0, places=1)
+
+
+def _base_numeric_tsv(run_result, slopes, window_medians):
+    """Frozen render_legacy_tsv body from d94daf81530b42cac7871166aaa1c8859b4d7c6d."""
+    lines = ["engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope"]
+    baseline_window = run_result.profile.windows[0]
+    for s in slopes:
+        t1_ms = window_medians[(s.engine, baseline_window)] * 1000
+        t2_ms = window_medians[(s.engine, s.window)] * 1000
+        scope = harness.OLLAMA_SCOPE if s.engine == "ollama" else ""
+        lines.append(
+            f"{s.engine}\t{s.window}\t{s.slope_tok_per_s:.1f}\t{t1_ms:.3f}\t{t2_ms:.3f}\t{s.window_n}\t{scope}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+class ProvenanceRenderingTest(unittest.TestCase):
+    def setUp(self):
+        _, profiles = harness.load_profiles_file(DEFAULT_PROFILES_FILE)
+        self.result = harness.run_profile(
+            profiles["context_scaling"],
+            {"lattice": _FakeAdapter(), "ollama": _FakeAdapter(), "mlx": _FakeAdapter()},
+            clock=_FakeClock(),
+            git_sha_value="a" * 40,
+            hardware_id_value="Linux-x86_64-recorded-host",
+            timestamp_fn=lambda: "2001-02-03T04:05:06+00:00",
+        )
+        self.slopes, self.medians = adapters.compute_context_scaling_aggregate(self.result)
+
+    def render(self, result=None):
+        return adapters.render_legacy_tsv(self.result if result is None else result, self.slopes, self.medians)
+
+    def test_numeric_output_matches_frozen_base_formatter_byte_for_byte(self):
+        rendered = self.render()
+        numeric = "".join(line for line in rendered.splitlines(keepends=True) if not line.startswith("#"))
+        baseline = _base_numeric_tsv(self.result, self.slopes, self.medians)
+        self.assertEqual(numeric.encode(), baseline.encode())
+        self.assertEqual(rendered.splitlines()[0], baseline.splitlines()[0])
+        self.assertEqual(len(numeric.splitlines()), 1 + len(self.slopes))
+        self.assertTrue(all(len(line.split("\t")) == 7 for line in numeric.splitlines()))
+
+    def test_metadata_records_original_measurement_timestamp(self):
+        _, provenance = chart.parse_tsv(self.render())
+        self.assertEqual(provenance["schema_version"], 1)
+        self.assertEqual(provenance["observation_schema_versions"], [harness.SCHEMA_VERSION])
+        self.assertEqual(provenance["harness"], "bench_decode_harness.py")
+        self.assertEqual(provenance["git_shas"], ["a" * 40])
+        self.assertEqual(provenance["hardware_ids"], ["Linux-x86_64-recorded-host"])
+        self.assertEqual(provenance["observation_timestamps"], ["2001-02-03T04:05:06+00:00"])
+
+    def test_all_distinct_recorded_identities_and_timestamps_are_retained(self):
+        observations = list(self.result.observations)
+        observations[-1] = dataclasses.replace(
+            observations[-1], git_sha="b" * 40, hardware_id="Darwin-arm64-other-host",
+            timestamp="2001-02-04T04:05:06+00:00",
+        )
+        mixed = dataclasses.replace(self.result, observations=tuple(observations))
+        _, provenance = chart.parse_tsv(self.render(mixed))
+        self.assertEqual(provenance["git_shas"], ["a" * 40, "b" * 40])
+        self.assertEqual(provenance["hardware_ids"], ["Darwin-arm64-other-host", "Linux-x86_64-recorded-host"])
+        self.assertEqual(provenance["observation_timestamps"], [
+            "2001-02-03T04:05:06+00:00", "2001-02-04T04:05:06+00:00",
+        ])
+
+    def test_metadata_escapes_control_characters_and_round_trips(self):
+        hardware = 'host\twith\n"quotes" and $math$'
+        observations = tuple(dataclasses.replace(obs, hardware_id=hardware) for obs in self.result.observations)
+        rendered = self.render(dataclasses.replace(self.result, observations=observations))
+        comments = [line for line in rendered.splitlines() if line.startswith("#")]
+        self.assertEqual(len(comments), 1)
+        self.assertNotIn("\t", comments[0])
+        self.assertIn("\\t", comments[0])
+        self.assertIn("\\n", comments[0])
+        _, provenance = chart.parse_tsv(rendered)
+        self.assertEqual(provenance["hardware_ids"], [hardware])
+
+    def test_new_reports_refuse_missing_or_invalid_recorded_provenance(self):
+        with self.assertRaises(ValueError):
+            self.render(dataclasses.replace(self.result, observations=()))
+        for field, value in (("timestamp", ""), ("timestamp", "not-a-date"),
+                             ("timestamp", "2001-02-03T04:05:06"), ("hardware_id", ""), ("git_sha", "")):
+            with self.subTest(field=field, value=value):
+                observations = tuple(dataclasses.replace(obs, **{field: value}) for obs in self.result.observations)
+                with self.assertRaises(ValueError):
+                    self.render(dataclasses.replace(self.result, observations=observations))
+
+
+class ChartProvenanceTest(unittest.TestCase):
+    HEADER = "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope\n"
+    ROW = "lattice\t64\t123.4\t1.000\t2.000\t5\t\n"
+
+    def setUp(self):
+        self.metadata = {
+            "schema_version": 1,
+            "harness": "bench_decode_harness.py",
+            "observation_schema_versions": [1],
+            "git_shas": ["a" * 40, "b" * 40],
+            "hardware_ids": ["Linux-x86_64-recorded-host", "host\twith\n$math$"],
+            "observation_timestamps": ["2001-02-03T04:05:06+00:00", "2001-02-04T04:05:06+00:00"],
+        }
+
+    def tsv(self, comments):
+        return self.HEADER + "\n".join(comments) + "\n" + self.ROW
+
+    def test_saved_metadata_is_used_by_chart_only(self):
+        text = self.tsv([chart.provenance_comment(self.metadata)])
+        with tempfile.TemporaryDirectory() as tmp:
+            source, output = Path(tmp) / "old.tsv", Path(tmp) / "chart.png"
+            source.write_text(text)
+            with mock.patch.object(chart, "render_chart") as render:
+                self.assertEqual(chart.main([str(source), str(output)]), 0)
+            render.assert_called_once_with({"lattice": {64: 123.4}}, self.metadata, output)
+
+    def test_legacy_six_column_and_historical_comment_files_remain_readable(self):
+        legacy = "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\n"
+        legacy += "# PROVENANCE (2026-07-20): historical freeform prose\n"
+        legacy += "# comment\twith\ttabs\n"
+        legacy += "lattice\t64\t123.4\t1.000\t2.000\t5\n"
+        engines, provenance = chart.parse_tsv(legacy)
+        self.assertEqual(engines, {"lattice": {64: 123.4}})
+        self.assertIsNone(provenance)
+        self.assertIn("timestamps, hardware and harness revision are unknown", chart.provenance_caption(provenance))
+        committed = (_REPO_ROOT / "docs/bench_results/context_scaling.tsv").read_text()
+        engines, provenance = chart.parse_tsv(committed)
+        self.assertEqual(set(engines), {"lattice", "ollama", "mlx"})
+        self.assertIsNone(provenance)
+
+    def test_malformed_or_unsupported_metadata_is_not_legacy_unknown(self):
+        invalid = [
+            {}, [], {**self.metadata, "schema_version": 2}, {**self.metadata, "schema_version": True},
+            {**self.metadata, "extra": "field"}, {**self.metadata, "harness": "other.py"},
+            {**self.metadata, "hardware_ids": []}, {**self.metadata, "hardware_ids": ["same", "same"]},
+            {**self.metadata, "git_shas": [""]}, {**self.metadata, "git_shas": "a" * 40},
+            {**self.metadata, "observation_schema_versions": [True]},
+            {**self.metadata, "observation_timestamps": ["bad"]},
+        ]
+        for value in invalid:
+            with self.subTest(value=value):
+                text = self.tsv([chart.PROVENANCE_PREFIX + json.dumps(value)])
+                with self.assertRaises(ValueError):
+                    chart.parse_tsv(text)
+        for comment in (chart.PROVENANCE_PREFIX + "{", chart.PROVENANCE_TAG + " missing colon"):
+            with self.subTest(comment=comment), self.assertRaises(ValueError):
+                chart.parse_tsv(self.tsv([comment]))
+
+    def test_duplicate_and_conflicting_metadata_records_and_fields_are_rejected(self):
+        first = chart.provenance_comment(self.metadata)
+        second = chart.provenance_comment({**self.metadata, "hardware_ids": ["different"]})
+        for other in (first, second):
+            with self.subTest(other=other), self.assertRaises(ValueError):
+                chart.parse_tsv(self.tsv([first, other]))
+        duplicate_key = json.dumps(self.metadata).replace('"schema_version": 1', '"schema_version": 1, "schema_version": 1')
+        with self.assertRaisesRegex(ValueError, "duplicate provenance field"):
+            chart.parse_tsv(self.tsv([chart.PROVENANCE_PREFIX + duplicate_key]))
+
+    def test_bad_metadata_exits_nonzero_before_rendering_or_writing_chart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, output = Path(tmp) / "bad.tsv", Path(tmp) / "chart.png"
+            source.write_text(self.tsv([chart.PROVENANCE_PREFIX + "{}"]))
+            with mock.patch.object(chart, "render_chart") as render:
+                self.assertEqual(chart.main([str(source), str(output)]), 1)
+            render.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_caption_timestamp_range_uses_instants_and_retains_original_offset_text(self):
+        metadata = {**self.metadata, "observation_timestamps": [
+            "2000-12-31T23:30:00+00:00", "2001-01-01T01:00:00+02:00",
+        ]}
+        caption = chart.provenance_caption(metadata)
+        self.assertIn("2001-01-01T01:00:00+02:00 to 2000-12-31T23:30:00+00:00", caption)
+
+    def test_actual_chart_attaches_literal_recorded_or_unknown_caption(self):
+        for provenance in (self.metadata, None):
+            with self.subTest(provenance=provenance):
+                plt, fig, ax = mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
+                plt.subplots.return_value = (fig, ax)
+                ax.bar.return_value = []
+                mpl, numpy = types.ModuleType("matplotlib"), types.ModuleType("numpy")
+                mpl.pyplot = plt
+                numpy.arange = mock.Mock(return_value=mock.MagicMock())
+                with mock.patch.dict(sys.modules, {"matplotlib": mpl, "matplotlib.pyplot": plt, "numpy": numpy}):
+                    chart.render_chart({"lattice": {64: 123.4}}, provenance, Path("chart.png"))
+                title = ax.set_title.call_args.args[0]
+                self.assertNotIn("Apple M2 Max", title)
+                fig.text.assert_called_once()
+                caption = fig.text.call_args.args[2]
+                self.assertFalse(fig.text.call_args.kwargs["parse_math"])
+                self.assertFalse(fig.text.call_args.kwargs["usetex"])
+                if provenance is None:
+                    self.assertIn("timestamps, hardware and harness revision are unknown", caption)
+                    self.assertNotIn("Apple M2 Max", caption)
+                else:
+                    for identity in provenance["hardware_ids"] + provenance["git_shas"]:
+                        self.assertIn(json.dumps(identity, ensure_ascii=True), caption)
+                    for timestamp in provenance["observation_timestamps"]:
+                        self.assertIn(timestamp, caption)
+                    self.assertIn("bench_decode_harness.py", caption)
+                    self.assertNotIn("host\twith\n", caption)
+                plt.savefig.assert_called_once_with(Path("chart.png"), dpi=150, bbox_inches="tight")
 
 
 class OllamaResponseParsingTest(unittest.TestCase):
@@ -463,7 +664,12 @@ class OllamaContextScalingDurationTest(unittest.TestCase):
         self.assertEqual(medians, {("ollama", 8): 0.125, ("ollama", 64): 1.0, ("ollama", 128): 2.0, ("ollama", 256): 4.0})
         self.assertEqual([(s.baseline_window, s.window, s.slope_tok_per_s, s.baseline_n, s.window_n) for s in slopes],
                          [(8, 64, 64.0, 1, 1), (8, 128, 64.0, 1, 1), (8, 256, 64.0, 1, 1)])
-        self.assertEqual(tsv, "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope\n"
+        _, provenance = chart.parse_tsv(tsv)
+        self.assertEqual(provenance["git_shas"], ["fixture-revision"])
+        self.assertEqual(provenance["hardware_ids"], ["fixture-host"])
+        self.assertEqual(provenance["observation_timestamps"], ["2001-02-03T04:05:06+00:00"])
+        numeric = "".join(line for line in tsv.splitlines(keepends=True) if not line.startswith("#"))
+        self.assertEqual(numeric, "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope\n"
                          f"ollama\t64\t64.0\t125.000\t1000.000\t1\t{harness.OLLAMA_SCOPE}\n"
                          f"ollama\t128\t64.0\t125.000\t2000.000\t1\t{harness.OLLAMA_SCOPE}\n"
                          f"ollama\t256\t64.0\t125.000\t4000.000\t1\t{harness.OLLAMA_SCOPE}\n")
