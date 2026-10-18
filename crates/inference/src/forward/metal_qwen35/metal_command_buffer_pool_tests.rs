@@ -161,6 +161,14 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
             }
             collect_rs_files(&path, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            // A `tests.rs` file is the file form of the `tests/` directory skipped
+            // above: both carry test modules, whose process exits after the
+            // measurement. The inline form of the same module is blanked by
+            // `blank_test_modules`; this keeps the external form out of the
+            // production population it was never meant to enter.
+            if path.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
+                continue;
+            }
             out.push(path);
         }
     }
