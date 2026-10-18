@@ -210,7 +210,11 @@ mod tests {
             .prepare(&base, "served-model", 64, 4096)
             .expect("CPU provider default thinking request");
         assert_eq!(cpu_default.prepared.prompt, default.prepared.prompt);
-        assert!(cpu_default.config.enable_thinking);
+        assert_eq!(
+            cpu_default.prepared.prompt,
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        assert!(!cpu_default.config.enable_thinking);
         for enabled in [true, false] {
             let req: ChatRequest = serde_json::from_value(serde_json::json!({
                 "model": "served-model",
@@ -233,11 +237,34 @@ mod tests {
                 .prepare(&req, "served-model", 64, 4096)
                 .expect("CPU provider explicit thinking switch");
             assert_eq!(cpu_prepared.prepared.prompt, prepared.prepared.prompt);
+            let expected_prompt = if enabled {
+                "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            } else {
+                "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            };
+            assert_eq!(cpu_prepared.prepared.prompt, expected_prompt);
             assert_eq!(cpu_prepared.config.enable_thinking, enabled);
             assert_eq!(
                 crate::serve::GenerateConfigSnapshot::from(&cpu_prepared.config),
                 crate::serve::GenerateConfigSnapshot::from(&prepared.config),
             );
         }
+
+        let budgeted: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "served-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 5,
+            "reasoning_budget": 16,
+        }))
+        .expect("budgeted request");
+        let budgeted = host
+            .prepare(&budgeted, "served-model", 64, 4096)
+            .expect("CPU provider request budget enables thinking");
+        assert_eq!(
+            budgeted.prepared.prompt,
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        assert!(budgeted.config.enable_thinking);
+        assert_eq!(budgeted.config.reasoning_budget, Some(16));
     }
 }

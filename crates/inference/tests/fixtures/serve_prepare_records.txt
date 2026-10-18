@@ -1,157 +1,167 @@
 == config=lattice case=all_absent
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}]}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=model_absent
 body: {"messages":[{"role":"user","content":"Hi"}]}
 refused code=invalid_request message="model is required"
 == config=lattice case=options_null
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":null,"temperature":null,"top_p":null,"top_k":null,"repetition_penalty":null,"seed":null,"stream":null,"stop":null,"reasoning_budget":null,"logprobs":null}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=max_tokens_256
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":256}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=max_tokens_512
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":512}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=max_tokens_100
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":100}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=temperature_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":0.7}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=top_p_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_p":0.9}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=top_k_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_k":50}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=repetition_penalty_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"repetition_penalty":1.1}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=stream_false
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stream":false}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=reasoning_budget_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":0}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+== config=lattice case=thinking_explicitly_on
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":true}}
+request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+== config=lattice case=thinking_explicitly_off
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":false}}
+request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=logprobs_false
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":false}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=top_logprobs_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":true,"top_logprobs":0}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=Some(0) stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=Some(0)
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=Some(0)
 == config=lattice case=max_tokens_32
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":32}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=32 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=32 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=32 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=max_completion_tokens_48
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":48}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=48 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=48 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=48 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=max_tokens_pair_equal
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":40,"max_completion_tokens":40}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=40 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=40 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=40 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=max_tokens_5000
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":5000}
 refused code=max_tokens_exceeds_limit message="max_tokens 5000 exceeds server limit 4096"
 == config=lattice case=temperature_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":0.0}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.0 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.0 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.0 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=temperature_high
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":1.5}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=1.5 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=1.5 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=1.5 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=temperature_two
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":2.0}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=2.0 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=2.0 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=2.0 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=top_p_half
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_p":0.5}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.5 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.5 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.5 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=top_p_one
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_p":1.0}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=1.0 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=1.0 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=1.0 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=top_k_7
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_k":7}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=repetition_penalty_125
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"repetition_penalty":1.25}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=seed_42
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"seed":42}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=Some(42) stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=Some(42) stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=Some(42) stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=stream_true
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stream":true}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=true
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=logprobs_true
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":true}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=Some(0) stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=Some(0)
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=Some(0)
 == config=lattice case=top_logprobs_5
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":true,"top_logprobs":5}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=Some(5) stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=Some(5)
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=Some(5)
 == config=lattice case=all_non_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"temperature":0.3,"top_p":0.8,"top_k":12,"repetition_penalty":1.05,"seed":7,"stream":true,"stop":["\n\n"],"reasoning_budget":16}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=64 temperature=0.3 top_p=0.8 logprobs=None stop_strings=["\n\n"] reasoning_budget=Some(16) seed=Some(7) stream=true
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=64 temperature=0.3 top_k=50 top_p=0.8 min_p=0.0 repetition_penalty=1.1 seed=Some(7) stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["\n\n"] reasoning_budget=Some(16) logprobs=None
 == config=lattice case=reasoning_budget_128
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":128}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=Some(128) seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(128) logprobs=None
 == config=lattice case=reasoning_budget_large
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"reasoning_budget":100000}
-refused code=context_length_exceeded message="prompt (52 tokens) plus max_tokens (64) plus reasoning_budget (100000) exceeds model context window (4096): 100117 tokens required"
+refused code=context_length_exceeded message="prompt (60 tokens) plus max_tokens (64) plus reasoning_budget (100000) exceeds model context window (4096): 100125 tokens required"
 == config=lattice case=reasoning_budget_negative
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":-1}
 refused code=invalid_request_body message="reasoning_budget is invalid: invalid value: integer `-1`, expected usize at line 1 column 2"
@@ -161,13 +171,13 @@ refused code=invalid_request_body message="reasoning_budget is invalid: invalid 
 == config=lattice case=stop_string
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop":"END"}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=["END"] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["END"] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=["END"] reasoning_budget=None logprobs=None
 == config=lattice case=stop_array
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop":["a","b"]}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=["a", "b"] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["a", "b"] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=["a", "b"] reasoning_budget=None logprobs=None
 == config=lattice case=stop_empty_array
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop":[]}
 refused code=invalid_stop message="stop array must not be empty"
@@ -183,23 +193,23 @@ refused code=invalid_stop message="stop array has 5 elements; maximum is 4"
 == config=lattice case=system_and_user
 body: {"model":"served-model","messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"}]}
 request: messages=[ChatMessage { role: System, content: "Be brief.", image: None }, ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=multi_turn
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello."},{"role":"user","content":"Again"}]}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }, ChatMessage { role: Assistant, content: "Hello.", image: None }, ChatMessage { role: User, content: "Again", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=text_parts
 body: {"model":"served-model","messages":[{"role":"user","content":[{"type":"text","text":"one "},{"type":"text","text":"two"}]}]}
 request: messages=[ChatMessage { role: User, content: "one two", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\none two<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\none two<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=response_format_text
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"text"}}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=response_format_json_schema
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}}}
 refused code=unsupported_feature message="response_format.type 'json_schema' is not supported; use 'text'"
@@ -257,25 +267,25 @@ refused code=invalid_messages message="the last message must have role 'user'"
 == config=lattice case=top_k_string
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_k":"many"}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=repetition_penalty_string
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"repetition_penalty":"high"}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice case=image_part
 body: {"model":"served-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}
 refused code=vision_unsupported message="image input requires a vision-capable model"
 == config=lattice case=context_exceeded
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":4090}
-refused code=context_length_exceeded message="prompt (52 tokens) plus max_tokens (4090) plus reasoning_budget (0) exceeds model context window (4096): 4143 tokens required"
+refused code=context_length_exceeded message="prompt (71 tokens) plus max_tokens (4090) plus reasoning_budget (0) exceeds model context window (4096): 4162 tokens required"
 == config=lattice case=context_exceeded_by_budget
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":2048,"reasoning_budget":2040}
-refused code=context_length_exceeded message="prompt (52 tokens) plus max_tokens (2048) plus reasoning_budget (2040) exceeds model context window (4096): 4141 tokens required"
+refused code=context_length_exceeded message="prompt (60 tokens) plus max_tokens (2048) plus reasoning_budget (2040) exceeds model context window (4096): 4149 tokens required"
 == config=lattice case=context_before_stop
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":4090,"stop":5}
-refused code=context_length_exceeded message="prompt (52 tokens) plus max_tokens (4090) plus reasoning_budget (0) exceeds model context window (4096): 4143 tokens required"
+refused code=context_length_exceeded message="prompt (71 tokens) plus max_tokens (4090) plus reasoning_budget (0) exceeds model context window (4096): 4162 tokens required"
 == config=lattice case=wrong_model_and_tools
 body: {"model":"other-model","messages":[{"role":"user","content":"Hi"}],"tools":[]}
 refused code=unsupported_feature message="tools and tool_choice are not supported by this server"
@@ -303,18 +313,18 @@ refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server li
 == config=lattice_default_above_cap case=max_tokens_256
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":256}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_default_above_cap case=max_tokens_512
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":512}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_default_above_cap case=max_tokens_100
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":100}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_default_above_cap case=temperature_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":0.7}
 refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server limit 4096"
@@ -333,6 +343,12 @@ refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server li
 == config=lattice_default_above_cap case=reasoning_budget_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":0}
 refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server limit 4096"
+== config=lattice_default_above_cap case=thinking_explicitly_on
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":true}}
+refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server limit 4096"
+== config=lattice_default_above_cap case=thinking_explicitly_off
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":false}}
+refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server limit 4096"
 == config=lattice_default_above_cap case=logprobs_false
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":false}
 refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server limit 4096"
@@ -342,18 +358,18 @@ refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server li
 == config=lattice_default_above_cap case=max_tokens_32
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":32}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=32 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=32 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=32 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_default_above_cap case=max_completion_tokens_48
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":48}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=48 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=48 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=48 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_default_above_cap case=max_tokens_pair_equal
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":40,"max_completion_tokens":40}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=40 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=40 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=40 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_default_above_cap case=max_tokens_5000
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":5000}
 refused code=max_tokens_exceeds_limit message="max_tokens 5000 exceeds server limit 4096"
@@ -393,14 +409,14 @@ refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server li
 == config=lattice_default_above_cap case=all_non_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"temperature":0.3,"top_p":0.8,"top_k":12,"repetition_penalty":1.05,"seed":7,"stream":true,"stop":["\n\n"],"reasoning_budget":16}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=64 temperature=0.3 top_p=0.8 logprobs=None stop_strings=["\n\n"] reasoning_budget=Some(16) seed=Some(7) stream=true
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=64 temperature=0.3 top_k=50 top_p=0.8 min_p=0.0 repetition_penalty=1.1 seed=Some(7) stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["\n\n"] reasoning_budget=Some(16) logprobs=None
 == config=lattice_default_above_cap case=reasoning_budget_128
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":128}
 refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server limit 4096"
 == config=lattice_default_above_cap case=reasoning_budget_large
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"reasoning_budget":100000}
-refused code=context_length_exceeded message="prompt (52 tokens) plus max_tokens (64) plus reasoning_budget (100000) exceeds model context window (16384): 100117 tokens required"
+refused code=context_length_exceeded message="prompt (60 tokens) plus max_tokens (64) plus reasoning_budget (100000) exceeds model context window (16384): 100125 tokens required"
 == config=lattice_default_above_cap case=reasoning_budget_negative
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":-1}
 refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server limit 4096"
@@ -503,12 +519,12 @@ refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server li
 == config=lattice_default_above_cap case=context_exceeded
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":4090}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=4090 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=None seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=4090 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=4090 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_default_above_cap case=context_exceeded_by_budget
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":2048,"reasoning_budget":2040}
 request: messages=[ChatMessage { role: User, content: "Hi", image: None }] max_tokens=2048 temperature=0.7 top_p=0.9 logprobs=None stop_strings=[] reasoning_budget=Some(2040) seed=None stream=false
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=2048 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(2040) logprobs=None
 == config=lattice_default_above_cap case=context_before_stop
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":4090,"stop":5}
@@ -531,136 +547,146 @@ refused code=max_tokens_exceeds_limit message="max_tokens 8192 exceeds server li
 == config=lattice_serve case=all_absent
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}]}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=model_absent
 body: {"messages":[{"role":"user","content":"Hi"}]}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=options_null
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":null,"temperature":null,"top_p":null,"top_k":null,"repetition_penalty":null,"seed":null,"stream":null,"stop":null,"reasoning_budget":null,"logprobs":null}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=max_tokens_256
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":256}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=max_tokens_512
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":512}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=max_tokens_100
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":100}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=temperature_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":0.7}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=top_p_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_p":0.9}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=top_k_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_k":50}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=repetition_penalty_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"repetition_penalty":1.1}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=stream_false
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stream":false}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=reasoning_budget_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":0}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+== config=lattice_serve case=thinking_explicitly_on
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":true}}
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+== config=lattice_serve case=thinking_explicitly_off
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":false}}
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=logprobs_false
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":false}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=top_logprobs_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":true,"top_logprobs":0}
 refused code=unsupported_feature message="logprobs/top_logprobs are not supported by this server"
 == config=lattice_serve case=max_tokens_32
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":32}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=32 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=32 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=32 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=max_completion_tokens_48
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":48}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=48 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=48 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=48 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=max_tokens_pair_equal
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":40,"max_completion_tokens":40}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=40 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=40 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=40 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=max_tokens_5000
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":5000}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=4095 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=4095 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=4095 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=temperature_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":0.0}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.0 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.0 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.0 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=temperature_high
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":1.5}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=1.5 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=1.5 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=1.5 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=temperature_two
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":2.0}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=2.0 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=2.0 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=2.0 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=top_p_half
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_p":0.5}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.5 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.5 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.5 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=top_p_one
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_p":1.0}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=1.0 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=1.0 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=1.0 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=top_k_7
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_k":7}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=7 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=7 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=7 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=repetition_penalty_125
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"repetition_penalty":1.25}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.25 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.25 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.25 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=seed_42
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"seed":42}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=Some(42) stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=Some(42) stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=Some(42) stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=stream_true
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stream":true}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=true stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=logprobs_true
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":true}
 refused code=unsupported_feature message="logprobs/top_logprobs are not supported by this server"
@@ -670,17 +696,17 @@ refused code=unsupported_feature message="logprobs/top_logprobs are not supporte
 == config=lattice_serve case=all_non_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"temperature":0.3,"top_p":0.8,"top_k":12,"repetition_penalty":1.05,"seed":7,"stream":true,"stop":["\n\n"],"reasoning_budget":16}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=64 temperature=0.3 top_k=12 top_p=0.8 repetition_penalty=1.05 seed=Some(7) stream=true stop_strings=["\n\n"] reasoning_budget=Some(16) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=64 temperature=0.3 top_k=12 top_p=0.8 min_p=0.0 repetition_penalty=1.05 seed=Some(7) stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["\n\n"] reasoning_budget=Some(16) logprobs=None
 == config=lattice_serve case=reasoning_budget_128
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":128}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=Some(128) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(128) logprobs=None
 == config=lattice_serve case=reasoning_budget_large
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"reasoning_budget":100000}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=64 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=Some(4031) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=64 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(4031) logprobs=None
 == config=lattice_serve case=reasoning_budget_negative
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":-1}
@@ -691,13 +717,13 @@ refused code=invalid_request_body message="reasoning_budget is invalid: invalid 
 == config=lattice_serve case=stop_string
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop":"END"}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=["END"] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["END"] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=["END"] reasoning_budget=None logprobs=None
 == config=lattice_serve case=stop_array
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop":["a","b"]}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=["a", "b"] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["a", "b"] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=["a", "b"] reasoning_budget=None logprobs=None
 == config=lattice_serve case=stop_empty_array
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop":[]}
 refused code=invalid_stop message="stop array must not be empty"
@@ -713,28 +739,28 @@ refused code=invalid_stop message="stop array has 5 elements; maximum is 4"
 == config=lattice_serve case=system_and_user
 body: {"model":"served-model","messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"}]}
 request: messages=[NormalizedChatMessage { role: System, content: "Be brief.", image: None }, NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=multi_turn
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello."},{"role":"user","content":"Again"}]}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }, NormalizedChatMessage { role: Assistant, content: "Hello.", image: None }, NormalizedChatMessage { role: User, content: "Again", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=text_parts
 body: {"model":"served-model","messages":[{"role":"user","content":[{"type":"text","text":"one "},{"type":"text","text":"two"}]}]}
 request: messages=[NormalizedChatMessage { role: User, content: "one two", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\none two<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\none two<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=response_format_text
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"text"}}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=response_format_json_schema
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}}}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=empty_messages
 body: {"model":"served-model","messages":[]}
 refused code=invalid_messages message="messages must not be empty"
@@ -780,8 +806,8 @@ refused code=unsupported_feature message="logprobs/top_logprobs are not supporte
 == config=lattice_serve case=last_message_assistant
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello."}]}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }, NormalizedChatMessage { role: Assistant, content: "Hello.", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=tool_role
 body: {"model":"served-model","messages":[{"role":"tool","content":"42"},{"role":"user","content":"Hi"}]}
 refused code=unsupported_feature message="role 'tool' is not supported by this server"
@@ -800,12 +826,12 @@ refused code=vision_unsupported message="image input requires a vision-capable m
 == config=lattice_serve case=context_exceeded
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":4090}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=4090 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=4090 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=4090 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve case=context_exceeded_by_budget
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":2048,"reasoning_budget":2040}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=2048 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=Some(2040) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=2048 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(2040) logprobs=None
 == config=lattice_serve case=context_before_stop
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":4090,"stop":5}
@@ -827,137 +853,147 @@ body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop"
 refused code=invalid_stop message="stop must be a string or array of strings"
 == config=lattice_serve_operator_defaults case=all_absent
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}]}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=model_absent
 body: {"messages":[{"role":"user","content":"Hi"}]}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=options_null
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":null,"temperature":null,"top_p":null,"top_k":null,"repetition_penalty":null,"seed":null,"stream":null,"stop":null,"reasoning_budget":null,"logprobs":null}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=max_tokens_256
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":256}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=159 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=159 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=159 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=max_tokens_512
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":512}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=159 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=159 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=159 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=max_tokens_100
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":100}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=temperature_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":0.7}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.7 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.7 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.7 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.7 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=top_p_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_p":0.9}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.9 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.9 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.9 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.9 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=top_k_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_k":50}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=50 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=50 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=50 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=50 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=repetition_penalty_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"repetition_penalty":1.1}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=stream_false
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stream":false}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=reasoning_budget_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":0}
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+== config=lattice_serve_operator_defaults case=thinking_explicitly_on
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":true}}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+== config=lattice_serve_operator_defaults case=thinking_explicitly_off
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":false}}
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=logprobs_false
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":false}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=top_logprobs_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":true,"top_logprobs":0}
 refused code=unsupported_feature message="logprobs/top_logprobs are not supported by this server"
 == config=lattice_serve_operator_defaults case=max_tokens_32
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":32}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=32 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(64) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=32 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(64) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=32 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=32 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=max_completion_tokens_48
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":48}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=48 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(64) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=48 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(64) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=48 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=48 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=max_tokens_pair_equal
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":40,"max_completion_tokens":40}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=40 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(64) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=40 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(64) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=40 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=40 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=max_tokens_5000
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":5000}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=159 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=159 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=159 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=temperature_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":0.0}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.0 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.0 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.0 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.0 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=temperature_high
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":1.5}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=1.5 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=1.5 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=1.5 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=1.5 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=temperature_two
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":2.0}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=2.0 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=2.0 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=2.0 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=2.0 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=top_p_half
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_p":0.5}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=top_p_one
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_p":1.0}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=1.0 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=1.0 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=1.0 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=1.0 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=top_k_7
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"top_k":7}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=7 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=7 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=7 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=7 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=repetition_penalty_125
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"repetition_penalty":1.25}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.25 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.25 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.25 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.25 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=seed_42
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"seed":42}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=Some(42) stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=Some(42) stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=Some(42) stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=Some(42) stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=stream_true
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stream":true}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=true stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=true stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=logprobs_true
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":true}
 refused code=unsupported_feature message="logprobs/top_logprobs are not supported by this server"
@@ -967,17 +1003,17 @@ refused code=unsupported_feature message="logprobs/top_logprobs are not supporte
 == config=lattice_serve_operator_defaults case=all_non_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"temperature":0.3,"top_p":0.8,"top_k":12,"repetition_penalty":1.05,"seed":7,"stream":true,"stop":["\n\n"],"reasoning_budget":16}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=64 temperature=0.3 top_k=12 top_p=0.8 repetition_penalty=1.05 seed=Some(7) stream=true stop_strings=["\n\n"] reasoning_budget=Some(16) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=64 temperature=0.3 top_k=12 top_p=0.8 min_p=0.0 repetition_penalty=1.05 seed=Some(7) stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["\n\n"] reasoning_budget=Some(16) logprobs=None
 == config=lattice_serve_operator_defaults case=reasoning_budget_128
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":128}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
 == config=lattice_serve_operator_defaults case=reasoning_budget_large
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"reasoning_budget":100000}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=64 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(95) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=64 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(95) logprobs=None
 == config=lattice_serve_operator_defaults case=reasoning_budget_negative
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":-1}
@@ -987,14 +1023,14 @@ body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reaso
 refused code=invalid_request_body message="reasoning_budget is invalid: invalid type: string \"many\", expected usize at line 1 column 6"
 == config=lattice_serve_operator_defaults case=stop_string
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop":"END"}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=["END"] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["END"] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=["END"] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=["END"] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=stop_array
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop":["a","b"]}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=["a", "b"] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["a", "b"] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=["a", "b"] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=["a", "b"] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=stop_empty_array
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop":[]}
 refused code=invalid_stop message="stop array must not be empty"
@@ -1009,29 +1045,29 @@ body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"stop"
 refused code=invalid_stop message="stop array has 5 elements; maximum is 4"
 == config=lattice_serve_operator_defaults case=system_and_user
 body: {"model":"served-model","messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"}]}
-request: messages=[NormalizedChatMessage { role: System, content: "Be brief.", image: None }, NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: System, content: "Be brief.", image: None }, NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=multi_turn
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello."},{"role":"user","content":"Again"}]}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }, NormalizedChatMessage { role: Assistant, content: "Hello.", image: None }, NormalizedChatMessage { role: User, content: "Again", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }, NormalizedChatMessage { role: Assistant, content: "Hello.", image: None }, NormalizedChatMessage { role: User, content: "Again", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=text_parts
 body: {"model":"served-model","messages":[{"role":"user","content":[{"type":"text","text":"one "},{"type":"text","text":"two"}]}]}
-request: messages=[NormalizedChatMessage { role: User, content: "one two", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\none two<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "one two", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\none two<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=response_format_text
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"text"}}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=response_format_json_schema
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}}}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=empty_messages
 body: {"model":"served-model","messages":[]}
 refused code=invalid_messages message="messages must not be empty"
@@ -1076,9 +1112,9 @@ body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logpr
 refused code=unsupported_feature message="logprobs/top_logprobs are not supported by this server"
 == config=lattice_serve_operator_defaults case=last_message_assistant
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello."}]}
-request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }, NormalizedChatMessage { role: Assistant, content: "Hello.", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(59) logprobs=None
+request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }, NormalizedChatMessage { role: Assistant, content: "Hello.", image: None }] max_tokens=100 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=tool_role
 body: {"model":"served-model","messages":[{"role":"tool","content":"42"},{"role":"user","content":"Hi"}]}
 refused code=unsupported_feature message="role 'tool' is not supported by this server"
@@ -1097,12 +1133,12 @@ refused code=vision_unsupported message="image input requires a vision-capable m
 == config=lattice_serve_operator_defaults case=context_exceeded
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":4090}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=159 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=159 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=159 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=context_exceeded_by_budget
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":2048,"reasoning_budget":2040}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=159 temperature=0.2 top_k=20 top_p=0.5 repetition_penalty=1.3 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=159 temperature=0.2 top_k=20 top_p=0.5 min_p=0.0 repetition_penalty=1.3 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_operator_defaults case=context_before_stop
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":4090,"stop":5}
@@ -1158,6 +1194,12 @@ refused code=invalid_temperature message="temperature must be between 0 and 2"
 == config=lattice_serve_invalid_defaults case=reasoning_budget_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":0}
 refused code=invalid_temperature message="temperature must be between 0 and 2"
+== config=lattice_serve_invalid_defaults case=thinking_explicitly_on
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":true}}
+refused code=invalid_temperature message="temperature must be between 0 and 2"
+== config=lattice_serve_invalid_defaults case=thinking_explicitly_off
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":false}}
+refused code=invalid_temperature message="temperature must be between 0 and 2"
 == config=lattice_serve_invalid_defaults case=logprobs_false
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":false}
 refused code=invalid_temperature message="temperature must be between 0 and 2"
@@ -1212,7 +1254,7 @@ refused code=unsupported_feature message="logprobs/top_logprobs are not supporte
 == config=lattice_serve_invalid_defaults case=all_non_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"temperature":0.3,"top_p":0.8,"top_k":12,"repetition_penalty":1.05,"seed":7,"stream":true,"stop":["\n\n"],"reasoning_budget":16}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=64 temperature=0.3 top_k=12 top_p=0.8 repetition_penalty=1.05 seed=Some(7) stream=true stop_strings=["\n\n"] reasoning_budget=Some(16) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=64 temperature=0.3 top_k=12 top_p=0.8 min_p=0.0 repetition_penalty=1.05 seed=Some(7) stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["\n\n"] reasoning_budget=Some(16) logprobs=None
 == config=lattice_serve_invalid_defaults case=reasoning_budget_128
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":128}
@@ -1355,18 +1397,18 @@ refused code=invalid_max_tokens message="max_tokens must be at least 1"
 == config=lattice_serve_zero_budget_default case=max_tokens_256
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":256}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=256 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=256 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_zero_budget_default case=max_tokens_512
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":512}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=512 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=512 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_zero_budget_default case=max_tokens_100
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":100}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=100 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=100 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=100 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_zero_budget_default case=temperature_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":0.7}
 refused code=invalid_max_tokens message="max_tokens must be at least 1"
@@ -1385,6 +1427,12 @@ refused code=invalid_max_tokens message="max_tokens must be at least 1"
 == config=lattice_serve_zero_budget_default case=reasoning_budget_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":0}
 refused code=invalid_max_tokens message="max_tokens must be at least 1"
+== config=lattice_serve_zero_budget_default case=thinking_explicitly_on
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":true}}
+refused code=invalid_max_tokens message="max_tokens must be at least 1"
+== config=lattice_serve_zero_budget_default case=thinking_explicitly_off
+body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":false}}
+refused code=invalid_max_tokens message="max_tokens must be at least 1"
 == config=lattice_serve_zero_budget_default case=logprobs_false
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"logprobs":false}
 refused code=invalid_max_tokens message="max_tokens must be at least 1"
@@ -1394,23 +1442,23 @@ refused code=unsupported_feature message="logprobs/top_logprobs are not supporte
 == config=lattice_serve_zero_budget_default case=max_tokens_32
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":32}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=32 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=32 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=32 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_zero_budget_default case=max_completion_tokens_48
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":48}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=48 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=48 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=48 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_zero_budget_default case=max_tokens_pair_equal
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":40,"max_completion_tokens":40}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=40 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=40 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=40 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_zero_budget_default case=max_tokens_5000
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":5000}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=4095 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=4095 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=4095 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_zero_budget_default case=temperature_zero
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"temperature":0.0}
 refused code=invalid_max_tokens message="max_tokens must be at least 1"
@@ -1447,7 +1495,7 @@ refused code=unsupported_feature message="logprobs/top_logprobs are not supporte
 == config=lattice_serve_zero_budget_default case=all_non_default
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"temperature":0.3,"top_p":0.8,"top_k":12,"repetition_penalty":1.05,"seed":7,"stream":true,"stop":["\n\n"],"reasoning_budget":16}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=64 temperature=0.3 top_k=12 top_p=0.8 repetition_penalty=1.05 seed=Some(7) stream=true stop_strings=["\n\n"] reasoning_budget=Some(16) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=64 temperature=0.3 top_k=12 top_p=0.8 min_p=0.0 repetition_penalty=1.05 seed=Some(7) stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=["\n\n"] reasoning_budget=Some(16) logprobs=None
 == config=lattice_serve_zero_budget_default case=reasoning_budget_128
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":128}
@@ -1455,7 +1503,7 @@ refused code=invalid_max_tokens message="max_tokens must be at least 1"
 == config=lattice_serve_zero_budget_default case=reasoning_budget_large
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":64,"reasoning_budget":100000}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=64 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=Some(4031) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=64 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(4031) logprobs=None
 == config=lattice_serve_zero_budget_default case=reasoning_budget_negative
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":-1}
@@ -1559,12 +1607,12 @@ refused code=invalid_max_tokens message="max_tokens must be at least 1"
 == config=lattice_serve_zero_budget_default case=context_exceeded
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":4090}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=4090 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=None logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
-config: max_new_tokens=4090 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+config: max_new_tokens=4090 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=false enable_mtp=None grammar=false stop_strings=[] reasoning_budget=None logprobs=None
 == config=lattice_serve_zero_budget_default case=context_exceeded_by_budget
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":2048,"reasoning_budget":2040}
 request: messages=[NormalizedChatMessage { role: User, content: "Hi", image: None }] max_tokens=2048 temperature=0.7 top_k=50 top_p=0.9 repetition_penalty=1.1 seed=None stream=false stop_strings=[] reasoning_budget=Some(2040) logprobs=None
-prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+prompt: "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
 config: max_new_tokens=2048 temperature=0.7 top_k=50 top_p=0.9 min_p=0.0 repetition_penalty=1.1 seed=None stop_token_ids=[248046] enable_thinking=true enable_mtp=None grammar=false stop_strings=[] reasoning_budget=Some(2040) logprobs=None
 == config=lattice_serve_zero_budget_default case=context_before_stop
 body: {"model":"served-model","messages":[{"role":"user","content":"Hi"}],"max_tokens":4090,"stop":5}

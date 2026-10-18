@@ -527,13 +527,8 @@ pub fn normalize_requested_options(
     req: &ChatRequest,
     profile: ServeProfile<'_>,
 ) -> Result<RequestedChatOptions, ApiError> {
-    type NoContextCheck = fn(
-        &[NormalizedChatMessage],
-        usize,
-        Option<usize>,
-        bool,
-        Option<bool>,
-    ) -> Result<(), ApiError>;
+    type NoContextCheck =
+        fn(&[NormalizedChatMessage], usize, Option<usize>, bool) -> Result<(), ApiError>;
     requested_options_inner::<(), NoContextCheck>(req, profile, None).map(|(options, _)| options)
 }
 
@@ -543,7 +538,7 @@ pub fn normalize_request(
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
 ) -> Result<ValidatedChatRequest, ApiError> {
-    normalize_request_inner(req, defaults, profile, |_, _, _, _, _| Ok(()))
+    normalize_request_inner(req, defaults, profile, |_, _, _, _| Ok(()))
         .map(|(validated, (), _)| validated)
 }
 
@@ -567,12 +562,9 @@ pub fn normalize_request_with_context_and_budget(
         Option<usize>,
     ) -> Result<String, ApiError>,
 ) -> Result<(ValidatedChatRequest, String), ApiError> {
-    normalize_request_inner(
-        req,
-        defaults,
-        profile,
-        |messages, max_tokens, budget, _, _| check_context(messages, max_tokens, budget),
-    )
+    normalize_request_inner(req, defaults, profile, |messages, max_tokens, budget, _| {
+        check_context(messages, max_tokens, budget)
+    })
     .map(|(validated, prompt, _)| (validated, prompt))
 }
 
@@ -586,7 +578,6 @@ pub(crate) fn normalize_request_with_context_and_thinking(
         usize,
         Option<usize>,
         bool,
-        Option<bool>,
     ) -> Result<String, ApiError>,
 ) -> Result<(ValidatedChatRequest, String, bool), ApiError> {
     normalize_request_inner(req, defaults, profile, check_context)
@@ -619,12 +610,11 @@ fn normalize_request_inner<C>(
         usize,
         Option<usize>,
         bool,
-        Option<bool>,
     ) -> Result<C, ApiError>,
 ) -> Result<(ValidatedChatRequest, C, bool), ApiError> {
     let step = QwenChatDefaults::new(defaults);
     let (options, context) = requested_options_inner(req, profile, Some((&step, check_context)))?;
-    let enable_thinking = step.enable_thinking(options.enable_thinking);
+    let enable_thinking = step.enable_thinking(options.enable_thinking, options.reasoning_budget);
     let validated = step.apply(options)?;
     match context {
         Some(context) => Ok((validated, context, enable_thinking)),
@@ -645,13 +635,7 @@ fn requested_options_inner<C, F>(
     step: Option<(&QwenChatDefaults, F)>,
 ) -> Result<(RequestedChatOptions, Option<C>), ApiError>
 where
-    F: FnOnce(
-        &[NormalizedChatMessage],
-        usize,
-        Option<usize>,
-        bool,
-        Option<bool>,
-    ) -> Result<C, ApiError>,
+    F: FnOnce(&[NormalizedChatMessage], usize, Option<usize>, bool) -> Result<C, ApiError>,
 {
     reject_unsupported(req, profile)?;
     let enable_thinking = parse_chat_template_kwargs(&req.chat_template_kwargs)?;
@@ -721,7 +705,8 @@ where
 
     let context = match (step, effective_max_tokens) {
         (Some((defaults, check_context)), Some(effective_max_tokens)) => {
-            let effective_enable_thinking = defaults.enable_thinking(enable_thinking);
+            let effective_enable_thinking =
+                defaults.enable_thinking(enable_thinking, reasoning_budget);
             let effective_reasoning_budget = defaults.reasoning_budget(
                 reasoning_budget,
                 profile.reasoning_budget_supported,
@@ -739,7 +724,6 @@ where
                 effective_max_tokens,
                 effective_reasoning_budget,
                 effective_enable_thinking,
-                enable_thinking,
             )?)
         }
         _ => None,

@@ -134,19 +134,21 @@ fn expected_gen_cfg() -> GenerateConfigSnapshot {
 #[tokio::test]
 async fn chat_completions_non_streaming_observation_captures_real_config_and_prompt() {
     let obs = run_observed(true, OBSERVATION_GOLDEN_REQUEST_BODY).await;
+    let mut expected = expected_gen_cfg();
+    expected.enable_thinking = false;
     let expected_prompt_tokens = {
         let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
             .tokenizer()
             .clone();
         tokenizer
-            .tokenize(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
+            .tokenize(OBSERVATION_GOLDEN_NO_THINK_CHATML)
             .real_length
     };
     assert_observation_matches(
         &obs,
         &ExpectedObservation {
-            gen_cfg: expected_gen_cfg(),
-            rendered_prompt: Some(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML),
+            gen_cfg: expected,
+            rendered_prompt: Some(OBSERVATION_GOLDEN_NO_THINK_CHATML),
             messages: None,
             prompt_tokens: expected_prompt_tokens,
             stopped: true,
@@ -181,11 +183,14 @@ async fn chat_completions_non_streaming_observation_captures_real_stopped_false(
 async fn chat_completions_non_streaming_observation_captures_real_reasoning_budget() {
     let body = r#"{"model":"test-model","messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9,"reasoning_budget":5}"#;
     let obs = run_observed(true, body).await;
+    assert!(obs.gen_cfg.enable_thinking);
     assert_eq!(
         obs.gen_cfg.reasoning_budget,
         Some(5),
         "reasoning_budget from the request must reach the real GenerateConfig"
     );
+    let primed = format!("{OBSERVATION_GOLDEN_USER_HI_THERE_CHATML}<think>\n");
+    assert_eq!(obs.rendered_prompt.as_deref(), Some(primed.as_str()));
 }
 
 #[tokio::test]
@@ -211,18 +216,21 @@ async fn chat_completions_non_streaming_observation_captures_real_enable_thinkin
 }
 
 #[tokio::test]
-async fn chat_completions_non_streaming_observation_preserves_thinking_default() {
+async fn chat_completions_non_streaming_observation_resolves_thinking_mode() {
     let explicit = thinking_request_body(true, None);
     let primed = format!("{OBSERVATION_GOLDEN_USER_HI_THERE_CHATML}<think>\n");
-    for (body, rendered) in [
+    for (body, rendered, enable_thinking) in [
         (
             OBSERVATION_GOLDEN_REQUEST_BODY,
-            OBSERVATION_GOLDEN_USER_HI_THERE_CHATML,
+            OBSERVATION_GOLDEN_NO_THINK_CHATML,
+            false,
         ),
-        (explicit.as_str(), primed.as_str()),
+        (explicit.as_str(), primed.as_str(), true),
     ] {
         let obs = run_observed(true, body).await;
-        assert_eq!(obs.gen_cfg, expected_gen_cfg());
+        let mut expected = expected_gen_cfg();
+        expected.enable_thinking = enable_thinking;
+        assert_eq!(obs.gen_cfg, expected);
         assert_eq!(obs.rendered_prompt.as_deref(), Some(rendered));
     }
 }
