@@ -1159,6 +1159,14 @@ def main() -> int:
         )
         return 2
 
+    if args.regenerate and MAX_TOKENS < max(REFERENCE_TOKEN_COUNTS):
+        print(
+            f"error: --regenerate requires E2E_MAX_TOKENS >= "
+            f"{max(REFERENCE_TOKEN_COUNTS)}",
+            file=sys.stderr,
+        )
+        return 2
+
     if not os.path.isdir(MODEL_DIR):
         print(f"error: model dir not found at {MODEL_DIR}", file=sys.stderr)
         return 2
@@ -1306,16 +1314,6 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    if args.regenerate:
-        try:
-            write_frozen_reference(
-                live_outputs, MAX_TOKENS, regeneration_summary
-            )
-        except (OSError, RuntimeError) as e:
-            print(f"error: could not write frozen reference: {e}", file=sys.stderr)
-            return 2
-        print(f"[hf] wrote frozen reference to {REFERENCE_PATH}", file=sys.stderr)
-
     report = render_report(results)
     print(report)
 
@@ -1348,6 +1346,16 @@ def main() -> int:
         # asked to certify a table that cannot certify anything.
         print(f"\nNO GATING PROMPT: {no_gating}", file=sys.stderr)
         return 2
+
+    if args.regenerate:
+        try:
+            write_frozen_reference(
+                live_outputs, MAX_TOKENS, regeneration_summary
+            )
+        except (OSError, RuntimeError) as e:
+            print(f"error: could not write frozen reference: {e}", file=sys.stderr)
+            return 2
+        print(f"[hf] wrote frozen reference to {REFERENCE_PATH}", file=sys.stderr)
 
     if xpass:
         print(
