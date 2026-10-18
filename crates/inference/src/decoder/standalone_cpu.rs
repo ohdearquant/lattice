@@ -366,6 +366,7 @@ pub(crate) fn generate_with_trace(
         &mut session,
         gen_cfg,
         None,
+        None,
         &prompt_ids,
         cfg.eos_token_id,
         false,

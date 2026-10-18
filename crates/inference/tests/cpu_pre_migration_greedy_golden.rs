@@ -18,11 +18,13 @@
 //! `DecodePolicy::apply_override` never executed in either case: a migration
 //! that got the candidate-to-final override wrong would have reproduced those
 //! ids exactly. The `_reasoning_budget_4` cases close that hole by replaying the
-//! same prompts with a budget, which forces `</think>` at the budget index and
-//! puts the separate reasoning/answer accounting on the measured path. A
-//! control asserts each budgeted case agrees with its unbudgeted pair up to the
-//! budget and disagrees at it, because a budgeted case that matched its pair
-//! would look like coverage while proving nothing.
+//! same prompts with a budget, which forces `</think>` once the budget is
+//! reached and puts the separate reasoning/answer accounting on the measured
+//! path. The forced close waits for the first step whose previous token
+//! contains a newline, or at most 32 tokens past the budget (#1886), so a
+//! control asserts each budgeted case agrees with its unbudgeted pair up to
+//! that close index and disagrees at it, because a budgeted case that matched
+//! its pair would look like coverage while proving nothing.
 //!
 //! **Not interchangeable with the QuaRot Q4 golden.** `quarot_q4_composed_golden`
 //! freezes tokens generated *from a rotated Q4 artifact* through
@@ -259,6 +261,25 @@ mod controls {
     /// The capture that produced the budgeted cases emitted exactly this id.
     const THINK_CLOSE_TOKEN_ID: u32 = 248_069;
 
+    /// Ids whose decoded text contains a newline among those the unbudgeted
+    /// captures emit (`198` is `"\n"`, `271` is `"\n\n"`). Every other id in
+    /// those captures decodes without one, so this set decides the close index
+    /// the same way the production boundary table does for these two prompts.
+    const NEWLINE_TOKEN_IDS: [u32; 2] = [198, 271];
+
+    /// Number of tokens past the budget after which the close fires without a
+    /// newline. Duplicated as a literal for the same reason as the close id.
+    const CLOSE_GRACE_TOKENS: usize = 32;
+
+    /// The index at which the budgeted capture must carry the forced close:
+    /// the first index at or after the budget whose previous token is a
+    /// newline in the unbudgeted pair, or the budget plus the grace window.
+    fn forced_close_index(pair: &[u32], budget: usize) -> usize {
+        (budget..budget + CLOSE_GRACE_TOKENS)
+            .find(|&k| k > 0 && NEWLINE_TOKEN_IDS.contains(&pair[k - 1]))
+            .unwrap_or(budget + CLOSE_GRACE_TOKENS)
+    }
+
     #[test]
     fn fixture_parses_and_declares_all_four_cases() {
         let golden: Golden = serde_json::from_str(FIXTURE).expect("golden fixture parses");
@@ -321,13 +342,14 @@ mod controls {
     }
 
     #[test]
-    fn every_budgeted_case_diverges_from_its_pair_at_the_budget() {
+    fn every_budgeted_case_diverges_from_its_pair_at_the_close() {
         // The point of the budgeted cases. `apply_override` replaces the sampled
-        // id with `</think>` once `generated_so_far` reaches the budget, so a
-        // budgeted capture must agree with its unbudgeted pair on every earlier
-        // token and disagree at exactly that index. A budgeted case whose ids
-        // matched its pair would prove nothing at all, which is the failure this
-        // control exists to make impossible to miss.
+        // id with `</think>` at the first step at or after the budget whose
+        // previous token contains a newline, or at the budget plus the grace
+        // window, so a budgeted capture must agree with its unbudgeted pair on
+        // every earlier token and disagree at exactly that index. A budgeted case
+        // whose ids matched its pair would prove nothing at all, which is the
+        // failure this control exists to make impossible to miss.
         let golden: Golden = serde_json::from_str(FIXTURE).expect("golden fixture parses");
         let mut checked = 0usize;
         for case in &golden.cases {
@@ -347,21 +369,28 @@ mod controls {
                 case.name
             );
             assert!(pair.reasoning_budget.is_none(), "a pair must be unbudgeted");
-            assert!(budget < pair.expected_generated_ids.len());
+            let close = forced_close_index(&pair.expected_generated_ids, budget);
+            assert!(
+                close > budget,
+                "case {}: the close must wait past the budget for these prompts, or \
+                 the deferral is not on the measured path",
+                case.name
+            );
+            assert!(close < pair.expected_generated_ids.len());
             assert_eq!(
-                case.expected_generated_ids[..budget],
-                pair.expected_generated_ids[..budget],
-                "case {} diverges from its pair BEFORE the budget",
+                case.expected_generated_ids[..close],
+                pair.expected_generated_ids[..close],
+                "case {} diverges from its pair BEFORE the close index {close}",
                 case.name
             );
             assert_eq!(
-                case.expected_generated_ids[budget], THINK_CLOSE_TOKEN_ID,
-                "case {} does not carry the forced close token at its budget",
+                case.expected_generated_ids[close], THINK_CLOSE_TOKEN_ID,
+                "case {} does not carry the forced close token at index {close}",
                 case.name
             );
             assert_ne!(
-                case.expected_generated_ids[budget], pair.expected_generated_ids[budget],
-                "case {} agrees with its unbudgeted pair at the budget index, so the \
+                case.expected_generated_ids[close], pair.expected_generated_ids[close],
+                "case {} agrees with its unbudgeted pair at the close index, so the \
                  override path was never exercised",
                 case.name
             );

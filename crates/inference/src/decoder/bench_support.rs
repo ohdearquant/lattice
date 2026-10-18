@@ -183,6 +183,7 @@ pub fn run_qwen_cpu_probed(
         &mut session,
         gen_cfg,
         think_close_id,
+        None,
         &prompt_ids,
         cfg.eos_token_id,
         true,
@@ -304,6 +305,7 @@ pub fn run_interface_only(
     let result = driver::run(
         &mut session,
         gen_cfg,
+        None,
         None,
         &prompt_ids,
         u32::MAX,

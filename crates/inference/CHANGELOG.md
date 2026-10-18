@@ -10,6 +10,10 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+### Changed
+
+- Reasoning-budgeted requests now close the thinking block at the first line boundary after the budget, or at most 32 tokens later, instead of at the budget itself. The decode cap and answer budget are unchanged.
+
 ## [0.13.0] - 2026-10-18
 
 ### Breaking

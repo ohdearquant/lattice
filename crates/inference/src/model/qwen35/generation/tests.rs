@@ -845,6 +845,7 @@ fn decode_policy_cap_ignores_reasoning_budget_when_thinking_disabled() {
     let policy = DecodePolicy::init(
         &gen_cfg,
         /* think_close_id */ None,
+        /* reasoning_newline_boundary */ None,
         &mut token_logprobs,
         /* first_emitted_id */ 0,
         /* first_logits */ &[],
@@ -1402,6 +1403,117 @@ fn build_tiny_thinking_model() -> Qwen35Model {
     "vocab":{"<unk>":0,"a":1,"b":2,"c":3,"d":4,"e":5," ":6},"merges":[]}
 }"#,
     )
+}
+
+fn build_tiny_newline_thinking_model() -> Qwen35Model {
+    build_tiny_zero_model_tok(
+        r#"{
+  "version":"1.0","truncation":null,"padding":null,
+  "added_tokens":[{"id":7,"content":"</think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}],
+  "normalizer":null,
+  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
+  "post_processor":null,
+  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
+    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+    "vocab":{"Ċ":0,"<unk>":1,"a":2,"b":3,"c":4,"d":5,"e":6},"merges":[]}
+}"#,
+    )
+}
+
+fn boundary_at(id: usize) -> std::sync::Arc<[bool]> {
+    let mut table = vec![false; id.saturating_add(1).max(10)];
+    table[id] = true;
+    table.into()
+}
+
+fn reasoning_budget_parity(model: &Qwen35Model, gen_cfg: &GenerateConfig) {
+    let nonstreaming = model
+        .generate("a", gen_cfg)
+        .expect("non-streaming budgeted generation must succeed");
+    let mut streamed_text = String::new();
+    let streaming = model
+        .generate_streaming("a", gen_cfg, |delta| streamed_text.push_str(delta))
+        .expect("streaming budgeted generation must succeed");
+
+    assert_eq!(
+        streaming.text, nonstreaming.text,
+        "streamed text must equal non-streamed text"
+    );
+    assert_eq!(
+        streamed_text, streaming.text,
+        "the streamed deltas must concatenate to the generation output"
+    );
+    assert_eq!(streaming.token_ids, nonstreaming.token_ids);
+    let (streamed_reasoning, streamed_answer) = streaming
+        .text
+        .split_once("</think>")
+        .expect("the budgeted request must emit a close marker");
+    let (nonstreamed_reasoning, nonstreamed_answer) = nonstreaming
+        .text
+        .split_once("</think>")
+        .expect("the non-streamed request must emit a close marker");
+    assert_eq!(
+        streamed_reasoning, nonstreamed_reasoning,
+        "streamed reasoning text must equal non-streamed reasoning text"
+    );
+    assert_eq!(
+        streamed_answer, nonstreamed_answer,
+        "streamed answer text must equal non-streamed answer text"
+    );
+}
+
+#[test]
+fn reasoning_budget_streaming_matches_nonstreaming_on_tiny_zero_model() {
+    let gen_cfg = GenerateConfig {
+        max_new_tokens: 40,
+        temperature: 0.0,
+        reasoning_budget: Some(4),
+        enable_thinking: true,
+        stop_token_ids: vec![],
+        ..Default::default()
+    };
+    reasoning_budget_parity(&build_tiny_thinking_model(), &gen_cfg);
+    reasoning_budget_parity(&build_tiny_newline_thinking_model(), &gen_cfg);
+}
+
+#[test]
+fn reasoning_budget_cap_can_end_generation_before_the_close() {
+    let model = build_tiny_thinking_model();
+    let close_id = model
+        .tokenizer
+        .special_token_id("</think>")
+        .expect("thinking model tokenizer resolves </think>");
+    let gen_cfg = GenerateConfig {
+        max_new_tokens: 2,
+        temperature: 0.0,
+        reasoning_budget: Some(4),
+        enable_thinking: true,
+        stop_token_ids: vec![],
+        ..Default::default()
+    };
+
+    let output = model
+        .generate("a", &gen_cfg)
+        .expect("a cap-limited budgeted request must succeed");
+
+    assert_eq!(
+        output.stop_reason,
+        Some(StopReason::Length),
+        "the decode cap, not the deferred close, must end this request"
+    );
+    assert_eq!(
+        output.generated_tokens, 7,
+        "decode_cap(Some(4), 2) must remain 7"
+    );
+    assert!(
+        !output.token_ids.contains(&close_id),
+        "the close must not be emitted when the cap ends first"
+    );
+    assert!(
+        !output.text.contains("</think>"),
+        "the rendered output must leave the thinking block open"
+    );
 }
 
 /// `PrefillEnd` must fire on the post-prefill cancellation early return
@@ -1995,18 +2107,17 @@ fn raw_observer_emits_no_raw_token_when_close_marker_resolution_fails() {
 /// This pins the load-bearing weave in `DecodePolicy::transition_inner` (driven,
 /// in production, via `decoder::driver::run`): grammar `advance` runs on the
 /// budget-FORCED token (`next_id`), not the pre-force `sampled_id`. Setup: grammar
-/// `root ::= "aa"` with a 7-entry grammar vocab (ids 0..=6); the tokenizer carries
+/// `root ::= "a"+` with a 7-entry grammar vocab (ids 0..=6); the tokenizer carries
 /// `</think>` at id 7 (outside the grammar vocab). All-zero weights → greedy always
-/// picks token 0's argmax after masking. Post-prefill emits one `'a'` (id 1); the
-/// first decode-loop step has `generated_len == budget == 1`, so `force_close_think`
-/// overrides the sampled `'a'` with `</think>` (id 7). `advance(7)`:
-/// `7 >= grammar.vocab_size (7)` → `false` → `StopReason::Grammar`, before `</think>`
-/// is pushed.
+/// picks token 0's argmax after masking. Post-prefill emits one `'a'` (id 1), and the
+/// repeating grammar accepts one at every decode step. The fallback arrives at
+/// `generated_len == budget + 32`, so `force_close_think` overrides the sampled `'a'`
+/// with `</think>` (id 7). `advance(7)`: `7 >= grammar.vocab_size (7)` → `false` →
+/// `StopReason::Grammar`, before `</think>` is pushed.
 ///
 /// Mutation sensitivity: if `advance` were called on `sampled_id` (1, grammar-legal)
 /// instead of the forced `next_id` (7), `advance(1)` would succeed, `</think>` would
-/// be emitted, and `token_ids` would be `[1, 7]` — failing the `token_ids == [1]`
-/// assertion below.
+/// be emitted, and `token_ids` would contain a final 7, failing the assertion below.
 #[test]
 fn grammar_budget_forced_close_fails_closed() {
     use crate::grammar::{GrammarEngine, GrammarSpec};
@@ -2022,9 +2133,10 @@ fn grammar_budget_forced_close_fails_closed() {
         "test assumes </think> id ({close_id}) is outside the 7-token grammar vocab"
     );
 
-    // root ::= "aa": grammar vocab ids 0..=6 (size 7). </think> (id 7) is out of the
-    // grammar vocab, so advance(7) fail-closes.
-    let spec = GrammarSpec::Gbnf("root ::= \"aa\"\n".to_string());
+    // root ::= "a"+: grammar vocab ids 0..=6 (size 7), never terminal, so decoding
+    // reaches the budget fallback. </think> (id 7) is out of the grammar vocab, so
+    // advance(7) fail-closes.
+    let spec = GrammarSpec::Gbnf("root ::= \"a\"+\n".to_string());
     let vocab: Vec<Vec<u8>> = vec![
         b"<unk>".to_vec(),
         b"a".to_vec(),
@@ -2037,7 +2149,7 @@ fn grammar_budget_forced_close_fails_closed() {
     let engine = Arc::new(GrammarEngine::new(&spec, vocab).expect("aa grammar compiles"));
 
     let gen_cfg = GenerateConfig {
-        max_new_tokens: 5,
+        max_new_tokens: 40,
         temperature: 0.0,
         enable_thinking: true,
         reasoning_budget: Some(1),
@@ -2057,12 +2169,12 @@ fn grammar_budget_forced_close_fails_closed() {
     );
     assert_eq!(
         result.token_ids,
-        vec![1],
+        vec![1; 33],
         "fail-closed: the budget-forced </think> must NOT be emitted; only the \
-             pre-force 'a' (id 1) survives. token_ids [1, 7] means advance ran on the \
+             sampled 'a' tokens (id 1) survive. A final 7 means advance ran on the \
              sampled token, not the forced token"
     );
-    assert_eq!(result.generated_tokens, 1);
+    assert_eq!(result.generated_tokens, 33);
 }
 
 // -----------------------------------------------------------------------
@@ -2102,6 +2214,7 @@ fn forced_close_with_logprobs_records_the_post_override_token() {
     let mut policy = DecodePolicy::init(
         &gen_cfg,
         Some(close_id),
+        Some(boundary_at(1)),
         &mut token_logprobs,
         /* first_emitted_id */ 1,
         &logits,
@@ -2173,6 +2286,7 @@ fn transition_refuses_eos_on_the_stale_pre_override_sample() {
     let mut policy = DecodePolicy::init(
         &gen_cfg,
         Some(close_id),
+        Some(boundary_at(1)),
         &mut token_logprobs,
         /* first_emitted_id */ 1,
         &[],
@@ -2240,6 +2354,7 @@ fn transition_refuses_to_force_close_a_second_time_once_already_closed() {
     let mut policy = DecodePolicy::init(
         &gen_cfg,
         Some(close_id),
+        None,
         &mut token_logprobs,
         /* first_emitted_id */ close_id,
         &[],
@@ -2301,6 +2416,7 @@ fn init_records_the_first_tokens_logprob_when_it_is_already_the_close_marker() {
     let _policy = DecodePolicy::init(
         &gen_cfg,
         Some(close_id),
+        None,
         &mut token_logprobs,
         /* first_emitted_id */ close_id,
         &logits,
@@ -2346,6 +2462,7 @@ fn answer_budget_exhausts_on_the_terminal_token_with_no_next_decode_expected() {
     let mut policy = DecodePolicy::init(
         &gen_cfg,
         Some(close_id),
+        None,
         &mut token_logprobs,
         /* first_emitted_id */ close_id,
         &[],
@@ -2407,6 +2524,7 @@ fn transition_leaves_an_unspent_reasoning_budget_inert() {
     let mut policy = DecodePolicy::init(
         &gen_cfg,
         Some(close_id),
+        None,
         &mut token_logprobs,
         /* first_emitted_id */ 1,
         &logits,

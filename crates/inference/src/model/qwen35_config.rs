@@ -2443,13 +2443,18 @@ pub type TokenLogprob = crate::generation::TokenLogprob;
 )]
 pub type TopLogprob = crate::generation::TopLogprob;
 
+/// Number of additional tokens a forced reasoning close may wait for a line boundary.
+pub(crate) const REASONING_CLOSE_GRACE_TOKENS: usize = 32;
+
 /// Decide whether to force-close the thinking block this step (s1 budget forcing).
 ///
 /// Returns `Some(close_id)` to override the sampled token with `</think>`, else `None`.
-/// All conditions must hold: thinking is enabled, budget enabled and non-zero, thinking
-/// block is still open, enough tokens have been generated. Returns `None` immediately if
-/// any guard fails so the common disabled path costs a single `Option::None` check per
-/// step.
+/// Once the budget is reached, the close waits for the previous emitted token to
+/// contain a newline, and fires without one after
+/// [`REASONING_CLOSE_GRACE_TOKENS`] more tokens. All of thinking enabled, a
+/// non-zero budget, an open block, and the budget being reached must also hold.
+/// Returns `None` immediately if any guard fails so the common disabled path
+/// costs a single `Option::None` check per step.
 ///
 /// `enable_thinking: false` makes `reasoning_budget` inert here regardless of its value --
 /// no reasoning block is produced in that state (the caller is contracted to have primed
@@ -2465,14 +2470,15 @@ pub(crate) fn force_close_think(
     thinking_closed: bool,
     generated_so_far: usize,
     close_id: Option<u32>,
+    previous_token_is_boundary: bool,
 ) -> Option<u32> {
     let budget = reasoning_budget?;
     let close = close_id?;
-    if enable_thinking && !thinking_closed && budget > 0 && generated_so_far >= budget {
-        Some(close)
-    } else {
-        None
+    if !enable_thinking || thinking_closed || budget == 0 || generated_so_far < budget {
+        return None;
     }
+    let grace_end = budget.saturating_add(REASONING_CLOSE_GRACE_TOKENS);
+    (generated_so_far >= grace_end || previous_token_is_boundary).then_some(close)
 }
 
 /// Decode-loop iteration cap.
@@ -2482,6 +2488,10 @@ pub(crate) fn force_close_think(
 /// itself: worst case `rb + max_new_tokens + 1` total tokens. The +1 is necessary because
 /// the forced `</think>` is an extra token that is not part of either the reasoning content
 /// or the answer — omitting it leaves the answer one token short (off-by-one).
+///
+/// The close may wait up to [`REASONING_CLOSE_GRACE_TOKENS`] past `rb` for a line
+/// boundary. Those grace tokens are part of the same cap and come out of the answer
+/// budget; they never extend it.
 ///
 /// Without a budget (`None` or `Some(0)`) the cap is unchanged (`max_new_tokens`), so the
 /// disabled path is byte-identical to the pre-budget behaviour (parity-safe).

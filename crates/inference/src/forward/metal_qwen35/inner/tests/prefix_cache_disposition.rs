@@ -134,8 +134,10 @@ fn warm_the_slot_with_a_first_turn(
     expected
 }
 
-/// The single-character vocabulary with id 30 re-spelled as `</think>`, and a
-/// greedy config whose reasoning budget closes on that token, under `gbnf`.
+/// The single-character vocabulary with id 30 re-spelled as `</think>` and id
+/// 31 decoding to a newline, though a grammar reads it as `F`, and a greedy
+/// config whose reasoning budget closes on `</think>`, under `gbnf`. A forced
+/// close waits for a line to end, so a budget test forces id 31 first.
 fn thinking_fixture(
     gbnf: &str,
     reasoning_budget: usize,
@@ -147,11 +149,13 @@ fn thinking_fixture(
 
     let mut vocab_bytes = single_char_vocab_bytes();
     vocab_bytes[30] = b"</think>".to_vec();
-    let vocab: HashMap<String, u32> = vocab_bytes
+    let mut vocab: HashMap<String, u32> = vocab_bytes
         .iter()
         .zip(0u32..)
         .map(|(bytes, id)| (String::from_utf8_lossy(bytes).into_owned(), id))
         .collect();
+    vocab.remove("F");
+    vocab.insert("\u{10a}".to_string(), 31);
     let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
         .expect("thinking vocab tokenizer build");
     let engine = Arc::new(
@@ -179,8 +183,11 @@ fn thinking_fixture(
 
 /// The single-character vocabulary with id 1 decoding to the lone byte 0xE4,
 /// which the detokenizer holds until the final flush renders it as U+FFFD,
-/// though a grammar reads it as `b`; and id 30 spelled `</think>`. Returns the
-/// tokenizer and the bytes the grammar engine reads each id as.
+/// though a grammar reads it as `b`; id 29 decoding to a newline followed by the
+/// same lone byte, read as `D`; id 30 spelled `</think>`; and id 31 decoding to a
+/// newline, read as `F`. A forced close waits for a line to end, so a budget
+/// test forces id 29 or 31 first. Returns the tokenizer and the bytes the
+/// grammar engine reads each id as.
 pub(super) fn lone_byte_vocabulary() -> (BpeTokenizer, Vec<Vec<u8>>) {
     use std::collections::HashMap;
 
@@ -193,6 +200,10 @@ pub(super) fn lone_byte_vocabulary() -> (BpeTokenizer, Vec<Vec<u8>>) {
         .collect();
     vocab.remove("b");
     vocab.insert("\u{e4}".to_string(), 1);
+    vocab.remove("D");
+    vocab.insert("\u{10a}\u{e4}".to_string(), 29);
+    vocab.remove("F");
+    vocab.insert("\u{10a}".to_string(), 31);
     let tokenizer =
         BpeTokenizer::from_vocab_and_merges(vocab, Vec::new()).expect("lone-byte tokenizer");
     (tokenizer, grammar_bytes)
@@ -776,15 +787,16 @@ fn grammar_rejecting_a_budget_forced_close_saves_the_boundary_without_forwarding
     if !metal_device_present() {
         return;
     }
-    let (tokenizer, gen_cfg) = thinking_fixture("root ::= \"a\" \"a\"\n", 1, 4);
+    let (tokenizer, gen_cfg) = thinking_fixture("root ::= \"F\" \"F\"\n", 1, 4);
     let (cfg, weights) = patterned_model();
     let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
     let slot_id = CrossTurnSlotId::DEFAULT;
 
-    // The grammar forces "a" (id 0) as the first sample. With a reasoning budget
-    // of one, the first decode iteration forwards that token and then overrides
-    // the sampled token with `</think>`, which the grammar rejects before it is
-    // pushed. The saved boundary is the prompt and the one forwarded token.
+    // The grammar forces the newline token (id 31) as the first sample. With a
+    // reasoning budget of one and a line just ended, the first decode iteration
+    // forwards that token and then overrides the sampled token with `</think>`,
+    // which the grammar rejects before it is pushed. The saved boundary is the
+    // prompt and the one forwarded token.
     let turn = state
         .generate_streaming_with_prefix_cache(slot_id, "a", &tokenizer, &gen_cfg, |_, _| true)
         .expect("a budget-forced token the grammar rejects is a stop, not an error");
@@ -793,9 +805,9 @@ fn grammar_rejecting_a_budget_forced_close_saves_the_boundary_without_forwarding
         !turn.output.stopped,
         "a grammar rejection reports stopped: false, as the streaming entry does"
     );
-    assert_eq!(turn.output.token_ids, vec![0]);
+    assert_eq!(turn.output.token_ids, vec![31]);
 
-    assert_saved_boundary(&state, &weights, &cfg, slot_id, &[0, 0]);
+    assert_saved_boundary(&state, &weights, &cfg, slot_id, &[0, 31]);
 }
 
 #[test]
@@ -1103,19 +1115,20 @@ fn budget_rejection_after_a_held_byte_saves_the_forwarded_boundary() {
     if !metal_device_present() {
         return;
     }
-    // The grammar forces the lone-byte token first. With a reasoning budget of
-    // one, the first decode iteration forwards it and then overrides the sampled
-    // token with `</think>`, which the grammar rejects before it is pushed.
-    let gen_cfg = lone_byte_cfg("root ::= \"b\" \"b\"\n", 4, &[], &[], Some(1));
+    // The grammar forces the newline-then-lone-byte token (id 29) first. With a
+    // reasoning budget of one and a line just ended, the first decode iteration
+    // forwards it and then overrides the sampled token with `</think>`, which the
+    // grammar rejects before it is pushed.
+    let gen_cfg = lone_byte_cfg("root ::= \"D\" \"b\"\n", 4, &[], &[], Some(1));
 
     let (cfg, weights, state, output) = run_lone_byte_request(&gen_cfg);
     assert!(!output.stopped);
     assert_eq!(output.stop_reason, Some(StopReason::Grammar));
-    assert_eq!(output.token_ids, vec![1]);
-    assert_eq!(output.text, "\u{fffd}");
+    assert_eq!(output.token_ids, vec![29]);
+    assert_eq!(output.text, "\n\u{fffd}");
 
     let mut expected = ids_of("ac");
-    expected.push(1);
+    expected.push(29);
     assert_saved_boundary(&state, &weights, &cfg, CrossTurnSlotId::DEFAULT, &expected);
 }
 
@@ -1125,12 +1138,12 @@ fn budget_rejection_after_a_held_byte_then_flush_completed_stop_string_leaves_th
     if !metal_device_present() {
         return;
     }
-    let gen_cfg = lone_byte_cfg("root ::= \"b\" \"b\"\n", 4, &[], &["\u{fffd}"], Some(1));
+    let gen_cfg = lone_byte_cfg("root ::= \"D\" \"b\"\n", 4, &[], &["\n\u{fffd}"], Some(1));
 
     let (_, _, state, output) = run_lone_byte_request(&gen_cfg);
     assert!(output.stopped);
     assert_eq!(output.stop_reason, Some(StopReason::Eos));
-    assert_eq!(output.token_ids, vec![1]);
+    assert_eq!(output.token_ids, vec![29]);
     assert_eq!(
         output.text, "",
         "the stop string must have been completed by the flush of the held byte"

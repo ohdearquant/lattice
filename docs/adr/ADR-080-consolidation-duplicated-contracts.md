@@ -461,6 +461,38 @@ extension requires no second version boundary. `AdapterMetadata` and
 `AdapterIndex` remain exhaustive: they represent worker output, excluded from
 the input policy alongside the normalization outputs in the earlier amendment.
 
+### Amendment (2026-10-XX): reasoning-budget close lands on a line boundary (#1886)
+
+C3 moved reasoning-budget accounting into the shared decode policy, so every
+entry point that applies `reasoning_budget` closes the thinking block the same
+way. Until now that close fired at exactly the budget, wherever the model was.
+On a budgeted request the forced `</think>` could land inside a sentence or an
+expression, and the model often failed to recover an answer from there.
+
+The forced close now waits for a line boundary. When the budget is reached, the
+policy closes the thinking block at the first step whose previously emitted
+token contains a newline, and closes it anyway at most 32 tokens after the
+budget. A `</think>` the model produces itself during that window is a normal
+close. The decode cap of a budgeted request, the budget plus `max_tokens` plus
+one token for the close, is unchanged and still bounds the whole completion:
+tokens spent in the window come out of the answer, and if the cap falls inside
+the window the cap ends generation as before.
+
+The boundary is decided from the emitted token alone, using a table built once
+per tokenizer at construction: for each vocabulary id, whether its decoded text
+contains a newline. Only the newline is a boundary. Wider sets, such as
+sentence punctuation, would need state the policy does not track, for example
+whether the text is inside a formula, and they were not measured. Inside long
+display math, where a newline can be more than 32 tokens away, the fallback can
+still close mid-expression.
+
+The policy holds nothing back: tokens generated during the window are emitted
+as they are generated, before the close. Entry points that reject `reasoning_budget`
+continue to reject it, so the apply-or-fail-closed contract of C3 holds.
+
+This changes the output of every request that sets `reasoning_budget`, so it
+ships in a minor release with a changelog entry.
+
 ## What we are NOT doing
 
 - **No new crate.** Every extracted helper lands inside `lattice-inference`, the crate that already

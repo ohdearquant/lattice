@@ -27,6 +27,194 @@ fn cfg_with(max_new_tokens: usize, reasoning_budget: Option<usize>) -> GenerateC
     }
 }
 
+fn policy_with_boundaries(
+    max_new_tokens: usize,
+    reasoning_budget: Option<usize>,
+    enable_thinking: bool,
+    close_id: Option<u32>,
+    boundary_table: Option<std::sync::Arc<[bool]>>,
+    first_emitted_id: u32,
+) -> DecodePolicy {
+    let cfg = GenerateConfig {
+        max_new_tokens,
+        reasoning_budget,
+        enable_thinking,
+        logprobs: None,
+        ..Default::default()
+    };
+    let mut logprobs = Vec::new();
+    DecodePolicy::init(
+        &cfg,
+        close_id,
+        boundary_table,
+        &mut logprobs,
+        first_emitted_id,
+        &[],
+        0.0,
+        1,
+        false,
+    )
+}
+
+fn emit_step(policy: &mut DecodePolicy, generated_len_before: usize, sampled_id: u32) -> u32 {
+    let mut logprobs = Vec::new();
+    let mut text = String::new();
+    let mut offsets = Vec::new();
+    match policy
+        .transition(
+            &mut logprobs,
+            sampled_id,
+            &[],
+            0.0,
+            generated_len_before,
+            |_| Ok(true),
+            |_| false,
+            |_| {},
+            |_| String::new(),
+            &mut text,
+            &mut offsets,
+            |_, _| true,
+        )
+        .expect("the policy callbacks cannot fail")
+    {
+        StepOutcome::Emitted { token_id, .. } => token_id,
+        _ => panic!("expected an emitted token"),
+    }
+}
+
+#[test]
+fn reasoning_close_waits_for_a_newline_after_the_budget() {
+    let close_id = 9u32;
+    let newline_id = 8u32;
+    let table: std::sync::Arc<[bool]> = vec![
+        false, false, false, false, false, false, false, false, true, false,
+    ]
+    .into();
+    let mut policy = policy_with_boundaries(8, Some(4), true, Some(close_id), Some(table), 1);
+
+    for generated_len_before in 1..6 {
+        let emitted = emit_step(&mut policy, generated_len_before, 1);
+        assert_ne!(emitted, close_id, "the close must wait past the budget");
+    }
+    assert_eq!(
+        emit_step(&mut policy, 6, newline_id),
+        newline_id,
+        "the newline token itself is emitted before the close can fire"
+    );
+    assert_eq!(
+        emit_step(&mut policy, 7, 1),
+        close_id,
+        "the step after the newline must force the close"
+    );
+}
+
+#[test]
+fn reasoning_close_falls_back_at_exactly_budget_plus_grace() {
+    let close_id = 9u32;
+    let table: std::sync::Arc<[bool]> = vec![false; 16].into();
+    let mut policy = policy_with_boundaries(40, Some(4), true, Some(close_id), Some(table), 1);
+
+    for generated_len_before in 4..36 {
+        assert_ne!(
+            emit_step(&mut policy, generated_len_before, 1),
+            close_id,
+            "without a newline the close must not fire before B + 32"
+        );
+    }
+    assert_eq!(
+        emit_step(&mut policy, 36, 1),
+        close_id,
+        "without a newline the close must fire at exactly B + 32"
+    );
+}
+
+#[test]
+fn reasoning_close_accepts_a_model_sampled_close_inside_the_window() {
+    let close_id = 9u32;
+    let table: std::sync::Arc<[bool]> = vec![false; 16].into();
+    let mut policy = policy_with_boundaries(8, Some(4), true, Some(close_id), Some(table), 1);
+
+    for generated_len_before in 1..4 {
+        assert_ne!(emit_step(&mut policy, generated_len_before, 1), close_id);
+    }
+    assert_eq!(
+        emit_step(&mut policy, 4, close_id),
+        close_id,
+        "a sampled close inside the window is a natural close"
+    );
+    assert_eq!(
+        emit_step(&mut policy, 5, 3),
+        3,
+        "once naturally closed, no later step may force the close again"
+    );
+}
+
+#[test]
+fn reasoning_close_is_inert_without_an_active_budget() {
+    let close_id = 9u32;
+    let table: std::sync::Arc<[bool]> = vec![true; 16].into();
+    for (budget, thinking) in [(None, true), (Some(0), true), (Some(4), false)] {
+        let mut policy =
+            policy_with_boundaries(8, budget, thinking, Some(close_id), Some(table.clone()), 1);
+        assert_eq!(
+            emit_step(&mut policy, 100, 3),
+            3,
+            "budget {budget:?} with thinking={thinking} must not force a close"
+        );
+        assert!(
+            !policy.thinking_closed,
+            "the inert path must leave the block state unchanged"
+        );
+    }
+}
+
+#[test]
+fn reasoning_close_cannot_outlive_a_shorter_decode_cap() {
+    let close_id = 9u32;
+    let table: std::sync::Arc<[bool]> = vec![false; 16].into();
+    let mut policy = policy_with_boundaries(2, Some(4), true, Some(close_id), Some(table), 1);
+    assert_eq!(
+        policy.cap(),
+        7,
+        "the decode cap must not grow for the grace window"
+    );
+
+    let mut generated_len = 1;
+    while generated_len < policy.cap() {
+        assert_ne!(
+            emit_step(&mut policy, generated_len, 1),
+            close_id,
+            "the cap ends generation while the block is still open"
+        );
+        generated_len += 1;
+    }
+    assert_eq!(generated_len, 7);
+    assert!(
+        !policy.thinking_closed,
+        "the cap must end the request before the deferred close"
+    );
+}
+
+#[test]
+fn reasoning_close_is_immediate_after_a_boundary_at_budget_minus_one() {
+    let close_id = 9u32;
+    let newline_id = 8u32;
+    let table: std::sync::Arc<[bool]> = vec![
+        false, false, false, false, false, false, false, false, true, false,
+    ]
+    .into();
+    let mut policy = policy_with_boundaries(8, Some(4), true, Some(close_id), Some(table), 1);
+
+    assert_eq!(emit_step(&mut policy, 1, 1), 1);
+    assert_eq!(emit_step(&mut policy, 2, 1), 1);
+    assert_eq!(emit_step(&mut policy, 3, newline_id), newline_id);
+    assert_eq!(
+        emit_step(&mut policy, 4, 1),
+        close_id,
+        "a newline emitted at step B - 1 must close at B without added delay"
+    );
+}
+
 #[test]
 fn force_close_think_cannot_fire_on_the_first_generated_token() {
     let close = 248_069_u32;
@@ -36,12 +224,12 @@ fn force_close_think_cannot_fire_on_the_first_generated_token() {
     // comes closest to holding at step 0, so it is where a wrong baseline
     // would first show. It must still not fire.
     assert_eq!(
-        force_close_think(Some(1), true, false, 0, Some(close)),
+        force_close_think(Some(1), true, false, 0, Some(close), false),
         None,
         "budget 1 must not force on the first generated token"
     );
     assert_eq!(
-        force_close_think(Some(2), true, false, 0, Some(close)),
+        force_close_think(Some(2), true, false, 0, Some(close), false),
         None,
         "budget 2 must not force on the first generated token"
     );
@@ -49,7 +237,7 @@ fn force_close_think_cannot_fire_on_the_first_generated_token() {
     // Must-FIRE control. Without it this test would keep passing if
     // `force_close_think` were changed to return None unconditionally.
     assert_eq!(
-        force_close_think(Some(1), true, false, 1, Some(close)),
+        force_close_think(Some(1), true, false, 1, Some(close), true),
         Some(close),
         "budget 1 must force once one token has been generated"
     );
@@ -69,6 +257,7 @@ fn answer_budget_cannot_be_exhausted_by_the_first_generated_token() {
     let policy = DecodePolicy::init(
         &cfg,
         Some(close),
+        None,
         &mut logprobs,
         close,
         &logits,
@@ -111,6 +300,7 @@ fn a_zero_length_request_never_reaches_the_first_token_path() {
     let policy = DecodePolicy::init(
         &cfg,
         Some(248_069),
+        None,
         &mut logprobs,
         248_069,
         &logits,
@@ -147,7 +337,7 @@ fn finish_after(
         stop_strings: stop_strings.iter().map(|s| (*s).to_string()).collect(),
         ..cfg_with(8, None)
     };
-    let mut policy = DecodePolicy::construct(&cfg, None, 1, 1, true);
+    let mut policy = DecodePolicy::construct(&cfg, None, None, 1, 1, true);
     let mut logprobs = Vec::new();
     let mut offsets = Vec::new();
     let mut text = String::new();
@@ -206,7 +396,7 @@ fn finish_stop_streaming_rejection_wins_over_a_stop_match_in_the_tail() {
 fn finish_stop_disabled_reports_a_rejected_tail_flush() {
     let run = |tail: &str, accept: bool| {
         let cfg = cfg_with(8, None);
-        let mut policy = DecodePolicy::construct(&cfg, None, 1, 1, true);
+        let mut policy = DecodePolicy::construct(&cfg, None, None, 1, 1, true);
         let mut text = String::new();
         let mut calls = 0;
         let outcome = policy.finish_stop(&mut text, tail, |_| {

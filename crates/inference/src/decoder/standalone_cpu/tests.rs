@@ -144,6 +144,7 @@ fn driver_refuses_every_unsupported_control_on_the_standalone_profile() {
                 &mut session,
                 gen_cfg,
                 None,
+                None,
                 &[0, 1, 2],
                 999_999,
                 false,
