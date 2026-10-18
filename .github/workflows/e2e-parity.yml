@@ -1205,8 +1205,7 @@ jobs:
 
       # MP2+MP3 Metal injection gate: `forward_step_injected_logits_differ_by_row_content`,
       # `generate_multimodal_vision_injection_is_mutation_sensitive`,
-      # `injected_embedding_logits_are_independent_of_token_id`,
-      # `injected_embedding_never_falls_back_to_token_lookup`, and (MP3)
+      # `injected_embedding_logits_are_independent_of_token_id`, and (MP3)
       # `forward_step_injected_mrope_logits_differ_by_position`
       # (crates/inference/src/forward/metal_qwen35/inner/tests/multimodal_vision.rs) previously ran nowhere in
       # CI: they early-returned on a missing Metal device or checkpoint instead
@@ -1214,7 +1213,7 @@ jobs:
       # job's `--lib q4` filter does not match their names). This step reuses
       # this job's already-downloaded checkpoint (no second ~2 min
       # checkout+download job) and its macos-latest runner, which exposes a
-      # PARAVIRTUAL Metal device — sufficient here because none of these five
+      # PARAVIRTUAL Metal device — sufficient here because none of these four
       # tests touch the Apple7-gated tiled-GEMM path (decode-only GEMV/element-wise
       # dispatch), the same reasoning the f16-KV-cache Metal gate in ci.yml
       # documents. LATTICE_METAL_TEST_ENFORCE=1 makes a missing device or
@@ -1240,10 +1239,12 @@ jobs:
       # (CPU f16 injection oracle), and
       # `shared_server_runner_drops_router_after_injected_shutdown` (serve-shutdown
       # regression matching only incidentally on the `injected` substring), so
-      # the exact-count grep below is 13 (8 `inject`-filter matches + 3
+      # the exact-count grep below is 12 (7 `inject`-filter matches + 3
       # `emit_head`-filter matches + 2 `vision_runtime_preload`-filter
-      # matches), not 5 -- update it in the same PR if the matched test
-      # surface changes. libtest ORs multiple filter arguments together, so
+      # matches), not 4 -- update it in the same PR if the matched test
+      # surface changes. The source-reading guard
+      # `injected_embedding_never_falls_back_to_token_lookup` runs on every host from
+      # `tests/metal_qwen35_source_contract.rs` and is no longer in this count. libtest ORs multiple filter arguments together, so
       # one step covers all three groups, but the filters MUST be passed to
       # libtest after `--`: `cargo test` itself accepts a single positional
       # TESTNAME (`cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]`) and exits
@@ -1265,7 +1266,7 @@ jobs:
             cat vision-mp2-inject-gate.log
             exit "$status"
           fi
-          grep -Eq '^test result: ok\. 13 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
+          grep -Eq '^test result: ok\. 12 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
 
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —
