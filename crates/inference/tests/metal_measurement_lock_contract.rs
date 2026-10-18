@@ -10,6 +10,9 @@ use syn::{Attribute, ItemFn, Meta, Token};
 mod source_graph;
 use source_graph::*;
 
+#[path = "support/measurement_lock_helpers.rs"]
+mod measurement_lock_helpers;
+
 #[derive(Clone, Copy)]
 enum CallSelector {
     Path(&'static [&'static str]),
@@ -3761,46 +3764,6 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
         violations.is_empty(),
         "in-crate raw command-buffer tests without a function-lifetime shared lock:\n{}",
         violations.join("\n")
-    );
-}
-
-fn assert_helper_mediated_test_holds_function_lifetime_lock(relative: &str, function_name: &str) {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = std::fs::read_to_string(manifest_dir.join(relative))
-        .expect("read helper-mediated Metal tests");
-    let parsed = StructuredSource::parse(relative, &source, true)
-        .unwrap_or_else(|reason| panic!("{reason}"));
-    let function = parsed
-        .test_functions()
-        .unwrap_or_else(|reason| panic!("{reason}"))
-        .into_iter()
-        .find(|function| function.name == function_name)
-        .unwrap_or_else(|| panic!("checked helper-mediated test `{function_name}` was not found"));
-    parsed
-        .validate_selector(
-            function.body.clone(),
-            DEVICE_SYSTEM_DEFAULT,
-            LOCAL_LOCK_SELECTOR,
-            GuardRequirement::Function {
-                closing_brace: function.body.end,
-            },
-        )
-        .unwrap_or_else(|reason| panic!("{relative}::{function_name}: {reason}"));
-}
-
-#[test]
-fn mtp_draft_logit_equivalence_test_holds_a_function_lifetime_lock() {
-    assert_helper_mediated_test_holds_function_lifetime_lock(
-        "src/forward/metal_qwen35/inner/tests/decode_attention.rs",
-        "mtp_draft_logit_equivalence_with_quarot_counter_rotation",
-    );
-}
-
-#[test]
-fn metal_engine_session_isolation_test_holds_a_function_lifetime_lock() {
-    assert_helper_mediated_test_holds_function_lifetime_lock(
-        "src/forward/metal_qwen35/inner/tests/mtp_verify.rs",
-        "test_metal_qwen35_engine_session_isolation",
     );
 }
 
