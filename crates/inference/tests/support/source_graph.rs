@@ -917,6 +917,49 @@ impl<'ast> Visit<'ast> for IncludeCollector<'_> {
     }
 }
 
+pub(crate) fn module_destination(
+    module: &syn::ItemMod,
+    module_dir: &Path,
+    path_attribute_dir: &Path,
+    context: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let module_name = module.ident.unraw().to_string();
+    let direct_path = literal_module_path(&module.attrs, context)?;
+    let target = if let Some(relative) = &direct_path {
+        path_attribute_dir.join(relative)
+    } else {
+        let flat = module_dir.join(format!("{module_name}.rs"));
+        let nested = module_dir.join(&module_name).join("mod.rs");
+        match (flat.exists(), nested.exists()) {
+            (true, false) => flat,
+            (false, true) => nested,
+            (true, true) => {
+                return Err(format!(
+                    "{context}: ambiguous compiler-selected module `{}` at {} and {}",
+                    module.ident,
+                    flat.display(),
+                    nested.display()
+                ));
+            }
+            (false, false) => {
+                return Err(format!(
+                    "{context}: compiler-selected module `{}` could not be resolved at {} or {}",
+                    module.ident,
+                    flat.display(),
+                    nested.display()
+                ));
+            }
+        }
+    };
+    let child_module_dir =
+        if direct_path.is_some() || target.file_name().is_some_and(|name| name == "mod.rs") {
+            target.parent().unwrap_or(module_dir).to_path_buf()
+        } else {
+            target.parent().unwrap_or(module_dir).join(&module_name)
+        };
+    Ok((target, child_module_dir))
+}
+
 pub(crate) struct ModuleGraph<'a> {
     pub(crate) manifest_dir: &'a Path,
     pub(crate) manifest_canonical: PathBuf,
@@ -1048,40 +1091,8 @@ impl ModuleGraph<'_> {
                 self.walk_items(contents, source_path, &inline_dir, &inline_dir, module_cfg)?;
                 continue;
             }
-            let direct_path = literal_module_path(&module.attrs, &context)?;
-            let target = if let Some(relative) = &direct_path {
-                path_attribute_dir.join(relative)
-            } else {
-                let flat = module_dir.join(format!("{module_name}.rs"));
-                let nested = module_dir.join(&module_name).join("mod.rs");
-                match (flat.exists(), nested.exists()) {
-                    (true, false) => flat,
-                    (false, true) => nested,
-                    (true, true) => {
-                        return Err(format!(
-                            "{context}: ambiguous compiler-selected module `{}` at {} and {}",
-                            module.ident,
-                            flat.display(),
-                            nested.display()
-                        ));
-                    }
-                    (false, false) => {
-                        return Err(format!(
-                            "{context}: compiler-selected module `{}` could not be resolved at {} or {}",
-                            module.ident,
-                            flat.display(),
-                            nested.display()
-                        ));
-                    }
-                }
-            };
-            let child_module_dir = if direct_path.is_some()
-                || target.file_name().is_some_and(|name| name == "mod.rs")
-            {
-                target.parent().unwrap_or(module_dir).to_path_buf()
-            } else {
-                target.parent().unwrap_or(module_dir).join(&module_name)
-            };
+            let (target, child_module_dir) =
+                module_destination(module, module_dir, path_attribute_dir, &context)?;
             self.load(&target, &child_module_dir, module_cfg)?;
         }
         Ok(())

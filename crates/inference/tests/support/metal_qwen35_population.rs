@@ -216,6 +216,29 @@ fn resolve_from(base: &Path, path: &Path) -> PathBuf {
     }
 }
 
+pub(crate) fn classify_production_items(
+    file: &str,
+    source: &str,
+    external_cfg: CfgFormula,
+) -> Result<Vec<ProductionItem>, String> {
+    let syntax = syn::parse_file(source)
+        .map_err(|reason| format!("could not parse discovered source {file}: {reason}"))?;
+    let mut reader = ItemReader {
+        file: file.to_string(),
+        inherited_cfg: external_cfg,
+        scope: Vec::new(),
+        next_ordinal: 0,
+        production_items: Vec::new(),
+        test_only_items: Vec::new(),
+        error: None,
+    };
+    reader.visit_file(&syntax);
+    if let Some(reason) = reader.error {
+        return Err(reason);
+    }
+    Ok(reader.production_items)
+}
+
 fn root_module_dir(root: &Path) -> Result<PathBuf, String> {
     let parent = root
         .parent()
