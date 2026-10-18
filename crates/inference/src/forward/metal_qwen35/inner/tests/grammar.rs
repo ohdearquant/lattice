@@ -5,7 +5,7 @@ use super::*;
 // Grammar fail-closed integration tests (#611)
 //
 // These three tests are the hardware-gated end-to-end counterpart to the
-// pure-function `has_finite_logit_tests` module further down this file:
+// pure-function `has_finite_logit_tests` module in `metal_qwen35`:
 // that module proves the *predicate* is correct in isolation, these prove
 // it is actually *wired in* at each real public Metal entry point, using
 // the same technique as the CPU reference test
