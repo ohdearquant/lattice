@@ -985,7 +985,7 @@ def ollama_model_available(base_url: str, model_tag: str, *, pull_if_missing: bo
         )
         if listed.returncode != 0:
             return False
-        if model_tag not in listed.stdout:
+        if not any(row.split()[:1] == [model_tag] for row in listed.stdout.splitlines()):
             pulled = subprocess.run(
                 ["ollama", "pull", model_tag], capture_output=True, text=True, timeout=600, check=False, env=env
             )
