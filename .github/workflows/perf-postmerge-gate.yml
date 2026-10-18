@@ -1,8 +1,8 @@
 name: perf post-merge detection (informational, PAUSED)
 #
 # PAUSED 2026-08-01: this lane no longer runs automatically. It is on-demand only
-# (workflow_dispatch). The rest of this header describes the lane's design and is
-# unchanged; the reason for the pause and the conditions for lifting it are in the
+# (workflow_dispatch). The rest of this header describes the lane's design;
+# the reason for the pause and the conditions for lifting it are in the
 # block immediately above `on:`. Read that before restoring the trigger.
 #
 # WHAT THIS IS, AND WHAT IT IS NOT (lattice#1105).
@@ -20,15 +20,13 @@ name: perf post-merge detection (informational, PAUSED)
 # checks: a post-merge job can never be satisfied pre-merge, and adding it would
 # wedge the merge queue rather than protect it.
 #
-# RESOLUTION CEILING, stated up front so this is not mistaken for fine-grained
-# coverage: GitHub-hosted runners are shared and noisy. This lane reliably
-# catches GROSS regressions (roughly the >=15% class, the magnitude that
-# motivated ADR-058's workflow in the first place). It does NOT resolve
-# sub-few-percent changes — the same noise floor that made quick-mode simd
-# unreliable applies here. A green run means "no gross regression detected", not
-# "performance is unchanged". Tightening this to sub-few-percent resolution
-# requires a dedicated quiet runner and is tracked separately; do not read the
-# absence of a FAIL as evidence of a small change's absence.
+# RESOLUTION IS UNCALIBRATED (#1120). The historical >=15% detection claim was
+# not measured, and identical-source comparisons produced larger excursions.
+# Use comparison_mode=aa with a pinned head_ref to collect same-commit evidence;
+# repeat on each architecture and compare both deltas and flagged-group overlap.
+# A completed calibration run means both targets produced usable measurements,
+# including any threshold excursions; it does not establish a noise floor or
+# certify a regression detector. Thresholds and group coverage remain unchanged.
 #
 # WHY AN A/B AGAINST THE LAST MEASURED COMMIT rather than perf-baselines:
 # bench-update.yml rewrites perf-baselines on nearly every perf-path push to
@@ -44,7 +42,8 @@ name: perf post-merge detection (informational, PAUSED)
 # triggering push's event-before SHA instead.
 
 # PAUSED 2026-08-01, NOT FIXED. The automatic push trigger is removed; the lane
-# still runs on demand via workflow_dispatch, unchanged in every other respect.
+# still runs on demand via workflow_dispatch. Explicit A/A calibration is also
+# available; adding it does not restore automatic detection.
 #
 # Why. Across its 15 verdict-producing runs this lane reported a confirmed
 # regression every single time, on 15 unrelated merges. The cause is its
@@ -189,12 +188,18 @@ name: perf post-merge detection (informational, PAUSED)
 on:
   workflow_dispatch:
     inputs:
+      comparison_mode:
+        description: 'ab: compare commits; aa: calibrate with the same commit in both arms'
+        type: choice
+        options: [ab, aa]
+        required: true
+        default: ab
       base_ref:
-        description: 'Base ref for the A/B (default: the parent commit)'
+        description: 'Base ref (ab default: parent; aa default: head, must resolve to the same commit)'
         required: false
         default: ''
       head_ref:
-        description: 'Head ref for the A/B (default: HEAD)'
+        description: 'Head ref (default: HEAD; use a full commit SHA for repeatable aa runs)'
         required: false
         default: ''
 
@@ -222,7 +227,7 @@ env:
 
 jobs:
   postmerge-ab:
-    name: post-merge A/B (${{ matrix.arch }})
+    name: post-merge ${{ inputs.comparison_mode || 'ab' }} (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -252,6 +257,7 @@ jobs:
         env:
           IN_BASE: ${{ github.event.inputs.base_ref }}
           IN_HEAD: ${{ github.event.inputs.head_ref }}
+          COMPARISON_MODE: ${{ inputs.comparison_mode || 'ab' }}
           EVENT_BEFORE: ${{ github.event.before }}
           STATE_BRANCH: perf-postmerge-measured-${{ matrix.arch }}
         run: |
@@ -261,10 +267,11 @@ jobs:
             --event-before "$EVENT_BEFORE" \
             --base-ref "$IN_BASE" \
             --head-ref "$IN_HEAD" \
+            --comparison-mode "$COMPARISON_MODE" \
             --state-branch "$STATE_BRANCH" \
             --github-output "$GITHUB_OUTPUT"
 
-      - name: Declare scope and resolution ceiling
+      - name: Declare scope and calibration limits
         env:
           BASE: ${{ steps.refs.outputs.base }}
           HEAD: ${{ steps.refs.outputs.head }}
@@ -272,9 +279,10 @@ jobs:
           SPAN_COUNT: ${{ steps.refs.outputs.span_count }}
           STATE_BRANCH: ${{ steps.refs.outputs.state_branch }}
           STATE_BEFORE: ${{ steps.refs.outputs.state_before }}
+          COMPARISON_MODE: ${{ steps.refs.outputs.comparison_mode }}
         run: |
           {
-            echo "### perf post-merge A/B (${{ matrix.arch }})"
+            echo "### perf post-merge $COMPARISON_MODE (${{ matrix.arch }})"
             echo
             echo "\`$BASE\` -> \`$HEAD\`, full-mode order-balanced Criterion."
             echo "Base source: \`$BASE_SOURCE\`; commit span: \`$SPAN_COUNT\`."
@@ -282,8 +290,8 @@ jobs:
             echo
             echo "**Coverage.** Every group of the two benched targets"
             echo "(\`lattice-inference:elementwise_cpu_bench\`, \`lattice-embed:simd\`)"
-            echo "gates: the quick-mode informational demotion does not apply in full"
-            echo "mode, and this job sets no \`BENCH_GROUPS_*\` filter. The workspace's"
+            echo "is evaluated at the full-mode thresholds: the quick-mode informational"
+            echo "demotion does not apply, and this job sets no \`BENCH_GROUPS_*\` filter. The workspace's"
             echo "other bench targets are not run here."
             echo
             echo "**Order control.** Enforcement runs \`base₁ → head₁ → head₂ →"
@@ -295,19 +303,25 @@ jobs:
             echo "**Scope.** This lane DETECTS post-merge; it cannot gate the merge"
             echo "that introduced a regression, and it is not a required check."
             echo
-            echo "**Resolution ceiling.** Hosted runners are shared and noisy. This"
-            echo "reliably catches gross regressions (roughly the >=15% class). It"
-            echo "does NOT resolve sub-few-percent changes. A green run means \"no"
-            echo "gross regression detected\", NOT \"performance is unchanged\"."
+            echo "**Calibration.** Resolution on these hosted runners remains"
+            echo "uncalibrated. A completed run alone does not establish a noise"
+            echo "floor or prove that this lane can detect a given effect size."
+            if [ "$COMPARISON_MODE" = "aa" ]; then
+              echo "Both arms use the same commit. Threshold excursions are"
+              echo "diagnostic observations, not regressions attributable to code."
+              echo "Repeat this commit on each architecture; compare group deltas"
+              echo "and flagged-group overlap using the calibration artifacts."
+            fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Full-mode A/B, failing on a confirmed regression
+      - name: Full-mode comparison with measurement guards
         id: ab
         continue-on-error: true
         env:
           BASE: ${{ steps.refs.outputs.base }}
           HEAD: ${{ steps.refs.outputs.head }}
           PERF_POSTMERGE_STATUS_DIR: ${{ runner.temp }}/perf-postmerge-status
+          COMPARISON_LOG: ${{ runner.temp }}/perf-postmerge-comparison.log
         run: |
           # Record the gate's OWN exit code before re-raising it. The summary
           # below has to tell "confirmed regression" from "refused to certify",
@@ -316,8 +330,9 @@ jobs:
           # would otherwise be reported to the reader as one of those two gate
           # verdicts and point them at a revert for a run that never benched.
           rc=0
-          scripts/bench-compare.sh --full --fail-on-regression "$BASE" "$HEAD" || rc=$?
+          scripts/bench-compare.sh --full --fail-on-regression "$BASE" "$HEAD" > "$COMPARISON_LOG" 2>&1 || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat "$COMPARISON_LOG"
           exit "$rc"
 
       - name: Upload machine-readable gate status
@@ -327,6 +342,19 @@ jobs:
           name: perf-postmerge-status-${{ matrix.arch }}
           path: ${{ runner.temp }}/perf-postmerge-status/
           if-no-files-found: warn
+
+      - name: Upload A/A calibration evidence
+        if: ${{ always() && steps.refs.outputs.comparison_mode == 'aa' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-postmerge-calibration-${{ matrix.arch }}
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/perf-postmerge-comparison.log
+            ${{ runner.temp }}/perf-postmerge-status/
+            .cache/bench-run-provenance.txt
+            .cache/bench-compare-criterion/
+          if-no-files-found: error
 
       - name: Record the successfully measured head
         id: record
@@ -345,6 +373,7 @@ jobs:
         env:
           AB_RC: ${{ steps.ab.outputs.rc }}
           STATUS_DIR: ${{ runner.temp }}/perf-postmerge-status
+          COMPARISON_MODE: ${{ steps.refs.outputs.comparison_mode }}
         run: |
           # Annotation failures must not replace the gate's existing outcome.
           python3 - "$STATUS_DIR" <<'PY' || true
@@ -374,6 +403,56 @@ jobs:
                   detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
                   print(f"::warning title=In-phase foreign CPU load::{detail}")
           PY
+          if [ "${COMPARISON_MODE:-ab}" = "aa" ]; then
+            python3 - "$STATUS_DIR" "$AB_RC" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          root, raw_rc, output = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+          expected = {
+              "lattice-inference-elementwise_cpu_bench.json": "lattice-inference:elementwise_cpu_bench",
+              "lattice-embed-simd.json": "lattice-embed:simd",
+          }
+          effective_rc = 3 if raw_rc == "3" else 2
+          try:
+              if raw_rc not in ("0", "1"):
+                  raise ValueError("comparison did not complete with usable measurements")
+              if {path.name for path in root.glob("*.json")} != set(expected):
+                  raise ValueError("expected exactly one status file for each of the two targets")
+              codes, excursions = [], 0
+              for name, target in expected.items():
+                  status = json.loads((root / name).read_text())
+                  if not isinstance(status, dict):
+                      raise ValueError(f"{name}: status is not an object")
+                  code = status.get("exit_code")
+                  count = status.get("measurement_count")
+                  failures = status.get("regression_count")
+                  if (status.get("schema") != "perf-bench-gate-status/v1"
+                          or status.get("target") != target
+                          or status.get("arch") != f"local-compare/{target}"
+                          or type(code) is not int or code not in (0, 1)
+                          or status.get("verdict") != ("pass" if code == 0 else "regression")
+                          or type(count) is not int or count < 1
+                          or type(failures) is not int or not 0 <= failures <= count
+                          or (failures > 0) != (code == 1)):
+                      raise ValueError(f"{name}: incomplete or inconsistent gate status")
+                  codes.append(code)
+                  excursions += failures
+              if max(codes) != int(raw_rc):
+                  raise ValueError("comparison exit disagrees with target statuses")
+              effective_rc = 0
+              print(f"A/A collection complete: {excursions} identical-source threshold excursion(s); "
+                    "this is calibration evidence, not a code-regression verdict.")
+          except (OSError, ValueError) as error:
+              print(f"A/A calibration incomplete: {error}; raw exit={raw_rc!r}", file=sys.stderr)
+          with output.open("a") as stream:
+              stream.write(f"effective_rc={effective_rc}\n")
+              stream.write(f"calibration_complete={'true' if effective_rc == 0 else 'false'}\n")
+          sys.exit(effective_rc)
+          PY
+            exit $?
+          fi
           if [ "$AB_RC" = "3" ]; then
             python3 - "$STATUS_DIR" <<'PY'
           import json
@@ -453,15 +532,30 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           STATE_BRANCH: ${{ steps.refs.outputs.state_branch }}
           HEAD: ${{ steps.refs.outputs.head }}
+          COMPARISON_MODE: ${{ steps.refs.outputs.comparison_mode }}
+          CALIBRATION_COMPLETE: ${{ steps.classify.outputs.calibration_complete }}
         run: |
           {
-            if [ "$EFFECTIVE_RC" = "3" ]; then
+            if [ "$COMPARISON_MODE" = "aa" ]; then
+              if [ "$CALIBRATION_COMPLETE" = "true" ]; then
+                echo "A/A collection completed for both targets (raw comparison exit \`$AB_RC\`)."
+                echo "Threshold excursions on identical source are calibration observations;"
+                echo "this run does not establish a noise floor or certify a detector."
+                if [ "$JOB_STATUS" != "success" ]; then
+                  echo "The job still failed outside classification; inspect the artifact and setup steps."
+                fi
+              else
+                echo "A/A calibration incomplete (raw comparison exit \`$AB_RC\`, classification \`$EFFECTIVE_RC\`)."
+                echo "Partial or unmeasurable data is not a completed calibration replicate."
+              fi
+              echo "Progression state was not updated. Retain the per-architecture calibration artifacts."
+            elif [ "$EFFECTIVE_RC" = "3" ]; then
               echo "GAP, exit 3 — verdict \`not_measurable\`. Measurement conditions"
               echo "invalidated this run, so it produced no performance data point"
               echo "and did not advance \`$STATE_BRANCH\`. See the warning and"
               echo "\`perf-postmerge-status-${{ matrix.arch }}\` artifact."
             elif [ "$JOB_STATUS" = "success" ]; then
-              echo "No gross regression detected (see ceiling above)."
+              echo "No threshold excursion detected; this lane's resolution remains uncalibrated."
               if [ "$EVENT_NAME" = "push" ]; then
                 echo "Recorded \`$HEAD\` as the last successful measurement on"
                 echo "\`$STATE_BRANCH\`."

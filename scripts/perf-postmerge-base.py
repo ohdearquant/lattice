@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve post-merge A/B endpoints from the last successfully measured commit."""
+"""Resolve post-merge A/B endpoints or explicitly requested manual A/A calibration."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 class ResolutionError(RuntimeError):
-    """The requested A/B range cannot be established safely."""
+    """The requested comparison range cannot be established safely."""
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -94,12 +94,22 @@ def event_parent(repo: Path, head: str, before: str, suffix: str) -> tuple[str, 
 
 
 def resolve(args: argparse.Namespace) -> dict[str, str]:
+    if args.comparison_mode == "aa" and args.event_name != "workflow_dispatch":
+        raise ResolutionError("A/A calibration requires workflow_dispatch")
+
     repo = args.repo.resolve()
     head_ref = args.head_ref or "HEAD"
     head = resolve_commit(repo, head_ref)
     state_before = "not-queried"
 
-    if args.base_ref:
+    if args.comparison_mode == "aa":
+        base = resolve_commit(repo, args.base_ref) if args.base_ref else head
+        if base != head:
+            raise ResolutionError(
+                f"A/A calibration requires identical commits: base {base}, head {head}"
+            )
+        source = "dispatch-calibration"
+    elif args.base_ref:
         base = resolve_commit(repo, args.base_ref)
         source = "dispatch-input"
     elif args.event_name == "push":
@@ -119,17 +129,23 @@ def resolve(args: argparse.Namespace) -> dict[str, str]:
     else:
         base, source = event_parent(repo, head, args.event_before, "dispatch")
 
-    if base == head:
+    if base == head and args.comparison_mode != "aa":
         raise ResolutionError(f"base and head resolve to the same commit ({head})")
     if not is_ancestor(repo, base, head):
         raise ResolutionError(f"base {base} is not an ancestor of head {head}")
 
     span_result = git(repo, "rev-list", "--count", f"{base}..{head}")
     span = span_result.stdout.strip()
-    if not span.isdigit() or int(span) < 1:
+    if args.comparison_mode == "aa":
+        if span != "0":
+            raise ResolutionError(
+                f"A/A calibration commit span for {base}..{head} is not zero: {span!r}"
+            )
+    elif not span.isdigit() or int(span) < 1:
         raise ResolutionError(f"commit span for {base}..{head} is not positive: {span!r}")
 
     return {
+        "comparison_mode": args.comparison_mode,
         "base": base,
         "head": head,
         "base_source": source,
@@ -143,6 +159,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--event-name", choices=("push", "workflow_dispatch"), required=True)
+    parser.add_argument("--comparison-mode", choices=("ab", "aa"), default="ab")
     parser.add_argument("--event-before", default="")
     parser.add_argument("--base-ref", default="")
     parser.add_argument("--head-ref", default="")
@@ -159,8 +176,9 @@ def main() -> int:
         print(f"perf-postmerge-base: {error}", file=sys.stderr)
         return 2
 
+    label = "A/A" if outputs["comparison_mode"] == "aa" else "A/B"
     print(
-        "A/B endpoints: "
+        f"{label} endpoints: "
         f"{outputs['base']} -> {outputs['head']} "
         f"(source={outputs['base_source']}, commits={outputs['span_count']}, "
         f"state={outputs['state_before']})"
