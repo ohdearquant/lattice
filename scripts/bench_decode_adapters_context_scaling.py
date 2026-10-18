@@ -15,6 +15,9 @@ adds the TSV-rendering + chart-invocation step the harness core does not
 own (`render_report`/`aggregate` produce the harness's own report and raw
 JSONL, not a chart-compatible TSV).
 
+Ollama's selected duration is `eval_duration`, so model loading and prompt
+evaluation do not enter the decode slope, including a cold RUNS=1 sweep.
+
 Run with (from repo root): `uv run --quiet --with mlx-lm python3
 scripts/bench_decode_harness.py run --profile context_scaling
 [--contexts 64,128,256] [--runs 5] [--chart-only]
@@ -140,13 +143,12 @@ _REQUIRED_OLLAMA_FIELDS = ("eval_count", "eval_duration", "total_duration")
 
 
 def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
-    """Mirrors `legacy context-scaling consumer`'s `ollama_median()`: its median is
-    over `total_duration/1e6` (ms) values -- the SAME primary field as the
-    apples_to_apples/apples_precise adapters, just pre-divided by run count
-    in the legacy shell function. `eval_count`/`eval_duration` are not used
-    by the legacy script's context-scaling ollama path, but are validated
-    here anyway for response-shape integrity (same contract as the other
-    two ollama adapters in this consolidation)."""
+    """Select positive decode-only `eval_duration` for context-scaling slopes.
+
+    Unlike the former `total_duration` metric, this excludes model loading
+    and prompt evaluation from each window's duration. `total_duration`
+    remains required and positive for response-shape validation.
+    """
     if "error" in data:
         raise OllamaResponseError(f"ollama: response is an error body: {data['error']!r}")
     for field in _REQUIRED_OLLAMA_FIELDS:
@@ -162,13 +164,13 @@ def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
     total_duration = data["total_duration"]
     if eval_count < 0:
         raise OllamaResponseError(f"ollama: eval_count={eval_count!r} is negative: {data!r}")
-    if eval_duration < 0:
-        raise OllamaResponseError(f"ollama: eval_duration={eval_duration!r} is negative: {data!r}")
+    if eval_duration <= 0:
+        raise OllamaResponseError(f"ollama: eval_duration={eval_duration!r} must be positive: {data!r}")
     if total_duration <= 0:
         raise OllamaResponseError(f"ollama: total_duration={total_duration!r} must be positive: {data!r}")
     return harness.AdapterRunResult(
         actual_completion_tokens=int(eval_count),
-        native_ns=int(total_duration),
+        native_ns=int(eval_duration),
         engine_version="ollama",
     )
 
@@ -344,7 +346,7 @@ def _legacy_ordered_median(values: list[float], engine: str) -> float:
 def compute_context_scaling_aggregate(
     run_result: harness.HarnessRunResult,
 ) -> tuple[list[harness.SlopeResult], dict[tuple[str, int], float]]:
-    """Legacy-exact aggregation for the `context_scaling` profile: computes
+    """Apply the profile's per-engine median policy to selected durations: computes
     both the slope AND the per-(engine, window) median elapsed seconds from
     the SAME `_legacy_ordered_median` call, so the printed report and the
     chart-compatible TSV's `t1_ms`/`t2_ms` columns can never diverge from
@@ -359,6 +361,8 @@ def compute_context_scaling_aggregate(
     predecessor script gives lattice/ollama and mlx two DIFFERENT
     even-`n` tie-break rules (see `_legacy_ordered_median`), which no
     single profile-wide `aggregation` setting can express.
+    Ollama's selected durations now exclude loading and prompt evaluation;
+    this preserves the median policy, not the former total-duration values.
     """
     profile = run_result.profile
     baseline_window = profile.windows[0]

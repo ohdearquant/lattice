@@ -7,7 +7,9 @@ Run with: python3 tests/test_bench_decode_adapters_context_scaling.py -v
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -376,11 +378,106 @@ class OllamaResponseParsingTest(unittest.TestCase):
             {"eval_count": 64, "eval_duration": 500_000_000, "total_duration": 800_000_000}
         )
         self.assertEqual(result.actual_completion_tokens, 64)
-        self.assertEqual(result.native_ns, 800_000_000)
+        self.assertEqual(result.native_ns, 500_000_000)
 
     def test_error_body_raises(self):
         with self.assertRaises(adapters.OllamaResponseError):
             adapters.ollama_response_to_result({"error": "boom"})
+
+    def test_required_fields_keep_type_presence_and_range_validation(self):
+        valid = {"eval_count": 64, "eval_duration": 500_000_000, "total_duration": 800_000_000}
+        for field in valid:
+            with self.subTest(field=field, missing=True):
+                data = {name: value for name, value in valid.items() if name != field}
+                with self.assertRaisesRegex(adapters.OllamaResponseError, field):
+                    adapters.ollama_response_to_result(data)
+            for invalid in (True, False, 1.5, "1", None, -1):
+                with self.subTest(field=field, value=invalid):
+                    with self.assertRaisesRegex(adapters.OllamaResponseError, field):
+                        adapters.ollama_response_to_result({**valid, field: invalid})
+        with self.assertRaisesRegex(adapters.OllamaResponseError, "total_duration.*positive"):
+            adapters.ollama_response_to_result({**valid, "total_duration": 0})
+        result = adapters.ollama_response_to_result({**valid, "eval_count": 0})
+        self.assertEqual(result.actual_completion_tokens, 0)
+
+    def test_zero_eval_duration_is_rejected(self):
+        with self.assertRaisesRegex(adapters.OllamaResponseError, "eval_duration.*positive"):
+            adapters.ollama_response_to_result(
+                {"eval_count": 64, "eval_duration": 0, "total_duration": 800_000_000}
+            )
+
+
+class OllamaContextScalingDurationTest(unittest.TestCase):
+    def _run_profile(self, load_durations, prompt_durations):
+        _, profiles = harness.load_profiles_file(DEFAULT_PROFILES_FILE)
+        profile = dataclasses.replace(profiles["context_scaling"], measured_repeats=1)
+        calls = []
+
+        def respond(request, *, timeout):
+            self.assertEqual(request.full_url, "http://127.0.0.1:11434/api/generate")
+            self.assertEqual(request.get_method(), "POST")
+            self.assertEqual(timeout, 600)
+            payload = json.loads(request.data)
+            calls.append(payload)
+            index = len(calls) - 1
+            tokens = payload["options"]["num_predict"]
+            decode_duration = tokens * 15_625_000
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = json.dumps({
+                "eval_count": tokens,
+                "eval_duration": decode_duration,
+                "total_duration": decode_duration + load_durations[index] + prompt_durations[index],
+                "load_duration": load_durations[index],
+                "prompt_eval_duration": prompt_durations[index],
+            }).encode("utf-8")
+            return response
+
+        with mock.patch.object(adapters.urllib.request, "urlopen", side_effect=respond) as urlopen:
+            result = harness.run_profile(
+                profile,
+                {"ollama": adapters.OllamaAdapter("http://127.0.0.1:11434")},
+                allow_missing_engine=True,
+                clock=_FakeClock(),
+                git_sha_value="fixture-revision",
+                hardware_id_value="fixture-host",
+                timestamp_fn=lambda: "2001-02-03T04:05:06+00:00",
+            )
+        self.assertEqual(urlopen.call_count, 4)
+        self.assertEqual(calls, [{
+            "model": "qwen3.5:0.8b", "prompt": profile.prompt, "stream": False,
+            "options": {"num_predict": tokens, "temperature": 0, "seed": 42},
+        } for tokens in (8, 64, 128, 256)])
+        self.assertEqual([obs.engine_native_ns for obs in result.observations], [125_000_000, 1_000_000_000, 2_000_000_000, 4_000_000_000])
+        slopes, medians = adapters.compute_context_scaling_aggregate(result)
+        return result, slopes, medians, adapters.render_legacy_tsv(result, slopes, medians)
+
+    def test_cold_single_repeat_uses_decode_duration_through_tsv(self):
+        result, slopes, medians, tsv = self._run_profile(
+            [10_000_000_000, 0, 0, 0], [7_000_000_000, 1_000_000_000, 2_000_000_000, 3_000_000_000],
+        )
+        self.assertEqual([obs.requested_completion_tokens for obs in result.observations], [8, 64, 128, 256])
+        self.assertEqual([obs.actual_completion_tokens for obs in result.observations], [8, 64, 128, 256])
+        self.assertEqual([obs.warmup for obs in result.observations], [False] * 4)
+        self.assertEqual([obs.run_index for obs in result.observations], [1] * 4)
+        self.assertEqual(medians, {("ollama", 8): 0.125, ("ollama", 64): 1.0, ("ollama", 128): 2.0, ("ollama", 256): 4.0})
+        self.assertEqual([(s.baseline_window, s.window, s.slope_tok_per_s, s.baseline_n, s.window_n) for s in slopes],
+                         [(8, 64, 64.0, 1, 1), (8, 128, 64.0, 1, 1), (8, 256, 64.0, 1, 1)])
+        self.assertEqual(tsv, "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope\n"
+                         f"ollama\t64\t64.0\t125.000\t1000.000\t1\t{harness.OLLAMA_SCOPE}\n"
+                         f"ollama\t128\t64.0\t125.000\t2000.000\t1\t{harness.OLLAMA_SCOPE}\n"
+                         f"ollama\t256\t64.0\t125.000\t4000.000\t1\t{harness.OLLAMA_SCOPE}\n")
+
+    def test_decode_tsv_is_invariant_to_load_and_prompt_overhead(self):
+        _, first_slopes, first_medians, first_tsv = self._run_profile(
+            [10_000_000_000, 0, 0, 0], [7_000_000_000, 1_000_000_000, 2_000_000_000, 3_000_000_000],
+        )
+        _, second_slopes, second_medians, second_tsv = self._run_profile(
+            [0, 1_234_567_890_123, 99_999_999_999, 500], [50_000_000_000, 0, 123, 9_876_543_210],
+        )
+        self.assertEqual(first_medians, second_medians)
+        self.assertEqual(first_slopes, second_slopes)
+        self.assertEqual(first_tsv, second_tsv)
 
 
 class LatticeResultParsingTest(unittest.TestCase):

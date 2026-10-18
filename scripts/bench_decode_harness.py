@@ -1814,26 +1814,26 @@ class SlopeResult:
 
 
 def _primary_elapsed_seconds(o: Observation) -> float:
-    """The duration used for aggregation/slope computation and legacy TSV
-    rendering: the adapter-reported native/engine duration
-    (`engine_native_ns`) when the adapter provided one, falling back to the
-    harness's own outer wall-clock `elapsed_ns` only when it did not (e.g.
-    MLX's in-process `generate()` call, where there is no separate native
-    reading -- the wall clock IS the measured work).
+    """Duration used for aggregation, slope computation and legacy TSV rendering.
+    Use adapter-reported `engine_native_ns` when available; otherwise use the
+    harness's outer `elapsed_ns` (for example, MLX's in-process `generate()`,
+    where the wall clock measures the work without a separate native reading).
 
-    This distinction matters because `elapsed_ns` measures the FULL adapter
-    invocation -- for the lattice/ollama subprocess-per-call adapters, that
-    includes one subprocess spawn and (for lattice) one model load per
-    measured/warmup call, time the legacy per-process-loop scripts
-    (`legacy precise apples-to-apples consumer`, `legacy Q4 comparison consumer`,
-    `legacy context-scaling consumer`) never paid per observation -- they load the
-    model once and time only the engine's own reported duration
-    (`RESULT total_ms=`/ollama's `total_duration`) for every repeat.
-    Aggregating `elapsed_ns` unconditionally would silently make every
-    migrated slope non-comparable with its legacy predecessor (issue #813
-    codex round-1 finding 1) -- `elapsed_ns` remains on every `Observation`
-    for provenance/diagnostics, but is never the primary aggregated value
-    when a native duration is available.
+    Outer timing includes the whole adapter invocation. For subprocess-per-call
+    Lattice/Ollama adapters, it includes process startup and, for Lattice,
+    model loading on every measured or warmup call. Legacy precise, Q4 and
+    context-scaling consumers instead loaded once per process and used
+    `RESULT total_ms=` or Ollama's `total_duration` for each observation.
+    Aggregating outer timing would introduce those costs and break comparison
+    with the corresponding legacy metric. Keep `elapsed_ns` for provenance
+    and diagnostics, but prefer native timing whenever the adapter provides it.
+
+    Native timing alone does not make different adapter metrics comparable.
+    The context-scaling Ollama adapter now reports `eval_duration` instead of
+    `total_duration`, excluding model loading and prompt evaluation.
+    Its old timings and slopes require a fresh baseline. This correction is
+    specific to that adapter; it does not change the other legacy profiles'
+    timing definitions or make their observations interchangeable.
     """
     return (o.engine_native_ns if o.engine_native_ns is not None else o.elapsed_ns) / 1e9
 

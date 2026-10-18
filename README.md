@@ -56,18 +56,22 @@ model library from a single window. To build and install it, follow the step-by-
 
 ## Benchmarks
 
-Decode throughput is measured **decode-only**: steady-state token generation speed with prompt
-prefill and one-time model load excluded. Per-token decode latency is fit as
-`t = intercept + slope * ctx` across several context lengths (the "slope method") and reported as
-`1000 / t` at each. `Context` is the number of tokens already in the KV cache when the measured
-token is decoded. Model load is kept out of the measured window per engine as follows: the
-Lattice leg times `generate()` after an in-process load, the MLX leg gets an explicit 4-token
-warmup, and the Ollama leg relies on the median across runs to shed a cold first request (its
-API's `total_duration` includes load time, so a single-run invocation can still include it — a
-known harness limitation noted in [#1060](https://github.com/ohdearquant/lattice/issues/1060)).
-The wall-clock speed you observe in an interactive chat is lower than decode-only numbers,
-because it also includes prefill of the whole prompt (see "Why throughput falls with context"
-below).
+The context-scaling benchmark estimates incremental generation throughput by comparing requested
+output-token budgets with an 8-token baseline. For each budget `N` (64, 128 and 256 by default),
+it reports `(N - 8) / (T(N) - T(8))` tokens/s, where `T(N)` is the median measured duration in
+seconds. The `Context` labels identify requested output-token budgets.
+
+Lattice times `chat_completion()` after model loading, including prompt processing, prefill and
+generation. Subtracting the baseline is intended to cancel common prefill and fixed per-call
+costs. The MLX leg receives an explicit 4-token warmup. The context-scaling Ollama leg uses the
+API's `eval_duration`, which records output-token generation separately from model loading and
+prompt evaluation. This excludes those durations even in a single-run invocation. Older
+context-scaling reports used Ollama's `total_duration`; their Ollama timings and derived slopes
+are not directly comparable with the corrected metric. Regenerate the measurements before
+making that comparison
+([#1060](https://github.com/ohdearquant/lattice/issues/1060)).
+These estimates do not measure end-to-end interactive latency, which also depends on model
+loading, prompt length and other request costs (see "Why throughput falls with context" below).
 
 The cross-engine decode table previously published here has been withdrawn. An audit traced its
 Lattice and Ollama columns to an arithmetic bug in a retired reporting script: the slope
