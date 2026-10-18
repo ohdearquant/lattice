@@ -1186,7 +1186,7 @@ fn chat_template_thinking_defaults_preserve_qwen_default() {
                 &request(&body),
                 defaults(),
                 profile,
-                |_, _, _, _| Ok(String::new()),
+                |_, _, _, _, _| Ok(String::new()),
             )
             .unwrap();
             assert_eq!(enable_thinking, expected, "field={field}");
@@ -1295,7 +1295,7 @@ fn thinking_off_makes_reasoning_budget_inert_in_context_callback() {
             &req,
             generation,
             ServeProfile::lattice("model", 100),
-            |_, max_tokens, effective_budget, enabled| {
+            |_, max_tokens, effective_budget, enabled, _| {
                 assert!(!enabled);
                 assert_eq!(effective_budget, None);
                 validate_context_window_with_budget(1, max_tokens, effective_budget, 18)?;

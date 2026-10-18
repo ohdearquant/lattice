@@ -192,6 +192,15 @@ pub fn build_cfg(req: &ValidatedChatRequest) -> GenerateConfig {
     crate::serving_provider::providers::qwen::build_cfg(req)
 }
 
+/// Whether this request explicitly enabled thinking in its chat template.
+#[doc(hidden)]
+pub fn explicitly_enabled_thinking(req: &ChatCompletionRequest) -> Result<bool, ApiError> {
+    Ok(
+        crate::serve::contract::parse_chat_template_kwargs(&req.chat_template_kwargs)?
+            == Some(true),
+    )
+}
+
 /// Output of [`prepare_gemma_chat_request`]: the rendered prompt and the
 /// `GenerateConfig` the Gemma adapter builds for it.
 #[doc(hidden)]

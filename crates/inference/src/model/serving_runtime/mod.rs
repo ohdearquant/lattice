@@ -38,11 +38,16 @@ pub(crate) trait ServingRuntime {
         cfg: &GenerateConfig,
         lora: &[LoraSelection],
         stream: bool,
+        explicitly_thinking: bool,
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure> {
         self.execute(
-            RuntimeInput::ChatMessages { messages, lora },
+            RuntimeInput::ChatMessages {
+                messages,
+                lora,
+                explicitly_thinking,
+            },
             cfg,
             stream,
             on_token,

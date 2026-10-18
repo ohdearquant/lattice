@@ -1159,6 +1159,8 @@ async fn chat_completions_with_request(
         state.default_max_tokens,
         state.max_tokens_cap,
     )?;
+    #[cfg(feature = "metal-gpu")]
+    let explicitly_thinking = lattice_inference::serve::prepare::explicitly_enabled_thinking(&req)?;
 
     // Metal-only: reuse the exact messages normalized alongside the CPU
     // prompt, so role/content validation and allocation happen once.
@@ -1388,12 +1390,13 @@ async fn chat_completions_with_request(
                 // `ApiError::ServiceUnavailable` (503) before this
                 // handler ever returns `Sse::new(...)`. Only draining the
                 // already-admitted job happens in the detached task.
-                let mut rx = handle.client.submit_with_lora_mode(
+                let mut rx = handle.client.submit_with_lora_mode_and_thinking(
                     chat_messages,
                     gen_cfg,
                     cancel_rx,
                     requested.selection().to_vec(),
                     true,
+                    explicitly_thinking,
                 )?;
                 // An unload queued ahead of this job can invalidate the HTTP
                 // snapshot. Resolve the worker's rejection before committing SSE.
@@ -1579,11 +1582,13 @@ async fn chat_completions_with_request(
             #[cfg(feature = "metal-gpu")]
             ModelBackend::Metal { handle, .. } => {
                 let (_guard, cancel) = lattice_inference::serve::cancel_pair();
-                let mut rx = handle.client.submit_with_lora(
+                let mut rx = handle.client.submit_with_lora_mode_and_thinking(
                     chat_messages,
                     gen_cfg,
                     cancel,
                     requested.selection().to_vec(),
+                    false,
+                    explicitly_thinking,
                 )?;
                 MetalHandle::drain(&mut rx, None, |_delta| true)
                     .await

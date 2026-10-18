@@ -63,7 +63,12 @@ impl ServingRuntime for QwenMetalRuntime {
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure> {
-        let RuntimeInput::ChatMessages { messages, lora } = input else {
+        let RuntimeInput::ChatMessages {
+            messages,
+            lora,
+            explicitly_thinking,
+        } = input
+        else {
             return Err(WorkerFailure::Failed(
                 "prepared text is not supported by the Metal runtime".to_owned(),
             ));
@@ -88,6 +93,7 @@ impl ServingRuntime for QwenMetalRuntime {
                 messages,
                 image_message_index,
                 cfg.enable_thinking,
+                explicitly_thinking,
                 should_cancel,
                 |prompt_len| {
                     check_prompt_fits_window(
@@ -135,6 +141,7 @@ impl ServingRuntime for QwenMetalRuntime {
             meta.context_window_policy,
             meta.model_max_context,
             cfg,
+            explicitly_thinking,
         )
         .map_err(WorkerFailure::Rejected)?;
 

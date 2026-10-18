@@ -203,6 +203,7 @@ pub struct WorkerJob {
     messages: Vec<ChatMessage>,
     cfg: GenerateConfig,
     lora: Vec<LoraSelection>,
+    explicitly_thinking: bool,
     /// Whether the submitting HTTP request is streamed. Generation does not
     /// depend on it; a runtime that records its route per request names the
     /// mode there.
@@ -536,7 +537,9 @@ impl MetalWorkerClient {
 
     /// [`Self::submit_with_lora`] for a caller that knows whether the HTTP
     /// response it will build is streamed. The worker hands the flag to the
-    /// runtime, which names the mode in its per-request route line.
+    /// runtime, which names the mode in its per-request route line. A request
+    /// that explicitly enabled thinking goes through
+    /// [`Self::submit_with_lora_mode_and_thinking`]; this one renders it unprimed.
     pub fn submit_with_lora_mode(
         &self,
         messages: Vec<ChatMessage>,
@@ -544,6 +547,20 @@ impl MetalWorkerClient {
         cancel: watch::Receiver<bool>,
         lora: Vec<LoraSelection>,
         stream: bool,
+    ) -> Result<mpsc::UnboundedReceiver<WorkerEvent>, ApiError> {
+        self.submit_with_lora_mode_and_thinking(messages, gen_cfg, cancel, lora, stream, false)
+    }
+
+    /// Submit a request that explicitly enabled thinking in its chat template.
+    #[doc(hidden)]
+    pub fn submit_with_lora_mode_and_thinking(
+        &self,
+        messages: Vec<ChatMessage>,
+        gen_cfg: GenerateConfig,
+        cancel: watch::Receiver<bool>,
+        lora: Vec<LoraSelection>,
+        stream: bool,
+        explicitly_thinking: bool,
     ) -> Result<mpsc::UnboundedReceiver<WorkerEvent>, ApiError> {
         self.validate_lora(&lora)?;
         let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
@@ -558,6 +575,7 @@ impl MetalWorkerClient {
             messages,
             cfg: gen_cfg,
             lora,
+            explicitly_thinking,
             stream,
             tx,
             cancel,
@@ -737,9 +755,10 @@ pub(crate) fn render_text_prompt_within_window(
     policy: ContextWindowPolicy,
     model_max_context: usize,
     cfg: &GenerateConfig,
+    explicitly_thinking: bool,
 ) -> Result<(String, usize), ApiError> {
     let mut prompt = format_chat_template(messages);
-    apply_qwen_thinking_mode(&mut prompt, cfg.enable_thinking);
+    apply_qwen_thinking_mode(&mut prompt, cfg.enable_thinking, explicitly_thinking);
     let prompt_len = tokenizer.tokenize(&prompt).pre_truncation_len;
     check_prompt_fits_window(policy, model_max_context, prompt_len, cfg)?;
     Ok((prompt, prompt_len))
@@ -846,6 +865,7 @@ fn run_worker_loop(
     generate: impl FnMut(
         &[ChatMessage],
         &GenerateConfig,
+        bool,
         &mut dyn FnMut(&str, u32) -> bool,
         &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>,
@@ -880,6 +900,7 @@ fn run_worker_loop_with_control(
     mut generate: impl FnMut(
         &[ChatMessage],
         &GenerateConfig,
+        bool,
         &mut dyn FnMut(&str, u32) -> bool,
         &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>,
@@ -887,8 +908,8 @@ fn run_worker_loop_with_control(
 ) {
     run_worker_loop_with_lora(
         msg_rx,
-        move |messages, cfg, _lora, _stream, on_token, cancel| {
-            generate(messages, cfg, on_token, cancel)
+        move |messages, cfg, _lora, _stream, explicitly_thinking, on_token, cancel| {
+            generate(messages, cfg, explicitly_thinking, on_token, cancel)
         },
         control,
     );
@@ -900,6 +921,7 @@ fn run_worker_loop_with_lora(
         &[ChatMessage],
         &GenerateConfig,
         &[LoraSelection],
+        bool,
         bool,
         &mut dyn FnMut(&str, u32) -> bool,
         &mut dyn FnMut() -> bool,
@@ -961,6 +983,7 @@ fn run_worker_loop_with_lora(
             &job.cfg,
             &job.lora,
             job.stream,
+            job.explicitly_thinking,
             &mut on_token,
             &mut should_cancel,
         ) {
@@ -1148,6 +1171,7 @@ fn build_vision_prompt_text(
     messages: &[ChatMessage],
     image_message_index: usize,
     enable_thinking: bool,
+    explicitly_thinking: bool,
 ) -> Result<(String, String), WorkerFailure> {
     let image_message = &messages[image_message_index];
     let image = image_message
@@ -1180,7 +1204,7 @@ fn build_vision_prompt_text(
         push_chat_turn_close(&mut after);
     }
     push_chat_generation_open(&mut after);
-    apply_qwen_thinking_mode(&mut after, enable_thinking);
+    apply_qwen_thinking_mode(&mut after, enable_thinking, explicitly_thinking);
 
     Ok((before, after))
 }
@@ -1195,8 +1219,14 @@ fn build_vision_prompt_ids(
     image_token_id: u32,
     image_pad_count: usize,
     enable_thinking: bool,
+    explicitly_thinking: bool,
 ) -> Result<Vec<u32>, WorkerFailure> {
-    let (before, after) = build_vision_prompt_text(messages, image_message_index, enable_thinking)?;
+    let (before, after) = build_vision_prompt_text(
+        messages,
+        image_message_index,
+        enable_thinking,
+        explicitly_thinking,
+    )?;
 
     let mut inserted_ids = Vec::with_capacity(image_pad_count.saturating_add(2));
     inserted_ids.push(vision_start_token_id);
@@ -1230,6 +1260,7 @@ pub(crate) fn build_vision_request(
     messages: &[ChatMessage],
     image_message_index: usize,
     enable_thinking: bool,
+    explicitly_thinking: bool,
     should_cancel: &mut dyn FnMut() -> bool,
     window_preflight: impl FnOnce(usize) -> Result<(), ApiError>,
 ) -> Result<VisionRequestBuild, WorkerFailure> {
@@ -1296,6 +1327,7 @@ pub(crate) fn build_vision_request(
         image_token_id,
         image_pad_count,
         enable_thinking,
+        explicitly_thinking,
     )?;
     if should_cancel() {
         return Ok(VisionRequestBuild::Cancelled);
@@ -1513,12 +1545,19 @@ impl MetalWorker {
                         let runtime = RefCell::new(runtime);
                         run_worker_loop_with_lora(
                             job_rx,
-                            |messages, cfg, lora, stream, on_token, should_cancel| {
+                            |messages,
+                             cfg,
+                             lora,
+                             stream,
+                             explicitly_thinking,
+                             on_token,
+                             should_cancel| {
                                 runtime.borrow_mut().generate(
                                     messages,
                                     cfg,
                                     lora,
                                     stream,
+                                    explicitly_thinking,
                                     on_token,
                                     should_cancel,
                                 )
@@ -1772,23 +1811,27 @@ fn spawn_fake_with_capability(
     let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
     let tokenizer = serving_tokenizer(tokenizer, model_max_context);
     let join_handle = std::thread::spawn(move || {
-        run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
-            let (prompt, _prompt_len) = render_text_prompt_within_window(
-                &tokenizer,
-                messages,
-                context_window_policy,
-                model_max_context,
-                cfg,
-            )
-            .map_err(WorkerFailure::Rejected)?;
-            // The production worker hands generation the rendered prompt and
-            // the worker's tokenizer, which re-tokenizes it; report the length
-            // that tokenization keeps, so a tokenizer cap below the window is
-            // visible here as it is on the real path.
-            let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
-            generate(messages, cfg, prompt_tokens, on_token, should_cancel)
-                .map_err(WorkerFailure::Failed)
-        });
+        run_worker_loop(
+            job_rx,
+            move |messages, cfg, explicitly_thinking, on_token, should_cancel| {
+                let (prompt, _prompt_len) = render_text_prompt_within_window(
+                    &tokenizer,
+                    messages,
+                    context_window_policy,
+                    model_max_context,
+                    cfg,
+                    explicitly_thinking,
+                )
+                .map_err(WorkerFailure::Rejected)?;
+                // The production worker hands generation the rendered prompt and
+                // the worker's tokenizer, which re-tokenizes it; report the length
+                // that tokenization keeps, so a tokenizer cap below the window is
+                // visible here as it is on the real path.
+                let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
+                generate(messages, cfg, prompt_tokens, on_token, should_cancel)
+                    .map_err(WorkerFailure::Failed)
+            },
+        );
     });
     let owner = MetalWorkerOwner::from_handle(join_handle);
     MetalWorkerClient::with_owner(

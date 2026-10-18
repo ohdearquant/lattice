@@ -2253,6 +2253,26 @@ mod imp {
             cfg.enable_thinking = false;
         }
         let streaming = validated.stream;
+        let explicitly_thinking =
+            match lattice_inference::serve::prepare::explicitly_enabled_thinking(&req) {
+                Ok(requested) => requested,
+                Err(api_err) => {
+                    let code = api_err.code();
+                    let response = api_err.into_response();
+                    emit_serve_event(
+                        &s.metrics,
+                        "POST",
+                        "/v1/chat/completions",
+                        response.status().as_u16(),
+                        None,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        false,
+                        Some(code),
+                    );
+                    return response;
+                }
+            };
         let messages = match into_engine_chat_messages(validated.messages) {
             Ok(messages) => messages,
             Err(err) => {
@@ -2284,12 +2304,13 @@ mod imp {
         // first-event peek (`rx.recv()` returning `None`) and report
         // identically to this binary's prior up-front `jobs.send(..).is_err()`
         // check.
-        let mut rx = match s.jobs.submit_with_lora_mode(
+        let mut rx = match s.jobs.submit_with_lora_mode_and_thinking(
             messages,
             cfg,
             cancel_rx,
             requested.selection().to_vec(),
             streaming,
+            explicitly_thinking,
         ) {
             Ok(rx) => rx,
             Err(api_err) => {

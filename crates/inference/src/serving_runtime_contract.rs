@@ -19,6 +19,9 @@ pub(crate) enum RuntimeInput<'a> {
     ChatMessages {
         messages: &'a [ChatMessage],
         lora: &'a [LoraSelection],
+        // Only the Qwen Metal runtime renders the thinking prime.
+        #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
+        explicitly_thinking: bool,
     },
 }
 

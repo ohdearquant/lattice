@@ -76,7 +76,7 @@ fn qwen_thinking_switch_renders_the_checkpoint_closed_prefix() {
         )
         .expect("explicit thinking switch");
         let expected = if enabled {
-            default.prepared.prompt.clone()
+            format!("{}<think>\n", default.prepared.prompt)
         } else {
             "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
                 .to_string()
@@ -84,6 +84,35 @@ fn qwen_thinking_switch_renders_the_checkpoint_closed_prefix() {
         assert_eq!(prepared.prepared.prompt, expected);
         assert_eq!(prepared.config.enable_thinking, enabled);
     }
+}
+
+#[test]
+fn qwen_explicit_thinking_primes_the_generation_turn() {
+    let explicit = prepare_chat_request_with_config(
+        &gemma_request(serde_json::json!({
+            "model": "served-model",
+            "chat_template_kwargs": {"enable_thinking": true},
+        })),
+        "served-model",
+        64,
+        4096,
+        false,
+        str::len,
+        || 4096,
+    )
+    .expect("explicit thinking request");
+    assert!(explicit.config.enable_thinking);
+    assert_eq!(
+        explicit.prepared.prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    );
+}
+
+#[test]
+fn qwen_explicit_thinking_yields_the_closed_block_when_thinking_is_forced_off() {
+    let mut prompt = String::from("<|im_start|>assistant\n");
+    crate::serve::prompt_adapter::apply_qwen_thinking_mode(&mut prompt, false, true);
+    assert_eq!(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
 }
 
 #[test]
@@ -114,7 +143,7 @@ fn qwen_preparation_handle_preserves_the_requested_thinking_mode() {
             .expect("explicit thinking switch");
         assert_eq!(prepared.config.enable_thinking, enabled);
         let expected = if enabled {
-            omitted.prepared.prompt.clone()
+            format!("{}<think>\n", omitted.prepared.prompt)
         } else {
             format!("{}<think>\n\n</think>\n\n", omitted.prepared.prompt)
         };
@@ -220,7 +249,9 @@ fn qwen_image_preparation_carries_thinking_mode_and_inert_budget() {
         let effective = enabled.unwrap_or(true);
         assert_eq!(prepared.config.enable_thinking, effective);
         assert_eq!(prepared.prepared.reasoning_budget, None);
-        let expected = if effective {
+        let expected = if enabled == Some(true) {
+            format!("{plain}<think>\n")
+        } else if effective {
             plain.to_owned()
         } else {
             "<|im_start|>user\nbeforeafter<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".to_owned()

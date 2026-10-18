@@ -46,7 +46,7 @@ impl ServingRuntime for GemmaCpuRuntime {
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure> {
-        let RuntimeInput::ChatMessages { messages, lora } = input else {
+        let RuntimeInput::ChatMessages { messages, lora, .. } = input else {
             return Err(WorkerFailure::Failed(
                 "prepared text is not supported by the worker runtime".to_owned(),
             ));

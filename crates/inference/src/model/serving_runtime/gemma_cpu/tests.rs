@@ -32,6 +32,7 @@ fn run(
         cfg,
         lora,
         true,
+        false,
         &mut |delta, _| {
             deltas.push(delta.to_string());
             true
@@ -131,6 +132,7 @@ fn a_job_cancelled_before_prefill_does_no_generation() {
             &user("hello"),
             &greedy(3),
             &[],
+            false,
             false,
             &mut |_, _| true,
             &mut || true,

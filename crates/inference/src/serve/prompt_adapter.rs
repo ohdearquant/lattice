@@ -16,7 +16,14 @@ use crate::serve::contract::{
 pub(crate) use crate::serving_provider::providers::gemma::template_trim;
 pub(crate) use crate::serving_provider::providers::qwen::QwenChatDefaults;
 
-pub(crate) fn apply_qwen_thinking_mode(prompt: &mut String, enable_thinking: bool) {
+pub(crate) fn apply_qwen_thinking_mode(
+    prompt: &mut String,
+    enable_thinking: bool,
+    explicitly_requested: bool,
+) {
+    if explicitly_requested && enable_thinking {
+        prompt.push_str("<think>\n");
+    }
     if !enable_thinking {
         prompt.push_str("<think>\n\n</think>\n\n");
     }
@@ -32,6 +39,7 @@ pub(crate) trait PromptAdapter {
         &self,
         messages: &[NormalizedChatMessage],
         _enable_thinking: bool,
+        _explicitly_requested: bool,
     ) -> String {
         self.render(messages)
     }
