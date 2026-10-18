@@ -50,40 +50,61 @@ fn refusal_code(error: ApiError) -> &'static str {
 }
 
 #[test]
-fn qwen_thinking_switch_renders_the_checkpoint_closed_prefix() {
+fn qwen_omitted_thinking_renders_the_checkpoint_closed_prefix() {
     let base = gemma_request(serde_json::json!({"model": "served-model"}));
     let default =
         prepare_chat_request_with_config(&base, "served-model", 64, 4096, false, str::len, || 4096)
             .expect("default thinking request");
     assert_eq!(
         default.prepared.prompt,
-        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
-    assert!(default.config.enable_thinking);
-    for enabled in [true, false] {
-        let req = gemma_request(serde_json::json!({
+    assert!(!default.config.enable_thinking);
+}
+
+#[test]
+fn qwen_omitted_thinking_with_positive_request_budget_renders_the_prime() {
+    let prepared = prepare_chat_request_with_config(
+        &gemma_request(serde_json::json!({
             "model": "served-model",
-            "chat_template_kwargs": {"enable_thinking": enabled},
-        }));
-        let prepared = prepare_chat_request_with_config(
-            &req,
-            "served-model",
-            64,
-            4096,
-            false,
-            str::len,
-            || 4096,
-        )
-        .expect("explicit thinking switch");
-        let expected = if enabled {
-            format!("{}<think>\n", default.prepared.prompt)
-        } else {
-            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-                .to_string()
-        };
-        assert_eq!(prepared.prepared.prompt, expected);
-        assert_eq!(prepared.config.enable_thinking, enabled);
-    }
+            "reasoning_budget": 16,
+        })),
+        "served-model",
+        64,
+        4096,
+        false,
+        str::len,
+        || 4096,
+    )
+    .expect("budgeted request enables thinking");
+    assert_eq!(
+        prepared.prepared.prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    );
+    assert!(prepared.config.enable_thinking);
+    assert_eq!(prepared.prepared.reasoning_budget, Some(16));
+}
+
+#[test]
+fn qwen_explicitly_disabled_thinking_renders_the_closed_block() {
+    let prepared = prepare_chat_request_with_config(
+        &gemma_request(serde_json::json!({
+            "model": "served-model",
+            "chat_template_kwargs": {"enable_thinking": false},
+        })),
+        "served-model",
+        64,
+        4096,
+        false,
+        str::len,
+        || 4096,
+    )
+    .expect("explicit thinking off");
+    assert_eq!(
+        prepared.prepared.prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
+    assert!(!prepared.config.enable_thinking);
 }
 
 #[test]
@@ -111,7 +132,7 @@ fn qwen_explicit_thinking_primes_the_generation_turn() {
 #[test]
 fn qwen_explicit_thinking_yields_the_closed_block_when_thinking_is_forced_off() {
     let mut prompt = String::from("<|im_start|>assistant\n");
-    crate::serve::prompt_adapter::apply_qwen_thinking_mode(&mut prompt, false, true);
+    crate::serve::prompt_adapter::apply_qwen_thinking_mode(&mut prompt, false);
     assert_eq!(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
 }
 
@@ -127,7 +148,7 @@ fn qwen_preparation_handle_preserves_the_requested_thinking_mode() {
             false,
         )
         .expect("default thinking request");
-    assert!(omitted.config.enable_thinking);
+    assert!(!omitted.config.enable_thinking);
     for enabled in [true, false] {
         let prepared = handle
             .prepare_lattice_with_config(
@@ -143,9 +164,9 @@ fn qwen_preparation_handle_preserves_the_requested_thinking_mode() {
             .expect("explicit thinking switch");
         assert_eq!(prepared.config.enable_thinking, enabled);
         let expected = if enabled {
-            format!("{}<think>\n", omitted.prepared.prompt)
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n".to_owned()
         } else {
-            format!("{}<think>\n\n</think>\n\n", omitted.prepared.prompt)
+            omitted.prepared.prompt.clone()
         };
         assert_eq!(prepared.prepared.prompt, expected);
     }
@@ -246,13 +267,11 @@ fn qwen_image_preparation_carries_thinking_mode_and_inert_budget() {
             || 4096,
         )
         .expect("vision-capable preparation");
-        let effective = enabled.unwrap_or(true);
+        let effective = enabled.unwrap_or(false);
         assert_eq!(prepared.config.enable_thinking, effective);
         assert_eq!(prepared.prepared.reasoning_budget, None);
         let expected = if enabled == Some(true) {
             format!("{plain}<think>\n")
-        } else if effective {
-            plain.to_owned()
         } else {
             "<|im_start|>user\nbeforeafter<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".to_owned()
         };
@@ -267,24 +286,59 @@ fn qwen_image_preparation_carries_thinking_mode_and_inert_budget() {
 }
 
 #[test]
-fn qwen_disabled_thinking_discards_the_standalone_default_budget() {
+fn qwen_standalone_thinking_modes_render_exact_prompts() {
     let handle = handle(4096);
     let defaults = GenerationDefaults {
         reasoning_budget: Some(4096),
         ..GenerationDefaults::standard(64)
     };
-    for enabled in [false, true] {
-        let request = gemma_request(serde_json::json!({
-            "max_tokens": 9,
-            "chat_template_kwargs": {"enable_thinking": enabled},
-        }));
+    let cases: [(serde_json::Value, bool, Option<usize>, &str); 4] = [
+        (
+            serde_json::json!({"max_tokens": 9}),
+            false,
+            None,
+            "<think>\n\n</think>\n\n",
+        ),
+        (
+            serde_json::json!({"max_tokens": 9, "reasoning_budget": 16}),
+            true,
+            Some(16),
+            "<think>\n",
+        ),
+        (
+            serde_json::json!({
+                "max_tokens": 9,
+                "chat_template_kwargs": {"enable_thinking": true},
+            }),
+            true,
+            Some(4086),
+            "<think>\n",
+        ),
+        (
+            serde_json::json!({
+                "max_tokens": 9,
+                "reasoning_budget": 16,
+                "chat_template_kwargs": {"enable_thinking": false},
+            }),
+            false,
+            None,
+            "<think>\n\n</think>\n\n",
+        ),
+    ];
+    for (extra, enabled, expected_budget, suffix) in cases {
+        let request = gemma_request(extra);
         let (validated, cfg) = handle
             .prepare_standalone(&request, defaults, "served-model", false)
             .expect("standalone request");
-        let expected_budget = if enabled { Some(4086) } else { None };
         assert_eq!(validated.reasoning_budget, expected_budget);
         assert_eq!(cfg.enable_thinking, enabled);
         assert_eq!(cfg.reasoning_budget, expected_budget);
+        let mut prompt = crate::serve::format_normalized_chat_template(&validated.messages);
+        crate::serve::prompt_adapter::apply_qwen_thinking_mode(&mut prompt, cfg.enable_thinking);
+        assert_eq!(
+            prompt,
+            format!("<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n{suffix}"),
+        );
         let (_, free_cfg) = prepare_standalone_chat_request(
             &request,
             defaults,

@@ -520,12 +520,12 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     },
     ConstructionExemption {
         site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::new()#1",
-        recorded_position: "examples/bench_serve_prepare.rs:690:47",
+        recorded_position: "examples/bench_serve_prepare.rs:688:47",
         reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
     },
     ConstructionExemption {
         site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "examples/bench_serve_prepare.rs:700:47",
+        recorded_position: "examples/bench_serve_prepare.rs:698:47",
         reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
     },
     ConstructionExemption {

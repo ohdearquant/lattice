@@ -16,14 +16,14 @@
 //!                  has no admission gate.
 //!   lattice-metal  `lattice serve` on a Q4 checkpoint (Metal worker).
 //!                  Handler: the worker factory's `PreparationHandle`
-//!                  (`prepare_lattice`, the same `prepare_chat_request` bound
-//!                  to the worker's tokenizer and 4096-token context), then
-//!                  `lattice_generate_config`.
+//!                  (`prepare_lattice_with_config`, the same
+//!                  `prepare_chat_request` bound to the worker's tokenizer and
+//!                  4096-token context).
 //!   lattice-serve  `lattice_serve` (Metal worker, Q4 or safetensors).
-//!                  Handler: the handle's `normalize_standalone` with the
-//!                  `lattice_serve` defaults, `standalone_generate_config`,
-//!                  then `serve::into_engine_chat_messages`. No render or
-//!                  tokenize happens in this handler.
+//!                  Handler: the handle's `prepare_standalone` with the
+//!                  `lattice_serve` defaults, then
+//!                  `serve::into_engine_chat_messages`. No render or tokenize
+//!                  happens in this handler.
 //!   gemma-cpu      Gemma 4 E2B text on a safetensors checkpoint, CPU.
 //!                  Preparation: `serve::prepare::prepare_gemma_chat_request`
 //!                  (validate, the Gemma prompt adapter's defaults, render
@@ -101,8 +101,8 @@ use lattice_inference::serve::contract::{
 };
 use lattice_inference::serve::into_engine_chat_messages;
 use lattice_inference::serve::prepare::{
-    GemmaPromptAdapter, PreparedChatRequest, PreparedGemmaChatRequest, build_cfg, lattice_gen_cfg,
-    prepare_chat_request, prepare_gemma_chat_request,
+    GemmaPromptAdapter, PreparedChatRequest, PreparedGemmaChatRequest, build_cfg,
+    prepare_chat_request, prepare_chat_request_with_config, prepare_gemma_chat_request,
 };
 use serde_json::json;
 
@@ -564,21 +564,19 @@ fn run_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error:
         for run in 0..=runs {
             let body = case.body(run);
             let start = Instant::now();
-            let prepared = lattice_prepare(
-                &body,
+            let req = parse_body(&body)?;
+            let prepared = prepare_chat_request_with_config(
+                &req,
+                MODEL_ID,
+                LATTICE_DEFAULT_MAX_TOKENS,
+                LATTICE_MAX_TOKENS_CAP,
+                false,
                 |p| model.tokenizer().tokenize(p).real_length,
-                model.max_context(),
-            )?
+                || model.max_context(),
+            )
             .map_err(|e| format!("{}: {e:?}", case.name()))?;
-            let gen_cfg = lattice_gen_cfg(
-                prepared.max_tokens,
-                prepared.temperature,
-                prepared.top_p,
-                prepared.seed,
-                prepared.stop_strings.clone(),
-                prepared.reasoning_budget,
-                prepared.logprobs,
-            );
+            let gen_cfg = prepared.config;
+            let prepared = prepared.prepared;
             let prepare_ms = ms(start);
             let prompt_tokens = model.tokenizer().tokenize(&prepared.prompt).real_length;
 
@@ -738,36 +736,24 @@ fn run_metal(
         let req = parse_body(body)?;
         match route {
             Route::LatticeServe => Ok(preparation
-                .normalize_standalone(
+                .prepare_standalone(
                     &req,
                     GenerationDefaults::standard(LATTICE_SERVE_DEFAULT_MAX_TOKENS),
                     MODEL_ID,
                     false,
                 )
-                .and_then(|validated| {
-                    let cfg = preparation.standalone_generate_config(&validated);
+                .and_then(|(validated, cfg)| {
                     into_engine_chat_messages(validated.messages).map(|messages| (messages, cfg))
                 })),
             _ => Ok(preparation
-                .prepare_lattice(
+                .prepare_lattice_with_config(
                     &req,
                     MODEL_ID,
                     LATTICE_DEFAULT_MAX_TOKENS,
                     LATTICE_MAX_TOKENS_CAP,
                     false,
                 )
-                .map(|prepared| {
-                    let cfg = preparation.lattice_generate_config(
-                        prepared.max_tokens,
-                        prepared.temperature,
-                        prepared.top_p,
-                        prepared.seed,
-                        prepared.stop_strings.clone(),
-                        prepared.reasoning_budget,
-                        prepared.logprobs,
-                    );
-                    (prepared.messages, cfg)
-                })),
+                .map(|prepared| (prepared.prepared.messages, prepared.config))),
         }
     };
 

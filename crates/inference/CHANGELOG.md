@@ -12,6 +12,7 @@ workspace version; the workspace release notes are in
 
 ### Changed
 
+- **Behavior change:** Qwen chat requests now turn thinking off when `chat_template_kwargs.enable_thinking` is omitted. A positive request `reasoning_budget` enables thinking; a server-configured `generation.reasoning_budget` alone does not. Set `enable_thinking: true` to keep the previous default.
 - Reasoning-budgeted requests now close the thinking block at the first line boundary after the budget, or at most 32 tokens later, instead of at the budget itself. The decode cap and answer budget are unchanged.
 
 ## [0.13.0] - 2026-10-18

@@ -175,78 +175,105 @@ fn thinking_tokenizer() -> BpeTokenizer {
 }
 
 #[test]
-fn text_worker_renders_closed_thinking_before_tokenization_and_admission() {
+fn text_worker_renders_omitted_thinking_as_a_closed_block() {
     let messages = [ChatMessage::user("hello")];
     let tokenizer = thinking_tokenizer();
-    let plain = format_chat_template(&messages);
-    let expected =
-        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
-    let prompt_tokens = tokenizer.tokenize(expected).pre_truncation_len;
     let cfg = GenerateConfig {
         enable_thinking: false,
-        reasoning_budget: Some(4096),
+        reasoning_budget: None,
         max_new_tokens: 9,
         ..GenerateConfig::default()
     };
-    let context = prompt_tokens + 9 + 1;
-    let (prompt, count) = render_text_prompt_within_window(
+    let (prompt, _) = render_text_prompt_within_window(
         &tokenizer,
         &messages,
         ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-        context,
+        4096,
         &cfg,
         false,
     )
-    .expect("disabled budget consumes no window");
-    assert_eq!(prompt, expected);
-    assert_eq!(count, prompt_tokens);
-    let enabled = GenerateConfig {
-        enable_thinking: true,
-        reasoning_budget: None,
-        ..cfg.clone()
-    };
-    let (prompt, _) = render_text_prompt_within_window(
-        &tokenizer,
-        &messages,
-        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-        context,
-        &enabled,
-        false,
-    )
-    .expect("legacy true prompt");
-    assert_eq!(prompt, plain);
-    let (prompt, _) = render_text_prompt_within_window(
-        &tokenizer,
-        &messages,
-        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-        context,
-        &enabled,
-        true,
-    )
-    .expect("explicit thinking prime");
-    assert_eq!(prompt, format!("{plain}<think>\n"));
-    let enabled_budget = GenerateConfig {
-        enable_thinking: true,
-        ..cfg
-    };
-    assert!(matches!(
-        render_text_prompt_within_window(
-            &tokenizer,
-            &messages,
-            ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-            context,
-            &enabled_budget,
-            false,
-        ),
-        Err(ApiError::BadRequest {
-            code: "context_length_exceeded",
-            ..
-        })
-    ));
+    .expect("omitted thinking is off");
+    assert_eq!(
+        prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
 }
 
 #[test]
-fn vision_worker_renders_and_tokenizes_the_closed_thinking_tail() {
+fn text_worker_renders_positive_request_budget_with_the_thinking_prime() {
+    let messages = [ChatMessage::user("hello")];
+    let tokenizer = thinking_tokenizer();
+    let cfg = GenerateConfig {
+        enable_thinking: true,
+        reasoning_budget: Some(16),
+        max_new_tokens: 9,
+        ..GenerateConfig::default()
+    };
+    let (prompt, _) = render_text_prompt_within_window(
+        &tokenizer,
+        &messages,
+        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+        4096,
+        &cfg,
+        false,
+    )
+    .expect("positive request budget enables thinking");
+    assert_eq!(
+        prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    );
+}
+
+#[test]
+fn text_worker_renders_explicit_thinking_true_with_the_thinking_prime() {
+    let messages = [ChatMessage::user("hello")];
+    let tokenizer = thinking_tokenizer();
+    let cfg = GenerateConfig {
+        enable_thinking: true,
+        max_new_tokens: 9,
+        ..GenerateConfig::default()
+    };
+    let (prompt, _) = render_text_prompt_within_window(
+        &tokenizer,
+        &messages,
+        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+        4096,
+        &cfg,
+        true,
+    )
+    .expect("explicit thinking prime");
+    assert_eq!(
+        prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    );
+}
+
+#[test]
+fn text_worker_renders_explicit_thinking_false_as_a_closed_block() {
+    let messages = [ChatMessage::user("hello")];
+    let tokenizer = thinking_tokenizer();
+    let cfg = GenerateConfig {
+        enable_thinking: false,
+        max_new_tokens: 9,
+        ..GenerateConfig::default()
+    };
+    let (prompt, _) = render_text_prompt_within_window(
+        &tokenizer,
+        &messages,
+        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+        4096,
+        &cfg,
+        false,
+    )
+    .expect("explicit thinking off");
+    assert_eq!(
+        prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
+}
+
+#[test]
+fn vision_worker_renders_omitted_thinking_as_a_closed_block() {
     let messages = [ChatMessage::user_with_image(
         "beforeafter",
         vec![1],
@@ -268,19 +295,41 @@ fn vision_worker_renders_and_tokenizes_the_closed_thinking_tail() {
         "after<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     );
     assert_eq!(ids, expected);
-    let (_, enabled_after) =
-        build_vision_prompt_text(&messages, 0, true, false).expect("legacy vision text");
-    assert_eq!(enabled_after, "after<|im_end|>\n<|im_start|>assistant\n");
-    let (_, primed_after) =
-        build_vision_prompt_text(&messages, 0, true, true).expect("explicit vision prime");
+}
+
+#[test]
+fn vision_worker_renders_enabled_thinking_with_the_thinking_prime() {
+    let messages = [ChatMessage::user_with_image(
+        "beforeafter",
+        vec![1],
+        "before".len(),
+    )];
+    let (_, after) = build_vision_prompt_text(&messages, 0, true, false).expect("vision text");
+    assert_eq!(after, "after<|im_end|>\n<|im_start|>assistant\n<think>\n");
+}
+
+#[test]
+fn vision_worker_renders_explicit_thinking_true_with_the_thinking_prime() {
+    let messages = [ChatMessage::user_with_image(
+        "beforeafter",
+        vec![1],
+        "before".len(),
+    )];
+    let (_, after) = build_vision_prompt_text(&messages, 0, true, true).expect("vision text");
+    assert_eq!(after, "after<|im_end|>\n<|im_start|>assistant\n<think>\n");
+}
+
+#[test]
+fn vision_worker_renders_explicit_thinking_false_as_a_closed_block() {
+    let messages = [ChatMessage::user_with_image(
+        "beforeafter",
+        vec![1],
+        "before".len(),
+    )];
+    let (_, after) = build_vision_prompt_text(&messages, 0, false, false).expect("vision text");
     assert_eq!(
-        primed_after,
-        "after<|im_end|>\n<|im_start|>assistant\n<think>\n"
-    );
-    assert_ne!(
-        ids,
-        build_vision_prompt_ids(&messages, 0, &tokenizer, 90, 91, 92, 3, true, false)
-            .expect("legacy vision prompt")
+        after,
+        "after<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
 }
 
@@ -395,7 +444,8 @@ fn vision_prompt_splices_tokens_at_original_content_part_position() {
         .expect("vision prompt");
 
     let before = "<|im_start|>system\npolicy<|im_end|>\n<|im_start|>user\nbefore";
-    let after = "after<|im_end|>\n<|im_start|>assistant\nprior<|im_end|>\n<|im_start|>assistant\n";
+    let after =
+        "after<|im_end|>\n<|im_start|>assistant\nprior<|im_end|>\n<|im_start|>assistant\n<think>\n";
     let mut expected = tokenize_text(&tokenizer, before);
     expected.extend([90, 92, 92, 92, 91]);
     expected.extend(tokenize_text(&tokenizer, after));
@@ -409,10 +459,14 @@ fn vision_prompt_text_matches_plain_template_around_image_splice() {
         ChatMessage::user_with_image("beforeafter", vec![1], "before".len()),
         ChatMessage::assistant("prior"),
     ];
-    let (before, after) = build_vision_prompt_text(&messages, 1, true, false).expect("vision text");
+    let (before, after) =
+        build_vision_prompt_text(&messages, 1, false, false).expect("vision text");
     let plain = format_chat_template(&messages);
     assert_eq!(
-        before.clone() + &after,
+        before.clone()
+            + after
+                .strip_suffix("<think>\n\n</think>\n\n")
+                .expect("closed suffix"),
         plain,
         "vision splice fragments must reconstruct exactly the canonical text-only template"
     );
@@ -2623,7 +2677,7 @@ fn run_text_job(
 }
 
 #[test]
-fn explicit_thinking_flag_crosses_submit_and_reaches_generation() {
+fn thinking_mode_reaches_generation_independent_of_legacy_flag() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen_by_generate = Arc::clone(&seen);
     let client = spawn_fake(
@@ -2647,31 +2701,31 @@ fn explicit_thinking_flag_crosses_submit_and_reaches_generation() {
         },
     );
     let messages = vec![ChatMessage::user("hello")];
-    let cfg = GenerateConfig {
-        enable_thinking: true,
-        ..GenerateConfig::default()
-    };
-    let (_guard, cancel) = crate::serve::cancel_pair();
-    let mut rx = client
-        .submit_with_lora_mode_and_thinking(
-            messages.clone(),
-            cfg.clone(),
-            cancel,
-            Vec::new(),
-            false,
-            true,
-        )
-        .expect("explicit thinking job is admitted");
-    assert!(matches!(rx.blocking_recv(), Some(WorkerEvent::Complete(_))));
-    let (_guard, cancel) = crate::serve::cancel_pair();
-    let mut rx = client
-        .submit_with_lora_mode_and_thinking(messages, cfg, cancel, Vec::new(), false, false)
-        .expect("omitted thinking job is admitted");
-    assert!(matches!(rx.blocking_recv(), Some(WorkerEvent::Complete(_))));
+    for (enable_thinking, explicitly_thinking) in [(true, true), (true, false), (false, true)] {
+        let (_guard, cancel) = crate::serve::cancel_pair();
+        let mut rx = client
+            .submit_with_lora_mode_and_thinking(
+                messages.clone(),
+                GenerateConfig {
+                    enable_thinking,
+                    ..GenerateConfig::default()
+                },
+                cancel,
+                Vec::new(),
+                false,
+                explicitly_thinking,
+            )
+            .expect("thinking job is admitted");
+        assert!(matches!(rx.blocking_recv(), Some(WorkerEvent::Complete(_))));
+    }
     let lengths = seen.lock().expect("prompt length slot");
-    assert!(
-        lengths[0] > lengths[1],
-        "the explicit prime must add tokens: {lengths:?}"
+    assert_eq!(
+        lengths[0], lengths[1],
+        "the legacy flag must not change the prompt: {lengths:?}"
+    );
+    assert_ne!(
+        lengths[0], lengths[2],
+        "the configured thinking mode must change the prompt: {lengths:?}"
     );
 }
 

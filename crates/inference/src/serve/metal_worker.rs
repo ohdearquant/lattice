@@ -537,9 +537,8 @@ impl MetalWorkerClient {
 
     /// [`Self::submit_with_lora`] for a caller that knows whether the HTTP
     /// response it will build is streamed. The worker hands the flag to the
-    /// runtime, which names the mode in its per-request route line. A request
-    /// that explicitly enabled thinking goes through
-    /// [`Self::submit_with_lora_mode_and_thinking`]; this one renders it unprimed.
+    /// runtime, which names the mode in its per-request route line. Prompt
+    /// rendering follows the effective mode in `gen_cfg`.
     pub fn submit_with_lora_mode(
         &self,
         messages: Vec<ChatMessage>,
@@ -551,7 +550,10 @@ impl MetalWorkerClient {
         self.submit_with_lora_mode_and_thinking(messages, gen_cfg, cancel, lora, stream, false)
     }
 
-    /// Submit a request that explicitly enabled thinking in its chat template.
+    /// Submit with the legacy explicitness argument.
+    ///
+    /// The argument remains for source compatibility. The effective thinking
+    /// mode in `gen_cfg` controls prompt rendering.
     #[doc(hidden)]
     pub fn submit_with_lora_mode_and_thinking(
         &self,
@@ -755,10 +757,10 @@ pub(crate) fn render_text_prompt_within_window(
     policy: ContextWindowPolicy,
     model_max_context: usize,
     cfg: &GenerateConfig,
-    explicitly_thinking: bool,
+    _explicitly_thinking: bool,
 ) -> Result<(String, usize), ApiError> {
     let mut prompt = format_chat_template(messages);
-    apply_qwen_thinking_mode(&mut prompt, cfg.enable_thinking, explicitly_thinking);
+    apply_qwen_thinking_mode(&mut prompt, cfg.enable_thinking);
     let prompt_len = tokenizer.tokenize(&prompt).pre_truncation_len;
     check_prompt_fits_window(policy, model_max_context, prompt_len, cfg)?;
     Ok((prompt, prompt_len))
@@ -1171,7 +1173,7 @@ fn build_vision_prompt_text(
     messages: &[ChatMessage],
     image_message_index: usize,
     enable_thinking: bool,
-    explicitly_thinking: bool,
+    _explicitly_thinking: bool,
 ) -> Result<(String, String), WorkerFailure> {
     let image_message = &messages[image_message_index];
     let image = image_message
@@ -1204,7 +1206,7 @@ fn build_vision_prompt_text(
         push_chat_turn_close(&mut after);
     }
     push_chat_generation_open(&mut after);
-    apply_qwen_thinking_mode(&mut after, enable_thinking, explicitly_thinking);
+    apply_qwen_thinking_mode(&mut after, enable_thinking);
 
     Ok((before, after))
 }

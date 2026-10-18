@@ -1165,14 +1165,14 @@ fn chat_template_thinking_options_preserve_absence_true_false() {
 }
 
 #[test]
-fn chat_template_thinking_defaults_preserve_qwen_default() {
+fn omitted_thinking_resolves_off_on_both_qwen_profiles() {
     for profile in [
         ServeProfile::lattice("model", 100),
         ServeProfile::lattice_serve("model", 100),
     ] {
         for (field, expected) in [
-            ("", true),
-            (r#", "chat_template_kwargs":{}"#, true),
+            ("", false),
+            (r#", "chat_template_kwargs":{}"#, false),
             (r#", "chat_template_kwargs":{"enable_thinking":true}"#, true),
             (
                 r#", "chat_template_kwargs":{"enable_thinking":false}"#,
@@ -1186,12 +1186,58 @@ fn chat_template_thinking_defaults_preserve_qwen_default() {
                 &request(&body),
                 defaults(),
                 profile,
-                |_, _, _, _, _| Ok(String::new()),
+                |_, _, _, _| Ok(String::new()),
             )
             .unwrap();
             assert_eq!(enable_thinking, expected, "field={field}");
         }
     }
+}
+
+#[test]
+fn positive_request_budget_enables_thinking_without_a_switch() {
+    for (budget, expected_thinking, expected_budget) in [("40", true, Some(40)), ("0", false, None)]
+    {
+        let req = request(&format!(
+            r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"reasoning_budget":{budget}}}"#
+        ));
+        let generation = GenerationDefaults {
+            reasoning_budget: Some(20),
+            ..defaults()
+        };
+        let (validated, _, enable_thinking) = normalize_request_with_context_and_thinking(
+            &req,
+            generation,
+            ServeProfile::lattice("model", 100),
+            |_, _, effective_budget, enabled| {
+                assert_eq!(enabled, expected_thinking);
+                assert_eq!(effective_budget, expected_budget);
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+        assert_eq!(enable_thinking, expected_thinking);
+        assert_eq!(validated.reasoning_budget, expected_budget);
+    }
+
+    let req = request(r#"{"model":"model","messages":[{"role":"user","content":"hi"}]}"#);
+    let generation = GenerationDefaults {
+        reasoning_budget: Some(20),
+        ..defaults()
+    };
+    let (validated, _, enable_thinking) = normalize_request_with_context_and_thinking(
+        &req,
+        generation,
+        ServeProfile::lattice("model", 100),
+        |_, _, effective_budget, enabled| {
+            assert!(!enabled);
+            assert_eq!(effective_budget, None);
+            Ok(String::new())
+        },
+    )
+    .unwrap();
+    assert!(!enable_thinking);
+    assert_eq!(validated.reasoning_budget, None);
 }
 
 #[test]
@@ -1295,7 +1341,7 @@ fn thinking_off_makes_reasoning_budget_inert_in_context_callback() {
             &req,
             generation,
             ServeProfile::lattice("model", 100),
-            |_, max_tokens, effective_budget, enabled, _| {
+            |_, max_tokens, effective_budget, enabled| {
                 assert!(!enabled);
                 assert_eq!(effective_budget, None);
                 validate_context_window_with_budget(1, max_tokens, effective_budget, 18)?;
