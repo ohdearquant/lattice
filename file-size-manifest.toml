@@ -19,7 +19,7 @@ ceiling = 3890
 
 [[ratchet]]
 path = "crates/inference/src/forward/metal_qwen35.rs"
-ceiling = 16317
+ceiling = 16268
 retired_by = "ADR-102 M8"
 
 [[ratchet]]
