@@ -461,7 +461,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
 ];
 const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
     "src/forward/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
-    "src/forward/metal_qwen35.rs::test_gemv_decode_numerical",
+    "src/forward/metal_qwen35/inner/tests.rs::test_gemv_decode_numerical",
     "src/forward/metal_qwen35/inner/tests/decode_attention.rs::test_gpu_argmax_parity_k1",
     "src/forward/metal_qwen35/inner/tests/gdn_chunked_scan.rs::decode_attention_reference_fails_closed_on_nan_q",
     "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
@@ -4968,7 +4968,7 @@ fn prior_lock_owners_and_existing_bench_use_the_shared_module() {
             "use crate::measurement::gpu_test_lock;",
         ),
         (
-            "src/forward/metal_qwen35.rs",
+            "src/forward/metal_qwen35/inner/tests.rs",
             "use crate::measurement::gpu_test_lock;",
         ),
         (
