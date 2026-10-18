@@ -2276,20 +2276,19 @@ mod imp {
         let created = unix_secs();
 
         let (cancel_guard, cancel_rx) = lattice_inference::serve::cancel_pair();
-        // `MetalWorkerClient::submit` (issue #832) never fails outwardly
-        // EXCEPT for admission (issue #932, checked synchronously here,
-        // before any tokenization/model work): if the worker thread is no
-        // longer running, the returned receiver simply closes with zero
-        // events, which both branches below detect via their own
-        // first-event peek (`rx.recv()` returning `None`) and report
-        // identically to this binary's prior up-front `jobs.send(..).is_err()`
+        // `MetalWorkerClient::submit` (issue #832) never fails outwardly EXCEPT for admission
+        // (issue #932, checked synchronously here, before any tokenization/model work): if the
+        // worker thread is no longer running, the returned receiver simply closes with zero events,
+        // which both branches below detect via their own first-event peek (`rx.recv()` returning
+        // `None`) and report identically to this binary's prior up-front `jobs.send(..).is_err()`
         // check.
-        let mut rx = match s.jobs.submit_with_lora_mode(
+        let mut rx = match s.jobs.submit_with_lora_mode_and_thinking(
             messages,
             cfg,
             cancel_rx,
             requested.selection().to_vec(),
             streaming,
+            lattice_inference::serve::prepare::explicitly_enabled_thinking(&req).is_ok_and(|on| on),
         ) {
             Ok(rx) => rx,
             Err(api_err) => {

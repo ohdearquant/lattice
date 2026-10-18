@@ -70,9 +70,10 @@ impl PromptAdapter for QwenPromptAdapter {
         &self,
         messages: &[NormalizedChatMessage],
         enable_thinking: bool,
+        explicitly_requested: bool,
     ) -> String {
         let mut prompt = self.render(messages);
-        apply_qwen_thinking_mode(&mut prompt, enable_thinking);
+        apply_qwen_thinking_mode(&mut prompt, enable_thinking, explicitly_requested);
         prompt
     }
 
@@ -340,8 +341,12 @@ fn prepare_chat_request_with_profile(
         req,
         GenerationDefaults::standard(default_max_tokens),
         profile,
-        |messages, max_tokens, reasoning_budget, enable_thinking| {
-            let prompt = QwenPromptAdapter.render_with_thinking(messages, enable_thinking);
+        |messages, max_tokens, reasoning_budget, enable_thinking, explicitly_requested| {
+            let prompt = QwenPromptAdapter.render_with_thinking(
+                messages,
+                enable_thinking,
+                explicitly_requested == Some(true),
+            );
             let prompt_token_count = tokenize_len(&prompt);
             validate_context_window_with_budget(
                 prompt_token_count,
@@ -415,7 +420,7 @@ pub(crate) fn prepare_standalone_chat_request(
     profile: ServeProfile<'_>,
 ) -> Result<(ValidatedChatRequest, GenerateConfig), ApiError> {
     let (validated, _, enable_thinking) =
-        normalize_request_with_context_and_thinking(req, defaults, profile, |_, _, _, _| {
+        normalize_request_with_context_and_thinking(req, defaults, profile, |_, _, _, _, _| {
             Ok(String::new())
         })?;
     let mut config = build_cfg(&validated);

@@ -213,13 +213,17 @@ async fn chat_completions_non_streaming_observation_captures_real_enable_thinkin
 #[tokio::test]
 async fn chat_completions_non_streaming_observation_preserves_thinking_default() {
     let explicit = thinking_request_body(true, None);
-    for body in [OBSERVATION_GOLDEN_REQUEST_BODY, explicit.as_str()] {
+    let primed = format!("{OBSERVATION_GOLDEN_USER_HI_THERE_CHATML}<think>\n");
+    for (body, rendered) in [
+        (
+            OBSERVATION_GOLDEN_REQUEST_BODY,
+            OBSERVATION_GOLDEN_USER_HI_THERE_CHATML,
+        ),
+        (explicit.as_str(), primed.as_str()),
+    ] {
         let obs = run_observed(true, body).await;
         assert_eq!(obs.gen_cfg, expected_gen_cfg());
-        assert_eq!(
-            obs.rendered_prompt.as_deref(),
-            Some(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
-        );
+        assert_eq!(obs.rendered_prompt.as_deref(), Some(rendered));
     }
 }
 
