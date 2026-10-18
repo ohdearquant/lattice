@@ -72,8 +72,8 @@
 //! Most of the paths tested here (1-5) were already EXCLUDE before this
 //! session's fix — they regression-lock behaviour that was already correct.
 //! The two paths whose logic changed (MTP, self-spec) are unit-tested at the
-//! decision-function level in `metal_qwen35.rs`'s `mtp_greedy_round_tests`
-//! and `self_spec_eos_tests`, where the same all-zero-weights style
+//! decision-function level in `metal_qwen35`'s `mtp_greedy_round_tests` and
+//! `self_spec_eos_tests` modules, where the same all-zero-weights style
 //! before/after vectors were hand-verified to flip from INCLUDE to EXCLUDE
 //! when the production fix is reverted.
 
