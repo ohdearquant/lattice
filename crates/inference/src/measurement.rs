@@ -14,14 +14,14 @@
 //! the returned guard owns both for its full lifetime.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::{File, FileTimes, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
 const GPU_MACHINE_LOCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -343,8 +343,15 @@ fn live_supervisor_pid(marker: Option<&OsStr>) -> Option<libc::pid_t> {
 }
 
 fn refresh_lock_file(file: &File) -> std::io::Result<()> {
-    let now = SystemTime::now();
-    file.set_times(FileTimes::new().set_accessed(now).set_modified(now))
+    // On macOS, `set_times` and `futimens` require ownership even for the current time;
+    // `futimes` permits write access to refresh a lock file owned by another user.
+    // SAFETY: `file` owns a valid descriptor for this call, and a null `times` pointer is the
+    // documented form for setting both timestamps to now.
+    if unsafe { libc::futimes(file.as_raw_fd(), std::ptr::null()) } != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn acquire_machine_lock(
