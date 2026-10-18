@@ -78,6 +78,7 @@ use crate::stop_reason::StopReason;
 #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::sync::Arc;
 
 #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
 thread_local! {
@@ -199,6 +200,7 @@ pub(crate) fn run(
     session: &mut dyn DecoderSession,
     gen_cfg: &GenerateConfig,
     think_close_id: Option<u32>,
+    reasoning_newline_boundary: Option<Arc<[bool]>>,
     prompt_ids: &[u32],
     eos_token_id: u32,
     streaming: bool,
@@ -215,6 +217,7 @@ pub(crate) fn run(
         session,
         gen_cfg,
         think_close_id,
+        reasoning_newline_boundary,
         prompt_ids,
         eos_token_id,
         streaming,
@@ -235,6 +238,7 @@ pub(crate) fn run_into(
     session: &mut dyn DecoderSession,
     gen_cfg: &GenerateConfig,
     think_close_id: Option<u32>,
+    reasoning_newline_boundary: Option<Arc<[bool]>>,
     prompt_ids: &[u32],
     eos_token_id: u32,
     streaming: bool,
@@ -256,6 +260,7 @@ pub(crate) fn run_into(
         session,
         gen_cfg,
         think_close_id,
+        reasoning_newline_boundary,
         prompt_ids,
         eos_token_id,
         streaming,
@@ -283,6 +288,7 @@ fn run_inner(
     session: &mut dyn DecoderSession,
     gen_cfg: &GenerateConfig,
     think_close_id: Option<u32>,
+    reasoning_newline_boundary: Option<Arc<[bool]>>,
     prompt_ids: &[u32],
     eos_token_id: u32,
     streaming: bool,
@@ -496,6 +502,7 @@ fn run_inner(
     let mut policy = DecodePolicy::init_with_metadata(
         gen_cfg,
         think_close_id,
+        reasoning_newline_boundary,
         &mut token_logprobs,
         candidate0.candidate_id,
         generated_ids.len(),

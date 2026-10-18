@@ -489,6 +489,10 @@ fn raw_observer_fires_before_on_token_for_buffered_incomplete_utf8_first_token()
     );
 }
 
+/// Id 0 decodes to a newline and then the lone lead byte 0xC2, which the
+/// detokenizer holds; the zero model samples it first, and because it ends a
+/// line a reasoning budget of 1 forces `</think>` (a stop token) on the next
+/// step. The held byte must reach both the returned and the streamed text.
 #[test]
 fn eos_flushes_incomplete_utf8_tail_in_streaming_and_nonstreaming() {
     const TOK_JSON: &str = r#"{
@@ -500,7 +504,7 @@ fn eos_flushes_incomplete_utf8_tail_in_streaming_and_nonstreaming() {
   "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
   "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
     "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
-    "vocab":{"Â":0,"<unk>":1,"a":2},"merges":[]}
+    "vocab":{"ĊÂ":0,"<unk>":1,"a":2},"merges":[]}
 }"#;
     let model = build_tiny_zero_model_tok(TOK_JSON);
     let gen_cfg = GenerateConfig {
@@ -522,7 +526,7 @@ fn eos_flushes_incomplete_utf8_tail_in_streaming_and_nonstreaming() {
     assert_eq!(nonstreaming.stop_reason, Some(StopReason::Eos));
     assert_eq!(streaming.stop_reason, Some(StopReason::Eos));
     assert_eq!(nonstreaming.token_ids, vec![0]);
-    assert_eq!(nonstreaming.text, "�");
+    assert_eq!(nonstreaming.text, "\n\u{fffd}");
     assert_eq!(nonstreaming.text, streaming.text);
     assert_eq!(streaming.text, streamed_text);
 }

@@ -712,11 +712,13 @@ fn stream_through_driver(
     let prefill_ran = Cell::new(false);
     let mut text = String::new();
     let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
+    let reasoning_newline_boundary = think_close_id.map(|_| tokenizer.newline_boundary_table());
 
     let result = driver::run(
         session,
         gen_cfg,
         think_close_id,
+        reasoning_newline_boundary,
         prompt_ids,
         eos_token_id,
         true,
@@ -962,6 +964,7 @@ pub(crate) fn run_direct(
     let result = driver::run(
         session,
         gen_cfg,
+        None,
         None,
         prompt_ids,
         eos_token_id,
@@ -1873,6 +1876,7 @@ mod tests {
             s,
             gen_cfg,
             None,
+            None,
             prompt_ids,
             (TINY_VOCAB - 1) as u32,
             true,
@@ -1970,9 +1974,11 @@ mod tests {
 
     /// Tokenizer ids: 0 decodes to "a"; 1 decodes to the lone byte 0xE4, an
     /// incomplete UTF-8 sequence the detokenizer holds until its final flush,
-    /// which renders it as U+FFFD; 2 decodes to "x".
+    /// which renders it as U+FFFD; 2 decodes to "x"; 3 decodes to a newline
+    /// followed by the same lone 0xE4 byte, so it ends a line (a reasoning
+    /// budget may close after it) and still holds a byte for the flush.
     fn scripted_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
-        let vocab = [("a", 0u32), ("\u{e4}", 1), ("x", 2)]
+        let vocab = [("a", 0u32), ("\u{e4}", 1), ("x", 2), ("\u{10a}\u{e4}", 3)]
             .into_iter()
             .map(|(token, id)| (token.to_string(), id))
             .collect();
@@ -1981,7 +1987,7 @@ mod tests {
     }
 
     /// A grammar over the scripted ids, where the grammar reads id 0 as "a",
-    /// id 1 as `second` and id 2 as "x".
+    /// ids 1 and 3 as `second` and id 2 as "x".
     fn scripted_grammar(
         gbnf: &str,
         second: &[u8],
@@ -1989,7 +1995,12 @@ mod tests {
         std::sync::Arc::new(
             crate::grammar::GrammarEngine::new(
                 &crate::grammar::GrammarSpec::Gbnf(gbnf.into()),
-                vec![b"a".to_vec(), second.to_vec(), b"x".to_vec()],
+                vec![
+                    b"a".to_vec(),
+                    second.to_vec(),
+                    b"x".to_vec(),
+                    second.to_vec(),
+                ],
             )
             .expect("scripted grammar compiles"),
         )
@@ -1999,7 +2010,7 @@ mod tests {
     const SCRIPTED_THINK_CLOSE: u32 = 2;
 
     /// Offers `script[i]` from the i-th `select` (the last entry repeats).
-    /// A grammar mask is applied to a zero row over the three ids first, so a
+    /// A grammar mask is applied to a zero row over the four ids first, so a
     /// mask that blocks every id is reported as `GrammarExhausted`, as the
     /// real session reports it.
     struct ScriptedSession {
@@ -2040,7 +2051,7 @@ mod tests {
             let candidate_id = self.script[self.selects.min(self.script.len() - 1)];
             self.selects += 1;
             if let Some(mask) = request.grammar_mask {
-                let mut row = vec![0.0f32; 3];
+                let mut row = vec![0.0f32; 4];
                 mask(&mut row)?;
                 if !has_finite_logit(&row) {
                     return Ok(SelectOutcome::GrammarExhausted);
@@ -2118,10 +2129,11 @@ mod tests {
         assert_eq!(output.text, "a\u{fffd}");
     }
 
-    /// Budget forcing replaces the second token with the close id, which the
-    /// grammar (`"b" "b"`, id 1 read as "b") rejects: the request ends with
-    /// `StopReason::Grammar` and `stopped: false`. The flushed tail still
-    /// reaches `on_token`, and completes no stop string.
+    /// Budget forcing replaces the second token with the close id, because the
+    /// first one (id 3) ends a line. The grammar (`"b" "b"`, id 3 read as "b")
+    /// rejects it: the request ends with `StopReason::Grammar` and
+    /// `stopped: false`. The flushed tail still reaches `on_token`, and
+    /// completes no stop string.
     #[test]
     fn streaming_grammar_rejection_reports_not_stopped() {
         let gen_cfg = GenerateConfig {
@@ -2131,11 +2143,11 @@ mod tests {
             grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
             ..Default::default()
         };
-        let (output, calls) = stream_script(vec![1], &gen_cfg);
+        let (output, calls) = stream_script(vec![3], &gen_cfg);
         let output = output.expect("a grammar rejection is not an error");
         assert_eq!(
             output.token_ids,
-            vec![1],
+            vec![3],
             "the forced close id is rejected before it is pushed"
         );
         assert_eq!(output.stop_reason, Some(StopReason::Grammar));
@@ -2143,7 +2155,10 @@ mod tests {
             !output.stopped,
             "a grammar rejection is not a stop condition"
         );
-        assert_eq!(calls, vec![("\u{fffd}".to_string(), 1)]);
+        assert_eq!(
+            calls,
+            vec![("\n".to_string(), 3), ("\u{fffd}".to_string(), 3)]
+        );
     }
 
     /// The same rejection, with a stop string the flushed tail completes: the
@@ -2156,12 +2171,12 @@ mod tests {
             enable_thinking: true,
             reasoning_budget: Some(1),
             grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
-            stop_strings: vec!["\u{fffd}".to_string()],
+            stop_strings: vec!["\n\u{fffd}".to_string()],
             ..Default::default()
         };
-        let (output, calls) = stream_script(vec![1], &gen_cfg);
+        let (output, calls) = stream_script(vec![3], &gen_cfg);
         let output = output.expect("a grammar rejection is not an error");
-        assert_eq!(output.token_ids, vec![1]);
+        assert_eq!(output.token_ids, vec![3]);
         assert_eq!(output.stop_reason, Some(StopReason::Eos));
         assert!(output.stopped);
         assert!(calls.is_empty(), "the stop string is withheld: {calls:?}");
@@ -2400,7 +2415,8 @@ mod tests {
     }
 
     /// Ids: 0 reads "a", 1 renders U+FFFD only in the final flush, 2 reads "x"
-    /// and is the budget-forced close id.
+    /// and is the budget-forced close id, 3 reads a newline and then holds the
+    /// same byte as 1, so a budget of 1 closes right after it.
     #[test]
     fn prefix_commit_saves_the_exits_that_forwarded_their_tokens() {
         // A length stop: the last pushed token is not forwarded yet.
@@ -2436,7 +2452,7 @@ mod tests {
             grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
             ..capped(4)
         };
-        let (run, _) = prefix_script(vec![1], &rejects, None, None);
+        let (run, _) = prefix_script(vec![3], &rejects, None, None);
         assert_eq!(run.output.stop_reason, Some(StopReason::Grammar));
         assert!(!run.output.stopped);
         assert_eq!(run.commit, PrefixCommit::Save { silent_step: false });
@@ -2533,7 +2549,12 @@ mod tests {
             grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
             ..capped(4)
         };
-        let (run, _) = prefix_script(vec![1], &flush(rejects), None, None);
+        let (run, _) = prefix_script(vec![3], &flush(rejects), None, None);
+        assert_eq!(
+            run.output.token_ids,
+            vec![3],
+            "the forced close was rejected"
+        );
         assert_eq!(run.output.stop_reason, Some(StopReason::Eos));
         assert!(run.output.stopped);
         assert_eq!(

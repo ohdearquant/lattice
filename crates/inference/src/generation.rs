@@ -61,11 +61,12 @@ pub struct GenerateConfig {
     /// halts and the matched text is excluded. Empty = disabled (default; parity-safe).
     pub stop_strings: Vec<String>,
     /// Reasoning-budget forcing (s1-style): after this many reasoning tokens are
-    /// generated without a `</think>`, force-inject `</think>` to commit the model
-    /// to an answer. `None`, `Some(0)`, or [`enable_thinking`](Self::enable_thinking)
-    /// `== false` = disabled (no behaviour change) -- with thinking disabled there is
-    /// no reasoning block for a forced `</think>` to close, so the budget is inert
-    /// regardless of its value. See `GenerateConfig::effective_reasoning_budget`.
+    /// generated, force-inject `</think>` at the first step whose previously emitted
+    /// token contains a newline, or at most 32 tokens later if no such token appears.
+    /// `None`, `Some(0)`, or [`enable_thinking`](Self::enable_thinking) `== false` =
+    /// disabled (no behaviour change) -- with thinking disabled there is no reasoning
+    /// block for a forced `</think>` to close, so the budget is inert regardless of
+    /// its value. See `GenerateConfig::effective_reasoning_budget`.
     pub reasoning_budget: Option<usize>,
     /// Capture per-token log-probabilities (OpenAI `logprobs`/`top_logprobs`).
     /// `None` (default) disables capture entirely -- no extra allocation or
@@ -336,6 +337,8 @@ pub(crate) struct DecodePolicy {
     max_new_tokens: usize,
     logprobs: Option<usize>,
     think_close_id: Option<u32>,
+    reasoning_newline_boundary: Option<Arc<[bool]>>,
+    previous_emitted_id: Option<u32>,
     thinking_closed: bool,
     reasoning_end_len: Option<usize>,
     stop_mode: StopMode,
@@ -430,6 +433,7 @@ impl DecodePolicy {
     pub(crate) fn init(
         gen_cfg: &GenerateConfig,
         think_close_id: Option<u32>,
+        reasoning_newline_boundary: Option<Arc<[bool]>>,
         token_logprobs: &mut Vec<TokenLogprob>,
         first_emitted_id: u32,
         first_logits: &[f32],
@@ -440,6 +444,7 @@ impl DecodePolicy {
         let policy = Self::construct(
             gen_cfg,
             think_close_id,
+            reasoning_newline_boundary,
             first_emitted_id,
             first_generated_len,
             streaming,
@@ -462,6 +467,7 @@ impl DecodePolicy {
     pub(crate) fn init_with_metadata(
         gen_cfg: &GenerateConfig,
         think_close_id: Option<u32>,
+        reasoning_newline_boundary: Option<Arc<[bool]>>,
         token_logprobs: &mut Vec<TokenLogprob>,
         first_emitted_id: u32,
         first_generated_len: usize,
@@ -471,6 +477,7 @@ impl DecodePolicy {
         let policy = Self::construct(
             gen_cfg,
             think_close_id,
+            reasoning_newline_boundary,
             first_emitted_id,
             first_generated_len,
             streaming,
@@ -495,7 +502,7 @@ impl DecodePolicy {
     /// is always "not closed".
     #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
     pub(crate) fn for_verified_stream(gen_cfg: &GenerateConfig, streaming: bool) -> Self {
-        Self::construct(gen_cfg, None, 0, 0, streaming)
+        Self::construct(gen_cfg, None, None, 0, 0, streaming)
     }
 
     /// Shared construction, factored out of [`Self::init`] so [`Self::init_with_metadata`]
@@ -504,6 +511,7 @@ impl DecodePolicy {
     fn construct(
         gen_cfg: &GenerateConfig,
         think_close_id: Option<u32>,
+        reasoning_newline_boundary: Option<Arc<[bool]>>,
         first_emitted_id: u32,
         first_generated_len: usize,
         streaming: bool,
@@ -520,6 +528,8 @@ impl DecodePolicy {
             max_new_tokens: gen_cfg.max_new_tokens,
             logprobs: gen_cfg.logprobs,
             think_close_id,
+            reasoning_newline_boundary,
+            previous_emitted_id: Some(first_emitted_id),
             thinking_closed,
             reasoning_end_len,
             stop_mode: StopMode::for_config(&gen_cfg.stop_strings, streaming),
@@ -533,7 +543,8 @@ impl DecodePolicy {
     }
 
     /// Overrides `sampled_id` with the forced `</think>` token when the reasoning
-    /// budget is exhausted and the block is still open; a no-op pass-through
+    /// budget is exhausted, the block is still open, and the previous emitted token
+    /// was a line boundary or the grace window has ended; a no-op pass-through
     /// otherwise. Call after sampling, before grammar-advance (the actually-emitted
     /// token, post-override, is what grammar must advance on).
     ///
@@ -546,6 +557,13 @@ impl DecodePolicy {
             self.thinking_closed,
             generated_len,
             self.think_close_id,
+            self.previous_emitted_id.is_some_and(|id| {
+                self.reasoning_newline_boundary
+                    .as_ref()
+                    .and_then(|table| table.get(id as usize))
+                    .copied()
+                    .unwrap_or(false)
+            }),
         )
         .unwrap_or(sampled_id)
     }
@@ -925,6 +943,7 @@ impl DecodePolicy {
 
         push(next_id);
         let generated_len_after = generated_len_before + 1;
+        self.previous_emitted_id = Some(next_id);
 
         if let Some(top_n) = self.logprobs {
             let (logprob, top) = record_metadata(next_id, top_n)?;

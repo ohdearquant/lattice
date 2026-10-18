@@ -75,6 +75,7 @@ fn interrupted_prefill_uses_real_cancel_and_finishes_poisoned_once() {
         &mut session,
         &GenerateConfig::default(),
         None,
+        None,
         &[2, 3],
         999,
         false,
@@ -166,6 +167,7 @@ fn run_with_capabilities(caps: ExecutionCapabilities) -> Result<DriverResult, In
         &mut session,
         &gen_cfg,
         None,
+        None,
         &[0u32],
         999,
         false,
@@ -232,6 +234,7 @@ fn request_buffers_reuse_driver_delta() {
     let result = run_into(
         &mut session,
         &config,
+        None,
         None,
         &[0],
         SCRIPTED_EOS,
@@ -441,6 +444,7 @@ fn on_push_fires_before_metadata_for_every_token_with_logprobs_enabled() {
         &mut session,
         &gen_cfg,
         None,
+        None,
         &[0u32],
         999, // eos_token_id; CANDIDATE_ID (7) and the default stop_token_ids
         // (QWEN_CHAT_IM_END_TOKEN_ID, 248_046) never match it, so the loop
@@ -571,6 +575,7 @@ fn run_streaming_script(
     let result = run(
         &mut session,
         &gen_cfg,
+        None,
         None,
         &[0u32],
         SCRIPTED_EOS,

@@ -157,6 +157,8 @@ impl Qwen35Model {
             gen_cfg.enable_thinking,
             cfg.vocab_size,
         )?;
+        let reasoning_newline_boundary =
+            think_close_id.map(|_| self.tokenizer.newline_boundary_table());
 
         let mut session =
             QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
@@ -177,6 +179,7 @@ impl Qwen35Model {
                 &mut session,
                 gen_cfg,
                 think_close_id,
+                reasoning_newline_boundary.clone(),
                 &prompt_ids,
                 cfg.eos_token_id,
                 false,
@@ -213,6 +216,7 @@ impl Qwen35Model {
                 &mut session,
                 gen_cfg,
                 think_close_id,
+                reasoning_newline_boundary,
                 &prompt_ids,
                 cfg.eos_token_id,
                 false,
@@ -475,6 +479,8 @@ impl Qwen35Model {
             gen_cfg.enable_thinking,
             cfg.vocab_size,
         )?;
+        let reasoning_newline_boundary =
+            think_close_id.map(|_| self.tokenizer.newline_boundary_table());
 
         let mut session =
             QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
@@ -504,6 +510,7 @@ impl Qwen35Model {
             &mut session,
             gen_cfg,
             think_close_id,
+            reasoning_newline_boundary,
             &prompt_ids,
             cfg.eos_token_id,
             true,

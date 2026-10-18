@@ -36,6 +36,29 @@ fn synthetic_bpe() -> BpeTokenizer {
 }
 
 #[test]
+fn newline_boundary_table_marks_decoded_newlines() {
+    let vocab = HashMap::from([
+        ("a".to_string(), 0u32),
+        ("Ċ".to_string(), 1),
+        (".Ċ".to_string(), 2),
+        (".".to_string(), 3),
+        ("b".to_string(), 4),
+    ]);
+    let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+        .expect("synthetic byte-level vocabulary must load");
+
+    let table = tokenizer.newline_boundary_table();
+    assert_eq!(
+        &table[..],
+        &[false, true, true, false, false],
+        "only ids whose decoded text contains a newline may be marked"
+    );
+    assert!(tokenizer.decode(&[1]).expect("decode").contains('\n'));
+    assert_eq!(tokenizer.decode(&[2]).as_deref(), Some(".\n"));
+    assert!(!tokenizer.decode(&[3]).expect("decode").contains('\n'));
+}
+
+#[test]
 fn test_gpt4_regex_pretokenize_matches_hf_bytelevel_use_regex_true() {
     // Golden pieces from HF `tokenizers.pre_tokenizers.ByteLevel(use_regex=True)`
     // (the real, unconditional default for every GPT-2-format tokenizer HF

@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::warn;
 
 pub(crate) const DEFAULT_BPE_CACHE_CAPACITY: usize = 8_192;
@@ -67,6 +67,7 @@ struct BpeInner {
     pre_tokenize_mode: PreTokenizeMode,
     max_seq_len: usize,
     cache: ThreadSafeLruCache<String, Vec<u32>>,
+    newline_boundary: OnceLock<Arc<[bool]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -319,11 +320,14 @@ impl BpeTokenizer {
             pre_tokenize_mode: PreTokenizeMode::Gpt4Regex,
             max_seq_len,
             cache: ThreadSafeLruCache::new(cache_capacity),
+            newline_boundary: OnceLock::new(),
         };
 
-        Ok(Self {
+        let tokenizer = Self {
             inner: Arc::new(inner),
-        })
+        };
+        drop(tokenizer.newline_boundary_table());
+        Ok(tokenizer)
     }
 
     /// **Unstable**: clone tokenizer with a new max sequence length.
@@ -346,6 +350,7 @@ impl BpeTokenizer {
             pre_tokenize_mode: self.inner.pre_tokenize_mode,
             max_seq_len,
             cache: self.inner.cache.clone(),
+            newline_boundary: self.inner.newline_boundary.clone(),
         };
         Self {
             inner: Arc::new(inner),
@@ -373,6 +378,7 @@ impl BpeTokenizer {
             pre_tokenize_mode: self.inner.pre_tokenize_mode,
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
+            newline_boundary: self.inner.newline_boundary.clone(),
         };
         Self {
             inner: Arc::new(inner),
@@ -404,6 +410,7 @@ impl BpeTokenizer {
             pre_tokenize_mode: self.inner.pre_tokenize_mode,
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
+            newline_boundary: self.inner.newline_boundary.clone(),
         };
         Self {
             inner: Arc::new(inner),
@@ -429,6 +436,7 @@ impl BpeTokenizer {
             pre_tokenize_mode: self.inner.pre_tokenize_mode,
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
+            newline_boundary: self.inner.newline_boundary.clone(),
         };
         Self {
             inner: Arc::new(inner),
@@ -454,6 +462,7 @@ impl BpeTokenizer {
             pre_tokenize_mode: mode,
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
+            newline_boundary: self.inner.newline_boundary.clone(),
         };
         Self {
             inner: Arc::new(inner),
@@ -611,6 +620,37 @@ impl BpeTokenizer {
         let mut bytes = Vec::new();
         self.append_token_bytes(id, &byte_decoder, &mut bytes)
             .then_some(bytes)
+    }
+
+    /// **Unstable**: per-id newline table for reasoning-close deferral.
+    ///
+    /// The table is built when the tokenizer is constructed and cached on its
+    /// shared internals, so a cloned tokenizer observes the same table and a
+    /// loaded tokenizer pays for it at most once. Ids outside the table are
+    /// not consulted and therefore are not boundaries.
+    pub(crate) fn newline_boundary_table(&self) -> Arc<[bool]> {
+        self.inner
+            .newline_boundary
+            .get_or_init(|| {
+                let byte_decoder = byte_decoder();
+                let mut len = self.inner.id_to_token.len();
+                if let Some(max_added) = self.inner.added_render.keys().max() {
+                    let required = (*max_added as usize).saturating_add(1);
+                    if required <= len.saturating_mul(16) {
+                        len = len.max(required);
+                    }
+                }
+                let mut table = vec![false; len];
+                let mut bytes = Vec::new();
+                for (id, boundary) in table.iter_mut().enumerate() {
+                    bytes.clear();
+                    if self.append_token_bytes(id as u32, &byte_decoder, &mut bytes) {
+                        *boundary = bytes.contains(&b'\n');
+                    }
+                }
+                Arc::from(table)
+            })
+            .clone()
     }
 
     pub(crate) fn append_token_bytes(

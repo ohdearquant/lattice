@@ -1539,8 +1539,10 @@ fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_dead
     );
 }
 
-/// The reasoning budget forces `</think>` on the first decode step, and a
-/// grammar that expects another `a` rejects it. The request ends with
+/// The grammar forces a newline token first (id 29, read by the grammar as
+/// `D`; id 31 is this fixture's EOS), so the reasoning budget of one forces
+/// `</think>` on the first decode step, and a grammar that expects another `D`
+/// rejects it. The request ends with
 /// `StopReason::Grammar`, and the boundary it saves must be one live
 /// KV/GDN state actually represents: the rejected step already forwarded
 /// the one pushed token, so nothing may forward it a second time.
@@ -1564,16 +1566,18 @@ fn generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_sa
     const THINK_CLOSE_ID: usize = 30;
     let mut vocab_bytes = single_char_vocab_bytes();
     vocab_bytes[THINK_CLOSE_ID] = b"</think>".to_vec();
-    let vocab: HashMap<String, u32> = vocab_bytes
+    let mut vocab: HashMap<String, u32> = vocab_bytes
         .iter()
         .zip(0u32..)
         .map(|(bytes, id)| (String::from_utf8_lossy(bytes).into_owned(), id))
         .collect();
+    vocab.remove("D");
+    vocab.insert("\u{10a}".to_string(), 29);
     let tokenizer = crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
         .expect("thinking vocab tokenizer build");
     let engine = Arc::new(
         GrammarEngine::new(
-            &GrammarSpec::Gbnf("root ::= \"a\" \"a\"\n".to_string()),
+            &GrammarSpec::Gbnf("root ::= \"D\" \"D\"\n".to_string()),
             vocab_bytes,
         )
         .expect("grammar engine builds over the thinking vocab"),
@@ -1610,11 +1614,11 @@ fn generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_sa
     assert_eq!(turn.output.stop_reason, Some(StopReason::Grammar));
     assert_eq!(
         turn.output.token_ids,
-        vec![0],
+        vec![29],
         "the forced </think> is rejected before it is pushed"
     );
-    assert_eq!(turn.output.text, "a");
-    assert_eq!(streamed, "a");
+    assert_eq!(turn.output.text, "\n");
+    assert_eq!(streamed, "\n");
     assert!(
         !turn.output.stopped,
         "a grammar rejection reports stopped: false, as the streaming entry does"
@@ -1633,7 +1637,7 @@ fn generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_sa
                  step forwarded, and nothing beyond it"
     );
     assert_eq!(entry.generic.token_ids.len(), represented_len);
-    assert_eq!(entry.generic.token_ids[prompt_len..], [0]);
+    assert_eq!(entry.generic.token_ids[prompt_len..], [29]);
     assert_eq!(entry.generic.gdn_snapshot_len, represented_len);
     assert_eq!(state.session.kv_cache.seq_len, represented_len);
 
