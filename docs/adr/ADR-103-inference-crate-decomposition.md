@@ -50,13 +50,13 @@ together with the base crate.
 
 Measured at `main` b58ce287 with `wc -l` over the `.rs` files under each crate's `src/` (shader sources excluded):
 
-| Crate               | Library source lines |
-| ------------------- | -------------------: |
-| `lattice-inference` |              353,172 |
-| `lattice-tune`      |               25,698 |
-| `lattice-embed`     |               22,554 |
-| `lattice-fann`      |               13,516 |
-| `lattice-transport` |                5,723 |
+| Crate               | Source lines (src/, binaries included) |
+| ------------------- | -------------------------------------: |
+| `lattice-inference` |                                353,172 |
+| `lattice-tune`      |                                 25,698 |
+| `lattice-embed`     |                                 22,554 |
+| `lattice-fann`      |                                 13,516 |
+| `lattice-transport` |                                  5,723 |
 
 `lattice-inference` is about 84% of the workspace's library source. Its largest top-level modules are `forward`
 (89,894 lines), `model` (57,355), `bin` (29,771), `weights` (22,509), `serve` (21,709), `attention` (16,348), `quant`
@@ -213,14 +213,19 @@ New crates add no default features of their own; the facade's defaults are uncha
    block merges, so the change runs that command itself and states that it passed.
 4. **Measurement.** The bench-compare disposition follows the reachability rules in `CLAUDE.md` ("Keep the Machine
    Quiet During A/B Runs"). A moved module that a declared measurement target reaches gets a before/after comparison of that target. A
-   move also changes build inputs (manifests, crate boundaries), which the guide treats as requiring a measured target
-   where one reaches the code.
+   move also changes build inputs (manifests, crate boundaries). Under `CLAUDE.md` the structural waiver applies only
+   when build inputs are identical, so reachability cannot waive a build-input change: a declared target that the
+   changed build inputs can affect is measured before and after.
 5. **CI reach.** Workflow path filters that select work by source path (for example the end-to-end parity gate,
    which watches `crates/inference/src/**` and `crates/embed/src/**`) are extended to the new crate's paths in the same
    change, so moved code keeps triggering the gates it triggered before. The same holds for checked-in lists that
    name the crate a measurement target lives in: GPU-handoff admission reads the bench targets declared in
-   `crates/inference/Cargo.toml`, and `scripts/bench-measurements.toml` classifies binaries by path. A change that
-   moves a bench target or a binary out of `crates/inference` updates those lists in the same change.
+   `crates/inference/Cargo.toml`, `scripts/lib/bench_admission.py` keeps required-feature tables that must name the
+   same sets (admission refuses a revision where they differ), and `scripts/bench-measurements.toml` classifies
+   binaries by path. A change that moves a bench target or a binary out of `crates/inference` updates all three in
+   the same change. The measurement harness admits targets of `lattice-inference` only, so moving a GPU-driving
+   target into another crate also needs a harness change, which is itself a build input; that move waits for its own
+   decision rather than riding an extraction.
 6. **Pure move.** No logic, signature or name changes in the same change beyond what D3 to D5 require. Renames and API
    redesigns are separate changes after the move lands.
 
@@ -244,7 +249,12 @@ narrower crate in their own changes. A CI check over `cargo metadata` fails if a
 3. A crate that has never been published cannot be resolved from the registry, so a registry-backed dry run of its
    dependents fails until it exists. The first release with a new crate states how its publish was rehearsed.
    Because a dry run also passes when someone else already owns the name, that release re-checks on crates.io,
-   immediately before publishing, that each new name is still unowned or owned by this project's publisher.
+   immediately before the first upload, that each new name is still unowned or owned by the account that publishes
+   the existing lattice crates. The check reads `https://crates.io/api/v1/crates/<name>` and its `owners` endpoint
+   with an identifying `User-Agent`, in the same pass as a control read of a crate that is known to exist, as the
+   registry check in `CLAUDE.md` (Publishing) does. Only a 404 for the name, with the control read succeeding, counts
+   as unowned. A refused, unreadable or timed-out answer, a failed control read, or an owner other than that account
+   stops the release before anything is uploaded.
 4. A new crate joins the semver job's package list in the first change after its first release, when a baseline
    exists. From then on the extracted crate is checked directly, which is where its API is now defined.
 
