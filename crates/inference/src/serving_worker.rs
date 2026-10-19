@@ -37,9 +37,10 @@
 //! [`run_worker_loop`] -- the FIFO/cancellation/terminal-event state
 //! machine -- is generic over an injected `generate` closure, exactly like
 //! `lattice_serve.rs`'s pre-existing `run_worker_loop` was. Production
-//! supplies callbacks from a model-owned runtime; this module's own tests
-//! inject a fake generator instead, so the state machine is covered without
-//! a Metal device.
+//! supplies callbacks from a model-owned runtime; the worker tests in
+//! `serve/metal_worker/tests.rs` inject a fake generator instead, so the
+//! state machine is covered without a Metal device. Those tests compile only
+//! on macOS with `metal-gpu`; no other build runs them.
 //! `AffineWorker::spawn`'s `loader` failure path is also GPU-free: a loader
 //! that returns `Err` before ever constructing a `MetalQwen35State`
 //! typechecks and runs with no device involved. The real `spawn` -> real
@@ -50,7 +51,11 @@
 //! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
 
 use crate::forward::metal_qwen35::ChatMessage;
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(target_os = "macos", feature = "metal-gpu")
+))]
 use crate::forward::metal_qwen35::format_chat_template;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
@@ -62,12 +67,20 @@ use crate::serve::lora::{
     AdapterControlError, AdapterControlResult, AdapterIndex, LoraSelection, ResidencyLimits,
 };
 use crate::serve::prepare::PreparationHandle;
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(target_os = "macos", feature = "metal-gpu")
+))]
 use crate::serve::prompt_adapter::apply_qwen_thinking_mode;
 use crate::serving_factory::ServingFactory;
 use crate::serving_runtime_contract::WorkerFailure;
 pub use crate::serving_runtime_contract::{ContextWindowPolicy, WorkerMetadata};
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(target_os = "macos", feature = "metal-gpu")
+))]
 use crate::tokenizer::Tokenizer as _;
 #[cfg(any(
     test,
@@ -194,9 +207,10 @@ impl std::error::Error for StartupError {}
 ///
 /// `pub` (unconditionally) so its type can appear in the `test-utils`-gated
 /// cross-binary test seam's public signatures below (a private type in a
-/// public function's return position does not compile) -- its FIELDS stay
-/// private always; only the `test-utils`-gated `impl` block further down
-/// can construct or read one.
+/// public function's return position does not compile). Its fields are
+/// `pub(crate)` so the model runtimes and the worker tests can build and read
+/// a job; outside this crate only the `test-utils`-gated `impl` block further
+/// down can construct or read one.
 pub struct WorkerJob {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) cfg: GenerateConfig,
@@ -682,8 +696,22 @@ impl Drop for WorkerClient {
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-fn fake_check_prompt_fits_window(
+/// Adapter-selected KV-window invariant for Metal jobs (#656).
+/// `lattice_serve` only knows the rendered prompt length on this worker, so
+/// its full-window check runs here. `lattice` already checks the rendered
+/// prompt in its HTTP preflight; repeating that adapter's exact formula here
+/// prevents the shared worker from tightening its accepted boundary.
+///
+/// `lattice_serve.rs` keeps its pre-existing full-decode formula, including
+/// reasoning tokens and one delimiter slot. `lattice.rs` keeps its
+/// pre-existing HTTP formula, which accepts
+/// `prompt_tokens + max_tokens == max_context`.
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(target_os = "macos", feature = "metal-gpu")
+))]
+pub(crate) fn check_prompt_fits_window(
     policy: ContextWindowPolicy,
     model_max_context: usize,
     prompt_len: usize,
@@ -733,8 +761,19 @@ fn fake_check_prompt_fits_window(
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-fn fake_serving_tokenizer(tokenizer: BpeTokenizer, model_max_context: usize) -> BpeTokenizer {
+/// Raises the worker tokenizer's truncation cap to the model's context window.
+///
+/// A tokenizer loaded from `tokenizer.json` caps sequences at a fixed default
+/// that can sit below the served context. Generation tokenizes the rendered
+/// prompt with this same tokenizer, so a lower cap would silently drop the
+/// prompt's tail (including the open assistant turn) for any prompt that
+/// fits the window but exceeds the cap. Only ever raises the cap.
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(target_os = "macos", feature = "metal-gpu")
+))]
+pub(crate) fn serving_tokenizer(tokenizer: BpeTokenizer, model_max_context: usize) -> BpeTokenizer {
     if tokenizer.max_seq_len() < model_max_context {
         tokenizer.with_max_seq_len(model_max_context)
     } else {
@@ -742,8 +781,17 @@ fn fake_serving_tokenizer(tokenizer: BpeTokenizer, model_max_context: usize) -> 
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-fn fake_render_text_prompt_within_window(
+/// Renders a text-only job's prompt and admits it against the context window.
+///
+/// Admission uses the pre-truncation token count: a truncated count can never
+/// exceed the tokenizer's cap, so an over-window prompt would pass the check
+/// and then be generated from a shortened prefix.
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(target_os = "macos", feature = "metal-gpu")
+))]
+pub(crate) fn render_text_prompt_within_window(
     tokenizer: &BpeTokenizer,
     messages: &[ChatMessage],
     policy: ContextWindowPolicy,
@@ -754,13 +802,13 @@ fn fake_render_text_prompt_within_window(
     let mut prompt = format_chat_template(messages);
     apply_qwen_thinking_mode(&mut prompt, cfg.enable_thinking);
     let prompt_len = tokenizer.tokenize(&prompt).pre_truncation_len;
-    fake_check_prompt_fits_window(policy, model_max_context, prompt_len, cfg)?;
+    check_prompt_fits_window(policy, model_max_context, prompt_len, cfg)?;
     Ok((prompt, prompt_len))
 }
 
 /// Dequeue -> cancel-check -> generate -> reply, serialized on whatever
 /// thread calls this (the dedicated serving worker thread in production; a
-/// plain `std::thread::spawn` in this module's own tests).
+/// plain `std::thread::spawn` in the worker tests).
 ///
 /// `generate` is injected so tests can swap in a fake, GPU-free generator
 /// while exercising the exact same queue/cancellation logic production
@@ -796,7 +844,7 @@ fn fake_render_text_prompt_within_window(
 ///
 /// Production no longer calls this form: [`AffineWorker::spawn_with_vision`]
 /// owns a model and therefore has a real control handler to inject. What is
-/// left is the fake-worker seam and this module's own tests, which is why the
+/// left is the fake-worker seam and the worker tests, which is why the
 /// two-argument form is gated to the same configurations those are. Widening
 /// that gate would mean claiming a production caller that does not exist.
 #[cfg(any(test, feature = "test-utils"))]
@@ -1310,12 +1358,12 @@ fn spawn_fake_with_capability(
     + 'static,
 ) -> WorkerClient {
     let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
-    let tokenizer = fake_serving_tokenizer(tokenizer, model_max_context);
+    let tokenizer = serving_tokenizer(tokenizer, model_max_context);
     let join_handle = std::thread::spawn(move || {
         run_worker_loop(
             job_rx,
             move |messages, cfg, explicitly_thinking, on_token, should_cancel| {
-                let (prompt, _prompt_len) = fake_render_text_prompt_within_window(
+                let (prompt, _prompt_len) = render_text_prompt_within_window(
                     &tokenizer,
                     messages,
                     context_window_policy,

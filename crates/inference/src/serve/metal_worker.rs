@@ -1,16 +1,21 @@
 //! Metal-facing compatibility paths for the thread-affine serving worker.
 //!
-//! The worker host lives in [`crate::serving_worker`]. This module retains
-//! the Metal prompt helpers, vision exports, measurement support, and the
-//! original paths used by the serving binaries and their tests.
+//! The worker host and its prompt-window helpers live in
+//! [`crate::serving_worker`]. This module retains the vision exports,
+//! measurement support, and the original paths used by the serving binaries
+//! and their tests.
 
+#[cfg(test)]
 use crate::forward::metal_qwen35::ChatMessage;
 #[cfg(test)]
 use crate::forward::metal_qwen35::MetalQwen35State;
+#[cfg(test)]
 use crate::forward::metal_qwen35::format_chat_template;
+#[cfg(any(test, feature = "bench-internals"))]
 use crate::generation::GenerateConfig;
 #[cfg(test)]
 use crate::generation::GenerateOutput;
+#[cfg(any(test, feature = "bench-internals"))]
 use crate::serve::ApiError;
 #[cfg(any(test, feature = "bench-internals"))]
 use crate::serve::lora::ResidencyLimits;
@@ -18,10 +23,11 @@ use crate::serve::lora::ResidencyLimits;
 use crate::serve::lora::{AdapterControlError, AdapterControlResult};
 #[cfg(feature = "bench-internals")]
 use crate::serve::prepare::PreparationHandle;
-use crate::serve::prompt_adapter::apply_qwen_thinking_mode;
 #[cfg(any(test, feature = "bench-internals"))]
 use crate::serving_factory::ServingFactory;
+#[cfg(test)]
 use crate::tokenizer::Tokenizer as _;
+#[cfg(test)]
 use crate::tokenizer::bpe::BpeTokenizer;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -70,100 +76,9 @@ use crate::serving_worker::{
     run_worker_loop_with_control,
 };
 
-/// Adapter-selected KV-window invariant for Metal jobs (#656).
-/// `lattice_serve` only knows the rendered prompt length on this worker, so
-/// its full-window check runs here. `lattice` already checks the rendered
-/// prompt in its HTTP preflight; repeating that adapter's exact formula here
-/// prevents the shared worker from tightening its accepted boundary.
-///
-/// `lattice_serve.rs` keeps its pre-existing full-decode formula, including
-/// reasoning tokens and one delimiter slot. `lattice.rs` keeps its
-/// pre-existing HTTP formula, which accepts
-/// `prompt_tokens + max_tokens == max_context`.
-pub(crate) fn check_prompt_fits_window(
-    policy: ContextWindowPolicy,
-    model_max_context: usize,
-    prompt_len: usize,
-    cfg: &GenerateConfig,
-) -> Result<(), ApiError> {
-    // `lattice.rs`'s pre-refactor `check_context_window` also rejected an
-    // empty rendered prompt (`prompt_token_count == 0`) as part of the same
-    // predicate, independent of the window arithmetic; preserve that
-    // conjunct for the policy that reproduces it.
-    if matches!(policy, ContextWindowPolicy::PromptAndMaxTokens) && prompt_len == 0 {
-        return Err(ApiError::BadRequest {
-            message: format!(
-                "prompt (0 tokens) plus max_tokens ({max_tokens}) exceeds model \
-                 context window ({model_max_context})",
-                max_tokens = cfg.max_new_tokens,
-            ),
-            code: "context_length_exceeded",
-        });
-    }
-    let (decode_cap, delimiter_tokens) = match policy {
-        ContextWindowPolicy::PromptAndMaxTokens => (cfg.max_new_tokens, 0),
-        ContextWindowPolicy::PromptAndDecodeWithDelimiter => (
-            cfg.max_new_tokens
-                .saturating_add(cfg.effective_reasoning_budget().unwrap_or(0)),
-            1,
-        ),
-    };
-    let required = prompt_len
-        .saturating_add(decode_cap)
-        .saturating_add(delimiter_tokens);
-    if required > model_max_context {
-        let available = model_max_context.saturating_sub(prompt_len);
-        let delimiter_clause = match delimiter_tokens {
-            0 => String::new(),
-            n => format!(" plus {n}"),
-        };
-        return Err(ApiError::BadRequest {
-            message: format!(
-                "prompt has {prompt_len} tokens, leaving {available} of the \
-                 {model_max_context}-token context window for generation, but this \
-                 request needs {decode_cap} generated tokens{delimiter_clause} (total {required}); \
-                 reduce max_tokens/reasoning_budget or shorten the prompt"
-            ),
-            code: "context_length_exceeded",
-        });
-    }
-    Ok(())
-}
-
-/// Raises the worker tokenizer's truncation cap to the model's context window.
-///
-/// A tokenizer loaded from `tokenizer.json` caps sequences at a fixed default
-/// that can sit below the served context. Generation tokenizes the rendered
-/// prompt with this same tokenizer, so a lower cap would silently drop the
-/// prompt's tail (including the open assistant turn) for any prompt that
-/// fits the window but exceeds the cap. Only ever raises the cap.
-pub(crate) fn serving_tokenizer(tokenizer: BpeTokenizer, model_max_context: usize) -> BpeTokenizer {
-    if tokenizer.max_seq_len() < model_max_context {
-        tokenizer.with_max_seq_len(model_max_context)
-    } else {
-        tokenizer
-    }
-}
-
-/// Renders a text-only job's prompt and admits it against the context window.
-///
-/// Admission uses the pre-truncation token count: a truncated count can never
-/// exceed the tokenizer's cap, so an over-window prompt would pass the check
-/// and then be generated from a shortened prefix.
-pub(crate) fn render_text_prompt_within_window(
-    tokenizer: &BpeTokenizer,
-    messages: &[ChatMessage],
-    policy: ContextWindowPolicy,
-    model_max_context: usize,
-    cfg: &GenerateConfig,
-    _explicitly_thinking: bool,
-) -> Result<(String, usize), ApiError> {
-    let mut prompt = format_chat_template(messages);
-    apply_qwen_thinking_mode(&mut prompt, cfg.enable_thinking);
-    let prompt_len = tokenizer.tokenize(&prompt).pre_truncation_len;
-    check_prompt_fits_window(policy, model_max_context, prompt_len, cfg)?;
-    Ok((prompt, prompt_len))
-}
+pub(crate) use crate::serving_worker::{
+    check_prompt_fits_window, render_text_prompt_within_window, serving_tokenizer,
+};
 
 /// Measurement access to worker internals, for the `bench_serve_prepare`
 /// example only. Not a stable API.

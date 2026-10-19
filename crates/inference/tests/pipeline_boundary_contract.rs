@@ -2,7 +2,7 @@
 //! the source-level `pipeline_boundary_contract` resolver.
 //!
 //! This is a bounded, source-only dependency scan of the production
-//! frontend roots (`src/serve`, six provider files, `src/serving_worker.rs`,
+//! frontend roots (`src/serve`, the provider files, `src/serving_worker.rs`,
 //! and every `src/bin` target) for concrete model/config/backend-state dependencies. It does
 //! NOT establish numerical or device execution, and it does not itself
 //! migrate anything: it is a ratchet against a recorded baseline, run in
@@ -144,7 +144,7 @@
 //! collects bare item NAMES, not paths, from anywhere in a file via
 //! unmodified default recursion) is consulted as the LAST resort, after
 //! every other resolution path has failed, on the invariant that every
-//! production frontend roots are `src/serve`, six provider files
+//! production frontend roots are `src/serve`, the provider files
 //! `src/serving_provider/providers/{gemma.rs,gemma/worker.rs,qwen.rs,qwen/adapters.rs,qwen/vision.rs,qwen/worker.rs}`,
 //! `src/serving_worker.rs`, and `src/bin/`;
 //! these trees stay disjoint from the origin directories `model/` and
@@ -1964,7 +1964,7 @@ struct RawUseLeaf {
 /// per item kind and let the default recursion carry it everywhere --
 /// it never needs to track a path, unlike every other index in this file.
 ///
-/// The bare-name fallback stays safe: roots `src/serve`, the six provider
+/// The bare-name fallback stays safe: roots `src/serve`, the provider
 /// files `src/serving_provider/providers/{gemma.rs,gemma/worker.rs,qwen.rs,qwen/adapters.rs,qwen/vision.rs,qwen/worker.rs}`,
 /// `src/serving_worker.rs`, and `src/bin/*` stay disjoint from `model/` and
 /// `forward/metal_*`; full path resolution runs before this fallback.
@@ -2905,7 +2905,7 @@ fn parse_baseline(text: &str) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-/// The production run scans `src/serve`, six provider roots, `src/serving_worker.rs`, and every
+/// The production run scans `src/serve`, the provider roots, `src/serving_worker.rs`, and every
 /// binary against the baseline. A ratchet, not a migration verdict: a new crossing, or a stale
 /// baseline entry for one that no longer exists, fails the test; a nonzero count does not.
 #[test]
