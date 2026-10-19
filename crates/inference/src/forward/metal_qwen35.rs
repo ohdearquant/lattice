@@ -23,11 +23,15 @@
 //! geometry as the `f32` path.
 //!
 //! Buffers stored as f16: all projection weights (QKV, Z, B, A, out, gate, up, down,
-//! q/k/v/o_proj) and embed_tokens. Buffers kept as f32: norm weights, bias/log scalars,
-//! conv1d weights (small, read by CPU), RoPE tables, activation scratch buffers.
+//! q/k/v/o_proj). `embed_tokens` is f16 for the safetensors upload; a Q4 checkpoint maps
+//! its payload and decodes rows on demand. Buffers kept as f32: norm weights, bias/log
+//! scalars, conv1d weights (small, read by CPU), RoPE tables, activation scratch buffers.
 
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 mod mtp_weights;
+
+#[cfg(any(test, feature = "metal-gpu"))]
+mod q4_embed_lookup;
 
 // -----------------------------------------------------------------------------
 // MTP / self-spec route-around predicates (PR #657) --
@@ -278,6 +282,7 @@ pub(crate) fn push_chat_generation_open(prompt: &mut String) {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
     mod dispatch;
+    mod embedding_table;
     mod gdn_state;
     mod layers;
 
@@ -294,6 +299,7 @@ mod inner {
     use super::mtp_weights::{
         MtpLoadErr, MtpTensorSource, resolve_mtp_norm, resolve_mtp_projection,
     };
+    use super::q4_embed_lookup::Q4Embedding;
     #[cfg(feature = "gdn-state-counters")]
     use super::{
         GdnStateCopyKind, GdnStateTrafficCounters, GdnStateTrafficReport, GdnStateTrafficShape,
@@ -312,6 +318,7 @@ mod inner {
     use crate::tokenizer::detokenize::IncrementalDetokenizer;
     use crate::vision::multimodal::Qwen35VisionRequest;
     use crate::weights::q4_weights::quantize_row_q4_0;
+    use embedding_table::EmbeddingTable;
     use metal::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1450,11 +1457,11 @@ mod inner {
         pub(crate) queue: CommandQueue,
         pub(crate) pipelines: MetalQwen35Pipelines,
         pub(crate) layer_weights: Vec<(MetalLayerAttnWeights, MetalCommonLayerWeights)>,
-        pub(crate) embed_tokens: Buffer, // [vocab_size, hidden] — f16
+        pub(crate) embed_tokens: EmbeddingTable, // [vocab_size, hidden] — f16 or Q4
         pub(crate) embed_tokens_q8: Q4WeightBuf, // [vocab_size, hidden] — Q8_0/Q4 for logits GEMV
-        pub(crate) final_norm: Buffer,   // [hidden] — f32
-        pub(crate) rope_cos: Buffer,     // [max_pos * half_rope_dim] — f32
-        pub(crate) rope_sin: Buffer,     // [max_pos * half_rope_dim] — f32
+        pub(crate) final_norm: Buffer,           // [hidden] — f32
+        pub(crate) rope_cos: Buffer,             // [max_pos * half_rope_dim] — f32
+        pub(crate) rope_sin: Buffer,             // [max_pos * half_rope_dim] — f32
         pub(crate) config: Qwen35Config,
         pub(crate) quant_format: QuantFormat,
         // Immutable MTP weights only; cache/activations live on InferenceSession.
@@ -3189,10 +3196,12 @@ mod inner {
                 layer_weights.push((attn, common));
             }
 
-            // Embedding matrix: f16 (large, used for both embed and tied lm_head)
-            // embed_tokens: keep f16 for embedding lookup (CPU reads it).
-            // Add a Q8_0 version for the logits projection (GPU matmul).
-            let embed_tokens = make_buffer_f16(&device, &weights.embed_tokens, "embed_tokens.f16");
+            // Embedding matrix: f16, shared by the CPU row lookup and the Q8_0 logits kernels.
+            let embed_tokens = EmbeddingTable::F16(make_buffer_f16(
+                &device,
+                &weights.embed_tokens,
+                "embed_tokens.f16",
+            ));
             let embed_tokens_q8 = Q4WeightBuf::from_buffer(make_buffer_quant(
                 &device,
                 &weights.embed_tokens,
@@ -4608,22 +4617,21 @@ mod inner {
             }
             self.checkpoint_gdn_to_slot(0, GdnStateTrafficScope::MtpVerify)?;
 
-            // Batch embedding: f16 → f32 for all K tokens into hidden[0..K*hidden].
-            // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight;
-            // each id is validated < vocab_size before computing offset.
-            unsafe {
-                let src_base = self.engine.embed_tokens.contents() as *const u16;
-                let dst_base = self.session.activations.hidden.contents() as *mut f32;
-                for (t, &id) in tokens.iter().enumerate() {
-                    assert!(
-                        (id as usize) < cfg.vocab_size,
-                        "verify_batch: token {id} >= vocab_size {}",
-                        cfg.vocab_size
+            // Batch embedding: one row per token into hidden[0..K*hidden].
+            let dst_base = self.session.activations.hidden.contents() as *mut f32;
+            for (t, &id) in tokens.iter().enumerate() {
+                assert!(
+                    (id as usize) < cfg.vocab_size,
+                    "verify_batch: token {id} >= vocab_size {}",
+                    cfg.vocab_size
+                );
+                // SAFETY: dst row t holds hidden f32 values and is disjoint from the table.
+                unsafe {
+                    self.engine.embed_tokens.write_row(
+                        id as usize,
+                        dst_base.add(t * hidden),
+                        hidden,
                     );
-                    let src = src_base.add(id as usize * hidden);
-                    let dst = dst_base.add(t * hidden);
-                    // SAFETY: embed_tokens row has hidden u16 values; dst row has hidden f32 values.
-                    convert_f16_row(src, dst, hidden);
                 }
             }
 
@@ -5392,14 +5400,16 @@ mod inner {
 
             // ---- Phase 1: CPU ----
 
-            // 1. Embedding lookup (f16 → f32), same token as was just generated.
+            // 1. Embedding lookup, same token as was just generated.
             let mut normed_embed = vec![0.0f32; hidden];
             assert!((pending_token as usize) < cfg.vocab_size);
+            // SAFETY: normed_embed holds hidden f32 values, disjoint from the embedding table.
             unsafe {
-                let src = (self.engine.embed_tokens.contents() as *const u16)
-                    .add(pending_token as usize * hidden);
-                // SAFETY: embed_tokens row has hidden u16 values; normed_embed has hidden f32 values.
-                convert_f16_row(src, normed_embed.as_mut_ptr(), hidden);
+                self.engine.embed_tokens.write_row(
+                    pending_token as usize,
+                    normed_embed.as_mut_ptr(),
+                    hidden,
+                );
             }
 
             if let Some(ref rot) = self.engine.quarot_rotation {
@@ -5911,10 +5921,12 @@ mod inner {
             let mut normed_embed = vec![0.0f32; hidden];
             assert!((token_id as usize) < cfg.vocab_size);
             unsafe {
-                let src = (self.engine.embed_tokens.contents() as *const u16)
-                    .add(token_id as usize * hidden);
-                // SAFETY: embed_tokens row has hidden u16 values; normed_embed has hidden f32 values.
-                convert_f16_row(src, normed_embed.as_mut_ptr(), hidden);
+                // SAFETY: normed_embed holds hidden f32 values, disjoint from the table.
+                self.engine.embed_tokens.write_row(
+                    token_id as usize,
+                    normed_embed.as_mut_ptr(),
+                    hidden,
+                );
             }
             if let Some(ref rot) = self.engine.quarot_rotation {
                 debug_assert_eq!(rot.dim(), normed_embed.len());
@@ -6324,7 +6336,7 @@ mod inner {
             let expected_gdn_dispatches = cfg.num_active_linear_attention_layers();
             let step_start = std::time::Instant::now();
 
-            // --- Embedding lookup (CPU, read f16 embed_tokens, write f32 hidden) ---
+            // --- Embedding lookup (CPU row read, write f32 hidden) ---
             // Qwen3.5 vision (ADR-069 Metal S5 / MP2): `injected_embedding` REPLACES this
             // lookup with a caller-supplied row (HF `masked_scatter`; mirrors
             // `cpu_f16::forward_step_f16`'s contract) instead of reading `embed_tokens`.
@@ -6344,20 +6356,17 @@ mod inner {
                     }
                 }
                 None => {
-                    let embed_offset = token_id as usize * hidden;
                     assert!(
                         (token_id as usize) < cfg.vocab_size,
                         "forward_step: token_id {token_id} >= vocab_size {}",
                         cfg.vocab_size
                     );
-                    // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight;
-                    // token_id validated < vocab_size above so embed_offset is in bounds.
+                    // SAFETY: token_id < vocab_size; hidden buffer row holds hidden f32 values.
                     unsafe {
-                        let src =
-                            (self.engine.embed_tokens.contents() as *const u16).add(embed_offset);
                         let dst = self.session.activations.hidden.contents() as *mut f32;
-                        // SAFETY: embed_tokens row has hidden u16 values; hidden buffer has hidden f32 values.
-                        convert_f16_row(src, dst, hidden);
+                        self.engine
+                            .embed_tokens
+                            .write_row(token_id as usize, dst, hidden);
                     }
                 }
             }
@@ -7450,14 +7459,12 @@ mod inner {
             let hidden = cfg.hidden_size;
 
             // Embedding lookup — identical to forward_step_inner.
-            // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight;
-            // token_id validated < vocab_size by the generate loop above.
+            // SAFETY: token_id < vocab_size; hidden buffer row holds hidden f32 values.
             unsafe {
-                let src = (self.engine.embed_tokens.contents() as *const u16)
-                    .add(token_id as usize * hidden);
                 let dst = self.session.activations.hidden.contents() as *mut f32;
-                // SAFETY: embed_tokens row has hidden u16 values; hidden buffer has hidden f32 values.
-                convert_f16_row(src, dst, hidden);
+                self.engine
+                    .embed_tokens
+                    .write_row(token_id as usize, dst, hidden);
             }
 
             let mut active_layer_idx = 0usize;
@@ -7852,15 +7859,15 @@ mod inner {
         }
 
         fn copy_prefill_embeddings(&self, token_ids: &[u32], hidden: usize) {
-            // SAFETY: embed_tokens is StorageModeShared f16 with no GPU work in flight;
-            // callers validate every token id before reaching the prefill schedulers.
+            // SAFETY: callers validate ids < vocab_size; hidden rows hold hidden f32 values.
             unsafe {
-                let src_base = self.engine.embed_tokens.contents() as *const u16;
                 let dst_base = self.session.activations.hidden.contents() as *mut f32;
                 for (t, &id) in token_ids.iter().enumerate() {
-                    let src = src_base.add(id as usize * hidden);
-                    let dst = dst_base.add(t * hidden);
-                    convert_f16_row(src, dst, hidden);
+                    self.engine.embed_tokens.write_row(
+                        id as usize,
+                        dst_base.add(t * hidden),
+                        hidden,
+                    );
                 }
             }
         }
@@ -8708,8 +8715,7 @@ mod inner {
             // symmetric Q8 quantization (which can't represent outlier rows
             // cleanly, corrupting hidden·embed dot products vs MLX).
             // For Q4 format (from .q4 dirs), keep using the Q4 path because
-            // the FP16 buffer was dequantized from Q4 and the original Q4
-            // matmul kernel is faster + handles QuaRot rotations correctly.
+            // it is faster and handles QuaRot rotations; a Q4 checkpoint has no f16 table.
             // Issue #171: when the last-token route only needs argmax/top-k (never
             // the full logit vector), skip the full [vocab_size] GEMV entirely —
             // Stage 1 fuses the GEMV with a block-local exact reduction, Stage 2
@@ -8738,7 +8744,7 @@ mod inner {
                             let logits_off = (p * cfg.vocab_size) as u64 * 4;
                             enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode_wide);
                             enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_off);
-                            enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
+                            enc.set_buffer(1, Some(self.engine.embed_tokens.f16_buffer()), 0);
                             enc.set_buffer(2, Some(pb), logits_off);
                             enc.set_bytes(3, 4, &vocab_n as *const u32 as *const _);
                             enc.set_bytes(4, 4, &hidden_k as *const u32 as *const _);
@@ -8750,7 +8756,7 @@ mod inner {
                     } else {
                         enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode_wide);
                         enc.set_buffer(0, Some(&self.session.activations.hidden), last_off);
-                        enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
+                        enc.set_buffer(1, Some(self.engine.embed_tokens.f16_buffer()), 0);
                         enc.set_buffer(2, Some(&self.session.activations.logits), 0);
                         enc.set_bytes(3, 4, &vocab_n as *const u32 as *const _);
                         enc.set_bytes(4, 4, &hidden_k as *const u32 as *const _);
@@ -11197,7 +11203,7 @@ mod inner {
                     let hidden_k = hidden as u32;
                     enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode_wide);
                     enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
-                    enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
+                    enc.set_buffer(1, Some(self.engine.embed_tokens.f16_buffer()), 0);
                     enc.set_buffer(2, Some(&self.session.activations.logits), 0);
                     enc.set_bytes(3, 4, &vocab_n as *const u32 as *const _);
                     enc.set_bytes(4, 4, &hidden_k as *const u32 as *const _);
@@ -11348,13 +11354,12 @@ mod inner {
                 "token_id {last_id} >= vocab_size {}",
                 orig_cfg.vocab_size
             );
-            // SAFETY: embed_tokens is StorageModeShared f16, no GPU command in flight.
+            // SAFETY: last_id < vocab_size above; out holds hidden f32 values.
             let first_input: Vec<f32> = unsafe {
-                let src = (self.engine.embed_tokens.contents() as *const u16)
-                    .add(last_id as usize * hidden);
                 let mut out = vec![0.0f32; hidden];
-                // SAFETY: embed_tokens row has hidden u16 values; out has hidden f32 values.
-                convert_f16_row(src, out.as_mut_ptr(), hidden);
+                self.engine
+                    .embed_tokens
+                    .write_row(last_id as usize, out.as_mut_ptr(), hidden);
                 out
             };
 
@@ -11835,8 +11840,7 @@ mod inner {
 
         /// Dequantize a [`Q4Tensor`] to f16 (as `u16` bit patterns) and create a Metal buffer.
         ///
-        /// Used for `embed_tokens`: the CPU embedding lookup reads f16 values from this buffer,
-        /// so we need an f16 Metal buffer even when the on-disk format is Q4.
+        /// Used for MTP projections and GDN input projections, which the GPU consumes as f16.
         fn make_buffer_f16_from_q4(
             device: &Device,
             tensor: &crate::weights::q4_weights::Q4Tensor,
@@ -12871,24 +12875,20 @@ mod inner {
 
             // ----------------------------------------------------------------
             // embed_tokens: Q4 on disk.
-            //   - embed_tokens (f16 buf): for CPU embedding lookup
-            //   - embed_tokens_q8 (Q4 buf): for logits GEMV on GPU
+            //   - embed_tokens / embed_tokens_q8: the Q4 payload for CPU lookup and GPU GEMV
             // ----------------------------------------------------------------
             let embed_name = "model.language_model.embed_tokens.weight";
             let embed_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
-            let embed_tensor = crate::weights::q4_weights::load_q4_file_checked(
+            let embed_tokens = EmbeddingTable::Q4(Q4Embedding::open(
                 &embed_path,
-                &[cfg.vocab_size, hidden],
-            )
-            .map_err(|e| format!("failed to load embed_tokens Q4 file: {e}"))?;
-            // f16 buffer for CPU embedding lookup
-            let embed_tokens =
-                Self::make_buffer_f16_from_q4(&device, &embed_tensor, "embed_tokens.f16");
+                cfg.vocab_size,
+                hidden,
+                embed_name,
+            )?);
             // Q4 buffer for GPU logits GEMV — mmap no-copy
-            let embed_q4_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
             let embed_tokens_q8 = mmap_q4_weight(
                 &device,
-                &embed_q4_path,
+                &embed_path,
                 "embed_tokens.q4",
                 &[cfg.vocab_size, hidden],
             )?;

@@ -432,24 +432,14 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
 ///   `in_proj_qkvz` runtime-cache buffer (a mmap'd `merged_qkvz_*.q4`
 ///   file, or a CPU-concat fallback), which has no manifest/directory
 ///   entry of its own — so each contributes 2x total.
-/// - `embed_tokens`: dequantized into a full f16 buffer for the CPU
-///   embedding lookup (3.2x, same ratio as `in_proj_a`/`b`) AND, only in
-///   the *tied* (`tie_word_embeddings == true`) case, ALSO separately
-///   mmap'd at its own on-disk size for the GPU logits GEMV
-///   (`embed_tokens_q8`) — 4.2x total for tied checkpoints. In the
-///   *untied* case, `MetalQwen35State::from_q4_dir` immediately shadows
-///   that same-named local binding with a fresh mmap of the separate
-///   `lm_head.weight.q4` file (`metal_qwen35.rs`, the
-///   `!cfg.tie_word_embeddings` branch a few lines after the tied
-///   assignment) — the embedding's own Q4 mmap is dropped before the
-///   function returns, so only the 3.2x f16 dequant survives, and
-///   `lm_head.weight` is counted separately (and correctly, as a plain
-///   1x mmap) via its own manifest/directory entry. Flattening this to
-///   a constant 4.2x regardless of `tie_word_embeddings` was a
-///   deliberate simplification when this estimator was pure telemetry,
-///   but it over-counts untied checkpoints by one full embedding-sized
-///   mmap once the estimate started gating a hard pass/fail verdict
-///   (#881) — hence the `tie_word_embeddings` parameter below.
+/// - `embed_tokens`: mmap'd at its on-disk size (1x) for the CPU row
+///   lookup. In the *tied* (`tie_word_embeddings == true`) case the GPU
+///   logits GEMV maps the same `embed_tokens.weight.q4` file a second
+///   time, but both mappings share the file's physical pages, so the
+///   pair is still 1x — unlike `in_proj_qkv`/`in_proj_z`, whose second
+///   copy is a distinct merged file on disk. In the *untied* case the
+///   GPU mapping is the separate `lm_head.weight.q4` file, counted on
+///   its own manifest entry, and the embedding stays 1x.
 /// - Everything else (full-attention `q/k/v/o_proj`, `mlp.down_proj`,
 ///   `mlp.gate_proj`/`up_proj` fused by plain concatenation into
 ///   `gate_up_proj`, `linear_attn.out_proj`, `lm_head`) is mmap'd
@@ -461,13 +451,12 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
 /// optionally with a trailing `.q4`/`.f16` extension) — both retain the
 /// same distinguishing suffix tokens after normalizing separators.
 ///
-/// Even with the `tie_word_embeddings` correction this remains an
-/// ESTIMATE of peak resident footprint, not a measurement: every mmap
-/// counted here is a lazy, file-backed no-copy mapping whose pages
-/// fault into physical memory on first touch rather than at map time,
-/// so on-disk byte length is an upper bound on eventual residency, not
-/// proof of it at any given instant.
-fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64, tie_word_embeddings: bool) -> u64 {
+/// This remains an ESTIMATE of peak resident footprint, not a
+/// measurement: every mmap counted here is a lazy, file-backed no-copy
+/// mapping whose pages fault into physical memory on first touch rather
+/// than at map time, so on-disk byte length is an upper bound on eventual
+/// residency, not proof of it at any given instant.
+fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64) -> u64 {
     let mut n = name_or_file.replace('.', "_");
     if let Some(stripped) = n.strip_suffix("_q4").or_else(|| n.strip_suffix("_f16")) {
         n = stripped.to_string();
@@ -488,8 +477,7 @@ fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64, tie_word_embeddings
         return on_disk_bytes.saturating_mul(2);
     }
     if n.ends_with("embed_tokens_weight") {
-        let ratio = if tie_word_embeddings { 4.2 } else { 3.2 };
-        return (on_disk_bytes as f64 * ratio).round() as u64;
+        return on_disk_bytes;
     }
     on_disk_bytes
 }
@@ -569,8 +557,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
             };
             match std::fs::metadata(&file_path) {
                 Ok(meta) => {
-                    total_bytes +=
-                        q4_resident_bytes(&entry.name, meta.len(), cfg.tie_word_embeddings);
+                    total_bytes += q4_resident_bytes(&entry.name, meta.len());
                     present_names.insert(entry.name.clone());
                     has_mtp_tensors |= entry.name.starts_with("mtp.");
                 }
@@ -618,7 +605,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
             if (name.ends_with(".q4") || name.ends_with(".f16"))
                 && let Ok(meta) = entry.metadata()
             {
-                total_bytes += q4_resident_bytes(name, meta.len(), cfg.tie_word_embeddings);
+                total_bytes += q4_resident_bytes(name, meta.len());
                 tensor_count += 1;
                 has_mtp_tensors |= name.starts_with("mtp_");
             }
@@ -1291,8 +1278,8 @@ mod tests {
         // must fail if `inspect_q4_dir` reverts to summing raw on-disk
         // sizes unmodified.
         let dir = tempdir("q4-resident-expansion");
-        // embed_tokens: expect 4.2x (dequantized f16 copy + separate
-        // mmap for the logits GEMV).
+        // embed_tokens: expect 1x (mapped in place; the tied GPU logits
+        // path maps the same file again and shares its pages).
         write_fake_q4_file(
             &dir.join("embed.q4"),
             2,
@@ -1324,13 +1311,11 @@ mod tests {
         let inv = inspect_q4_dir(&dir, &cfg).unwrap();
 
         let naive_sum = embed_len + proj_a_len + q_proj_len;
-        let expected = (embed_len as f64 * 4.2).round() as u64
-            + (proj_a_len as f64 * 3.2).round() as u64
-            + q_proj_len;
+        let expected = embed_len + (proj_a_len as f64 * 3.2).round() as u64 + q_proj_len;
         assert!(
             inv.total_bytes > naive_sum,
             "resident estimate ({}) must exceed the naive on-disk sum ({naive_sum}) \
-                 once embed_tokens/in_proj_a expansion is accounted for",
+                 once in_proj_a expansion is accounted for",
             inv.total_bytes
         );
         assert_eq!(inv.total_bytes, expected);
@@ -1342,138 +1327,106 @@ mod tests {
         // Direct unit coverage for the classifier itself, independent of
         // the manifest/fallback-scan plumbing above -- also exercises
         // the sanitized-filename form (dots -> `_`, `.q4`/`.f16` suffix)
-        // used by the no-manifest fallback path. `tie_word_embeddings`
-        // is fixed at `true` throughout this test except where noted --
-        // see `q4_resident_bytes_embed_tokens_scales_by_tie_word_embeddings`
-        // for the tied/untied comparison this parameter exists for.
+        // used by the no-manifest fallback path.
         assert_eq!(
-            q4_resident_bytes("model.language_model.norm.weight", 100, true),
+            q4_resident_bytes("model.language_model.norm.weight", 100),
             200
         );
         assert_eq!(
-            q4_resident_bytes("model_language_model_norm_weight.f16", 100, true),
+            q4_resident_bytes("model_language_model_norm_weight.f16", 100),
             200
         );
         assert_eq!(
-            q4_resident_bytes("model.language_model.layers.0.linear_attn.A_log", 100, true),
+            q4_resident_bytes("model.language_model.layers.0.linear_attn.A_log", 100),
             200
         );
         assert_eq!(
-            q4_resident_bytes(
-                "model.language_model.layers.0.linear_attn.dt_bias",
-                100,
-                true
-            ),
+            q4_resident_bytes("model.language_model.layers.0.linear_attn.dt_bias", 100),
             200
         );
         assert_eq!(
             q4_resident_bytes(
                 "model.language_model.layers.0.linear_attn.conv1d.weight",
-                100,
-                true
+                100
             ),
             200
         );
         assert_eq!(
             q4_resident_bytes(
                 "model.language_model.layers.0.linear_attn.in_proj_a.weight",
-                100,
-                true
+                100
             ),
             320
         );
         assert_eq!(
             q4_resident_bytes(
                 "model.language_model.layers.0.linear_attn.in_proj_b.weight",
-                100,
-                true
+                100
             ),
             320
         );
         assert_eq!(
             q4_resident_bytes(
                 "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
-                100,
-                true
+                100
             ),
             200
         );
         assert_eq!(
             q4_resident_bytes(
                 "model.language_model.layers.0.linear_attn.in_proj_z.weight",
-                100,
-                true
+                100
             ),
             200
         );
         assert_eq!(
-            q4_resident_bytes("model.language_model.embed_tokens.weight", 100, true),
-            420
-        );
-        assert_eq!(
-            q4_resident_bytes("mtp.pre_fc_norm_embedding.weight", 100, true),
-            200
-        );
-        assert_eq!(
-            q4_resident_bytes("mtp.pre_fc_norm_hidden.weight", 100, true),
-            200
-        );
-        assert_eq!(
-            q4_resident_bytes("mtp_pre_fc_norm_embedding_weight.f16", 100, true),
-            200
-        );
-        assert_eq!(
-            q4_resident_bytes("mtp_pre_fc_norm_hidden_weight.f16", 100, true),
-            200
-        );
-        // Unaffected categories stay at exactly 1x, regardless of
-        // tie_word_embeddings (only embed_tokens reads that flag).
-        assert_eq!(
-            q4_resident_bytes(
-                "model.language_model.layers.0.self_attn.q_proj.weight",
-                100,
-                true
-            ),
+            q4_resident_bytes("model.language_model.embed_tokens.weight", 100),
             100
         );
         assert_eq!(
-            q4_resident_bytes(
-                "model.language_model.layers.0.mlp.gate_proj.weight",
-                100,
-                false
-            ),
+            q4_resident_bytes("mtp.pre_fc_norm_embedding.weight", 100),
+            200
+        );
+        assert_eq!(q4_resident_bytes("mtp.pre_fc_norm_hidden.weight", 100), 200);
+        assert_eq!(
+            q4_resident_bytes("mtp_pre_fc_norm_embedding_weight.f16", 100),
+            200
+        );
+        assert_eq!(
+            q4_resident_bytes("mtp_pre_fc_norm_hidden_weight.f16", 100),
+            200
+        );
+        // mmap'd-or-fused categories all stay at exactly 1x.
+        assert_eq!(
+            q4_resident_bytes("model.language_model.layers.0.self_attn.q_proj.weight", 100),
+            100
+        );
+        assert_eq!(
+            q4_resident_bytes("model.language_model.layers.0.mlp.gate_proj.weight", 100),
             100
         );
         assert_eq!(
             q4_resident_bytes(
                 "model.language_model.layers.0.linear_attn.out_proj.weight",
-                100,
-                true
+                100
             ),
             100
         );
-        assert_eq!(q4_resident_bytes("lm_head.weight", 100, false), 100);
+        assert_eq!(q4_resident_bytes("lm_head.weight", 100), 100);
     }
 
     #[test]
-    fn q4_resident_bytes_embed_tokens_scales_by_tie_word_embeddings() {
-        // #881: a tied checkpoint's `embed_tokens_q8`
-        // binding keeps the raw Q4 mmap of `embed_tokens.weight` itself
-        // (1x) on top of the dequantized f16 lookup buffer (3.2x) =
-        // 4.2x. An untied checkpoint's `from_q4_dir` immediately
-        // shadows that same binding with a fresh mmap of the separate
-        // `lm_head.weight.q4` file, dropping the embedding's own Q4
-        // mmap before the function returns -- only the 3.2x f16 dequant
-        // survives, and `lm_head.weight` is counted on its own (as a
-        // plain 1x, via a different `q4_resident_bytes` call for that
-        // name, which does not match any expansion category).
+    fn q4_resident_bytes_embed_tokens_counts_its_file_once() {
+        // The CPU lookup maps `embed_tokens.weight.q4` in place, and a
+        // tied checkpoint's GPU logits path maps that same file again.
+        // Two mappings of one file share its physical pages, so the
+        // embedding contributes its on-disk size once -- unlike
+        // `in_proj_qkv`/`in_proj_z`, whose second copy is a separate
+        // merged file. An untied checkpoint's GPU mapping is the
+        // separate `lm_head.weight.q4`, counted on its own entry.
         let tensor = "model.language_model.embed_tokens.weight";
-        assert_eq!(q4_resident_bytes(tensor, 1000, true), 4200);
-        assert_eq!(q4_resident_bytes(tensor, 1000, false), 3200);
-        // lm_head itself is always a plain 1x mmap in the inventory,
-        // independent of tie_word_embeddings.
-        assert_eq!(q4_resident_bytes("lm_head.weight", 1000, true), 1000);
-        assert_eq!(q4_resident_bytes("lm_head.weight", 1000, false), 1000);
+        assert_eq!(q4_resident_bytes(tensor, 1000), 1000);
+        assert_eq!(q4_resident_bytes("lm_head.weight", 1000), 1000);
     }
 
     #[test]
@@ -1521,9 +1474,9 @@ mod tests {
         // (q4_tensor_path: dots -> `_`), not the original dotted tensor
         // name -- this proves the classifier's suffix matching still
         // works against that form for an expanded category.
-        let dir = tempdir("q4-no-manifest-embed");
+        let dir = tempdir("q4-no-manifest-expanded");
         write_fake_q4_file(
-            &dir.join("model_language_model_embed_tokens_weight.q4"),
+            &dir.join("model_language_model_layers_0_linear_attn_in_proj_a_weight.q4"),
             2,
             &[32],
             32,
@@ -1536,9 +1489,10 @@ mod tests {
             32,
             10,
         );
-        let embed_len = fs::metadata(dir.join("model_language_model_embed_tokens_weight.q4"))
-            .unwrap()
-            .len();
+        let proj_a_len =
+            fs::metadata(dir.join("model_language_model_layers_0_linear_attn_in_proj_a_weight.q4"))
+                .unwrap()
+                .len();
         let q_proj_len =
             fs::metadata(dir.join("model_language_model_layers_0_self_attn_q_proj_weight.q4"))
                 .unwrap()
@@ -1546,9 +1500,9 @@ mod tests {
 
         let cfg = Qwen35Config::qwen35_0_8b();
         let inv = inspect_q4_dir(&dir, &cfg).unwrap();
-        let expected = (embed_len as f64 * 4.2).round() as u64 + q_proj_len;
+        let expected = (proj_a_len as f64 * 3.2).round() as u64 + q_proj_len;
         assert_eq!(inv.total_bytes, expected);
-        assert!(inv.total_bytes > embed_len + q_proj_len);
+        assert!(inv.total_bytes > proj_a_len + q_proj_len);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1896,26 +1850,28 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Minimal Q4 fixture for the threshold-regression tests below: just
-    /// two manifest entries (an `embed_tokens` tensor and one
-    /// never-expanded tensor, e.g. a plain `q_proj`) rather than the
-    /// full `qwen_required_tensor_names` set. `inspect_q4_dir` sums
-    /// `total_bytes` only over manifest entries actually present, so
-    /// this keeps the expected total small enough to state as a closed
-    /// formula in the test -- computed independently of
-    /// `q4_resident_bytes`/`inspect_q4_dir` themselves, so a regression
-    /// in either is caught rather than silently absorbed into a
-    /// self-referential expectation. `missing_tensors` will list the
-    /// rest of `qwen_required_tensor_names(cfg)` as absent, which is
-    /// irrelevant here: it drives a separate, unrelated blocking
-    /// reason, not the "exceeds detected system memory" one under test.
-    fn write_minimal_q4_fixture(dir: &Path, cfg: &Qwen35Config) -> (u64, u64) {
+    /// Minimal Q4 fixture for the threshold-regression tests below: an
+    /// `embed_tokens` tensor, a still-expanding `in_proj_a`, and a plain
+    /// `q_proj` rather than the full `qwen_required_tensor_names` set.
+    /// `inspect_q4_dir` sums `total_bytes` only over manifest entries
+    /// actually present, so this keeps the expected total small enough to
+    /// state as a closed formula in the test -- computed independently of
+    /// `q4_resident_bytes`/`inspect_q4_dir` themselves, so a regression in
+    /// either is caught rather than silently absorbed into a
+    /// self-referential expectation. `missing_tensors` will list the rest
+    /// of `qwen_required_tensor_names(cfg)` as absent, which is irrelevant
+    /// here: it drives a separate, unrelated blocking reason, not the
+    /// "exceeds detected system memory" one under test.
+    fn write_expanded_q4_fixture(dir: &Path, cfg: &Qwen35Config) -> (u64, u64, u64) {
         write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 5);
-        write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 3);
+        write_fake_q4_file(&dir.join("proj_a.q4"), 2, &[32], 32, 20);
+        write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 5);
         let embed_bytes = fs::metadata(dir.join("embed.q4")).unwrap().len();
+        let proj_a_bytes = fs::metadata(dir.join("proj_a.q4")).unwrap().len();
         let q_proj_bytes = fs::metadata(dir.join("q_proj.q4")).unwrap().len();
         let index = serde_json::json!([
             {"name": "model.language_model.embed_tokens.weight", "file": "embed.q4", "quantized": true, "shape": [32], "numel": 32},
+            {"name": "model.language_model.layers.0.linear_attn.in_proj_a.weight", "file": "proj_a.q4", "quantized": true, "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
         fs::write(
@@ -1925,41 +1881,26 @@ mod tests {
         .unwrap();
         write_config_json(dir, cfg);
         fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
-        (embed_bytes, q_proj_bytes)
+        (embed_bytes, proj_a_bytes, q_proj_bytes)
     }
 
     #[test]
-    fn build_report_q4_untied_embed_tokens_threshold_no_longer_overcounts() {
-        // #881: before this fix, `q4_resident_bytes`
-        // charged `embed_tokens` at a flat 4.2x on-disk size regardless
-        // of `tie_word_embeddings`, even though an UNTIED checkpoint's
-        // loader drops the embedding's own Q4 mmap and only keeps the
-        // 3.2x f16 dequant (see `q4_resident_bytes`'s doc comment). That
-        // stale 4.2x overcounted an untied checkpoint by exactly one
-        // embedding-file's worth of bytes -- enough to push a
-        // near-boundary checkpoint across the new hard-fail threshold
-        // for a machine it would actually fit on.
-        //
-        // Reproduce at the boundary: pick a memory override strictly
-        // between an INDEPENDENTLY hand-computed corrected (3.2x) total
-        // and what the stale flat-4.2x estimate would have been for the
-        // same on-disk bytes -- both computed here with the `* 3.2`/
-        // `* 4.2` arithmetic directly, not by calling
-        // `q4_resident_bytes`/`inspect_q4_dir`, so a regression back to
-        // the flat-4.2x behavior actually pushes `report`'s real
-        // `inventory.total_bytes` back over this test's override and
+    fn build_report_q4_resident_estimate_no_longer_overcounts_embed_tokens() {
+        // The CPU embedding lookup now maps `embed_tokens.weight.q4` and
+        // reads rows from it, so the embedding contributes its on-disk
+        // size once. Pin the boundary with an INDEPENDENTLY hand-computed
+        // total -- embed 1x + in_proj_a 3.2x (still dequantized to f16)
+        // + q_proj 1x -- rather than by calling `q4_resident_bytes`, so a
+        // regression back to a larger embedding charge pushes the
+        // report's real `inventory.total_bytes` over this override and
         // is caught.
-        let dir = tempdir("report-q4-untied-threshold");
-        let mut cfg = Qwen35Config::qwen35_0_8b();
-        cfg.tie_word_embeddings = false;
-        let (embed_bytes, q_proj_bytes) = write_minimal_q4_fixture(&dir, &cfg);
+        let dir = tempdir("report-q4-resident-threshold");
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let (embed_bytes, proj_a_bytes, q_proj_bytes) = write_expanded_q4_fixture(&dir, &cfg);
 
-        let corrected_total = (embed_bytes as f64 * 3.2).round() as u64 + q_proj_bytes; // untied: 3.2x + 1x
-        let stale_would_have_been = (embed_bytes as f64 * 4.2).round() as u64 + q_proj_bytes; // old flat 4.2x + 1x
-        assert!(stale_would_have_been > corrected_total);
-        let threshold_override = corrected_total + (stale_would_have_been - corrected_total) / 2;
-        assert!(threshold_override > corrected_total);
-        assert!(threshold_override < stale_would_have_been);
+        let corrected_total =
+            embed_bytes + (proj_a_bytes as f64 * 3.2).round() as u64 + q_proj_bytes;
+        let threshold_override = corrected_total + 1;
 
         let report = build_report(&dir, None, None, Some(threshold_override)).unwrap();
         assert!(
@@ -1967,8 +1908,8 @@ mod tests {
                 .blocking_reasons
                 .iter()
                 .any(|r| r.contains("exceeds detected system memory")),
-            "corrected Q4 estimate must fit within a budget between the corrected and \
-                 stale flat-4.2x estimate; blocking reasons: {:?}",
+            "the resident estimate must fit a budget one byte above the hand-computed \
+                 total; blocking reasons: {:?}",
             report.blocking_reasons
         );
         fs::remove_dir_all(&dir).ok();
@@ -1977,16 +1918,16 @@ mod tests {
     #[test]
     fn build_report_q4_true_over_budget_still_fails() {
         // Belt-and-suspenders alongside the threshold test above: a Q4
-        // checkpoint that genuinely exceeds even the corrected
-        // (tie_word_embeddings-aware) estimate must still fail closed
-        // -- the fix must not turn into a blanket pass for Q4. Same
-        // independent hand-computed formula as the test above.
+        // checkpoint that genuinely exceeds the resident estimate must
+        // still fail closed -- the fix must not turn into a blanket pass
+        // for Q4. Same independent hand-computed formula as the test
+        // above.
         let dir = tempdir("report-q4-true-over-budget");
-        let mut cfg = Qwen35Config::qwen35_0_8b();
-        cfg.tie_word_embeddings = false;
-        let (embed_bytes, q_proj_bytes) = write_minimal_q4_fixture(&dir, &cfg);
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let (embed_bytes, proj_a_bytes, q_proj_bytes) = write_expanded_q4_fixture(&dir, &cfg);
 
-        let corrected_total = (embed_bytes as f64 * 3.2).round() as u64 + q_proj_bytes;
+        let corrected_total =
+            embed_bytes + (proj_a_bytes as f64 * 3.2).round() as u64 + q_proj_bytes;
         let report = build_report(&dir, None, None, Some(corrected_total - 1)).unwrap();
         assert!(
             report
