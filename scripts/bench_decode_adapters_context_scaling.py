@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Engine adapters + profile hooks for the `context_scaling` profile (issue
 #813 step 2: migrate `legacy context-scaling consumer`, keeping its chart
-renderer, `scripts/bench_context_scaling_chart.py`, unchanged).
+renderer, `scripts/bench_context_scaling_chart.py`).
 
 This module does more than exec `bench_decode_harness.main()` (unlike the
 apples_to_apples/apples_precise/q4_apples adapters) because the legacy
@@ -42,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_decode_harness as harness  # noqa: E402
+import bench_context_scaling_chart as chart  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROFILE_NAME = "context_scaling"
@@ -412,7 +413,18 @@ def render_legacy_tsv(
     `s.slope_tok_per_s` -- never independently recomputed, so the TSV can
     never render a `t1_ms`/`t2_ms` pair inconsistent with the slope next to
     it (issue #813 codex round-1 finding 2c)."""
-    lines = ["engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope"]
+    provenance = {
+        "schema_version": 1,
+        "harness": "bench_decode_harness.py",
+        "observation_schema_versions": sorted({obs.schema_version for obs in run_result.observations}),
+        "git_shas": sorted({obs.git_sha for obs in run_result.observations}),
+        "hardware_ids": sorted({obs.hardware_id for obs in run_result.observations}),
+        "observation_timestamps": sorted({obs.timestamp for obs in run_result.observations}),
+    }
+    lines = [
+        "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope",
+        chart.provenance_comment(provenance),
+    ]
     baseline_window = run_result.profile.windows[0]
     for s in slopes:
         t1_ms = window_medians[(s.engine, baseline_window)] * 1000
