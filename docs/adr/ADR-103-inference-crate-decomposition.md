@@ -1,6 +1,6 @@
 # ADR-103: Splitting lattice-inference into focused crates behind a facade
 
-**Status**: Proposed (2026-10-19)\
+**Status**: Accepted (2026-10-19)\
 **Date**: 2026-10-19\
 **Origin**: roadmap item "Inference crate decomposition" (docs/ROADMAP.md), 2026-10-18\
 **Crate**: lattice-inference and the crates extracted from it; workspace manifests, publish script, CI\
