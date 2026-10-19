@@ -23,10 +23,9 @@
 //! geometry as the `f32` path.
 //!
 //! Buffers stored as f16: all projection weights (QKV, Z, B, A, out, gate, up, down,
-//! q/k/v/o_proj). `embed_tokens` is f16 for the safetensors upload, while a Q4
-//! checkpoint maps its own payload and decodes rows on demand. Buffers kept as
-//! f32: norm weights, bias/log scalars, conv1d weights (small, read by CPU), RoPE
-//! tables, activation scratch buffers.
+//! q/k/v/o_proj). `embed_tokens` is f16 for the safetensors upload; a Q4 checkpoint maps
+//! its payload and decodes rows on demand. Buffers kept as f32: norm weights, bias/log
+//! scalars, conv1d weights (small, read by CPU), RoPE tables, activation scratch buffers.
 
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 mod mtp_weights;
@@ -283,6 +282,7 @@ pub(crate) fn push_chat_generation_open(prompt: &mut String) {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
     mod dispatch;
+    mod embedding_table;
     mod gdn_state;
     mod layers;
 
@@ -318,6 +318,7 @@ mod inner {
     use crate::tokenizer::detokenize::IncrementalDetokenizer;
     use crate::vision::multimodal::Qwen35VisionRequest;
     use crate::weights::q4_weights::quantize_row_q4_0;
+    use embedding_table::EmbeddingTable;
     use metal::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1434,56 +1435,6 @@ mod inner {
                 return env_fmt;
             }
             Self::from_model_size(cfg)
-        }
-    }
-
-    /// Where `embed_tokens` rows come from for the CPU embedding lookup.
-    pub(crate) enum EmbeddingTable {
-        /// f16 rows in a shared Metal buffer: the safetensors upload and every
-        /// Q8_0 build, whose GPU logits path reads the same f16 buffer.
-        F16(Buffer),
-        /// Q4 blocks in a read-only mapping of the checkpoint's own file,
-        /// decoded per row. GPU logits for a Q4 checkpoint read a separate
-        /// mapping.
-        Q4(Q4Embedding),
-    }
-
-    impl EmbeddingTable {
-        /// Write row `id` as f32 values to `dst`.
-        ///
-        /// # Safety
-        ///
-        /// `dst` must point to at least `cols` writable f32 values that do not
-        /// alias the embedding storage.
-        pub(crate) unsafe fn write_row(&self, id: usize, dst: *mut f32, cols: usize) {
-            match self {
-                Self::F16(buffer) => {
-                    // SAFETY: the buffer holds f16 rows of `cols` values, and
-                    // the caller guarantees `dst` holds `cols` f32 values.
-                    unsafe {
-                        let src = (buffer.contents() as *const u16).add(id * cols);
-                        for i in 0..cols {
-                            *dst.add(i) = crate::weights::half_bits::f16_bits_to_f32(*src.add(i));
-                        }
-                    }
-                }
-                Self::Q4(embedding) => {
-                    // SAFETY: forwarded caller guarantee; the Q4 table was
-                    // opened for exactly this many rows and columns.
-                    unsafe { embedding.write_row(id, dst) }
-                }
-            }
-        }
-
-        /// The f16 rows bound to the GPU logits kernels on a Q8_0 build.
-        ///
-        /// Only Q8_0 dispatches call this, and every Q8_0 construction takes
-        /// [`Self::F16`], so the Q4 arm cannot be reached from a valid engine.
-        pub(crate) fn f16_buffer(&self) -> &Buffer {
-            match self {
-                Self::F16(buffer) => buffer,
-                Self::Q4(_) => unreachable!("a Q8_0 engine always builds the f16 embedding table"),
-            }
         }
     }
 
@@ -3245,9 +3196,7 @@ mod inner {
                 layer_weights.push((attn, common));
             }
 
-            // Embedding matrix: f16 (large, used for both embed and tied lm_head).
-            // Q8_0 logits kernels read the same f16 rows; on Q4_0 both stay
-            // consistent because this constructor uploads the same source.
+            // Embedding matrix: f16, shared by the CPU row lookup and the Q8_0 logits kernels.
             let embed_tokens = EmbeddingTable::F16(make_buffer_f16(
                 &device,
                 &weights.embed_tokens,
@@ -4676,8 +4625,7 @@ mod inner {
                     "verify_batch: token {id} >= vocab_size {}",
                     cfg.vocab_size
                 );
-                // SAFETY: destination row `t` of the shared hidden buffer holds
-                // `hidden` f32 values and is disjoint from the embedding table.
+                // SAFETY: dst row t holds hidden f32 values and is disjoint from the table.
                 unsafe {
                     self.engine.embed_tokens.write_row(
                         id as usize,
@@ -5455,8 +5403,7 @@ mod inner {
             // 1. Embedding lookup, same token as was just generated.
             let mut normed_embed = vec![0.0f32; hidden];
             assert!((pending_token as usize) < cfg.vocab_size);
-            // SAFETY: `normed_embed` holds `hidden` f32 values and is disjoint
-            // from the embedding table.
+            // SAFETY: normed_embed holds hidden f32 values, disjoint from the embedding table.
             unsafe {
                 self.engine.embed_tokens.write_row(
                     pending_token as usize,
@@ -5974,8 +5921,7 @@ mod inner {
             let mut normed_embed = vec![0.0f32; hidden];
             assert!((token_id as usize) < cfg.vocab_size);
             unsafe {
-                // SAFETY: `normed_embed` holds `hidden` f32 values and is
-                // disjoint from the embedding table.
+                // SAFETY: normed_embed holds hidden f32 values, disjoint from the table.
                 self.engine.embed_tokens.write_row(
                     token_id as usize,
                     normed_embed.as_mut_ptr(),
@@ -6415,8 +6361,7 @@ mod inner {
                         "forward_step: token_id {token_id} >= vocab_size {}",
                         cfg.vocab_size
                     );
-                    // SAFETY: token_id is validated below `vocab_size` above, and
-                    // the shared hidden buffer holds `hidden` f32 values.
+                    // SAFETY: token_id < vocab_size; hidden buffer row holds hidden f32 values.
                     unsafe {
                         let dst = self.session.activations.hidden.contents() as *mut f32;
                         self.engine
@@ -7514,8 +7459,7 @@ mod inner {
             let hidden = cfg.hidden_size;
 
             // Embedding lookup — identical to forward_step_inner.
-            // SAFETY: token_id is validated below `vocab_size` by the generate
-            // loop above, and the shared hidden buffer holds `hidden` f32 values.
+            // SAFETY: token_id < vocab_size; hidden buffer row holds hidden f32 values.
             unsafe {
                 let dst = self.session.activations.hidden.contents() as *mut f32;
                 self.engine
@@ -7915,9 +7859,7 @@ mod inner {
         }
 
         fn copy_prefill_embeddings(&self, token_ids: &[u32], hidden: usize) {
-            // SAFETY: callers validate every token id against `vocab_size` before
-            // reaching the prefill schedulers, and each destination row of the
-            // shared hidden buffer holds `hidden` f32 values.
+            // SAFETY: callers validate ids < vocab_size; hidden rows hold hidden f32 values.
             unsafe {
                 let dst_base = self.session.activations.hidden.contents() as *mut f32;
                 for (t, &id) in token_ids.iter().enumerate() {
@@ -8773,8 +8715,7 @@ mod inner {
             // symmetric Q8 quantization (which can't represent outlier rows
             // cleanly, corrupting hidden·embed dot products vs MLX).
             // For Q4 format (from .q4 dirs), keep using the Q4 path because
-            // the original Q4 matmul kernel is faster + handles QuaRot
-            // rotations correctly. A Q4 checkpoint has no f16 embedding table.
+            // it is faster and handles QuaRot rotations; a Q4 checkpoint has no f16 table.
             // Issue #171: when the last-token route only needs argmax/top-k (never
             // the full logit vector), skip the full [vocab_size] GEMV entirely —
             // Stage 1 fuses the GEMV with a block-local exact reduction, Stage 2
@@ -11413,8 +11354,7 @@ mod inner {
                 "token_id {last_id} >= vocab_size {}",
                 orig_cfg.vocab_size
             );
-            // SAFETY: `last_id` is validated below `vocab_size` above, and `out`
-            // holds `hidden` f32 values disjoint from the embedding table.
+            // SAFETY: last_id < vocab_size above; out holds hidden f32 values.
             let first_input: Vec<f32> = unsafe {
                 let mut out = vec![0.0f32; hidden];
                 self.engine
@@ -11900,8 +11840,7 @@ mod inner {
 
         /// Dequantize a [`Q4Tensor`] to f16 (as `u16` bit patterns) and create a Metal buffer.
         ///
-        /// Used for MTP projections and the GDN input projections, which the GPU
-        /// consumes as f16.
+        /// Used for MTP projections and GDN input projections, which the GPU consumes as f16.
         fn make_buffer_f16_from_q4(
             device: &Device,
             tensor: &crate::weights::q4_weights::Q4Tensor,
@@ -12936,8 +12875,7 @@ mod inner {
 
             // ----------------------------------------------------------------
             // embed_tokens: Q4 on disk.
-            //   - embed_tokens: maps the Q4 payload for the CPU row lookup
-            //   - embed_tokens_q8: the same file (or lm_head) for the GPU GEMV
+            //   - embed_tokens / embed_tokens_q8: the Q4 payload for CPU lookup and GPU GEMV
             // ----------------------------------------------------------------
             let embed_name = "model.language_model.embed_tokens.weight";
             let embed_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
