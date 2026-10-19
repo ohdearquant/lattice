@@ -6,6 +6,22 @@
 **Crate**: lattice-inference and the crates extracted from it; workspace manifests, publish script, CI\
 **Related**: ADR-102 (in-crate reorganisation and the 3000-line file cap; complementary, see "Relation to ADR-102")
 
+## Amendment 1 (2026-10-19)
+
+A review of the accepted text found two contradictions that the first extraction would hit, and several statements
+that did not match the repository. Changed:
+
+1. D4: "Public" no longer applies to members of a type the facade re-exports, because making one public adds it to
+   the facade and breaks D6.2's identical listing. Such members take "Internal", and the example moved there. Items
+   already public through the facade keep their path through a public export of the new crate, never `__internal`.
+2. D6.2 now states how an extraction change clears the required semver job: it merges only while `main` carries an
+   unreleased minor version, where the job runs zero checks and says so, and its own listing instruments are the
+   surface gate. The Consequences line that said the job "stops seeing" moved items is corrected.
+3. D5's reason for removing consumer-feature gates, D6.3 (the CI rustdoc job does not block, so the change runs the
+   command itself), D6.4 and D7 (the rules they point at are in `CLAUDE.md`, not a contribution guide), D6.5 (bench
+   and binary lists that name a target's crate), D8.3 (name ownership re-checked before the first publish), the
+   Context counting method, and the compile-scope consequence.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
@@ -31,7 +47,7 @@ together with the base crate.
 
 ## Context
 
-Measured at `main` b58ce287 with `wc -l` over each crate's `src/`:
+Measured at `main` b58ce287 with `wc -l` over the `.rs` files under each crate's `src/` (shader sources excluded):
 
 | Crate               | Library source lines |
 | ------------------- | -------------------: |
@@ -135,13 +151,23 @@ Every `pub(crate)` item of the moving module that is used from outside it is lis
 of three dispositions, in this order of preference:
 
 1. **Stays crate-private** in the new crate, when its outside callers can move with it or use public API instead.
-2. **Public**: a documented public item of the new crate, when it is a coherent part of that crate's job (for example
-   `BpeTokenizer::token_ids_for_content`).
+2. **Public**: a documented public item of the new crate, when it is a coherent part of that crate's job and making
+   it public does not add to the facade's public surface. A member of a type the facade re-exports (an inherent
+   method, an associated item, a field) fails that test: members travel with their type, so making one public adds
+   it at the facade path and breaks the identical listing D6.2 requires. In an extraction change such a member takes
+   disposition 3; making it public is a separate API change after the move.
 3. **Internal**: a free function or extension trait inside `#[doc(hidden)] pub mod __internal` of the new crate,
-   called by the facade's code by its full path and never re-exported by the facade. This is for engine-specific glue.
+   called by the facade's code by its full path and never re-exported by the facade. This is for engine-specific glue,
+   and for members of re-exported types that other modules still call (for example
+   `BpeTokenizer::token_ids_for_content` becomes a free function in `__internal` that calls the crate-private method).
 
 An internal item is never an inherent method of a type the facade re-exports: methods travel with their type, so a
 hidden inherent method would be callable through the facade path. No item is widened without a listed disposition.
+
+An item of the moving module that is already public through the facade today, under any path, keeps that path. The
+new crate exports it publicly (disposition 2, which adds nothing to the facade because the path already exists) and the
+facade re-exports it from there. It is never routed through `__internal`, which the facade does not re-export. For the
+tokenizer, `lattice_inference::model::qwen35::bytes_to_unicode` is such an item.
 
 ### D5. Features
 
@@ -150,9 +176,10 @@ new crate with the same name and meaning, and the facade's feature of that name 
 (`serve = [..., "lattice-tokenizer/serve"]`).
 
 A `cfg` that exists only because the item's callers are compiled under some combination of consumer features (the
-three tokenizer items listed under Context) is removed in the move, and the item compiles unconditionally. A gate
-cannot be kept: Cargo features cannot express "all of these features together", and `cfg(test)` is false in a
-dependency when the facade's tests run, so a kept gate would break the CPU test suites that call these items today.
+three tokenizer items listed under Context) is removed in the move, and the item compiles unconditionally. Keeping such
+a gate would require the new crate to declare consumer features it does not use, only so the facade can forward them.
+Where the gate also has a `cfg(test)` alternative, it cannot be kept at all: `cfg(test)` is false in a dependency when
+the facade's tests run, so a kept gate would break the CPU test suites that call these items today.
 New crates add no default features of their own; the facade's defaults are unchanged.
 
 ### D6. Acceptance of every extraction change
@@ -170,15 +197,28 @@ New crates add no default features of their own; the facade's defaults are uncha
      conversions);
    - a listing of the facade's public items that resolves re-exports across the workspace's rustdoc JSON, identical
      before and after the move.
+
+   Clearing the semver job. The job is part of the required gate, and against a published release of the same
+   version it fails on an extraction change, because it reports the moved items as missing. An extraction change
+   therefore merges only while `main`'s workspace version is an unreleased minor above the latest published release,
+   that is, after the release-bump change for the release that will publish the new crates and before that release is
+   published. In that state the job runs zero checks under 0.x versioning, and its disclosure step reports that
+   (Context). The two instruments above are then that change's public-surface gate, and their outputs are pasted in the
+   change. An extraction change never edits the semver job, its package list or its lint levels, and never bumps the
+   workspace version itself.
 3. **Clippy and docs.** `cargo clippy` with `-D warnings` on the CI feature sets, and the CI rustdoc command with its
-   broken-link lints over the whole workspace, so links in the new crate are checked too.
-4. **Measurement.** The bench-compare disposition follows the reachability rules in the repository's contribution
-   guide. A moved module that a declared measurement target reaches gets a before/after comparison of that target. A
+   broken-link lints over the whole workspace, so links in the new crate are checked too. The CI rustdoc job does not
+   block merges, so the change runs that command itself and states that it passed.
+4. **Measurement.** The bench-compare disposition follows the reachability rules in `CLAUDE.md` ("Keep the Machine
+   Quiet During A/B Runs"). A moved module that a declared measurement target reaches gets a before/after comparison of that target. A
    move also changes build inputs (manifests, crate boundaries), which the guide treats as requiring a measured target
    where one reaches the code.
 5. **CI reach.** Workflow path filters that select work by source path (for example the end-to-end parity gate,
    which watches `crates/inference/src/**` and `crates/embed/src/**`) are extended to the new crate's paths in the same
-   change, so moved code keeps triggering the gates it triggered before.
+   change, so moved code keeps triggering the gates it triggered before. The same holds for checked-in lists that
+   name the crate a measurement target lives in: GPU-handoff admission reads the bench targets declared in
+   `crates/inference/Cargo.toml`, and `scripts/bench-measurements.toml` classifies binaries by path. A change that
+   moves a bench target or a binary out of `crates/inference` updates those lists in the same change.
 6. **Pure move.** No logic, signature or name changes in the same change beyond what D3 to D5 require. Renames and API
    redesigns are separate changes after the move lands.
 
@@ -188,7 +228,7 @@ Extracted crates may depend on the base crate and on each other, in one directio
 `lattice-inference`. `lattice-embed` and `lattice-tune` keep depending on the facade; they may later depend on a
 narrower crate in their own changes. A CI check over `cargo metadata` fails if any extracted crate depends on
 `lattice-inference` or if the extracted crates form a cycle. The crate-ownership and publishing sections of the
-contribution guide are updated in the same change that adds a crate.
+`CLAUDE.md` ("Crate Ownership", "Publishing") are updated in the same change that adds a crate.
 
 ### D8. Naming, versioning and publishing
 
@@ -201,6 +241,8 @@ contribution guide are updated in the same change that adds a crate.
    tiers.
 3. A crate that has never been published cannot be resolved from the registry, so a registry-backed dry run of its
    dependents fails until it exists. The first release with a new crate states how its publish was rehearsed.
+   Because a dry run also passes when someone else already owns the name, that release re-checks on crates.io,
+   immediately before publishing, that each new name is still unowned or owned by this project's publisher.
 4. A new crate joins the semver job's package list in the first change after its first release, when a baseline
    exists. From then on the extracted crate is checked directly, which is where its API is now defined.
 
@@ -237,7 +279,10 @@ first.
 
 - Downstream users see no change unless they opt into a narrower crate.
 - The workspace gains crates to publish and version; the publish script and release notes cover them.
-- Compile and review scope for tokenizer, grammar and format work shrinks to the crate that owns it.
-- The semver job on `lattice-inference` stops seeing items that moved out of it; those items are checked on their
+- Review scope for tokenizer, grammar and format work shrinks to the crate that owns it, and so does compile scope
+  for a consumer that depends on the narrow crate directly. Inside the workspace an edit to an extracted crate still
+  rebuilds the facade and everything that depends on it, because the facade depends on every extracted crate (D1).
+- The semver job on `lattice-inference` reports moved items as missing and cannot check them through the facade
+  (Context); extraction changes clear it by the rule in D6.2. Those items are checked on their
   own crates after first release (D8.4), and the facade's surface by the D6.2 instruments.
 - Internal glue modules (D4.3) are a cost that should fall over time as consumers move.
