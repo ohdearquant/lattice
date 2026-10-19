@@ -83,7 +83,10 @@ use crate::model::qwen35::{
 use crate::sampling::compute_step_logprobs;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
-use crate::tokenizer::detokenize::{IncrementalDetokenizer, decode_tokens};
+use lattice_tokenizer::__internal::{
+    decode_tokens, incremental_detokenizer_finish, incremental_detokenizer_new,
+    incremental_detokenizer_push,
+};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 
@@ -704,7 +707,7 @@ fn stream_through_driver(
         cancelled
     });
     let cancel = FnMutCancellation(&should_cancel);
-    let detok = RefCell::new(IncrementalDetokenizer::new());
+    let detok = RefCell::new(incremental_detokenizer_new());
     let last_pushed: Cell<Option<u32>> = Cell::new(None);
     let decoded_len = Cell::new(0usize);
     let flushing_tail = Cell::new(false);
@@ -712,7 +715,8 @@ fn stream_through_driver(
     let prefill_ran = Cell::new(false);
     let mut text = String::new();
     let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
-    let reasoning_newline_boundary = think_close_id.map(|_| tokenizer.newline_boundary_table());
+    let reasoning_newline_boundary =
+        think_close_id.map(|_| lattice_tokenizer::__internal::newline_boundary_table(tokenizer));
 
     let result = driver::run(
         session,
@@ -726,7 +730,7 @@ fn stream_through_driver(
         |_generated_len| {},
         |next_id| {
             last_pushed.set(Some(next_id));
-            let delta = detok.borrow_mut().push(tokenizer, next_id);
+            let delta = incremental_detokenizer_push(&mut detok.borrow_mut(), tokenizer, next_id);
             decoded_len.set(decoded_len.get() + delta.len());
             delta
         },
@@ -747,7 +751,7 @@ fn stream_through_driver(
         || prefill_ran.set(true),
         || {
             flushing_tail.set(true);
-            let tail = detok.borrow_mut().finish();
+            let tail = incremental_detokenizer_finish(&mut detok.borrow_mut());
             decoded_len.set(decoded_len.get() + tail.len());
             tail
         },
@@ -955,7 +959,7 @@ pub(crate) fn run_direct(
     tokenizer: &BpeTokenizer,
 ) -> Result<GenerateOutput, InferenceError> {
     let scan_stop_strings = !gen_cfg.stop_strings.is_empty();
-    let mut detok = IncrementalDetokenizer::new();
+    let mut detok = incremental_detokenizer_new();
     let pushed = Cell::new(0usize);
     let mut text = String::new();
     let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
@@ -973,7 +977,7 @@ pub(crate) fn run_direct(
         |generated_len| pushed.set(generated_len),
         |next_id| {
             if scan_stop_strings {
-                detok.push(tokenizer, next_id)
+                incremental_detokenizer_push(&mut detok, tokenizer, next_id)
             } else {
                 String::new()
             }
@@ -995,7 +999,7 @@ pub(crate) fn run_direct(
 
     let text = if scan_stop_strings {
         if !result.confirmed_stop_string_match {
-            let tail = detok.finish();
+            let tail = incremental_detokenizer_finish(&mut detok);
             text.push_str(&tail);
             if let Some(hit) = earliest_stop_match(&text, &gen_cfg.stop_strings) {
                 text.truncate(hit);

@@ -289,7 +289,8 @@ fn vision_worker_renders_omitted_thinking_as_a_closed_block() {
     );
     let ids = build_vision_prompt_ids(&messages, 0, &tokenizer, 90, 91, 92, 3, false, false)
         .expect("closed vision prompt");
-    let expected = tokenizer.tokenize_fragments_with_inserted_ids(
+    let expected = lattice_tokenizer::__internal::tokenize_fragments_with_inserted_ids(
+        &tokenizer,
         "<|im_start|>user\nbefore",
         &[90, 92, 92, 92, 91],
         "after<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -2733,7 +2734,7 @@ fn thinking_mode_reaches_generation_independent_of_legacy_flag() {
 fn text_prompt_above_the_default_tokenizer_cap_reaches_generation_in_full() {
     let messages = long_text_prompt(10_000);
     let full_len = untruncated_prompt_len(&messages);
-    let default_cap = crate::tokenizer::bpe::DEFAULT_BPE_MAX_SEQ_LEN;
+    let default_cap = lattice_tokenizer::__internal::DEFAULT_BPE_MAX_SEQ_LEN;
     let window = 16_384;
     assert_eq!(tiny_tokenizer().max_seq_len(), default_cap);
     assert!(

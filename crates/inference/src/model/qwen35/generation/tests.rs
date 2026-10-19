@@ -1618,7 +1618,10 @@ fn reasoning_budget_inert_when_thinking_disabled_in_both_tokenizer_states() {
     let without_marker =
         BpeTokenizer::from_vocab_and_merges(HashMap::from([("a".to_string(), 0)]), Vec::new())
             .expect("marker-free tokenizer must load");
-    assert!(without_marker.token_ids_for_content("</think>").is_empty());
+    assert!(
+        lattice_tokenizer::__internal::token_ids_for_content(&without_marker, "</think>")
+            .is_empty()
+    );
     assert_eq!(
         resolve_reasoning_close_token(&without_marker, Some(1), false, 97)
             .expect("enable_thinking: false must never error, marker present or not"),
@@ -1656,7 +1659,9 @@ fn reasoning_budget_absent_resolves_to_none_without_error() {
     let tokenizer =
         BpeTokenizer::from_vocab_and_merges(HashMap::from([("a".to_string(), 0)]), Vec::new())
             .expect("marker-free tokenizer must load");
-    assert!(tokenizer.token_ids_for_content("</think>").is_empty());
+    assert!(
+        lattice_tokenizer::__internal::token_ids_for_content(&tokenizer, " response").is_empty()
+    );
     assert_eq!(
         resolve_reasoning_close_token(&tokenizer, None, true, 97)
             .expect("None budget never errors"),
@@ -1788,7 +1793,7 @@ fn reasoning_budget_rejects_close_marker_spelled_by_more_than_one_id() {
     // in `bpe.rs`. Both directions are the same defect, which is the reason
     // this resolver refuses ambiguity outright rather than trying to pick
     // the right one.
-    let mut ids = ambiguous.token_ids_for_content("</think>");
+    let mut ids = lattice_tokenizer::__internal::token_ids_for_content(&ambiguous, " response");
     ids.sort_unstable();
     assert_eq!(
         ids,
@@ -1857,7 +1862,7 @@ fn reasoning_budget_rejects_duplicate_added_token_aliases_of_the_close_marker() 
     )
     .expect("duplicate-alias tokenizer must load");
 
-    let mut ids = tokenizer.token_ids_for_content("</think>");
+    let mut ids = lattice_tokenizer::__internal::token_ids_for_content(&tokenizer, " response");
     ids.sort_unstable();
     assert_eq!(
         ids,

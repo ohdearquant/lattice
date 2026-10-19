@@ -696,7 +696,7 @@ mod scoring {
             check_token_byte_bound(
                 bounds,
                 state.max_context(),
-                tokenizer.max_token_byte_span(),
+                lattice_tokenizer::__internal::max_token_byte_span(tokenizer),
                 &byte_spans,
             )?;
             let reference_hash = reference_content_hash(examples)?;
@@ -1178,7 +1178,7 @@ mod scoring {
         }
         #[test]
         fn reference_scoring_refuses_a_byte_bounded_oversized_completion() {
-            let span = byte_bound_tokenizer().max_token_byte_span();
+            let span = lattice_tokenizer::__internal::max_token_byte_span(&byte_bound_tokenizer());
             assert!(span > 0);
             assert!(
                 check_token_byte_bound(
@@ -1207,7 +1207,7 @@ mod scoring {
         }
         #[test]
         fn reference_scoring_accepts_an_example_within_the_byte_bound() {
-            let span = byte_bound_tokenizer().max_token_byte_span();
+            let span = lattice_tokenizer::__internal::max_token_byte_span(&byte_bound_tokenizer());
             assert!(
                 check_token_byte_bound(
                     ReferenceBounds {
@@ -1223,7 +1223,7 @@ mod scoring {
         }
         #[test]
         fn reference_scoring_refuses_context_overflow_the_token_total_would_allow() {
-            let span = byte_bound_tokenizer().max_token_byte_span();
+            let span = lattice_tokenizer::__internal::max_token_byte_span(&byte_bound_tokenizer());
             let bounds = ReferenceBounds {
                 max_examples: 1,
                 max_tokens: 16,
@@ -1234,7 +1234,7 @@ mod scoring {
         }
         #[test]
         fn reference_scoring_byte_bound_is_exact_at_the_limit_multiple() {
-            let span = byte_bound_tokenizer().max_token_byte_span();
+            let span = lattice_tokenizer::__internal::max_token_byte_span(&byte_bound_tokenizer());
             let bounds = ReferenceBounds {
                 max_examples: 1,
                 max_tokens: 4,
@@ -1251,7 +1251,7 @@ mod scoring {
             }"#;
             let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
             assert_eq!(
-                tokenizer.max_token_byte_span(),
+                lattice_tokenizer::__internal::max_token_byte_span(tokenizer),
                 "<|long_control_marker|>".len()
             );
             assert!("<|long_control_marker|>".len() > 1);
