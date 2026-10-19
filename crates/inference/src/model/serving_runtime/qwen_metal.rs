@@ -8,13 +8,14 @@ use crate::serve::lora::{
     AdapterControlError, AdapterControlResult, AdapterIndex, ResidencyLimits,
 };
 use crate::serve::lora_registry::ResidencyRegistry;
-use crate::serve::metal_worker::{
-    AdapterCommand, JobRoute, VisionRequestBuild, VisionRuntime, WorkerFailure, WorkerMetadata,
-    build_vision_request, cancelled_output, check_prompt_fits_window, classify_job,
-    render_text_prompt_within_window,
-};
+use crate::serve::metal_worker::{check_prompt_fits_window, render_text_prompt_within_window};
 use crate::serve::route::{DriverEvidence, ServedRoute};
+use crate::serving_provider::providers::qwen::vision::{
+    JobRoute, VisionRequestBuild, VisionRuntime, build_vision_request, classify_job,
+};
 use crate::serving_runtime_contract::RuntimeInput;
+use crate::serving_runtime_contract::{WorkerFailure, WorkerMetadata, cancelled_output};
+use crate::serving_worker::AdapterCommand;
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};

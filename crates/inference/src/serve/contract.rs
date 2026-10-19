@@ -1438,10 +1438,10 @@ pub fn parse_stop_strings(stop: &Option<Value>) -> Result<Vec<String>, ApiError>
 /// `prompt + max_new_tokens + reasoning_budget + 1 <= max_context`. The `+1`
 /// reserves the generation-turn delimiter token, matching
 /// `check_prompt_fits_window`'s `PromptAndDecodeWithDelimiter` policy in
-/// `crates/inference/src/serve/metal_worker.rs` -- this is the one shared
+/// `crates/inference/src/serving_worker.rs` -- this is the one shared
 /// formula both `lattice serve`'s HTTP preflight (below) and that worker-side
-/// invariant compute, so neither binary can drift back to its own
-/// pre-#831 accounting independently.
+/// invariant compute, so neither binary can drift back to separate
+/// accounting.
 pub fn validate_context_window_with_budget(
     prompt_tokens: usize,
     max_tokens: usize,

@@ -34,6 +34,45 @@ pub(crate) fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
     sources
 }
 
+#[allow(dead_code)]
+pub(crate) fn missing_roots(paths: &[PathBuf], roots: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| !roots.contains(path))
+        .cloned()
+        .collect()
+}
+
+#[allow(dead_code)]
+pub(crate) fn assert_provider_roots_complete(provider_dir: &Path, roots: &[PathBuf]) {
+    let required: Vec<PathBuf> = rust_sources_under(provider_dir)
+        .into_iter()
+        .filter(|path| {
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|reason| panic!("could not read {}: {reason}", path.display()));
+            ["RuntimeFactory", "ServingFactory", "MetalQwen35State"]
+                .iter()
+                .any(|name| source.contains(name))
+        })
+        .collect();
+    assert!(
+        !required.is_empty(),
+        "no provider source under {} names a runtime factory or Metal state; an empty population is a failure",
+        provider_dir.display()
+    );
+    let missing = missing_roots(&required, roots);
+    assert!(
+        missing.is_empty(),
+        "provider source files naming runtime factories or Metal state need roots: {missing:?}"
+    );
+    let omitted_fixture = provider_dir.join("omitted-root-control.rs");
+    assert_eq!(
+        missing_roots(std::slice::from_ref(&omitted_fixture), roots),
+        vec![omitted_fixture],
+        "the completeness check must detect a provider path absent from its roots"
+    );
+}
+
 #[derive(Deserialize)]
 pub(crate) struct CargoMetadata {
     pub(crate) packages: Vec<CargoPackage>,

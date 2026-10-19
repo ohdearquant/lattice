@@ -162,9 +162,9 @@ pub mod serving_cpu;
 #[cfg(feature = "serve")]
 #[doc(hidden)]
 pub mod serving_cpu_host;
-/// Builds the Metal serving worker's runtime and request preparation for a
-/// loaded model. Not a stable API.
-#[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+/// Builds the serving worker's runtime and request preparation for a loaded
+/// model. Not a stable API.
+#[cfg(feature = "serve")]
 #[doc(hidden)]
 pub mod serving_factory;
 #[cfg(feature = "serve")]
@@ -176,6 +176,10 @@ mod serving_preparation;
 pub mod serving_provider;
 #[cfg(feature = "serve")]
 pub(crate) mod serving_runtime_contract;
+/// Dedicated-thread host for thread-affine serving runtimes. Not a stable API.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_worker;
 /// N-gram prompt lookup speculative decoding. See [`sampling`] and [`model`].
 pub mod speculative;
 /// Generation stop reason taxonomy; see [`StopReason`] and [`model`].

@@ -77,7 +77,6 @@ src/serve/lora_registry.rs	crate::forward::metal_qwen35::blend_lora_layer_data
 src/serve/lora_registry.rs	crate::forward::metal_qwen35::LoraLayerData
 src/serve/metal_worker.rs	crate::forward::metal_qwen35::ChatMessage
 src/serve/metal_worker.rs	crate::forward::metal_qwen35::format_chat_template
-src/serve/metal_worker.rs	crate::forward::metal_qwen35::LoraLayerData
 src/serve/metal_worker.rs	crate::forward::metal_qwen35::MetalQwen35State
 src/serve/metal_worker.rs	crate::model::qwen35_config::Qwen35Config
 src/serve/metal_worker.rs	crate::model::qwen35_config::VisionModelConfig
@@ -88,6 +87,13 @@ src/serve/prompt_adapter.rs	crate::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_
 src/serving_provider/providers/gemma/worker.rs	crate::model::serving_runtime::gemma_cpu::GemmaCpuRuntime
 src/serving_provider/providers/gemma/worker.rs	crate::model::serving_runtime::RuntimeFactory
 src/serving_provider/providers/gemma/worker.rs	crate::model::serving_runtime::ServingRuntime
+src/serving_provider/providers/gemma/cpu.rs	crate::model::serving_runtime::ServingRuntime
+src/serving_provider/providers/gemma/cpu.rs	crate::model::serving_runtime::gemma_cpu::GemmaPreparedCpuRuntime
+src/serving_provider/providers/gemma/preparation.rs	crate::model::config_file::read_config_json_bounded
+src/serving_provider/providers/gemma/preparation.rs	crate::model::gemma4_config::Gemma4Config
+src/serving_provider/providers/gemma/preparation.rs	crate::model::gemma4_config::resolve_stop_token_ids
+src/serving_provider/providers/qwen.rs	crate::model::qwen35::model::Qwen35Model
+src/serving_provider/providers/qwen.rs	crate::model::qwen35_config::Qwen35Config
 src/serving_provider/providers/qwen/adapters.rs	crate::forward::metal_qwen35::LoraLayerData
 src/serving_provider/providers/qwen/adapters.rs	crate::forward::metal_qwen35::MetalQwen35State
 src/serving_provider/providers/qwen/vision.rs	crate::forward::metal_qwen35::ChatMessage
@@ -101,3 +107,12 @@ src/serving_provider/providers/qwen/worker.rs	crate::forward::metal_qwen35::Meta
 src/serving_provider/providers/qwen/worker.rs	crate::model::serving_runtime::qwen_metal::QwenMetalRuntime
 src/serving_provider/providers/qwen/worker.rs	crate::model::serving_runtime::RuntimeFactory
 src/serving_provider/providers/qwen/worker.rs	crate::model::serving_runtime::ServingRuntime
+src/serving_provider/providers/qwen/cpu.rs	crate::model::qwen35::model::Qwen35Model
+src/serving_provider/providers/qwen/cpu.rs	crate::model::qwen35::test_support::tiny_zero_model_with_context
+src/serving_provider/providers/qwen/cpu.rs	crate::model::serving_runtime::ServingRuntime
+src/serving_provider/providers/qwen/cpu.rs	crate::model::serving_runtime::qwen_cpu::QwenCpuRuntime
+src/serving_provider/providers/qwen/preparation.rs	crate::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID
+src/serving_worker.rs	crate::forward::metal_qwen35::ChatMessage
+src/serving_worker.rs	crate::forward::metal_qwen35::format_chat_template
+src/serving_worker.rs	crate::forward::metal_qwen35::LoraLayerData
+src/serving_worker.rs	crate::forward::metal_qwen35::MetalQwen35State

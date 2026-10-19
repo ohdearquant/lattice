@@ -173,8 +173,8 @@ per unit time.
   Q4/Metal backend ignores this flag.
 - **Metal/Q4 backend: effectively concurrency-1, with a bounded pending-job admission cap.** All
   Metal generation is funneled through one dedicated worker thread (an `mpsc` channel into a
-  single OS thread holding the `!Send` Metal state, `crates/inference/src/serve/metal_worker.rs`)
-  — a deliberate design choice matching how one local GPU device actually works, not an oversight.
+  single OS thread holding the `!Send` Metal state, `crates/inference/src/serving_worker.rs`),
+  a deliberate design choice matching how one local GPU device actually works, not an oversight.
   Two concurrent requests against a Q4-backed `lattice serve` run back-to-back, not in parallel;
   the later request's connection simply stays open until its turn in the channel comes up, up to
   `DEFAULT_MAX_PENDING_JOBS = 32` jobs queued or in flight at once by default (issue #932). This is
@@ -183,8 +183,8 @@ per unit time.
   default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/inference/src/bin/lattice/main.rs`,
   `crates/inference/src/bin/lattice_serve/main.rs`). A request submitted while the cap is already full
   is rejected at the worker's admission boundary (`MetalWorkerClient::submit_with_lora`'s
-  `try_acquire_owned`, `crates/inference/src/serve/metal_worker.rs`) before any Metal
-  generation work happens — the HTTP handler has already tokenized the rendered prompt during
+  `try_acquire_owned`, `crates/inference/src/serving_worker.rs`) before any Metal
+  generation work happens. The HTTP handler has already tokenized the rendered prompt during
   request preparation ahead of that point (`prepare_chat_request`'s `tokenize_len` call in
   `crates/inference/src/bin/lattice/serve.rs`, versus the later `submit_with_lora` call in the
   same handler), so this is not an end-to-end pre-tokenization guarantee, with:
@@ -796,9 +796,9 @@ The server is stateless per request — there is no session/conversation ID — 
 carry the full conversation history in `messages`. That doesn't mean every request re-prefills that
 history from scratch: on a Metal/Q4-backed server, a text request that safely extends the previous
 turn reuses the retained KV/GDN prefix via `generate_streaming_with_prefix_cache_and_cancel`
-(called from `crates/inference/src/serve/metal_worker.rs`) instead of a full re-prefill; a
+(called from `crates/inference/src/model/serving_runtime/qwen_metal.rs`) instead of a full re-prefill; a
 vision-classified request always takes the separate `generate_multimodal_vision_with_cancel` path
-(also called from `crates/inference/src/serve/metal_worker.rs`) and never participates in that cache. The CPU
+(also called from `crates/inference/src/model/serving_runtime/qwen_metal.rs`) and never participates in that cache. The CPU
 (safetensors) backend has no such cache and always re-prefills the full history. See
 [`docs/cross-turn-cache.md`](cross-turn-cache.md) for what counts as a safe extension:
 

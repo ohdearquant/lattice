@@ -2,8 +2,9 @@ use super::vision::VisionRuntime;
 use crate::forward::metal_qwen35::MetalQwen35State;
 use crate::model::serving_runtime::{QwenMetalRuntime, RuntimeFactory, ServingRuntime};
 use crate::serve::lora::{AdapterIndex, ResidencyLimits};
-use crate::serve::metal_worker::{WorkerMetadata, serving_tokenizer};
+use crate::serve::metal_worker::serving_tokenizer;
 use crate::serve::prepare::PreparationHandle;
+use crate::serving_runtime_contract::WorkerMetadata;
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::sync::{Arc, RwLock};
 

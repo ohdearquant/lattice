@@ -1,6 +1,7 @@
 use super::*;
 
-const MEASUREMENT_WORKER_SOURCE: &str = "src/serve/metal_worker.rs";
+const MEASUREMENT_WORKER_SOURCE: &str = "src/serving_worker.rs";
+const MEASUREMENT_WORKER_COMPAT_SOURCE: &str = "src/serve/metal_worker.rs";
 const MEASUREMENT_WORKER_CALLER: &str = "examples/bench_serve_prepare.rs";
 const MEASUREMENT_WORKER_ENTRY: &str =
     "lattice_inference::serve::metal_worker::bench_support::spawn_with_measurement_lock";
@@ -9,7 +10,7 @@ const WORKER_LOCK_FIXTURE: &str = r#"
 #[cfg(feature = "bench-internals")]
 mod bench_support {
     fn spawn_with_measurement_lock(factory: Factory, max_pending: usize, residency_limits: Limits) {
-        let worker = super::MetalWorker::spawn_with_guard(
+        let worker = crate::serving_worker::AffineWorker::spawn_with_guard(
             factory, max_pending, residency_limits,
             move || {
                 let gpu_guard = crate::measurement::gpu_test_lock();
@@ -23,7 +24,7 @@ fn run_guarded_worker<G>(acquire_guard: impl FnOnce() -> G, work: impl FnOnce())
     let worker_guard = acquire_guard();
     work();
 }
-impl MetalWorker {
+impl AffineWorker {
     fn spawn_with_guard<G>(factory: Factory, max_pending: usize, residency_limits: Limits,
         acquire_guard: impl FnOnce() -> G) {
         let join_handle = std::thread::spawn(move || {
@@ -52,11 +53,26 @@ fn run_metal() {
 }
 "#;
 
+fn combined_measurement_worker_source() -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let worker = std::fs::read_to_string(root.join(MEASUREMENT_WORKER_SOURCE))
+        .expect("read serving worker source");
+    let compatibility = std::fs::read_to_string(root.join(MEASUREMENT_WORKER_COMPAT_SOURCE))
+        .expect("read worker compatibility source");
+    // Inner doc comments are valid only at the top of a file, so the second
+    // file's module docs are dropped before the two are parsed as one.
+    let compatibility: String = compatibility
+        .lines()
+        .filter(|line| !line.starts_with("//!"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    format!("{worker}\n{compatibility}")
+}
+
 #[test]
 fn measurement_worker_lock_covers_factory_and_runtime() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let worker = std::fs::read_to_string(root.join(MEASUREMENT_WORKER_SOURCE))
-        .expect("read measurement worker source");
+    let worker = combined_measurement_worker_source();
     let caller = std::fs::read_to_string(root.join(MEASUREMENT_WORKER_CALLER))
         .expect("read measurement worker caller");
     validate_measurement_worker(&worker).expect("measurement worker must retain its shared lock");
@@ -207,10 +223,7 @@ fn measurement_worker_caller_requires_guarded_loader_route() {
 #[test]
 fn measurement_worker_contract_rejects_real_source_lock_removal() {
     use syn::spanned::Spanned;
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join(MEASUREMENT_WORKER_SOURCE),
-    )
-    .expect("read measurement worker source");
+    let source = combined_measurement_worker_source();
     validate_measurement_worker(&source).expect("unmodified worker must satisfy the contract");
     let parsed = StructuredSource::parse(MEASUREMENT_WORKER_SOURCE, &source, false).unwrap();
     let syntax = syn::parse_file(&source).unwrap();
@@ -220,7 +233,11 @@ fn measurement_worker_contract_rejects_real_source_lock_removal() {
         "bench_support::spawn_with_measurement_lock",
     )
     .unwrap();
-    let spawn = worker_top_call(entry, "super::MetalWorker::spawn_with_guard").unwrap();
+    let spawn = worker_top_call(
+        entry,
+        "crate::serving_worker::AffineWorker::spawn_with_guard",
+    )
+    .unwrap();
     let acquisition = worker_closure(&spawn.args[3]).unwrap();
     let syn::Stmt::Local(local) = &acquisition.stmts[0] else {
         panic!("guard binding missing")
@@ -238,10 +255,7 @@ fn measurement_worker_contract_rejects_real_source_lock_removal() {
 #[test]
 fn measurement_worker_contract_rejects_real_source_early_drop() {
     use syn::spanned::Spanned;
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join(MEASUREMENT_WORKER_SOURCE),
-    )
-    .expect("read measurement worker source");
+    let source = combined_measurement_worker_source();
     validate_measurement_worker(&source).expect("unmodified worker must satisfy the contract");
     let parsed = StructuredSource::parse(MEASUREMENT_WORKER_SOURCE, &source, false).unwrap();
     let syntax = syn::parse_file(&source).unwrap();
@@ -263,14 +277,11 @@ fn measurement_worker_contract_rejects_real_source_early_drop() {
 #[test]
 fn measurement_worker_contract_rejects_real_source_caller_thread_execution() {
     use syn::spanned::Spanned;
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join(MEASUREMENT_WORKER_SOURCE),
-    )
-    .expect("read measurement worker source");
+    let source = combined_measurement_worker_source();
     validate_measurement_worker(&source).expect("unmodified worker must satisfy the contract");
     let parsed = StructuredSource::parse(MEASUREMENT_WORKER_SOURCE, &source, false).unwrap();
     let syntax = syn::parse_file(&source).unwrap();
-    let worker = worker_function(&parsed, &syntax, "MetalWorker::spawn_with_guard").unwrap();
+    let worker = worker_function(&parsed, &syntax, "AffineWorker::spawn_with_guard").unwrap();
     let spawn = worker_top_call(worker, "std::thread::spawn").unwrap();
     let mut mutant = source.clone();
     mutant.replace_range(spawn.func.span().byte_range(), "(|work| work())");
@@ -322,7 +333,7 @@ fn worker_function<'a>(
                 "bench_support::spawn_with_measurement_lock" => {
                     &["factory", "max_pending", "residency_limits"]
                 }
-                "MetalWorker::spawn_with_guard" => &[
+                "AffineWorker::spawn_with_guard" => &[
                     "factory",
                     "max_pending",
                     "residency_limits",
@@ -478,7 +489,10 @@ fn validate_measurement_worker(source: &str) -> Result<(), String> {
         &syntax,
         "bench_support::spawn_with_measurement_lock",
     )?;
-    let spawn = worker_top_call(entry, "super::MetalWorker::spawn_with_guard")?;
+    let spawn = worker_top_call(
+        entry,
+        "crate::serving_worker::AffineWorker::spawn_with_guard",
+    )?;
     if spawn.args.len() != 4
         || !spawn
             .args
@@ -510,7 +524,7 @@ fn validate_measurement_worker(source: &str) -> Result<(), String> {
     }
     worker_name_usage(acquisition, &guard, 1, 1)?;
 
-    let worker = worker_function(&parsed, &syntax, "MetalWorker::spawn_with_guard")?;
+    let worker = worker_function(&parsed, &syntax, "AffineWorker::spawn_with_guard")?;
     worker_name_usage(worker, "acquire_guard", 0, 1)?;
     worker_name_usage(worker, "factory", 0, 1)?;
     let thread = worker_top_call(worker, "std::thread::spawn")?;

@@ -3,11 +3,11 @@
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::forward::metal_qwen35::MetalQwen35State;
 use crate::model_format::ModelFormat;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::serve::metal_worker::WorkerMetadata;
 use crate::serve::route::{RouteRefusal, ServedBackend, ServedRoute};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_runtime_contract::WorkerMetadata;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::path::{Path, PathBuf};

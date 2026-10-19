@@ -97,7 +97,7 @@ image requests. Metal HTTP chat routes require vision geometry, distinct valid i
 token IDs and compatible vision
 weights in the actual checkpoint. Both Qwen3.6 Rust presets are text-only. The chat image path
 accepts one inline PNG/JPEG per request and rejects streaming image requests; it does not imply
-27B/35B image parity. See [vision admission](../crates/inference/src/serve/metal_worker.rs) and
+27B/35B image parity. See [vision admission](../crates/inference/src/serving_provider/providers/qwen/vision.rs) and
 [request validation](../crates/inference/src/serve/contract.rs).
 
 ### Model loading and cache

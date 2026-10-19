@@ -585,7 +585,7 @@ pub fn list_request<B>(
 /// The confirmed worker reply supplies response metadata when identity is reused.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub struct PreparedAdapter {
-    pub command: super::metal_worker::AdapterCommand,
+    pub command: crate::serving_worker::AdapterCommand,
     pub rank: usize,
     pub layers: usize,
 }
@@ -614,7 +614,7 @@ pub fn prepare_adapter_load(path: &str, name: &str) -> Result<PreparedAdapter, A
     let count = layers.len();
     let rank = descriptor.rank;
     Ok(PreparedAdapter {
-        command: super::metal_worker::AdapterCommand::Load {
+        command: crate::serving_worker::AdapterCommand::Load {
             name: name.to_string(),
             path: path.to_string(),
             layers,
