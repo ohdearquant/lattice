@@ -757,6 +757,27 @@ require_measured() {
   fi
 }
 
+# The GPU handoff builds into its own target directory, and `measure` builds
+# from inside the sampled window. Warm that exact build before the window
+# opens: same frozen-plan entry, same argv, cwd, environment and target
+# directory, without launching the executable or acknowledging a handoff.
+prebuild_handoff() {
+  local what="$1" home="$2" entry="$3" revision="$4" rc=0 output
+  shift 4
+  output="$(mktemp)"
+  if env CRITERION_HOME="$home" \
+       "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" prebuild \
+       --entry "$entry" --revision "$revision" --target "$BENCHES_INFERENCE" \
+       --features "$CARGO_FEATURES_INFERENCE" -- "$@" >"$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+    cat "$output" >&2
+  fi
+  rm -f "$output"
+  require_measured "$what" "$rc"
+}
+
 # --- Build + bench base ---
 echo ""
 echo "--- Building + benching BASE ($BASE_SHA) ---"
@@ -776,6 +797,11 @@ BASE_PHASE_RC=0
   fi
   # Sampler starts AFTER the --no-run build check: that build is self load
   # anyway, but the window boundaries must be the measurement, not the build.
+  if [ -n "$handoff_broker" ] && [ "$BASE_INFERENCE_PRESENT" = "1" ]; then
+    prebuild_handoff "base lattice-inference:$BENCHES_INFERENCE prebuild" \
+      "$BASE_INFERENCE_CRITERION_ROOT" base1 "$BASE_FULL_SHA" \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  fi
   phase_sampler_start "base1"
   if [ "$BASE_INFERENCE_PRESENT" = "1" ]; then
     if [ -n "$handoff_broker" ]; then
@@ -864,6 +890,11 @@ HEAD_PHASE_RC=0
   if ! cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} --no-run; then
     require_measured "head lattice-embed:$BENCHES_EMBED build (--no-run)" 1
   fi
+  if [ -n "$handoff_broker" ] && [ "$HEAD_INFERENCE_PRESENT" = "1" ]; then
+    prebuild_handoff "head lattice-inference:$BENCHES_INFERENCE prebuild" \
+      "$INFERENCE_CRITERION_ROOT" head1 "$HEAD_FULL_SHA" \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  fi
   phase_sampler_start "head1"
   if [ "$HEAD_INFERENCE_PRESENT" = "1" ]; then
     if [ -n "$handoff_broker" ]; then
@@ -899,6 +930,11 @@ HEAD_CONTROL_PHASE_RC=0
   cd "$HEAD_DIR"
   if ! cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} --no-run; then
     require_measured "head control lattice-embed:$BENCHES_EMBED build (--no-run)" 1
+  fi
+  if [ -n "$handoff_broker" ]; then
+    prebuild_handoff "head control lattice-inference:$BENCHES_INFERENCE prebuild" \
+      "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" head2 "$HEAD_FULL_SHA" \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
   phase_sampler_start "head2"
   if [ -n "$handoff_broker" ]; then
@@ -937,6 +973,11 @@ BASE_CONTROL_PHASE_RC=0
   cd "$WT"
   if ! cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} --no-run; then
     require_measured "base control lattice-embed:$BENCHES_EMBED build (--no-run)" 1
+  fi
+  if [ -n "$handoff_broker" ]; then
+    prebuild_handoff "base control lattice-inference:$BENCHES_INFERENCE prebuild" \
+      "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" base2 "$BASE_FULL_SHA" \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
   phase_sampler_start "base2"
   if [ -n "$handoff_broker" ]; then
