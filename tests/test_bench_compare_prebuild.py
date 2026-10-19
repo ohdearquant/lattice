@@ -364,6 +364,11 @@ class PrebuildOrdering(unittest.TestCase):
         features = ["default", "f16", "metal-gpu", "std"]
 
         def setup(root):
+            # The fixture substitutes the macOS host and Metal workload, never admission.
+            admission = root / "scripts" / "lib" / "bench_admission.py"
+            text = admission.read_text()
+            self.assertEqual(text.count('if sys.platform != "darwin":'), 1)
+            admission.write_text(text.replace('if sys.platform != "darwin":', 'if False:', 1))
             (root / "Cargo.toml").write_text(
                 '[workspace]\nmembers = ["crates/inference"]\n'
                 '[workspace.package]\nversion = "0.0.1"\n'
