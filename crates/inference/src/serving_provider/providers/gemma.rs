@@ -17,6 +17,8 @@ use std::path::Path;
 
 pub(crate) mod cpu;
 mod preparation;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod worker;
 
 #[cfg(test)]
 pub(crate) use preparation::template_trim;

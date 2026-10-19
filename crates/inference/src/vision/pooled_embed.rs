@@ -88,7 +88,8 @@ pub fn embed_image_from_bytes_f16(
 /// Metal-dispatching sibling of [`embed_image_from_bytes_f16`]: runs the ViT
 /// forward pass on the Metal GPU ([`qwen35_vit_forward_metal`]) instead of
 /// the CPU, mirroring the serving path's CPU/Metal split
-/// (`crate::serve::metal_worker::build_vision_request` dispatches
+/// (`crate::serving_provider::providers::qwen::vision::build_vision_request`
+/// dispatches
 /// `qwen35_vit_forward_metal_with_cancel` then the CPU
 /// `qwen35_merger_forward`). The merger and the decoder-side pooling both
 /// stay CPU here too — only the ViT block loop moves to the GPU.

@@ -1,9 +1,9 @@
 //! ADR-092 "Completion requires both dependency and execution evidence" —
 //! the source-level `pipeline_boundary_contract` resolver.
 //!
-//! This is a bounded, source-only dependency scan of the two production
-//! frontier surfaces (the `src/serve` module tree and every `src/bin`
-//! target) for concrete model/config/backend-state dependencies. It does
+//! This is a bounded, source-only dependency scan of the production
+//! frontend roots (`src/serve`, the moved provider files, and every
+//! `src/bin` target) for concrete model/config/backend-state dependencies. It does
 //! NOT establish numerical or device execution, and it does not itself
 //! migrate anything: it is a ratchet against a recorded baseline, run in
 //! two configurations (default features, and `metal-gpu,f16` on macOS).
@@ -2913,13 +2913,9 @@ fn parse_baseline(text: &str) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-/// The production run: every `src/serve` module and every inference binary
-/// source, against the recorded baseline population.
-///
-/// This is a ratchet, not a verdict about migration completeness: the tree
-/// today has crossings, this PR does not migrate any of them, and a new
-/// crossing (or a stale baseline entry for one that no longer exists) is
-/// what fails the test -- not the raw count being nonzero.
+/// The production run: `src/serve`, the provider files that build serving runtimes, and every
+/// binary, against the baseline. A ratchet, not a migration verdict: a new crossing, or a stale
+/// baseline entry for one that no longer exists, fails the test; a nonzero count does not.
 #[test]
 fn pipeline_boundary_matches_recorded_baseline() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2932,6 +2928,10 @@ fn pipeline_boundary_matches_recorded_baseline() {
     );
 
     let mut frontend_roots: Vec<PathBuf> = vec![crate_dir.join("src/serve/mod.rs")];
+    let providers = crate_dir.join("src/serving_provider/providers");
+    for path in "gemma/worker.rs qwen/adapters.rs qwen/vision.rs qwen/worker.rs".split(' ') {
+        frontend_roots.push(providers.join(path));
+    }
     frontend_roots.extend(bin_targets.iter().map(|target| target.path.clone()));
 
     let index_roots = vec![crate_dir.join("src/lib.rs")];

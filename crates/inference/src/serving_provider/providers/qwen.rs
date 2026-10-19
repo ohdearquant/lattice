@@ -1,12 +1,12 @@
 //! Qwen serving provider and typed CPU loader facade.
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use self::vision::VisionRuntime;
 use crate::error::InferenceError;
 use crate::model::qwen35::Qwen35Model;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::model::qwen35_config::Qwen35Config;
 use crate::model_format::ModelFamily;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::serve::metal_worker::VisionRuntime;
 use crate::serve::route::{RouteRefusal, ServedRoute, select_route, select_standalone_route};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
@@ -17,8 +17,14 @@ use crate::serving_provider::{
 };
 use std::path::Path;
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod adapters;
 pub(crate) mod cpu;
 mod preparation;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod vision;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod worker;
 
 pub(crate) use preparation::{
     QwenChatDefaults, build_cfg, lattice_gen_cfg, prepare_chat_request,

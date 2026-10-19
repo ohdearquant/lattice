@@ -1,4 +1,4 @@
-use super::{ServingFactory, gemma_parts};
+use super::ServingFactory;
 use crate::forward::metal_qwen35::ChatMessage;
 use crate::generation::GenerateConfig;
 use crate::model::serving_runtime::{RuntimeFactory, ServingRuntime};
@@ -6,6 +6,7 @@ use crate::serve::lora::{AdapterIndex, ResidencyLimits};
 use crate::serve::metal_worker::{MetalWorker, VisionRuntime, WorkerEvent, WorkerMetadata};
 use crate::serve::prepare::PreparationHandle;
 use crate::serving_cpu::{GemmaCpuServing, tiny_zero_serving};
+use crate::serving_provider::providers::gemma::worker::gemma_parts;
 use std::sync::{Arc, RwLock};
 
 /// The Gemma worker parts around an already loaded checkpoint: the tiny
