@@ -20,7 +20,8 @@ that did not match the repository. Changed:
 3. D5's reason for removing consumer-feature gates, D6.3 (the CI rustdoc job does not block, so the change runs the
    command itself), D6.4 and D7 (the rules they point at are in `CLAUDE.md`, not a contribution guide), D6.5 (bench
    and binary lists that name a target's crate), D8.3 (name ownership re-checked before the first publish), the
-   Context counting method, and the compile-scope consequence.
+   Context counting method, the Context statement that `bytes_to_unicode` is public (its facade re-export is
+   `cfg(test)` only), and the compile-scope consequence.
 
 ## Direction
 
@@ -71,7 +72,8 @@ Facts about the first candidate, the tokenizer module (`src/tokenizer/`), read a
 - Crate-private items used from other modules include `BpeTokenizer::newline_boundary_table` (called from
   `decoder/qwen_metal.rs` and `model/qwen35/generation.rs`), `token_ids_for_content`, `max_token_byte_span`,
   `tokenize_fragments_with_inserted_ids`, `DEFAULT_BPE_MAX_SEQ_LEN` and `IncrementalDetokenizer`.
-  `detokenize::bytes_to_unicode` is already public through `lattice_inference::model::qwen35`.
+  `detokenize::bytes_to_unicode` is re-exported at `lattice_inference::model::qwen35` only under `cfg(test)`, for the
+  crate's own unit tests, so it is not part of the public API.
 - Three of those items are compiled only under feature combinations that belong to consumers:
   `max_token_byte_span` (`serve`, `f16`, `router-learning`, `metal-gpu` on macOS, or `test`),
   `tokenize_fragments_with_inserted_ids` (`metal-gpu` and `serve`), and `IncrementalDetokenizer::push` (`metal-gpu` on
@@ -166,8 +168,8 @@ hidden inherent method would be callable through the facade path. No item is wid
 
 An item of the moving module that is already public through the facade today, under any path, keeps that path. The
 new crate exports it publicly (disposition 2, which adds nothing to the facade because the path already exists) and the
-facade re-exports it from there. It is never routed through `__internal`, which the facade does not re-export. For the
-tokenizer, `lattice_inference::model::qwen35::bytes_to_unicode` is such an item.
+facade re-exports it from there. It is never routed through `__internal`, which the facade does not re-export. A
+re-export compiled only under `cfg(test)` is not public API and is not covered by this rule.
 
 ### D5. Features
 
