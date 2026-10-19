@@ -304,8 +304,8 @@ PYTHON_ENTRYPOINTS_USING_DATETIME_UTC = (
     REPO / "scripts" / "bench_cpu_flagship_supervisor.py",
 )
 
-# Test helpers invoking real Git must disable repository hooks.
-GIT = ("git", "-c", "core.hooksPath=/dev/null")
+# Disable hooks and auto-gc so disposable Git fixtures have no automatic GC writer.
+GIT = ("git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0")
 
 STALE_CHANGE_CARGO = r"""#!/usr/bin/env bash
 set -euo pipefail
