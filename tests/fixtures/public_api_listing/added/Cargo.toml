@@ -1,0 +1,3 @@
+[workspace]
+members = ["core", "facade"]
+resolver = "2"
