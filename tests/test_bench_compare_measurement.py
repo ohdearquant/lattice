@@ -77,6 +77,38 @@ printf '%s\n' 'fixture cargo failed before producing a measurement' >&2
 exit 7
 """
 
+FAILING_EMBED_BUILD_CARGO = """#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+  exit 0
+fi
+if [[ -n "${STUB_SAMPLER_STATE_FILE:-}" ]]; then
+  sampler="not-running"
+  for marker in "${STUB_REPO_ROOT:-}/.cache/bench-compare-criterion/phase-load/"*.ready; do
+    if [[ -e "$marker" ]]; then
+      sampler="running"
+    fi
+  done
+  package="none"
+  if [[ " $* " == *" -p lattice-embed "* ]]; then
+    package="lattice-embed"
+  elif [[ " $* " == *" -p lattice-inference "* ]]; then
+    package="lattice-inference"
+  fi
+  mode="run"
+  if [[ " $* " == *" --no-run "* ]]; then
+    mode="build"
+  fi
+  printf '%s\t%s\t%s\n' "$package" "$mode" "$sampler" \
+    >> "$STUB_SAMPLER_STATE_FILE"
+fi
+if [[ " $* " == *" -p lattice-embed "* && " $* " == *" --no-run "* ]]; then
+  printf '%s\n' 'fixture embed build failed' >&2
+  exit 7
+fi
+exit 0
+"""
+
 STUB_GOVERNOR = """#!/usr/bin/env python3
 import json
 import sys
@@ -320,6 +352,27 @@ if [[ -n "${STUB_CARGO_ARGV_FILE:-}" ]]; then
     printf '%q ' "$@"
     printf '\n'
   } >> "$STUB_CARGO_ARGV_FILE"
+fi
+
+if [[ -n "${STUB_SAMPLER_STATE_FILE:-}" ]]; then
+  sampler="not-running"
+  for marker in "${STUB_REPO_ROOT:-}/.cache/bench-compare-criterion/phase-load/"*.ready; do
+    if [[ -e "$marker" ]]; then
+      sampler="running"
+    fi
+  done
+  package="none"
+  if [[ " $* " == *" -p lattice-embed "* ]]; then
+    package="lattice-embed"
+  elif [[ " $* " == *" -p lattice-inference "* ]]; then
+    package="lattice-inference"
+  fi
+  mode="run"
+  if [[ " $* " == *" --no-run "* ]]; then
+    mode="build"
+  fi
+  printf '%s\t%s\t%s\n' "$package" "$mode" "$sampler" \
+    >> "$STUB_SAMPLER_STATE_FILE"
 fi
 
 if [[ "${1:-}" == "bench" && "${STUB_REQUIRE_LOCKED:-0}" == "1" ]]; then
@@ -668,6 +721,7 @@ def _run(
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "BENCH_IDLE_FLOOR": "0",
             "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
+            "STUB_REPO_ROOT": str(root),
             **(extra_env or {}),
             "STUB_EMIT_CRITERION_HOME": "1" if emit_criterion_home else "0",
         }
@@ -900,7 +954,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         ]
         self.assertTrue(commands, "found 0 cargo bench invocations")
         self.assertEqual(
-            len(commands), 10,
+            len(commands), 14,
             f"found {len(commands)} cargo bench invocations:\n"
             + "\n".join(commands),
         )
@@ -1220,6 +1274,35 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertIn("failed (exit 7)", result.stderr)
         self.assertIn(
             "fixture cargo failed before producing a measurement", result.stderr
+        )
+
+    def test_failed_embed_build_refuses_before_its_sampler_starts(self):
+        """A failed embed prebuild must refuse the run with its own label."""
+        with tempfile.TemporaryDirectory() as temporary:
+            state_file = Path(temporary) / "cargo-sampler-state.tsv"
+            result = _run(
+                [],
+                stub_cargo=FAILING_EMBED_BUILD_CARGO,
+                extra_env={"STUB_SAMPLER_STATE_FILE": str(state_file)},
+            )
+            records = [
+                tuple(line.split("\t"))
+                for line in state_file.read_text().splitlines()
+            ]
+        self.assertEqual(
+            result.returncode, 2,
+            f"expected exit 2 (embed build failed), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn(
+            "base lattice-embed:simd build (--no-run) failed (exit 1)", result.stderr
+        )
+        self.assertNotIn("base lattice-embed:simd exited 0", result.stderr)
+        self.assertEqual(
+            records,
+            [("lattice-inference", "build", "not-running"),
+             ("lattice-embed", "build", "not-running")],
+            records,
         )
 
     def test_default_mode_refuses_a_failed_machine_state_probe_before_base(self):
@@ -1736,12 +1819,15 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"embed target override failed\nstdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}",
         )
-        self.assertEqual(len(embed_argv), 4, embed_argv)
+        self.assertEqual(len(embed_argv), 8, embed_argv)
         for argv in embed_argv:
             bench_index = argv.index("--bench")
             self.assertEqual(argv[bench_index + 1], "embeddings", argv)
             self.assertNotIn("simd", argv)
             self.assertNotIn("--features", argv)
+        self.assertEqual(
+            sum("--no-run" in argv for argv in embed_argv), 4, embed_argv
+        )
         roots = set(re.findall(r"criterion-home=(\S+)", result.stdout))
         embed_roots = {path for path in roots if "/embed/" in path}
         self.assertEqual(
@@ -1760,6 +1846,55 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         )
         self.assertIn("embed features: <none>", result.stdout)
         self.assertIn("embed_features=<none>", result.stdout)
+
+    def test_embed_bench_is_built_before_each_arms_sampler_starts(self):
+        """Every embed build must finish before that arm's sampler runs.
+
+        The stub cargo records whether a phase sampler readiness marker
+        exists at invocation time. A build after phase_sampler_start would
+        compile inside the sampled window, which is self-load the sampler's
+        decaying process average under-reads.
+
+        Mutation-sensitive: remove the embed --no-run call from any arm and
+        that arm contributes no embed build record, so the four-build
+        assertion fails. Move the build after phase_sampler_start and its
+        record says "running".
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            state_file = Path(temporary) / "cargo-sampler-state.tsv"
+            result = _run(
+                [],
+                stub_cargo=STALE_CHANGE_CARGO,
+                extra_env={"STUB_SAMPLER_STATE_FILE": str(state_file)},
+            )
+            records = [
+                tuple(line.split("\t"))
+                for line in state_file.read_text().splitlines()
+            ]
+        self.assertEqual(
+            result.returncode, 0,
+            f"embed prebuild fixture failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        embed = [record for record in records if record[0] == "lattice-embed"]
+        builds = [record for record in embed if record[1] == "build"]
+        runs = [record for record in embed if record[1] == "run"]
+        self.assertEqual(
+            len(builds), 4,
+            f"expected one embed build per arm, got {builds}\nrecords: {records}",
+        )
+        self.assertEqual(
+            [record[2] for record in builds], ["not-running"] * 4,
+            f"an embed build ran inside a sampled window: {builds}",
+        )
+        self.assertEqual(
+            len(runs), 4,
+            f"expected one embed measurement per arm, got {runs}\nrecords: {records}",
+        )
+        self.assertEqual(
+            [record[2] for record in runs], ["running"] * 4,
+            f"an embed measurement ran outside a sampled window: {runs}",
+        )
 
     def test_embed_features_reach_all_four_abba_commands_and_provenance(self):
         """CARGO_FEATURES_EMBED is one exact argv value in every embed arm."""
@@ -1785,11 +1920,14 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             )
             embed_argv = _captured_embed_argv(argv_file)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(embed_argv), 4, embed_argv)
+        self.assertEqual(len(embed_argv), 8, embed_argv)
         for argv in embed_argv:
             self.assertEqual(argv.count("--features"), 1, argv)
             feature_index = argv.index("--features")
             self.assertEqual(argv[feature_index + 1], "native,prepared-bench", argv)
+        self.assertEqual(
+            sum("--no-run" in argv for argv in embed_argv), 4, embed_argv
+        )
         self.assertIn("embed features: native,prepared-bench", result.stdout)
         self.assertIn("embed_features=native,prepared-bench", result.stdout)
         self.assertEqual(len(captured_provenance), 1)

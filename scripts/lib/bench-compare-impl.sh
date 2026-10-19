@@ -771,6 +771,9 @@ BASE_PHASE_RC=0
   if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
     BASE_INFERENCE_PRESENT=1
   fi
+  if ! cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} --no-run; then
+    require_measured "base lattice-embed:$BENCHES_EMBED build (--no-run)" 1
+  fi
   # Sampler starts AFTER the --no-run build check: that build is self load
   # anyway, but the window boundaries must be the measurement, not the build.
   phase_sampler_start "base1"
@@ -858,6 +861,9 @@ HEAD_PHASE_RC=0
   if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
     HEAD_INFERENCE_PRESENT=1
   fi
+  if ! cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} --no-run; then
+    require_measured "head lattice-embed:$BENCHES_EMBED build (--no-run)" 1
+  fi
   phase_sampler_start "head1"
   if [ "$HEAD_INFERENCE_PRESENT" = "1" ]; then
     if [ -n "$handoff_broker" ]; then
@@ -891,6 +897,9 @@ echo "--- Re-benching HEAD for reverse-order control ($HEAD_SHA) ---"
 HEAD_CONTROL_PHASE_RC=0
 (
   cd "$HEAD_DIR"
+  if ! cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} --no-run; then
+    require_measured "head control lattice-embed:$BENCHES_EMBED build (--no-run)" 1
+  fi
   phase_sampler_start "head2"
   if [ -n "$handoff_broker" ]; then
     run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
@@ -926,6 +935,9 @@ echo "--- Re-benching BASE for reverse-order control ($BASE_SHA) ---"
 BASE_CONTROL_PHASE_RC=0
 (
   cd "$WT"
+  if ! cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} --no-run; then
+    require_measured "base control lattice-embed:$BENCHES_EMBED build (--no-run)" 1
+  fi
   phase_sampler_start "base2"
   if [ -n "$handoff_broker" ]; then
     run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
