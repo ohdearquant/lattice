@@ -6,14 +6,28 @@
 **Crate**: lattice-inference and the crates extracted from it; workspace manifests, publish script, CI\
 **Related**: ADR-102 (in-crate reorganisation and the 3000-line file cap; complementary, see "Relation to ADR-102")
 
+## Direction
+
+The project maintainer's direction, 2026-10-18, quoted as given:
+
+> add to roadmap, inference crate decomposition, will do those in a harmless fashion in high level public API level,
+> inference crate itself might be the aggragator interface for acceessing stuff. right now inference crate is huge
+
+and, on the tokenizer as the first extraction:
+
+> if you think that's reasonable enough of a scope, sure., we probably want some kind of standard around these,
+
+This ADR is that standard. "Harmless at the public API level" is D1 and D6, "the aggregator interface" is D1 and D7,
+"tokenizer first" is D9.
+
 ## Decision summary
 
 `lattice-inference` is split into focused crates along module boundaries that already exist. `lattice-inference`
-remains the published entry point: a facade that depends on the extracted crates and re-exports each one at the path
-it has today, so every public `lattice_inference::...` path, type and feature keeps working. Shared vocabulary types,
-starting with `InferenceError`, move to one small base crate so that extracted crates and the facade use the same types
-rather than converting between copies. Every extraction is a zero-behaviour move with a fixed acceptance list. The
-first extraction is the tokenizer, together with the base crate.
+remains the published entry point: a facade that depends on the extracted crates and re-exports their items at the
+paths they have today, so every public `lattice_inference::...` path, type and feature keeps working. `InferenceError`
+moves to one small base crate so that extracted crates and the facade share one error type. Every extraction is a
+zero-behaviour move with a fixed readiness check and a fixed acceptance list. The first extraction is the tokenizer,
+together with the base crate.
 
 ## Context
 
@@ -33,79 +47,140 @@ Measured at `main` b58ce287 with `wc -l` over each crate's `src/`:
 recompiles the whole crate, review ownership is crate-wide, and a downstream user who needs one tokenizer compiles a
 Metal inference engine.
 
-Facts about the first candidate, the tokenizer module (`src/tokenizer/`, 13 files), read at the same commit:
+Facts about the first candidate, the tokenizer module (`src/tokenizer/`), read at the same commit:
 
-- Outside its own files its non-test code uses one thing from the rest of the crate: `crate::error::InferenceError`.
-  Its tests additionally use `crate::grammar` and `crate::model::qwen35_config`.
-- About ten `pub(crate)` items are used by other modules of the crate, for example `IncrementalDetokenizer`,
-  `detokenize`, `decode_tokens`, `token_ids_for_content`, `append_token_bytes`, `DEFAULT_BPE_MAX_SEQ_LEN`,
-  `max_token_byte_span` and `tokenize_fragments_with_inserted_ids`.
-- Two of those items are compiled only under feature combinations that belong to consumers (`serve` with
-  `metal-gpu`; `serve`, `f16`, `router-learning` and `metal-gpu` together).
-- `InferenceError` (`src/error.rs`, 104 lines) depends on nothing in the crate. It is `#[non_exhaustive]` and is
-  documented as a stable type consumed by `lattice-embed`.
+- Outside its own files its non-test code uses one thing from the rest of the crate:
+  `crate::error::InferenceError`. Its tests additionally use `crate::grammar` and `crate::model::qwen35_config`, and
+  two doc comments link into the rest of the crate (`bpe.rs`, links to `crate::model::qwen35` and `crate::grammar`).
+- Crate-private items used from other modules include `BpeTokenizer::newline_boundary_table` (called from
+  `decoder/qwen_metal.rs` and `model/qwen35/generation.rs`), `token_ids_for_content`, `max_token_byte_span`,
+  `tokenize_fragments_with_inserted_ids`, `DEFAULT_BPE_MAX_SEQ_LEN` and `IncrementalDetokenizer`.
+  `detokenize::bytes_to_unicode` is already public through `lattice_inference::model::qwen35`.
+- Three of those items are compiled only under feature combinations that belong to consumers:
+  `max_token_byte_span` (`serve`, `f16`, `router-learning`, `metal-gpu` on macOS, or `test`),
+  `tokenize_fragments_with_inserted_ids` (`metal-gpu` and `serve`), and `IncrementalDetokenizer::push` (`metal-gpu` on
+  macOS, or `test`). CPU test suites that run without `metal-gpu` call `push` and `max_token_byte_span`.
+- `InferenceError` (`src/error.rs`) depends on nothing in the crate and is `#[non_exhaustive]`. Two trait impls on it
+  live in other modules: `From<GrammarError>` (`grammar/engine.rs`) and `From<PredictionError>` (`decoder.rs`).
 
-These are the four problems every extraction meets: a shared error type, crate-private items that cross the new
-boundary, feature gates owned by consumers, and tests that exercise more than one module.
+Two tool facts shape the acceptance rules. Both were measured with `cargo-semver-checks` 0.50.0 on a minimal workspace
+that moves a struct, a function and an error enum out of a crate and re-exports them from it:
+
+- `cargo semver-checks` reports every moved item as removed (`struct_missing`, `function_missing`, `enum_missing`)
+  whether the facade re-exports them by name with `#[doc(inline)]` or by glob. Controls in the same run behaved
+  correctly: identical code passed, and a really removed function failed. Re-exports from another crate are not
+  followed, so the facade check can neither pass on an extraction nor see moved items afterwards.
+- The repository's semver job checks default features on Linux only, and under 0.x a workspace minor bump makes it
+  skip every check (this is already disclosed by the job itself).
 
 ## Decisions
 
 ### D1. The facade keeps every public path
 
-`lattice-inference` depends on each extracted crate and re-exports it where the module lives today, for example
-`pub use lattice_tokenizer as tokenizer;` or a `pub mod tokenizer { pub use lattice_tokenizer::*; }` shim when the
-facade module also holds items that stay behind. Re-exports, never copies, so a type reached through the old path and
-the new crate is the same type. Crate-root re-exports (`pub use crate::...` in `lib.rs`) are kept unchanged.
+`lattice-inference` depends on each extracted crate and keeps each module at its current path as a small shim that
+re-exports named items:
 
-### D2. Shared vocabulary lives in one base crate
+```rust
+pub mod tokenizer {
+    #[doc(inline)]
+    pub use lattice_tokenizer::{bpe, common, BpeTokenizer, Tokenizer, TokenizedInput /* ... the full current list */};
+}
+```
 
-`InferenceError` moves to a base crate (working name `lattice-inference-core`) and is re-exported at
-`lattice_inference::error::InferenceError` and at the crate root. Extracted crates return that same type, so no
-public signature changes. The base crate holds only types that two or more extracted crates need; it gains a type only
-in the change that makes a second crate depend on it. It has no Metal, no I/O beyond what the moved types already use,
-and no default features.
+The list is exactly today's public surface of that module, and the crate-root re-exports in `lib.rs` keep their
+current names. Re-exports, never copies, so a type reached through the old path and the new crate is the same type.
+The facade uses neither a whole-crate alias (`pub use lattice_tokenizer as tokenizer;`) nor a glob
+(`pub use lattice_tokenizer::*;`): both forward everything the new crate makes public, including the internal items
+D4 keeps out of the supported API, and a glob can collide with another glob.
+
+### D2. `InferenceError` lives in one base crate
+
+The base crate is `lattice-inference-core` (`lattice-core` is taken on crates.io by an unrelated crate). It is created
+in the first extraction and holds `InferenceError`, re-exported at `lattice_inference::error::InferenceError` and at
+the crate root. Extracted crates return that same type, so no public signature changes. The tokenizer crate does not
+own it, because the next candidates (weight and quantization formats, grammar) also return it and have no reason to
+depend on a tokenizer.
+
+Rules for the base crate:
+
+1. No dependency on any other lattice crate, no Metal, no default features.
+2. `InferenceError` variants carry only standard-library or primitive payloads, never a type from an extracted crate
+   (that would create a cycle). A crate with a richer error defines its own error type and implements
+   `From<ItsError> for InferenceError`, as `grammar` already does by converting to a string.
+3. A new variant is a change to the base crate first, released with the crate that needs it.
+4. Any type other than `InferenceError` enters the base crate only in the change that makes a second extracted crate
+   need it.
 
 ### D3. When a module is ready to move
 
-A module is extractable when its non-test code depends only on the standard library, external crates, the base crate,
-and crates already extracted. The check is a search of the module's non-test sources for `crate::` and `super::` paths
-that leave it, with a known-positive control in the same run. Tests that exercise the module together with code that
-stays behind (the tokenizer's grammar tests, for example) stay in `lattice-inference` as integration tests, unchanged
-except for their paths.
+A module is extractable when all of these hold, each checked by a search with a known-positive control in the same
+run:
+
+1. **Outbound paths.** Its non-test sources, doc comments included, reach outside it only into the standard library,
+   external crates, the base crate and crates already extracted. Doc links to code that stays behind become plain code
+   spans in the move. Self-paths such as `crate::tokenizer::...` are rewritten to the new crate root.
+2. **Inbound impls.** No code that stays behind holds an inherent `impl` of a moving type (it stops compiling once
+   the type lives in another crate), and every trait impl on a moving type that stays behind still satisfies the
+   orphan rule. Inherent impls split across modules exist in the crate today (`impl Qwen35Model` in
+   `forward/batch_prefill.rs`, `impl PreparationHandle` in three files), so this check is not hypothetical for later
+   steps.
+3. **Field access.** No code that stays behind reads or writes a private or crate-private field of a moving type.
+
+Tests that exercise the module together with code that stays behind (the tokenizer's grammar tests, for example) stay
+in `lattice-inference` as integration tests, unchanged except for their paths.
 
 ### D4. Crate-private items that cross the boundary
 
-Every `pub(crate)` item used from outside the moving module is listed in the extraction change with one of three
-dispositions:
+Every `pub(crate)` item of the moving module that is used from outside it is listed in the extraction change with one
+of three dispositions, in this order of preference:
 
-1. **Public**: it becomes a documented public item of the new crate, because it is genuinely useful there.
-2. **Moves with its consumer**: the code that calls it moves into the new crate instead.
-3. **Hidden**: `#[doc(hidden)] pub`, with a comment naming the consumer, for items that are implementation glue. Hidden
-   items are not re-exported by the facade and are not part of the supported API.
+1. **Stays crate-private** in the new crate, when its outside callers can move with it or use public API instead.
+2. **Public**: a documented public item of the new crate, when it is a coherent part of that crate's job (for example
+   `BpeTokenizer::token_ids_for_content`).
+3. **Internal**: a free function or extension trait inside `#[doc(hidden)] pub mod __internal` of the new crate,
+   called by the facade's code by its full path and never re-exported by the facade. This is for engine-specific glue.
 
-No item is widened without a listed disposition.
+An internal item is never an inherent method of a type the facade re-exports: methods travel with their type, so a
+hidden inherent method would be callable through the facade path. No item is widened without a listed disposition.
 
 ### D5. Features
 
-A feature that gates code inside a moved module becomes a feature of the new crate with the same name and meaning. The
-facade's feature of that name forwards to it (`serve = [..., "lattice-tokenizer/serve"]`). An item gated on a
-combination of consumer features is either made unconditional when it is plain CPU code with no extra dependencies, or
-gated on a single feature of the new crate that the facade enables when all the consumer features are on. New crates
-add no default features of their own; the facade's defaults are unchanged.
+A feature that gates code inside a moved module because the code needs an optional dependency becomes a feature of the
+new crate with the same name and meaning, and the facade's feature of that name forwards to it
+(`serve = [..., "lattice-tokenizer/serve"]`).
+
+A `cfg` that exists only because the item's callers are compiled under some combination of consumer features (the
+three tokenizer items listed under Context) is removed in the move, and the item compiles unconditionally. A gate
+cannot be kept: Cargo features cannot express "all of these features together", and `cfg(test)` is false in a
+dependency when the facade's tests run, so a kept gate would break the CPU test suites that call these items today.
+New crates add no default features of their own; the facade's defaults are unchanged.
 
 ### D6. Acceptance of every extraction change
 
-1. **Same tests.** The set of test names across the workspace (`cargo test --workspace --all-features -- --list`, plus
-   the Metal feature set on Apple silicon) is identical before and after, allowing only the crate prefix of moved
-   tests to change. The count is stated in the change.
-2. **No public change.** `cargo semver-checks` on `lattice-inference` against its last published release reports no
-   removed or changed item, and every crate's public API listing is attached to the change.
-3. **Clippy and docs.** `cargo clippy --workspace --all-targets -D warnings` on the CI feature sets, and `cargo doc`
-   for the facade with its docs.rs feature list, both clean.
+1. **Same tests.** The set of `(crate, test name)` pairs listed by `cargo test --lib --tests -- --list` for
+   `lattice-inference` before the move equals the union over `lattice-inference` and the new crate after it, apart from
+   the crate prefix of moved tests. Test targets declared `test = false` or `harness = false` do not answer `--list`, and are accounted for by name.
+   The counts are stated in the change, and every CI feature-matrix job passes.
+2. **Same public surface.** Because `cargo semver-checks` does not follow re-exports from another crate (Context),
+   the repository's semver job reports the moved items as missing on an extraction change. The change states this and
+   carries two instruments instead:
+   - an integration test in `lattice-inference` that names every moved public item through both its facade path and
+     its new crate path and proves they are the same item (for types, by assigning one to the other; for traits and
+     functions, by use), together with the trait bounds callers rely on (`Send`, `Sync`, `std::error::Error`, `From`
+     conversions);
+   - a listing of the facade's public items that resolves re-exports across the workspace's rustdoc JSON, identical
+     before and after the move.
+3. **Clippy and docs.** `cargo clippy` with `-D warnings` on the CI feature sets, and the CI rustdoc command with its
+   broken-link lints over the whole workspace, so links in the new crate are checked too.
 4. **Measurement.** The bench-compare disposition follows the reachability rules in the repository's contribution
-   guide. A moved module that a declared measurement target reaches gets a before/after comparison of that target.
-5. **Pure move.** No logic, signature or name changes in the same change. Renames and API redesigns are separate
-   changes after the move lands.
+   guide. A moved module that a declared measurement target reaches gets a before/after comparison of that target. A
+   move also changes build inputs (manifests, crate boundaries), which the guide treats as requiring a measured target
+   where one reaches the code.
+5. **CI reach.** Workflow path filters that select work by source path (for example the end-to-end parity gate,
+   which watches `crates/inference/src/**` and `crates/embed/src/**`) are extended to the new crate's paths in the same
+   change, so moved code keeps triggering the gates it triggered before.
+6. **Pure move.** No logic, signature or name changes in the same change beyond what D3 to D5 require. Renames and API
+   redesigns are separate changes after the move lands.
 
 ### D7. Dependency direction
 
@@ -117,13 +192,21 @@ contribution guide are updated in the same change that adds a crate.
 
 ### D8. Naming, versioning and publishing
 
-New crates are named `lattice-<area>`, share the workspace version, and are published in dependency order before the
-facade. The publish script's order is re-derived from the path dependencies in the change that adds a crate. Each new
-crate carries a README, `package.metadata.docs.rs` features, and the workspace's lint and licence settings.
+1. New crates are named `lattice-<area>`, share the workspace version, licence, lints and repository metadata, and
+   carry a README and `package.metadata.docs.rs` features. Each name is checked free on crates.io in the change that
+   introduces it.
+2. The publish script's tiers are re-derived from path dependencies in that change. With the base crate and the
+   tokenizer the order becomes: `lattice-fann`, `lattice-transport`, `lattice-inference-core`; then
+   `lattice-tokenizer`; then `lattice-inference`; then `lattice-embed`, `lattice-tune`, with an index wait between
+   tiers.
+3. A crate that has never been published cannot be resolved from the registry, so a registry-backed dry run of its
+   dependents fails until it exists. The first release with a new crate states how its publish was rehearsed.
+4. A new crate joins the semver job's package list in the first change after its first release, when a baseline
+   exists. From then on the extracted crate is checked directly, which is where its API is now defined.
 
 ### D9. Order
 
-1. Base crate plus tokenizer: the smallest real case, and it exercises D1 to D8 end to end.
+1. The base crate and the tokenizer: the smallest real case, and it exercises D1 to D8 end to end.
 2. Grammar, and weight and quantization formats.
 3. The shared Metal runtime and per-model definitions, after ADR-102's in-crate split has brought the Metal files
    under the 3000-line cap, so that code is not cut twice.
@@ -146,6 +229,8 @@ first.
   downstream changes for no behavioural gain. Rejected.
 - **Per-crate error types with `From` conversions into `InferenceError`.** Changes the return type of every moved
   public function, which is a breaking change at the facade. Rejected in favour of D2.
+- **The tokenizer crate owns `InferenceError`.** Saves one crate now and forces weight, quantization and grammar
+  crates to depend on a tokenizer later, or a second move of the error type. Rejected in favour of D2.
 - **One large split in a single change.** Unreviewable and not bisectable. Rejected in favour of D9's order.
 
 ## Consequences
@@ -153,4 +238,6 @@ first.
 - Downstream users see no change unless they opt into a narrower crate.
 - The workspace gains crates to publish and version; the publish script and release notes cover them.
 - Compile and review scope for tokenizer, grammar and format work shrinks to the crate that owns it.
-- Hidden cross-crate items (D4.3) are a cost that should fall over time as consumers move.
+- The semver job on `lattice-inference` stops seeing items that moved out of it; those items are checked on their
+  own crates after first release (D8.4), and the facade's surface by the D6.2 instruments.
+- Internal glue modules (D4.3) are a cost that should fall over time as consumers move.
