@@ -17,6 +17,11 @@ extend-exclude = [
     "target/**",
 ]
 
+[default]
+# Verbatim quotation in ADR-103's Direction section, kept as written. Matches only that phrase, so the
+# misspelling stays flagged everywhere else.
+extend-ignore-re = ["the aggragator interface for acceessing stuff"]
+
 [default.extend-words]
 # Domain vocabulary and established abbreviations, not misspellings:
 ot = "ot"       # optimal transport (crates/transport, ADR-035/036/038/039/055)
