@@ -5,12 +5,12 @@ use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::serve::ApiError;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serve::lora::{AdapterControlError, AdapterControlResult};
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::serve::metal_worker::AdapterCommand;
 use crate::serve::prepare::lora_unsupported_backend;
 use crate::serve::route::ServedRoute;
 use crate::serving_cpu::GemmaCpuServing;
 use crate::serving_runtime_contract::{RuntimeInput, TextGenerationEntry};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_worker::AdapterCommand;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 

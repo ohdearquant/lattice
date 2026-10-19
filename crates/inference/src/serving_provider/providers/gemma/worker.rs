@@ -1,9 +1,8 @@
 use crate::model::serving_runtime::{GemmaCpuRuntime, RuntimeFactory, ServingRuntime};
 use crate::serve::lora::{AdapterIndex, ResidencyLimits};
-use crate::serve::metal_worker::ContextWindowPolicy;
 use crate::serve::prepare::PreparationHandle;
 use crate::serving_cpu::GemmaCpuServing;
-use crate::serving_runtime_contract::WorkerMetadata;
+use crate::serving_runtime_contract::{ContextWindowPolicy, WorkerMetadata};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 

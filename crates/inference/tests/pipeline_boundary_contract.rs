@@ -2,8 +2,8 @@
 //! the source-level `pipeline_boundary_contract` resolver.
 //!
 //! This is a bounded, source-only dependency scan of the production
-//! frontend roots (`src/serve`, the moved provider files, and every
-//! `src/bin` target) for concrete model/config/backend-state dependencies. It does
+//! frontend roots (`src/serve`, six provider files, `src/serving_worker.rs`,
+//! and every `src/bin` target) for concrete model/config/backend-state dependencies. It does
 //! NOT establish numerical or device execution, and it does not itself
 //! migrate anything: it is a ratchet against a recorded baseline, run in
 //! two configurations (default features, and `metal-gpu,f16` on macOS).
@@ -144,13 +144,12 @@
 //! collects bare item NAMES, not paths, from anywhere in a file via
 //! unmodified default recursion) is consulted as the LAST resort, after
 //! every other resolution path has failed, on the invariant that every
-//! scanned file lives in a frontier tree (`src/serve`, `src/bin/*`)
-//! disjoint from every origin directory -- so a local item's own defining
-//! file can never itself be an origin file, and suppressing "unresolved"
-//! for a name it declares can never mask a real crossing. Bare-name only
-//! (never a full path), which is sound for the same reason: a bare name
-//! collision with an unrelated same-named item elsewhere would still
-//! resolve correctly through every EARLIER step in the chain first.
+//! production frontend roots are `src/serve`, six provider files
+//! `src/serving_provider/providers/{gemma.rs,gemma/worker.rs,qwen.rs,qwen/adapters.rs,qwen/vision.rs,qwen/worker.rs}`,
+//! `src/serving_worker.rs`, and `src/bin/`;
+//! these trees stay disjoint from the origin directories `model/` and
+//! `forward/metal_*`. A same-file local item therefore cannot hide an origin
+//! crossing. Bare-name lookup remains last, after full path resolution.
 //!
 //! ## Fifth narrowing: a file mounted from more than one module tree
 //!
@@ -1965,17 +1964,10 @@ struct RawUseLeaf {
 /// per item kind and let the default recursion carry it everywhere --
 /// it never needs to track a path, unlike every other index in this file.
 ///
-/// The reason a bare name (no path, no scope) is enough here and nowhere
-/// else: EVERY item this scan ever visits was declared physically inside
-/// one of the two frontier trees `analyze_boundary` walks (`src/serve`,
-/// `src/bin/*`), which are disjoint directory trees from every origin
-/// directory by construction (the origin rule is decided by `crate_dir/
-/// model/` and `crate_dir/forward/metal_*`, neither of which contains
-/// `src/serve` or `src/bin`). A reference whose head names a LOCAL item
-/// declared in the SAME file can therefore never be an origin crossing
-/// regardless of what its tail names (an associated function, an enum
-/// variant, a derived trait method reached through the type name) -- see
-/// the module doc's fourth narrowing.
+/// The bare-name fallback stays safe: roots `src/serve`, the six provider
+/// files `src/serving_provider/providers/{gemma.rs,gemma/worker.rs,qwen.rs,qwen/adapters.rs,qwen/vision.rs,qwen/worker.rs}`,
+/// `src/serving_worker.rs`, and `src/bin/*` stay disjoint from `model/` and
+/// `forward/metal_*`; full path resolution runs before this fallback.
 struct LocalItemNames {
     names: BTreeSet<String>,
 }
@@ -2913,8 +2905,8 @@ fn parse_baseline(text: &str) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-/// The production run: `src/serve`, the provider files that build serving runtimes, and every
-/// binary, against the baseline. A ratchet, not a migration verdict: a new crossing, or a stale
+/// The production run scans `src/serve`, six provider roots, `src/serving_worker.rs`, and every
+/// binary against the baseline. A ratchet, not a migration verdict: a new crossing, or a stale
 /// baseline entry for one that no longer exists, fails the test; a nonzero count does not.
 #[test]
 fn pipeline_boundary_matches_recorded_baseline() {
@@ -2927,11 +2919,16 @@ fn pipeline_boundary_matches_recorded_baseline() {
         "an empty bin-target set is a failure, not a clean run"
     );
 
-    let mut frontend_roots: Vec<PathBuf> = vec![crate_dir.join("src/serve/mod.rs")];
     let providers = crate_dir.join("src/serving_provider/providers");
-    for path in "gemma/worker.rs qwen/adapters.rs qwen/vision.rs qwen/worker.rs".split(' ') {
-        frontend_roots.push(providers.join(path));
-    }
+    let provider_roots: Vec<PathBuf> =
+        "gemma.rs gemma/worker.rs qwen.rs qwen/adapters.rs qwen/vision.rs qwen/worker.rs"
+            .split(' ')
+            .map(|path| providers.join(path))
+            .collect();
+    let mut frontend_roots: Vec<PathBuf> = vec![crate_dir.join("src/serve/mod.rs")];
+    frontend_roots.extend(provider_roots.iter().cloned());
+    frontend_roots.push(crate_dir.join("src/serving_worker.rs"));
+    assert_provider_roots_complete(&providers, &provider_roots);
     frontend_roots.extend(bin_targets.iter().map(|target| target.path.clone()));
 
     let index_roots = vec![crate_dir.join("src/lib.rs")];
@@ -2944,6 +2941,7 @@ fn pipeline_boundary_matches_recorded_baseline() {
     // crossings and look like a completed migration.
     let known_positive_roots = [
         crate_dir.join("src/serve/mod.rs"),
+        crate_dir.join("src/serving_worker.rs"),
         crate_dir.join("src/bin/lattice_serve/main.rs"),
     ];
     for root in &known_positive_roots {

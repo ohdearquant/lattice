@@ -31,10 +31,6 @@ path = "crates/inference/tests/metal_measurement_lock_contract.rs"
 ceiling = 4989
 
 [[ratchet]]
-path = "crates/inference/tests/pipeline_boundary_contract.rs"
-ceiling = 3002
-
-[[ratchet]]
 path = "scripts/bench_decode_harness.py"
 ceiling = 3249
 

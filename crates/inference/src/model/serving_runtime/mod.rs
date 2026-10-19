@@ -19,9 +19,9 @@ use crate::generation::{GenerateConfig, GenerateOutput};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serve::lora::{AdapterControlError, AdapterControlResult};
 use crate::serve::lora::{AdapterIndex, LoraSelection, ResidencyLimits};
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::serve::metal_worker::AdapterCommand;
 use crate::serve::prepare::PreparationHandle;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_worker::AdapterCommand;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 

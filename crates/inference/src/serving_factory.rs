@@ -1,12 +1,18 @@
 //! Select the serving family before building worker-local execution state.
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::forward::metal_qwen35::MetalQwen35State;
 use crate::model::serving_runtime::{RuntimeFactory, ServingRuntime};
 use crate::serve::lora::{AdapterIndex, ResidencyLimits};
-use crate::serve::metal_worker::{VisionRuntime, WorkerMetadata};
 use crate::serve::prepare::PreparationHandle;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_provider::providers;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_provider::providers::qwen::vision::VisionRuntime;
+use crate::serving_runtime_contract::WorkerMetadata;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::tokenizer::bpe::BpeTokenizer;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -19,6 +25,7 @@ pub struct ServingFactory {
 impl ServingFactory {
     /// Bind the existing Qwen loader and lazy vision state.
     /// Loading still occurs on the worker thread.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub fn qwen_metal(
         loader: impl FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
         + Send
@@ -33,20 +40,20 @@ impl ServingFactory {
     /// Bind a Gemma 4 E2B text checkpoint directory. The checkpoint is loaded
     /// on the worker thread, and its jobs run on the CPU under the shared
     /// decoder driver.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub fn gemma_cpu(model_dir: PathBuf) -> Self {
         Self {
             inner: providers::gemma::worker::factory(model_dir),
         }
     }
 
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub(crate) fn legacy_qwen(
         loader: impl FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
         + Send
         + 'static,
     ) -> Self {
-        Self {
-            inner: providers::qwen::worker::factory(Box::new(loader), VisionRuntime::unsupported()),
-        }
+        Self::qwen_metal(loader, VisionRuntime::unsupported())
     }
 
     pub(crate) fn build(
@@ -61,5 +68,5 @@ impl ServingFactory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
 mod tests;

@@ -89,7 +89,7 @@ impl VisionRuntime {
     }
 
     /// Text-only runtime used by the compatibility
-    /// [`crate::serve::metal_worker::MetalWorker::spawn`] entry point and GPU-free worker tests.
+    /// [`crate::serving_worker::AffineWorker::spawn`] entry point and GPU-free worker tests.
     pub fn unsupported() -> Self {
         Self {
             state: VisionState::Unsupported,
