@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import io
 import json
+import subprocess
 import sys
 import tempfile
 import types
@@ -707,18 +709,23 @@ class WrapperExitStatusTest(unittest.TestCase):
     """
 
     def _run_main(self, registry: dict, tmp: Path) -> int:
+        def render_chart(command, **_kwargs):
+            Path(command[3]).write_bytes(b"synthetic chart")
+            return subprocess.CompletedProcess(command, 0)
+
         saved = dict(harness.ADAPTER_REGISTRY)
         harness.ADAPTER_REGISTRY.clear()
         harness.ADAPTER_REGISTRY.update(registry)
         try:
             with (
                 mock.patch.object(adapters, "register_available_adapters"),
+                mock.patch.object(adapters, "REPO_ROOT", tmp),
                 mock.patch.object(adapters, "OUT_DIR", tmp),
                 mock.patch.object(adapters, "DATA_TSV", tmp / "data.tsv"),
                 mock.patch.object(adapters, "CHART_PNG", tmp / "chart.png"),
                 mock.patch.object(adapters, "subprocess") as fake_subprocess,
             ):
-                fake_subprocess.run.return_value = None
+                fake_subprocess.run.side_effect = render_chart
                 return adapters.main(["--allow-missing-engine"])
         finally:
             harness.ADAPTER_REGISTRY.clear()
@@ -731,6 +738,99 @@ class WrapperExitStatusTest(unittest.TestCase):
     def test_one_live_engine_with_missing_peers_exits_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(self._run_main({"lattice": _FakeAdapter()}, Path(tmp)), 0)
+
+
+class ChartPublicationTest(unittest.TestCase):
+    OLD_TSV = b"previous canonical TSV\n"
+    OLD_PNG = b"previous canonical PNG\n"
+    NEW_TSV = "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope\nlattice\t64\t100.0\t80.000\t640.000\t1\t\n"
+    NEW_PNG = b"synthetic staged PNG\n"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.out_dir = self.root / "published"
+        self.out_dir.mkdir()
+        self.data_tsv = self.out_dir / "data.tsv"
+        self.chart_png = self.out_dir / "chart.png"
+        self.data_tsv.write_bytes(self.OLD_TSV)
+        self.chart_png.write_bytes(self.OLD_PNG)
+
+    def _run_main(self, *, returncode: int, create_png: bool):
+        def render_chart(command, *, cwd, check):
+            self.assertEqual(command[:2], [sys.executable, str(adapters.CHART_SCRIPT)])
+            self.assertEqual(cwd, self.root)
+            self.assertFalse(check)
+            self.staged_tsv = Path(command[2])
+            self.staged_png = Path(command[3])
+            self.stage_dir = self.staged_tsv.parent
+            self.assertEqual(self.stage_dir.parent, self.root / ".cache")
+            self.assertEqual(self.staged_png.parent, self.stage_dir)
+            self.assertNotEqual(self.staged_tsv, self.data_tsv)
+            self.assertNotEqual(self.staged_png, self.chart_png)
+            self.assertEqual(self.staged_tsv.read_bytes(), self.NEW_TSV.encode())
+            if create_png:
+                self.staged_png.write_bytes(self.NEW_PNG)
+            return subprocess.CompletedProcess(command, returncode)
+
+        with (
+            mock.patch.object(harness, "coordinator_is_supervised", return_value=False),
+            mock.patch.object(adapters, "register_available_adapters"),
+            mock.patch.object(adapters, "REPO_ROOT", self.root),
+            mock.patch.object(adapters, "OUT_DIR", self.out_dir),
+            mock.patch.object(adapters, "DATA_TSV", self.data_tsv),
+            mock.patch.object(adapters, "CHART_PNG", self.chart_png),
+            mock.patch.object(harness, "run_profile", return_value=mock.sentinel.result) as run_profile,
+            mock.patch.object(adapters, "compute_context_scaling_aggregate", return_value=([], {})),
+            mock.patch.object(harness, "render_report", return_value="synthetic report"),
+            mock.patch.object(adapters, "render_legacy_tsv", return_value=self.NEW_TSV),
+            mock.patch.object(adapters, "subprocess") as fake_subprocess,
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
+            mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
+        ):
+            fake_subprocess.run.side_effect = render_chart
+            try:
+                status = adapters.main(["--allow-missing-engine"])
+            except FileNotFoundError:
+                self.fail("wrapper raised FileNotFoundError instead of returning a publication status")
+            run_profile.assert_called_once()
+            fake_subprocess.run.assert_called_once()
+            return status, stdout.getvalue(), stderr.getvalue()
+
+    def _assert_failure_preserved_outputs(self, stdout: str, stderr: str):
+        self.assertEqual(self.data_tsv.read_bytes(), self.OLD_TSV)
+        self.assertEqual(self.chart_png.read_bytes(), self.OLD_PNG)
+        self.assertTrue(self.stage_dir.is_dir())
+        self.assertEqual(self.staged_tsv.read_bytes(), self.NEW_TSV.encode())
+        self.assertEqual((self.stage_dir / "report.txt").read_text(), "synthetic report\n")
+        self.assertIn(f"staged data retained at {self.stage_dir}", stderr)
+        self.assertNotIn("Raw data (chart-compatible TSV):", stdout)
+        self.assertNotIn("Chart:", stdout)
+
+    def test_nonzero_renderer_preserves_outputs_even_with_staged_png(self):
+        status, stdout, stderr = self._run_main(returncode=23, create_png=True)
+        self.assertEqual(status, 23, "renderer failure status must propagate")
+        self._assert_failure_preserved_outputs(stdout, stderr)
+        self.assertEqual(self.staged_png.read_bytes(), self.NEW_PNG)
+        self.assertIn("FAIL: chart generation exited with status 23;", stderr)
+
+    def test_success_without_png_refuses_publication_and_retains_stage(self):
+        status, stdout, stderr = self._run_main(returncode=0, create_png=False)
+        self.assertEqual(status, 1, "missing PNG must return failure")
+        self._assert_failure_preserved_outputs(stdout, stderr)
+        self.assertFalse(self.staged_png.exists())
+        self.assertIn("FAIL: chart generation produced no PNG;", stderr)
+
+    def test_success_publishes_exact_outputs_and_removes_stage(self):
+        status, stdout, stderr = self._run_main(returncode=0, create_png=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(self.data_tsv.read_bytes(), self.NEW_TSV.encode())
+        self.assertEqual(self.chart_png.read_bytes(), self.NEW_PNG)
+        self.assertFalse(self.stage_dir.exists())
+        self.assertEqual(stderr, "")
+        self.assertIn(f"Raw data (chart-compatible TSV): {self.data_tsv}\n", stdout)
+        self.assertIn(f"Chart: {self.chart_png}\n", stdout)
 
 
 if __name__ == "__main__":

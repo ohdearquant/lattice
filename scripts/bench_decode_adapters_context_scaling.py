@@ -506,11 +506,16 @@ def main(argv: list[str] | None = None) -> int:
     staged_tsv.write_text(render_legacy_tsv(result, slopes, window_medians))
 
     print("\n--- Generating chart ---")
-    subprocess.run([sys.executable, str(CHART_SCRIPT), str(staged_tsv), str(staged_chart)], cwd=REPO_ROOT, check=False)
+    chart = subprocess.run([sys.executable, str(CHART_SCRIPT), str(staged_tsv), str(staged_chart)], cwd=REPO_ROOT, check=False)
+    if chart.returncode != 0:
+        print(f"FAIL: chart generation exited with status {chart.returncode}; staged data retained at {stage_dir}", file=sys.stderr)
+        return chart.returncode
+    if not staged_chart.is_file():
+        print(f"FAIL: chart generation produced no PNG; staged data retained at {stage_dir}", file=sys.stderr)
+        return 1
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(staged_tsv, DATA_TSV)
-    if staged_chart.is_file():
-        shutil.copy2(staged_chart, CHART_PNG)
+    shutil.copy2(staged_chart, CHART_PNG)
     print(f"Raw data (chart-compatible TSV): {DATA_TSV}")
     print(f"Chart: {CHART_PNG}")
     shutil.rmtree(stage_dir)
