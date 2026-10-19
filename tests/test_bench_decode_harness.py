@@ -182,6 +182,129 @@ class OllamaAvailabilityTest(unittest.TestCase):
                 harness.ollama_model_available("http://203.0.113.1:11434", "qwen3.5:0.8b")
         urlopen.assert_not_called()
 
+    def test_model_name_prefix_collision_still_pulls_requested_model(self):
+        missing = self._Response({"models": [{"name": "qwen3.5:0.8b-custom"}]})
+        present = self._Response({"models": [{"name": "qwen3.5:0.8b"}]})
+        listing = "NAME ID SIZE MODIFIED\n\nqwen3.5:0.8b-custom abc123 1GB today\n"
+        list_result = mock.Mock(returncode=0, stdout=listing, stderr="")
+        pull_result = mock.Mock(returncode=0, stdout="success", stderr="")
+        with (
+            mock.patch.object(harness.urllib.request, "urlopen", side_effect=[missing, present]) as urlopen,
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run", side_effect=[list_result, pull_result]) as run,
+        ):
+            available = harness.ollama_model_available(
+                "http://127.0.0.1:11435", "qwen3.5:0.8b", pull_if_missing=True
+            )
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["ollama", "list"], ["ollama", "pull", "qwen3.5:0.8b"]])
+        self.assertTrue(available)
+        self.assertEqual(urlopen.call_args_list, [
+            mock.call("http://127.0.0.1:11435/api/tags", timeout=3),
+            mock.call("http://127.0.0.1:11435/api/tags", timeout=3),
+        ])
+        self.assertTrue(all(call.kwargs["env"]["OLLAMA_HOST"] == "http://127.0.0.1:11435" for call in run.call_args_list))
+
+    def test_model_name_suffix_collision_still_pulls_requested_model(self):
+        missing = self._Response({"models": [{"name": "custom-qwen3.5:0.8b"}]})
+        present = self._Response({"models": [{"model": "qwen3.5:0.8b"}]})
+        listing = "NAME ID SIZE MODIFIED\ncustom-qwen3.5:0.8b abc123 1GB today\n"
+        list_result = mock.Mock(returncode=0, stdout=listing, stderr="")
+        pull_result = mock.Mock(returncode=0, stdout="success", stderr="")
+        with (
+            mock.patch.object(harness.urllib.request, "urlopen", side_effect=[missing, present]),
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run", side_effect=[list_result, pull_result]) as run,
+        ):
+            available = harness.ollama_model_available(
+                "http://localhost:11434", "qwen3.5:0.8b", pull_if_missing=True
+            )
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["ollama", "list"], ["ollama", "pull", "qwen3.5:0.8b"]])
+        self.assertTrue(available)
+
+    def test_requested_name_in_other_column_still_pulls_requested_model(self):
+        missing = self._Response({"models": [{"name": "other-model:latest"}]})
+        present = self._Response({"models": [{"name": "qwen3.5:0.8b"}]})
+        listing = "NAME ID SIZE MODIFIED\nother-model:latest abc123 1GB qwen3.5:0.8b\n"
+        list_result = mock.Mock(returncode=0, stdout=listing, stderr="")
+        pull_result = mock.Mock(returncode=0, stdout="success", stderr="")
+        with (
+            mock.patch.object(harness.urllib.request, "urlopen", side_effect=[missing, present]),
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run", side_effect=[list_result, pull_result]) as run,
+        ):
+            available = harness.ollama_model_available(
+                "http://localhost:11434", "qwen3.5:0.8b", pull_if_missing=True
+            )
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["ollama", "list"], ["ollama", "pull", "qwen3.5:0.8b"]])
+        self.assertTrue(available)
+
+    def test_exact_cli_model_name_skips_pull_and_rechecks_api(self):
+        missing = self._Response({"models": []})
+        present = self._Response({"models": [{"name": "qwen3.5:0.8b"}]})
+        listing = "NAME ID SIZE MODIFIED\n  qwen3.5:0.8b\tabc123\t1GB\ttoday\n"
+        list_result = mock.Mock(returncode=0, stdout=listing, stderr="")
+        with (
+            mock.patch.object(harness.urllib.request, "urlopen", side_effect=[missing, present]) as urlopen,
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run", side_effect=[list_result]) as run,
+        ):
+            self.assertTrue(
+                harness.ollama_model_available("http://localhost:11434", "qwen3.5:0.8b", pull_if_missing=True)
+            )
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["ollama", "list"]])
+        self.assertEqual(urlopen.call_args_list, [
+            mock.call("http://localhost:11434/api/tags", timeout=3),
+            mock.call("http://localhost:11434/api/tags", timeout=3),
+        ])
+
+    def test_failed_pull_is_missing_without_final_api_recheck(self):
+        missing = self._Response({"models": []})
+        list_result = mock.Mock(returncode=0, stdout="NAME\n", stderr="")
+        pull_result = mock.Mock(returncode=1, stdout="", stderr="pull failed")
+        with (
+            mock.patch.object(harness.urllib.request, "urlopen", side_effect=[missing]) as urlopen,
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run", side_effect=[list_result, pull_result]) as run,
+        ):
+            self.assertFalse(
+                harness.ollama_model_available("http://localhost:11434", "qwen3.5:0.8b", pull_if_missing=True)
+            )
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["ollama", "list"], ["ollama", "pull", "qwen3.5:0.8b"]])
+        urlopen.assert_called_once_with("http://localhost:11434/api/tags", timeout=3)
+
+    def test_failed_list_is_missing_without_pull_or_final_api_recheck(self):
+        missing = self._Response({"models": []})
+        list_result = mock.Mock(returncode=1, stdout="NAME\nqwen3.5:0.8b\n", stderr="list failed")
+        with (
+            mock.patch.object(harness.urllib.request, "urlopen", side_effect=[missing]) as urlopen,
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run", side_effect=[list_result]) as run,
+        ):
+            self.assertFalse(
+                harness.ollama_model_available("http://localhost:11434", "qwen3.5:0.8b", pull_if_missing=True)
+            )
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["ollama", "list"]])
+        urlopen.assert_called_once_with("http://localhost:11434/api/tags", timeout=3)
+
+    def test_successful_pull_requires_exact_model_in_final_api_recheck(self):
+        missing = self._Response({"models": []})
+        still_missing = self._Response({"models": [{"name": "qwen3.5:0.8b-custom"}]})
+        list_result = mock.Mock(returncode=0, stdout="NAME\n", stderr="")
+        pull_result = mock.Mock(returncode=0, stdout="success", stderr="")
+        with (
+            mock.patch.object(harness.urllib.request, "urlopen", side_effect=[missing, still_missing]) as urlopen,
+            mock.patch.object(harness.shutil, "which", return_value="/usr/bin/ollama"),
+            mock.patch.object(harness.subprocess, "run", side_effect=[list_result, pull_result]) as run,
+        ):
+            self.assertFalse(
+                harness.ollama_model_available("http://localhost:11434", "qwen3.5:0.8b", pull_if_missing=True)
+            )
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["ollama", "list"], ["ollama", "pull", "qwen3.5:0.8b"]])
+        self.assertEqual(urlopen.call_args_list, [
+            mock.call("http://localhost:11434/api/tags", timeout=3),
+            mock.call("http://localhost:11434/api/tags", timeout=3),
+        ])
+
 
 def _engine(
     name: str = "fake",
