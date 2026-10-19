@@ -667,7 +667,7 @@ def _run(
             "CARGO_TARGET_DIR": str(root / "target"),
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "BENCH_IDLE_FLOOR": "0",
-            "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
+            "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id", "STUB_REPO_ROOT": str(root),
             **(extra_env or {}),
             "STUB_EMIT_CRITERION_HOME": "1" if emit_criterion_home else "0",
         }
@@ -900,7 +900,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         ]
         self.assertTrue(commands, "found 0 cargo bench invocations")
         self.assertEqual(
-            len(commands), 10,
+            len(commands), 14,
             f"found {len(commands)} cargo bench invocations:\n"
             + "\n".join(commands),
         )
@@ -1736,7 +1736,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"embed target override failed\nstdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}",
         )
-        self.assertEqual(len(embed_argv), 4, embed_argv)
+        self.assertEqual(len(embed_argv), 8, embed_argv)
         for argv in embed_argv:
             bench_index = argv.index("--bench")
             self.assertEqual(argv[bench_index + 1], "embeddings", argv)
@@ -1785,7 +1785,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             )
             embed_argv = _captured_embed_argv(argv_file)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(embed_argv), 4, embed_argv)
+        self.assertEqual(len(embed_argv), 8, embed_argv)
         for argv in embed_argv:
             self.assertEqual(argv.count("--features"), 1, argv)
             feature_index = argv.index("--features")

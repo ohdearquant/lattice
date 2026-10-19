@@ -2103,6 +2103,11 @@ jobs:
       # invoked, which keeps it in the same harness-plumbing scope as above.
       - name: python3 tests/test_bench_compare_measurement.py
         run: python3 tests/test_bench_compare_measurement.py -v
+      # The prebuild ordering cases live in their own module because the
+      # measurement suite above is frozen at its ADR-102 line ceiling. Same
+      # stub-cargo scope: they drive the shipping script and run no benchmark.
+      - name: python3 tests/test_bench_compare_prebuild.py
+        run: python3 tests/test_bench_compare_prebuild.py -v
       - name: python3 tests/test_bench_decode_slopefit.py
         run: python3 tests/test_bench_decode_slopefit.py -v
       # The in-phase load sampler's self/foreign split under --gpu-handoff,
