@@ -5,7 +5,7 @@ use super::lora::{
     AdapterControlError, AdapterIndex, AdapterMetadata, LoraSelection, ResidencyLimits,
     unknown_adapter, validate_scales, validate_unique_ids,
 };
-use crate::forward::metal_qwen35::{LoraLayerData, MetalQwen35State, blend_lora_layer_data};
+use crate::forward::metal_qwen35::{LoraLayerData, blend_lora_layer_data};
 use lattice_fann::lora::LoraDescriptor;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -13,17 +13,6 @@ use std::sync::{Arc, RwLock};
 pub(crate) trait AdapterSlot {
     fn load(&mut self, layers: Vec<LoraLayerData>) -> Result<(), String>;
     fn unload(&mut self);
-}
-
-impl AdapterSlot for MetalQwen35State {
-    fn load(&mut self, layers: Vec<LoraLayerData>) -> Result<(), String> {
-        self.load_lora_adapter(layers, 1.0, None)
-            .map_err(|err| err.to_string())
-    }
-
-    fn unload(&mut self) {
-        self.unload_lora_adapter();
-    }
 }
 
 struct ResidentAdapter {
