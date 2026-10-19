@@ -1,0 +1,11 @@
+[package]
+name = "listing_baseline"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+listing_core = { path = "../core" }
+
+[lib]
+name = "listing_baseline"
+path = "src/lib.rs"
