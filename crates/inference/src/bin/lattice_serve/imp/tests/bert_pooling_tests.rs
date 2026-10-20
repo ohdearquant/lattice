@@ -10,7 +10,7 @@ const MODELS: [(&str, BertPooling); 2] = [
     ("all-minilm-l6-v2", BertPooling::Mean),
 ];
 
-fn fixture(parent: &Path, name: &str) -> PathBuf {
+pub(super) fn fixture(parent: &Path, name: &str) -> PathBuf {
     let path = parent.join(name);
     write_checkpoint(&path).expect("deterministic BERT checkpoint must be written");
     path
@@ -22,7 +22,7 @@ fn valid_vector(vector: &[f32]) -> bool {
         && vector.iter().any(|&value| value != 0.0)
 }
 
-fn assert_vector(actual: &[f32], expected: &[f32]) {
+pub(super) fn assert_vector(actual: &[f32], expected: &[f32]) {
     assert!(valid_vector(actual), "invalid actual embedding");
     assert!(valid_vector(expected), "invalid expected embedding");
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -81,23 +81,29 @@ fn reference(path: &Path, pooling: BertPooling) -> (Vec<f32>, Vec<Vec<f32>>) {
     (single, batch)
 }
 
-async fn request(embedding: Arc<EmbeddingState>, input: Value) -> Response {
+pub(super) async fn request(embedding: Arc<EmbeddingState>, input: Value) -> Response {
     let model_id = embedding.model_id.to_string();
+    request_json(Some(embedding), json!({"input": input, "model": model_id})).await
+}
+
+pub(super) async fn request_json(embedding: Option<Arc<EmbeddingState>>, body: Value) -> Response {
     let request = axum::http::Request::builder()
         .method("POST")
         .uri("/v1/embeddings")
         .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            json!({"input": input, "model": model_id}).to_string(),
-        ))
+        .body(Body::from(body.to_string()))
         .expect("request must build");
-    router(test_app_state_with_embedding(embedding))
+    let state = match embedding {
+        Some(embedding) => test_app_state_with_embedding(embedding),
+        None => test_app_state(),
+    };
+    router(state)
         .oneshot(request)
         .await
         .expect("actual router must respond")
 }
 
-async fn vectors(response: Response, name: &str, expected_count: usize) -> Vec<Vec<f32>> {
+pub(super) async fn success_body(response: Response, name: &str, expected_count: usize) -> Value {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap();
@@ -110,15 +116,22 @@ async fn vectors(response: Response, name: &str, expected_count: usize) -> Vec<V
     );
     let rows = value["data"].as_array().unwrap();
     assert_eq!(rows.len(), expected_count);
-    rows.iter()
-        .enumerate()
-        .map(|(index, row)| {
-            assert_eq!(row["object"], "embedding");
-            assert_eq!(row["index"].as_u64().unwrap(), index as u64);
-            let vector: Vec<f32> = serde_json::from_value(row["embedding"].clone()).unwrap();
-            assert!(valid_vector(&vector));
-            vector
-        })
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row["object"], "embedding");
+        assert_eq!(row["index"].as_u64().unwrap(), index as u64);
+        let vector: Vec<f32> = serde_json::from_value(row["embedding"].clone()).unwrap();
+        assert!(valid_vector(&vector));
+    }
+    value
+}
+
+async fn vectors(response: Response, name: &str, expected_count: usize) -> Vec<Vec<f32>> {
+    let value = success_body(response, name, expected_count).await;
+    value["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| serde_json::from_value(row["embedding"].clone()).unwrap())
         .collect()
 }
 
