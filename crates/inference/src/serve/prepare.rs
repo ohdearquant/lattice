@@ -65,7 +65,7 @@ pub struct PreparedChatRequest {
 /// `cm_serve_context_window_checked_before_stop_parsing`.
 ///
 /// `tokenize_len`/`max_context` are threaded through as thunks (rather
-/// than a `&ModelBackend`) so this whole cascade — including the
+/// than a serving handle) so this whole cascade, including the
 /// ordering — is testable without constructing a real model: the
 /// rendered `prompt` that `tokenize_len` needs only exists once
 /// `validate_chat_request` has already run, so the thunk form lets a

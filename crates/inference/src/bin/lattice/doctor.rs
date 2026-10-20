@@ -34,7 +34,7 @@ fn kv_cache_dtype_bytes() -> usize {
 /// Which backend a format runs on in *this* binary. Mirrors the
 /// dispatch already in `run_chat`/`main`: `Safetensors` always loads via
 /// `Qwen35Model::from_safetensors` (CPU); `Q4` always requires the Metal
-/// forward pass (`MetalChatBackend` / `serve::ModelBackend::spawn_metal`).
+/// forward pass (`MetalChatBackend` / the serving command's Metal loader).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     Cpu,

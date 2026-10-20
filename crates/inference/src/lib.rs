@@ -167,6 +167,10 @@ pub mod serving_cpu_host;
 #[cfg(feature = "serve")]
 #[doc(hidden)]
 pub mod serving_factory;
+/// Shared request facade for the HTTP serving binaries. Not a stable API.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_host;
 #[cfg(feature = "serve")]
 mod serving_preparation;
 /// Selects serving providers from bounded checkpoint metadata.

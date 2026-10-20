@@ -655,15 +655,16 @@ async fn main() {
                 }
             };
 
+            let cpu_generation_admission = Arc::new(Semaphore::new(max_cpu_generations));
             let state = serve::AppState {
-                model: model_backend,
+                model: model_backend.into_serving_handle(Arc::clone(&cpu_generation_admission)),
                 default_max_tokens: max_tokens,
                 max_tokens_cap: 4096,
                 model_id: served_model_id.clone(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model,
                 embedding_admission: Arc::new(Semaphore::new(serve::EMBEDDING_MAX_CONCURRENT_JOBS)),
-                cpu_generation_admission: Arc::new(Semaphore::new(max_cpu_generations)),
+                cpu_generation_admission,
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: router_artifact,
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -1098,8 +1099,8 @@ mod preload_vision_cli_tests {
 
     /// Lazy loading is the default: omitting `--preload-vision` must not
     /// flip it on. This is the CLI-level half of the "lazy stays the
-    /// default" contract the issue asks for -- the startup-behavior half is
-    /// structural (`ModelBackend::spawn_metal` only calls
+    /// default" contract -- the startup behavior is structural (the serving
+    /// command's Metal loader only calls
     /// `VisionRuntime::preload()` inside `if preload_vision { .. }`).
     #[test]
     fn preload_vision_omitted_defaults_to_false() {
