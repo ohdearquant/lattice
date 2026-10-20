@@ -30,6 +30,7 @@ use lattice_inference::serve::into_engine_chat_messages;
 use lattice_inference::serve::prepare::PreparedChatRequest;
 #[cfg(test)]
 use lattice_inference::serve::prepare::prepare_chat_request;
+use lattice_inference::serving_host::ServingHandle;
 use lattice_inference::{GenerateOutput, TokenLogprob};
 use serde::Serialize;
 use serde_json::Value;
@@ -1904,10 +1905,7 @@ pub(super) fn router<M: IntoServingHandle>(state: AppState<M>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
-        .route(
-            "/v1/lora",
-            get(lora_list::<lattice_inference::serving_host::ServingHandle>),
-        )
+        .route("/v1/lora", get(lora_list::<ServingHandle>))
         .route("/v1/lora/load", post(lora_load))
         .route("/v1/lora/unload", post(lora_unload))
         .route("/v1/router/feedback", post(router_feedback))
