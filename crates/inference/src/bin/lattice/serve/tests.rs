@@ -1972,6 +1972,8 @@ mod vision_content_parts_1135;
 // POST /v1/embeddings router-level contract tests.
 // -----------------------------------------------------------------------
 #[cfg(feature = "test-utils")]
+mod embeddings_characterization;
+#[cfg(feature = "test-utils")]
 mod embeddings_route;
 
 // -----------------------------------------------------------------------

@@ -1214,6 +1214,20 @@ jobs:
           fi
           cat "$log"
           grep -Eq '^test result: ok\. 64 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # Embedding-model startup through both shipped binaries, on synthetic Qwen3.5
+      # and BERT checkpoints written by the test-utils fixtures. The exact count
+      # keeps a renamed or deleted test from turning this step into a no-op.
+      - name: inference - embedding startup goldens (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/serve-startup-embedding-golden.log"
+          if ! cargo test -p lattice-inference --features f16,metal-gpu,serve,test-utils --test serve_startup_embedding_golden -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # These checkpoint targets are test = false, so --all-targets does not
       # compile them. Lint each target by name with the features it requires.
       - name: inference - serving checkpoint target lint (macOS only)

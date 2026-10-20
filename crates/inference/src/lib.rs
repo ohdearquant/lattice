@@ -142,6 +142,10 @@ pub mod pool;
 pub mod pruning;
 /// Quantization and pre-transform primitives. See [`weights`] and [`forward`].
 pub mod quant;
+/// Synthetic Qwen3.5 checkpoint support for repository regression tests.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod qwen35_checkpoint_fixture;
 /// Rotary position embedding tables and application helpers. See [`model`] and [`forward`].
 pub mod rope;
 /// Sampling configuration and token selection helpers. See [`model`] and [`speculative`].
