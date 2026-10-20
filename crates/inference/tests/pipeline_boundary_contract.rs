@@ -145,7 +145,7 @@
 //! unmodified default recursion) is consulted as the LAST resort, after
 //! every other resolution path has failed, on the invariant that every
 //! production frontend roots are `src/serve`, the provider files
-//! `src/serving_provider/providers/{gemma.rs,gemma/worker.rs,qwen.rs,qwen/adapters.rs,qwen/vision.rs,qwen/worker.rs}`,
+//! `src/serving_provider/providers/{gemma.rs,gemma/worker.rs,qwen.rs,qwen/adapters.rs,qwen/lattice_worker.rs,qwen/vision.rs,qwen/worker.rs}`,
 //! `src/serving_worker.rs`, and `src/bin/`;
 //! these trees stay disjoint from the origin directories `model/` and
 //! `forward/metal_*`. A same-file local item therefore cannot hide an origin
@@ -1965,7 +1965,7 @@ struct RawUseLeaf {
 /// it never needs to track a path, unlike every other index in this file.
 ///
 /// The bare-name fallback stays safe: roots `src/serve`, the provider
-/// files `src/serving_provider/providers/{gemma.rs,gemma/worker.rs,qwen.rs,qwen/adapters.rs,qwen/vision.rs,qwen/worker.rs}`,
+/// files `src/serving_provider/providers/{gemma.rs,gemma/worker.rs,qwen.rs,qwen/adapters.rs,qwen/lattice_worker.rs,qwen/vision.rs,qwen/worker.rs}`,
 /// `src/serving_worker.rs`, and `src/bin/*` stay disjoint from `model/` and
 /// `forward/metal_*`; full path resolution runs before this fallback.
 struct LocalItemNames {
@@ -2921,7 +2921,7 @@ fn pipeline_boundary_matches_recorded_baseline() {
 
     let providers = crate_dir.join("src/serving_provider/providers");
     let provider_roots: Vec<PathBuf> =
-        "gemma.rs gemma/worker.rs qwen.rs qwen/adapters.rs qwen/vision.rs qwen/worker.rs"
+        "gemma.rs gemma/worker.rs qwen.rs qwen/adapters.rs qwen/lattice_worker.rs qwen/vision.rs qwen/worker.rs"
             .split(' ')
             .map(|path| providers.join(path))
             .collect();

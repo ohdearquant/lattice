@@ -685,11 +685,18 @@ fn metal_engine_session_isolation_test_holds_a_function_lifetime_lock() {
 /// of a binary into the library would leave the construction inventory. Each
 /// row adds the module as an extra root of that binary's scan; the binary's
 /// own source stays scanned.
-const BIN_LIBRARY_LOADER_ROOTS: &[(&str, &str, &str)] = &[(
-    "bin",
-    "lattice_serve",
-    "src/serving_provider/providers/qwen/worker.rs",
-)];
+const BIN_LIBRARY_LOADER_ROOTS: &[(&str, &str, &str)] = &[
+    (
+        "bin",
+        "lattice",
+        "src/serving_provider/providers/qwen/lattice_worker.rs",
+    ),
+    (
+        "bin",
+        "lattice_serve",
+        "src/serving_provider/providers/qwen/worker.rs",
+    ),
+];
 
 /// The parsed sources the construction scan reads for one Cargo target.
 pub(super) fn construction_scan_sources(

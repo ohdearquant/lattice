@@ -391,7 +391,6 @@ async fn main() {
             embedding_model: embedding_model_dir,
             embedding_model_id,
         } => {
-            use lattice_inference::serve::route::ServedBackend;
             use std::path::Path;
             use std::sync::Arc;
             use std::sync::atomic::AtomicU64;
@@ -430,54 +429,32 @@ async fn main() {
                 std::process::exit(1);
             };
             eprintln!("{}", route.selection_marker(format));
-            let model_backend: serve::ModelBackend = match route.backend {
-                ServedBackend::Cpu => match selected.load_lattice_cpu() {
-                    Ok(cpu) => serve::ModelBackend::Cpu(cpu),
-                    Err(error) => {
-                        eprintln!("Error: {error}");
-                        std::process::exit(1);
-                    }
+            #[cfg(feature = "metal-gpu")]
+            let context_window = chat::chat_max_cache_len();
+            #[cfg(not(feature = "metal-gpu"))]
+            let context_window = 0;
+            let cpu_generation_admission = Arc::new(Semaphore::new(max_cpu_generations));
+            let serving_model = match selected.open_lattice(
+                lattice_inference::serving_provider::LatticeOpenOptions {
+                    tokenizer_dir: tokenizer_dir.map(std::path::PathBuf::from),
+                    max_pending,
+                    max_resident_adapters,
+                    max_resident_adapter_bytes,
+                    preload_vision,
+                    context_window,
                 },
-                ServedBackend::Metal => {
-                    #[cfg(feature = "metal-gpu")]
-                    {
-                        let tokenizer_dir_path =
-                            tokenizer_dir.as_ref().map(std::path::PathBuf::from);
-                        match serve::ModelBackend::spawn_metal(
-                            model_path.to_path_buf(),
-                            tokenizer_dir_path,
-                            max_pending,
-                            lattice_inference::serve::lora::ResidencyLimits {
-                                max_adapters: max_resident_adapters,
-                                max_bytes: max_resident_adapter_bytes,
-                            },
-                            preload_vision,
-                        ) {
-                            Ok((backend, _max_context)) => backend,
-                            Err(e) => {
-                                eprintln!("Error: failed to load Q4 model: {e}");
-                                std::process::exit(1);
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "metal-gpu"))]
-                    {
-                        let _ = &tokenizer_dir;
-                        let _ = (
-                            max_pending,
-                            max_resident_adapters,
-                            max_resident_adapter_bytes,
-                        );
-                        let _ = preload_vision;
-                        eprintln!("Error: {}", backend::metal_gpu_required_message(model_path));
-                        std::process::exit(1);
-                    }
+                Arc::clone(&cpu_generation_admission),
+            ) {
+                Ok(model) => model,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
                 }
             };
             eprintln!("Model loaded. Serving as '{served_model_id}'.");
 
             // `/v1/embeddings` needs its own f16-packed vision-language
-            // checkpoint load, independent of `model_backend` above (see
+            // checkpoint load, independent of the serving model opened above (see
             // `lattice_inference::serve::embeddings`'s module doc comment
             // for why the two loaders can't share weights).
             //
@@ -655,9 +632,8 @@ async fn main() {
                 }
             };
 
-            let cpu_generation_admission = Arc::new(Semaphore::new(max_cpu_generations));
             let state = serve::AppState {
-                model: model_backend.into_serving_handle(Arc::clone(&cpu_generation_admission)),
+                model: serving_model,
                 default_max_tokens: max_tokens,
                 max_tokens_cap: 4096,
                 model_id: served_model_id.clone(),
@@ -850,7 +826,26 @@ mod cpu_serve_prompt_tests {
             .split("Command::Serve {")
             .nth(1)
             .unwrap();
-        assert!(startup.contains("selected.load_lattice_cpu()"));
+        assert!(startup.contains("selected.open_lattice("));
+        let provider_api = include_str!("../../serving_provider.rs");
+        let open_lattice = provider_api
+            .split_once("pub fn open_lattice(")
+            .map(|(_, body)| body)
+            .expect("the selected provider exposes the lattice route opener");
+        let open_lattice_body = open_lattice
+            .split_once("\n    /// Validate standalone flag presence")
+            .map(|(body, _)| body)
+            .expect("the lattice route opener ends before standalone validation");
+        assert!(open_lattice_body.contains("self.load_lattice_cpu()?"));
+        let cpu_loader = provider_api
+            .split_once("pub fn load_lattice_cpu(")
+            .map(|(_, body)| body)
+            .expect("the selected provider exposes its CPU loader");
+        let cpu_loader_body = cpu_loader
+            .split_once("\n    /// Open the selected route")
+            .map(|(body, _)| body)
+            .expect("the CPU loader body ends before the lattice route opener");
+        assert!(cpu_loader_body.contains("self.provider.load_lattice_cpu(&self.evidence)"));
         let provider = include_str!("../../serving_provider/providers/qwen/cpu.rs");
         let loader = provider
             .split_once("pub(super) fn load(")
