@@ -135,7 +135,17 @@ pub(in crate::serving_provider) fn qwen_standalone_factory(
 ) -> Result<ServingFactory, String> {
     let config = Qwen35Config::from_model_dir(&evidence.directory)
         .map_err(|error| format!("config.json load failed: {error}"))?;
-    let mut vision_runtime = VisionRuntime::from_model_config(evidence.directory.clone(), &config);
+    qwen_standalone_factory_with_config(evidence, &config, options, qwen_loader)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn qwen_standalone_factory_with_config(
+    evidence: CheckpointEvidence,
+    config: &Qwen35Config,
+    options: StandaloneLoadOptions,
+    qwen_loader: StandaloneQwenLoader,
+) -> Result<ServingFactory, String> {
+    let mut vision_runtime = VisionRuntime::from_model_config(evidence.directory.clone(), config);
     if options.preload_vision
         && let Err(error) = vision_runtime.preload()
     {
@@ -155,8 +165,19 @@ pub(in crate::serving_provider) fn qwen_standalone_plan(
 ) -> Result<StandaloneLoadPlan, String> {
     let vocabulary_model_dir = evidence.directory.clone();
     let vocabulary_tokenizer_path = options.tokenizer_path.clone();
-    let factory = qwen_standalone_factory(evidence, options, worker::standalone_loader())?;
+    let config = Qwen35Config::from_model_dir(&evidence.directory)
+        .map_err(|error| format!("config.json load failed: {error}"))?;
+    let (served_context, context_source) = worker::resolve_serve_context(
+        worker::model_context_from_config(Some(&config)),
+        options.max_context,
+    );
+    let factory = qwen_standalone_factory_with_config(
+        evidence,
+        &config,
+        options,
+        worker::standalone_loader(served_context),
+    )?;
     let post_ready =
         worker::vocabulary_after_ready(vocabulary_tokenizer_path, vocabulary_model_dir);
-    Ok(StandaloneLoadPlan::new(factory, post_ready))
+    Ok(StandaloneLoadPlan::new(factory, post_ready).with_context_source(context_source))
 }
