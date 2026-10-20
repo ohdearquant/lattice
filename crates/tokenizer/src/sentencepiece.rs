@@ -4,11 +4,11 @@
 //! `tokenizer.model` protobuf payloads, builds a byte trie over pieces, and
 //! performs Viterbi decoding with optional byte fallback.
 
-use crate::error::InferenceError;
-use crate::tokenizer::common::{
+use crate::common::{
     JsonValue, ThreadSafeLruCache, TokenizedInput, Tokenizer, json_path, known_special_id, pad_ids,
     parse_added_tokens, parse_json, parse_post_processor_flags, push_eos_preserving_limit,
 };
+use lattice_inference_core::InferenceError;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

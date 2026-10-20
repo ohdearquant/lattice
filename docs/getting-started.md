@@ -175,7 +175,7 @@ a MiniLM model, fetches `tokenizer.json` rather than `vocab.txt`. Nothing preven
 being present in a model directory (e.g. if placed there manually). When both exist, the loader
 probes `tokenizer.json` first and returns as soon as the JSON declares a recognized tokenizer model
 type, falling through to `vocab.txt`/legacy files only when the JSON declares no model type
-(`crates/inference/src/tokenizer/common.rs`). Tokenizer kind is auto-detected from the file's
+(`crates/tokenizer/src/common.rs`). Tokenizer kind is auto-detected from the file's
 contents when `tokenizer.json` is used; when the loader falls through to legacy files, kind is
 selected by which files are present instead, checked in this order: `vocab.json` + `merges.txt`
 or `vocab.txt` + `merges.txt` → BPE, `vocab.txt` when neither merge-file BPE condition matched →

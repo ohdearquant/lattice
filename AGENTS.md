@@ -92,14 +92,19 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ## Crate Structure
 
 ```
-fann (7.7K)   transport (5.4K)                    ← leaf, zero internal deps
-    |
-inference (~118K)                                 ← optional dep on fann (`mixture` feature)
-    |
+fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
+                                       |
+                                 tokenizer (8K)   ← depends on inference-core
+    |                                  |
+inference (~118K)                                 ← depends on inference-core + tokenizer;
+    |                                               optional dep on fann (`mixture` feature)
 embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
 ```
 
-Three of those four edges are feature-gated, and the gates do not all default the
+`inference-core` (the shared `InferenceError`) and `tokenizer` were split out of
+`inference`; both edges into them are unconditional, and `inference` re-exports their
+public items at the paths they had before the split. Of the four edges among the
+other crates, three are feature-gated, and the gates do not all default the
 same way, so "depends on" in the diagram is not one relationship. `tune` depends on
 `fann` unconditionally. The other three are optional deps: `embed` to `inference` is
 enabled through `native`, which is in embed's default set, so it is present in an
@@ -110,12 +115,29 @@ default set. A default `cargo build -p lattice-tune` therefore does not compile
 that is the whole of its reach. Check the manifest before assuming an edge is live in
 the build you are looking at.
 
+### lattice-inference-core — Shared base types
+
+| Module     | Purpose                  | Key Exports      |
+| ---------- | ------------------------ | ---------------- |
+| `error.rs` | Error type across crates | `InferenceError` |
+
+### lattice-tokenizer — Pure Rust tokenizers
+
+| Module             | Purpose                     | Key Exports                                           |
+| ------------------ | --------------------------- | ----------------------------------------------------- |
+| `common.rs`        | Trait, loader, shared types | `Tokenizer` trait, `load_tokenizer`, `TokenizedInput` |
+| `wordpiece.rs`     | BERT-style WordPiece        | `WordPieceTokenizer`                                  |
+| `sentencepiece.rs` | SentencePiece               | `SentencePieceTokenizer`                              |
+| `bpe.rs`           | Qwen-style byte-level BPE   | `BpeTokenizer`                                        |
+| `gemma_bpe.rs`     | Gemma BPE                   | `GemmaBpeTokenizer`                                   |
+| `detokenize.rs`    | Incremental detokenization  | used by the engine through `lattice-inference`        |
+
 ### lattice-inference — Transformer kernel
 
 | Module           | Purpose                      | Key Exports                                                                       |
 | ---------------- | ---------------------------- | --------------------------------------------------------------------------------- |
 | `model/`         | Model configs and loaders    | `BertConfig`, `BertModel`, `QwenConfig`, `QwenModel`, `CrossEncoderModel`         |
-| `tokenizer/`     | Pure Rust tokenizers         | `Tokenizer` trait, `WordPieceTokenizer`, `SentencePieceTokenizer`, `BpeTokenizer` |
+| `tokenizer/`     | Re-exports lattice-tokenizer | `Tokenizer` trait, `WordPieceTokenizer`, `SentencePieceTokenizer`, `BpeTokenizer` |
 | `weights/`       | Weight storage formats       | `F32Weights`, `F16Weights`, `Q8Weights`, `Q4Weights`                              |
 | `attention/`     | Attention mechanisms         | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
 | `forward/`       | Compute backends             | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
@@ -231,9 +253,9 @@ GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Ru
 
 ### Bench-Compare Disposition
 
-Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include a
-bench-compare disposition in its description. By default, run `make bench-compare` and paste its
-A/B table into the PR body. If the result shows no change, state that as the disposition.
+Every PR that touches `crates/inference/`, `crates/inference-core/`, `crates/tokenizer/`,
+`crates/embed/`, or `crates/fann/` must include a bench-compare disposition in its description.
+By default, run `make bench-compare` and paste its A/B table into the PR body. If the result shows no change, state that as the disposition.
 `crates/fann/` is covered both because it feeds inference through the optional `mixture` feature
 and because it declares its own bench target (`router_online`).
 

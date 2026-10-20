@@ -22,7 +22,10 @@ use crate::model::qwen35_config::{Qwen35Config, decode_cap};
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::common::Tokenizer;
-use crate::tokenizer::detokenize::{IncrementalDetokenizer, decode_tokens};
+use lattice_tokenizer::__internal::{
+    IncrementalDetokenizer, decode_tokens, incremental_detokenizer_finish,
+    incremental_detokenizer_new, incremental_detokenizer_push_into,
+};
 
 /// Adapts the streaming API's `should_cancel: impl FnMut() -> bool` (which may
 /// capture a `Receiver`-style handle and mutate on each poll) to
@@ -157,8 +160,8 @@ impl Qwen35Model {
             gen_cfg.enable_thinking,
             cfg.vocab_size,
         )?;
-        let reasoning_newline_boundary =
-            think_close_id.map(|_| self.tokenizer.newline_boundary_table());
+        let reasoning_newline_boundary = think_close_id
+            .map(|_| lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer));
 
         let mut session =
             QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
@@ -208,7 +211,7 @@ impl Qwen35Model {
                 result.trace,
             ))
         } else {
-            let mut detok = IncrementalDetokenizer::new();
+            let mut detok = incremental_detokenizer_new();
             let mut full = String::new();
             let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
@@ -222,7 +225,9 @@ impl Qwen35Model {
                 false,
                 &never_cancel,
                 |_generated_len| {},
-                |next_id, out| detok.push_into(&self.tokenizer, next_id, out),
+                |next_id, out| {
+                    incremental_detokenizer_push_into(&mut detok, &self.tokenizer, next_id, out)
+                },
                 &mut full,
                 &mut token_logprob_end_offsets,
                 |_delta, _next_id| true,
@@ -479,8 +484,8 @@ impl Qwen35Model {
             gen_cfg.enable_thinking,
             cfg.vocab_size,
         )?;
-        let reasoning_newline_boundary =
-            think_close_id.map(|_| self.tokenizer.newline_boundary_table());
+        let reasoning_newline_boundary = think_close_id
+            .map(|_| lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer));
 
         let mut session =
             QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
@@ -502,7 +507,7 @@ impl Qwen35Model {
         // calls them strictly sequentially, single-threaded), so the runtime borrow
         // check never conflicts.
         let on_raw_event_cell = std::cell::RefCell::new(on_raw_event);
-        let detok_cell = std::cell::RefCell::new(IncrementalDetokenizer::new());
+        let detok_cell = std::cell::RefCell::new(incremental_detokenizer_new());
         let mut text = String::new();
         let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
@@ -528,9 +533,12 @@ impl Qwen35Model {
                 });
             },
             |next_id, out| {
-                detok_cell
-                    .borrow_mut()
-                    .push_into(&self.tokenizer, next_id, out)
+                incremental_detokenizer_push_into(
+                    &mut detok_cell.borrow_mut(),
+                    &self.tokenizer,
+                    next_id,
+                    out,
+                )
             },
             &mut text,
             &mut token_logprob_end_offsets,
@@ -545,7 +553,7 @@ impl Qwen35Model {
                 #[cfg(test)]
                 test_record_first_sample_entry();
             },
-            || detok_cell.borrow_mut().finish(),
+            || incremental_detokenizer_finish(&mut detok_cell.borrow_mut()),
         )?;
 
         Ok((
@@ -662,7 +670,7 @@ fn finish_detokenizer(
     detok: &mut IncrementalDetokenizer,
     confirmed_stop_string_match: bool,
 ) -> Option<String> {
-    (!confirmed_stop_string_match).then(|| detok.finish())
+    (!confirmed_stop_string_match).then(|| incremental_detokenizer_finish(detok))
 }
 
 pub(crate) fn prefill_tokens(
@@ -848,7 +856,8 @@ pub(crate) fn resolve_reasoning_close_token(
     // reasoning block as open, spending the budget and forcing a second marker.
     // That is a silently unenforced budget reached by a different route, which
     // is the exact failure this resolver exists to refuse.
-    let ids = tokenizer.token_ids_for_content(REASONING_CLOSE_MARKER);
+    let ids =
+        lattice_tokenizer::__internal::token_ids_for_content(tokenizer, REASONING_CLOSE_MARKER);
     let token_id = match ids.as_slice() {
         [] => {
             return Err(InferenceError::InvalidInput(

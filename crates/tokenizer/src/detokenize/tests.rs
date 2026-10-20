@@ -1,5 +1,5 @@
 use super::*;
-use crate::tokenizer::bpe::BpeTokenizer;
+use crate::bpe::BpeTokenizer;
 use std::collections::HashMap;
 
 #[test]

@@ -1751,6 +1751,8 @@ dependencies = [
  "image",
  "indexmap",
  "lattice-fann",
+ "lattice-inference-core",
+ "lattice-tokenizer",
  "libc",
  "memmap2",
  "metal 0.33.0",
@@ -1776,6 +1778,19 @@ dependencies = [
  "tracing",
  "ureq 2.12.1",
  "wgpu 24.0.5",
+]
+
+[[package]]
+name = "lattice-inference-core"
+version = "0.14.0"
+
+[[package]]
+name = "lattice-tokenizer"
+version = "0.14.0"
+dependencies = [
+ "lattice-inference-core",
+ "rayon",
+ "tracing",
 ]
 
 [[package]]

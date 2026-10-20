@@ -3,9 +3,9 @@
 //! ADR-082 G17.
 //!
 //! This is an **additive, explicitly-selected** path — `GemmaBpeTokenizer`
-//! is never reached through [`crate::tokenizer::common::load_tokenizer`] or
-//! [`crate::tokenizer::common::tokenizer_from_json_str`]; callers construct
-//! it directly. The existing Qwen-oriented [`crate::tokenizer::BpeTokenizer`]
+//! is never reached through [`crate::common::load_tokenizer`] or
+//! [`crate::common::tokenizer_from_json_str`]; callers construct
+//! it directly. The existing Qwen-oriented [`crate::BpeTokenizer`]
 //! loader's `validate_bpe_pretokenizer` continues to reject Gemma's
 //! `tokenizer.json` (a literal-string `Split`, not a regex `Split`/
 //! `ByteLevel`), which proves this path is additive rather than a silent
@@ -33,12 +33,12 @@
 //!   in the target vocab, so once introduced they never re-merge.
 //! - `decoder`: `Sequence[Replace("▁" -> " "), ByteFallback, Fuse]`.
 
-use crate::error::InferenceError;
-use crate::tokenizer::bpe::parse_merges_json;
-use crate::tokenizer::common::{
+use crate::bpe::parse_merges_json;
+use crate::common::{
     JsonValue, TokenizedInput, Tokenizer, invert_vocab, json_object_to_vocab, json_path,
     known_special_id, pad_ids, parse_added_tokens, parse_json, parse_rendered_added_tokens,
 };
+use lattice_inference_core::InferenceError;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
@@ -52,7 +52,7 @@ const DEFAULT_MAX_SEQ_LEN: usize = 4_096;
 
 /// **Unstable**: additive Gemma-family byte-level BPE tokenizer; API evolving.
 /// See the module docs for why this is a separate type from
-/// [`crate::tokenizer::BpeTokenizer`].
+/// [`crate::BpeTokenizer`].
 #[derive(Debug, Clone)]
 pub struct GemmaBpeTokenizer {
     inner: Arc<GemmaBpeInner>,
@@ -188,7 +188,7 @@ impl PartialOrd for MergeCandidate {
 impl GemmaBpeTokenizer {
     /// **Unstable**: load from a Hugging Face `tokenizer.json` file.
     /// Selected explicitly by the caller — never reached via
-    /// [`crate::tokenizer::common::load_tokenizer`]'s model-type sniffing.
+    /// [`crate::common::load_tokenizer`]'s model-type sniffing.
     pub fn from_tokenizer_json(path: &Path) -> Result<Self, InferenceError> {
         let text = fs::read_to_string(path).map_err(|e| {
             InferenceError::Tokenizer(format!("failed to read {}: {e}", path.display()))
@@ -446,7 +446,7 @@ impl GemmaBpeTokenizer {
     }
 
     /// Same rank-priority-queue merge algorithm as
-    /// [`crate::tokenizer::bpe::BpeTokenizer::bpe_merge`], adapted to merge
+    /// [`crate::bpe::BpeTokenizer::bpe_merge`], adapted to merge
     /// pre-built symbol strings (chars or `<0xXX>` byte-fallback tokens)
     /// instead of `chars()` of a byte-remapped word — Gemma's vocab holds
     /// literal UTF-8 pieces, not GPT-2 byte-remapped ones, so a byte

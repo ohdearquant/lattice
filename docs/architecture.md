@@ -7,9 +7,16 @@ optimal transport — are written in Rust with hand-written SIMD kernels.
 ## Crate Dependency Graph
 
 ```
-lattice-inference   (standalone — transformer forward pass, weights, tokenizers)
+lattice-inference-core  (standalone — shared InferenceError)
 lattice-fann        (standalone — fast tiny neural nets, <5ms inference)
 lattice-transport   (standalone — optimal transport math, Sinkhorn-Knopp)
+       │
+       ▼
+lattice-tokenizer   ←── lattice-inference-core   (WordPiece, SentencePiece, BPE tokenizers)
+lattice-inference   ←── lattice-inference-core
+                    ←── lattice-tokenizer
+                    ←── lattice-fann (optional, `mixture` feature)
+                                     (transformer forward pass, weights)
        │
        ▼
 lattice-embed   ←── lattice-inference   (embedding service, SIMD distance ops)
@@ -17,8 +24,10 @@ lattice-tune    ←── lattice-fann
                 ←── lattice-inference   (training, LoRA, knowledge distillation)
 ```
 
-The three leaf crates (`inference`, `fann`, `transport`) have zero intra-workspace dependencies
-and can be used standalone. Consumer crates (`embed`, `tune`) compose them.
+The three leaf crates (`inference-core`, `fann`, `transport`) have zero intra-workspace
+dependencies and can be used standalone. `tokenizer` depends only on `inference-core`, and
+`inference` builds on both (plus `fann` under the optional `mixture` feature), re-exporting the
+tokenizer and error types at their original paths. Consumer crates (`embed`, `tune`) compose them.
 
 ## Design Philosophy
 

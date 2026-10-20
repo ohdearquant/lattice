@@ -248,7 +248,12 @@ pub(crate) fn build_vision_prompt_ids(
     inserted_ids.push(vision_start_token_id);
     inserted_ids.extend(std::iter::repeat_n(image_token_id, image_pad_count));
     inserted_ids.push(vision_end_token_id);
-    let ids = tokenizer.tokenize_fragments_with_inserted_ids(&before, &inserted_ids, &after);
+    let ids = lattice_tokenizer::__internal::tokenize_fragments_with_inserted_ids(
+        tokenizer,
+        &before,
+        &inserted_ids,
+        &after,
+    );
     if ids.iter().filter(|&&id| id == image_token_id).count() != image_pad_count {
         return Err(WorkerFailure::Rejected(ApiError::BadRequest {
             message: "message text must not contain the checkpoint's reserved image token"

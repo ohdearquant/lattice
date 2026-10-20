@@ -301,7 +301,10 @@ fn byte_level_token(byte_encoder: &[char], bytes: &[u8]) -> String {
 #[test]
 fn token_level_split_cjk_codepoint_decodes_without_mojibake() {
     use crate::tokenizer::bpe::BpeTokenizer;
-    use crate::tokenizer::detokenize::{IncrementalDetokenizer, bytes_to_unicode};
+    use lattice_tokenizer::__internal::bytes_to_unicode;
+    use lattice_tokenizer::__internal::{
+        incremental_detokenizer_new, incremental_detokenizer_push,
+    };
     use std::collections::HashMap;
 
     let byte_encoder = bytes_to_unicode();
@@ -311,13 +314,13 @@ fn token_level_split_cjk_codepoint_decodes_without_mojibake() {
     let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
         .expect("byte-level split-CJK vocab builds");
 
-    let mut detok = IncrementalDetokenizer::new();
-    let delta0 = detok.push(&tokenizer, 0);
+    let mut detok = incremental_detokenizer_new();
+    let delta0 = incremental_detokenizer_push(&mut detok, &tokenizer, 0);
     assert_eq!(
         delta0, "",
         "first 2 of 3 bytes of a CJK codepoint must buffer, not emit a replacement char"
     );
-    let delta1 = detok.push(&tokenizer, 1);
+    let delta1 = incremental_detokenizer_push(&mut detok, &tokenizer, 1);
     assert_eq!(
         delta1, "好",
         "the completing byte must reveal the exact codepoint, not mojibake"
@@ -332,7 +335,10 @@ fn token_level_split_cjk_codepoint_decodes_without_mojibake() {
 #[test]
 fn stop_streamer_matches_split_cjk_stop_string_no_dropped_tail() {
     use crate::tokenizer::bpe::BpeTokenizer;
-    use crate::tokenizer::detokenize::{IncrementalDetokenizer, bytes_to_unicode};
+    use lattice_tokenizer::__internal::bytes_to_unicode;
+    use lattice_tokenizer::__internal::{
+        incremental_detokenizer_new, incremental_detokenizer_push,
+    };
     use std::collections::HashMap;
 
     let byte_encoder = bytes_to_unicode();
@@ -345,13 +351,13 @@ fn stop_streamer_matches_split_cjk_stop_string_no_dropped_tail() {
         .expect("byte-level split-CJK vocab builds");
 
     let stops = vec!["好".to_string()];
-    let mut detok = IncrementalDetokenizer::new();
+    let mut detok = incremental_detokenizer_new();
     let mut streamer = StopStringMatcher::new(&stops);
     let mut emitted: Vec<String> = Vec::new();
 
     // Token stream: "hi", then the two split bytes of "好".
     for id in [2u32, 0, 1] {
-        let delta = detok.push(&tokenizer, id);
+        let delta = incremental_detokenizer_push(&mut detok, &tokenizer, id);
         let stopped = streamer.push(&delta, &mut |s| emitted.push(s.to_string()));
         if stopped {
             break;

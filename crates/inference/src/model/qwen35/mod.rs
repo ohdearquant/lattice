@@ -47,8 +47,8 @@ pub mod test_support;
 pub use model::Qwen35Model;
 pub use weights::ModelWeights;
 
-pub(crate) use crate::tokenizer::detokenize::decode_tokens;
 pub(crate) use cache::{ForwardScratch, KvCache, resize};
+pub(crate) use lattice_tokenizer::__internal::decode_tokens;
 // Re-exported so that quantized CPU generate helpers (cpu_q8, cpu_f16,
 // neon_forward) can share the same typed grammar-not-set guard without
 // duplicating the predicate or the error message (#397/#398).
@@ -93,7 +93,7 @@ pub(crate) use weights::{
 pub(crate) use weights::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert};
 
 #[cfg(test)]
-pub use crate::tokenizer::detokenize::bytes_to_unicode;
+pub use lattice_tokenizer::__internal::bytes_to_unicode;
 // Needed by all generate paths (cpu_q8, cpu_f16, neon_forward)
 // and by tests. `pub(crate)` keeps it out of the public API surface.
 pub(crate) use generation::should_stop_token;

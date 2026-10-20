@@ -87,7 +87,8 @@
 //!   (issue #931), so schema-constrained output is valid UTF-8 by construction and its
 //!   decoded string does re-validate.
 //!
-//! The other end of the seam is documented on `tokenizer::detokenize::decode_tokens`.
+//! The other end of the seam is documented on `decode_tokens` in the `lattice-tokenizer`
+//! crate (`crates/tokenizer/src/detokenize.rs`).
 //!
 //! # State machine encoding
 //!
