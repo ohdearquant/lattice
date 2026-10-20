@@ -2070,6 +2070,9 @@ mod canonical_schema_key_properties;
 mod v0_schema;
 
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod characterization;
+
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 #[tokio::test]
 async fn chat_completions_n_greater_than_one_400() {
     let body = Body::from(r#"{"messages":[{"role":"user","content":"hi"}],"n":2}"#.to_string());

@@ -1188,7 +1188,7 @@ jobs:
           grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$' "$log"
       # The standalone server's startup routing, Gemma refusals and unchanged
       # startup errors run against the shipped `lattice_serve` binary with stub
-      # model directories. The two real-checkpoint cases report
+      # model directories. The three real-checkpoint cases report
       # `LATTICE_SERVE_STANDALONE_SKIPPED` and pass when no checkpoint is
       # present on the runner; the exact count keeps a renamed or deleted test
       # from turning this step into a no-op.
@@ -1202,7 +1202,7 @@ jobs:
             exit 1
           fi
           cat "$log"
-          grep -Eq '^test result: ok\. 10 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          grep -Eq '^test result: ok\. 11 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: inference - serving startup error goldens (macOS only)
         if: runner.os == 'macOS'
         run: |
@@ -1213,7 +1213,7 @@ jobs:
             exit 1
           fi
           cat "$log"
-          grep -Eq '^test result: ok\. 61 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          grep -Eq '^test result: ok\. 64 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # These checkpoint targets are test = false, so --all-targets does not
       # compile them. Lint each target by name with the features it requires.
       - name: inference - serving checkpoint target lint (macOS only)
