@@ -88,7 +88,7 @@ async fn embedding_route_validates_input_before_unloaded_model() {
         request_json(None, json!({"input": ""})).await,
         StatusCode::BAD_REQUEST,
         error_body(
-            "input must not be empty",
+            "input[0] must not be empty",
             "invalid_request_error",
             "invalid_input",
         ),
@@ -211,7 +211,7 @@ async fn embedding_route_admission_follows_request_validation() {
         request_json(Some(embedding.clone()), json!({"input": ""})).await,
         StatusCode::BAD_REQUEST,
         error_body(
-            "input must not be empty",
+            "input[0] must not be empty",
             "invalid_request_error",
             "invalid_input",
         ),
