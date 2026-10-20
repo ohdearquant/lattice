@@ -95,9 +95,9 @@ macro_rules! tokenizer_name {
     };
 }
 
-pub use tokenizer::*;
 #[doc(inline)]
 pub use tokenizer::DEFAULT_TOKENIZER_NAME as TOKENIZER_NAME;
+pub use tokenizer::*;
 
 /// Implementation detail retained for engine callers.
 #[doc(hidden)]
