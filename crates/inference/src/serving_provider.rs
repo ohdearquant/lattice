@@ -606,7 +606,7 @@ pub(crate) fn select_with_registry<'a>(
             .iter()
             .filter_map(|provider| provider.generation()),
         |provider| provider.claims(&evidence),
-        |provider| provider.name(),
+        ServingProvider::name,
     ) {
         Ok(Some(provider)) => provider,
         Ok(None) => registry.legacy_generation,
@@ -662,7 +662,7 @@ fn select_pooled_with_registry<'a>(
             .iter()
             .filter_map(|provider| provider.pooled_embeddings()),
         |provider| provider.claims(evidence),
-        |provider| provider.name(),
+        PooledEmbeddingProvider::name,
     ) {
         Ok(Some(provider)) => Ok(provider),
         Ok(None) => Ok(legacy),
