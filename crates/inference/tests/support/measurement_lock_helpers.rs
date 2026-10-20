@@ -678,3 +678,34 @@ fn metal_engine_session_isolation_test_holds_a_function_lifetime_lock() {
         "test_metal_qwen35_engine_session_isolation",
     );
 }
+
+/// Library modules that hold a binary's own production model loader.
+///
+/// The library target is scanned for test functions only, so a loader moved out
+/// of a binary into the library would leave the construction inventory. Each
+/// row adds the module as an extra root of that binary's scan; the binary's
+/// own source stays scanned.
+const BIN_LIBRARY_LOADER_ROOTS: &[(&str, &str, &str)] = &[(
+    "bin",
+    "lattice_serve",
+    "src/serving_provider/providers/qwen/worker.rs",
+)];
+
+/// The parsed sources the construction scan reads for one Cargo target.
+pub(super) fn construction_scan_sources(
+    manifest_dir: &Path,
+    target: &CargoTargetRoot,
+) -> Vec<ParsedModuleSource> {
+    let test_cfg = matches!(target.kind.as_str(), "test" | "lib");
+    let mut sources = parsed_module_closure(manifest_dir, &target.path, test_cfg)
+        .unwrap_or_else(|reason| panic!("{reason}"));
+    for (kind, name, root) in BIN_LIBRARY_LOADER_ROOTS {
+        if target.kind == *kind && target.name == *name {
+            sources.extend(
+                parsed_module_closure(manifest_dir, Path::new(root), false)
+                    .unwrap_or_else(|reason| panic!("{reason}")),
+            );
+        }
+    }
+    sources
+}

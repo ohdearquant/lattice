@@ -11,7 +11,8 @@ use crate::serving_factory::ServingFactory;
 use crate::serving_provider::{CheckpointEvidence, ServingEntry, ServingProvider};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_provider::{
-    StandaloneLoadOptions, StandaloneOptionPresence, StandaloneQwenLoader,
+    StandaloneLoadOptions, StandaloneLoadPlan, StandaloneOptionPresence, StandalonePostReady,
+    StandaloneQwenLoader, StandaloneStartupDescription,
 };
 use std::path::Path;
 
@@ -104,6 +105,32 @@ impl ServingProvider for GemmaProvider {
             Ok(ServingFactory::gemma_cpu(evidence.directory))
         } else {
             super::qwen::qwen_standalone_factory(evidence, options, qwen_loader)
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_startup_description(
+        &self,
+        format: ModelFormat,
+        route: Option<ServedRoute>,
+    ) -> StandaloneStartupDescription {
+        crate::serving_provider::standalone_startup_description(format, route)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn prepare_standalone_load(
+        &self,
+        evidence: CheckpointEvidence,
+        _route: Option<ServedRoute>,
+        options: StandaloneLoadOptions,
+    ) -> Result<StandaloneLoadPlan, String> {
+        if evidence.format == ModelFormat::Safetensors {
+            Ok(StandaloneLoadPlan::new(
+                ServingFactory::gemma_cpu(evidence.directory),
+                StandalonePostReady::new(|| Ok(std::sync::Arc::new(Vec::new()))),
+            ))
+        } else {
+            super::qwen::qwen_standalone_plan(evidence, options)
         }
     }
 }

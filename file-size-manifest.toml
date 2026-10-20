@@ -15,7 +15,7 @@ ceiling = 3016
 
 [[ratchet]]
 path = "crates/inference/src/bin/lattice_serve/main.rs"
-ceiling = 3890
+ceiling = 3703
 
 [[ratchet]]
 path = "crates/inference/src/forward/metal_qwen35.rs"
@@ -28,7 +28,7 @@ ceiling = 3311
 
 [[ratchet]]
 path = "crates/inference/tests/metal_measurement_lock_contract.rs"
-ceiling = 4989
+ceiling = 4984
 
 [[ratchet]]
 path = "scripts/bench_decode_harness.py"

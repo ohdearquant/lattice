@@ -1,6 +1,9 @@
 use super::*;
 use axum::body::to_bytes;
 use axum::http::header::CONTENT_TYPE;
+use lattice_inference::forward::metal_qwen35::MetalQwen35State;
+use lattice_inference::serve::metal_worker::{StartupError, WorkerMetadata};
+use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
 fn app_state_with_jobs(jobs: MetalWorkerClient, vocab_bytes: Arc<Vec<Vec<u8>>>) -> AppState {
     AppState {

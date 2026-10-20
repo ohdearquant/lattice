@@ -625,6 +625,25 @@ impl ServingProvider for TestProvider {
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_startup_description(
+        &self,
+        format: ModelFormat,
+        route: Option<ServedRoute>,
+    ) -> StandaloneStartupDescription {
+        super::standalone_startup_description(format, route)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn prepare_standalone_load(
+        &self,
+        _evidence: CheckpointEvidence,
+        _route: Option<ServedRoute>,
+        _options: StandaloneLoadOptions,
+    ) -> Result<StandaloneLoadPlan, String> {
+        Err("test provider does not build a standalone load plan".to_owned())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn standalone_factory(
         &self,
         _evidence: CheckpointEvidence,

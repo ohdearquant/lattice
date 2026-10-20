@@ -422,7 +422,6 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "src/bin/eval_perplexity.rs",
     "src/bin/gramperf_profile.rs",
     "src/bin/lattice/main.rs",
-    "src/bin/lattice_serve/main.rs",
     "src/bin/ppl_metal.rs",
 ];
 const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
@@ -453,6 +452,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "examples/load_cross_encoder.rs",
     "src/bin/bench_gemma4_driver_pair.rs",
     "src/bin/gramtime_profile.rs",
+    "src/bin/lattice_serve/main.rs",
     "src/bin/moe_admission_sim.rs",
     "src/bin/quantize_q4.rs",
     "src/bin/quantize_quarot.rs",
@@ -554,13 +554,13 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
         reason: "ModelBackend::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
-        site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/bin/lattice_serve/main.rs::imp::load_model::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/lattice_serve/main.rs:1899:47",
+        site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::from_q4_dir()#1",
+        recorded_position: "src/serving_provider/providers/qwen/worker.rs:51:43",
         reason: "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
-        site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/bin/lattice_serve/main.rs::imp::load_model::MetalQwen35State::new()#1",
-        recorded_position: "src/bin/lattice_serve/main.rs:1919:47",
+        site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::new()#1",
+        recorded_position: "src/serving_provider/providers/qwen/worker.rs:71:43",
         reason: "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
 ];
@@ -4803,12 +4803,7 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
             .expect("source under manifest directory")
             .to_string_lossy()
             .into_owned();
-        let sources = parsed_module_closure(
-            manifest_dir,
-            &target.path,
-            matches!(target.kind.as_str(), "test" | "lib"),
-        )
-        .unwrap_or_else(|reason| panic!("{reason}"));
+        let sources = measurement_lock_helpers::construction_scan_sources(manifest_dir, &target);
         let caller_owned = BENCH_HARNESSES
             .iter()
             .find(|contract| contract.path == target_relative && !contract.calls.is_empty());
