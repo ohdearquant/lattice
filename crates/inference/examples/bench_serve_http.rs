@@ -74,14 +74,25 @@
 //!                              shared decoder driver's counters, so a pattern
 //!                              such as `driver=shared` counts the requests
 //!                              that went through the driver
+//!   BENCH_EMBEDDING_MODEL      embedding checkpoint directory; when set the
+//!                              server is started with `--embedding-model DIR`
+//!                              and `POST /v1/embeddings` is measured with one
+//!                              text and with a batch of texts. `lattice serve`
+//!                              takes a pooled vision-language checkpoint there,
+//!                              `lattice_serve` a BERT-family text encoder
+//!   BENCH_CHAT                 `1` (default) measures the chat cases, `0`
+//!                              skips them; `0` needs BENCH_EMBEDDING_MODEL
 //!
 //! Output:
 //!   ROUTE binary=<path> binary_bytes=<n> binary_sha256=<hex> model_dir=<dir>
-//!     format=<safetensors|q4> family=<qwen35|gemma4>
+//!     format=<safetensors|q4> family=<qwen35|gemma4> embedding_model=<dir|none>
 //!   STARTUP startup_ms=<f>
 //!   RESULT case=<short|long> mode=<nonstream|stream> run=<n>
 //!     prompt_tokens=<n|na> completion_tokens=<n|na> deltas=<n|na>
 //!     first_event_ms=<f|na> first_delta_ms=<f|na> total_ms=<f> finish=<reason>
+//!   RESULT case=<embed_one|embed_batch> mode=embedding run=<n> items=<n>
+//!     dimensions=<n> prompt_tokens=<n> total_ms=<f>
+//!                          (only with BENCH_EMBEDDING_MODEL)
 //!   MARKER pattern=<p> count=<n> requests=<n>   (only with BENCH_STDERR_MARKER)
 //!   SERVER_STDERR <line>
 //!   SKIP reason=<...>      (exit status 2: nothing was measured)
@@ -131,6 +142,9 @@ const SERVER_FINISH_REASONS: [&str; 2] = ["stop", "length"];
 const SHORT_PROMPT: &str = "Name three primary colors and say which one you like best.";
 const LONG_PARAGRAPH: &str = "The quick brown fox jumps over the lazy dog while the river keeps running past the old stone bridge.";
 const LONG_QUESTION: &str = "Summarize the passage above in one sentence.";
+const EMBED_BATCH_ITEMS: usize = 8;
+const EMBED_TEXT: &str =
+    "A short passage about rivers, bridges and the towns that grew beside them.";
 
 #[derive(Debug)]
 enum Refusal {
@@ -173,6 +187,7 @@ enum Refusal {
     StreamUnfinished,
     DataAfterDone,
     UnterminatedEvent,
+    EmbeddingShape(String),
 }
 
 impl Refusal {
@@ -243,6 +258,7 @@ impl std::fmt::Display for Refusal {
             Self::StreamUnfinished => write!(f, "stream_without_finish_reason_or_done"),
             Self::DataAfterDone => write!(f, "stream_event_after_done"),
             Self::UnterminatedEvent => write!(f, "stream_ended_inside_an_event"),
+            Self::EmbeddingShape(why) => write!(f, "embedding_response {why}"),
         }
     }
 }
@@ -256,6 +272,8 @@ struct Config {
     startup_timeout: Duration,
     request_timeout: Duration,
     marker: Option<String>,
+    embedding_model: Option<PathBuf>,
+    chat: bool,
 }
 
 fn positive(
@@ -308,6 +326,29 @@ impl Config {
             }
             Some(pattern) => Some(pattern),
         };
+        let embedding_model = match lookup("BENCH_EMBEDDING_MODEL") {
+            None => None,
+            Some(dir) if dir.is_empty() => {
+                return Err(Refusal::BadConfig(
+                    "BENCH_EMBEDDING_MODEL must not be empty".to_string(),
+                ));
+            }
+            Some(dir) => Some(PathBuf::from(dir)),
+        };
+        let chat = match lookup("BENCH_CHAT").as_deref() {
+            None | Some("1") => true,
+            Some("0") => false,
+            Some(other) => {
+                return Err(Refusal::BadConfig(format!(
+                    "BENCH_CHAT={other:?} must be 0 or 1"
+                )));
+            }
+        };
+        if !chat && embedding_model.is_none() {
+            return Err(Refusal::BadConfig(
+                "BENCH_CHAT=0 measures nothing without BENCH_EMBEDDING_MODEL".to_string(),
+            ));
+        }
         Ok(Self {
             bin,
             model_dir,
@@ -325,6 +366,8 @@ impl Config {
                 900,
             )? as u64),
             marker,
+            embedding_model,
+            chat,
         })
     }
 }
@@ -561,6 +604,9 @@ fn serve_command(cfg: &Config, port: u16) -> Command {
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string());
+        if let Some(dir) = &cfg.embedding_model {
+            command.arg("--embedding-model").arg(dir);
+        }
         return command;
     }
     command
@@ -573,6 +619,9 @@ fn serve_command(cfg: &Config, port: u16) -> Command {
         .arg(port.to_string())
         .arg("--model-id")
         .arg(MODEL_ID);
+    if let Some(dir) = &cfg.embedding_model {
+        command.arg("--embedding-model").arg(dir);
+    }
     command
 }
 
@@ -818,10 +867,19 @@ impl Client {
     }
 
     fn post_chat(&self, body: &Value, deadline: Instant) -> Result<ureq::Response, Refusal> {
+        self.post_json("/v1/chat/completions", body, deadline)
+    }
+
+    fn post_json(
+        &self,
+        path: &str,
+        body: &Value,
+        deadline: Instant,
+    ) -> Result<ureq::Response, Refusal> {
         let bytes = serde_json::to_vec(body).map_err(|e| Refusal::MalformedBody(e.to_string()))?;
         match self
             .agent
-            .post(&format!("{}/v1/chat/completions", self.base))
+            .post(&format!("{}{path}", self.base))
             .set("content-type", "application/json")
             .send_bytes(&bytes)
         {
@@ -882,6 +940,16 @@ impl Client {
         Ok((certify_nonstream(&text, max_tokens)?, total_ms))
     }
 
+    fn run_embeddings(&self, body: &Value) -> Result<(EmbeddingStats, f64), Refusal> {
+        let start = Instant::now();
+        let deadline = self.deadline_from(start)?;
+        let items = requested_items(body)?;
+        let response = self.post_json("/v1/embeddings", body, deadline)?;
+        let text = self.read_body(response.into_reader(), deadline)?;
+        let total_ms = ms(start);
+        Ok((certify_embeddings(&text, items)?, total_ms))
+    }
+
     fn run_stream(&self, body: &Value) -> Result<(StreamStats, f64), Refusal> {
         let start = Instant::now();
         let deadline = self.deadline_from(start)?;
@@ -917,6 +985,121 @@ fn requested_max_tokens(body: &Value) -> Result<u64, Refusal> {
     body["max_tokens"].as_u64().ok_or_else(|| {
         Refusal::BadConfig("the request body carries no integer max_tokens".to_string())
     })
+}
+
+#[derive(Debug, PartialEq)]
+struct EmbeddingStats {
+    dimensions: usize,
+    prompt_tokens: u64,
+}
+
+fn requested_items(body: &Value) -> Result<usize, Refusal> {
+    body["input"]
+        .as_array()
+        .map(Vec::len)
+        .filter(|&items| items > 0)
+        .ok_or_else(|| {
+            Refusal::BadConfig(
+                "the embeddings request carries no non-empty input array".to_string(),
+            )
+        })
+}
+
+/// Certifies a `/v1/embeddings` body: one finite, non-empty vector per input,
+/// in input order, all of one width, and a positive `usage.prompt_tokens`.
+fn certify_embeddings(body: &str, items: usize) -> Result<EmbeddingStats, Refusal> {
+    let value: Value =
+        serde_json::from_str(body).map_err(|e| Refusal::MalformedBody(e.to_string()))?;
+    if let Some(error) = value.get("error") {
+        return Err(Refusal::ServerError(error.to_string()));
+    }
+    let data = value["data"]
+        .as_array()
+        .ok_or_else(|| Refusal::EmbeddingShape("data is missing or not an array".to_string()))?;
+    if data.len() != items {
+        return Err(Refusal::EmbeddingShape(format!(
+            "data has {} entries for {items} inputs",
+            data.len()
+        )));
+    }
+    let mut dimensions = None;
+    for (position, entry) in data.iter().enumerate() {
+        if entry["index"].as_u64() != Some(position as u64) {
+            return Err(Refusal::EmbeddingShape(format!(
+                "data[{position}].index is {}",
+                entry["index"]
+            )));
+        }
+        let vector = entry["embedding"].as_array().ok_or_else(|| {
+            Refusal::EmbeddingShape(format!("data[{position}].embedding is not an array"))
+        })?;
+        if vector.is_empty() {
+            return Err(Refusal::EmbeddingShape(format!(
+                "data[{position}].embedding is empty"
+            )));
+        }
+        if !vector
+            .iter()
+            .all(|x| x.as_f64().is_some_and(f64::is_finite))
+        {
+            return Err(Refusal::EmbeddingShape(format!(
+                "data[{position}].embedding holds a value that is not a finite number"
+            )));
+        }
+        match dimensions {
+            None => dimensions = Some(vector.len()),
+            Some(width) if width != vector.len() => {
+                return Err(Refusal::EmbeddingShape(format!(
+                    "data[{position}].embedding has {} values, data[0] has {width}",
+                    vector.len()
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    let prompt_tokens = value["usage"]["prompt_tokens"].as_u64().ok_or_else(|| {
+        Refusal::MalformedBody("usage.prompt_tokens is missing or not an integer".to_string())
+    })?;
+    if prompt_tokens == 0 {
+        return Err(Refusal::EmbeddingShape(
+            "usage.prompt_tokens is zero".to_string(),
+        ));
+    }
+    Ok(EmbeddingStats {
+        dimensions: dimensions.unwrap_or_default(),
+        prompt_tokens,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum EmbedCase {
+    One,
+    Batch,
+}
+
+impl EmbedCase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::One => "embed_one",
+            Self::Batch => "embed_batch",
+        }
+    }
+
+    fn items(self) -> usize {
+        match self {
+            Self::One => 1,
+            Self::Batch => EMBED_BATCH_ITEMS,
+        }
+    }
+}
+
+/// No `model` field: the standalone server refuses a name that is not its
+/// embedding model's, and `lattice serve` ignores the field.
+fn embeddings_body(case: EmbedCase, run: usize) -> Value {
+    let input: Vec<String> = (0..case.items())
+        .map(|item| format!("Request {run} item {item}. {EMBED_TEXT}"))
+        .collect();
+    json!({ "input": input })
 }
 
 #[derive(Clone, Copy)]
@@ -968,6 +1151,41 @@ struct Progress {
 
 fn measure(client: &Client, cfg: &Config, progress: &mut Progress) -> Result<(), Refusal> {
     client.check_health()?;
+    if cfg.chat {
+        measure_chat(client, cfg, progress)?;
+    }
+    if cfg.embedding_model.is_some() {
+        measure_embeddings(client, cfg, progress)?;
+    }
+    Ok(())
+}
+
+fn measure_embeddings(
+    client: &Client,
+    cfg: &Config,
+    progress: &mut Progress,
+) -> Result<(), Refusal> {
+    for case in [EmbedCase::One, EmbedCase::Batch] {
+        for run in 0..=cfg.runs {
+            let body = embeddings_body(case, run);
+            progress.requests += 1;
+            let (stats, total_ms) = client.run_embeddings(&body)?;
+            if run > 0 {
+                println!(
+                    "RESULT case={} mode=embedding run={run} items={} dimensions={} \
+                     prompt_tokens={} total_ms={total_ms:.1}",
+                    case.name(),
+                    case.items(),
+                    stats.dimensions,
+                    stats.prompt_tokens
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn measure_chat(client: &Client, cfg: &Config, progress: &mut Progress) -> Result<(), Refusal> {
     for case in [Case::Short, Case::Long] {
         for stream in [false, true] {
             let mode = if stream { "stream" } else { "nonstream" };
@@ -1026,14 +1244,25 @@ fn run(cfg: &Config) -> Result<(), Refusal> {
             format_name(format)
         )));
     }
+    if let Some(dir) = &cfg.embedding_model
+        && !dir.is_dir()
+    {
+        return Err(Refusal::ModelAbsent(format!(
+            "embedding_model={}",
+            dir.display()
+        )));
+    }
     let (binary_bytes, binary_sha256) = binary_identity(&cfg.bin)?;
     println!(
         "ROUTE binary={} binary_bytes={binary_bytes} binary_sha256={binary_sha256} \
-         model_dir={} format={} family={}",
+         model_dir={} format={} family={} embedding_model={}",
         cfg.bin.display(),
         cfg.model_dir.display(),
         format_name(format),
-        detect_family(&cfg.model_dir).name()
+        detect_family(&cfg.model_dir).name(),
+        cfg.embedding_model
+            .as_deref()
+            .map_or_else(|| "none".to_string(), |dir| dir.display().to_string())
     );
     let port = free_loopback_port()?;
     let addr = format!("127.0.0.1:{port}");
@@ -1092,6 +1321,8 @@ mod tests {
             startup_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
             marker: None,
+            embedding_model: None,
+            chat: true,
         }
     }
 
@@ -1784,6 +2015,174 @@ mod tests {
         ];
         assert_eq!(count_marker_lines(&lines, "[M]"), 2);
         assert_eq!(count_marker_lines(&lines, "[X]"), 0);
+    }
+
+    fn embeddings_reply(vectors: &[Vec<f64>], prompt_tokens: u64) -> String {
+        let data: Vec<Value> = vectors
+            .iter()
+            .enumerate()
+            .map(|(index, vector)| json!({"object": "embedding", "index": index, "embedding": vector}))
+            .collect();
+        json!({
+            "object": "list",
+            "data": data,
+            "model": "m",
+            "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn embeddings_body_carries_one_input_per_item_and_no_model() {
+        for (case, items) in [(EmbedCase::One, 1), (EmbedCase::Batch, EMBED_BATCH_ITEMS)] {
+            let body = embeddings_body(case, 3);
+            assert!(body.get("model").is_none(), "{}", case.name());
+            assert_eq!(requested_items(&body).unwrap(), items, "{}", case.name());
+            let first = body["input"][0].as_str().unwrap();
+            assert!(first.starts_with("Request 3 item 0."), "{first}");
+        }
+        assert!(matches!(
+            requested_items(&json!({"input": []})),
+            Err(Refusal::BadConfig(_))
+        ));
+        assert!(matches!(
+            requested_items(&json!({"input": "one"})),
+            Err(Refusal::BadConfig(_))
+        ));
+    }
+
+    #[test]
+    fn a_well_formed_embeddings_reply_is_certified() {
+        let reply = embeddings_reply(&[vec![0.5, -0.25, 1.0], vec![0.0, 0.1, 0.2]], 17);
+        assert_eq!(
+            certify_embeddings(&reply, 2).unwrap(),
+            EmbeddingStats {
+                dimensions: 3,
+                prompt_tokens: 17
+            }
+        );
+    }
+
+    #[test]
+    fn embeddings_replies_that_measure_nothing_are_refused() {
+        let ok = vec![0.5, 0.25];
+        let cases: Vec<(&str, String, usize)> = vec![
+            ("too few entries", embeddings_reply(&[ok.clone()], 3), 2),
+            ("too many entries", embeddings_reply(&[ok.clone(), ok.clone()], 3), 1),
+            ("empty vector", embeddings_reply(&[vec![]], 3), 1),
+            ("ragged widths", embeddings_reply(&[ok.clone(), vec![0.5]], 3), 2),
+            ("zero prompt tokens", embeddings_reply(&[ok.clone()], 0), 1),
+            (
+                "out of order",
+                json!({"data": [
+                    {"index": 1, "embedding": [0.5]},
+                    {"index": 0, "embedding": [0.5]},
+                ], "usage": {"prompt_tokens": 2}})
+                .to_string(),
+                2,
+            ),
+            (
+                "non-number value",
+                json!({"data": [{"index": 0, "embedding": [0.5, "x"]}], "usage": {"prompt_tokens": 2}})
+                    .to_string(),
+                1,
+            ),
+            ("no data", json!({"usage": {"prompt_tokens": 2}}).to_string(), 1),
+        ];
+        for (name, reply, items) in cases {
+            assert!(
+                matches!(
+                    certify_embeddings(&reply, items),
+                    Err(Refusal::EmbeddingShape(_))
+                ),
+                "{name} must be refused as an embedding shape"
+            );
+        }
+        let no_usage = json!({"data": [{"index": 0, "embedding": [0.5]}]}).to_string();
+        assert!(matches!(
+            certify_embeddings(&no_usage, 1),
+            Err(Refusal::MalformedBody(_))
+        ));
+        let error = json!({"error": {"message": "boom"}}).to_string();
+        assert!(matches!(
+            certify_embeddings(&error, 1),
+            Err(Refusal::ServerError(_))
+        ));
+        assert!(matches!(
+            certify_embeddings("not json", 1),
+            Err(Refusal::MalformedBody(_))
+        ));
+        assert_eq!(
+            Refusal::EmbeddingShape("x".to_string()).exit_code(),
+            1,
+            "a bad embeddings reply is a refusal, never a skip"
+        );
+    }
+
+    #[test]
+    fn both_binaries_pass_the_embedding_model_when_one_is_named() {
+        for (bin, subcommand) in [("/x/lattice", true), ("/x/release/lattice_serve", false)] {
+            let mut cfg = test_config(PathBuf::from(bin), PathBuf::from("/m/qwen"));
+            assert!(
+                !args_of(&serve_command(&cfg, 4000)).contains(&"--embedding-model".to_string()),
+                "{bin}"
+            );
+            cfg.embedding_model = Some(PathBuf::from("/m/embedder"));
+            let args = args_of(&serve_command(&cfg, 4000));
+            assert_eq!(
+                args.first().map(String::as_str) == Some("serve"),
+                subcommand,
+                "{bin}"
+            );
+            assert_eq!(
+                &args[args.len() - 2..],
+                ["--embedding-model", "/m/embedder"],
+                "{bin}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_reads_the_embedding_and_chat_switches() {
+        let base = [("BENCH_BIN", "/x/lattice"), ("HOME", "/h")];
+        let cfg = Config::from_lookup(&lookup_from(&base)).unwrap();
+        assert!(cfg.chat);
+        assert!(cfg.embedding_model.is_none());
+        let mut pairs = base.to_vec();
+        pairs.extend([
+            ("BENCH_EMBEDDING_MODEL", "/m/embedder"),
+            ("BENCH_CHAT", "0"),
+        ]);
+        let cfg = Config::from_lookup(&lookup_from(&pairs)).unwrap();
+        assert!(!cfg.chat);
+        assert_eq!(cfg.embedding_model, Some(PathBuf::from("/m/embedder")));
+        for extra in [
+            vec![("BENCH_CHAT", "0")],
+            vec![("BENCH_CHAT", "yes")],
+            vec![("BENCH_EMBEDDING_MODEL", "")],
+        ] {
+            let mut pairs = base.to_vec();
+            pairs.extend(extra.iter().copied());
+            assert!(
+                matches!(
+                    Config::from_lookup(&lookup_from(&pairs)),
+                    Err(Refusal::BadConfig(_))
+                ),
+                "{extra:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_embedding_checkpoint_is_a_skip() {
+        let scratch = tempfile::tempdir().unwrap();
+        let model = model_dir_with_weights();
+        let bin = fake_binary(scratch.path(), "lattice", "exit 0");
+        let mut cfg = test_config(bin, model.path().to_path_buf());
+        cfg.embedding_model = Some(scratch.path().join("no-such-embedder"));
+        let refusal = run(&cfg).unwrap_err();
+        assert!(matches!(refusal, Refusal::ModelAbsent(_)), "{refusal}");
+        assert_eq!(refusal.exit_code(), 2);
     }
 
     #[test]
