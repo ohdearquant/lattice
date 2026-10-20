@@ -2576,6 +2576,102 @@ mod tests {
         );
     }
 
+    /// Only a 200 certifies health. Any other status below 400 is refused
+    /// with that status and no body, so a reply that carries one does not
+    /// leak it into the report.
+    #[test]
+    fn http_health_reply_below_400_other_than_200_is_refused_without_its_body() {
+        let port = spawn_scripted_server(|stream| {
+            write!(
+                stream,
+                "HTTP/1.1 202 Accepted\r\ncontent-type: text/plain\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy"
+            )
+            .ok()
+        });
+        let outcome = client_for(port, Duration::from_secs(10)).check_health();
+        assert!(
+            matches!(&outcome, Err(Refusal::HttpStatus { status: 202, body }) if body.is_empty()),
+            "{outcome:?}"
+        );
+    }
+
+    /// A successful reply is read to its end however large it is: the
+    /// client's own string reader stops at 10 MB, which a long completion
+    /// can pass.
+    #[test]
+    fn http_success_body_past_the_client_string_cap_is_read_whole() {
+        let filler = "a".repeat(11 * 1024 * 1024);
+        let payload = json!({
+            "choices": [{"message": {"role": "assistant", "content": filler}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        })
+        .to_string();
+        assert!(payload.len() > 10 * 1024 * 1024);
+        let port = spawn_scripted_server(move |stream| {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                payload.len()
+            )
+            .ok()
+        });
+        let outcome = client_for(port, Duration::from_secs(30)).run_nonstream(&probe_body());
+        assert!(outcome.is_ok(), "{:?}", outcome.err());
+    }
+
+    const PROXY_CHILD_PORT: &str = "BENCH_SERVE_HTTP_PROXY_CHILD_PORT";
+
+    /// Proxy settings in the environment never reach the loopback server.
+    /// The check runs in a child process so the variables are set only there.
+    /// In the child, a client built with the library's default configuration
+    /// must fail through the dead proxy, which shows the variables were read.
+    #[test]
+    fn http_requests_ignore_proxy_settings_in_the_environment() {
+        if let Ok(port) = std::env::var(PROXY_CHILD_PORT) {
+            let port: u16 = port.parse().expect("child port");
+            client_for(port, Duration::from_secs(10))
+                .check_health()
+                .unwrap_or_else(|refusal| panic!("the harness client used the proxy: {refusal}"));
+            let through_env = ureq::Agent::new_with_defaults()
+                .get(&format!("http://127.0.0.1:{port}/health"))
+                .call();
+            assert!(
+                through_env.is_err(),
+                "a default client reached the server, so the proxy variables were not read"
+            );
+            return;
+        }
+        let port = spawn_scripted_server(|stream| {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .ok()
+        });
+        let dead_proxy = "http://127.0.0.1:9";
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "tests::http_requests_ignore_proxy_settings_in_the_environment",
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(PROXY_CHILD_PORT, port.to_string())
+            .env("ALL_PROXY", dead_proxy)
+            .env("HTTP_PROXY", dead_proxy)
+            .env("http_proxy", dead_proxy)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+            .expect("child test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn http_server_that_never_answers_is_refused_as_a_timeout() {
         let port = spawn_scripted_server(|_| {
