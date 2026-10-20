@@ -218,6 +218,11 @@ name = "serve_request_refusals"
 test = false
 required-features = ["f16", "metal-gpu", "serve"]
 
+[[test]]
+name = "serve_worker_live"
+test = false
+required-features = ["f16", "metal-gpu", "serve"]
+
 # These targets load real checkpoints, which take minutes each on the CPU.
 [[test]]
 name = "serve_cpu_isolation"

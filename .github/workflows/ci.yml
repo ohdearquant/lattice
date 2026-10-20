@@ -1220,6 +1220,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cargo clippy -p lattice-inference --test serve_request_refusals --features f16,metal-gpu,serve -- -D warnings
+          cargo clippy -p lattice-inference --test serve_worker_live --features f16,metal-gpu,serve -- -D warnings
           cargo clippy -p lattice-inference --test serve_cpu_isolation --features serve -- -D warnings
       # The metal-gpu surface was BUILT and linted above but never RUN, so Metal
       # correctness tests (e.g. the Q4 decode dispatch-geometry regression #384)
