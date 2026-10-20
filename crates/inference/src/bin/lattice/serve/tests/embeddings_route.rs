@@ -3,7 +3,7 @@ use axum::body::Body;
 use lattice_inference::serve::embeddings::test_support::{tiny_embedding_model, tiny_png_data_uri};
 use tower::ServiceExt as _;
 
-fn post_embeddings(body: serde_json::Value) -> axum::http::Request<Body> {
+pub(super) fn post_embeddings(body: serde_json::Value) -> axum::http::Request<Body> {
     axum::http::Request::builder()
         .method("POST")
         .uri("/v1/embeddings")
@@ -12,13 +12,13 @@ fn post_embeddings(body: serde_json::Value) -> axum::http::Request<Body> {
         .expect("request fixture must build")
 }
 
-fn state_with_embedder() -> AppState {
+pub(super) fn state_with_embedder() -> AppState {
     let mut state = tiny_state(64);
     state.embedding_model = Some(Arc::new(tiny_embedding_model()));
     state
 }
 
-async fn json_body(response: Response) -> serde_json::Value {
+pub(super) async fn json_body(response: Response) -> serde_json::Value {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body must be readable");

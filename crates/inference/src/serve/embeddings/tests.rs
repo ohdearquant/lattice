@@ -2,6 +2,8 @@ use super::*;
 use std::path::Path;
 use test_support::{tiny_embedding_model, tiny_png_data_uri};
 
+mod characterization;
+
 /// Tensor inventory a tiny f16-decoder + vision checkpoint must carry
 /// for [`open_qwen35_single_decoder_safetensors`],
 /// [`load_qwen35_vision_weights_from_safetensors`], and
