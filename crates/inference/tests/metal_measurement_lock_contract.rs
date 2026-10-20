@@ -550,7 +550,7 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     },
     ConstructionExemption {
         site: "bin:lattice:src/bin/lattice/main.rs=>src/serving_provider/providers/qwen/lattice_worker.rs::open::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/serving_provider/providers/qwen/lattice_worker.rs:65:29",
+        recorded_position: "src/serving_provider/providers/qwen/lattice_worker.rs:64:47",
         reason: "the Qwen lattice worker initializes a long-running server worker outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
