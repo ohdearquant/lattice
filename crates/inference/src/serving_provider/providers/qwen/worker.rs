@@ -148,7 +148,7 @@ fn load_model(
 }
 
 pub(crate) fn standalone_loader(requested_context: usize) -> StandaloneQwenLoader {
-    Box::new(|model_dir, tokenizer_path, format| {
+    Box::new(move |model_dir, tokenizer_path, format| {
         Box::new(move || {
             let LoadedModel {
                 metal,
