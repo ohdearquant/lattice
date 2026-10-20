@@ -304,16 +304,14 @@ mod inner {
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{
         AttentionWeights, GenerationEntryContract, GenerationPlan, GenerationPreparation,
-        ModelWeights, prepare_generation,
+        ModelWeights, REASONING_CLOSE_MARKER, prepare_generation,
     };
     use crate::model::qwen35_config::Qwen35Config;
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::vision::multimodal::Qwen35VisionRequest;
     use crate::weights::q4_weights::quantize_row_q4_0;
-    use lattice_tokenizer::__internal::{
-        incremental_detokenizer_finish, incremental_detokenizer_new, incremental_detokenizer_push,
-    };
+    use lattice_tokenizer::__internal::{self as tok, incremental_detokenizer_finish};
     use metal::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10509,7 +10507,7 @@ mod inner {
                 None
             } else {
                 Some((
-                    incremental_detokenizer_new(),
+                    tok::incremental_detokenizer_new(),
                     StopStringMatcher::new(&gen_cfg.stop_strings),
                 ))
             };
@@ -10522,7 +10520,7 @@ mod inner {
                 generated_ids.push(first_id);
                 all_ids.push(first_id);
                 if let Some((detok, matcher)) = stop_text_state.as_mut() {
-                    let delta = incremental_detokenizer_push(detok, tokenizer, first_id);
+                    let delta = tok::incremental_detokenizer_push(detok, tokenizer, first_id);
                     if matcher.push(&delta, &mut |_| {}) {
                         stopped = true;
                         stop_reason = StopReason::Eos;
@@ -10556,7 +10554,7 @@ mod inner {
                 all_ids.push(next_id);
 
                 if let Some((detok, matcher)) = stop_text_state.as_mut() {
-                    let delta = incremental_detokenizer_push(detok, tokenizer, next_id);
+                    let delta = tok::incremental_detokenizer_push(detok, tokenizer, next_id);
                     if matcher.push(&delta, &mut |_| {}) {
                         stopped = true;
                         stop_reason = StopReason::Eos;
@@ -10882,7 +10880,7 @@ mod inner {
                 None
             } else {
                 Some((
-                    incremental_detokenizer_new(),
+                    tok::incremental_detokenizer_new(),
                     StopStringMatcher::new(&gen_cfg.stop_strings),
                 ))
             };
@@ -10895,7 +10893,7 @@ mod inner {
                 generated_ids.push(first_id);
                 all_ids.push(first_id);
                 if let Some((detok, matcher)) = stop_text_state.as_mut() {
-                    let delta = incremental_detokenizer_push(detok, tokenizer, first_id);
+                    let delta = tok::incremental_detokenizer_push(detok, tokenizer, first_id);
                     if matcher.push(&delta, &mut |_| {}) {
                         stopped = true;
                         stop_reason = StopReason::Eos;
@@ -10970,7 +10968,7 @@ mod inner {
                 all_ids.push(next_id);
 
                 if let Some((detok, matcher)) = stop_text_state.as_mut() {
-                    let delta = incremental_detokenizer_push(detok, tokenizer, next_id);
+                    let delta = tok::incremental_detokenizer_push(detok, tokenizer, next_id);
                     if matcher.push(&delta, &mut |_| {}) {
                         stopped = true;
                         stop_reason = StopReason::Eos;
@@ -11607,7 +11605,7 @@ mod inner {
     }
 
     fn decode_tokens(tokenizer: &BpeTokenizer, ids: &[u32]) -> String {
-        lattice_tokenizer::__internal::decode_tokens(tokenizer, ids)
+        tok::decode_tokens(tokenizer, ids)
     }
 
     // -----------------------------------------------------------------------
@@ -13766,10 +13764,8 @@ mod inner {
             // one id in would hash them identically. Sorted because the added
             // -token walk is over a HashMap, and a cache key should not depend
             // on iteration order.
-            let mut close_marker_ids = lattice_tokenizer::__internal::token_ids_for_content(
-                tokenizer,
-                crate::model::qwen35::REASONING_CLOSE_MARKER,
-            );
+            let mut close_marker_ids =
+                tok::token_ids_for_content(tokenizer, REASONING_CLOSE_MARKER);
             close_marker_ids.sort_unstable();
             close_marker_ids.hash(&mut tok_hasher);
             let tokenizer_fingerprint = tok_hasher.finish();
