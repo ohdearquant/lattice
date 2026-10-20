@@ -135,7 +135,7 @@ mod imp {
     use tokio::sync::Semaphore;
     #[path = "state.rs"]
     mod state;
-    use state::{AppState, IntoServingHost};
+    pub(crate) use state::{AppState, IntoServingHost};
     /// Only used by the test module's raw job-channel helpers
     /// (`mpsc::UnboundedReceiver<WorkerMessage>` etc. -- see
     /// `lattice_inference::serve::metal_worker`'s `test-utils`-gated

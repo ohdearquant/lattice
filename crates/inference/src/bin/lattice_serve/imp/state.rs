@@ -4,11 +4,11 @@ use super::{EmbeddingState, GenerationDefaults, GrammarCache, ServeMetrics};
 use std::sync::Arc;
 
 #[cfg(all(test, feature = "test-utils"))]
-pub(super) type DefaultServingHost = MetalWorkerClient;
+pub(crate) type DefaultServingHost = MetalWorkerClient;
 #[cfg(not(all(test, feature = "test-utils")))]
-pub(super) type DefaultServingHost = lattice_inference::serving_host::ServingHandle;
+pub(crate) type DefaultServingHost = lattice_inference::serving_host::ServingHandle;
 
-pub(super) trait IntoServingHost: Clone + Send + Sync + 'static {
+pub(crate) trait IntoServingHost: Clone + Send + Sync + 'static {
     fn into_serving_host(self) -> lattice_inference::serving_host::ServingHandle;
 
     fn available_permits(&self) -> usize;
@@ -68,7 +68,7 @@ impl IntoServingHost for MetalWorkerClient {
 }
 
 #[derive(Clone)]
-pub(super) struct AppState<H = DefaultServingHost> {
+pub(crate) struct AppState<H = DefaultServingHost> {
     pub(super) jobs: H,
     pub(super) model_id: Arc<str>,
     pub(super) defaults: GenerationDefaults,
