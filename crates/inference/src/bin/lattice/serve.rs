@@ -12,8 +12,6 @@ use axum::{
     routing::{get, post},
 };
 use futures::StreamExt as _;
-#[cfg(feature = "metal-gpu")]
-use lattice_inference::Tokenizer;
 // The canonical ChatML renderer is CPU-available (#668): this binary's
 // CPU serve path renders normalized contract messages through the same
 // formatter core the Metal worker uses, with no bespoke template copy.
@@ -32,8 +30,6 @@ use lattice_inference::serve::into_engine_chat_messages;
 use lattice_inference::serve::prepare::PreparedChatRequest;
 #[cfg(test)]
 use lattice_inference::serve::prepare::prepare_chat_request;
-#[cfg(feature = "metal-gpu")]
-use lattice_inference::serve::prepare::prepare_chat_request_with_config;
 use lattice_inference::{GenerateOutput, TokenLogprob};
 use serde::Serialize;
 use serde_json::Value;
@@ -49,129 +45,22 @@ use tokio::sync::Semaphore;
 use lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES;
 
 // -----------------------------------------------------------------------
-// Model backend: CPU (safetensors) or Metal GPU (native Q4)
+// Startup handoff: shared CPU host or affine worker
 // -----------------------------------------------------------------------
 
-/// Handle to the shared Metal GPU worker thread
-/// (`lattice_inference::serve::metal_worker::MetalWorker`, issue #832:
-/// the single shared owner module that replaces this binary's prior
-/// private `MetalJob`/`MetalHandle` loop and `lattice_serve.rs`'s prior
-/// private `Job`/`spawn_worker`/`run_worker_loop` loop). Cheaply `Clone`
-/// (wraps a `MetalWorkerClient`, itself backed by an `mpsc` sender),
-/// `Send + Sync`, so it can live in `AppState` like the CPU
-/// `Arc<Qwen35Model>` does — only the underlying `MetalQwen35State`
-/// inside the shared worker thread is confined to that thread.
-///
-/// This still serializes ALL Metal generation onto one thread: two
-/// concurrent requests to a Q4-backed `lattice serve` run back-to-back,
-/// not in parallel. That is correct for a single-GPU local engine (the
-/// same default ollama uses) and is documented here rather than hidden
-/// behind an innocuous-looking channel send.
+/// Handle used while constructing the unified server's serving facade.
 #[cfg(feature = "metal-gpu")]
 #[derive(Clone)]
 pub struct MetalHandle {
     client: lattice_inference::serve::metal_worker::MetalWorkerClient,
 }
 
-#[cfg(feature = "metal-gpu")]
-impl MetalHandle {
-    fn supports_vision(&self) -> bool {
-        self.client.supports_vision()
-    }
-
-    /// Normalizes
-    /// [`lattice_inference::serve::metal_worker::WorkerEvent::Cancelled`]
-    /// (the job was skipped at dequeue time: the client's `cancel`
-    /// watch flag was already `true`, or this job's own event receiver
-    /// was already closed) into the exact empty, interrupted
-    /// `GenerateOutput` this binary's prior dequeue-cancellation reply
-    /// already produced (#832: preserves this binary's own pre-existing
-    /// observable shape — the shared `WorkerEvent::Cancelled` contract
-    /// itself was modeled on it; see the shared module's own doc
-    /// comment).
-    fn normalize_cancelled(
-        ev: lattice_inference::serve::metal_worker::WorkerEvent,
-    ) -> lattice_inference::serve::metal_worker::WorkerEvent {
-        use lattice_inference::serve::metal_worker::WorkerEvent;
-        match ev {
-            WorkerEvent::Cancelled => WorkerEvent::Complete(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: 0,
-                generated_tokens: 0,
-                stopped: false,
-                stop_reason: Some(lattice_inference::StopReason::Interrupt),
-                token_logprobs: vec![],
-            }),
-            other => other,
-        }
-    }
-
-    /// Drain an admitted job, forwarding deltas and preserving worker failures.
-    async fn drain(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<
-            lattice_inference::serve::metal_worker::WorkerEvent,
-        >,
-        mut first: Option<lattice_inference::serve::metal_worker::WorkerEvent>,
-        mut on_token: impl FnMut(&str) -> bool + Send + 'static,
-    ) -> Result<GenerateOutput, ApiError> {
-        use lattice_inference::serve::metal_worker::WorkerEvent;
-
-        let mut deliver_deltas = true;
-        loop {
-            let event = match first.take() {
-                Some(event) => Some(event),
-                None => rx.recv().await,
-            };
-            let Some(ev) = event else {
-                return Err(ApiError::Internal {
-                    message: "inference worker unavailable".to_string(),
-                });
-            };
-            match Self::normalize_cancelled(ev) {
-                WorkerEvent::Delta(delta) => {
-                    if deliver_deltas && !on_token(&delta) {
-                        deliver_deltas = false;
-                    }
-                }
-                WorkerEvent::Complete(output) => return Ok(output),
-                WorkerEvent::Rejected(api_err) => return Err(api_err),
-                WorkerEvent::Failed(message) | WorkerEvent::ConstraintBlocked(message) => {
-                    return Err(ApiError::Internal {
-                        message: format!("generation failed: {message}"),
-                    });
-                }
-                WorkerEvent::Cancelled => {
-                    unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
-                }
-                // Unrecognized future event kind: mirror the
-                // `Failed`/`ConstraintBlocked` arm above and fail the
-                // request with a generic internal error rather than
-                // guessing.
-                _ => {
-                    return Err(ApiError::Internal {
-                        message: "generation failed: unrecognized worker event".to_string(),
-                    });
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "metal-gpu")]
+#[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
 fn map_metal_generation_error(error: ApiError) -> ApiError {
-    match error {
-        error @ (ApiError::ServiceUnavailable { .. } | ApiError::BadRequest { .. }) => error,
-        other => {
-            eprintln!("generation error (metal): {other:?}");
-            ApiError::Internal {
-                message: "inference failed".to_string(),
-            }
-        }
-    }
+    lattice_inference::serving_host::map_worker_generation_error(error)
 }
 
-/// The loaded execution route used by the HTTP server.
+/// Startup result used to construct the HTTP serving facade.
 #[derive(Clone)]
 pub enum ModelBackend {
     Cpu(lattice_inference::serving_cpu_host::SharedCpuHandle),
@@ -184,97 +73,36 @@ pub enum ModelBackend {
 }
 
 impl ModelBackend {
-    /// Prepare the prompt and provider config together before worker submission.
-    fn prepare_chat_request(
-        &self,
-        req: &ChatCompletionRequest,
-        model_id: &str,
-        default_max_tokens: usize,
-        max_tokens_cap: usize,
-    ) -> Result<(PreparedChatRequest, lattice_inference::GenerateConfig), ApiError> {
-        #[cfg(not(feature = "metal-gpu"))]
-        {
-            let ModelBackend::Cpu(cpu) = self;
-            let prepared = cpu.prepare(req, model_id, default_max_tokens, max_tokens_cap)?;
-            Ok((prepared.prepared, prepared.config))
-        }
-        #[cfg(feature = "metal-gpu")]
-        {
-            match self {
-                ModelBackend::Cpu(cpu) => {
-                    let prepared =
-                        cpu.prepare(req, model_id, default_max_tokens, max_tokens_cap)?;
-                    Ok((prepared.prepared, prepared.config))
-                }
-                ModelBackend::Metal {
-                    handle,
-                    max_context,
-                    ..
-                } => {
-                    if let Some(preparation) = handle.client.preparation() {
-                        return preparation
-                            .prepare_lattice_with_config(
-                                req,
-                                model_id,
-                                default_max_tokens,
-                                max_tokens_cap,
-                                self.supports_vision(),
-                            )
-                            .map(|prepared| (prepared.prepared, prepared.config));
-                    }
-                    prepare_chat_request_with_config(
-                        req,
-                        model_id,
-                        default_max_tokens,
-                        max_tokens_cap,
-                        self.supports_vision(),
-                        |prompt| self.tokenize_len(prompt),
-                        || *max_context,
-                    )
-                    .map(|prepared| (prepared.prepared, prepared.config))
-                }
-            }
-        }
-    }
-
-    /// Tokenizer for this backend, used to render `logprobs` token ids
-    /// back into text/bytes (#585). `None` for Gemma, which refuses
-    /// `logprobs` before generation and so never renders any.
-    pub fn tokenizer(&self) -> Option<&lattice_inference::tokenizer::bpe::BpeTokenizer> {
+    /// Build the shared request facade after the startup route has loaded.
+    pub(super) fn into_serving_handle(
+        self,
+        generation_admission: Arc<Semaphore>,
+    ) -> lattice_inference::serving_host::ServingHandle {
         match self {
-            ModelBackend::Cpu(cpu) => cpu.preparation().tokenizer(),
+            Self::Cpu(cpu) => lattice_inference::serving_host::ServingHandle::shared_cpu(
+                cpu,
+                generation_admission,
+            ),
             #[cfg(feature = "metal-gpu")]
-            ModelBackend::Metal { tokenizer, .. } => Some(tokenizer),
-        }
-    }
-
-    /// Count input tokens with the tokenizer attached to this backend.
-    /// This fallback serves Metal workers without a preparation handle.
-    #[cfg(feature = "metal-gpu")]
-    fn tokenize_len(&self, text: &str) -> usize {
-        match self {
-            ModelBackend::Cpu(cpu) => cpu.preparation().tokenize_len(text),
-            ModelBackend::Metal { tokenizer, .. } => tokenizer.tokenize(text).pre_truncation_len,
-        }
-    }
-
-    /// Report image support for request preparation.
-    /// CPU routes reject images before generation begins.
-    #[cfg(feature = "metal-gpu")]
-    fn supports_vision(&self) -> bool {
-        match self {
-            ModelBackend::Cpu(_) => false,
-            ModelBackend::Metal { handle, .. } => handle.supports_vision(),
+            Self::Metal {
+                handle,
+                tokenizer,
+                max_context,
+            } => lattice_inference::serving_host::ServingHandle::affine_cli(
+                handle.client,
+                tokenizer,
+                max_context,
+            ),
         }
     }
 
     /// Load a native Q4 checkpoint on the shared Metal worker thread
     /// (`lattice_inference::serve::metal_worker::MetalWorker`, issue
     /// #832 — the same shared owner `lattice_serve.rs` uses) and return
-    /// the `ModelBackend::Metal` handle plus the resolved context
+    /// the startup handle plus the resolved context
     /// window, for `main()`'s `Command::Serve` startup sequence.
     #[cfg(feature = "metal-gpu")]
-    pub fn spawn_metal(
+    pub(super) fn spawn_metal(
         model_dir: std::path::PathBuf,
         tokenizer_dir: Option<std::path::PathBuf>,
         max_pending: usize,
@@ -423,11 +251,43 @@ pub fn episode_store() -> Arc<std::sync::Mutex<lattice_inference::router_episode
     ))
 }
 
+#[cfg(test)]
+pub type DefaultAppStateModel = ModelBackend;
+#[cfg(not(test))]
+pub type DefaultAppStateModel = lattice_inference::serving_host::ServingHandle;
+
+/// A construction-time model value converted to the serving facade at startup.
+pub(super) trait IntoServingHandle {
+    fn into_serving_handle(
+        self,
+        generation_admission: Arc<Semaphore>,
+    ) -> lattice_inference::serving_host::ServingHandle;
+}
+
+impl IntoServingHandle for lattice_inference::serving_host::ServingHandle {
+    fn into_serving_handle(
+        self,
+        _generation_admission: Arc<Semaphore>,
+    ) -> lattice_inference::serving_host::ServingHandle {
+        self
+    }
+}
+
+#[cfg(test)]
+impl IntoServingHandle for ModelBackend {
+    fn into_serving_handle(
+        self,
+        generation_admission: Arc<Semaphore>,
+    ) -> lattice_inference::serving_host::ServingHandle {
+        ModelBackend::into_serving_handle(self, generation_admission)
+    }
+}
+
 /// State shared across all request handlers via axum's `State` extractor.
 #[derive(Clone)]
-pub struct AppState {
-    /// The loaded model backend (CPU safetensors or Metal GPU Q4).
-    pub model: ModelBackend,
+pub struct AppState<M = DefaultAppStateModel> {
+    /// The shared execution and capability facade.
+    pub model: M,
     /// Default `max_tokens` value used when a request omits the field.
     /// Set from the `--max-tokens` CLI flag passed to `lattice serve`.
     pub default_max_tokens: usize,
@@ -460,11 +320,8 @@ pub struct AppState {
     /// (see [`CPU_GENERATION_MAX_CONCURRENT_JOBS`]). A resource guard, not a
     /// throughput setting: each admitted generation holds one serving runtime
     /// and its KV cache, and concurrent generations contend for the same CPU
-    /// cores. The Metal backend keeps its own pending-job cap, so this one is
-    /// inert when `model` is `ModelBackend::Metal`: the Metal arms never
-    /// acquire from it. Always constructed, for every backend, the way
-    /// [`AppState::embedding_admission`] is, so a handler can take a permit
-    /// without first proving which backend is loaded.
+    /// cores. The shared serving facade receives this same semaphore for CPU
+    /// generations while affine workers retain their own admission permits.
     pub cpu_generation_admission: Arc<Semaphore>,
     /// The router gate loaded at startup from `--router-state`, or `None` on a
     /// server with no router configured.
@@ -491,6 +348,40 @@ pub struct AppState {
     /// two states the feedback route answers identically.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub episodes: Arc<std::sync::Mutex<lattice_inference::router_episode::EpisodeStore>>,
+}
+
+impl<M: IntoServingHandle> AppState<M> {
+    fn into_serving_handle(self) -> AppState<lattice_inference::serving_host::ServingHandle> {
+        let Self {
+            model,
+            default_max_tokens,
+            max_tokens_cap,
+            model_id,
+            request_counter,
+            embedding_model,
+            embedding_admission,
+            cpu_generation_admission,
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            router_state,
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            episodes,
+        } = self;
+        let model = model.into_serving_handle(Arc::clone(&cpu_generation_admission));
+        AppState {
+            model,
+            default_max_tokens,
+            max_tokens_cap,
+            model_id,
+            request_counter,
+            embedding_model,
+            embedding_admission,
+            cpu_generation_admission,
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            router_state,
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            episodes,
+        }
+    }
 }
 
 /// See [`AppState::embedding_admission`]. Same cap `lattice_serve.rs` uses
@@ -538,29 +429,6 @@ fn try_acquire_embedding_slot(
 /// between concurrent generations. An operator with spare cores and memory can
 /// raise it.
 pub const CPU_GENERATION_MAX_CONCURRENT_JOBS: usize = 2;
-
-/// Acquires one CPU-generation admission slot for
-/// [`AppState::cpu_generation_admission`], mirroring
-/// [`try_acquire_embedding_slot`]. Synchronous and non-blocking: a full cap
-/// is rejected immediately, before any `spawn_blocking` work is submitted and
-/// before the streaming path builds an SSE response.
-///
-/// # Errors
-///
-/// Returns [`ApiError::ServiceUnavailable`] (`server_busy`) when the cap is
-/// already full.
-fn try_acquire_cpu_generation_slot(
-    admission: &Arc<Semaphore>,
-) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
-    admission
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::ServiceUnavailable {
-            message:
-                "too many concurrent CPU chat generations on /v1/chat/completions; retry shortly"
-                    .to_string(),
-        })
-}
 
 /// Runs one pooled-embedding job (`check_pooled_embedding_total_tokens` then
 /// `embed_items`) on the blocking thread pool with `permit` moved into the
@@ -1007,7 +875,9 @@ pub async fn root() -> Json<Value> {
 /// single loaded model, in the same shape `lattice_serve.rs` already
 /// served on its own daemon -- this binary had no equivalent route at
 /// all before this change.
-pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
+pub async fn list_models(
+    State(state): State<AppState<lattice_inference::serving_host::ServingHandle>>,
+) -> Json<Value> {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1073,7 +943,7 @@ fn validate_chat_request(
 /// `to_bytes` call below, so an invalid-MIME request never pays the
 /// buffering cost, mirroring `lattice_serve.rs`'s equivalent handler.
 pub async fn chat_completions(
-    State(state): State<AppState>,
+    State(state): State<AppState<lattice_inference::serving_host::ServingHandle>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
@@ -1125,8 +995,16 @@ pub async fn chat_completions(
 /// covered separately in `serve::contract`'s own tests and this
 /// binary's router-level tests.
 #[allow(clippy::field_reassign_with_default)]
-async fn chat_completions_with_request(
-    State(state): State<AppState>,
+async fn chat_completions_with_request<M: IntoServingHandle>(
+    State(state): State<AppState<M>>,
+    req: ChatCompletionRequest,
+) -> Result<Response, ApiError> {
+    chat_completions_with_serving_request(State(state.into_serving_handle()), req).await
+}
+
+#[allow(clippy::field_reassign_with_default)]
+async fn chat_completions_with_serving_request(
+    State(state): State<AppState<lattice_inference::serving_host::ServingHandle>>,
     req: ChatCompletionRequest,
 ) -> Result<Response, ApiError> {
     // Resolved ONCE here, upstream of every branch below, so the two submit
@@ -1153,7 +1031,7 @@ async fn chat_completions_with_request(
             ..
         },
         gen_cfg,
-    ) = state.model.prepare_chat_request(
+    ) = state.model.prepare_lattice_chat_request(
         &req,
         &state.model_id,
         state.default_max_tokens,
@@ -1161,6 +1039,8 @@ async fn chat_completions_with_request(
     )?;
     #[cfg(feature = "metal-gpu")]
     let explicitly_thinking = lattice_inference::serve::prepare::explicitly_enabled_thinking(&req)?;
+    #[cfg(not(feature = "metal-gpu"))]
+    let explicitly_thinking = false;
 
     // Metal-only: reuse the exact messages normalized alongside the CPU
     // prompt, so role/content validation and allocation happen once.
@@ -1231,14 +1111,16 @@ async fn chat_completions_with_request(
             }
         }
     };
-    // CPU-only builds never render `_normalized_messages` (the CPU
-    // closures below capture only `cpu_model`/`prompt`/`gen_cfg`) -- drop
-    // it here instead of letting it ride, unused, across the
-    // `spawn_blocking(...).await` that follows.
-    #[cfg(not(feature = "metal-gpu"))]
-    drop(_normalized_messages);
-
-    let model = state.model.clone();
+    let execution_request = lattice_inference::serving_host::LatticeExecutionRequest {
+        prompt,
+        config: gen_cfg,
+        #[cfg(feature = "metal-gpu")]
+        messages: Some(chat_messages),
+        #[cfg(not(feature = "metal-gpu"))]
+        messages: None,
+        selection: requested.selection().to_vec(),
+        explicitly_thinking,
+    };
 
     // Recorded here because this is the first moment both halves exist: the
     // id a judgement will name was minted before routing, and the routing
@@ -1324,10 +1206,8 @@ async fn chat_completions_with_request(
         let stream_id = response_id.clone();
         let stream_model = state.model_id.clone();
 
-        // Both backends funnel their result through this closure so the
-        // "generated_tokens > decode_token_budget invariant, then
-        // finish_reason_for" logic is written exactly once and shared by
-        // CPU and Metal.
+        // Keep the completion-budget invariant and finish reason shared by
+        // both execution hosts.
         let finish_streaming = {
             let tx = tx.clone();
             move |output: GenerateOutput| {
@@ -1345,98 +1225,26 @@ async fn chat_completions_with_request(
             }
         };
 
-        match model {
-            ModelBackend::Cpu(cpu) => {
-                // Admission before any blocking work is submitted: a full cap
-                // returns 503 `server_busy` here, before the SSE response below
-                // is ever built.
-                let generation_permit =
-                    try_acquire_cpu_generation_slot(&state.cpu_generation_admission)?;
-                let delta_tx = tx.clone();
-                let failure_tx = tx.clone();
-                cpu.spawn_streaming(
-                    prompt,
-                    gen_cfg,
-                    cancel_rx,
-                    move |delta| {
-                        delta_tx
-                            .unbounded_send(StreamMsg::Delta(delta.to_owned()))
-                            .is_ok()
-                    },
-                    // `generation_permit` is captured by `finish`, which is owned
-                    // by the blocking closure and runs last; if that closure
-                    // unwinds its captures drop with it. So the slot frees when
-                    // the blocking generation ends, not when this HTTP future is
-                    // dropped on client disconnect.
-                    move |result| {
-                        let _permit = generation_permit;
-                        match result {
-                            Ok(output) => finish_streaming(output),
-                            Err(error) => {
-                                eprintln!("generation error (streaming): {error}");
-                                let _ = failure_tx.unbounded_send(StreamMsg::Failed);
-                            }
-                        }
-                    },
-                );
-            }
-            #[cfg(feature = "metal-gpu")]
-            ModelBackend::Metal { handle, .. } => {
-                // #939: submit synchronously, before any SSE response is
-                // built. `handle.submit` runs `MetalWorkerClient::submit`'s
-                // admission check (#932) directly on this task -- not
-                // inside the `tokio::spawn` below -- so an admission
-                // rejection propagates via `?` as an ordinary
-                // `ApiError::ServiceUnavailable` (503) before this
-                // handler ever returns `Sse::new(...)`. Only draining the
-                // already-admitted job happens in the detached task.
-                let mut rx = handle.client.submit_with_lora_mode_and_thinking(
-                    chat_messages,
-                    gen_cfg,
-                    cancel_rx,
-                    requested.selection().to_vec(),
-                    true,
-                    explicitly_thinking,
-                )?;
-                // An unload queued ahead of this job can invalidate the HTTP
-                // snapshot. Resolve the worker's rejection before committing SSE.
-                let first = if requested.selection().is_empty() {
-                    None
-                } else {
-                    use lattice_inference::serve::metal_worker::WorkerEvent;
-                    match rx.recv().await {
-                        Some(WorkerEvent::Rejected(error)) => return Err(error),
-                        Some(
-                            WorkerEvent::Failed(message) | WorkerEvent::ConstraintBlocked(message),
-                        ) => {
-                            return Err(ApiError::Internal { message });
-                        }
-                        Some(event) => Some(event),
-                        None => {
-                            return Err(ApiError::Internal {
-                                message: "inference worker unavailable".into(),
-                            });
-                        }
+        let delta_tx = tx.clone();
+        let failure_tx = tx.clone();
+        state
+            .model
+            .stream_lattice(
+                execution_request,
+                cancel_rx,
+                move |delta| {
+                    delta_tx
+                        .unbounded_send(StreamMsg::Delta(delta.to_owned()))
+                        .is_ok()
+                },
+                move |result| match result {
+                    Ok(output) => finish_streaming(output),
+                    Err(_) => {
+                        let _ = failure_tx.unbounded_send(StreamMsg::Failed);
                     }
-                };
-                tokio::spawn(async move {
-                    let tx_delta = tx.clone();
-                    let result = MetalHandle::drain(&mut rx, first, move |delta| {
-                        tx_delta
-                            .unbounded_send(StreamMsg::Delta(delta.to_string()))
-                            .is_ok()
-                    })
-                    .await;
-                    match result {
-                        Ok(output) => finish_streaming(output),
-                        Err(e) => {
-                            eprintln!("generation error (streaming, metal): {e:?}");
-                            let _ = tx.unbounded_send(StreamMsg::Failed);
-                        }
-                    }
-                });
-            }
-        }
+                },
+            )
+            .await?;
 
         // Build the SSE stream.
         //
@@ -1545,56 +1353,7 @@ async fn chat_completions_with_request(
             .into_response())
     } else {
         // --- Non-streaming path ---
-        let output = match model {
-            ModelBackend::Cpu(cpu) => {
-                let generation_permit =
-                    try_acquire_cpu_generation_slot(&state.cpu_generation_admission)?;
-                let handle = cpu.spawn_completion(prompt, gen_cfg);
-                // The permit is moved into a detached task that awaits the
-                // blocking job and only then drops it, so a dropped HTTP future
-                // detaches this task without cancelling it: the slot stays held
-                // until the blocking generation ends, not until the client
-                // disconnects.
-                tokio::spawn(async move {
-                    let _permit = generation_permit;
-                    handle.await
-                })
-                .await
-                .map_err(|e| {
-                    eprintln!("task join error: {e}");
-                    ApiError::Internal {
-                        message: "inference failed".to_string(),
-                    }
-                })?
-                .map_err(|e| {
-                    eprintln!("task join error: {e}");
-                    ApiError::Internal {
-                        message: "inference failed".to_string(),
-                    }
-                })?
-                .map_err(|e| {
-                    eprintln!("generation error: {e}");
-                    ApiError::Internal {
-                        message: "inference failed".to_string(),
-                    }
-                })?
-            }
-            #[cfg(feature = "metal-gpu")]
-            ModelBackend::Metal { handle, .. } => {
-                let (_guard, cancel) = lattice_inference::serve::cancel_pair();
-                let mut rx = handle.client.submit_with_lora_mode_and_thinking(
-                    chat_messages,
-                    gen_cfg,
-                    cancel,
-                    requested.selection().to_vec(),
-                    false,
-                    explicitly_thinking,
-                )?;
-                MetalHandle::drain(&mut rx, None, |_delta| true)
-                    .await
-                    .map_err(map_metal_generation_error)?
-            }
-        };
+        let output = state.model.complete_lattice(execution_request).await?;
 
         // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
         // `GenerateOutput.stopped` carries the explicit stop reason set by the library.
@@ -1655,7 +1414,7 @@ async fn chat_completions_with_request(
 /// `lattice_inference::serve::embeddings` for the wire contract and pooled
 /// execution this handler wires into axum.
 pub async fn embeddings(
-    State(state): State<AppState>,
+    State(state): State<AppState<lattice_inference::serving_host::ServingHandle>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
@@ -1767,15 +1526,12 @@ fn lora_unsupported_backend(message: &'static str) -> ApiError {
 /// The Metal worker client behind a Metal-backed server, or the refusal above.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn adapter_client(
-    state: &AppState,
+    state: &AppState<lattice_inference::serving_host::ServingHandle>,
 ) -> Result<&lattice_inference::serve::metal_worker::MetalWorkerClient, ApiError> {
-    match &state.model {
-        ModelBackend::Metal { handle, .. } => Ok(&handle.client),
-        _ => Err(lora_unsupported_backend(
-            "runtime LoRA adapters require the Metal backend; restart this server with a \
-             Metal Q4 checkpoint to enable this route",
-        )),
-    }
+    state.model.adapter_client_or(lora_unsupported_backend(
+        "runtime LoRA adapters require the Metal backend; restart this server with a \
+         Metal Q4 checkpoint to enable this route",
+    ))
 }
 
 /// The refusal a build without Metal owes every adapter request.
@@ -1788,7 +1544,9 @@ fn adapter_unsupported_build() -> ApiError {
 }
 
 /// List confirmed resident adapters and the currently applied mixture.
-pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiError> {
+pub async fn lora_list(
+    State(state): State<AppState<lattice_inference::serving_host::ServingHandle>>,
+) -> Result<Response, ApiError> {
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
         lora_list_with_backend(
@@ -1820,7 +1578,7 @@ pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiErr
 /// names both lists side by side, so "which adapter moved" is answered where it is asked.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 async fn route_selection(
-    state: &AppState,
+    state: &AppState<lattice_inference::serving_host::ServingHandle>,
     served: &Arc<lattice_inference::serve::routing::ServedRouter>,
     messages: &[ChatMessage],
     completion_id: &str,
@@ -1915,7 +1673,7 @@ async fn route_selection(
 /// serves; collapsing it into a failure would tell a caller its feedback was
 /// lost, which is also untrue.
 pub async fn router_feedback(
-    State(state): State<AppState>,
+    State(state): State<AppState<lattice_inference::serving_host::ServingHandle>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1986,7 +1744,7 @@ pub async fn router_feedback(
 /// missing and not zero, and `evicted` because a census taken over a bounded
 /// window is a window, which a reader cannot otherwise tell.
 pub async fn router_episodes(
-    State(state): State<AppState>,
+    State(state): State<AppState<lattice_inference::serving_host::ServingHandle>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
@@ -2012,7 +1770,7 @@ pub async fn router_episodes(
 /// removes it for every caller; aliases and changed file contents are not detected.
 /// This unauthenticated route reads a caller-selected path on the server host.
 pub async fn lora_load(
-    State(state): State<AppState>,
+    State(state): State<AppState<lattice_inference::serving_host::ServingHandle>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
@@ -2045,7 +1803,7 @@ pub async fn lora_load(
 
 /// Remove one resident identifier, refusing unknown ids.
 pub async fn lora_unload(
-    State(state): State<AppState>,
+    State(state): State<AppState<lattice_inference::serving_host::ServingHandle>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
@@ -2137,7 +1895,8 @@ fn lora_list_with_backend<B>(
 // Router
 // -----------------------------------------------------------------------
 
-pub fn router(state: AppState) -> Router {
+pub(super) fn router<M: IntoServingHandle>(state: AppState<M>) -> Router {
+    let state = state.into_serving_handle();
     Router::new()
         .route("/", get(root))
         .route("/health", get(health))

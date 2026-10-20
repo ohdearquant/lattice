@@ -15,7 +15,7 @@ ceiling = 3016
 
 [[ratchet]]
 path = "crates/inference/src/bin/lattice_serve/main.rs"
-ceiling = 3703
+ceiling = 3693
 
 [[ratchet]]
 path = "crates/inference/src/forward/metal_qwen35.rs"

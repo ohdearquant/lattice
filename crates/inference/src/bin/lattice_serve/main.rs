@@ -43,7 +43,7 @@
 //! worker thread for the whole process lifetime, owned by
 //! `lattice_inference::serve::metal_worker::MetalWorker`. The async
 //! axum handlers never touch Metal directly: each request is submitted via
-//! `MetalWorkerClient::submit`, which ships a job (messages + sampling
+//! `ServingHandle::submit_standalone`, which ships a job (messages + sampling
 //! config + a cancellation watch) to the worker over a tokio mpsc and
 //! returns a `WorkerEvent` receiver; the worker drives cache-aware
 //! generation, forwarding each token delta back as `WorkerEvent::Delta`.
@@ -101,13 +101,12 @@ mod imp {
     use lattice_inference::GenerateOutput;
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
     use lattice_inference::serve::contract::{
-        ChatRequest as ChatReq, GenerationDefaults, ServeProfile, is_message_flood_error,
-        message_flood_text,
+        ChatRequest as ChatReq, GenerationDefaults, is_message_flood_error, message_flood_text,
     };
     #[cfg(test)]
     use lattice_inference::serve::contract::{
-        ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, ValidatedChatRequest,
-        normalize_messages, normalize_request,
+        ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, ServeProfile,
+        ValidatedChatRequest, normalize_messages, normalize_request,
     };
     use lattice_inference::serve::embeddings::{
         TextEmbeddingsRequest, build_embeddings_response, check_embeddings_item_fits_window,
@@ -115,11 +114,12 @@ mod imp {
         parse_embeddings_input,
     };
     use lattice_inference::serve::into_engine_chat_messages;
+    #[cfg(all(test, feature = "test-utils"))]
+    use lattice_inference::serve::metal_worker::MetalWorkerClient;
+    use lattice_inference::serve::metal_worker::WorkerEvent;
     #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
     use lattice_inference::serve::metal_worker::{ContextWindowPolicy, MetalWorker};
-    use lattice_inference::serve::metal_worker::{MetalWorkerClient, WorkerEvent};
     use lattice_inference::serve::metrics::ServeMetrics;
-    use lattice_inference::serve::prepare::prepare_standalone_chat_request;
     use lattice_inference::serving_provider::{
         self, ServingEntry, StandaloneLoadOptions, StandaloneOptionPresence,
     };
@@ -133,10 +133,13 @@ mod imp {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::Semaphore;
+    #[path = "state.rs"]
+    mod state;
+    use state::{AppState, IntoServingHost};
     /// Only used by the test module's raw job-channel helpers
     /// (`mpsc::UnboundedReceiver<WorkerMessage>` etc. -- see
     /// `lattice_inference::serve::metal_worker`'s `test-utils`-gated
-    /// surface); production code only ever holds a `MetalWorkerClient`.
+    /// surface); production state holds a `ServingHandle`.
     #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
     use tokio::sync::mpsc;
 
@@ -174,49 +177,6 @@ mod imp {
             }),
             other => other,
         }
-    }
-
-    #[derive(Clone)]
-    pub struct AppState {
-        jobs: MetalWorkerClient,
-        model_id: Arc<str>,
-        defaults: GenerationDefaults,
-        /// Runtime context window reported by the selected provider. See
-        /// `build_cfg` for request-level clamping.
-        model_max_context: usize,
-        /// The shared worker's outstanding-job admission cap (issue #932),
-        /// needed alongside `jobs.available_permits()` to compute the
-        /// `/metrics` (#583) queue-depth/in-flight gauge as `max_pending -
-        /// available_permits()`.
-        max_pending: usize,
-        /// Process-wide Prometheus metrics registry (#583), `Arc`-shared so
-        /// every clone of `AppState` (one per request) records into the same
-        /// counters.
-        metrics: Arc<ServeMetrics>,
-        /// The loaded model's tokenizer vocabulary, byte-decoded once at
-        /// startup (structured-output v0 design note): `GrammarEngine::new`
-        /// needs `vocab_bytes[i]` for every token id to compile a schema
-        /// into a PDA + vocabulary partition. `Arc`-shared so every request
-        /// clones a pointer, not the ~vocab_size-entry `Vec<Vec<u8>>` --
-        /// `GrammarEngine::new` itself still takes ownership of a fresh
-        /// clone per compile (no cross-request grammar cache in v0; see the
-        /// structured-output v0 design note's stage split).
-        vocab_bytes: Arc<Vec<Vec<u8>>>,
-        /// Bounded (32-entry, LRU) single-flight cache of compiled
-        /// `GrammarEngine`s, keyed by [`grammar_cache_key`] on the
-        /// canonicalized admitted schema JSON *and* the `vocab_bytes` this
-        /// request was compiled against (structured-output v0 design note,
-        /// stage 2). `Arc`-shared so every clone of `AppState` (one per
-        /// request) hits the same cache.
-        grammar_cache: Arc<GrammarCache>,
-        /// The optional embedding model loaded via `--embedding-model`
-        /// (issue #584). `None` when the flag was not passed at startup, in
-        /// which case `POST /v1/embeddings` answers 503
-        /// `embedding_model_not_loaded` for every request rather than the
-        /// route not existing at all -- the route is always registered so
-        /// its absence is a documented, discoverable server state instead of
-        /// a bare 404.
-        embedding: Option<Arc<EmbeddingState>>,
     }
 
     /// The loaded embedding model and its identity, independent of the
@@ -301,7 +261,7 @@ mod imp {
     const EMBEDDING_MAX_CONCURRENT_JOBS: usize = 4;
 
     /// Acquires one embedding-job admission slot, mirroring
-    /// `MetalWorkerClient::submit`'s admission check (issue #932) for
+    /// the serving worker's admission check for
     /// [`EmbeddingState::admission`]. Synchronous and non-blocking: a full
     /// admission cap is rejected immediately, before any tokenization or
     /// `encode_batch` work runs, exactly like the chat path's admission
@@ -1847,7 +1807,7 @@ mod imp {
 
     // ─── HTTP handlers ───────────────────────────────────────────────────────
 
-    async fn health(State(s): State<AppState>) -> &'static str {
+    async fn health<H: Send + Sync + 'static>(State(s): State<AppState<H>>) -> &'static str {
         let t = Instant::now();
         emit_serve_event(
             &s.metrics,
@@ -1863,7 +1823,7 @@ mod imp {
         "ok"
     }
 
-    async fn root(State(s): State<AppState>) -> Json<Value> {
+    async fn root<H: Send + Sync + 'static>(State(s): State<AppState<H>>) -> Json<Value> {
         let t = Instant::now();
         // ADR-080 C2: shared with lattice.rs's equivalent route so
         // both binaries advertise the same engine-identity document.
@@ -1882,7 +1842,7 @@ mod imp {
         Json(body)
     }
 
-    async fn list_models(State(s): State<AppState>) -> Json<Value> {
+    async fn list_models<H: Send + Sync + 'static>(State(s): State<AppState<H>>) -> Json<Value> {
         let t = Instant::now();
         // ADR-080 C2: shared with `lattice.rs`'s equivalent route so both
         // binaries advertise the single loaded model in byte-identical shape.
@@ -1918,7 +1878,9 @@ mod imp {
     /// volume/latency/error-rate shape) to anyone who can reach the
     /// listening address. Do not bind `--host` to a non-loopback address
     /// without an external auth layer (reverse proxy, firewall) in front.
-    async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
+    async fn metrics_handler<H: IntoServingHost>(
+        State(s): State<AppState<H>>,
+    ) -> impl IntoResponse {
         let in_flight = s.max_pending.saturating_sub(s.jobs.available_permits());
         let body = s.metrics.render(s.model_id.as_ref(), in_flight);
         (
@@ -1956,8 +1918,16 @@ mod imp {
     /// it never got `Json`'s free Content-Type enforcement either, before
     /// or after this PR's message-count preflight. Guarded here with the
     /// same `require_json_content_type` check, ahead of `to_bytes`.
-    async fn chat_completions(
-        State(s): State<AppState>,
+    async fn chat_completions<H: IntoServingHost>(
+        State(s): State<AppState<H>>,
+        headers: HeaderMap,
+        body: Body,
+    ) -> Response {
+        chat_completions_with_serving_host(State(s.into_serving_host()), headers, body).await
+    }
+
+    async fn chat_completions_with_serving_host(
+        State(s): State<AppState<lattice_inference::serving_host::ServingHandle>>,
         headers: HeaderMap,
         body: Body,
     ) -> Response {
@@ -2045,9 +2015,7 @@ mod imp {
         // Features the loaded model cannot serve are refused by name before
         // any other work. A model that serves them all (Qwen3.5) never
         // refuses here.
-        if let Some(preparation) = s.jobs.preparation()
-            && let Err(err) = preparation.refuse_standalone_unsupported(&req)
-        {
+        if let Err(err) = s.jobs.refuse_standalone_unsupported(&req) {
             emit_serve_event(
                 &s.metrics,
                 "POST",
@@ -2095,20 +2063,12 @@ mod imp {
             );
             return err.into_response();
         }
-        let normalized = match s.jobs.preparation() {
-            Some(preparation) => preparation.prepare_standalone(
-                &req,
-                s.defaults,
-                s.model_id.as_ref(),
-                s.jobs.supports_vision(),
-            ),
-            None => prepare_standalone_chat_request(
-                &req,
-                s.defaults,
-                ServeProfile::lattice_serve(s.model_id.as_ref(), s.model_max_context)
-                    .with_vision_support(s.jobs.supports_vision()),
-            ),
-        };
+        let normalized = s.jobs.prepare_standalone_chat_request(
+            &req,
+            s.defaults,
+            s.model_id.as_ref(),
+            s.model_max_context,
+        );
         let (validated, mut cfg) = match normalized {
             Ok(prepared) => prepared,
             Err(err) => {
@@ -2187,13 +2147,13 @@ mod imp {
         let created = unix_secs();
 
         let (cancel_guard, cancel_rx) = lattice_inference::serve::cancel_pair();
-        // `MetalWorkerClient::submit` (issue #832) never fails outwardly EXCEPT for admission
+        // The serving facade's worker submission only fails outwardly for admission
         // (issue #932, checked synchronously here, before any tokenization/model work): if the
         // worker thread is no longer running, the returned receiver simply closes with zero events,
         // which both branches below detect via their own first-event peek (`rx.recv()` returning
         // `None`) and report identically to this binary's prior up-front `jobs.send(..).is_err()`
         // check.
-        let mut rx = match s.jobs.submit_with_lora_mode_and_thinking(
+        let mut rx = match s.jobs.submit_standalone(
             messages,
             cfg,
             cancel_rx,
@@ -2574,11 +2534,11 @@ mod imp {
                 .keep_alive(KeepAlive::default())
                 .into_response()
         } else {
-            // ADR-080 C2 / #832: mirrors the streaming branch's own
-            // first-event peek above -- previously this binary's up-front
+            // Mirrors the streaming branch's own first-event peek above.
+            // This binary's earlier up-front
             // `jobs.send(..).is_err()` check was the ONLY thing catching a
             // dead/unavailable worker for this path; now that
-            // `MetalWorkerClient::submit` never fails outwardly, a worker
+            // facade submission never fails outwardly, a worker
             // that is gone before this job is even dequeued shows up here as
             // `rx.recv()` returning `None` on the very first poll, same as
             // streaming's preflight. Without this peek the loop below would
@@ -2847,7 +2807,11 @@ mod imp {
     /// but has no worker to submit to: `BertModel::encode_batch` runs
     /// directly, off the async executor via `spawn_blocking` (CPU matmuls,
     /// not `.await`-friendly).
-    async fn embeddings(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+    async fn embeddings<H: Send + Sync + 'static>(
+        State(s): State<AppState<H>>,
+        headers: HeaderMap,
+        body: Body,
+    ) -> Response {
         let timer = Instant::now();
         const ROUTE: &str = "/v1/embeddings";
         if let Err(err) = lattice_inference::serve::require_json_content_type(&headers) {
@@ -3299,17 +3263,17 @@ mod imp {
     /// resulting status/code (413 `request_body_too_large`) is identical on
     /// both binaries today (see the
     /// `oversized_body_over_limit` parity case).
-    pub fn router(state: AppState) -> Router {
+    pub fn router<H: IntoServingHost>(state: AppState<H>) -> Router {
         Router::new()
-            .route("/", get(root))
-            .route("/health", get(health))
-            .route("/v1/models", get(list_models))
-            .route("/v1/chat/completions", post(chat_completions))
-            .route("/v1/embeddings", post(embeddings))
-            .route("/v1/lora", get(lora_list))
-            .route("/v1/lora/load", post(lora_load))
-            .route("/v1/lora/unload", post(lora_unload))
-            .route("/metrics", get(metrics_handler))
+            .route("/", get(root::<H>))
+            .route("/health", get(health::<H>))
+            .route("/v1/models", get(list_models::<H>))
+            .route("/v1/chat/completions", post(chat_completions::<H>))
+            .route("/v1/embeddings", post(embeddings::<H>))
+            .route("/v1/lora", get(lora_list::<H>))
+            .route("/v1/lora/load", post(lora_load::<H>))
+            .route("/v1/lora/unload", post(lora_unload::<H>))
+            .route("/metrics", get(metrics_handler::<H>))
             .with_state(state)
     }
 
@@ -3327,39 +3291,50 @@ mod imp {
     /// `--host` this route lets anyone who can reach the port make the server open a
     /// file of their choosing. The startup warning covers it; an allow-root is the
     /// obvious next control and is deliberately not invented here.
-    async fn lora_list(State(s): State<AppState>) -> Response {
+    async fn lora_list<H: IntoServingHost>(State(state): State<AppState<H>>) -> Response {
+        let s = state.into_serving_host();
         lora_list_with_backend(
             || {
                 if adapters_supported(&s) {
-                    Ok(&s.jobs)
+                    s.jobs.adapter_client_or(
+                        lattice_inference::serve::prepare::lora_unsupported_backend(),
+                    )
                 } else {
                     Err(lattice_inference::serve::prepare::lora_unsupported_backend())
                 }
             },
-            lattice_inference::serve::metal_worker::MetalWorkerClient::adapter_index,
+            lattice_inference::serving_worker::WorkerClient::adapter_index,
         )
     }
 
     /// Whether the loaded model takes runtime LoRA adapters. A worker with no
     /// model-bound preparation is the Qwen3.5 test worker, which does.
-    fn adapters_supported(s: &AppState) -> bool {
-        s.jobs
-            .preparation()
-            .is_none_or(lattice_inference::serve::prepare::PreparationHandle::supports_adapters)
+    fn adapters_supported<H: IntoServingHost>(s: &AppState<H>) -> bool {
+        s.jobs.supports_adapters()
     }
 
     /// Repeated exact `(name, path)` identities share one resident id and lifetime:
     /// one unload removes it for all callers. Path aliases and changed contents
     /// are not detected. Capacity exhaustion rejects the load without eviction.
-    async fn lora_load(state: State<AppState>, headers: HeaderMap, body: Body) -> Response {
-        lora_load_with_adapter_support(state, headers, body, adapters_supported).await
-    }
-
-    async fn lora_load_with_adapter_support(
-        State(s): State<AppState>,
+    async fn lora_load<H: IntoServingHost>(
+        State(state): State<AppState<H>>,
         headers: HeaderMap,
         body: Body,
-        supports_adapters: impl FnOnce(&AppState) -> bool,
+    ) -> Response {
+        lora_load_with_adapter_support(
+            State(state.into_serving_host()),
+            headers,
+            body,
+            adapters_supported,
+        )
+        .await
+    }
+
+    async fn lora_load_with_adapter_support<H: IntoServingHost>(
+        State(s): State<AppState<H>>,
+        headers: HeaderMap,
+        body: Body,
+        supports_adapters: impl FnOnce(&AppState<H>) -> bool,
     ) -> Response {
         lora_load_with_backend(
             &s.metrics,
@@ -3367,7 +3342,9 @@ mod imp {
             body,
             || {
                 if supports_adapters(&s) {
-                    Ok(&s.jobs)
+                    s.jobs.adapter_client_or(
+                        lattice_inference::serve::prepare::lora_unsupported_backend(),
+                    )
                 } else {
                     Err(lattice_inference::serve::prepare::lora_unsupported_backend())
                 }
@@ -3379,15 +3356,25 @@ mod imp {
     }
 
     /// Remove one resident identifier, refusing unknown ids.
-    async fn lora_unload(state: State<AppState>, headers: HeaderMap, body: Body) -> Response {
-        lora_unload_with_adapter_support(state, headers, body, adapters_supported).await
-    }
-
-    async fn lora_unload_with_adapter_support(
-        State(s): State<AppState>,
+    async fn lora_unload<H: IntoServingHost>(
+        State(state): State<AppState<H>>,
         headers: HeaderMap,
         body: Body,
-        supports_adapters: impl FnOnce(&AppState) -> bool,
+    ) -> Response {
+        lora_unload_with_adapter_support(
+            State(state.into_serving_host()),
+            headers,
+            body,
+            adapters_supported,
+        )
+        .await
+    }
+
+    async fn lora_unload_with_adapter_support<H: IntoServingHost>(
+        State(s): State<AppState<H>>,
+        headers: HeaderMap,
+        body: Body,
+        supports_adapters: impl FnOnce(&AppState<H>) -> bool,
     ) -> Response {
         lora_unload_with_backend(
             &s.metrics,
@@ -3395,7 +3382,9 @@ mod imp {
             body,
             || {
                 if supports_adapters(&s) {
-                    Ok(&s.jobs)
+                    s.jobs.adapter_client_or(
+                        lattice_inference::serve::prepare::lora_unsupported_backend(),
+                    )
                 } else {
                     Err(lattice_inference::serve::prepare::lora_unsupported_backend())
                 }
@@ -3636,6 +3625,7 @@ mod imp {
 
         // Finish the provider's vocabulary work after the worker is ready.
         let vocab_bytes = post_ready.finish()?;
+        let serving = lattice_inference::serving_host::ServingHandle::affine_standalone(jobs);
 
         // Issue #584: independent, optional second model for
         // `POST /v1/embeddings`. `BertModel` is CPU-only (see
@@ -3659,7 +3649,7 @@ mod imp {
         };
 
         let state = AppState {
-            jobs,
+            jobs: serving,
             model_id,
             defaults,
             model_max_context,
