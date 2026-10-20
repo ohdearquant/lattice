@@ -549,9 +549,9 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
         reason: "MetalChatBackend::load belongs to an interactive or one-shot product process outside the measurement-harness contract",
     },
     ConstructionExemption {
-        site: "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/serve.rs::ModelBackend::spawn_metal::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/lattice/serve.rs:164:67",
-        reason: "ModelBackend::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
+        site: "bin:lattice:src/bin/lattice/main.rs=>src/serving_provider/providers/qwen/lattice_worker.rs::open::MetalQwen35State::from_q4_dir()#1",
+        recorded_position: "src/serving_provider/providers/qwen/lattice_worker.rs:65:29",
+        reason: "the Qwen lattice worker initializes a long-running server worker outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
         site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::from_q4_dir()#1",
