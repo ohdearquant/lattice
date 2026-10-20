@@ -1251,7 +1251,7 @@ mod scoring {
             }"#;
             let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
             assert_eq!(
-                lattice_tokenizer::__internal::max_token_byte_span(tokenizer),
+                lattice_tokenizer::__internal::max_token_byte_span(&tokenizer),
                 "<|long_control_marker|>".len()
             );
             assert!("<|long_control_marker|>".len() > 1);
