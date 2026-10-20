@@ -5,13 +5,13 @@
 //! in separate tries so runtime tokenization can stay O(text length) while still
 //! matching the exact greedy-longest semantics of the legacy implementation.
 
-pub use crate::tokenizer::common::{TokenizedInput, Tokenizer};
+pub use crate::common::{TokenizedInput, Tokenizer};
 
-use crate::error::InferenceError;
-use crate::tokenizer::common::{
+use crate::common::{
     ThreadSafeLruCache, invert_vocab, json_object_to_vocab, json_path, pad_ids,
     pad_ids_with_token_types, parse_added_tokens, parse_json,
 };
+use lattice_inference_core::InferenceError;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;

@@ -1,6 +1,7 @@
 //! Streaming generation with cancellation and observers, and token parity of the public prefill delegation.
 
 use super::*;
+use lattice_tokenizer::__internal::incremental_detokenizer_push;
 
 // -----------------------------------------------------------------------
 // generate_streaming_with_cancel mutation-sensitive tests (ADR-080 C2, #744)
@@ -429,9 +430,9 @@ fn raw_observer_fires_before_on_token_for_buffered_incomplete_utf8_first_token()
     // Independent confirmation that token id 0 alone is genuinely
     // incomplete UTF-8, not just asserted by comment: pushing it once
     // into a fresh detokenizer must yield an empty delta.
-    let mut probe = IncrementalDetokenizer::new();
+    let mut probe = incremental_detokenizer_new();
     assert_eq!(
-        probe.push(model.tokenizer(), 0),
+        incremental_detokenizer_push(&mut probe, model.tokenizer(), 0),
         "",
         "token id 0 (raw byte 0xC2) must be an incomplete UTF-8 lead byte on its own -- \
              this test's premise depends on it"

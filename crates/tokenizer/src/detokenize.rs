@@ -1,5 +1,5 @@
 //! Qwen3.5 byte-decoder construction, token-byte appending, token decoding, incremental detokenization, and byte-to-Unicode mapping.
-use crate::tokenizer::bpe::BpeTokenizer;
+use crate::bpe::BpeTokenizer;
 use std::collections::HashMap;
 
 /// Build the GPT-2 byte-level reverse map (unicode placeholder char → original byte).
@@ -67,7 +67,7 @@ const DETOK_RETAINED_BYTE_CAPACITY: usize = 8;
 /// the whole-generation string (e.g. `GenerateOutput.text`) accumulate the
 /// `push`/`finish` deltas themselves. The concatenation of every `push` delta
 /// plus the final `finish` equals `decode_tokens` over the same ids.
-pub(crate) struct IncrementalDetokenizer {
+pub struct IncrementalDetokenizer {
     byte_decoder: HashMap<char, u8>,
     /// Bytes appended since the last `push`, not yet proven to be either a
     /// complete UTF-8 prefix (already emitted) or an unrepairable invalid
@@ -87,7 +87,6 @@ impl IncrementalDetokenizer {
     /// Feed one token id; return the complete-UTF-8 text it reveals (which may be
     /// empty when the token only contributed continuation bytes of a codepoint
     /// still being assembled).
-    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
     pub(crate) fn push(&mut self, tokenizer: &BpeTokenizer, id: u32) -> String {
         append_token_bytes(tokenizer, id, &self.byte_decoder, &mut self.pending);
         let mut out = String::new();
