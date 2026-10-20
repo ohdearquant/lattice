@@ -2067,11 +2067,11 @@ mod tests {
     fn embeddings_replies_that_measure_nothing_are_refused() {
         let ok = vec![0.5, 0.25];
         let cases: Vec<(&str, String, usize)> = vec![
-            ("too few entries", embeddings_reply(&[ok.clone()], 3), 2),
+            ("too few entries", embeddings_reply(std::slice::from_ref(&ok), 3), 2),
             ("too many entries", embeddings_reply(&[ok.clone(), ok.clone()], 3), 1),
             ("empty vector", embeddings_reply(&[vec![]], 3), 1),
             ("ragged widths", embeddings_reply(&[ok.clone(), vec![0.5]], 3), 2),
-            ("zero prompt tokens", embeddings_reply(&[ok.clone()], 0), 1),
+            ("zero prompt tokens", embeddings_reply(std::slice::from_ref(&ok), 0), 1),
             (
                 "out of order",
                 json!({"data": [
