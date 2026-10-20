@@ -16,6 +16,7 @@ fn input_image_url(url: String, detail: Option<String>) -> ImageUrl {
 }
 
 use super::*;
+use lattice_inference::model::qwen35_config::Qwen35Config;
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 use lattice_inference::serve::ApiError;
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

@@ -44,10 +44,7 @@ src/bin/eval_perplexity.rs	crate::model::qwen35::eval::PerplexityReport
 src/bin/eval_perplexity.rs	crate::model::qwen35::model::Qwen35Model
 src/bin/gramperf_profile.rs	crate::forward::metal_qwen35::MetalQwen35State
 src/bin/gramperf_profile.rs	crate::model::qwen35_config::Qwen35Config
-src/bin/lattice_serve/main.rs	crate::forward::metal_qwen35::MetalQwen35State
 src/bin/lattice_serve/main.rs	crate::model::bert::BertModel
-src/bin/lattice_serve/main.rs	crate::model::qwen35_config::Qwen35Config
-src/bin/lattice_serve/main.rs	crate::model::qwen35::model::Qwen35Model
 src/bin/lattice/chat.rs	crate::forward::metal_qwen35::MetalQwen35State
 src/bin/lattice/chat.rs	crate::model::qwen35_config::Qwen35Config
 src/bin/lattice/chat.rs	crate::model::qwen35::model::Qwen35Model
@@ -104,6 +101,8 @@ src/serving_provider/providers/qwen/vision.rs	crate::forward::metal_qwen35::push
 src/serving_provider/providers/qwen/vision.rs	crate::model::qwen35_config::Qwen35Config
 src/serving_provider/providers/qwen/vision.rs	crate::model::qwen35_config::VisionModelConfig
 src/serving_provider/providers/qwen/worker.rs	crate::forward::metal_qwen35::MetalQwen35State
+src/serving_provider/providers/qwen/worker.rs	crate::model::qwen35::model::Qwen35Model
+src/serving_provider/providers/qwen/worker.rs	crate::model::qwen35_config::Qwen35Config
 src/serving_provider/providers/qwen/worker.rs	crate::model::serving_runtime::qwen_metal::QwenMetalRuntime
 src/serving_provider/providers/qwen/worker.rs	crate::model::serving_runtime::RuntimeFactory
 src/serving_provider/providers/qwen/worker.rs	crate::model::serving_runtime::ServingRuntime

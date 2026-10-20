@@ -13,7 +13,8 @@ use crate::serving_factory::ServingFactory;
 use crate::serving_provider::{CheckpointEvidence, ServingEntry, ServingProvider};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_provider::{
-    StandaloneLoadOptions, StandaloneOptionPresence, StandaloneQwenLoader,
+    StandaloneLoadOptions, StandaloneLoadPlan, StandaloneOptionPresence, StandaloneQwenLoader,
+    StandaloneStartupDescription,
 };
 use std::path::Path;
 
@@ -88,6 +89,25 @@ impl ServingProvider for QwenProvider {
     ) -> Result<ServingFactory, String> {
         qwen_standalone_factory(evidence, options, qwen_loader)
     }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_startup_description(
+        &self,
+        format: crate::model_format::ModelFormat,
+        route: Option<ServedRoute>,
+    ) -> StandaloneStartupDescription {
+        crate::serving_provider::standalone_startup_description(format, route)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn prepare_standalone_load(
+        &self,
+        evidence: CheckpointEvidence,
+        _route: Option<ServedRoute>,
+        options: StandaloneLoadOptions,
+    ) -> Result<StandaloneLoadPlan, String> {
+        qwen_standalone_plan(evidence, options)
+    }
 }
 
 /// Load a Qwen safetensors CPU model using the existing model loader.
@@ -115,4 +135,17 @@ pub(in crate::serving_provider) fn qwen_standalone_factory(
     }
     let loader = qwen_loader(evidence.directory, options.tokenizer_path, evidence.format);
     Ok(ServingFactory::qwen_metal(loader, vision_runtime))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(in crate::serving_provider) fn qwen_standalone_plan(
+    evidence: CheckpointEvidence,
+    options: StandaloneLoadOptions,
+) -> Result<StandaloneLoadPlan, String> {
+    let vocabulary_model_dir = evidence.directory.clone();
+    let vocabulary_tokenizer_path = options.tokenizer_path.clone();
+    let factory = qwen_standalone_factory(evidence, options, worker::standalone_loader())?;
+    let post_ready =
+        worker::vocabulary_after_ready(vocabulary_tokenizer_path, vocabulary_model_dir);
+    Ok(StandaloneLoadPlan::new(factory, post_ready))
 }

@@ -39,10 +39,9 @@
 //!
 //! # Design
 //!
-//! `MetalQwen35State` owns raw `metal::*` objects and is `!Send`, so it lives on
-//! one dedicated worker thread for the whole process lifetime, owned by
-//! `lattice_inference::serve::metal_worker::MetalWorker` (issue #832: the
-//! same shared owner module `lattice.rs`'s Metal backend uses). The async
+//! The selected provider builds its thread-affine model state on one dedicated
+//! worker thread for the whole process lifetime, owned by
+//! `lattice_inference::serve::metal_worker::MetalWorker`. The async
 //! axum handlers never touch Metal directly: each request is submitted via
 //! `MetalWorkerClient::submit`, which ships a job (messages + sampling
 //! config + a cancellation watch) to the worker over a tokio mpsc and
@@ -100,11 +99,7 @@ mod imp {
         routing::{get, post},
     };
     use lattice_inference::GenerateOutput;
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
-    use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::model_format::{self, ModelFamily, ModelFormat};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatReq, GenerationDefaults, ServeProfile, is_message_flood_error,
         message_flood_text,
@@ -120,16 +115,18 @@ mod imp {
         parse_embeddings_input,
     };
     use lattice_inference::serve::into_engine_chat_messages;
-    use lattice_inference::serve::metal_worker::{
-        ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, WorkerEvent,
-        WorkerMetadata,
-    };
+    #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
+    use lattice_inference::serve::metal_worker::{ContextWindowPolicy, MetalWorker};
+    use lattice_inference::serve::metal_worker::{MetalWorkerClient, WorkerEvent};
     use lattice_inference::serve::metrics::ServeMetrics;
     use lattice_inference::serve::prepare::prepare_standalone_chat_request;
     use lattice_inference::serving_provider::{
-        self, ServingEntry, StandaloneLoadOptions, StandaloneOptionPresence, StandaloneQwenLoader,
+        self, ServingEntry, StandaloneLoadOptions, StandaloneOptionPresence,
     };
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    #[cfg(test)]
+    use lattice_inference::serving_provider::{
+        FALLBACK_MODEL_MAX_CONTEXT, model_context_from_config,
+    };
     use lattice_inference::{BertModel, BertPooling};
     use serde_json::{Value, json};
     use std::collections::{HashMap, VecDeque};
@@ -184,9 +181,8 @@ mod imp {
         jobs: MetalWorkerClient,
         model_id: Arc<str>,
         defaults: GenerationDefaults,
-        /// Runtime context window derived from the loaded model (#551): the
-        /// exact KV cache length `load_model` allocated, never a hard-coded
-        /// constant. See `model_context_from_config` and `build_cfg`.
+        /// Runtime context window reported by the selected provider. See
+        /// `build_cfg` for request-level clamping.
         model_max_context: usize,
         /// The shared worker's outstanding-job admission cap (issue #932),
         /// needed alongside `jobs.available_permits()` to compute the
@@ -359,9 +355,6 @@ mod imp {
     const MAX_CONTENT_PARTS_PER_MESSAGE: usize = 64;
     /// Maximum byte length of a single content string / part payload (#649).
     const MAX_CONTENT_PART_BYTES: usize = 65_536;
-    /// #551 fallback when the loaded model's config has no derivable context.
-    const FALLBACK_MODEL_MAX_CONTEXT: usize = 4096;
-
     /// Capability-error wording pinned by text-only backend tests. Image
     /// content is admitted only when the loaded worker advertises a complete
     /// vision configuration.
@@ -1850,88 +1843,6 @@ mod imp {
                 "invalid_request_body",
             )
         })
-    }
-
-    /// Derive the model's usable context window from its config (#551):
-    /// `max_position_embeddings` when a real `config.json` was loaded,
-    /// otherwise (or when the field is non-positive) the documented
-    /// fallback. Never a hard-coded constant divorced from the loaded model.
-    fn model_context_from_config(cfg: Option<&Qwen35Config>) -> usize {
-        cfg.map(|cfg| cfg.max_position_embeddings)
-            .filter(|&n| n > 0)
-            .unwrap_or(FALLBACK_MODEL_MAX_CONTEXT)
-    }
-
-    // ─── GPU worker thread ───────────────────────────────────────────────────
-    //
-    // The dedicated thread that owns the `!Send` Metal state, the shared
-    // FIFO/cancellation job loop, and the shared KV-window invariant check
-    // all now live in `lattice_inference::serve::metal_worker` (issue #832),
-    // replacing this binary's previous private `spawn_worker`/
-    // `run_worker_loop`/`check_prompt_fits_window`/`enforce_prompt_window`.
-    // `load_model`/`LoadedModel` below are unchanged: `run()` gives the
-    // factory a loader closure, which it invokes on the worker thread
-    // (the `!Send` `MetalQwen35State` never crosses a thread boundary).
-
-    /// Everything the worker thread needs after a successful model load,
-    /// including the actual KV context (#551) so request clamping never
-    /// drifts from what was actually allocated.
-    struct LoadedModel {
-        metal: MetalQwen35State,
-        tokenizer: BpeTokenizer,
-        format: String,
-        model_max_context: usize,
-    }
-
-    fn load_model(
-        model_dir: &std::path::Path,
-        tokenizer_path: &std::path::Path,
-        format: ModelFormat,
-    ) -> Result<LoadedModel, String> {
-        let tokenizer = BpeTokenizer::from_tokenizer_json(tokenizer_path)
-            .map_err(|e| format!("tokenizer load failed ({}): {e}", tokenizer_path.display()))?;
-
-        match format {
-            ModelFormat::Q4 => {
-                let cfg = Qwen35Config::from_model_dir(model_dir)
-                    .map_err(|e| format!("config.json load failed: {e}"))?;
-                let requested_context = model_context_from_config(Some(&cfg));
-                let metal = MetalQwen35State::from_q4_dir(
-                    model_dir,
-                    tokenizer_path,
-                    &cfg,
-                    requested_context,
-                )
-                .map_err(|e| format!("Q4 model load failed: {e}"))?;
-                let model_max_context = metal.max_context();
-                Ok(LoadedModel {
-                    metal,
-                    tokenizer,
-                    format: "q4".to_string(),
-                    model_max_context,
-                })
-            }
-            ModelFormat::Safetensors => {
-                let model = Qwen35Model::from_safetensors(model_dir)
-                    .map_err(|e| format!("safetensors load failed: {e}"))?;
-                let cfg = model.config().clone();
-                let requested_context = model_context_from_config(Some(&cfg));
-                let metal = MetalQwen35State::new(model.weights(), &cfg, requested_context)
-                    .map_err(|e| format!("Metal init failed: {e}"))?;
-                let model_max_context = metal.max_context();
-                Ok(LoadedModel {
-                    metal,
-                    tokenizer,
-                    format: "bf16".to_string(),
-                    model_max_context,
-                })
-            }
-            ModelFormat::Unknown => Err(model_format::unrecognized_format_message(model_dir)),
-            // Any format this binary doesn't yet know how to load is handled
-            // the same way as `Unknown`: report it rather than silently
-            // guessing a loader.
-            _ => Err(model_format::unloadable_format_message(model_dir)),
-        }
     }
 
     // ─── HTTP handlers ───────────────────────────────────────────────────────
@@ -3603,19 +3514,12 @@ mod imp {
             return Err(format!("model directory not found: {}", model_dir.display()).into());
         }
         let evidence = serving_provider::inspect_checkpoint(&model_dir);
-        let format = evidence.format();
-        let factory_evidence = evidence.clone();
-        // The family and backend come from the table `lattice serve` uses, with
-        // this binary's Metal worker for Qwen3.5. Only a refusal the table
-        // owns outright (Gemma 4 in the Q4 format) ends startup here: a
-        // directory with no recognized format keeps the loader errors this
-        // binary has always reported for it, in their order.
+        // The provider selects the route and preserves fallback loading for
+        // checkpoints without a recognized format.
         let selected = match serving_provider::select(evidence, ServingEntry::Standalone) {
             Ok(selected) => selected,
             Err(error) => return Err(error.message().into()),
         };
-        let route = selected.legacy_route();
-        let gemma = route.is_some_and(|route| route.family == ModelFamily::Gemma4);
         let tokenizer_path = parse_arg(&args, "--tokenizer-dir")
             .map(|d| std::path::Path::new(&d).join("tokenizer.json"))
             .unwrap_or_else(|| model_dir.join("tokenizer.json"));
@@ -3689,86 +3593,29 @@ mod imp {
                 positive_reasoning_budget: defaults.reasoning_budget.is_some(),
             },
         )?;
-        if let Some(route) = route {
-            eprintln!("{}", route.selection_marker(format));
+        let startup = selected.standalone_startup_description();
+        if let Some(marker) = startup.route_marker {
+            eprintln!("{marker}");
         }
         eprintln!(
             "[lattice_serve] loading model from {} ({}) ...",
             model_dir.display(),
-            match format {
-                _ if gemma => "safetensors",
-                ModelFormat::Q4 => "q4",
-                ModelFormat::Safetensors => "bf16",
-                ModelFormat::Unknown => "unknown",
-                _ => "unknown",
-            }
+            startup.loading_label
         );
-        // #832: `load_model` (unchanged) runs INSIDE this loader closure, on
-        // the dedicated worker thread `MetalWorker::spawn` creates -- the
-        // `!Send` `MetalQwen35State` it returns never crosses a thread
-        // boundary. Blocks here until loading finishes (or fails), exactly
-        // like this binary's prior `spawn_worker` + separate `ready` channel
-        // did.
-        let tokenizer_path_for_vocab = tokenizer_path.clone();
-        let qwen_loader: StandaloneQwenLoader = Box::new(|model_dir, tokenizer_path, format| {
-            Box::new(move || {
-                let LoadedModel {
-                    metal,
-                    tokenizer,
-                    format,
-                    model_max_context,
-                } = load_model(&model_dir, &tokenizer_path, format)?;
-                Ok((
-                    metal,
-                    tokenizer,
-                    WorkerMetadata {
-                        format,
-                        model_max_context,
-                        context_window_policy: ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-                    },
-                ))
-            })
-        });
-        let factory = selected.into_standalone_factory(
-            ServingEntry::Standalone,
-            factory_evidence,
-            StandaloneLoadOptions {
-                tokenizer_path,
-                preload_vision,
-            },
-            qwen_loader,
-        )?;
-        let (
+        let plan = selected.prepare_standalone_load(StandaloneLoadOptions {
+            tokenizer_path,
+            preload_vision,
+        })?;
+        let started = plan.open(max_pending, residency_limits)?;
+        let lattice_inference::serving_provider::StartedStandalone {
             owner,
             jobs,
-            WorkerMetadata {
-                format: fmt,
-                model_max_context,
-                ..
-            },
-            _preparation,
-        ) = match MetalWorker::spawn_with_vision(factory, max_pending, residency_limits) {
-            Ok(triple) => triple,
-            Err(StartupError::Load(e)) => return Err(e.into()),
-            // Preserves this binary's exact prior wording (distinct from
-            // `MetalWorker::spawn`'s own generic `StartupError::ThreadExited`
-            // `Display` text) for the same condition: the worker thread
-            // exited/panicked before ever sending a readiness signal.
-            Err(StartupError::ThreadExited) => {
-                return Err("worker thread exited during model load".into());
-            }
-            // #939: zero, or above `Semaphore::MAX_PERMITS` -- a
-            // configuration error caught before `Semaphore::new` panics.
-            Err(err @ StartupError::InvalidMaxPending { .. }) => {
-                return Err(err.to_string().into());
-            }
-            // Unrecognized future startup-failure kind: fall back to its
-            // `Display` text rather than guessing at a more specific
-            // wording, same as `InvalidMaxPending` above.
-            Err(err) => {
-                return Err(err.to_string().into());
-            }
-        };
+            metadata,
+            preparation: _preparation,
+            post_ready,
+        } = started;
+        let fmt = metadata.format;
+        let model_max_context = metadata.model_max_context;
         // Retain the explicit owner through the server lifetime. Every
         // production client also retains an owner clone, so on a normal
         // return whichever reference is dropped last performs the same
@@ -3787,51 +3634,17 @@ mod imp {
             .into();
         eprintln!("[lattice_serve] model '{model_id}' ({fmt}) ready (context={model_max_context})");
 
-        // Structured-output v0 (design note): the tokenizer vocabulary,
-        // byte-decoded once here so `admit_structured_request` can compile
-        // `GrammarEngine`s without touching the `!Send` worker thread.
-        // Reloads the tokenizer and `config.json` a second time -- the
-        // worker thread's `load_model` (above) already loaded both once,
-        // inside a closure this async-setup code cannot reach across the
-        // thread boundary. Stage 2 (the `GrammarCache` below) does NOT
-        // remove this duplication: the underlying obstacle is the `!Send`
-        // worker closure boundary, not the lack of a compile cache -- the
-        // cache only avoids re-cloning `vocab_bytes` into `GrammarEngine`
-        // on a cache HIT, it does not change where the first, authoritative
-        // tokenizer/config load happens. Removing the second load would
-        // require restructuring `load_model`'s ownership across that
-        // thread boundary, out of stage 2's cache-placement scope.
-        let vocab_bytes: Arc<Vec<Vec<u8>>> = if gemma {
-            // Grammar-constrained output is refused for Gemma 4 before this
-            // table is read.
-            Arc::new(Vec::new())
-        } else {
-            let tokenizer_for_vocab = BpeTokenizer::from_tokenizer_json(&tokenizer_path_for_vocab)
-                .map_err(|e| {
-                    format!(
-                        "tokenizer load failed ({}): {e}",
-                        tokenizer_path_for_vocab.display()
-                    )
-                })?;
-            let vocab_size = Qwen35Config::from_model_dir(&model_dir)
-                .map(|cfg| cfg.vocab_size)
-                .map_err(|e| format!("config.json load failed: {e}"))?;
-            Arc::new(
-                tokenizer_for_vocab
-                    .vocab_bytes(vocab_size)
-                    .map_err(|e| format!("tokenizer vocab_bytes failed: {e}"))?,
-            )
-        };
+        // Finish the provider's vocabulary work after the worker is ready.
+        let vocab_bytes = post_ready.finish()?;
 
         // Issue #584: independent, optional second model for
         // `POST /v1/embeddings`. `BertModel` is CPU-only (see
         // `crate::model::bert`'s doc comment) so it loads directly here,
-        // synchronously, the same way the chat model's tokenizer/config are
-        // reloaded above for the grammar cache -- no `!Send` worker thread
-        // boundary applies to it. `--embedding-model` is deliberately
-        // optional: an operator who only wants chat completions should not
-        // have to point this flag at anything, and the route itself stays
-        // registered either way (see `AppState::embedding`'s doc comment).
+        // synchronously -- no `!Send` worker thread boundary applies to it.
+        // `--embedding-model` is deliberately optional: an operator who only
+        // wants chat completions should not have to point this flag at
+        // anything, and the route itself stays registered either way (see
+        // `AppState::embedding`'s doc comment).
         let embedding_state = match parse_arg(&args, "--embedding-model")
             .or_else(|| std::env::var("LATTICE_SERVE_EMBEDDING_MODEL").ok())
         {

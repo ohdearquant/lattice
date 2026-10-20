@@ -2,17 +2,29 @@
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::forward::metal_qwen35::MetalQwen35State;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::model_format::ModelFamily;
 use crate::model_format::ModelFormat;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serve::lora::ResidencyLimits;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serve::prepare::PreparationHandle;
 use crate::serve::route::{RouteRefusal, ServedBackend, ServedRoute};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_runtime_contract::WorkerMetadata;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_worker::{AffineWorker, StartupError, WorkerClient, WorkerOwner};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::path::{Path, PathBuf};
 
 pub mod providers;
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub use providers::qwen::worker::{FALLBACK_MODEL_MAX_CONTEXT, model_context_from_config};
 
 /// A binary's serving route policy.
 #[doc(hidden)]
@@ -116,7 +128,7 @@ pub struct StandaloneOptionPresence {
     pub positive_reasoning_budget: bool,
 }
 
-/// Options needed to construct the standalone serving factory.
+/// Options used to prepare a standalone load plan.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[doc(hidden)]
 pub struct StandaloneLoadOptions {
@@ -126,7 +138,7 @@ pub struct StandaloneLoadOptions {
     pub preload_vision: bool,
 }
 
-/// Binary-owned worker loader builder retained at the standalone call site.
+/// Compatibility loader builder for existing standalone factory callers.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[doc(hidden)]
 pub type StandaloneQwenLoader = Box<
@@ -141,6 +153,123 @@ pub type StandaloneQwenLoader = Box<
         > + Send
         + 'static,
 >;
+
+/// Startup text selected with the serving provider.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub struct StandaloneStartupDescription {
+    /// Route evidence printed before the loading line.
+    pub route_marker: Option<String>,
+    /// Format label used by the loading line.
+    pub loading_label: &'static str,
+}
+
+/// A provider's staged standalone worker load and post-ready continuation.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub struct StandaloneLoadPlan {
+    factory: ServingFactory,
+    post_ready: StandalonePostReady,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+impl StandaloneLoadPlan {
+    pub(crate) fn new(factory: ServingFactory, post_ready: StandalonePostReady) -> Self {
+        Self {
+            factory,
+            post_ready,
+        }
+    }
+
+    /// Open the worker and load the selected provider's model on its thread.
+    pub fn open(
+        self,
+        max_pending: usize,
+        residency_limits: ResidencyLimits,
+    ) -> Result<StartedStandalone, String> {
+        let (owner, jobs, metadata, preparation) = AffineWorker::spawn_with_vision(
+            self.factory,
+            max_pending,
+            residency_limits,
+        )
+        .map_err(|error| match error {
+            StartupError::Load(message) => message,
+            StartupError::ThreadExited => "worker thread exited during model load".to_owned(),
+            other => other.to_string(),
+        })?;
+        Ok(StartedStandalone {
+            owner,
+            jobs,
+            metadata,
+            preparation,
+            post_ready: self.post_ready,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+type GrammarVocabularyLoad =
+    Box<dyn FnOnce() -> Result<std::sync::Arc<Vec<Vec<u8>>>, String> + Send + 'static>;
+
+/// One-shot work that follows the worker's ready line.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub struct StandalonePostReady {
+    finish: GrammarVocabularyLoad,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+impl StandalonePostReady {
+    pub(crate) fn new(
+        finish: impl FnOnce() -> Result<std::sync::Arc<Vec<Vec<u8>>>, String> + Send + 'static,
+    ) -> Self {
+        Self {
+            finish: Box::new(finish),
+        }
+    }
+
+    /// Complete provider work and return the grammar vocabulary.
+    pub fn finish(self) -> Result<std::sync::Arc<Vec<Vec<u8>>>, String> {
+        (self.finish)()
+    }
+}
+
+/// The standalone worker handles and post-ready continuation.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub struct StartedStandalone {
+    /// Owner retained for the server lifetime.
+    pub owner: WorkerOwner,
+    /// Client stored in the standalone application state.
+    pub jobs: WorkerClient,
+    /// Metadata from the loaded model.
+    pub metadata: WorkerMetadata,
+    /// Preparation data returned by the worker factory.
+    pub preparation: PreparationHandle,
+    /// Provider-owned work performed after the ready line.
+    pub post_ready: StandalonePostReady,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) fn standalone_startup_description(
+    format: ModelFormat,
+    route: Option<ServedRoute>,
+) -> StandaloneStartupDescription {
+    let loading_label = if route.is_some_and(|route| route.family == ModelFamily::Gemma4) {
+        "safetensors"
+    } else {
+        match format {
+            ModelFormat::Q4 => "q4",
+            ModelFormat::Safetensors => "bf16",
+            ModelFormat::Unknown => "unknown",
+            _ => "unknown",
+        }
+    };
+    StandaloneStartupDescription {
+        route_marker: route.map(|route| route.selection_marker(format)),
+        loading_label,
+    }
+}
 
 /// The provider selected for one checkpoint and its existing route projection.
 #[doc(hidden)]
@@ -183,6 +312,26 @@ impl SelectedProvider<'_> {
             .validate_standalone_options(entry, self.legacy_route, presence)
     }
 
+    /// Describe the route before model loading starts.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub fn standalone_startup_description(&self) -> StandaloneStartupDescription {
+        self.provider
+            .standalone_startup_description(self.evidence.format, self.legacy_route)
+    }
+
+    /// Prepare the selected provider's staged standalone load plan.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub fn prepare_standalone_load(
+        self,
+        options: StandaloneLoadOptions,
+    ) -> Result<StandaloneLoadPlan, String> {
+        if self.entry != ServingEntry::Standalone {
+            return Err("standalone load plan requested for a non-standalone entry".to_owned());
+        }
+        self.provider
+            .prepare_standalone_load(self.evidence, self.legacy_route, options)
+    }
+
     /// Build the standalone worker factory through the selected provider.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub fn into_standalone_factory(
@@ -223,6 +372,21 @@ pub(crate) trait ServingProvider: Sync {
         route: Option<ServedRoute>,
         presence: &StandaloneOptionPresence,
     ) -> Result<(), String>;
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_startup_description(
+        &self,
+        format: ModelFormat,
+        route: Option<ServedRoute>,
+    ) -> StandaloneStartupDescription;
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn prepare_standalone_load(
+        &self,
+        evidence: CheckpointEvidence,
+        route: Option<ServedRoute>,
+        options: StandaloneLoadOptions,
+    ) -> Result<StandaloneLoadPlan, String>;
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn standalone_factory(

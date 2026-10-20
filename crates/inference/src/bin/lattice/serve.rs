@@ -305,7 +305,7 @@ impl ModelBackend {
         // Preserves this binary's pre-existing behavior exactly: the
         // context window is this fixed cap, not re-derived from
         // `state.max_context()` after loading (unlike
-        // `lattice_serve.rs`'s `load_model`). Passed to the shared
+        // `providers::qwen::worker::load_model`). Passed to the shared
         // worker's `WorkerMetadata` too, so its internal
         // `check_prompt_fits_window` invariant agrees with the
         // HTTP-layer `check_context_window` preflight that already runs
