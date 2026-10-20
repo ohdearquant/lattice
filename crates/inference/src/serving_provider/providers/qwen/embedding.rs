@@ -377,6 +377,9 @@ mod route_tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::serve::embeddings::*;
+    // The route module imports these privately, so its glob does not carry them.
+    #[allow(unused_imports)]
+    use crate::serve::{ApiError, contract::decode_inline_image};
 
     mod tests;
 }

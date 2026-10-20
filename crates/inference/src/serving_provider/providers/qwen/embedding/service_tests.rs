@@ -1,13 +1,16 @@
 use crate::forward::cpu_f16::PoolingStrategy;
 use crate::serve::embeddings::test_support::tiny_embedding_model;
-use crate::serving_embeddings::{EmbeddingRepresentation, PooledEmbeddingHandle};
+use crate::serving_embeddings::{
+    EmbeddingRepresentation, PooledEmbeddingHandle, PooledEmbeddingService,
+};
 use crate::tokenizer::common::Tokenizer as _;
 use std::sync::Arc;
 
 #[test]
 fn pooled_handle_matches_legacy_model_operations() {
     let model = Arc::new(tiny_embedding_model());
-    let handle = PooledEmbeddingHandle::new(Arc::clone(&model));
+    let service: Arc<dyn PooledEmbeddingService> = model.clone();
+    let handle = PooledEmbeddingHandle::new(service);
     let text = "ab";
     let pooling = PoolingStrategy::MeanVisualTokens;
 
