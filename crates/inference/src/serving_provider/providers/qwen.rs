@@ -13,14 +13,16 @@ use crate::serving_factory::ServingFactory;
 use crate::serving_provider::{CheckpointEvidence, ServingEntry, ServingProvider};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_provider::{
-    StandaloneLoadOptions, StandaloneLoadPlan, StandaloneOptionPresence, StandaloneQwenLoader,
-    StandaloneStartupDescription,
+    LatticeOpenOptions, StandaloneLoadOptions, StandaloneLoadPlan, StandaloneOptionPresence,
+    StandaloneQwenLoader, StandaloneStartupDescription,
 };
 use std::path::Path;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod adapters;
 pub(crate) mod cpu;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod lattice_worker;
 mod preparation;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod vision;
@@ -68,6 +70,15 @@ impl ServingProvider for QwenProvider {
         evidence: &CheckpointEvidence,
     ) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
         cpu::load(evidence)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn open_lattice_metal(
+        &self,
+        evidence: CheckpointEvidence,
+        options: LatticeOpenOptions,
+    ) -> Result<crate::serving_host::ServingHandle, String> {
+        lattice_worker::open(evidence.directory, options)
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]

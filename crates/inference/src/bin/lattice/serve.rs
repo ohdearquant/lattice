@@ -50,7 +50,7 @@ use lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES;
 // -----------------------------------------------------------------------
 
 /// Handle used while constructing the unified server's serving facade.
-#[cfg(feature = "metal-gpu")]
+#[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
 #[derive(Clone)]
 pub struct MetalHandle {
     client: lattice_inference::serve::metal_worker::MetalWorkerClient,
@@ -62,10 +62,11 @@ fn map_metal_generation_error(error: ApiError) -> ApiError {
 }
 
 /// Startup result used to construct the HTTP serving facade.
+#[cfg(all(test, feature = "test-utils"))]
 #[derive(Clone)]
 pub enum ModelBackend {
     Cpu(lattice_inference::serving_cpu_host::SharedCpuHandle),
-    #[cfg(feature = "metal-gpu")]
+    #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
     Metal {
         handle: MetalHandle,
         tokenizer: Arc<lattice_inference::tokenizer::bpe::BpeTokenizer>,
@@ -73,6 +74,7 @@ pub enum ModelBackend {
     },
 }
 
+#[cfg(all(test, feature = "test-utils"))]
 impl ModelBackend {
     /// Build the shared request facade after the startup route has loaded.
     pub(super) fn into_serving_handle(
@@ -84,7 +86,7 @@ impl ModelBackend {
                 cpu,
                 generation_admission,
             ),
-            #[cfg(feature = "metal-gpu")]
+            #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
             Self::Metal {
                 handle,
                 tokenizer,
@@ -95,136 +97,6 @@ impl ModelBackend {
                 max_context,
             ),
         }
-    }
-
-    /// Load a native Q4 checkpoint on the shared Metal worker thread
-    /// (`lattice_inference::serve::metal_worker::MetalWorker`, issue
-    /// #832 — the same shared owner `lattice_serve.rs` uses) and return
-    /// the startup handle plus the resolved context
-    /// window, for `main()`'s `Command::Serve` startup sequence.
-    #[cfg(feature = "metal-gpu")]
-    pub(super) fn spawn_metal(
-        model_dir: std::path::PathBuf,
-        tokenizer_dir: Option<std::path::PathBuf>,
-        max_pending: usize,
-        residency_limits: lattice_inference::serve::lora::ResidencyLimits,
-        preload_vision: bool,
-    ) -> Result<(Self, usize), String> {
-        use lattice_inference::serve::metal_worker::{
-            ContextWindowPolicy, MetalWorker, StartupError, VisionRuntime, WorkerMetadata,
-        };
-        use lattice_inference::serving_factory::ServingFactory;
-
-        let tokenizer_path = tokenizer_dir
-            .as_deref()
-            .unwrap_or(&model_dir)
-            .join("tokenizer.json");
-        let tokenizer = Arc::new(
-            lattice_inference::tokenizer::bpe::BpeTokenizer::from_tokenizer_json(&tokenizer_path)
-                .map_err(|e| format!("tokenizer load failed ({}): {e}", tokenizer_path.display()))?,
-        );
-        // #832: the shared worker's loader needs its own owned
-        // tokenizer (it renders + tokenizes the prompt once per request
-        // for the KV-window check, `check_prompt_fits_window`).
-        // Cloned from the `Arc` above rather than re-read from disk, so
-        // `tokenizer.json` is still parsed exactly once; this is a
-        // single, one-time, startup-only in-memory clone, not a
-        // per-request cost.
-        let tokenizer_for_worker = (*tokenizer).clone();
-        // Preserves this binary's pre-existing behavior exactly: the
-        // context window is this fixed cap, not re-derived from
-        // `state.max_context()` after loading (unlike
-        // `providers::qwen::worker::load_model`). Passed to the shared
-        // worker's `WorkerMetadata` too, so its internal
-        // `check_prompt_fits_window` invariant agrees with the
-        // HTTP-layer `check_context_window` preflight that already runs
-        // first in `prepare_chat_request`.
-        let max_context = crate::chat::chat_max_cache_len();
-        let vision_config = crate::chat::load_q4_config(&model_dir)?;
-        let mut vision_runtime =
-            VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
-        if preload_vision {
-            // issue #1336: eager-load now, on this startup thread, before the
-            // Metal worker thread spawns. Lazy stays the default (see the
-            // `--preload-vision` help text); a failure here must not abort
-            // startup — warn and fall back to the normal lazy load on the
-            // first image request, exactly as if this flag were absent.
-            if let Err(err) = vision_runtime.preload() {
-                eprintln!(
-                    "Warning: --preload-vision failed, falling back to lazy vision loading: {err}"
-                );
-            }
-        }
-        let model_dir_for_loader = model_dir.clone();
-        let tokenizer_path_for_loader = tokenizer_path.clone();
-        let (owner, client, _meta, _preparation) = MetalWorker::spawn_with_vision(
-            ServingFactory::qwen_metal(
-                move || {
-                    let cfg = crate::chat::load_q4_config(&model_dir_for_loader)?;
-                    let state =
-                        lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir(
-                            &model_dir_for_loader,
-                            &tokenizer_path_for_loader,
-                            &cfg,
-                            max_context,
-                        )
-                        .map_err(|e| format!("Q4 model load failed: {e}"))?;
-                    Ok((
-                        state,
-                        tokenizer_for_worker,
-                        WorkerMetadata {
-                            format: "q4".to_string(),
-                            model_max_context: max_context,
-                            context_window_policy: ContextWindowPolicy::PromptAndMaxTokens,
-                        },
-                    ))
-                },
-                vision_runtime,
-            ),
-            max_pending,
-            residency_limits,
-        )
-        .map_err(|e| match e {
-            StartupError::Load(msg) => msg,
-            // Preserves this binary's exact prior wording (distinct
-            // from `MetalWorker::spawn`'s own generic
-            // `StartupError::ThreadExited` `Display` text) for the same
-            // condition: the worker thread exited/panicked before ever
-            // sending a readiness signal.
-            StartupError::ThreadExited => {
-                "Metal worker thread exited before loading finished".to_string()
-            }
-            // #939: clap's own `value_parser` range already rejects an
-            // out-of-range `--max-pending` before this call, so this
-            // arm is unreachable in practice through the CLI -- kept
-            // for exhaustiveness and as defense in depth against any
-            // other future `spawn_metal` caller.
-            err @ StartupError::InvalidMaxPending { .. } => err.to_string(),
-            // Unrecognized future startup-failure kind: fall back to its
-            // `Display` text rather than guessing at a more specific
-            // wording, same as `InvalidMaxPending` above.
-            err => err.to_string(),
-        })?;
-        // The explicit owner is not needed by this binary: every
-        // production `MetalWorkerClient` retains an owner clone. The
-        // clone held by `client` keeps the worker alive through the
-        // router's lifetime; on a normal return, dropping the last
-        // client closes the queue before the last owner performs its
-        // bounded join. As with `lattice_serve.rs`, that guarantee does
-        // not reach this file's fatal `std::process::exit` calls (e.g.
-        // the server-error path a few lines below, after
-        // `serve_until_shutdown` returns `Err`): process exit never
-        // runs destructors, so any owner clone still alive at that
-        // point is dropped without performing the bounded join.
-        drop(owner);
-        Ok((
-            ModelBackend::Metal {
-                handle: MetalHandle { client },
-                tokenizer,
-                max_context,
-            },
-            max_context,
-        ))
     }
 }
 
@@ -252,9 +124,9 @@ pub fn episode_store() -> Arc<std::sync::Mutex<lattice_inference::router_episode
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-utils"))]
 pub type DefaultAppStateModel = ModelBackend;
-#[cfg(not(test))]
+#[cfg(not(all(test, feature = "test-utils")))]
 pub type DefaultAppStateModel = lattice_inference::serving_host::ServingHandle;
 
 /// A construction-time model value converted to the serving facade at startup.
@@ -274,7 +146,7 @@ impl IntoServingHandle for lattice_inference::serving_host::ServingHandle {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-utils"))]
 impl IntoServingHandle for ModelBackend {
     fn into_serving_handle(
         self,

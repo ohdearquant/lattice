@@ -19,6 +19,8 @@ use crate::serving_worker::{AffineWorker, StartupError, WorkerClient, WorkerOwne
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 pub mod providers;
 
@@ -43,6 +45,23 @@ pub struct CheckpointEvidence {
     directory: PathBuf,
     format: ModelFormat,
     model_type: Option<String>,
+}
+
+/// Options used when opening a `lattice serve` route.
+#[doc(hidden)]
+pub struct LatticeOpenOptions {
+    /// Optional directory containing the Q4 tokenizer.
+    pub tokenizer_dir: Option<PathBuf>,
+    /// Maximum number of queued and in-flight worker requests.
+    pub max_pending: usize,
+    /// Maximum number of resident adapter identities.
+    pub max_resident_adapters: usize,
+    /// Maximum resident adapter tensor payload, in bytes.
+    pub max_resident_adapter_bytes: usize,
+    /// Whether to eagerly load available vision weights before worker startup.
+    pub preload_vision: bool,
+    /// Fixed context cap used by the `lattice` command.
+    pub context_window: usize,
 }
 
 impl CheckpointEvidence {
@@ -301,6 +320,49 @@ impl SelectedProvider<'_> {
         self.provider.load_lattice_cpu(&self.evidence)
     }
 
+    /// Open the selected route for the `lattice serve` command.
+    #[doc(hidden)]
+    pub fn open_lattice(
+        self,
+        options: LatticeOpenOptions,
+        generation_admission: Arc<Semaphore>,
+    ) -> Result<crate::serving_host::ServingHandle, String> {
+        if self.entry != ServingEntry::Lattice {
+            return Err("lattice loading requested for a non-lattice entry".to_owned());
+        }
+        let Some(route) = self.legacy_route else {
+            return Err(crate::model_format::unloadable_format_message(
+                &self.evidence.directory,
+            ));
+        };
+        match route.backend {
+            ServedBackend::Cpu => {
+                #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+                let _ = options;
+                let cpu = self.load_lattice_cpu()?;
+                Ok(crate::serving_host::ServingHandle::shared_cpu(
+                    cpu,
+                    generation_admission,
+                ))
+            }
+            ServedBackend::Metal => {
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                {
+                    self.provider
+                        .open_lattice_metal(self.evidence, options)
+                        .map_err(|error| format!("failed to load Q4 model: {error}"))
+                }
+                #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+                {
+                    let _ = (options, generation_admission);
+                    Err(crate::model_format::metal_gpu_required_message(
+                        &self.evidence.directory,
+                    ))
+                }
+            }
+        }
+    }
+
     /// Validate standalone flag presence through the selected provider.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub fn validate_standalone_options(
@@ -363,6 +425,15 @@ pub(crate) trait ServingProvider: Sync {
         _evidence: &CheckpointEvidence,
     ) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
         Err("selected provider does not load a lattice CPU route".to_owned())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn open_lattice_metal(
+        &self,
+        _evidence: CheckpointEvidence,
+        _options: LatticeOpenOptions,
+    ) -> Result<crate::serving_host::ServingHandle, String> {
+        Err("selected provider does not load a lattice Metal route".to_owned())
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
