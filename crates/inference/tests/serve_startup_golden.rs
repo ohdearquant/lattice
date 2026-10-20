@@ -161,6 +161,40 @@ fn standalone_gemma_refuses_max_resident_adapter_bytes_before_route_selection() 
 }
 
 #[test]
+fn standalone_gemma_refuses_explicit_default_residency_flags_by_presence() {
+    let dir = stub_model(&gemma_config(), Some("model.safetensors"));
+    let result = run(
+        Binary::LatticeServe,
+        Some(dir.path()),
+        &["--max-resident-adapters", "32"],
+    );
+    assert_startup(
+        &result,
+        Some(dir.path()),
+        Some(1),
+        "lattice_serve: unsupported_feature: --max-resident-adapters is not supported for Gemma 4 checkpoints",
+        &[],
+    );
+}
+
+#[test]
+fn standalone_gemma_refuses_explicit_default_resident_bytes_by_presence() {
+    let dir = stub_model(&gemma_config(), Some("model.safetensors"));
+    let result = run(
+        Binary::LatticeServe,
+        Some(dir.path()),
+        &["--max-resident-adapter-bytes", "536870912"],
+    );
+    assert_startup(
+        &result,
+        Some(dir.path()),
+        Some(1),
+        "lattice_serve: unsupported_feature: --max-resident-adapter-bytes is not supported for Gemma 4 checkpoints",
+        &[],
+    );
+}
+
+#[test]
 fn standalone_gemma_refuses_positive_reasoning_budget_before_route_selection() {
     let dir = stub_model(&gemma_config(), Some("model.safetensors"));
     let result = run(
@@ -970,6 +1004,39 @@ fn standalone_unknown_absent_valid_config_valid_tokenizer_preload_vision() {
         UnknownTokenizer::Valid,
         &["--preload-vision"],
         "lattice_serve: '<TEMP>' is not a recognized model directory: no model.safetensors, model.safetensors.index.json, or *.q4 tensor files were found",
+    );
+}
+
+#[test]
+fn standalone_unclaimed_identity_falls_back_to_the_qwen_route() {
+    let dir = tempfile::tempdir().expect("temporary model directory");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/qwen35_0_8b_config.json"))
+            .expect("valid Qwen config fixture");
+    config["model_type"] = serde_json::Value::String("unregistered_architecture".into());
+    std::fs::write(
+        dir.path().join("config.json"),
+        serde_json::to_vec(&config).expect("serialize config"),
+    )
+    .expect("write config.json");
+    common::stub_weights(&dir.path().join("model.safetensors"));
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tokenizers/qwen3-embedding-0.6b/tokenizer.json"),
+        dir.path().join("tokenizer.json"),
+    )
+    .expect("copy Qwen tokenizer fixture");
+
+    let result = run(Binary::LatticeServe, Some(dir.path()), &[]);
+    assert_startup(
+        &result,
+        Some(dir.path()),
+        Some(1),
+        "lattice_serve: safetensors load failed: Missing tensor: model.language_model.embed_tokens.weight",
+        &[
+            "[route] selected family=qwen35 backend=metal format=safetensors",
+            "[lattice_serve] loading model from <TEMP> (bf16) ...",
+        ],
     );
 }
 
