@@ -26,7 +26,10 @@ pub mod providers;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[doc(hidden)]
-pub use providers::qwen::worker::{FALLBACK_MODEL_MAX_CONTEXT, model_context_from_config};
+pub use providers::qwen::worker::{
+    DEFAULT_SERVE_MAX_CONTEXT, FALLBACK_MODEL_MAX_CONTEXT, ServeContextSource,
+    model_context_from_config, parse_max_context, resolve_serve_context,
+};
 
 /// A binary's serving route policy.
 #[doc(hidden)]
@@ -155,6 +158,9 @@ pub struct StandaloneLoadOptions {
     pub tokenizer_path: PathBuf,
     /// Whether Qwen vision weights should be loaded before worker startup.
     pub preload_vision: bool,
+    /// `--max-context`: caps the served context window. `None` serves
+    /// the smaller of the model window and the default serving cap.
+    pub max_context: Option<usize>,
 }
 
 /// Compatibility loader builder for existing standalone factory callers.
@@ -189,6 +195,7 @@ pub struct StandaloneStartupDescription {
 pub struct StandaloneLoadPlan {
     factory: ServingFactory,
     post_ready: StandalonePostReady,
+    context_source: Option<ServeContextSource>,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -197,7 +204,13 @@ impl StandaloneLoadPlan {
         Self {
             factory,
             post_ready,
+            context_source: None,
         }
+    }
+
+    pub(crate) fn with_context_source(mut self, source: ServeContextSource) -> Self {
+        self.context_source = Some(source);
+        self
     }
 
     /// Open the worker and load the selected provider's model on its thread.
@@ -222,6 +235,7 @@ impl StandaloneLoadPlan {
             metadata,
             preparation,
             post_ready: self.post_ready,
+            context_source: self.context_source,
         })
     }
 }
@@ -267,6 +281,9 @@ pub struct StartedStandalone {
     pub preparation: PreparationHandle,
     /// Provider-owned work performed after the ready line.
     pub post_ready: StandalonePostReady,
+    /// Where the served context window came from, when the provider chose
+    /// it. `None` means the model's own window.
+    pub context_source: Option<ServeContextSource>,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
