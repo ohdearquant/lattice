@@ -115,7 +115,7 @@ mod imp {
         parse_embeddings_input,
     };
     use lattice_inference::serve::into_engine_chat_messages;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
     use lattice_inference::serve::metal_worker::{ContextWindowPolicy, MetalWorker};
     use lattice_inference::serve::metal_worker::{MetalWorkerClient, WorkerEvent};
     use lattice_inference::serve::metrics::ServeMetrics;
