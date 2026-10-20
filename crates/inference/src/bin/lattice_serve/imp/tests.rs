@@ -2073,6 +2073,9 @@ mod v0_schema;
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 mod characterization;
 
+#[cfg(feature = "test-utils")]
+mod embeddings_route_characterization;
+
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 #[tokio::test]
 async fn chat_completions_n_greater_than_one_400() {
