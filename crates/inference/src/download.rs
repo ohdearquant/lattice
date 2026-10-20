@@ -343,13 +343,15 @@ fn expected_checksums(model_name: &str) -> ExpectedChecksums {
 fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
     use std::io::Write;
 
-    let response = ureq::get(url)
-        .set("User-Agent", "lattice-inference/0.3.3")
+    let agent: ureq::Agent = ureq::Agent::config_builder().proxy(None).build().into();
+    let response = agent
+        .get(url)
+        .header("User-Agent", "lattice-inference/0.3.3")
         .call()
         .map_err(|e| InferenceError::Download(format!("{url}: {e}")))?;
 
     let tmp_path = path.with_extension("part");
-    let mut reader = response.into_reader();
+    let mut reader = response.into_body().into_reader();
     let mut file = create_download_target(&tmp_path)?;
     std::io::copy(&mut reader, &mut file)?;
     file.flush()?;

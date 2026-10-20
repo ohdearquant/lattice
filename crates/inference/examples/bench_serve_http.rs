@@ -38,7 +38,7 @@
 //! bytes) is refused at the first read that returns after that deadline: the
 //! deadline is checked between reads. A read already blocked when the deadline
 //! passes is bounded by the HTTP client's own whole-request timeout, which
-//! `ureq` 2 applies to body reads as well as to the headers, and which is set
+//! `ureq` 3 applies to body reads as well as to the headers, and which is set
 //! 2 s after this deadline, so that read fails about 2 s later. Streaming
 //! chunks carry no `usage` object, so a stream is certified by its content
 //! deltas and reports `completion_tokens=na`.
@@ -825,10 +825,13 @@ struct Client {
 impl Client {
     fn new(base: String, request_timeout: Duration) -> Self {
         Self {
-            agent: ureq::AgentBuilder::new()
-                .timeout_connect(CONNECT_TIMEOUT.min(request_timeout))
-                .timeout(request_timeout.saturating_add(TRANSPORT_GRACE))
-                .build(),
+            agent: ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .proxy(None)
+                .timeout_connect(Some(CONNECT_TIMEOUT.min(request_timeout)))
+                .timeout_global(Some(request_timeout.saturating_add(TRANSPORT_GRACE)))
+                .build()
+                .into(),
             base,
             request_timeout,
         }
@@ -837,20 +840,24 @@ impl Client {
     fn check_health(&self) -> Result<(), Refusal> {
         match self.agent.get(&format!("{}/health", self.base)).call() {
             Ok(response) if response.status() == 200 => Ok(()),
-            Ok(response) => Err(Refusal::HttpStatus {
-                status: response.status(),
+            Ok(response) if response.status().as_u16() < 400 => Err(Refusal::HttpStatus {
+                status: response.status().as_u16(),
                 body: String::new(),
             }),
-            Err(ureq::Error::Status(status, response)) => Err(Refusal::HttpStatus {
-                status,
-                body: response.into_string().unwrap_or_default(),
+            Ok(response) => Err(Refusal::HttpStatus {
+                status: response.status().as_u16(),
+                body: response.into_body().read_to_string().unwrap_or_default(),
             }),
             Err(e) => Err(self.transport_refusal(&e)),
         }
     }
 
     fn io_refusal(&self, error: &std::io::Error) -> Refusal {
-        if error.kind() == std::io::ErrorKind::TimedOut {
+        let wrapped_timeout = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+            .is_some_and(|inner| matches!(inner, ureq::Error::Timeout(_)));
+        if error.kind() == std::io::ErrorKind::TimedOut || wrapped_timeout {
             Refusal::Timeout {
                 waited_secs: self.request_timeout.as_secs(),
             }
@@ -860,13 +867,20 @@ impl Client {
     }
 
     fn transport_refusal(&self, error: &ureq::Error) -> Refusal {
-        match std::error::Error::source(error).and_then(|s| s.downcast_ref::<std::io::Error>()) {
-            Some(io) => self.io_refusal(io),
-            None => Refusal::Transport(error.to_string()),
+        match error {
+            ureq::Error::Timeout(_) => Refusal::Timeout {
+                waited_secs: self.request_timeout.as_secs(),
+            },
+            ureq::Error::Io(io) => self.io_refusal(io),
+            _ => Refusal::Transport(error.to_string()),
         }
     }
 
-    fn post_chat(&self, body: &Value, deadline: Instant) -> Result<ureq::Response, Refusal> {
+    fn post_chat(
+        &self,
+        body: &Value,
+        deadline: Instant,
+    ) -> Result<ureq::http::Response<ureq::Body>, Refusal> {
         self.post_json("/v1/chat/completions", body, deadline)
     }
 
@@ -875,17 +889,18 @@ impl Client {
         path: &str,
         body: &Value,
         deadline: Instant,
-    ) -> Result<ureq::Response, Refusal> {
+    ) -> Result<ureq::http::Response<ureq::Body>, Refusal> {
         let bytes = serde_json::to_vec(body).map_err(|e| Refusal::MalformedBody(e.to_string()))?;
         match self
             .agent
             .post(&format!("{}{path}", self.base))
-            .set("content-type", "application/json")
-            .send_bytes(&bytes)
+            .header("content-type", "application/json")
+            .send(&bytes[..])
         {
-            Ok(response) => Ok(response),
-            Err(ureq::Error::Status(status, response)) => {
-                match self.read_body(response.into_reader(), deadline) {
+            Ok(response) if response.status().as_u16() < 400 => Ok(response),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                match self.read_body(response.into_body().into_reader(), deadline) {
                     Err(timeout @ Refusal::Timeout { .. }) => Err(timeout),
                     Err(_) => Err(Refusal::HttpStatus {
                         status,
@@ -935,7 +950,7 @@ impl Client {
         let deadline = self.deadline_from(start)?;
         let max_tokens = requested_max_tokens(body)?;
         let response = self.post_chat(body, deadline)?;
-        let text = self.read_body(response.into_reader(), deadline)?;
+        let text = self.read_body(response.into_body().into_reader(), deadline)?;
         let total_ms = ms(start);
         Ok((certify_nonstream(&text, max_tokens)?, total_ms))
     }
@@ -945,7 +960,7 @@ impl Client {
         let deadline = self.deadline_from(start)?;
         let items = requested_items(body)?;
         let response = self.post_json("/v1/embeddings", body, deadline)?;
-        let text = self.read_body(response.into_reader(), deadline)?;
+        let text = self.read_body(response.into_body().into_reader(), deadline)?;
         let total_ms = ms(start);
         Ok((certify_embeddings(&text, items)?, total_ms))
     }
@@ -955,7 +970,7 @@ impl Client {
         let deadline = self.deadline_from(start)?;
         let max_tokens = requested_max_tokens(body)?;
         let response = self.post_chat(body, deadline)?;
-        let mut reader = BufReader::new(response.into_reader());
+        let mut reader = BufReader::new(response.into_body().into_reader());
         let mut tally = StreamTally::default();
         let mut events = SseEventBuffer::default();
         let mut line = String::new();
