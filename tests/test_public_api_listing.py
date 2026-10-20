@@ -61,6 +61,7 @@ class PublicApiListingTests(unittest.TestCase):
         cls.glob = listing(cls.docs / "glob")
         cls.missing = listing(cls.docs / "missing")
         cls.added = listing(cls.docs / "added")
+        cls.local_glob = listing(cls.docs / "local_glob")
 
     def test_baseline_shape_covers_every_required_kind(self) -> None:
         expected = {
@@ -97,6 +98,11 @@ class PublicApiListingTests(unittest.TestCase):
 
     def test_glob_reexports_are_identical(self) -> None:
         self.assertEqual(self.glob, self.baseline)
+
+    def test_local_glob_reexports_expand_in_place(self) -> None:
+        self.assertEqual(
+            set(self.local_glob), set(self.baseline) | {"function listing_baseline::run"}
+        )
 
     def test_missing_reexport_differs_by_exactly_that_item(self) -> None:
         self.assertEqual(
