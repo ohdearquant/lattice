@@ -1,5 +1,6 @@
 //! Directory-aware provider selection for serving entry points.
 
+use crate::error::InferenceError;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::forward::metal_qwen35::MetalQwen35State;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -10,6 +11,7 @@ use crate::serve::lora::ResidencyLimits;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serve::prepare::PreparationHandle;
 use crate::serve::route::{RouteRefusal, ServedBackend, ServedRoute};
+use crate::serving_embeddings::PooledEmbeddingHandle;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -132,6 +134,84 @@ impl SelectionError {
             Self::Route { directory, refusal } => refusal.message(directory),
         }
     }
+}
+
+/// Why pooled embedding provider selection could not choose one provider.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingSelectionError {
+    /// More than one registered provider claimed the checkpoint.
+    Ambiguous {
+        /// Provider names in deterministic sorted order.
+        providers: Vec<&'static str>,
+    },
+}
+
+impl std::fmt::Display for EmbeddingSelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ambiguous { providers } => {
+                write!(
+                    formatter,
+                    "ambiguous pooled embedding providers: {}",
+                    providers.join(", ")
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EmbeddingSelectionError {}
+
+/// Opaque pooled embedding load plan selected from checkpoint evidence.
+#[doc(hidden)]
+pub struct PooledEmbeddingPlan {
+    inner: Box<dyn PooledEmbeddingLoadPlan>,
+}
+
+impl PooledEmbeddingPlan {
+    /// Loads the selected provider's pooled embedding service.
+    pub fn load(self) -> Result<PooledEmbeddingHandle, InferenceError> {
+        self.inner.load()
+    }
+}
+
+/// An implicit pooled embedding action selected alongside generation.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplicitPooledEmbeddingPlan {
+    /// Checkpoint directory to try after generation loading succeeds.
+    pub directory_to_try: Option<PathBuf>,
+    /// Startup line to emit when pooled embeddings are disabled.
+    pub disabled_line: Option<String>,
+}
+
+pub(crate) trait RegisteredProvider: Sync {
+    fn generation(&self) -> Option<&dyn ServingProvider>;
+    fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider>;
+}
+
+pub(crate) trait PooledEmbeddingProvider: Sync {
+    fn name(&self) -> &'static str;
+    fn claims(&self, evidence: &CheckpointEvidence) -> bool;
+    fn plan(&self, directory: PathBuf) -> Box<dyn PooledEmbeddingLoadPlan>;
+}
+
+pub(crate) trait PooledEmbeddingLoadPlan {
+    fn load(self: Box<Self>) -> Result<PooledEmbeddingHandle, InferenceError>;
+}
+
+/// Plans a pooled embedding load from a checkpoint directory.
+#[doc(hidden)]
+pub fn plan_pooled_embeddings(
+    directory: &Path,
+) -> Result<PooledEmbeddingPlan, EmbeddingSelectionError> {
+    let evidence = inspect_checkpoint(directory);
+    let provider =
+        select_pooled_with_registry(&evidence, &providers::PROVIDERS, &providers::QWEN_PROVIDER)?;
+    Ok(PooledEmbeddingPlan {
+        inner: provider.plan(evidence.directory),
+    })
 }
 
 /// Presence of standalone flags that a provider may reject.
@@ -323,6 +403,12 @@ impl SelectedProvider<'_> {
         self.legacy_route
     }
 
+    /// Describes the selected provider's implicit pooled embedding action.
+    pub fn implicit_pooled_embeddings(&self, model: &str) -> ImplicitPooledEmbeddingPlan {
+        self.provider
+            .implicit_pooled_embeddings(&self.evidence, model)
+    }
+
     /// Load the selected provider's CPU route for `lattice serve`.
     pub fn load_lattice_cpu(&self) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
         if self.entry != ServingEntry::Lattice {
@@ -437,6 +523,12 @@ pub(crate) trait ServingProvider: Sync {
         entry: ServingEntry,
     ) -> Result<Option<ServedRoute>, RouteRefusal>;
 
+    fn implicit_pooled_embeddings(
+        &self,
+        evidence: &CheckpointEvidence,
+        model: &str,
+    ) -> ImplicitPooledEmbeddingPlan;
+
     fn load_lattice_cpu(
         &self,
         _evidence: &CheckpointEvidence,
@@ -486,11 +578,9 @@ pub(crate) trait ServingProvider: Sync {
 }
 
 pub(crate) struct ProviderRegistry<'a> {
-    providers: &'a [&'a dyn ServingProvider],
-    legacy: &'a dyn ServingProvider,
+    providers: &'a [&'a dyn RegisteredProvider],
+    legacy_generation: &'a dyn ServingProvider,
 }
-
-static LEGACY_PROVIDER: &dyn ServingProvider = &providers::QWEN_PROVIDER;
 
 /// Select a provider and project the route for one serving entry.
 #[doc(hidden)]
@@ -500,7 +590,7 @@ pub fn select(
 ) -> Result<SelectedProvider<'static>, SelectionError> {
     let registry = ProviderRegistry {
         providers: &providers::PROVIDERS,
-        legacy: LEGACY_PROVIDER,
+        legacy_generation: &providers::QWEN_PROVIDER,
     };
     select_with_registry(evidence, entry, &registry)
 }
@@ -510,29 +600,22 @@ pub(crate) fn select_with_registry<'a>(
     entry: ServingEntry,
     registry: &ProviderRegistry<'a>,
 ) -> Result<SelectedProvider<'a>, SelectionError> {
-    let claimants = registry
-        .providers
-        .iter()
-        .copied()
-        .filter(|provider| provider.claims(&evidence))
-        .collect::<Vec<_>>();
-
-    if claimants.len() > 1 {
-        let mut names = claimants
+    let provider = match unique_claim(
+        registry
+            .providers
             .iter()
-            .map(|provider| provider.name())
-            .collect::<Vec<_>>();
-        names.sort_unstable();
-        return Err(SelectionError::Ambiguous {
-            directory: evidence.directory.clone(),
-            claimants: names,
-        });
-    }
-
-    let provider = if claimants.len() == 1 {
-        claimants[0]
-    } else {
-        registry.legacy
+            .filter_map(|provider| provider.generation()),
+        |provider| provider.claims(&evidence),
+        |provider| provider.name(),
+    ) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => registry.legacy_generation,
+        Err(claimants) => {
+            return Err(SelectionError::Ambiguous {
+                directory: evidence.directory.clone(),
+                claimants,
+            });
+        }
     };
     let legacy_route =
         provider
@@ -548,6 +631,43 @@ pub(crate) fn select_with_registry<'a>(
         entry,
         legacy_route,
     })
+}
+
+fn unique_claim<'a, T: ?Sized>(
+    providers: impl Iterator<Item = &'a T>,
+    claims: impl Fn(&T) -> bool,
+    name: impl Fn(&T) -> &'static str,
+) -> Result<Option<&'a T>, Vec<&'static str>> {
+    let claimants = providers
+        .filter(|provider| claims(provider))
+        .collect::<Vec<_>>();
+    if claimants.len() > 1 {
+        let mut names = claimants
+            .iter()
+            .map(|provider| name(provider))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        return Err(names);
+    }
+    Ok(claimants.into_iter().next())
+}
+
+fn select_pooled_with_registry<'a>(
+    evidence: &CheckpointEvidence,
+    providers: &'a [&'a dyn RegisteredProvider],
+    legacy: &'a dyn PooledEmbeddingProvider,
+) -> Result<&'a dyn PooledEmbeddingProvider, EmbeddingSelectionError> {
+    match unique_claim(
+        providers
+            .iter()
+            .filter_map(|provider| provider.pooled_embeddings()),
+        |provider| provider.claims(evidence),
+        |provider| provider.name(),
+    ) {
+        Ok(Some(provider)) => Ok(provider),
+        Ok(None) => Ok(legacy),
+        Err(providers) => Err(EmbeddingSelectionError::Ambiguous { providers }),
+    }
 }
 
 #[cfg(test)]

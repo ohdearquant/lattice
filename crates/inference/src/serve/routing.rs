@@ -33,6 +33,7 @@
 use crate::router_state::RouterArtifact;
 use crate::serve::ApiError;
 use crate::serve::lora::{AdapterIndex, LoraSelection};
+use crate::serving_embeddings::EmbeddingRepresentation;
 
 // The name-matching machinery below serves the `mixture` body and its tests.
 // It is deliberately NOT `#[cfg(feature = "mixture")]` alone: `cargo test
@@ -859,6 +860,23 @@ pub fn check_representation(
     embedder_identity: &EmbedderIdentity,
     dimensions: usize,
 ) -> Result<crate::forward::cpu_f16::PoolingStrategy, ApiError> {
+    check_service_representation(
+        artifact,
+        embedder_identity,
+        &EmbeddingRepresentation {
+            loader_format: crate::serve::embeddings::QWEN35_F16_DECODER_LOADER,
+            dimensions,
+        },
+    )
+}
+
+/// Checks a gate artifact against the loaded embedding service descriptor.
+#[doc(hidden)]
+pub fn check_service_representation(
+    artifact: &RouterArtifact,
+    embedder_identity: &EmbedderIdentity,
+    representation: &EmbeddingRepresentation,
+) -> Result<crate::forward::cpu_f16::PoolingStrategy, ApiError> {
     // The EMBEDDER's identity, never the chat model's. Those were the same
     // string before ADR-094 decision 1 amendment 2, because the embedder was
     // loaded from the served model's own directory -- so this check passed by
@@ -884,18 +902,18 @@ pub fn check_representation(
     // record now and impossible to add later without invalidating every
     // artifact already written.
     let trained_loader = &artifact.representation.loader_format;
-    if trained_loader != crate::serve::embeddings::QWEN35_F16_DECODER_LOADER {
+    if trained_loader != representation.loader_format {
         return Err(ApiError::BadRequest {
             message: format!(
                 "router gate was trained through the {trained_loader:?} embedding loader but this server embeds through {:?}",
-                crate::serve::embeddings::QWEN35_F16_DECODER_LOADER
+                representation.loader_format
             ),
             code: "router_representation_loader_mismatch",
         });
     }
 
     let recorded = artifact.representation.input_width;
-    let measured = dimensions as u64;
+    let measured = representation.dimensions as u64;
     if recorded != measured {
         return Err(ApiError::BadRequest {
             message: format!(
@@ -951,6 +969,25 @@ impl ServedRouter {
         dimensions: usize,
         learning: bool,
     ) -> Result<Self, ApiError> {
+        Self::new_with_representation(
+            resolved,
+            embedder_identity,
+            &EmbeddingRepresentation {
+                loader_format: crate::serve::embeddings::QWEN35_F16_DECODER_LOADER,
+                dimensions,
+            },
+            learning,
+        )
+    }
+
+    /// [`Self::new`], checked against the loaded embedding service's own
+    /// representation instead of the pooled Qwen loader's.
+    pub fn new_with_representation(
+        resolved: crate::router_state::ResolvedRouter,
+        embedder_identity: &EmbedderIdentity,
+        representation: &EmbeddingRepresentation,
+        learning: bool,
+    ) -> Result<Self, ApiError> {
         // Ordered from the most general refusal to the most specific, which
         // is the same rule the `/v1/lora` handlers follow. A build with no
         // gate implementation cannot route any artifact, so it answers first;
@@ -960,7 +997,8 @@ impl ServedRouter {
         // `mixture` is told to go fix a representation that was never the
         // problem.
         let router = ServingRouter::new(resolved.artifact, learning)?;
-        let pooling = check_representation(router.artifact(), embedder_identity, dimensions)?;
+        let pooling =
+            check_service_representation(router.artifact(), embedder_identity, representation)?;
         Ok(Self {
             router: std::sync::Mutex::new(router),
             pooling,
