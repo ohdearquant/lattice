@@ -339,10 +339,12 @@ async fn pooled_route_uses_the_served_model_and_preserves_mixed_batch_output() {
                 .all(|value| value.as_f64().is_some_and(f64::is_finite)),
             "embedding {index} must contain only finite values"
         );
+        let expected_wire = serde_json::to_string(&expected_data[index].embedding)
+            .expect("fixture embedding must serialize");
         assert_eq!(
             item["embedding"],
-            serde_json::to_value(&expected_data[index].embedding)
-                .expect("fixture embedding must serialize")
+            serde_json::from_str::<Value>(&expected_wire)
+                .expect("serialized fixture embedding must parse")
         );
     }
 }
@@ -352,7 +354,7 @@ async fn pooled_route_returns_distinct_vectors_for_both_pooling_modes() {
     let mut vectors = Vec::new();
     for pooling in ["mean_visual", "last_token"] {
         let response = router(state_with_embedder())
-            .oneshot(post_embeddings(json!({"input": "aa", "pooling": pooling})))
+            .oneshot(post_embeddings(json!({"input": "ab", "pooling": pooling})))
             .await
             .expect("router must return a response");
         assert_eq!(response.status(), StatusCode::OK);
