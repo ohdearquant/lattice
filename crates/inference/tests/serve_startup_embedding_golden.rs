@@ -157,7 +157,7 @@ fn lattice_serve_without_embedding_flag_returns_full_no_model_refusal() {
         server.port(),
         &[
             "[route] selected family=qwen35 backend=metal format=safetensors",
-            "[lattice_serve] loading model from <TEMP>/generation (safetensors) ...",
+            "[lattice_serve] loading model from <TEMP>/generation (bf16) ...",
             "[lattice_serve] model 'generation' (bf16) ready (context=1024, from model max_position_embeddings)",
             "[lattice_serve] OpenAI-compatible API on http://127.0.0.1:<PORT>/v1",
         ],
@@ -188,7 +188,7 @@ fn lattice_serve_loads_bert_embedding_and_returns_finite_vectors() {
         server.port(),
         &[
             "[route] selected family=qwen35 backend=metal format=safetensors",
-            "[lattice_serve] loading model from <TEMP>/generation (safetensors) ...",
+            "[lattice_serve] loading model from <TEMP>/generation (bf16) ...",
             "[lattice_serve] model 'generation' (bf16) ready (context=1024, from model max_position_embeddings)",
             "[lattice_serve] loading embedding model from <TEMP>/bert-fixture ...",
             "[lattice_serve] embedding model 'bert-fixture' ready (dimensions=384)",
@@ -205,11 +205,11 @@ fn lattice_serve_loads_bert_embedding_and_returns_finite_vectors() {
         .as_array()
         .expect("embedding vector array");
     assert_eq!(vector.len(), bert_pooling_fixture::DIMENSIONS);
-    assert!(vector.iter().all(|value| {
-        value
-            .as_f64()
-            .is_some_and(|component| component.is_finite())
-    }));
+    assert!(
+        vector
+            .iter()
+            .all(|value| value.as_f64().is_some_and(f64::is_finite))
+    );
 }
 
 #[test]
@@ -231,7 +231,7 @@ fn lattice_serve_missing_embedding_directory_fails_after_generation_load() {
         "lattice_serve: embedding model directory not found: <TEMP>/missing-embedding",
         &[
             "[route] selected family=qwen35 backend=metal format=safetensors",
-            "[lattice_serve] loading model from <TEMP>/generation (safetensors) ...",
+            "[lattice_serve] loading model from <TEMP>/generation (bf16) ...",
             "[lattice_serve] model 'generation' (bf16) ready (context=1024, from model max_position_embeddings)",
         ],
     );
@@ -260,7 +260,7 @@ fn lattice_serve_pooling_validation_runs_after_directory_and_model_load() {
         "lattice_serve: invalid --embedding-pooling 'max'; expected 'mean' or 'cls'",
         &[
             "[route] selected family=qwen35 backend=metal format=safetensors",
-            "[lattice_serve] loading model from <TEMP>/generation (safetensors) ...",
+            "[lattice_serve] loading model from <TEMP>/generation (bf16) ...",
             "[lattice_serve] model 'generation' (bf16) ready (context=1024, from model max_position_embeddings)",
         ],
     );
@@ -270,7 +270,7 @@ fn lattice_serve_pooling_validation_runs_after_directory_and_model_load() {
         0,
         &[
             "[route] selected family=qwen35 backend=metal format=safetensors",
-            "[lattice_serve] loading model from <TEMP>/generation (safetensors) ...",
+            "[lattice_serve] loading model from <TEMP>/generation (bf16) ...",
             "[lattice_serve] model 'generation' (bf16) ready (context=1024, from model max_position_embeddings)",
             "[lattice_serve] loading embedding model from <TEMP>/bert-fixture ...",
         ],
@@ -299,7 +299,7 @@ fn lattice_serve_pooling_validation_runs_after_directory_and_model_load() {
         "lattice_serve: embedding model directory not found: <TEMP>/missing-bert",
         &[
             "[route] selected family=qwen35 backend=metal format=safetensors",
-            "[lattice_serve] loading model from <TEMP>/generation (safetensors) ...",
+            "[lattice_serve] loading model from <TEMP>/generation (bf16) ...",
             "[lattice_serve] model 'generation' (bf16) ready (context=1024, from model max_position_embeddings)",
         ],
     );
@@ -309,7 +309,7 @@ fn lattice_serve_pooling_validation_runs_after_directory_and_model_load() {
         0,
         &[
             "[route] selected family=qwen35 backend=metal format=safetensors",
-            "[lattice_serve] loading model from <TEMP>/generation (safetensors) ...",
+            "[lattice_serve] loading model from <TEMP>/generation (bf16) ...",
             "[lattice_serve] model 'generation' (bf16) ready (context=1024, from model max_position_embeddings)",
         ],
     );
