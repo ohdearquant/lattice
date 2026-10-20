@@ -1544,9 +1544,10 @@ fn adapter_unsupported_build() -> ApiError {
 }
 
 /// List confirmed resident adapters and the currently applied mixture.
-pub async fn lora_list(
-    State(state): State<AppState<lattice_inference::serving_host::ServingHandle>>,
+pub async fn lora_list<M: IntoServingHandle>(
+    State(state): State<AppState<M>>,
 ) -> Result<Response, ApiError> {
+    let state = state.into_serving_handle();
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
         lora_list_with_backend(
@@ -1903,7 +1904,10 @@ pub(super) fn router<M: IntoServingHandle>(state: AppState<M>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
-        .route("/v1/lora", get(lora_list))
+        .route(
+            "/v1/lora",
+            get(lora_list::<lattice_inference::serving_host::ServingHandle>),
+        )
         .route("/v1/lora/load", post(lora_load))
         .route("/v1/lora/unload", post(lora_unload))
         .route("/v1/router/feedback", post(router_feedback))

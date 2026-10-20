@@ -461,11 +461,6 @@ async fn drain_worker_events(
             WorkerEvent::Cancelled => {
                 unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
             }
-            _ => {
-                return Err(ApiError::Internal {
-                    message: "generation failed: unrecognized worker event".to_string(),
-                });
-            }
         }
     }
 }
