@@ -15,7 +15,9 @@ FIXTURE_CRATES = {
     "glob": ["listing_core", "listing_baseline"],
     "missing": ["listing_core", "listing_baseline"],
     "added": ["listing_core", "listing_baseline"],
+    "local_glob": ["listing_baseline"],
 }
+SINGLE_CRATE_FIXTURES = {"baseline", "local_glob"}
 
 
 def package_manifest(workspace: Path, crate: str) -> Path:
@@ -39,7 +41,11 @@ def generate(fixture_root: Path, output_dir: Path) -> None:
         fixture_output = output_dir / fixture
         fixture_output.mkdir(parents=True, exist_ok=True)
         for crate in crates:
-            manifest = package_manifest(workspace, crate) if fixture != "baseline" else workspace / "Cargo.toml"
+            manifest = (
+                workspace / "Cargo.toml"
+                if fixture in SINGLE_CRATE_FIXTURES
+                else package_manifest(workspace, crate)
+            )
             command = [
                 "cargo",
                 "rustdoc",

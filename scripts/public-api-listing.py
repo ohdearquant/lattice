@@ -361,7 +361,9 @@ class Listing:
         if marker in stack:
             raise ListingError(f"{crate.crate_name}: recursive glob re-export at {parent_path}")
         nested = stack + (marker,)
-        record = crate.paths.get(str(target_id))
+        # `paths` also lists the crate's own items (crate_id 0), so a local
+        # module must be found in the index before `paths` is read as external.
+        record = None if str(target_id) in crate.index else crate.paths.get(str(target_id))
         if isinstance(record, dict):
             crate_id = record.get("crate_id")
             external = crate.external_crates.get(str(crate_id)) if isinstance(crate_id, int) else None

@@ -16,6 +16,7 @@ tests/fixtures/public_api_listing/added/facade/src/lib.rs 2024  rustdoc JSON fix
 tests/fixtures/public_api_listing/baseline/src/lib.rs 2024  rustdoc JSON fixture crate for the public API listing tests; each fixture is a standalone workspace so Cargo can generate its own docs
 tests/fixtures/public_api_listing/glob/core/src/lib.rs 2024  rustdoc JSON fixture crate for the public API listing tests; each fixture is a standalone workspace so Cargo can generate its own docs
 tests/fixtures/public_api_listing/glob/facade/src/lib.rs 2024  rustdoc JSON fixture crate for the public API listing tests; each fixture is a standalone workspace so Cargo can generate its own docs
+tests/fixtures/public_api_listing/local_glob/src/lib.rs 2024  rustdoc JSON fixture crate for the public API listing tests; each fixture is a standalone workspace so Cargo can generate its own docs
 tests/fixtures/public_api_listing/missing/core/src/lib.rs 2024  rustdoc JSON fixture crate for the public API listing tests; each fixture is a standalone workspace so Cargo can generate its own docs
 tests/fixtures/public_api_listing/missing/facade/src/lib.rs 2024  rustdoc JSON fixture crate for the public API listing tests; each fixture is a standalone workspace so Cargo can generate its own docs
 tests/fixtures/public_api_listing/split/core/src/lib.rs 2024  rustdoc JSON fixture crate for the public API listing tests; each fixture is a standalone workspace so Cargo can generate its own docs
