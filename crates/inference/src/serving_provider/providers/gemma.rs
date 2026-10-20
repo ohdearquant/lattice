@@ -125,6 +125,12 @@ impl ServingProvider for GemmaProvider {
         options: StandaloneLoadOptions,
     ) -> Result<StandaloneLoadPlan, String> {
         if evidence.format == ModelFormat::Safetensors {
+            if options.max_context.is_some() {
+                return Err(
+                    "unsupported_feature: --max-context is not supported for Gemma 4 checkpoints"
+                        .to_owned(),
+                );
+            }
             Ok(StandaloneLoadPlan::new(
                 ServingFactory::gemma_cpu(evidence.directory),
                 StandalonePostReady::new(|| Ok(std::sync::Arc::new(Vec::new()))),
