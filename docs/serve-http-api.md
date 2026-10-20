@@ -790,6 +790,16 @@ requests that never touched the field.
 The CPU (safetensors) backend doesn't have this particular cap — its `max_context()` comes from
 the model's own config — but the 4096 `max_tokens_cap` still applies to both backends equally.
 
+The standalone `lattice_serve` daemon serves Qwen checkpoints with a 32768-token context window by
+default, or the model's `max_position_embeddings` when that is smaller. Its Metal worker allocates
+the KV cache for the whole window at startup, so serving the full 262144-token window of
+Qwen3.5 would reserve several GiB before the first request. Pass `--max-context <N>` to choose the
+window; a value above the model's own window is reduced to it. The startup line names the served
+window and where it came from, for example
+`ready (context=32768, from default cap, raise with --max-context)`. The clamp on `max_tokens`, the
+tokenizer limit and the `context_length_exceeded` threshold all use that one value. Gemma 4
+checkpoints keep their model window and refuse `--max-context`.
+
 ## A realistic multi-turn example
 
 The server is stateless per request — there is no session/conversation ID — so every request must

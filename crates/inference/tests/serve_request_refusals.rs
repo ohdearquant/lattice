@@ -273,6 +273,52 @@ fn standalone_qwen_safetensors_metal_request_refusal_matrix() {
     );
 }
 
+/// Qwen3.5-0.8B declares 262144 positions, so the default window is the
+/// serving cap. `max_tokens` equal to the window passes the old window and is
+/// refused at the served one.
+#[test]
+fn standalone_qwen_metal_serves_the_capped_window_and_refuses_past_it() {
+    let _cell = MATRIX_CELL_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(model) = require_checkpoint(
+        common::QWEN_DIR_ENV,
+        "qwen3.5-0.8b",
+        "standalone-qwen-window",
+    ) else {
+        return;
+    };
+    let _gpu = acquire_gpu_lock();
+    let cells: [(&[&str], usize, &str); 2] = [
+        (&[], 32768, "default cap, raise with --max-context"),
+        (&["--max-context", "4096"], 4096, "--max-context"),
+    ];
+    for (args, window, source) in cells {
+        let extra: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let server = Server::spawn(Binary::LatticeServe, &model, &extra);
+        let ready = format!("ready (context={window}, from {source})");
+        assert!(
+            server.diagnostics().contains(&ready),
+            "standalone-qwen {args:?}: no `{ready}` line:\n{}",
+            server.diagnostics()
+        );
+        let at_window = server.chat_body(json!({"max_tokens": window}));
+        assert_http_golden(
+            &server.request("POST", "/v1/chat/completions", Some(&at_window)),
+            400,
+            Some("context_length_exceeded"),
+            &format!("standalone-qwen {args:?} max_tokens={window}"),
+        );
+        let inside = server.chat_body(json!({}));
+        assert_http_golden(
+            &server.request("POST", "/v1/chat/completions", Some(&inside)),
+            200,
+            None,
+            &format!("standalone-qwen {args:?} max_tokens=2"),
+        );
+    }
+}
+
 #[test]
 fn standalone_gemma_e2b_cpu_request_refusal_matrix() {
     let _cell = MATRIX_CELL_LOCK

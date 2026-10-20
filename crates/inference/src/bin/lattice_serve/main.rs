@@ -133,8 +133,11 @@ mod imp {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::Semaphore;
+    #[path = "args.rs"]
+    mod args;
     #[path = "state.rs"]
     mod state;
+    use args::{parse_arg, parse_flag, parse_max_pending, parse_residency_limits};
     pub(crate) use state::{AppState, IntoServingHost};
     /// Only used by the test module's raw job-channel helpers
     /// (`mpsc::UnboundedReceiver<WorkerMessage>` etc. -- see
@@ -3172,56 +3175,6 @@ mod imp {
 
     // ─── arg parsing + model resolution ──────────────────────────────────────
 
-    fn parse_arg(args: &[String], flag: &str) -> Option<String> {
-        args.iter()
-            .position(|a| a == flag)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-    }
-
-    /// Presence-only boolean flag (no value): `--preload-vision`, not
-    /// `--preload-vision true`.
-    fn parse_flag(args: &[String], flag: &str) -> bool {
-        args.iter().any(|a| a == flag)
-    }
-
-    /// Parses `--max-pending`, rejecting a malformed or negative value
-    /// outright instead of silently substituting the default (issue #939):
-    /// the prior `.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT)` chain
-    /// could not distinguish "flag omitted" from "flag given garbage" --
-    /// `--max-pending -1` silently became `32`. Range validation (zero, or
-    /// above `Semaphore::MAX_PERMITS`) is deliberately NOT duplicated here:
-    /// it happens once, downstream, in `MetalWorker::spawn`
-    /// (`StartupError::InvalidMaxPending`), shared with `lattice.rs`.
-    fn parse_max_pending(args: &[String]) -> Result<usize, String> {
-        match parse_arg(args, "--max-pending") {
-            Some(raw) => raw.parse::<usize>().map_err(|_| {
-                format!("--max-pending: invalid value {raw:?} (expected a positive integer)")
-            }),
-            None => Ok(lattice_inference::serve::metal_worker::DEFAULT_MAX_PENDING_JOBS),
-        }
-    }
-
-    fn parse_residency_limits(
-        args: &[String],
-    ) -> Result<lattice_inference::serve::lora::ResidencyLimits, String> {
-        use lattice_inference::serve::lora::{ResidencyLimits, parse_resident_limit};
-        let parse = |flag: &str, default: usize| {
-            let Some(index) = args.iter().position(|arg| arg == flag) else {
-                return Ok(default);
-            };
-            let raw = args
-                .get(index + 1)
-                .ok_or_else(|| format!("{flag}: expected a positive integer"))?;
-            parse_resident_limit(raw).map_err(|err| format!("{flag}: {err}"))
-        };
-        let defaults = ResidencyLimits::default();
-        Ok(ResidencyLimits {
-            max_adapters: parse("--max-resident-adapters", defaults.max_adapters)?,
-            max_bytes: parse("--max-resident-adapter-bytes", defaults.max_bytes)?,
-        })
-    }
-
     fn default_model_cache() -> std::path::PathBuf {
         std::env::var("LATTICE_MODEL_CACHE")
             .map(std::path::PathBuf::from)
@@ -3571,6 +3524,8 @@ mod imp {
         // `lattice/main.rs`'s `--preload-vision` help text for the full
         // startup-time/memory tradeoff this trades away.
         let preload_vision = parse_flag(&args, "--preload-vision");
+        let max_context =
+            serving_provider::parse_max_context(parse_arg(&args, "--max-context").as_deref())?;
 
         selected.validate_standalone_options(
             ServingEntry::Standalone,
@@ -3594,6 +3549,7 @@ mod imp {
         let plan = selected.prepare_standalone_load(StandaloneLoadOptions {
             tokenizer_path,
             preload_vision,
+            max_context,
         })?;
         let started = plan.open(max_pending, residency_limits)?;
         let lattice_inference::serving_provider::StartedStandalone {
@@ -3602,6 +3558,7 @@ mod imp {
             metadata,
             preparation: _preparation,
             post_ready,
+            context_source,
         } = started;
         let fmt = metadata.format;
         let model_max_context = metadata.model_max_context;
@@ -3621,7 +3578,10 @@ mod imp {
             .and_then(|n| n.to_str())
             .unwrap_or("lattice")
             .into();
-        eprintln!("[lattice_serve] model '{model_id}' ({fmt}) ready (context={model_max_context})");
+        eprintln!(
+            "[lattice_serve] model '{model_id}' ({fmt}) ready (context={model_max_context}, from {})",
+            context_source.map_or("model max_position_embeddings", |source| source.describe())
+        );
 
         // Finish the provider's vocabulary work after the worker is ready.
         let vocab_bytes = post_ready.finish()?;
