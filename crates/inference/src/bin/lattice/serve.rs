@@ -73,9 +73,9 @@ pub enum ModelBackend {
     },
 }
 
+#[cfg(all(test, feature = "test-utils"))]
 impl ModelBackend {
     /// Build the shared request facade after the startup route has loaded.
-    #[cfg(all(test, feature = "test-utils"))]
     pub(super) fn into_serving_handle(
         self,
         generation_admission: Arc<Semaphore>,
