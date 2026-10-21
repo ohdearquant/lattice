@@ -174,7 +174,7 @@ local safetensors directory -> Qwen35Model::from_safetensors
   -> load_weights                                    (model/qwen35/loading.rs)
   -> BpeTokenizer::from_tokenizer_json                (tokenizer.json)
   -> Qwen35Model::generate / generate_streaming       (model/qwen35/generation.rs)
-  -> Tokenizer::tokenize(prompt)                      (tokenizer/common.rs)
+  -> Tokenizer::tokenize(prompt)                      (crates/tokenizer/src/common.rs)
   -> prefill_tokens_batched_for_generate              (forward/batch_prefill.rs)
        -> prefill_prompt                              (forward/batch_prefill.rs)
   -> sample_token (first generated token)             (model/qwen35/sampling.rs)
