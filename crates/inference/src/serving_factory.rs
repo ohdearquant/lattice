@@ -23,6 +23,10 @@ pub struct ServingFactory {
 }
 
 impl ServingFactory {
+    pub(crate) fn new(inner: Box<dyn RuntimeFactory>) -> Self {
+        Self { inner }
+    }
+
     /// Bind the existing Qwen loader and lazy vision state.
     /// Loading still occurs on the worker thread.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -32,9 +36,7 @@ impl ServingFactory {
         + 'static,
         vision: VisionRuntime,
     ) -> Self {
-        Self {
-            inner: providers::qwen::worker::factory(Box::new(loader), vision),
-        }
+        Self::new(providers::qwen::worker::factory(Box::new(loader), vision))
     }
 
     /// Bind a Gemma 4 E2B text checkpoint directory. The checkpoint is loaded
@@ -42,9 +44,7 @@ impl ServingFactory {
     /// decoder driver.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub fn gemma_cpu(model_dir: PathBuf) -> Self {
-        Self {
-            inner: providers::gemma::worker::factory(model_dir),
-        }
+        Self::new(providers::gemma::worker::factory(model_dir))
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -53,7 +53,10 @@ impl ServingFactory {
         + Send
         + 'static,
     ) -> Self {
-        Self::qwen_metal(loader, VisionRuntime::unsupported())
+        Self::new(providers::qwen::worker::factory(
+            Box::new(loader),
+            VisionRuntime::unsupported(),
+        ))
     }
 
     pub(crate) fn build(
