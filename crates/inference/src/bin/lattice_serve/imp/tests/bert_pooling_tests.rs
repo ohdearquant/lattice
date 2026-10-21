@@ -1,4 +1,5 @@
 use super::*;
+use lattice_inference::BertModel;
 use lattice_inference::bert_pooling_fixture::{
     DIMENSIONS, INPUTS, MAX_POSITIONS, checkpoint_hashes, write_checkpoint,
 };
@@ -163,7 +164,6 @@ async fn embeddings_default_pooling_matches_library_for_single_and_batch() {
         hashes = Some(current);
         let (single, batch) = reference(&path, pooling);
         let embedding = load_embedding_state(&path, None).unwrap();
-        assert_eq!(embedding.model.pooling(), pooling);
         compare_route(embedding, name, &single, &batch).await;
     }
 }
@@ -176,7 +176,6 @@ async fn embeddings_explicit_pooling_override_matches_library() {
         for (argument, pooling) in [("cls", BertPooling::CLS), ("mean", BertPooling::Mean)] {
             let (single, batch) = reference(&path, pooling);
             let embedding = load_embedding_state(&path, Some(argument)).unwrap();
-            assert_eq!(embedding.model.pooling(), pooling);
             compare_route(embedding, name, &single, &batch).await;
         }
     }
@@ -226,20 +225,22 @@ pub(super) async fn check_context_window_route() {
     let temp = tempfile::tempdir().unwrap();
     let path = fixture(temp.path(), MODELS[0].0);
     let embedding = load_embedding_state(&path, None).unwrap();
+    let mut reference_model = BertModel::from_directory(&path).unwrap();
+    reference_model.set_pooling(BertPooling::CLS);
     assert_eq!(
-        embedding.model.config().max_position_embeddings,
+        reference_model.config().max_position_embeddings,
         MAX_POSITIONS
     );
-    assert_eq!(embedding.model.tokenizer().max_seq_len(), MAX_POSITIONS);
+    assert_eq!(reference_model.tokenizer().max_seq_len(), MAX_POSITIONS);
     let at_limit = "hello ".repeat(MAX_POSITIONS - 2);
     let over_limit = "hello ".repeat(MAX_POSITIONS - 1);
-    let at_tokens = embedding.model.tokenizer().tokenize(&at_limit);
-    let over_tokens = embedding.model.tokenizer().tokenize(&over_limit);
+    let at_tokens = reference_model.tokenizer().tokenize(&at_limit);
+    let over_tokens = reference_model.tokenizer().tokenize(&over_limit);
     assert_eq!(at_tokens.real_length, MAX_POSITIONS);
     assert_eq!(at_tokens.pre_truncation_len, MAX_POSITIONS);
     assert_eq!(over_tokens.real_length, MAX_POSITIONS);
     assert_eq!(over_tokens.pre_truncation_len, MAX_POSITIONS + 1);
-    let expected = embedding.model.encode(&at_limit).unwrap();
+    let expected = reference_model.encode(&at_limit).unwrap();
     let actual = vectors(
         request(embedding.clone(), json!(at_limit)).await,
         MODELS[0].0,

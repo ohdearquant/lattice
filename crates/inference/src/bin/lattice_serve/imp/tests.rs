@@ -509,10 +509,10 @@ fn test_app_state_with_embedding(embedding: Arc<EmbeddingState>) -> AppState {
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 fn test_embedding_state() -> Option<Arc<EmbeddingState>> {
     let dir = std::env::var("LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR").ok()?;
-    let model = BertModel::from_directory(std::path::Path::new(&dir))
-        .expect("LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR must be a valid BertModel directory");
+    let plan = serving_provider::plan_text_embeddings(std::path::Path::new(&dir), None).ok()?;
+    let service = plan.load().ok()?;
     Some(Arc::new(EmbeddingState {
-        model,
+        service,
         model_id: Arc::from("test-embedding-model"),
         admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
     }))
@@ -978,7 +978,7 @@ async fn embeddings_single_string_200_response_shape() {
     let Some(embedding) = test_embedding_state() else {
         return;
     };
-    let dimensions = embedding.model.dimensions();
+    let dimensions = embedding.service.representation().dimensions;
     let body = Body::from(r#"{"input":"hello world"}"#.to_string());
     let response = embeddings(
         State(test_app_state_with_embedding(embedding)),

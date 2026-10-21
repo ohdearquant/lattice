@@ -2,6 +2,7 @@ use super::bert_pooling_tests::{assert_vector, fixture, request, request_json, s
 use super::*;
 use axum::http::StatusCode;
 use axum::response::Response;
+use lattice_inference::BertModel;
 use lattice_inference::bert_pooling_fixture::{INPUTS, MAX_POSITIONS};
 use lattice_inference::serve::embeddings::{
     MAX_EMBEDDINGS_BATCH_SIZE, MAX_EMBEDDINGS_TOTAL_TOKENS,
@@ -112,19 +113,18 @@ async fn embedding_route_fixture_usage_matches_tokenizer_and_batch_vectors() {
     let temp = tempfile::tempdir().expect("temporary directory must be created");
     let path = fixture(temp.path(), "all-minilm-route-fixture");
     let embedding = load_embedding_state(&path, None).expect("fixture checkpoint must load");
+    let reference_model = BertModel::from_directory(&path).expect("fixture model must load");
     let model_id = embedding.model_id.to_string();
 
     let single_refs = [INPUTS[0]];
-    let single_tokens: usize = embedding
-        .model
+    let single_tokens: usize = reference_model
         .tokenizer()
         .tokenize_batch(&single_refs)
         .iter()
         .map(|tokens| tokens.real_length)
         .sum();
     let batch_refs: Vec<&str> = INPUTS.to_vec();
-    let batch_tokens: usize = embedding
-        .model
+    let batch_tokens: usize = reference_model
         .tokenizer()
         .tokenize_batch(&batch_refs)
         .iter()
@@ -161,10 +161,11 @@ async fn embedding_route_fixture_budget_boundary_reaches_admission() {
     let temp = tempfile::tempdir().expect("temporary directory must be created");
     let path = fixture(temp.path(), "all-minilm-budget-fixture");
     let embedding = load_embedding_state(&path, None).expect("fixture checkpoint must load");
+    let reference_model = BertModel::from_directory(&path).expect("fixture model must load");
     let text = "hello ".repeat(MAX_POSITIONS - 2);
     let inputs = vec![text; MAX_EMBEDDINGS_BATCH_SIZE];
     let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
-    let tokens = embedding.model.tokenizer().tokenize_batch(&refs);
+    let tokens = reference_model.tokenizer().tokenize_batch(&refs);
     assert_eq!(tokens.len(), MAX_EMBEDDINGS_BATCH_SIZE);
     assert!(tokens.iter().all(|item| {
         item.real_length == MAX_POSITIONS && item.pre_truncation_len == MAX_POSITIONS
@@ -194,6 +195,7 @@ async fn embedding_route_admission_follows_request_validation() {
     let temp = tempfile::tempdir().expect("temporary directory must be created");
     let path = fixture(temp.path(), "all-minilm-admission-fixture");
     let embedding = load_embedding_state(&path, None).expect("fixture checkpoint must load");
+    let reference_model = BertModel::from_directory(&path).expect("fixture model must load");
     let _permits = hold_all_embedding_permits(&embedding);
 
     assert_response(
@@ -223,7 +225,7 @@ async fn embedding_route_admission_follows_request_validation() {
     let mut inputs = vec![normal; MAX_EMBEDDINGS_BATCH_SIZE];
     inputs[0] = over_context;
     let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
-    let tokens = embedding.model.tokenizer().tokenize_batch(&refs);
+    let tokens = reference_model.tokenizer().tokenize_batch(&refs);
     assert_eq!(tokens[0].pre_truncation_len, MAX_POSITIONS + 1);
     assert_eq!(tokens[0].real_length, MAX_POSITIONS);
     assert!(tokens.iter().skip(1).all(|item| {

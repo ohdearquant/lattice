@@ -11,7 +11,7 @@ use crate::serve::lora::ResidencyLimits;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serve::prepare::PreparationHandle;
 use crate::serve::route::{RouteRefusal, ServedBackend, ServedRoute};
-use crate::serving_embeddings::PooledEmbeddingHandle;
+use crate::serving_embeddings::{PooledEmbeddingHandle, TextEmbeddingHandle};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -176,6 +176,19 @@ impl PooledEmbeddingPlan {
     }
 }
 
+/// Opaque text embedding load plan selected from checkpoint evidence.
+#[doc(hidden)]
+pub struct TextEmbeddingPlan {
+    inner: Box<dyn TextEmbeddingLoadPlan>,
+}
+
+impl TextEmbeddingPlan {
+    /// Loads the selected provider's text embedding service.
+    pub fn load(self) -> Result<TextEmbeddingHandle, String> {
+        self.inner.load()
+    }
+}
+
 /// An implicit pooled embedding action selected alongside generation.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +202,7 @@ pub struct ImplicitPooledEmbeddingPlan {
 pub(crate) trait RegisteredProvider: Sync {
     fn generation(&self) -> Option<&dyn ServingProvider>;
     fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider>;
+    fn text_embeddings(&self) -> Option<&dyn TextEmbeddingProvider>;
 }
 
 pub(crate) trait PooledEmbeddingProvider: Sync {
@@ -201,6 +215,20 @@ pub(crate) trait PooledEmbeddingLoadPlan {
     fn load(self: Box<Self>) -> Result<PooledEmbeddingHandle, InferenceError>;
 }
 
+pub(crate) trait TextEmbeddingProvider: Sync {
+    fn name(&self) -> &'static str;
+    fn claims(&self, evidence: &CheckpointEvidence) -> bool;
+    fn plan(
+        &self,
+        directory: PathBuf,
+        pooling_override: Option<String>,
+    ) -> Box<dyn TextEmbeddingLoadPlan>;
+}
+
+pub(crate) trait TextEmbeddingLoadPlan {
+    fn load(self: Box<Self>) -> Result<TextEmbeddingHandle, String>;
+}
+
 /// Plans a pooled embedding load from a checkpoint directory.
 #[doc(hidden)]
 pub fn plan_pooled_embeddings(
@@ -211,6 +239,20 @@ pub fn plan_pooled_embeddings(
         select_pooled_with_registry(&evidence, &providers::PROVIDERS, &providers::QWEN_PROVIDER)?;
     Ok(PooledEmbeddingPlan {
         inner: provider.plan(evidence.directory),
+    })
+}
+
+/// Plans a text embedding load from a checkpoint directory.
+#[doc(hidden)]
+pub fn plan_text_embeddings(
+    directory: &Path,
+    pooling_override: Option<String>,
+) -> Result<TextEmbeddingPlan, EmbeddingSelectionError> {
+    let evidence = inspect_checkpoint(directory);
+    let provider =
+        select_text_with_registry(&evidence, &providers::PROVIDERS, &providers::BERT_PROVIDER)?;
+    Ok(TextEmbeddingPlan {
+        inner: provider.plan(evidence.directory, pooling_override),
     })
 }
 
@@ -663,6 +705,24 @@ fn select_pooled_with_registry<'a>(
             .filter_map(|provider| provider.pooled_embeddings()),
         |provider| provider.claims(evidence),
         PooledEmbeddingProvider::name,
+    ) {
+        Ok(Some(provider)) => Ok(provider),
+        Ok(None) => Ok(legacy),
+        Err(providers) => Err(EmbeddingSelectionError::Ambiguous { providers }),
+    }
+}
+
+fn select_text_with_registry<'a>(
+    evidence: &CheckpointEvidence,
+    providers: &'a [&'a dyn RegisteredProvider],
+    legacy: &'a dyn TextEmbeddingProvider,
+) -> Result<&'a dyn TextEmbeddingProvider, EmbeddingSelectionError> {
+    match unique_claim(
+        providers
+            .iter()
+            .filter_map(|provider| provider.text_embeddings()),
+        |provider| provider.claims(evidence),
+        TextEmbeddingProvider::name,
     ) {
         Ok(Some(provider)) => Ok(provider),
         Ok(None) => Ok(legacy),
