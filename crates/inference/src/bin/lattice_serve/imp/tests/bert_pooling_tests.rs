@@ -1,8 +1,8 @@
 use super::*;
-use lattice_inference::BertModel;
 use lattice_inference::bert_pooling_fixture::{
     DIMENSIONS, INPUTS, MAX_POSITIONS, checkpoint_hashes, write_checkpoint,
 };
+use lattice_inference::{BertModel, BertPooling};
 use std::path::{Path, PathBuf};
 use tower::ServiceExt as _;
 
