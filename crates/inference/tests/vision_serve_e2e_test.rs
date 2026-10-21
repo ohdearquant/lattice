@@ -344,6 +344,16 @@ impl Drop for ChildGuard {
     }
 }
 
+// Statuses come back as responses so a refusal's body can be reported, and an
+// ambient proxy setting never sees a loopback request.
+fn loopback_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .proxy(None)
+        .build()
+        .into()
+}
+
 fn free_loopback_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("ephemeral port must bind")
@@ -355,7 +365,7 @@ fn free_loopback_port() -> u16 {
 fn wait_for_health(port: u16, deadline: Instant) -> bool {
     let url = format!("http://127.0.0.1:{port}/health");
     while Instant::now() < deadline {
-        if let Ok(response) = ureq::get(&url).call()
+        if let Ok(response) = loopback_agent().get(&url).call()
             && response.status() == 200
         {
             return true;
@@ -382,13 +392,15 @@ fn health_wait_timeout() -> Duration {
 
 fn post_chat_completion(port: u16, body: &serde_json::Value) -> serde_json::Value {
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
-    let response = ureq::post(&url)
-        .set("content-type", "application/json")
-        .send_bytes(&serde_json::to_vec(body).expect("request body must serialize"));
+    let response = loopback_agent()
+        .post(&url)
+        .header("content-type", "application/json")
+        .send(serde_json::to_vec(body).expect("request body must serialize"));
     let response = match response {
-        Ok(response) => response,
-        Err(ureq::Error::Status(code, response)) => {
-            let body = response.into_string().unwrap_or_default();
+        Ok(response) if response.status().as_u16() < 400 => response,
+        Ok(response) => {
+            let code = response.status().as_u16();
+            let body = response.into_body().read_to_string().unwrap_or_default();
             panic!("chat completion returned HTTP {code}; body: {body}");
         }
         Err(err) => panic!("chat completion request failed: {err}"),
@@ -396,7 +408,8 @@ fn post_chat_completion(port: u16, body: &serde_json::Value) -> serde_json::Valu
     assert_eq!(response.status(), 200);
     serde_json::from_str(
         &response
-            .into_string()
+            .into_body()
+            .read_to_string()
             .expect("response body must be readable UTF-8"),
     )
     .expect("response body must be JSON")
