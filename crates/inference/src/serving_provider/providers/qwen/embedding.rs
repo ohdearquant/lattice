@@ -23,7 +23,9 @@ use crate::vision::checkpoint::{
     Qwen35VisionWeights, load_qwen35_vision_weights_from_safetensors,
     open_qwen35_single_decoder_safetensors,
 };
-use crate::vision::qwen35_vit::preprocess_qwen35_image;
+use crate::vision::qwen35_vit::{
+    preprocess_qwen35_image, preprocess_qwen35_image_for_embedding_serve,
+};
 use crate::vision::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 use crate::weights::f16_weights::{F16ModelWeights, load_f16_weights};
 
@@ -228,15 +230,30 @@ impl EmbeddingModel {
         image_bytes: &[u8],
         prompt: &str,
     ) -> Result<usize, InferenceError> {
+        self.scaffold_token_count_with(image_bytes, prompt, false)
+    }
+
+    /// [`Self::image_scaffold_token_count`], preprocessing under the
+    /// embeddings route's own image budget when `serve_budget` is set.
+    fn scaffold_token_count_with(
+        &self,
+        image_bytes: &[u8],
+        prompt: &str,
+        serve_budget: bool,
+    ) -> Result<usize, InferenceError> {
         let vision_cfg = self.config.vision_config.as_ref().ok_or_else(|| {
             InferenceError::InvalidInput(
                 "checkpoint has no vision_config; cannot count image scaffold tokens".to_string(),
             )
         })?;
-        let (_pixel_values, grid) =
-            preprocess_qwen35_image(image_bytes, vision_cfg).map_err(|e| {
-                InferenceError::InvalidInput(format!("image preprocessing failed: {e}"))
-            })?;
+        let preprocess = if serve_budget {
+            preprocess_qwen35_image_for_embedding_serve
+        } else {
+            preprocess_qwen35_image
+        };
+        let (_pixel_values, grid) = preprocess(image_bytes, vision_cfg).map_err(|e| {
+            InferenceError::InvalidInput(format!("image preprocessing failed: {e}"))
+        })?;
         let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
         if merge_sq == 0 || !grid.num_patches().is_multiple_of(merge_sq) {
             return Err(InferenceError::InvalidInput(format!(
@@ -347,8 +364,10 @@ impl crate::serving_embeddings::PooledEmbeddingService for EmbeddingModel {
         }
     }
 
+    /// Counts through the serving image budget, so an image over it is refused
+    /// with `HTTP 400` before the route embeds anything.
     fn image_scaffold_len(&self, image: &[u8]) -> Result<usize, InferenceError> {
-        self.image_scaffold_token_count(image, "")
+        self.scaffold_token_count_with(image, "", true)
     }
 
     fn embed_text(&self, text: &str, pooling: PoolingStrategy) -> Result<Vec<f32>, InferenceError> {
