@@ -838,7 +838,7 @@ mod cpu_serve_prompt_tests {
     #[cfg(feature = "test-utils")]
     use lattice_inference::{GenerateConfig, Tokenizer};
 
-    fn source_between(source: &str, start: &str, end: &str) -> &str {
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         &source[source.find(start).unwrap() + start.len()..source.find(end).unwrap()]
     }
 

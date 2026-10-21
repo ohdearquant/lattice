@@ -23,6 +23,7 @@ pub struct ServingFactory {
 }
 
 impl ServingFactory {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub(crate) fn new(inner: Box<dyn RuntimeFactory>) -> Self {
         Self { inner }
     }

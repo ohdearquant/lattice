@@ -98,7 +98,7 @@ fn q4_qwen_open_without_the_metal_build_reports_the_rebuild_message() {
     let temp = checkpoint(FormatFixture::Q4Only, Some(br#"{"model_type":"qwen3_5"}"#));
     let selected = select(inspect_checkpoint(temp.path()), ServingEntry::Lattice)
         .expect("Q4 Qwen is admitted on the lattice entry");
-    let error = match selected.open_lattice(
+    let Err(error) = selected.open_lattice(
         LatticeOpenOptions {
             tokenizer_dir: None,
             max_pending: 1,
@@ -108,9 +108,8 @@ fn q4_qwen_open_without_the_metal_build_reports_the_rebuild_message() {
             context_window: 0,
         },
         Arc::new(Semaphore::new(1)),
-    ) {
-        Ok(_) => panic!("a Q4 checkpoint cannot open without the Metal build"),
-        Err(error) => error,
+    ) else {
+        panic!("a Q4 checkpoint cannot open without the Metal build");
     };
     assert_eq!(
         error,
