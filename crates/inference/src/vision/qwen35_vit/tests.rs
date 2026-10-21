@@ -210,6 +210,21 @@ fn embedding_serve_preprocess_caps_output_allocation() {
         matches!(&err, VisionError::DimensionsExceeded(message) if message.contains("preprocessing requires") && message.contains(&MAX_SERVE_EMBED_PREPROCESSED_BYTES.to_string())),
         "expected the 32 MiB preprocessing cap, got: {err}"
     );
+
+    // 16 * 16 = 256 patches: exactly 24 MiB, over the chat route's 16 MiB cap
+    // and inside the embeddings cap, so only the embeddings cap admits it.
+    let between = make_test_png(128, 128);
+    let chat_err =
+        preprocess_qwen35_image_inner(&between, &cfg, chat_budget(MAX_SERVE_EMBED_VISION_PATCHES))
+            .unwrap_err();
+    assert!(
+        matches!(&chat_err, VisionError::DimensionsExceeded(message) if message.contains("preprocessing requires")),
+        "expected the chat route's 16 MiB cap to refuse 24 MiB, got: {chat_err}"
+    );
+    let (pixels, grid) = preprocess_qwen35_image_inner(&between, &cfg, embed_budget())
+        .expect("the embeddings route must admit 24 MiB under its own 32 MiB cap");
+    assert_eq!((grid.h, grid.w), (16, 16));
+    assert_eq!(pixels.len() * std::mem::size_of::<f32>(), 24 * 1024 * 1024);
 }
 
 #[test]

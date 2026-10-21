@@ -30,6 +30,8 @@ use crate::vision::qwen35_vit::{
 use crate::vision::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 use crate::weights::f16_weights::{F16ModelWeights, load_f16_weights};
 
+type ImagePreprocessFn = fn(&[u8], &VisionModelConfig) -> Result<(Vec<f32>, GridThw), VisionError>;
+
 /// Raises `tokenizer`'s own truncation cap to `max_context` when it sits
 /// below it, otherwise returns `tokenizer` unchanged.
 ///
@@ -240,7 +242,7 @@ impl EmbeddingModel {
         &self,
         image_bytes: &[u8],
         prompt: &str,
-        preprocess: fn(&[u8], &VisionModelConfig) -> Result<(Vec<f32>, GridThw), VisionError>,
+        preprocess: ImagePreprocessFn,
     ) -> Result<usize, InferenceError> {
         let vision_cfg = self.config.vision_config.as_ref().ok_or_else(|| {
             InferenceError::InvalidInput(
