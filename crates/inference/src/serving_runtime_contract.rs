@@ -17,7 +17,10 @@ pub(crate) enum RuntimeInput<'a> {
         entry: TextGenerationEntry,
     },
     ChatMessages {
+        // Read by runtimes that only the Metal serving worker constructs.
+        #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
         messages: &'a [ChatMessage],
+        #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
         lora: &'a [LoraSelection],
         // Only the Qwen Metal runtime renders the thinking prime.
         #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
