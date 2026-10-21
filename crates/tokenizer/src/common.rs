@@ -5,10 +5,10 @@
 //! used for dependency-free `tokenizer.json` loading, a thread-safe LRU cache,
 //! and tokenizer auto-detection helpers.
 
-use crate::error::InferenceError;
-use crate::tokenizer::WordPieceTokenizer;
-use crate::tokenizer::bpe::BpeTokenizer;
-use crate::tokenizer::sentencepiece::SentencePieceTokenizer;
+use crate::bpe::BpeTokenizer;
+use crate::sentencepiece::SentencePieceTokenizer;
+use crate::wordpiece::WordPieceTokenizer;
+use lattice_inference_core::InferenceError;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::hash::Hash;

@@ -139,7 +139,7 @@ Qwen3.5 generation uses the separate `forward/metal_qwen35.rs` engine and is not
 
 ## Environment Variables
 
-This table lists every `LATTICE_*` environment variable that non-test code under `crates/*/src/` (all five crates, library and `src/bin/` targets) reads or names. Variables used only by tests, benches, examples or `#[cfg(test)]` code are outside the table on purpose, so an absence here says nothing about them. `tests/env_var_contract.rs` fails when a variable read by that code has no row below, when a row names a variable nothing reads, and when a non-test read tests a variable by presence.
+This table lists every `LATTICE_*` environment variable that non-test code under `crates/*/src/` (all seven crates, library and `src/bin/` targets) reads or names. Variables used only by tests, benches, examples or `#[cfg(test)]` code are outside the table on purpose, so an absence here says nothing about them. `tests/env_var_contract.rs` fails when a variable read by that code has no row below, when a row names a variable nothing reads, and when a non-test read tests a variable by presence.
 
 How a variable is read, as used in the "How read" column:
 

@@ -4,13 +4,13 @@
 //! byte-level pre-tokenization, merge-rank driven BPE, a per-word LRU cache,
 //! and `tokenizer.json` / `vocab.json` + `merges.txt` loading.
 
-use crate::error::InferenceError;
-use crate::tokenizer::common::{
+use crate::common::{
     JsonValue, ThreadSafeLruCache, TokenizedInput, Tokenizer, invert_vocab, json_object_to_vocab,
     json_path, known_special_id, pad_ids, parse_added_tokens, parse_json,
     parse_post_processor_flags, parse_rendered_added_tokens, push_eos_preserving_limit,
     vocab_txt_to_map,
 };
+use lattice_inference_core::InferenceError;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
@@ -524,7 +524,7 @@ impl BpeTokenizer {
     ///    O(added_render.len()) linear scan, the only one of the three.
     ///
     /// This is the single resolution path for the `</think>` reasoning-close
-    /// marker: [`crate::model::qwen35::resolve_reasoning_close_token`] (the
+    /// marker: the reasoning-close resolver in the inference engine (the
     /// actual generation-time validation, shared by the CPU and Metal decode
     /// loops) and the Metal cross-turn prefix-cache fingerprint
     /// (`cross_turn_metadata`) both call this directly rather than each
@@ -577,7 +577,7 @@ impl BpeTokenizer {
     /// byte-level alphabet (gets no bytes rather than a partially-decoded,
     /// possibly-colliding sequence) (#1722).
     ///
-    /// Used by [`GrammarEngine::new`](crate::grammar::GrammarEngine::new) to build
+    /// Used by `GrammarEngine::new` in the inference engine to build
     /// the precomputed vocabulary partition for grammar-constrained decoding (ADR-046).
     ///
     /// Cost: O(vocab_size) — called once at engine initialisation.
@@ -704,16 +704,6 @@ impl BpeTokenizer {
     /// length instead, because `match_special` consumes the matched literal text
     /// while the token id itself may decode to fewer bytes than that (a control
     /// token marked special decodes to none at all).
-    #[cfg(any(
-        test,
-        all(
-            feature = "serve",
-            feature = "f16",
-            feature = "router-learning",
-            target_os = "macos",
-            feature = "metal-gpu"
-        )
-    ))]
     pub(crate) fn max_token_byte_span(&self) -> usize {
         let byte_decoder = byte_decoder();
         let mut span = 0usize;
@@ -741,7 +731,6 @@ impl BpeTokenizer {
         self.tokenize_to_ids_into(text, &mut scratch).0
     }
 
-    #[cfg(all(feature = "metal-gpu", feature = "serve"))]
     pub(crate) fn tokenize_fragments_with_inserted_ids(
         &self,
         before: &str,

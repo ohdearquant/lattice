@@ -128,17 +128,19 @@ regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
 
 ## Crates
 
-| Crate                                    | Description                                                                                                                                                           | crates.io                                                                                                |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| [`lattice-embed`](crates/embed/)         | Embedding service: `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill                                  | [![](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)         |
-| [`lattice-inference`](crates/inference/) | Transformer kernel: safetensors loading, BERT/BGE/Qwen3 forward pass, three tokenizers, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding, quantization | [![](https://img.shields.io/crates/v/lattice-inference.svg)](https://crates.io/crates/lattice-inference) |
-| [`lattice-fann`](crates/fann/)           | Fast neural network primitives: `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer                                                     | [![](https://img.shields.io/crates/v/lattice-fann.svg)](https://crates.io/crates/lattice-fann)           |
-| [`lattice-tune`](crates/tune/)           | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry                                                                | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune)           |
-| [`lattice-transport`](crates/transport/) | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport) |
+| Crate                                              | Description                                                                                                                                                           | crates.io                                                                                                          |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| [`lattice-embed`](crates/embed/)                   | Embedding service: `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill                                  | [![](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)                   |
+| [`lattice-inference`](crates/inference/)           | Transformer kernel: safetensors loading, BERT/BGE/Qwen3 forward pass, three tokenizers, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding, quantization | [![](https://img.shields.io/crates/v/lattice-inference.svg)](https://crates.io/crates/lattice-inference)           |
+| [`lattice-fann`](crates/fann/)                     | Fast neural network primitives: `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer                                                     | [![](https://img.shields.io/crates/v/lattice-fann.svg)](https://crates.io/crates/lattice-fann)                     |
+| [`lattice-tune`](crates/tune/)                     | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry                                                                | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune)                     |
+| [`lattice-tokenizer`](crates/tokenizer/)           | Pure Rust tokenizers: WordPiece, SentencePiece, Qwen and Gemma BPE, model-directory auto-detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-tokenizer.svg)](https://crates.io/crates/lattice-tokenizer)           |
+| [`lattice-inference-core`](crates/inference-core/) | Shared base types: `InferenceError`, re-exported by `lattice-inference`                                                                                               | [![](https://img.shields.io/crates/v/lattice-inference-core.svg)](https://crates.io/crates/lattice-inference-core) |
+| [`lattice-transport`](crates/transport/)           | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport)           |
 
-Two leaf crates (`fann`, `transport`) have zero intra-workspace dependencies. `inference` is
-standalone by default and pulls in `fann` only when the optional `mixture` feature is enabled.
-All three can be used on their own.
+Three leaf crates (`fann`, `transport`, `inference-core`) have zero intra-workspace
+dependencies. `tokenizer` depends only on `inference-core`. `inference` depends on both and pulls
+in `fann` only when the optional `mixture` feature is enabled. Each can be used on its own.
 
 ---
 
