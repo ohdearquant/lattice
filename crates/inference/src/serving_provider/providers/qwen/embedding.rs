@@ -367,19 +367,5 @@ impl crate::serving_embeddings::PooledEmbeddingService for EmbeddingModel {
 #[cfg(test)]
 mod service_tests;
 
-// The pooled route's existing tests read this model's private fields, so they
-// compile as a descendant of this module; the inline module keeps their
-// nested files resolving where they already live.
 #[cfg(test)]
-#[path = "../../../serve/embeddings"]
-mod route_tests {
-    #[allow(unused_imports)]
-    use super::*;
-    #[allow(unused_imports)]
-    use crate::serve::embeddings::*;
-    // The route module imports these privately, so its glob does not carry them.
-    #[allow(unused_imports)]
-    use crate::serve::{ApiError, contract::decode_inline_image};
-
-    mod tests;
-}
+mod route_tests;
