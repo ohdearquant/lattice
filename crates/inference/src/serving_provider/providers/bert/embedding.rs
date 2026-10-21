@@ -195,10 +195,12 @@ mod tests {
     fn text_plan_reports_load_errors_before_invalid_pooling() {
         let temp = tempfile::tempdir().expect("temporary directory must be created");
         let missing = temp.path().join("missing");
-        let missing_error = plan_text_embeddings(&missing, Some("invalid".to_owned()))
+        let Err(missing_error) = plan_text_embeddings(&missing, Some("invalid".to_owned()))
             .expect("missing paths use the legacy BERT fallback")
             .load()
-            .expect_err("missing path must fail before pooling validation");
+        else {
+            panic!("missing path must fail before pooling validation");
+        };
         assert_eq!(
             missing_error,
             format!("embedding model directory not found: {}", missing.display())
@@ -206,10 +208,12 @@ mod tests {
 
         let malformed = temp.path().join("malformed");
         fs::create_dir(&malformed).expect("malformed directory must be created");
-        let malformed_error = plan_text_embeddings(&malformed, Some("invalid".to_owned()))
+        let Err(malformed_error) = plan_text_embeddings(&malformed, Some("invalid".to_owned()))
             .expect("malformed paths use the legacy BERT fallback")
             .load()
-            .expect_err("checkpoint load must fail before pooling validation");
+        else {
+            panic!("checkpoint load must fail before pooling validation");
+        };
         assert!(malformed_error.starts_with(&format!(
             "embedding model load failed ({}): ",
             malformed.display()
