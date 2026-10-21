@@ -179,7 +179,7 @@ pub struct AppState<M = DefaultAppStateModel> {
     /// `None` when no vision-language checkpoint was found at the served
     /// model directory; every `/v1/embeddings` request then fails closed
     /// with `vision_unsupported`.
-    pub embedding_model: Option<Arc<lattice_inference::serve::embeddings::EmbeddingModel>>,
+    pub embedding_model: Option<lattice_inference::serving_embeddings::PooledEmbeddingHandle>,
     /// Bounded concurrent-job admission for `/v1/embeddings`'s pooled
     /// `embed_items` `spawn_blocking` calls (issue #1397), mirroring
     /// `lattice_serve.rs`'s `EmbeddingState::admission` for its own
@@ -1292,7 +1292,7 @@ pub async fn embeddings(
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
     use lattice_inference::serve::embeddings::{
-        EmbeddingsRequest, check_pooled_embedding_total_tokens, embed_items,
+        EmbeddingsRequest, check_pooled_service_total_tokens, embed_pooled_items,
         normalize_embedding_items, parse_pooling,
     };
 
@@ -1355,8 +1355,8 @@ pub async fn embeddings(
         // before `embed_items`, so a request already admitted past the
         // concurrency cap is still rejected before its actual pooled-decoder
         // work starts.
-        check_pooled_embedding_total_tokens(&embedder, &items)?;
-        embed_items(&embedder, items, pooling)
+        check_pooled_service_total_tokens(&embedder, &items)?;
+        embed_pooled_items(&embedder, items, pooling)
     })
     .await
     .map_err(|e| {

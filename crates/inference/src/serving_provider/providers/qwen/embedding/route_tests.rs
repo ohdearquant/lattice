@@ -1,4 +1,9 @@
+// The pooled route's tests read this model's private fields, so they compile as a
+// descendant of this module and reach the route through its module path.
 use super::*;
+use crate::serve::embeddings::*;
+// The route module imports these privately, so its glob does not carry them.
+use crate::serve::{ApiError, contract::decode_inline_image};
 use std::path::Path;
 use test_support::{tiny_embedding_model, tiny_png_data_uri};
 

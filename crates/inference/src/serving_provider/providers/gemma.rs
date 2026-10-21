@@ -8,7 +8,10 @@ use crate::serve::route::{RouteRefusal, ServedRoute, select_route, select_standa
 use crate::serving_cpu::GemmaCpuServing;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
-use crate::serving_provider::{CheckpointEvidence, ServingEntry, ServingProvider};
+use crate::serving_provider::{
+    CheckpointEvidence, ImplicitPooledEmbeddingPlan, RegisteredProvider, ServingEntry,
+    ServingProvider,
+};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_provider::{
     StandaloneLoadOptions, StandaloneLoadPlan, StandaloneOptionPresence, StandalonePostReady,
@@ -50,6 +53,19 @@ impl ServingProvider for GemmaProvider {
                     Err(refusal) => Err(refusal),
                 }
             }
+        }
+    }
+
+    fn implicit_pooled_embeddings(
+        &self,
+        _evidence: &CheckpointEvidence,
+        model: &str,
+    ) -> ImplicitPooledEmbeddingPlan {
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: None,
+            disabled_line: Some(format!(
+                "Embeddings disabled ({model}): not available for Gemma 4 checkpoints."
+            )),
         }
     }
 
@@ -138,6 +154,16 @@ impl ServingProvider for GemmaProvider {
         } else {
             super::qwen::qwen_standalone_plan(evidence, options)
         }
+    }
+}
+
+impl RegisteredProvider for GemmaProvider {
+    fn generation(&self) -> Option<&dyn ServingProvider> {
+        Some(self)
+    }
+
+    fn pooled_embeddings(&self) -> Option<&dyn crate::serving_provider::PooledEmbeddingProvider> {
+        None
     }
 }
 
