@@ -215,7 +215,7 @@ mod imp {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-utils"))]
     fn load_embedding_state(
         embedding_model_dir: &std::path::Path,
         pooling_override: Option<&str>,
