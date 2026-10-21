@@ -510,6 +510,20 @@ fn embed_items_refuses_an_image_over_the_serving_pixel_cap_before_embedding() {
 }
 
 #[test]
+fn route_image_count_admits_an_image_over_the_chat_patch_budget() {
+    use crate::serving_embeddings::PooledEmbeddingService as _;
+    // 32 * 32 = 1024 pre-merge patches: over the chat route's default of 256,
+    // inside the embeddings route's default of 4096. A process that sets
+    // LATTICE_EMBED_VISION_MAX_PATCHES below 1024 refuses it.
+    let mut png = Vec::new();
+    image::RgbImage::new(64, 64)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let count = tiny_embedding_model().image_scaffold_len(&png).unwrap();
+    assert_eq!(count, 2 + 1024 / 4);
+}
+
+#[test]
 fn embed_items_mixed_batch_preserves_input_order() {
     let model = tiny_embedding_model();
     let items = normalize_embedding_items(vec![
