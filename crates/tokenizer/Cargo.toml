@@ -1,0 +1,25 @@
+[package]
+name = "lattice-tokenizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Rust tokenizers for Lattice inference"
+keywords = ["tokenizer", "wordpiece", "sentencepiece", "bpe", "inference"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+
+[dependencies]
+lattice-inference-core = { version = "0.14.0", path = "../inference-core" }
+rayon = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

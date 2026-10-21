@@ -5,10 +5,10 @@
 //! used for dependency-free `tokenizer.json` loading, a thread-safe LRU cache,
 //! and tokenizer auto-detection helpers.
 
-use crate::error::InferenceError;
-use crate::tokenizer::WordPieceTokenizer;
-use crate::tokenizer::bpe::BpeTokenizer;
-use crate::tokenizer::sentencepiece::SentencePieceTokenizer;
+use crate::bpe::BpeTokenizer;
+use crate::sentencepiece::SentencePieceTokenizer;
+use crate::wordpiece::WordPieceTokenizer;
+use lattice_inference_core::InferenceError;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::hash::Hash;
@@ -469,9 +469,19 @@ pub(crate) fn parse_json(text: &str) -> Result<JsonValue, InferenceError> {
     Ok(value)
 }
 
+/// Maximum number of nested JSON arrays and objects [`parse_json`] accepts.
+///
+/// The parser recurses once per container, so without a bound a deeply nested
+/// `tokenizer.json` exhausts the thread stack and aborts the process. Real
+/// tokenizer and model config files nest at most about ten containers deep,
+/// so 64 leaves ample headroom.
+const MAX_JSON_DEPTH: usize = 64;
+
 struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Containers currently open, checked against [`MAX_JSON_DEPTH`] in [`Self::parse_nested`].
+    depth: usize,
 }
 
 impl<'a> JsonParser<'a> {
@@ -479,6 +489,7 @@ impl<'a> JsonParser<'a> {
         Self {
             bytes: text.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -513,8 +524,8 @@ impl<'a> JsonParser<'a> {
             Some(b't') => self.parse_literal(b"true", JsonValue::Bool(true)),
             Some(b'f') => self.parse_literal(b"false", JsonValue::Bool(false)),
             Some(b'"') => self.parse_string().map(JsonValue::String),
-            Some(b'[') => self.parse_array(),
-            Some(b'{') => self.parse_object(),
+            Some(b'[') => self.parse_nested(Self::parse_array),
+            Some(b'{') => self.parse_nested(Self::parse_object),
             Some(b'-' | b'0'..=b'9') => self.parse_number(),
             Some(other) => Err(InferenceError::Tokenizer(format!(
                 "unexpected JSON byte 0x{other:02x} at offset {}",
@@ -524,6 +535,22 @@ impl<'a> JsonParser<'a> {
                 "unexpected end of JSON input".into(),
             )),
         }
+    }
+
+    fn parse_nested(
+        &mut self,
+        parse: fn(&mut Self) -> Result<JsonValue, InferenceError>,
+    ) -> Result<JsonValue, InferenceError> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(InferenceError::Tokenizer(format!(
+                "JSON nesting exceeds depth limit of {MAX_JSON_DEPTH} at offset {}",
+                self.pos
+            )));
+        }
+        self.depth += 1;
+        let value = parse(self);
+        self.depth -= 1;
+        value
     }
 
     fn parse_literal(

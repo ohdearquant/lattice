@@ -1,4 +1,5 @@
 use super::*;
+use lattice_inference_core::InferenceError;
 
 #[test]
 fn test_parse_json_round_trip_shapes() {
@@ -207,4 +208,57 @@ fn test_parse_post_processor_xlm_roberta_style() {
     let pp = parse_post_processor_flags(&root);
     assert_eq!(pp.bos_id, Some(0));
     assert_eq!(pp.eos_id, Some(2));
+}
+
+fn nested_arrays(depth: usize) -> String {
+    format!("{}{}", "[".repeat(depth), "]".repeat(depth))
+}
+
+fn nested_objects(depth: usize) -> String {
+    format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth))
+}
+
+fn assert_depth_refusal(result: Result<JsonValue, InferenceError>) {
+    match result {
+        Err(InferenceError::Tokenizer(msg)) => {
+            assert!(
+                msg.contains("depth limit of 64"),
+                "unexpected message: {msg}"
+            )
+        }
+        other => panic!("expected a tokenizer depth error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_json_accepts_nesting_at_the_depth_limit() {
+    assert!(parse_json(&nested_arrays(MAX_JSON_DEPTH)).is_ok());
+    assert!(parse_json(&nested_objects(MAX_JSON_DEPTH)).is_ok());
+}
+
+#[test]
+fn test_parse_json_refuses_nesting_one_past_the_depth_limit() {
+    assert_depth_refusal(parse_json(&nested_arrays(MAX_JSON_DEPTH + 1)));
+    assert_depth_refusal(parse_json(&nested_objects(MAX_JSON_DEPTH + 1)));
+}
+
+#[test]
+fn test_parse_json_depth_counts_open_containers_not_siblings() {
+    let siblings = format!("[{}]", vec![nested_arrays(MAX_JSON_DEPTH - 1); 8].join(","));
+    assert!(parse_json(&siblings).is_ok());
+}
+
+#[test]
+fn test_tokenizer_from_json_str_refuses_deep_nesting_on_a_default_stack() {
+    let outcomes = std::thread::spawn(|| {
+        [nested_arrays(100_000), nested_objects(100_000)].map(|text| match tokenizer_from_json_str(
+            &text, 512,
+        ) {
+            Err(InferenceError::Tokenizer(msg)) => msg.contains("depth limit of 64"),
+            _ => false,
+        })
+    })
+    .join()
+    .expect("parser thread panicked");
+    assert_eq!(outcomes, [true, true]);
 }

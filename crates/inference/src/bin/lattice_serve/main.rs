@@ -53,19 +53,15 @@
 //! OpenAI wire format on either side.
 //!
 //! `POST /v1/embeddings` (issue #584) does not go through that worker at
-//! all: it is served by an independently loaded, optional `BertModel`
-//! (`crate::model::bert`), which is CPU-only and has no `!Send` state of its
-//! own, so its `encode_batch` call runs via `tokio::task::spawn_blocking`
-//! instead of a dedicated owner thread. This is a deliberate scope choice,
-//! not an oversight: `lattice-embed`'s `EmbeddingService` trait is the
+//! all: it is served by an independently loaded, optional text embedding
+//! service (`lattice_inference::serving_embeddings::TextEmbeddingHandle`),
+//! which is CPU-only and has no `!Send` state of its own, so its
+//! `encode_batch` call runs via `tokio::task::spawn_blocking` instead of a
+//! dedicated owner thread. This is a deliberate scope choice, not an
+//! oversight: `lattice-embed`'s `EmbeddingService` trait is the
 //! natural-looking integration point, but `lattice-embed` already depends on
-//! `lattice-inference` (for `BertModel`/`QwenModel`), so a dependency edge
-//! the other way is a cyclic package dependency Cargo refuses to build.
-//! `BertModel` is this crate's own, already-published embedding primitive,
-//! so using it directly costs no new dependency edge and no default-build
-//! weight. It has no per-model pooling table (BGE-family checkpoints need
-//! CLS pooling, not `BertModel`'s mean-pooling default) — pass
-//! `--embedding-pooling cls` when serving one.
+//! `lattice-inference`, so a dependency edge the other way is a cyclic
+//! package dependency Cargo refuses to build.
 
 #![allow(clippy::field_reassign_with_default)]
 
@@ -127,7 +123,6 @@ mod imp {
     use lattice_inference::serving_provider::{
         FALLBACK_MODEL_MAX_CONTEXT, model_context_from_config,
     };
-    use lattice_inference::{BertModel, BertPooling};
     use serde_json::{Value, json};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Condvar, Mutex};
@@ -182,19 +177,17 @@ mod imp {
         }
     }
 
-    /// The loaded embedding model and its identity, independent of the
-    /// chat model this binary always loads. `BertModel` is CPU-only (no
-    /// `metal-gpu` dependency of its own -- see `crate::model::bert`), so it
-    /// is loaded directly on the calling thread at startup and its
-    /// `encode_batch` calls run via `spawn_blocking` rather than through the
-    /// shared Metal worker, which owns only the `!Send` chat model state.
+    /// The loaded embedding service and its identity, independent of the
+    /// chat model this binary always loads. The service is CPU-only, so it
+    /// is loaded on the calling thread at startup and its `encode_batch`
+    /// calls run via `spawn_blocking` rather than through the shared Metal
+    /// worker, which owns only the `!Send` chat model state.
     pub struct EmbeddingState {
-        model: BertModel,
+        service: lattice_inference::serving_embeddings::TextEmbeddingHandle,
         model_id: Arc<str>,
-        /// Bounded concurrent-job admission for `encode_batch`'s
-        /// `spawn_blocking` calls (issue #584 hardening), mirroring
-        /// `MetalWorkerClient`'s admission `Semaphore` (`AppState::max_pending`,
-        /// issue #932): each outstanding job can already allocate up to
+        /// Bounded concurrent-job admission for blocking text encoding,
+        /// kept separate from the chat worker's queue. Each outstanding job
+        /// can allocate up to
         /// [`lattice_inference::serve::embeddings::MAX_EMBEDDINGS_TOTAL_TOKENS`]
         /// worth of activation buffers, so total memory pressure across
         /// concurrent requests is bounded by (this cap) x (that per-request
@@ -206,58 +199,33 @@ mod imp {
         admission: Arc<Semaphore>,
     }
 
-    fn load_embedding_state(
+    fn embedding_state(
         embedding_model_dir: &std::path::Path,
-        pooling_override: Option<&str>,
-    ) -> Result<Arc<EmbeddingState>, String> {
-        if !embedding_model_dir.exists() {
-            return Err(format!(
-                "embedding model directory not found: {}",
-                embedding_model_dir.display()
-            ));
-        }
-        eprintln!(
-            "[lattice_serve] loading embedding model from {} ...",
-            embedding_model_dir.display()
-        );
-        let mut model = BertModel::from_directory(embedding_model_dir).map_err(|e| {
-            format!(
-                "embedding model load failed ({}): {e}",
-                embedding_model_dir.display()
-            )
-        })?;
+        service: lattice_inference::serving_embeddings::TextEmbeddingHandle,
+    ) -> Arc<EmbeddingState> {
         let embedding_model_id: Arc<str> = embedding_model_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("embedding")
             .into();
-        // Auto-select the same default `--embedding-pooling` would
-        // otherwise force the operator to pass explicitly. See
-        // `lattice_inference::pool::default_bert_pooling_for_model_name`
-        // for the rule and its agreement test against
-        // `lattice-embed`'s `EmbeddingModel::bert_pooling` table.
-        model.set_pooling(
-            lattice_inference::pool::default_bert_pooling_for_model_name(&embedding_model_id),
-        );
-        match pooling_override {
-            None => {}
-            Some("mean") => model.set_pooling(BertPooling::Mean),
-            Some("cls") => model.set_pooling(BertPooling::CLS),
-            Some(other) => {
-                return Err(format!(
-                    "invalid --embedding-pooling '{other}'; expected 'mean' or 'cls'"
-                ));
-            }
-        }
-        eprintln!(
-            "[lattice_serve] embedding model '{embedding_model_id}' ready (dimensions={})",
-            model.dimensions()
-        );
-        Ok(Arc::new(EmbeddingState {
-            model,
+        Arc::new(EmbeddingState {
+            service,
             model_id: embedding_model_id,
             admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
-        }))
+        })
+    }
+
+    #[cfg(all(test, feature = "test-utils"))]
+    fn load_embedding_state(
+        embedding_model_dir: &std::path::Path,
+        pooling_override: Option<&str>,
+    ) -> Result<Arc<EmbeddingState>, String> {
+        let plan = serving_provider::plan_text_embeddings(
+            embedding_model_dir,
+            pooling_override.map(str::to_owned),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(embedding_state(embedding_model_dir, plan.load()?))
     }
 
     /// See [`EmbeddingState::admission`].
@@ -2805,11 +2773,10 @@ mod imp {
     }
 
     /// `POST /v1/embeddings` (issue #584): OpenAI-compatible embeddings over
-    /// the independently loaded `--embedding-model` `BertModel`. Follows
+    /// the independently loaded `--embedding-model` service. Follows
     /// `chat_completions`'s content-type/body-size/parse/validate cascade,
-    /// but has no worker to submit to: `BertModel::encode_batch` runs
-    /// directly, off the async executor via `spawn_blocking` (CPU matmuls,
-    /// not `.await`-friendly).
+    /// but has no worker to submit to: `encode_batch` runs off the async
+    /// executor via `spawn_blocking` (CPU matmuls, not `.await`-friendly).
     async fn embeddings<H: Send + Sync + 'static>(
         State(s): State<AppState<H>>,
         headers: HeaderMap,
@@ -2951,27 +2918,19 @@ mod imp {
         }
 
         let embedding_model_id = embedding.model_id.clone();
-        let (item_token_counts, item_pre_truncation_counts): (Vec<usize>, Vec<usize>) = {
-            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-            embedding
-                .model
-                .tokenizer()
-                .tokenize_batch(&refs)
-                .iter()
-                .map(|t| (t.real_length, t.pre_truncation_len))
-                .unzip()
-        };
+        let token_counts = embedding.service.count_batch(&texts);
+        let item_token_counts: Vec<usize> = token_counts.iter().map(|t| t.embedded).collect();
+        let item_pre_truncation_counts: Vec<usize> =
+            token_counts.iter().map(|t| t.pre_truncation).collect();
         let prompt_tokens: usize = item_token_counts.iter().sum();
-        // Checked per item, before either `BertModel::encode_batch` path
-        // runs: `encode_batch_packed` clamps an over-length item to
-        // `max_position_embeddings` and would otherwise answer 200 for a
-        // silently truncated embedding, and the single-item `encode` path
-        // does not clamp at all. See `check_embeddings_item_fits_window`'s
+        // Checked per item before encoding: the tokenizer truncates to its
+        // own limit, so the guard must compare the pre-truncation count.
+        // See `check_embeddings_item_fits_window`'s
         // doc comment. The guard tests `pre_truncation_len`, not
         // `real_length`: the tokenizer's own `max_seq_len` truncation runs
         // first, so `real_length` can never exceed it and the guard would be
         // unsatisfiable whenever `max_seq_len <= max_position_embeddings`.
-        let max_position_embeddings = embedding.model.config().max_position_embeddings;
+        let max_position_embeddings = embedding.service.max_context();
         if let Some((index, &token_count)) = item_pre_truncation_counts
             .iter()
             .enumerate()
@@ -3026,8 +2985,7 @@ mod imp {
         };
 
         let encode_result = run_embedding_encode(admission_permit, move || {
-            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-            embedding.model.encode_batch(&refs)
+            embedding.service.encode_batch(&texts)
         })
         .await;
         let vectors = match encode_result {
@@ -3588,23 +3546,23 @@ mod imp {
         let serving = lattice_inference::serving_host::ServingHandle::affine_standalone(jobs);
 
         // Issue #584: independent, optional second model for
-        // `POST /v1/embeddings`. `BertModel` is CPU-only (see
-        // `crate::model::bert`'s doc comment) so it loads directly here,
-        // synchronously -- no `!Send` worker thread boundary applies to it.
-        // `--embedding-model` is deliberately optional: an operator who only
-        // wants chat completions should not have to point this flag at
-        // anything, and the route itself stays registered either way (see
-        // `AppState::embedding`'s doc comment).
+        // `POST /v1/embeddings`. `--embedding-model` is deliberately
+        // optional: an operator who only wants chat completions should not
+        // have to point this flag at anything, and the route itself stays
+        // registered either way (see `AppState::embedding`'s doc comment).
         let embedding_state = match parse_arg(&args, "--embedding-model")
             .or_else(|| std::env::var("LATTICE_SERVE_EMBEDDING_MODEL").ok())
         {
             None => None,
             Some(embedding_model_arg) => {
                 let embedding_model_dir = resolve_model_dir(&embedding_model_arg);
-                Some(load_embedding_state(
+                let plan = serving_provider::plan_text_embeddings(
                     &embedding_model_dir,
-                    parse_arg(&args, "--embedding-pooling").as_deref(),
-                )?)
+                    parse_arg(&args, "--embedding-pooling"),
+                )
+                .map_err(|error| error.to_string())?;
+                let service = plan.load()?;
+                Some(embedding_state(&embedding_model_dir, service))
             }
         };
 

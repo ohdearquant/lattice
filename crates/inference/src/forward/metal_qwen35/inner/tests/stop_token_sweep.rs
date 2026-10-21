@@ -688,7 +688,7 @@ fn moe_rejection_gen_cfg() -> crate::generation::GenerateConfig {
 /// `好` (`0xE5 0xA5 0xBD`), exactly as a real byte-level BPE vocab
 /// would encode it, so ids 30/31 decode to genuine CJK bytes if sampled.
 fn multibyte_vocab_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
-    use crate::tokenizer::detokenize::bytes_to_unicode;
+    use lattice_tokenizer::__internal::bytes_to_unicode;
     use std::collections::HashMap;
     let byte_encoder = bytes_to_unicode();
     let byte_level_token =

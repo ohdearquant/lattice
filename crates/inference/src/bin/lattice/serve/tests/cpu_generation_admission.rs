@@ -145,7 +145,7 @@ async fn wait_flag(flag: &std::sync::atomic::AtomicBool, what: &str) {
 /// Cap 1 and a generator that FAILS on its first call and succeeds
 /// afterwards, for the "a failed generation releases its slot" pair.
 /// The error is an existing `InferenceError` variant,
-/// `InferenceError::Inference(String)` (`crates/inference/src/error.rs:27`).
+/// `InferenceError::Inference(String)` (`crates/inference-core/src/error.rs:28`).
 /// The serve arms surface it as HTTP 500 `internal_error` on the
 /// non-streaming path (`serve.rs:1467-1472`) and as an SSE error event
 /// on the streaming path (`StreamMsg::Failed`), so request 1 differs per

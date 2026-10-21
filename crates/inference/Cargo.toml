@@ -140,6 +140,8 @@ ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 lattice-fann = { version = "0.14.0", path = "../fann", optional = true }
+lattice-inference-core = { version = "0.14.0", path = "../inference-core" }
+lattice-tokenizer = { version = "0.14.0", path = "../tokenizer" }
 
 # Two independent unix-only uses: (1) `fcntl(F_GETPATH)` for `weights/f32_weights.rs`'s
 # `real_path_of_open_file`, which reports the real path of an already-open shard descriptor
@@ -414,7 +416,7 @@ required-features = ["f16", "metal-gpu", "gdn-state-counters"]
 # code in download.rs is correspondingly `not(target_arch = "wasm32")`-gated, so on
 # wasm the "downloads unavailable" path is what compiles. See issue #1095.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ureq = { version = "2", features = ["tls"], optional = true }
+ureq = { version = "3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
