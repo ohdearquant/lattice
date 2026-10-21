@@ -272,6 +272,19 @@ fn downloaded_checksum_mismatch_removes_artifact() {
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn download_agent_keeps_the_connect_timeout_and_redirect_limit_ureq_2_had() {
+    let agent = download_agent();
+    let config = agent.config();
+    assert_eq!(
+        config.timeouts().connect,
+        Some(std::time::Duration::from_secs(30)),
+        "a stalled connect must give up after 30 s, not wait for the OS"
+    );
+    assert_eq!(config.max_redirects(), 5);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn serve_loopback(response: Vec<u8>) -> u16 {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");

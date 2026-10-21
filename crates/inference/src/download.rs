@@ -339,11 +339,25 @@ fn expected_checksums(model_name: &str) -> ExpectedChecksums {
     }
 }
 
+/// The client ureq 2 gave this module by default: no proxy from the
+/// environment, a 30 s connect timeout, and at most 5 redirects. ureq 3
+/// reads proxies from the environment, has no connect timeout and follows
+/// 10 redirects unless told otherwise.
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .proxy(None)
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .max_redirects(5)
+        .build()
+        .into()
+}
+
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
     use std::io::Write;
 
-    let agent: ureq::Agent = ureq::Agent::config_builder().proxy(None).build().into();
+    let agent = download_agent();
     let response = agent
         .get(url)
         .header("User-Agent", "lattice-inference/0.3.3")
