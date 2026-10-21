@@ -612,6 +612,89 @@ fn pooled_selection_refuses_two_claims_in_sorted_order() {
 }
 
 #[test]
+fn text_selection_uses_one_claim_and_refuses_two_in_sorted_order() {
+    let evidence = empty_evidence();
+    let alpha = TextTestProvider::new("alpha", true);
+    let zeta = TextTestProvider::new("zeta", true);
+    let other = TextTestProvider::new("other", false);
+    let fallback = TextTestProvider::new("legacy", false);
+
+    let one_claim: [&dyn RegisteredProvider; 2] = [&other, &alpha];
+    let selected = select_text_with_registry(&evidence, &one_claim, &fallback)
+        .expect("one text claim selects its provider");
+    assert_eq!(selected.name(), "alpha");
+
+    let two_claims: [&dyn RegisteredProvider; 2] = [&zeta, &alpha];
+    let error = select_text_with_registry(&evidence, &two_claims, &fallback)
+        .err()
+        .expect("two text claims are ambiguous");
+    assert_eq!(
+        error,
+        EmbeddingSelectionError::Ambiguous {
+            providers: vec!["alpha", "zeta"]
+        }
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn text_selection_uses_the_bert_loader_for_unknown_and_missing_model_types() {
+    use crate::bert_pooling_fixture::write_checkpoint;
+    use serde_json::Value;
+    use std::fs;
+
+    let temp = tempfile::tempdir().expect("temporary directory must be created");
+    for (name, model_type) in [("unknown-type", Some("other")), ("missing-type", None)] {
+        let path = temp.path().join(name);
+        write_checkpoint(&path).expect("deterministic checkpoint must be written");
+        let config_path = path.join("config.json");
+        let mut config: Value = serde_json::from_slice(
+            &fs::read(&config_path).expect("fixture config must be readable"),
+        )
+        .expect("fixture config must parse");
+        match model_type {
+            Some(model_type) => config["model_type"] = Value::String(model_type.to_owned()),
+            None => {
+                config
+                    .as_object_mut()
+                    .expect("fixture config must be an object")
+                    .remove("model_type");
+            }
+        }
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&config).expect("fixture config must serialize"),
+        )
+        .expect("fixture config must be updated");
+
+        let service = plan_text_embeddings(&path, None)
+            .expect("zero claims must use the legacy BERT loader")
+            .load()
+            .expect("legacy BERT loader must accept this directory");
+        assert_eq!(service.representation().loader_format, "bert-safetensors");
+    }
+}
+
+#[test]
+fn text_registration_does_not_change_qwen_or_gemma_generation_selection() {
+    assert!(providers::BERT_PROVIDER.generation().is_none());
+    assert!(providers::BERT_PROVIDER.pooled_embeddings().is_none());
+
+    for (model_type, expected) in [("qwen3_5", "qwen"), ("gemma4", "gemma")] {
+        let selected = select(
+            CheckpointEvidence {
+                directory: PathBuf::from("checkpoint"),
+                format: ModelFormat::Safetensors,
+                model_type: Some(model_type.to_owned()),
+            },
+            ServingEntry::Lattice,
+        )
+        .expect("existing generation provider must remain selected");
+        assert_eq!(selected.provider.name(), expected);
+    }
+}
+
+#[test]
 fn implicit_pooled_plan_preserves_qwen_directory_and_gemma_message() {
     let qwen_directory = PathBuf::from("/models/qwen");
     let qwen = SelectedProvider {
@@ -672,6 +755,10 @@ impl RegisteredProvider for PooledTestProvider {
 
     fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider> {
         Some(self)
+    }
+
+    fn text_embeddings(&self) -> Option<&dyn TextEmbeddingProvider> {
+        None
     }
 }
 
@@ -801,6 +888,10 @@ impl RegisteredProvider for TestProvider {
     fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider> {
         Some(self)
     }
+
+    fn text_embeddings(&self) -> Option<&dyn TextEmbeddingProvider> {
+        None
+    }
 }
 
 impl PooledEmbeddingProvider for TestProvider {
@@ -814,5 +905,56 @@ impl PooledEmbeddingProvider for TestProvider {
 
     fn plan(&self, _directory: PathBuf) -> Box<dyn PooledEmbeddingLoadPlan> {
         Box::new(TestPooledLoadPlan)
+    }
+}
+
+struct TextTestProvider {
+    name: &'static str,
+    claim: bool,
+}
+
+impl TextTestProvider {
+    fn new(name: &'static str, claim: bool) -> Self {
+        Self { name, claim }
+    }
+}
+
+impl RegisteredProvider for TextTestProvider {
+    fn generation(&self) -> Option<&dyn ServingProvider> {
+        None
+    }
+
+    fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider> {
+        None
+    }
+
+    fn text_embeddings(&self) -> Option<&dyn TextEmbeddingProvider> {
+        Some(self)
+    }
+}
+
+impl TextEmbeddingProvider for TextTestProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn claims(&self, _evidence: &CheckpointEvidence) -> bool {
+        self.claim
+    }
+
+    fn plan(
+        &self,
+        _directory: PathBuf,
+        _pooling_override: Option<String>,
+    ) -> Box<dyn TextEmbeddingLoadPlan> {
+        Box::new(TestTextLoadPlan)
+    }
+}
+
+struct TestTextLoadPlan;
+
+impl TextEmbeddingLoadPlan for TestTextLoadPlan {
+    fn load(self: Box<Self>) -> Result<crate::serving_embeddings::TextEmbeddingHandle, String> {
+        Err("test text service is not loadable".to_owned())
     }
 }

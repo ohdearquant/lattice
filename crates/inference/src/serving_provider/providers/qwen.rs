@@ -147,6 +147,10 @@ impl RegisteredProvider for QwenProvider {
     fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider> {
         Some(self)
     }
+
+    fn text_embeddings(&self) -> Option<&dyn crate::serving_provider::TextEmbeddingProvider> {
+        None
+    }
 }
 
 impl PooledEmbeddingProvider for QwenProvider {

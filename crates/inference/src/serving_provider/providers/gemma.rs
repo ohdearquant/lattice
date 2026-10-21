@@ -165,6 +165,10 @@ impl RegisteredProvider for GemmaProvider {
     fn pooled_embeddings(&self) -> Option<&dyn crate::serving_provider::PooledEmbeddingProvider> {
         None
     }
+
+    fn text_embeddings(&self) -> Option<&dyn crate::serving_provider::TextEmbeddingProvider> {
+        None
+    }
 }
 
 /// Load Gemma's CPU serving resources using the existing serving loader.

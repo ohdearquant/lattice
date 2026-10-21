@@ -1,4 +1,4 @@
-//! Serving interfaces for pooled embeddings.
+//! Serving interfaces for text and pooled embeddings.
 
 use std::sync::Arc;
 
@@ -36,6 +36,13 @@ pub(crate) trait PooledEmbeddingService: Send + Sync {
         image: &[u8],
         pooling: PoolingStrategy,
     ) -> Result<Vec<f32>, InferenceError>;
+}
+
+pub(crate) trait TextEmbeddingService: Send + Sync {
+    fn representation(&self) -> EmbeddingRepresentation;
+    fn max_context(&self) -> usize;
+    fn count_batch(&self, input: &[String]) -> Vec<TokenCounts>;
+    fn encode_batch(&self, input: &[String]) -> Result<Vec<Vec<f32>>, InferenceError>;
 }
 
 /// Shared access to a loaded pooled embedding service.
@@ -116,5 +123,38 @@ impl PooledEmbeddingService for PooledEmbeddingHandle {
         pooling: PoolingStrategy,
     ) -> Result<Vec<f32>, InferenceError> {
         self.inner.embed_image(image, pooling)
+    }
+}
+
+/// Shared access to a loaded text embedding service.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct TextEmbeddingHandle {
+    inner: Arc<dyn TextEmbeddingService>,
+}
+
+impl TextEmbeddingHandle {
+    pub(crate) fn new(inner: Arc<dyn TextEmbeddingService>) -> Self {
+        Self { inner }
+    }
+
+    /// Returns the loader identifier and vector width.
+    pub fn representation(&self) -> EmbeddingRepresentation {
+        self.inner.representation()
+    }
+
+    /// Returns the maximum accepted text input length.
+    pub fn max_context(&self) -> usize {
+        self.inner.max_context()
+    }
+
+    /// Returns each input's raw pre-truncation and embedded token lengths.
+    pub fn count_batch(&self, input: &[String]) -> Vec<TokenCounts> {
+        self.inner.count_batch(input)
+    }
+
+    /// Computes one embedding vector for each input string.
+    pub fn encode_batch(&self, input: &[String]) -> Result<Vec<Vec<f32>>, InferenceError> {
+        self.inner.encode_batch(input)
     }
 }
