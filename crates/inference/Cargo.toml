@@ -416,7 +416,7 @@ required-features = ["f16", "metal-gpu", "gdn-state-counters"]
 # code in download.rs is correspondingly `not(target_arch = "wasm32")`-gated, so on
 # wasm the "downloads unavailable" path is what compiles. See issue #1095.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ureq = { version = "2", features = ["tls"], optional = true }
+ureq = { version = "3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

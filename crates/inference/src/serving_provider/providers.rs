@@ -3,9 +3,9 @@
 pub mod gemma;
 pub mod qwen;
 
-use super::ServingProvider;
+use super::RegisteredProvider;
 
 pub(super) static QWEN_PROVIDER: qwen::QwenProvider = qwen::QwenProvider;
 pub(super) static GEMMA_PROVIDER: gemma::GemmaProvider = gemma::GemmaProvider;
 
-pub(super) static PROVIDERS: [&dyn ServingProvider; 2] = [&QWEN_PROVIDER, &GEMMA_PROVIDER];
+pub(super) static PROVIDERS: [&dyn RegisteredProvider; 2] = [&QWEN_PROVIDER, &GEMMA_PROVIDER];

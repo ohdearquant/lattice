@@ -166,6 +166,10 @@ pub mod serving_cpu;
 #[cfg(feature = "serve")]
 #[doc(hidden)]
 pub mod serving_cpu_host;
+/// Pooled embedding service interfaces used by serving entry points.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_embeddings;
 /// Builds the serving worker's runtime and request preparation for a loaded
 /// model. Not a stable API.
 #[cfg(feature = "serve")]

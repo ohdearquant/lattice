@@ -270,3 +270,128 @@ fn downloaded_checksum_mismatch_removes_artifact() {
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn download_agent_keeps_the_connect_timeout_and_redirect_limit_ureq_2_had() {
+    let agent = download_agent();
+    let config = agent.config();
+    assert_eq!(
+        config.timeouts().connect,
+        Some(std::time::Duration::from_secs(30)),
+        "a stalled connect must give up after 30 s, not wait for the OS"
+    );
+    assert_eq!(config.max_redirects(), 5);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn serve_loopback(response: Vec<u8>) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => request.push(byte[0]),
+                    _ => break,
+                }
+            }
+            let _ = stream.write_all(&response);
+        }
+    });
+    port
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn loopback_reply(status: &str, body: &[u8]) -> Vec<u8> {
+    let mut reply = format!(
+        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    reply.extend_from_slice(body);
+    reply
+}
+
+/// Checkpoint files run to gigabytes, far past the 10 MB the HTTP client's
+/// own buffered readers stop at, so the body is streamed to disk whole.
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn download_file_writes_a_body_past_ten_megabytes_whole() {
+    let body = vec![b'x'; 11 * 1024 * 1024];
+    let port = serve_loopback(loopback_reply("200 OK", &body));
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("model.safetensors");
+    download_file(&format!("http://127.0.0.1:{port}/model"), &path).expect("download");
+    let written = std::fs::read(&path).expect("downloaded file");
+    assert_eq!(written.len(), body.len());
+    assert!(written == body);
+    assert!(!path.with_extension("part").exists());
+}
+
+/// An error status is a failed download, never a file holding the error page.
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn download_file_refuses_an_error_status_and_writes_nothing() {
+    let port = serve_loopback(loopback_reply("404 Not Found", b"missing"));
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("model.safetensors");
+    let result = download_file(&format!("http://127.0.0.1:{port}/model"), &path);
+    assert!(
+        matches!(result, Err(InferenceError::Download(_))),
+        "{result:?}"
+    );
+    assert!(!path.exists());
+    assert!(!path.with_extension("part").exists());
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+const PROXY_CHILD_PORT: &str = "LATTICE_DOWNLOAD_PROXY_CHILD_PORT";
+
+/// Proxy settings in the environment are not applied to downloads. The check
+/// runs in a child process so the variables are set only there. In the child,
+/// a client built with the library's default configuration must fail through
+/// the dead proxy, which shows the variables were read.
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn download_file_ignores_proxy_settings_in_the_environment() {
+    if let Ok(port) = std::env::var(PROXY_CHILD_PORT) {
+        let url = format!("http://127.0.0.1:{port}/model");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("model.safetensors");
+        download_file(&url, &path).expect("download through the proxy settings");
+        assert_eq!(std::fs::read(&path).expect("downloaded file"), b"weights");
+        assert!(
+            ureq::Agent::new_with_defaults().get(&url).call().is_err(),
+            "a default client reached the server, so the proxy variables were not read"
+        );
+        return;
+    }
+    let port = serve_loopback(loopback_reply("200 OK", b"weights"));
+    let dead_proxy = "http://127.0.0.1:9";
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "download::tests::download_file_ignores_proxy_settings_in_the_environment",
+            "--exact",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(PROXY_CHILD_PORT, port.to_string())
+        .env("ALL_PROXY", dead_proxy)
+        .env("HTTP_PROXY", dead_proxy)
+        .env("http_proxy", dead_proxy)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .expect("child test process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "child failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

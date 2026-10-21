@@ -8,19 +8,26 @@ use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::model_format::ModelFamily;
 use crate::serve::route::{RouteRefusal, ServedRoute, select_route, select_standalone_route};
+use crate::serving_embeddings::PooledEmbeddingHandle;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
-use crate::serving_provider::{CheckpointEvidence, ServingEntry, ServingProvider};
+use crate::serving_provider::{
+    CheckpointEvidence, PooledEmbeddingLoadPlan, PooledEmbeddingProvider, RegisteredProvider,
+    ServingEntry, ServingProvider,
+};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_provider::{
     LatticeOpenOptions, StandaloneLoadOptions, StandaloneLoadPlan, StandaloneOptionPresence,
     StandaloneQwenLoader, StandaloneStartupDescription,
 };
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod adapters;
 pub(crate) mod cpu;
+pub(crate) mod embedding;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod lattice_worker;
 mod preparation;
@@ -62,6 +69,17 @@ impl ServingProvider for QwenProvider {
                     Err(refusal) => Err(refusal),
                 }
             }
+        }
+    }
+
+    fn implicit_pooled_embeddings(
+        &self,
+        evidence: &CheckpointEvidence,
+        _model: &str,
+    ) -> crate::serving_provider::ImplicitPooledEmbeddingPlan {
+        crate::serving_provider::ImplicitPooledEmbeddingPlan {
+            directory_to_try: Some(evidence.directory.clone()),
+            disabled_line: None,
         }
     }
 
@@ -118,6 +136,42 @@ impl ServingProvider for QwenProvider {
         options: StandaloneLoadOptions,
     ) -> Result<StandaloneLoadPlan, String> {
         qwen_standalone_plan(evidence, options)
+    }
+}
+
+impl RegisteredProvider for QwenProvider {
+    fn generation(&self) -> Option<&dyn ServingProvider> {
+        Some(self)
+    }
+
+    fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider> {
+        Some(self)
+    }
+}
+
+impl PooledEmbeddingProvider for QwenProvider {
+    fn name(&self) -> &'static str {
+        ServingProvider::name(self)
+    }
+
+    fn claims(&self, evidence: &CheckpointEvidence) -> bool {
+        ServingProvider::claims(self, evidence)
+    }
+
+    fn plan(&self, directory: PathBuf) -> Box<dyn PooledEmbeddingLoadPlan> {
+        Box::new(QwenPooledEmbeddingPlan { directory })
+    }
+}
+
+struct QwenPooledEmbeddingPlan {
+    directory: PathBuf,
+}
+
+impl PooledEmbeddingLoadPlan for QwenPooledEmbeddingPlan {
+    fn load(self: Box<Self>) -> Result<PooledEmbeddingHandle, InferenceError> {
+        let model = embedding::EmbeddingModel::from_directory(&self.directory)
+            .map_err(InferenceError::InvalidInput)?;
+        Ok(PooledEmbeddingHandle::new(Arc::new(model)))
     }
 }
 

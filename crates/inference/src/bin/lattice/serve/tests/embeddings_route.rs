@@ -14,7 +14,11 @@ pub(super) fn post_embeddings(body: serde_json::Value) -> axum::http::Request<Bo
 
 pub(super) fn state_with_embedder() -> AppState {
     let mut state = tiny_state(64);
-    state.embedding_model = Some(Arc::new(tiny_embedding_model()));
+    state.embedding_model = Some(
+        lattice_inference::serve::embeddings::test_support::tiny_embedding_handle(
+            tiny_embedding_model(),
+        ),
+    );
     state
 }
 

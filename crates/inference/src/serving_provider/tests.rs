@@ -225,7 +225,7 @@ fn gemma_identity_is_selected_even_for_an_unsupported_or_malformed_profile() {
 
 #[test]
 fn provider_route_projections_match_the_existing_route_functions() {
-    let family_providers: [(&dyn ServingProvider, ModelFamily, &str); 2] = [
+    let family_providers: [(&dyn RegisteredProvider, ModelFamily, &str); 2] = [
         (&providers::QWEN_PROVIDER, ModelFamily::Qwen35, "qwen3_5"),
         (&providers::GEMMA_PROVIDER, ModelFamily::Gemma4, "gemma4"),
     ];
@@ -248,7 +248,7 @@ fn provider_route_projections_match_the_existing_route_functions() {
                     entry,
                     &ProviderRegistry {
                         providers: &provider_list,
-                        legacy: &providers::QWEN_PROVIDER,
+                        legacy_generation: &providers::QWEN_PROVIDER,
                     },
                 );
                 let actual = selected
@@ -277,8 +277,8 @@ fn provider_route_projections_match_the_existing_route_functions() {
 fn ambiguity_is_sorted_duplicate_sensitive_and_order_independent() {
     let alpha = TestProvider::new("alpha", true, Ok(Some(ServedRoute::QWEN35_CPU)));
     let zeta = TestProvider::new("zeta", true, Ok(Some(ServedRoute::GEMMA4_CPU)));
-    let forward = [&zeta as &dyn ServingProvider, &alpha];
-    let reverse = [&alpha as &dyn ServingProvider, &zeta];
+    let forward = [&zeta as &dyn RegisteredProvider, &alpha];
+    let reverse = [&alpha as &dyn RegisteredProvider, &zeta];
     let legacy = TestProvider::new("legacy", false, Ok(None));
 
     let forward_error = select_with_registry(
@@ -286,7 +286,7 @@ fn ambiguity_is_sorted_duplicate_sensitive_and_order_independent() {
         ServingEntry::Lattice,
         &ProviderRegistry {
             providers: &forward,
-            legacy: &legacy,
+            legacy_generation: &legacy,
         },
     )
     .err()
@@ -296,7 +296,7 @@ fn ambiguity_is_sorted_duplicate_sensitive_and_order_independent() {
         ServingEntry::Lattice,
         &ProviderRegistry {
             providers: &reverse,
-            legacy: &legacy,
+            legacy_generation: &legacy,
         },
     )
     .err()
@@ -316,13 +316,13 @@ fn ambiguity_is_sorted_duplicate_sensitive_and_order_independent() {
     assert_eq!(alpha.route_calls.load(Ordering::SeqCst), 0);
     assert_eq!(zeta.route_calls.load(Ordering::SeqCst), 0);
 
-    let duplicated = [&alpha as &dyn ServingProvider, &alpha];
+    let duplicated = [&alpha as &dyn RegisteredProvider, &alpha];
     let duplicate_error = select_with_registry(
         empty_evidence(),
         ServingEntry::Lattice,
         &ProviderRegistry {
             providers: &duplicated,
-            legacy: &legacy,
+            legacy_generation: &legacy,
         },
     )
     .err()
@@ -341,13 +341,13 @@ fn ambiguity_is_sorted_duplicate_sensitive_and_order_independent() {
 fn positive_claim_refusal_does_not_reach_the_legacy_provider() {
     let claimant = TestProvider::new("claimant", true, Err(RouteRefusal::GemmaMetalUnsupported));
     let legacy = TestProvider::new("legacy", false, Ok(None));
-    let providers = [&claimant as &dyn ServingProvider, &legacy];
+    let providers = [&claimant as &dyn RegisteredProvider, &legacy];
     let error = select_with_registry(
         empty_evidence(),
         ServingEntry::Lattice,
         &ProviderRegistry {
             providers: &providers,
-            legacy: &legacy,
+            legacy_generation: &legacy,
         },
     )
     .err()
@@ -368,13 +368,13 @@ fn positive_claim_refusal_does_not_reach_the_legacy_provider() {
 fn legacy_provider_route_is_reached_only_when_no_provider_claims() {
     let nonclaimant = TestProvider::new("nonclaimant", false, Ok(None));
     let legacy = TestProvider::new("legacy", false, Ok(Some(ServedRoute::QWEN35_CPU)));
-    let providers = [&nonclaimant as &dyn ServingProvider, &legacy];
+    let providers = [&nonclaimant as &dyn RegisteredProvider, &legacy];
     let selected = select_with_registry(
         empty_evidence(),
         ServingEntry::Lattice,
         &ProviderRegistry {
             providers: &providers,
-            legacy: &legacy,
+            legacy_generation: &legacy,
         },
     )
     .expect("zero claims binds the registered legacy provider");
@@ -574,6 +574,134 @@ fn empty_evidence() -> CheckpointEvidence {
     }
 }
 
+#[test]
+fn pooled_selection_uses_one_claim_and_the_legacy_provider_for_zero_claims() {
+    let evidence = empty_evidence();
+    let claimant = PooledTestProvider::new("alpha", true);
+    let nonclaimant = PooledTestProvider::new("other", false);
+    let fallback = PooledTestProvider::new("legacy", false);
+    let one_provider: [&dyn RegisteredProvider; 1] = [&claimant];
+    let no_claim_providers: [&dyn RegisteredProvider; 1] = [&nonclaimant];
+
+    let selected = select_pooled_with_registry(&evidence, &one_provider, &fallback)
+        .expect("one pooled claim selects its provider");
+    assert_eq!(selected.name(), "alpha");
+
+    let selected = select_pooled_with_registry(&evidence, &no_claim_providers, &fallback)
+        .expect("zero pooled claims use the legacy provider");
+    assert_eq!(selected.name(), "legacy");
+}
+
+#[test]
+fn pooled_selection_refuses_two_claims_in_sorted_order() {
+    let evidence = empty_evidence();
+    let zeta = PooledTestProvider::new("zeta", true);
+    let alpha = PooledTestProvider::new("alpha", true);
+    let fallback = PooledTestProvider::new("legacy", false);
+    let providers: [&dyn RegisteredProvider; 2] = [&zeta, &alpha];
+
+    let error = select_pooled_with_registry(&evidence, &providers, &fallback)
+        .err()
+        .expect("two pooled claims are ambiguous");
+    assert_eq!(
+        error,
+        EmbeddingSelectionError::Ambiguous {
+            providers: vec!["alpha", "zeta"]
+        }
+    );
+}
+
+#[test]
+fn implicit_pooled_plan_preserves_qwen_directory_and_gemma_message() {
+    let qwen_directory = PathBuf::from("/models/qwen");
+    let qwen = SelectedProvider {
+        provider: &providers::QWEN_PROVIDER,
+        evidence: CheckpointEvidence {
+            directory: qwen_directory.clone(),
+            format: ModelFormat::Safetensors,
+            model_type: Some("qwen3_5".to_owned()),
+        },
+        entry: ServingEntry::Lattice,
+        legacy_route: Some(ServedRoute::QWEN35_CPU),
+    };
+    assert_eq!(
+        qwen.implicit_pooled_embeddings("qwen display"),
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: Some(qwen_directory),
+            disabled_line: None,
+        }
+    );
+
+    let gemma = SelectedProvider {
+        provider: &providers::GEMMA_PROVIDER,
+        evidence: CheckpointEvidence {
+            directory: PathBuf::from("/models/gemma"),
+            format: ModelFormat::Safetensors,
+            model_type: Some("gemma4".to_owned()),
+        },
+        entry: ServingEntry::Lattice,
+        legacy_route: Some(ServedRoute::GEMMA4_CPU),
+    };
+    assert_eq!(
+        gemma.implicit_pooled_embeddings("gemma display"),
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: None,
+            disabled_line: Some(
+                "Embeddings disabled (gemma display): not available for Gemma 4 checkpoints."
+                    .to_owned()
+            ),
+        }
+    );
+}
+
+struct PooledTestProvider {
+    name: &'static str,
+    claim: bool,
+}
+
+impl PooledTestProvider {
+    fn new(name: &'static str, claim: bool) -> Self {
+        Self { name, claim }
+    }
+}
+
+impl RegisteredProvider for PooledTestProvider {
+    fn generation(&self) -> Option<&dyn ServingProvider> {
+        None
+    }
+
+    fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider> {
+        Some(self)
+    }
+}
+
+impl PooledEmbeddingProvider for PooledTestProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn claims(&self, _evidence: &CheckpointEvidence) -> bool {
+        self.claim
+    }
+
+    fn plan(&self, _directory: PathBuf) -> Box<dyn PooledEmbeddingLoadPlan> {
+        Box::new(TestPooledLoadPlan)
+    }
+}
+
+struct TestPooledLoadPlan;
+
+impl PooledEmbeddingLoadPlan for TestPooledLoadPlan {
+    fn load(
+        self: Box<Self>,
+    ) -> Result<crate::serving_embeddings::PooledEmbeddingHandle, crate::error::InferenceError>
+    {
+        Err(crate::error::InferenceError::Inference(
+            "test pooled service is not loadable".to_owned(),
+        ))
+    }
+}
+
 struct TestProvider {
     name: &'static str,
     claim: bool,
@@ -614,6 +742,17 @@ impl ServingProvider for TestProvider {
         self.route
     }
 
+    fn implicit_pooled_embeddings(
+        &self,
+        evidence: &CheckpointEvidence,
+        _model: &str,
+    ) -> ImplicitPooledEmbeddingPlan {
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: Some(evidence.directory.clone()),
+            disabled_line: None,
+        }
+    }
+
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn validate_standalone_options(
         &self,
@@ -651,5 +790,29 @@ impl ServingProvider for TestProvider {
         _qwen_loader: StandaloneQwenLoader,
     ) -> Result<ServingFactory, String> {
         Err("test provider does not build a factory".to_owned())
+    }
+}
+
+impl RegisteredProvider for TestProvider {
+    fn generation(&self) -> Option<&dyn ServingProvider> {
+        Some(self)
+    }
+
+    fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider> {
+        Some(self)
+    }
+}
+
+impl PooledEmbeddingProvider for TestProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn claims(&self, _evidence: &CheckpointEvidence) -> bool {
+        self.claim
+    }
+
+    fn plan(&self, _directory: PathBuf) -> Box<dyn PooledEmbeddingLoadPlan> {
+        Box::new(TestPooledLoadPlan)
     }
 }

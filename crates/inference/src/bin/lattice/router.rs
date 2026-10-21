@@ -91,17 +91,25 @@ pub fn run(args: &InitArgs) -> bool {
     // Named explicitly, so it fails closed: the operator said where the
     // embedder is, and "it did not load" is an error rather than a downgrade.
     // `lattice serve` applies the same rule to the same flag.
-    let embedder =
-        match lattice_inference::serve::embeddings::EmbeddingModel::from_directory(embedder_dir) {
-            Ok(model) => model,
-            Err(err) => {
-                eprintln!(
-                    "Error: --embedding-model {} cannot serve as an embedding model: {err}",
-                    args.embedding_model
-                );
-                return false;
-            }
-        };
+    let embedder = lattice_inference::serving_provider::plan_pooled_embeddings(embedder_dir)
+        .map_err(|error| error.to_string())
+        .and_then(|plan| {
+            plan.load().map_err(|error| match error {
+                lattice_inference::error::InferenceError::InvalidInput(message) => message,
+                other => other.to_string(),
+            })
+        });
+    let embedder = match embedder {
+        Ok(model) => model,
+        Err(err) => {
+            eprintln!(
+                "Error: --embedding-model {} cannot serve as an embedding model: {err}",
+                args.embedding_model
+            );
+            return false;
+        }
+    };
+    let representation = embedder.representation();
     let identity = EmbedderIdentity::resolve(embedder_dir, args.embedding_model_id.as_deref());
 
     // Both validated with the serving path's own parsers. A second list here
@@ -123,9 +131,8 @@ pub fn run(args: &InitArgs) -> bool {
             embedding_model: identity.as_str().to_string(),
             pooling: args.pooling.clone(),
             prompt_source: args.prompt_source.clone(),
-            loader_format: lattice_inference::serve::embeddings::QWEN35_F16_DECODER_LOADER
-                .to_string(),
-            input_width: embedder.dimensions() as u64,
+            loader_format: representation.loader_format.to_string(),
+            input_width: representation.dimensions as u64,
         },
         schema_id: args.schema_id.clone(),
         base_model: args.base_model.clone(),

@@ -429,6 +429,7 @@ async fn main() {
                 std::process::exit(1);
             };
             eprintln!("{}", route.selection_marker(format));
+            let implicit_embedding_plan = selected.implicit_pooled_embeddings(&model);
             #[cfg(feature = "metal-gpu")]
             let context_window = chat::chat_max_cache_len();
             #[cfg(not(feature = "metal-gpu"))]
@@ -455,38 +456,56 @@ async fn main() {
 
             // `/v1/embeddings` needs its own f16-packed vision-language
             // checkpoint load, independent of the serving model opened above (see
-            // `lattice_inference::serve::embeddings`'s module doc comment
-            // for why the two loaders can't share weights).
+            // the pooled loader's module doc comment for why the two loaders
+            // can't share weights).
             //
             // Two policies, because the two cases are different asks. An
             // explicitly named directory is an instruction and fails closed:
             // the operator said where the embedder is, so "it did not load"
             // is an error, not a downgrade. The implicit case keeps the
             // best-effort policy described above, since a chat-only
-            // checkpoint having no embedder is ordinary and expected.
-            let embedding_source = embedding_model_dir.as_deref().unwrap_or(&model);
-            // The embedder is a Qwen3.5 vision-language loader; a Gemma 4
-            // directory is never one, so the implicit attempt is skipped
-            // rather than reporting a Qwen config error about a Gemma file.
-            // An explicitly named `--embedding-model` is still honored.
-            let embedding_model = if route.family == backend::ModelFamily::Gemma4
-                && embedding_model_dir.is_none()
+            // checkpoint having no embedder is ordinary and expected. Which
+            // implicit attempt to make is the selected provider's answer: a
+            // provider with no pooled embedder names its disabled line
+            // instead of reporting another loader's config error about its
+            // own files. An explicitly named `--embedding-model` is still
+            // honored.
+            let explicit_embedding_source = embedding_model_dir.as_deref();
+            let implicit_embedding_directory = implicit_embedding_plan.directory_to_try.as_deref();
+            let embedding_source = explicit_embedding_source
+                .or_else(|| implicit_embedding_directory.map(|_| model.as_str()));
+            let embedding_directory = explicit_embedding_source
+                .map(Path::new)
+                .or(implicit_embedding_directory);
+            let embedding_model = if let Some(disabled_line) =
+                implicit_embedding_plan.disabled_line.as_deref()
+                && explicit_embedding_source.is_none()
             {
-                eprintln!("Embeddings disabled ({model}): not available for Gemma 4 checkpoints.");
+                eprintln!("{disabled_line}");
                 None
-            } else {
-                match lattice_inference::serve::embeddings::EmbeddingModel::from_directory(
-                    Path::new(embedding_source),
-                ) {
+            } else if let (Some(embedding_source), Some(embedding_directory)) =
+                (embedding_source, embedding_directory)
+            {
+                let result = lattice_inference::serving_provider::plan_pooled_embeddings(
+                    embedding_directory,
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|plan| {
+                    plan.load().map_err(|error| match error {
+                        lattice_inference::error::InferenceError::InvalidInput(message) => message,
+                        other => other.to_string(),
+                    })
+                });
+                match result {
                     Ok(embedding_model) => {
                         eprintln!(
                             "Embeddings enabled: pooled {}-dim vectors from {embedding_source}.",
-                            embedding_model.dimensions()
+                            embedding_model.representation().dimensions
                         );
-                        Some(Arc::new(embedding_model))
+                        Some(embedding_model)
                     }
                     Err(err) => {
-                        if embedding_model_dir.is_some() {
+                        if explicit_embedding_source.is_some() {
                             eprintln!(
                                 "Error: --embedding-model {embedding_source} cannot serve as an embedding model: {err}"
                             );
@@ -500,6 +519,8 @@ async fn main() {
                         None
                     }
                 }
+            } else {
+                None
             };
 
             // Fail closed: a configured router that will not load stops the
@@ -586,6 +607,7 @@ async fn main() {
                             );
                             std::process::exit(1);
                         };
+                        let representation = embedder.representation();
                         // The identity RECORDED for the embedder, and it is
                         // the embedder's, never the chat model's. A NAME, so
                         // it catches a misconfigured server and not a
@@ -606,10 +628,10 @@ async fn main() {
                         // only against the gate the artifact ships with: the
                         // two are different pairings and the constructor can
                         // only see one of them.
-                        match lattice_inference::serve::routing::ServedRouter::new(
+                        match lattice_inference::serve::routing::ServedRouter::new_with_representation(
                             *resolved,
                             &embedder_identity,
-                            embedder.dimensions(),
+                            &representation,
                             router_learn,
                         ) {
                             Ok(served) => {

@@ -1,6 +1,8 @@
 use super::*;
 use crate::serve::lora::AdapterMetadata;
 
+mod representation;
+
 fn resident(pairs: &[(u32, &str)]) -> AdapterIndex {
     AdapterIndex {
         adapters: pairs
