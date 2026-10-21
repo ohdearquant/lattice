@@ -34,10 +34,12 @@ cargo publish -p lattice-fann $FLAG
 cargo publish -p lattice-transport $FLAG
 cargo publish -p lattice-inference-core $FLAG
 
-if [ -z "$DRY_RUN" ]; then
-    echo "Waiting for crates.io indexing..."
-    sleep 30
+if [ -n "$DRY_RUN" ]; then
+    echo "=== Dry run stops after the leaf tier: later tiers need this release's leaf crates live on crates.io ==="
+    exit 0
 fi
+echo "Waiting for crates.io indexing..."
+sleep 30
 
 echo "--- Tier 2: tokenizer (depends on inference-core) ---"
 cargo publish -p lattice-tokenizer $FLAG

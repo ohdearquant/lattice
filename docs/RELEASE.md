@@ -49,7 +49,7 @@ make ci  # fmt + clippy + doc lint + test + release build
 # 4. Dry-run publish (catches missing fields, version conflicts)
 make publish-dry
 
-# 5. Package size against the crates.io upload limit, all five crates
+# 5. Package size against the crates.io upload limit, all seven crates
 scripts/package-size-check.sh
 ```
 
@@ -64,7 +64,7 @@ That same gap hides the registry's upload limit until publish time, which is the
 to find it: crates.io rejects an archive over 10 MiB (10,485,760 bytes), and a rejection in
 the second tier leaves the first tier already published and immutable.
 
-`scripts/package-size-check.sh` covers all five crates and needs no registry access. It
+`scripts/package-size-check.sh` covers all seven crates and needs no registry access. It
 brackets each archive from `cargo package --list`, which builds nothing and names exactly the
 files that would ship, gzipped at level 6 — cargo's default, and the level to use here,
 because level 9 shaves enough off the estimate to flatter a crate that is close to the limit.

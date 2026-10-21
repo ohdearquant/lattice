@@ -87,6 +87,7 @@ impl IncrementalDetokenizer {
     /// Feed one token id; return the complete-UTF-8 text it reveals (which may be
     /// empty when the token only contributed continuation bytes of a codepoint
     /// still being assembled).
+    #[inline]
     pub(crate) fn push(&mut self, tokenizer: &BpeTokenizer, id: u32) -> String {
         append_token_bytes(tokenizer, id, &self.byte_decoder, &mut self.pending);
         let mut out = String::new();
@@ -95,6 +96,7 @@ impl IncrementalDetokenizer {
     }
 
     /// Append a token's complete UTF-8 prefix to a caller-owned delta buffer.
+    #[inline]
     pub(crate) fn push_into(&mut self, tokenizer: &BpeTokenizer, id: u32, out: &mut String) {
         append_token_bytes(tokenizer, id, &self.byte_decoder, &mut self.pending);
         self.flush_complete_into(out);
@@ -158,6 +160,7 @@ impl IncrementalDetokenizer {
     /// Flush any trailing incomplete bytes lossily. Call once after the final
     /// token so the concatenated stream matches `decode_tokens` exactly even when
     /// a generation is truncated mid-codepoint.
+    #[inline]
     pub(crate) fn finish(&mut self) -> String {
         if self.pending.is_empty() {
             return String::new();
