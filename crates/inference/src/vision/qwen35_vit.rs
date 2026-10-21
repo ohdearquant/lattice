@@ -43,6 +43,20 @@ const MAX_IMAGE_DIMENSION_PIXELS: u32 = 2048;
 const MAX_SERVE_VISION_PATCHES: usize = 256;
 const MAX_SERVE_PREPROCESSED_BYTES: usize = 16 * 1024 * 1024;
 const SERVE_VISION_MAX_PATCHES_ENV: &str = "LATTICE_VISION_MAX_PATCHES";
+/// The embeddings route's budget bounds memory rather than latency: the CPU
+/// tower holds one `patches * patches` f32 score buffer per head, 64 MiB at
+/// this default (a 1024x1024 image with 16 px patches).
+const MAX_SERVE_EMBED_VISION_PATCHES: usize = 4096;
+const MAX_SERVE_EMBED_PREPROCESSED_BYTES: usize = 32 * 1024 * 1024;
+const SERVE_EMBED_VISION_MAX_PATCHES_ENV: &str = "LATTICE_EMBED_VISION_MAX_PATCHES";
+
+/// Limits a serving entry point applies from the image header, before any
+/// pixel data is decoded.
+#[derive(Debug, Clone, Copy)]
+struct ServeImageBudget {
+    max_patches: usize,
+    max_preprocessed_bytes: usize,
+}
 
 /// Resolve the serving pre-merge patch budget from an optional raw override
 /// string (the `LATTICE_VISION_MAX_PATCHES` environment value), falling back
@@ -51,10 +65,21 @@ const SERVE_VISION_MAX_PATCHES_ENV: &str = "LATTICE_VISION_MAX_PATCHES";
 /// Takes the raw value rather than reading the environment itself so tests
 /// can exercise every fallback case without mutating real process state.
 fn resolve_serve_max_patches(raw_override: Option<&str>) -> usize {
+    resolve_max_patches(raw_override, MAX_SERVE_VISION_PATCHES)
+}
+
+/// [`resolve_serve_max_patches`] for the embeddings route's
+/// `LATTICE_EMBED_VISION_MAX_PATCHES` value and its
+/// [`MAX_SERVE_EMBED_VISION_PATCHES`] default.
+fn resolve_serve_embed_max_patches(raw_override: Option<&str>) -> usize {
+    resolve_max_patches(raw_override, MAX_SERVE_EMBED_VISION_PATCHES)
+}
+
+fn resolve_max_patches(raw_override: Option<&str>, default: usize) -> usize {
     raw_override
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(MAX_SERVE_VISION_PATCHES)
+        .unwrap_or(default)
 }
 
 /// The temporal/height/width patch-grid shape for one image (`grid_thw` in
@@ -120,15 +145,55 @@ pub fn preprocess_qwen35_image_for_serve(
 ) -> Result<(Vec<f32>, GridThw), VisionError> {
     let max_patches =
         resolve_serve_max_patches(std::env::var(SERVE_VISION_MAX_PATCHES_ENV).ok().as_deref());
-    preprocess_qwen35_image_inner(image_bytes, cfg, Some(max_patches))
+    preprocess_qwen35_image_inner(
+        image_bytes,
+        cfg,
+        Some(ServeImageBudget {
+            max_patches,
+            max_preprocessed_bytes: MAX_SERVE_PREPROCESSED_BYTES,
+        }),
+    )
+}
+
+/// Decode and preprocess one image sent to the serving embeddings route.
+///
+/// The same header checks as [`preprocess_qwen35_image_for_serve`] run before
+/// any pixel data is decoded, with a larger budget sized for document images:
+/// at most 2048 pixels per side, 4096 pre-merge patches (overridden by
+/// `LATTICE_EMBED_VISION_MAX_PATCHES`), and a 32 MiB preprocessed f32 buffer.
+///
+/// # Errors
+///
+/// As [`preprocess_qwen35_image_for_serve`].
+pub fn preprocess_qwen35_image_for_embedding_serve(
+    image_bytes: &[u8],
+    cfg: &VisionModelConfig,
+) -> Result<(Vec<f32>, GridThw), VisionError> {
+    let max_patches = resolve_serve_embed_max_patches(
+        std::env::var(SERVE_EMBED_VISION_MAX_PATCHES_ENV)
+            .ok()
+            .as_deref(),
+    );
+    preprocess_qwen35_image_inner(
+        image_bytes,
+        cfg,
+        Some(ServeImageBudget {
+            max_patches,
+            max_preprocessed_bytes: MAX_SERVE_EMBED_PREPROCESSED_BYTES,
+        }),
+    )
 }
 
 fn preprocess_qwen35_image_inner(
     image_bytes: &[u8],
     cfg: &VisionModelConfig,
-    max_patches: Option<usize>,
+    budget: Option<ServeImageBudget>,
 ) -> Result<(Vec<f32>, GridThw), VisionError> {
-    let img = if let Some(max_patches) = max_patches {
+    let img = if let Some(ServeImageBudget {
+        max_patches,
+        max_preprocessed_bytes,
+    }) = budget
+    {
         if cfg.patch_size == 0 {
             return Err(VisionError::InvalidConfig(
                 "patch_size must be > 0".to_string(),
@@ -176,10 +241,10 @@ fn preprocess_qwen35_image_inner(
                     "serving image preprocessing byte count overflowed".to_string(),
                 )
             })?;
-        if preprocessed_bytes > MAX_SERVE_PREPROCESSED_BYTES {
+        if preprocessed_bytes > max_preprocessed_bytes {
             return Err(VisionError::DimensionsExceeded(format!(
                 "serving image preprocessing requires {preprocessed_bytes} bytes; maximum is \
-                 {MAX_SERVE_PREPROCESSED_BYTES}"
+                 {max_preprocessed_bytes}"
             )));
         }
 

@@ -477,6 +477,39 @@ fn embed_items_rejects_image_item_over_context_window() {
 }
 
 #[test]
+fn embed_items_refuses_an_image_over_the_serving_pixel_cap_before_embedding() {
+    use base64::Engine as _;
+    // 2052 is a multiple of the tiny model's patch_size * spatial_merge_size,
+    // so the unbudgeted preprocessing accepts this image and only the serving
+    // budget's 2048 px side cap refuses it.
+    let mut png = Vec::new();
+    image::RgbImage::new(2052, 4)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let vision_cfg = tiny_embedding_model().config.vision_config.clone().unwrap();
+    assert!(preprocess_qwen35_image(&png, &vision_cfg).is_ok());
+    let url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&png)
+    );
+
+    let items = normalize_embedding_items(vec![EmbeddingInputItem::Image { url }]).unwrap();
+    let err = embed_items(
+        &tiny_embedding_model(),
+        items,
+        PoolingStrategy::MeanVisualTokens,
+    )
+    .unwrap_err();
+    match err {
+        ApiError::BadRequest { message, code } => {
+            assert_eq!(code, "invalid_input");
+            assert!(message.contains("2048px"), "message: {message}");
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+#[test]
 fn embed_items_mixed_batch_preserves_input_order() {
     let model = tiny_embedding_model();
     let items = normalize_embedding_items(vec![

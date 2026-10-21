@@ -16,6 +16,24 @@ fn tiny_cfg() -> VisionModelConfig {
     }
 }
 
+/// The chat route's budget with an explicit patch count, so a test does not
+/// read `LATTICE_VISION_MAX_PATCHES` from the process environment.
+fn chat_budget(max_patches: usize) -> Option<ServeImageBudget> {
+    Some(ServeImageBudget {
+        max_patches,
+        max_preprocessed_bytes: MAX_SERVE_PREPROCESSED_BYTES,
+    })
+}
+
+/// The embeddings route's default budget, without reading
+/// `LATTICE_EMBED_VISION_MAX_PATCHES` from the process environment.
+fn embed_budget() -> Option<ServeImageBudget> {
+    Some(ServeImageBudget {
+        max_patches: MAX_SERVE_EMBED_VISION_PATCHES,
+        max_preprocessed_bytes: MAX_SERVE_EMBED_PREPROCESSED_BYTES,
+    })
+}
+
 fn make_test_png(w: u32, h: u32) -> Vec<u8> {
     use image::RgbImage;
     let mut img = RgbImage::new(w, h);
@@ -61,11 +79,14 @@ fn serving_preprocess_enforces_patch_budget_without_narrowing_embedding_path() {
     // case below spuriously pass.
     let cfg = tiny_cfg();
     let boundary = make_test_png(32, 32); // 16 * 16 = 256 patches
-    assert!(preprocess_qwen35_image_inner(&boundary, &cfg, Some(MAX_SERVE_VISION_PATCHES)).is_ok());
+    assert!(
+        preprocess_qwen35_image_inner(&boundary, &cfg, chat_budget(MAX_SERVE_VISION_PATCHES))
+            .is_ok()
+    );
 
     let over = make_test_png(36, 32); // 18 * 16 = 288 patches
-    let err =
-        preprocess_qwen35_image_inner(&over, &cfg, Some(MAX_SERVE_VISION_PATCHES)).unwrap_err();
+    let err = preprocess_qwen35_image_inner(&over, &cfg, chat_budget(MAX_SERVE_VISION_PATCHES))
+        .unwrap_err();
     assert!(
         matches!(err, VisionError::DimensionsExceeded(message) if message.contains("serving maximum is 256"))
     );
@@ -120,8 +141,8 @@ fn resolve_serve_max_patches_honors_a_positive_override() {
 fn serving_preprocess_inner_honors_a_lower_override_below_the_default_boundary() {
     let cfg = tiny_cfg();
     let boundary = make_test_png(32, 32); // 16 * 16 = 256 patches, accepted at the default
-    assert!(preprocess_qwen35_image_inner(&boundary, &cfg, Some(256)).is_ok());
-    let err = preprocess_qwen35_image_inner(&boundary, &cfg, Some(200)).unwrap_err();
+    assert!(preprocess_qwen35_image_inner(&boundary, &cfg, chat_budget(256)).is_ok());
+    let err = preprocess_qwen35_image_inner(&boundary, &cfg, chat_budget(200)).unwrap_err();
     assert!(
         matches!(err, VisionError::DimensionsExceeded(message) if message.contains("serving maximum is 200"))
     );
@@ -138,6 +159,74 @@ fn serving_preprocess_caps_output_allocation_for_pathological_config() {
     assert!(
         matches!(err, VisionError::DimensionsExceeded(message) if message.contains("preprocessing requires"))
     );
+}
+
+#[test]
+fn embedding_serve_preprocess_enforces_its_own_patch_budget() {
+    let cfg = tiny_cfg();
+    let boundary = make_test_png(128, 128); // 64 * 64 = 4096 patches
+    assert!(preprocess_qwen35_image_inner(&boundary, &cfg, embed_budget()).is_ok());
+    assert!(
+        preprocess_qwen35_image_inner(&boundary, &cfg, chat_budget(MAX_SERVE_VISION_PATCHES))
+            .is_err(),
+        "the embeddings budget is wider than the chat route's latency budget"
+    );
+
+    let over = make_test_png(132, 128); // 66 * 64 = 4224 patches
+    let err = preprocess_qwen35_image_inner(&over, &cfg, embed_budget()).unwrap_err();
+    assert!(
+        matches!(&err, VisionError::DimensionsExceeded(message) if message.contains("4224 patches") && message.contains("serving maximum is 4096")),
+        "expected DimensionsExceeded naming 4224 of 4096 patches, got: {err}"
+    );
+}
+
+#[test]
+fn embedding_serve_preprocess_rejects_declared_pixel_dimensions_over_the_hard_cap() {
+    // Width 2052 is a multiple of patch_size * spatial_merge_size, so only the
+    // pixel-dimension cap can refuse it; 1026 * 2 patches is inside the patch
+    // budget whatever LATTICE_EMBED_VISION_MAX_PATCHES says, unless it is set
+    // below 2052.
+    let cfg = tiny_cfg();
+    let over_width = make_test_png(MAX_IMAGE_DIMENSION_PIXELS + 4, 4);
+    assert!(preprocess_qwen35_image(&over_width, &cfg).is_ok());
+    let err = preprocess_qwen35_image_for_embedding_serve(&over_width, &cfg).unwrap_err();
+    assert!(
+        matches!(&err, VisionError::DimensionsExceeded(message) if message.contains("2048px")),
+        "expected DimensionsExceeded naming the 2048px cap, got: {err}"
+    );
+}
+
+#[test]
+fn embedding_serve_preprocess_caps_output_allocation() {
+    let mut cfg = tiny_cfg();
+    cfg.patch_size = 8;
+    cfg.spatial_merge_size = 1;
+    cfg.temporal_patch_size = 128;
+    // 20 * 20 = 400 patches of 3 * 128 * 8 * 8 f32 each: about 37.5 MiB,
+    // over the 32 MiB cap while far inside the 4096-patch budget.
+    let image = make_test_png(160, 160);
+    let err = preprocess_qwen35_image_inner(&image, &cfg, embed_budget()).unwrap_err();
+    assert!(
+        matches!(&err, VisionError::DimensionsExceeded(message) if message.contains("preprocessing requires") && message.contains(&MAX_SERVE_EMBED_PREPROCESSED_BYTES.to_string())),
+        "expected the 32 MiB preprocessing cap, got: {err}"
+    );
+}
+
+#[test]
+fn resolve_serve_embed_max_patches_falls_back_and_honors_overrides() {
+    assert_eq!(
+        resolve_serve_embed_max_patches(None),
+        MAX_SERVE_EMBED_VISION_PATCHES
+    );
+    for invalid in ["", "not-a-number", "0", "-4"] {
+        assert_eq!(
+            resolve_serve_embed_max_patches(Some(invalid)),
+            MAX_SERVE_EMBED_VISION_PATCHES,
+            "{invalid:?}"
+        );
+    }
+    assert_eq!(resolve_serve_embed_max_patches(Some(" 8192 ")), 8192);
+    assert_eq!(resolve_serve_max_patches(None), MAX_SERVE_VISION_PATCHES);
 }
 
 fn make_test_weights(cfg: &VisionModelConfig) -> Qwen35VisionWeights {
