@@ -618,6 +618,22 @@ jobs:
             echo "GUARD FAILED: expected one complete 95-test router-state result."
             exit 1
           fi
+      - name: inference — image decoding compiled out (CPU, no default features)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-image-off-tests.log"
+          if cargo test --locked -p lattice-inference --no-default-features --lib \
+            image_decoders_require_image_feature -- --color never >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -Fxq 'test vision::qwen35_vit::tests::image_decoders_require_image_feature ... ok' "$log" || {
+            echo "GUARD FAILED: the image-off decoder test did not run and pass."
+            exit 1
+          }
       - name: inference — router bootstrap publication (CPU, mixture)
         run: |
           log="${RUNNER_TEMP:-/tmp}/inference-router-bootstrap-tests.log"
