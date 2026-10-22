@@ -381,7 +381,7 @@ impl SafetensorsFile {
     }
 
     /// Number of tensors currently holding a cached f32 conversion.
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cached_f32_tensor_count(&self) -> usize {
         self.tensors
             .values()

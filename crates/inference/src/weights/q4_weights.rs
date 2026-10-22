@@ -1652,16 +1652,5 @@ pub(crate) fn write_merged_qkvz(
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Negative-scale Q4 fixture shared by every Q4 consumer's sign test.
-///
-/// Every block has a negative scale, so a consumer that drops the sign, clamps the
-/// scale at zero or otherwise reads the scale's sign computes different weights. Each
-/// consumer test runs the fixture, the same blocks with `|scale|`, and the same blocks
-/// with a zero scale: the first must match the f64 reference, and the other two, which
-/// are exactly what a sign-dropping or zero-clamping consumer would compute on the
-/// fixture, must miss it by more than ten times the tolerance.
-#[cfg(test)]
-pub(crate) mod signed_scale_fixture;
-
 #[cfg(test)]
 mod tests;

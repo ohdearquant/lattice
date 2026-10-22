@@ -122,8 +122,8 @@ impl Q4Embedding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signed_scale_fixture::negative_scale_tensor;
     use crate::weights::q4_weights::save_q4_file;
-    use crate::weights::q4_weights::signed_scale_fixture::negative_scale_tensor;
 
     fn expected_row(
         tensor: &crate::weights::q4_weights::Q4Tensor,
