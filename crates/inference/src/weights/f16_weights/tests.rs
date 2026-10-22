@@ -82,19 +82,6 @@ fn test_bulk_f32_to_f16_matches_scalar() {
 }
 
 #[test]
-fn test_f16_memory_savings() {
-    let cfg = Qwen35Config::qwen35_2b();
-    let f32_bytes = estimate_f32_model_bytes(&cfg);
-    let f16_bytes = estimate_f16_model_bytes(&cfg);
-
-    let ratio = f16_bytes as f64 / f32_bytes as f64;
-    assert!(
-        (ratio - 0.5).abs() < 0.05,
-        "f16/f32 ratio should be ~0.5, got {ratio}"
-    );
-}
-
-#[test]
 fn test_f16_moe_router_shape_validation() {
     let router = F16MoeRouter::new(vec![F16::ONE.0; 6], 3, 2, 2).expect("valid router shape");
     assert_eq!(router.num_experts, 3);

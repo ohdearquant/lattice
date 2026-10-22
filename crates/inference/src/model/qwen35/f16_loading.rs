@@ -337,3 +337,6 @@ pub fn load_f16_weights(
         layers,
     })
 }
+
+#[cfg(test)]
+mod tests;
