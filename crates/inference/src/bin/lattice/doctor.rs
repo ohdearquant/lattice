@@ -308,7 +308,7 @@ const SUPPORTED_DTYPES: [&str; 3] = ["F32", "F16", "BF16"];
 /// `model.safetensors.index.json` (sharded) when both exist.
 /// Bytes one tensor occupies once resident in CPU RAM after
 /// `Qwen35Model::from_safetensors` loads it. The CPU path
-/// (`crates/inference/src/weights/f32_weights.rs`) always materializes
+/// (`crates/weights/src/f32_weights.rs`) always materializes
 /// weights as owned `f32`, converting on load via
 /// `convert_f16_bytes_to_f32`/`convert_bf16_bytes_to_f32` — so an
 /// F16/BF16 tensor's on-disk byte length under-counts its resident

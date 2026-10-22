@@ -291,7 +291,7 @@ pub(super) mod mtp_resolve_tests {
 
     /// Write a tiny `.f16` (KHF1) tensor file with the given `shape`,
     /// filled with copies of `1.0`, mirroring the format
-    /// `load_f16_tensor_file` reads (crates/inference/src/weights/q4_weights.rs).
+    /// `load_f16_tensor_file` reads (crates/weights/src/q4_weights.rs).
     pub(crate) fn write_tiny_f16_fixture(dir: &std::path::Path, name: &str, shape: &[usize]) {
         use lattice_weights::q4_weights::q4_f32_to_f16;
         let numel: usize = shape.iter().product();
