@@ -1,7 +1,7 @@
 //! Model module index for BERT, BitNet config, cross-encoder, Qwen, Qwen3.5, and Qwen3.5 config, with BERT/CrossEncoder/Qwen/Qwen3.5 type re-exports.
 pub mod bert;
 pub mod bitnet_config;
-pub(crate) mod config_file;
+pub(crate) use crate::bounded_config as config_file;
 pub mod cross_encoder;
 pub mod embeddinggemma2;
 pub mod embeddinggemma2_config;

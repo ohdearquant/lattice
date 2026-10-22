@@ -55,6 +55,7 @@ pub mod weights;
 /// Continuous batching and scheduler support for multi-sequence inference. See [`kv_cache`]
 /// and [`model`].
 pub mod batch;
+pub(crate) mod bounded_config;
 pub(crate) mod bounded_read;
 /// Registered held-out evidence for router candidate admission.
 #[cfg(feature = "router-learning")]

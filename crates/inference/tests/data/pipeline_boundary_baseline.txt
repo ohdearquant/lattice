@@ -85,7 +85,6 @@ src/serving_provider/providers/gemma/worker.rs	crate::model::serving_runtime::Ru
 src/serving_provider/providers/gemma/worker.rs	crate::model::serving_runtime::ServingRuntime
 src/serving_provider/providers/gemma/cpu.rs	crate::model::serving_runtime::ServingRuntime
 src/serving_provider/providers/gemma/cpu.rs	crate::model::serving_runtime::gemma_cpu::GemmaPreparedCpuRuntime
-src/serving_provider/providers/gemma/preparation.rs	crate::model::config_file::read_config_json_bounded
 src/serving_provider/providers/gemma/preparation.rs	crate::model::gemma4_config::Gemma4Config
 src/serving_provider/providers/gemma/preparation.rs	crate::model::gemma4_config::resolve_stop_token_ids
 src/serving_provider/providers/qwen.rs	crate::model::qwen35::model::Qwen35Model

@@ -420,7 +420,7 @@ fn read_declarations(dir: &Path) -> Result<Declarations, String> {
     // and reporting a broken config.json stays the loader's job.
     let config = match std::fs::symlink_metadata(&config_path) {
         Err(_) => None,
-        Ok(_) => crate::model::config_file::read_config_json_bounded(&config_path, "config.json")
+        Ok(_) => crate::bounded_config::read_config_json_bounded(&config_path, "config.json")
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .filter(Value::is_object),
@@ -584,7 +584,7 @@ const GEMMA4_MODEL_TYPE: &str = "gemma4";
 /// [`ModelFamily::Qwen35`], so a directory the Gemma route does not claim is
 /// handled exactly as it was before this detector existed.
 pub fn detect_family(dir: &Path) -> ModelFamily {
-    let is_gemma4 = crate::model::config_file::read_config_json_bounded(
+    let is_gemma4 = crate::bounded_config::read_config_json_bounded(
         &dir.join("config.json"),
         "config.json",
     )
