@@ -3197,11 +3197,11 @@ mod inner {
             }
 
             // Embedding matrix: f16, shared by the CPU row lookup and the Q8_0 logits kernels.
-            let embed_tokens = EmbeddingTable::F16(make_buffer_f16(
-                &device,
-                &weights.embed_tokens,
-                "embed_tokens.f16",
-            ));
+            let embed_tokens = EmbeddingTable::f16(
+                make_buffer_f16(&device, &weights.embed_tokens, "embed_tokens.f16"),
+                cfg.vocab_size,
+                hidden,
+            )?;
             let embed_tokens_q8 = Q4WeightBuf::from_buffer(make_buffer_quant(
                 &device,
                 &weights.embed_tokens,
@@ -4629,8 +4629,7 @@ mod inner {
                 unsafe {
                     self.engine.embed_tokens.write_row(
                         id as usize,
-                        dst_base.add(t * hidden),
-                        hidden,
+                        std::slice::from_raw_parts_mut(dst_base.add(t * hidden), hidden),
                     );
                 }
             }
@@ -5405,11 +5404,9 @@ mod inner {
             assert!((pending_token as usize) < cfg.vocab_size);
             // SAFETY: normed_embed holds hidden f32 values, disjoint from the embedding table.
             unsafe {
-                self.engine.embed_tokens.write_row(
-                    pending_token as usize,
-                    normed_embed.as_mut_ptr(),
-                    hidden,
-                );
+                self.engine
+                    .embed_tokens
+                    .write_row(pending_token as usize, &mut normed_embed);
             }
 
             if let Some(ref rot) = self.engine.quarot_rotation {
@@ -5922,11 +5919,9 @@ mod inner {
             assert!((token_id as usize) < cfg.vocab_size);
             unsafe {
                 // SAFETY: normed_embed holds hidden f32 values, disjoint from the table.
-                self.engine.embed_tokens.write_row(
-                    token_id as usize,
-                    normed_embed.as_mut_ptr(),
-                    hidden,
-                );
+                self.engine
+                    .embed_tokens
+                    .write_row(token_id as usize, &mut normed_embed);
             }
             if let Some(ref rot) = self.engine.quarot_rotation {
                 debug_assert_eq!(rot.dim(), normed_embed.len());
@@ -6364,9 +6359,10 @@ mod inner {
                     // SAFETY: token_id < vocab_size; hidden buffer row holds hidden f32 values.
                     unsafe {
                         let dst = self.session.activations.hidden.contents() as *mut f32;
-                        self.engine
-                            .embed_tokens
-                            .write_row(token_id as usize, dst, hidden);
+                        self.engine.embed_tokens.write_row(
+                            token_id as usize,
+                            std::slice::from_raw_parts_mut(dst, hidden),
+                        );
                     }
                 }
             }
@@ -7462,9 +7458,10 @@ mod inner {
             // SAFETY: token_id < vocab_size; hidden buffer row holds hidden f32 values.
             unsafe {
                 let dst = self.session.activations.hidden.contents() as *mut f32;
-                self.engine
-                    .embed_tokens
-                    .write_row(token_id as usize, dst, hidden);
+                self.engine.embed_tokens.write_row(
+                    token_id as usize,
+                    std::slice::from_raw_parts_mut(dst, hidden),
+                );
             }
 
             let mut active_layer_idx = 0usize;
@@ -7865,8 +7862,7 @@ mod inner {
                 for (t, &id) in token_ids.iter().enumerate() {
                     self.engine.embed_tokens.write_row(
                         id as usize,
-                        dst_base.add(t * hidden),
-                        hidden,
+                        std::slice::from_raw_parts_mut(dst_base.add(t * hidden), hidden),
                     );
                 }
             }
@@ -11359,7 +11355,7 @@ mod inner {
                 let mut out = vec![0.0f32; hidden];
                 self.engine
                     .embed_tokens
-                    .write_row(last_id as usize, out.as_mut_ptr(), hidden);
+                    .write_row(last_id as usize, &mut out);
                 out
             };
 

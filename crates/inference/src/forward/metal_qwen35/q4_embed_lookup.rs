@@ -73,35 +73,27 @@ impl Q4Embedding {
         })
     }
 
-    /// Dequantize row `id` into `dst[..cols]`.
+    /// Return the table's row count and stored width.
+    pub(crate) fn dimensions(&self) -> (usize, usize) {
+        (self.rows, self.row_bytes / Q4_BLOCK_BYTES * Q4_BLOCK_WEIGHTS)
+    }
+
+    /// Dequantize row `id` into `dst`.
     ///
     /// Each weight is rounded through f16 exactly as the former load-time
     /// copy did: `nibble * scale + bias` in f32, narrowed to f16, widened
     /// back to f32.
     ///
-    /// # Safety
+    /// # Panics
     ///
-    /// `dst` must point to at least `cols` writable f32 values, and must not
-    /// alias this mapping.
-    ///
-    /// Callers validate `id` against the model's vocabulary size, which the
-    /// constructor has already tied to this table's row count; an id outside
-    /// that range is a caller bug; the lookup writes nothing rather than
-    /// reading a different row.
-    pub(crate) unsafe fn write_row(&self, id: usize, dst: *mut f32) {
-        if id >= self.rows {
-            debug_assert!(
-                false,
-                "embedding row {id} is out of range for {} rows",
-                self.rows
-            );
-            return;
-        }
+    /// Panics before writing if `id` is outside the table or `dst` does not
+    /// contain exactly the table's stored number of columns.
+    pub(crate) fn write_row(&self, id: usize, dst: &mut [f32]) {
+        let (rows, cols) = self.dimensions();
+        assert!(id < rows, "embedding row {id} is out of range for {rows} rows");
+        assert_eq!(dst.len(), cols, "embedding destination width mismatch");
         let start = self.payload_offset + id * self.row_bytes;
-        let Some(row) = self.mmap.get(start..start + self.row_bytes) else {
-            debug_assert!(false, "embedding row {id} lies outside the mapped payload");
-            return;
-        };
+        let row = &self.mmap[start..start + self.row_bytes];
         let mut out = 0usize;
         for block in row.chunks_exact(Q4_BLOCK_BYTES) {
             let scale = q4_f16_to_f32(u16::from_ne_bytes([block[0], block[1]]));
@@ -109,9 +101,7 @@ impl Q4Embedding {
             for &byte in &block[4..] {
                 for code in [byte & 0x0f, byte >> 4] {
                     let weight = code as f32 * scale + bias;
-                    // SAFETY: the caller guarantees `cols` writable slots, and
-                    // each row holds exactly `cols` weights.
-                    unsafe { *dst.add(out) = q4_f16_to_f32(q4_f32_to_f16(weight)) };
+                    dst[out] = q4_f16_to_f32(q4_f32_to_f16(weight));
                     out += 1;
                 }
             }
@@ -161,8 +151,7 @@ mod tests {
 
         for id in 0..rows {
             let mut actual = vec![0.0f32; cols];
-            // SAFETY: `actual` holds `cols` f32 values and is not part of the mapping.
-            unsafe { embedding.write_row(id, actual.as_mut_ptr()) };
+            embedding.write_row(id, &mut actual);
             let expected = expected_row(&tensor, id, cols);
             for (j, (a, e)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(a.to_bits(), e.to_bits(), "row {id} column {j}: {a} != {e}");

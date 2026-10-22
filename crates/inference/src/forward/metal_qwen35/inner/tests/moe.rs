@@ -449,7 +449,7 @@ fn from_q4_dir_builds_the_cpu_embedding_lookup_from_the_q4_payload() {
             state
                 .engine
                 .embed_tokens
-                .write_row(id, actual.as_mut_ptr(), hidden)
+                .write_row(id, &mut actual)
         };
         let value = q4_const_roundtrip(embed_row_value(id));
         assert!(
