@@ -951,6 +951,7 @@ impl Gemma4Model {
             &mut session,
             &extended_gen_cfg,
             None,
+            None,
             prompt_ids,
             cfg.eos_token_id,
             false,
@@ -1102,6 +1103,7 @@ impl Gemma4Model {
         let result = driver::run(
             &mut session,
             &extended_gen_cfg,
+            None,
             None,
             prompt_ids,
             cfg.eos_token_id,

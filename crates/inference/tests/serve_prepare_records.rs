@@ -16,11 +16,11 @@
 use lattice_inference::GenerateConfig;
 use lattice_inference::forward::metal_qwen35::format_chat_template;
 use lattice_inference::serve::ApiError;
-use lattice_inference::serve::contract::{
-    ChatRequest, GenerationDefaults, ServeProfile, normalize_request,
-};
+use lattice_inference::serve::contract::{ChatRequest, GenerationDefaults, ServeProfile};
 use lattice_inference::serve::into_engine_chat_messages;
-use lattice_inference::serve::prepare::{build_cfg, lattice_gen_cfg, prepare_chat_request};
+use lattice_inference::serve::prepare::{
+    prepare_chat_request_with_config, prepare_standalone_chat_request,
+};
 
 const FIXTURE: &str = "tests/fixtures/serve_prepare_records.txt";
 const MODEL: &str = "served-model";
@@ -77,6 +77,14 @@ const BODIES: &[(&str, &str)] = &[
     (
         "reasoning_budget_zero",
         r#"{"model":"served-model","messages":[{"role":"user","content":"Hi"}],"reasoning_budget":0}"#,
+    ),
+    (
+        "thinking_explicitly_on",
+        r#"{"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":true}}"#,
+    ),
+    (
+        "thinking_explicitly_off",
+        r#"{"model":"served-model","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"enable_thinking":false}}"#,
     ),
     (
         "logprobs_false",
@@ -459,7 +467,7 @@ fn record(config: Config, case: &str, body: &str, out: &mut String) {
             max_tokens_cap,
             max_context,
             ..
-        } => match prepare_chat_request(
+        } => match prepare_chat_request_with_config(
             &req,
             MODEL,
             default_max_tokens,
@@ -470,30 +478,22 @@ fn record(config: Config, case: &str, body: &str, out: &mut String) {
         ) {
             Err(err) => out.push_str(&format!("{}\n", refusal(&err))),
             Ok(prepared) => {
+                let request = &prepared.prepared;
                 out.push_str(&format!(
                     "request: messages={:?} max_tokens={} temperature={:?} top_p={:?} \
                      logprobs={:?} stop_strings={:?} reasoning_budget={:?} seed={:?} stream={}\n",
-                    prepared.messages,
-                    prepared.max_tokens,
-                    prepared.temperature,
-                    prepared.top_p,
-                    prepared.logprobs,
-                    prepared.stop_strings,
-                    prepared.reasoning_budget,
-                    prepared.seed,
-                    prepared.stream,
+                    request.messages,
+                    request.max_tokens,
+                    request.temperature,
+                    request.top_p,
+                    request.logprobs,
+                    request.stop_strings,
+                    request.reasoning_budget,
+                    request.seed,
+                    request.stream,
                 ));
-                out.push_str(&format!("prompt: {:?}\n", prepared.prompt));
-                let cfg = lattice_gen_cfg(
-                    prepared.max_tokens,
-                    prepared.temperature,
-                    prepared.top_p,
-                    prepared.seed,
-                    prepared.stop_strings,
-                    prepared.reasoning_budget,
-                    prepared.logprobs,
-                );
-                out.push_str(&gen_cfg_line(&cfg));
+                out.push_str(&format!("prompt: {:?}\n", request.prompt));
+                out.push_str(&gen_cfg_line(&prepared.config));
                 out.push('\n');
             }
         },
@@ -501,13 +501,13 @@ fn record(config: Config, case: &str, body: &str, out: &mut String) {
             defaults,
             model_max_context,
             ..
-        } => match normalize_request(
+        } => match prepare_standalone_chat_request(
             &req,
             defaults,
             ServeProfile::lattice_serve(MODEL, model_max_context).with_vision_support(false),
         ) {
             Err(err) => out.push_str(&format!("{}\n", refusal(&err))),
-            Ok(validated) => {
+            Ok((validated, cfg)) => {
                 out.push_str(&format!(
                     "request: messages={:?} max_tokens={} temperature={:?} top_k={} top_p={:?} \
                      repetition_penalty={:?} seed={:?} stream={} stop_strings={:?} \
@@ -524,10 +524,15 @@ fn record(config: Config, case: &str, body: &str, out: &mut String) {
                     validated.reasoning_budget,
                     validated.logprobs,
                 ));
-                let cfg = build_cfg(&validated);
                 match into_engine_chat_messages(validated.messages) {
                     Ok(messages) => {
-                        out.push_str(&format!("prompt: {:?}\n", format_chat_template(&messages)))
+                        let mut prompt = format_chat_template(&messages);
+                        if cfg.enable_thinking {
+                            prompt.push_str("<think>\n");
+                        } else {
+                            prompt.push_str("<think>\n\n</think>\n\n");
+                        }
+                        out.push_str(&format!("prompt: {prompt:?}\n"));
                     }
                     Err(err) => out.push_str(&format!("engine_messages: {}\n", refusal(&err))),
                 }

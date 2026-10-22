@@ -105,10 +105,7 @@ fn assert_stream_overlap_and_recovery(
     let solo_survivor = answer(survivor_prompt);
     let solo_next = answer(next_prompt);
     let expected = match family {
-        "qwen35" => (
-            "<think>\n\n</think>\n\nSTABLE",
-            "<think>\n\n</think>\n\nNEXT",
-        ),
+        "qwen35" => ("STABLE", "NEXT"),
         "gemma4" => ("ORCHID", "MAPLE"),
         _ => panic!("unknown CPU family {family}"),
     };
@@ -257,7 +254,7 @@ fn observe_transcripts(server: &Server, family: &str) {
         assert_eq!(
             first_transcript,
             expected_transcript(family, streaming),
-            "{family} {mode} pre-migration HTTP transcript"
+            "{family} {mode} HTTP transcript"
         );
         eprintln!("CPU HTTP transcript family={family} mode={mode} {first_transcript}");
     }
@@ -265,7 +262,7 @@ fn observe_transcripts(server: &Server, family: &str) {
 
 fn expected_transcript(family: &str, streaming: bool) -> Value {
     let (content, finish_reason, prompt_tokens, completion_tokens, stream_deltas) = match family {
-        "qwen35" => ("<think>\n\n", "length", 15, 2, vec!["<think>", "\n\n"]),
+        "qwen35" => ("amber", "stop", 19, 1, vec!["amber"]),
         "gemma4" => ("amber", "stop", 16, 1, vec!["amber"]),
         _ => panic!("unknown CPU family {family}"),
     };
@@ -688,7 +685,7 @@ fn expected_competing_contract(family: &str, name: &str, streaming: bool) -> Val
         "context_vs_malformed_stop" if family == "qwen35" => expected_error_contract(
             400,
             "context_length_exceeded",
-            "prompt (100009 tokens) plus max_tokens (2) plus reasoning_budget (0) exceeds model context window (8192): 100012 tokens required",
+            "prompt (100013 tokens) plus max_tokens (2) plus reasoning_budget (0) exceeds model context window (8192): 100016 tokens required",
         ),
         "context_vs_malformed_stop" => {
             expected_error_contract(400, "invalid_stop", "stop string must not be empty")
@@ -842,9 +839,10 @@ fn logprobs_contract_accepts_cpu_drift() {
     assert_eq!(compare_qwen_logprobs_contract(&expected, &expected), Ok(()));
 
     let mut reported = expected.clone();
-    *reported.pointer_mut(QWEN_LOGPROB_POINTERS[2]).unwrap() = json!(-9.10298);
-    for pointer in [QWEN_LOGPROB_POINTERS[3], QWEN_LOGPROB_POINTERS[5]] {
-        *reported.pointer_mut(pointer).unwrap() = json!(-0.9120007);
+    for (index, drift) in [(2, -4e-6), (3, -1.1e-6), (5, -1.1e-6)] {
+        let pointer = QWEN_LOGPROB_POINTERS[index];
+        let golden = expected.pointer(pointer).unwrap().as_f64().unwrap();
+        *reported.pointer_mut(pointer).unwrap() = json!(golden + drift);
     }
     assert_eq!(compare_qwen_logprobs_contract(&reported, &expected), Ok(()));
 
@@ -1022,46 +1020,46 @@ fn expected_qwen_logprobs() -> Value {
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": "<think>\n\n"},
+                "message": {"role": "assistant", "content": "Got it"},
                 "finish_reason": "length",
                 "logprobs": {"content": [
                     {
-                        "token": "<think>",
-                        "bytes": [60, 116, 104, 105, 110, 107, 62],
-                        "logprob": -0.0003875935,
+                        "token": "Got",
+                        "bytes": [71, 111, 116],
+                        "logprob": -0.7324315,
                         "top_logprobs": [
                             {
-                                "token": "<think>",
-                                "bytes": [60, 116, 104, 105, 110, 107, 62],
-                                "logprob": -0.0003875935
+                                "token": "Got",
+                                "bytes": [71, 111, 116],
+                                "logprob": -0.7324315
                             },
                             {
-                                "token": "Sure",
-                                "bytes": [83, 117, 114, 101],
-                                "logprob": -9.102976
+                                "token": "Yes",
+                                "bytes": [89, 101, 115],
+                                "logprob": -2.4184647
                             }
                         ]
                     },
                     {
-                        "token": "\n\n",
-                        "bytes": [10, 10],
-                        "logprob": -0.9119996,
+                        "token": " it",
+                        "bytes": [32, 105, 116],
+                        "logprob": -0.0017744048,
                         "top_logprobs": [
                             {
-                                "token": "\n",
-                                "bytes": [10],
-                                "logprob": -0.5146111
+                                "token": " it",
+                                "bytes": [32, 105, 116],
+                                "logprob": -0.0017744048
                             },
                             {
-                                "token": "\n\n",
-                                "bytes": [10, 10],
-                                "logprob": -0.9119996
+                                "token": " one",
+                                "bytes": [32, 111, 110, 101],
+                                "logprob": -7.1529145
                             }
                         ]
                     }
                 ]}
             }],
-            "usage": {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13}
+            "usage": {"prompt_tokens": 15, "completion_tokens": 2, "total_tokens": 17}
         }
     })
 }

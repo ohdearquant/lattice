@@ -851,16 +851,16 @@ fn prefix_cache_route_slot_follows_the_request_on_a_flushed_lone_byte() {
         ),
         (
             "budget-rejection",
-            thinking(forced(&fixture, "root ::= \"a\" \"a\"\n", 4), 1),
+            thinking(forced(&fixture, "root ::= \"F\" \"a\"\n", 4), 1),
         ),
         (
             "budget-rejection-with-held-byte",
-            thinking(forced(&fixture, "root ::= \"b\" \"b\"\n", 4), 1),
+            thinking(forced(&fixture, "root ::= \"D\" \"b\"\n", 4), 1),
         ),
         (
             "budget-rejection-with-held-byte-then-stop-string",
             with_stop_strings(
-                thinking(forced(&fixture, "root ::= \"b\" \"b\"\n", 4), 1),
+                thinking(forced(&fixture, "root ::= \"D\" \"b\"\n", 4), 1),
                 flush,
             ),
         ),

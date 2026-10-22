@@ -1998,7 +1998,7 @@ fn decode_cap_saturates_on_overflow() {
 fn force_close_think_disabled_when_budget_none() {
     // budget=None → always returns None regardless of other args.
     assert_eq!(
-        force_close_think(None, true, false, 100, Some(99)),
+        force_close_think(None, true, false, 100, Some(99), true),
         None,
         "None budget must disable forcing"
     );
@@ -2008,7 +2008,7 @@ fn force_close_think_disabled_when_budget_none() {
 fn force_close_think_disabled_when_budget_zero() {
     // budget=Some(0) → budget > 0 guard fails → None.
     assert_eq!(
-        force_close_think(Some(0), true, false, 100, Some(99)),
+        force_close_think(Some(0), true, false, 100, Some(99), true),
         None,
         "budget=0 must disable forcing"
     );
@@ -2018,7 +2018,7 @@ fn force_close_think_disabled_when_budget_zero() {
 fn force_close_think_disabled_when_enable_thinking_false() {
     // enable_thinking=false → no reasoning block → forcing is a no-op.
     assert_eq!(
-        force_close_think(Some(10), false, false, 20, Some(99)),
+        force_close_think(Some(10), false, false, 20, Some(99), true),
         None,
         "enable_thinking=false must disable forcing"
     );
@@ -2028,7 +2028,7 @@ fn force_close_think_disabled_when_enable_thinking_false() {
 fn force_close_think_disabled_when_already_closed() {
     // thinking_closed=true → block already closed → should not force again.
     assert_eq!(
-        force_close_think(Some(10), true, true, 20, Some(99)),
+        force_close_think(Some(10), true, true, 20, Some(99), true),
         None,
         "already-closed thinking block must not force again"
     );
@@ -2038,7 +2038,7 @@ fn force_close_think_disabled_when_already_closed() {
 fn force_close_think_disabled_when_close_id_none() {
     // close_id=None → model has no </think> token → forcing is a no-op.
     assert_eq!(
-        force_close_think(Some(10), true, false, 20, None),
+        force_close_think(Some(10), true, false, 20, None, true),
         None,
         "close_id=None must disable forcing"
     );
@@ -2049,15 +2049,50 @@ fn force_close_think_fires_at_budget_boundary() {
     let close_id = 248_069_u32;
     // generated_so_far == budget → should force (mutation: >= not >).
     assert_eq!(
-        force_close_think(Some(10), true, false, 10, Some(close_id)),
+        force_close_think(Some(10), true, false, 10, Some(close_id), true),
         Some(close_id),
         "must force when generated_so_far equals budget"
     );
     // generated_so_far > budget → also forces.
     assert_eq!(
-        force_close_think(Some(10), true, false, 11, Some(close_id)),
+        force_close_think(Some(10), true, false, 11, Some(close_id), true),
         Some(close_id),
         "must force when generated_so_far exceeds budget"
+    );
+}
+
+#[test]
+fn force_close_think_waits_for_a_boundary_within_the_grace_window() {
+    let close_id = 248_069_u32;
+    assert_eq!(
+        force_close_think(Some(10), true, false, 10, Some(close_id), false),
+        None,
+        "the budget alone must not close before a boundary or the fallback"
+    );
+    assert_eq!(
+        force_close_think(Some(10), true, false, 20, Some(close_id), true),
+        Some(close_id),
+        "a boundary after the budget must close"
+    );
+    assert_eq!(
+        force_close_think(Some(10), true, false, 41, Some(close_id), false),
+        None,
+        "the fallback is exactly B + 32, not earlier"
+    );
+    assert_eq!(
+        force_close_think(Some(10), true, false, 42, Some(close_id), false),
+        Some(close_id),
+        "the fallback must close at B + 32"
+    );
+}
+
+#[test]
+fn force_close_think_accepts_a_boundary_at_the_budget() {
+    let close_id = 248_069_u32;
+    assert_eq!(
+        force_close_think(Some(10), true, false, 10, Some(close_id), true),
+        Some(close_id),
+        "a boundary at the budget must close without delay"
     );
 }
 
@@ -2066,12 +2101,12 @@ fn force_close_think_does_not_fire_before_budget() {
     let close_id = 248_069_u32;
     // generated_so_far < budget → must NOT force (mutation-sensitive boundary).
     assert_eq!(
-        force_close_think(Some(10), true, false, 9, Some(close_id)),
+        force_close_think(Some(10), true, false, 9, Some(close_id), false),
         None,
         "must not force when generated_so_far is one below budget"
     );
     assert_eq!(
-        force_close_think(Some(10), true, false, 0, Some(close_id)),
+        force_close_think(Some(10), true, false, 0, Some(close_id), false),
         None,
         "must not force when zero tokens generated"
     );

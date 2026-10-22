@@ -16,6 +16,8 @@ workspace version; the workspace release notes are in
 
 ### Changed
 
+- **Behavior change:** Qwen chat requests now turn thinking off when `chat_template_kwargs.enable_thinking` is omitted. A positive request `reasoning_budget` enables thinking; a server-configured `generation.reasoning_budget` alone does not. Set `enable_thinking: true` to keep the previous default.
+- Reasoning-budgeted requests now close the thinking block at the first line boundary after the budget, or at most 32 tokens later, instead of at the budget itself. The decode cap and answer budget are unchanged.
 - The `backward_stage0` benchmark requires `train-backward,test-utils`, adds matched scalar cases, and initializes fixtures only for selected cases (#1392).
 - `ForcedDispatch::mark_executed` is deprecated and always refuses manual attestation; call an arithmetic method and `verify_for` instead. A probe is single-use, and failed or repeated execution invalidates its evidence (#1392).
 
@@ -52,6 +54,7 @@ workspace version; the workspace release notes are in
 - Qwen CPU requests reserve KV cache and attention scratch for their token budget before prefill, and reuse one buffer for text deltas (#1966).
 - Standalone Q8 generation keeps its macOS tile buffers across a request (#1982).
 - Model downloads resolve at a pinned commit per repository instead of `main` (#1961).
+- `lattice` subcommand `--help` output ends with example invocations and each command's platform and checkpoint requirements (#2027).
 - **Behavior change:** LoRA adapter load and unload (`/v1/lora/load`, `/v1/lora/unload`) on both
   `lattice serve` and `lattice_serve` now answer 413 `request_body_too_large` for a request body
   over the 1 MiB limit, instead of 400.

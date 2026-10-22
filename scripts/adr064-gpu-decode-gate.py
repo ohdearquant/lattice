@@ -11,6 +11,7 @@ scripts/bench_decode_slopefit.sh (root keys: commit, date, arch, benches, ...).
 Each entry under "benches" has {value, ci95_low, ci95_high, unit, higher_is_better}.
 A row is INCOMPLETE (not evaluated) when a metric it depends on is missing/null in
 either file -- this is an honest-nil state, not a pass.
+Numeric fields read by a row must be finite numbers in the supported arithmetic range.
 
 Usage:
   adr064-gpu-decode-gate.py --current CURRENT.json --baseline BASELINE.json [--out REPORT.md]
@@ -18,13 +19,14 @@ Usage:
 Exit codes:
   0 - all evaluated rows PASS, nothing INCOMPLETE
   1 - at least one row FAIL (confirmed regression)
-  2 - no FAIL, but at least one row INCOMPLETE (missing data)
+  2 - invalid evaluated metrics/architecture, or no FAIL but INCOMPLETE data
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +44,18 @@ def _bench(benches: dict[str, Any], key: str) -> dict[str, Any] | None:
     entry = benches.get(key)
     if entry is None:
         return None
+    for field_name in ("value", "ci95_low", "ci95_high"):
+        value = entry.get(field_name)
+        if value is None:
+            continue
+        valid_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if valid_number:
+            try:
+                valid_number = math.isfinite(value)
+            except OverflowError:
+                valid_number = False
+        if not valid_number:
+            raise ValueError(f"{key}.{field_name} must be a finite number in the supported range")
     if (
         entry.get("value") is None
         or entry.get("ci95_low") is None

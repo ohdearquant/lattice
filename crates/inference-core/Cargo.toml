@@ -1,0 +1,20 @@
+[package]
+name = "lattice-inference-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared error types for Lattice inference crates"
+keywords = ["inference", "error", "lattice"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+
+[lints]
+workspace = true

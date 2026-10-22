@@ -61,11 +61,12 @@ pub struct GenerateConfig {
     /// halts and the matched text is excluded. Empty = disabled (default; parity-safe).
     pub stop_strings: Vec<String>,
     /// Reasoning-budget forcing (s1-style): after this many reasoning tokens are
-    /// generated without a `</think>`, force-inject `</think>` to commit the model
-    /// to an answer. `None`, `Some(0)`, or [`enable_thinking`](Self::enable_thinking)
-    /// `== false` = disabled (no behaviour change) -- with thinking disabled there is
-    /// no reasoning block for a forced `</think>` to close, so the budget is inert
-    /// regardless of its value. See `GenerateConfig::effective_reasoning_budget`.
+    /// generated, force-inject `</think>` at the first step whose previously emitted
+    /// token contains a newline, or at most 32 tokens later if no such token appears.
+    /// `None`, `Some(0)`, or [`enable_thinking`](Self::enable_thinking) `== false` =
+    /// disabled (no behaviour change) -- with thinking disabled there is no reasoning
+    /// block for a forced `</think>` to close, so the budget is inert regardless of
+    /// its value. See `GenerateConfig::effective_reasoning_budget`.
     pub reasoning_budget: Option<usize>,
     /// Capture per-token log-probabilities (OpenAI `logprobs`/`top_logprobs`).
     /// `None` (default) disables capture entirely -- no extra allocation or
@@ -336,6 +337,8 @@ pub(crate) struct DecodePolicy {
     max_new_tokens: usize,
     logprobs: Option<usize>,
     think_close_id: Option<u32>,
+    reasoning_newline_boundary: Option<Arc<[bool]>>,
+    previous_emitted_id: Option<u32>,
     thinking_closed: bool,
     reasoning_end_len: Option<usize>,
     stop_mode: StopMode,
@@ -430,6 +433,7 @@ impl DecodePolicy {
     pub(crate) fn init(
         gen_cfg: &GenerateConfig,
         think_close_id: Option<u32>,
+        reasoning_newline_boundary: Option<Arc<[bool]>>,
         token_logprobs: &mut Vec<TokenLogprob>,
         first_emitted_id: u32,
         first_logits: &[f32],
@@ -440,6 +444,7 @@ impl DecodePolicy {
         let policy = Self::construct(
             gen_cfg,
             think_close_id,
+            reasoning_newline_boundary,
             first_emitted_id,
             first_generated_len,
             streaming,
@@ -462,6 +467,7 @@ impl DecodePolicy {
     pub(crate) fn init_with_metadata(
         gen_cfg: &GenerateConfig,
         think_close_id: Option<u32>,
+        reasoning_newline_boundary: Option<Arc<[bool]>>,
         token_logprobs: &mut Vec<TokenLogprob>,
         first_emitted_id: u32,
         first_generated_len: usize,
@@ -471,6 +477,7 @@ impl DecodePolicy {
         let policy = Self::construct(
             gen_cfg,
             think_close_id,
+            reasoning_newline_boundary,
             first_emitted_id,
             first_generated_len,
             streaming,
@@ -495,7 +502,7 @@ impl DecodePolicy {
     /// is always "not closed".
     #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
     pub(crate) fn for_verified_stream(gen_cfg: &GenerateConfig, streaming: bool) -> Self {
-        Self::construct(gen_cfg, None, 0, 0, streaming)
+        Self::construct(gen_cfg, None, None, 0, 0, streaming)
     }
 
     /// Shared construction, factored out of [`Self::init`] so [`Self::init_with_metadata`]
@@ -504,6 +511,7 @@ impl DecodePolicy {
     fn construct(
         gen_cfg: &GenerateConfig,
         think_close_id: Option<u32>,
+        reasoning_newline_boundary: Option<Arc<[bool]>>,
         first_emitted_id: u32,
         first_generated_len: usize,
         streaming: bool,
@@ -520,6 +528,8 @@ impl DecodePolicy {
             max_new_tokens: gen_cfg.max_new_tokens,
             logprobs: gen_cfg.logprobs,
             think_close_id,
+            reasoning_newline_boundary,
+            previous_emitted_id: Some(first_emitted_id),
             thinking_closed,
             reasoning_end_len,
             stop_mode: StopMode::for_config(&gen_cfg.stop_strings, streaming),
@@ -533,7 +543,8 @@ impl DecodePolicy {
     }
 
     /// Overrides `sampled_id` with the forced `</think>` token when the reasoning
-    /// budget is exhausted and the block is still open; a no-op pass-through
+    /// budget is exhausted, the block is still open, and the previous emitted token
+    /// was a line boundary or the grace window has ended; a no-op pass-through
     /// otherwise. Call after sampling, before grammar-advance (the actually-emitted
     /// token, post-override, is what grammar must advance on).
     ///
@@ -546,6 +557,13 @@ impl DecodePolicy {
             self.thinking_closed,
             generated_len,
             self.think_close_id,
+            self.previous_emitted_id.is_some_and(|id| {
+                self.reasoning_newline_boundary
+                    .as_ref()
+                    .and_then(|table| table.get(id as usize))
+                    .copied()
+                    .unwrap_or(false)
+            }),
         )
         .unwrap_or(sampled_id)
     }
@@ -925,6 +943,7 @@ impl DecodePolicy {
 
         push(next_id);
         let generated_len_after = generated_len_before + 1;
+        self.previous_emitted_id = Some(next_id);
 
         if let Some(top_n) = self.logprobs {
             let (logprob, top) = record_metadata(next_id, top_n)?;
@@ -1047,240 +1066,4 @@ pub(crate) fn truncate_token_logprobs_to_retained_text(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The three facts that make the prefill-derived first token safe to route
-    /// through the ordinary per-step sequence.
-    ///
-    /// ADR-090 D2 requires the first-token exception to be *characterized*
-    /// rather than inferred from later steps, because the canonical CPU entry
-    /// runs a differently shaped step 0: it advances grammar on the sampled ID
-    /// and never calls `apply_override` or `answer_budget_exhausted`, while
-    /// [`DecodePolicy::transition`] calls both. Reading both paths at
-    /// `model/qwen35/generation.rs:196-300` against `transition` shows every
-    /// control is either present at step 0 in an equivalent form or unable to
-    /// fire there at all. These tests pin the "unable to fire" half, which is
-    /// the half that is a property of this module rather than of the entry.
-    ///
-    /// They exist because the shared driver may unify step 0 with later steps
-    /// only while these hold, and each would be broken by an ordinary-looking
-    /// change (a `>` relaxed to `>=`, a budget baseline moved) with no other
-    /// test in this crate going red.
-    fn cfg_with(max_new_tokens: usize, reasoning_budget: Option<usize>) -> GenerateConfig {
-        GenerateConfig {
-            max_new_tokens,
-            reasoning_budget,
-            enable_thinking: true,
-            logprobs: None,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn force_close_think_cannot_fire_on_the_first_generated_token() {
-        let close = 248_069_u32;
-
-        // budget == 1 is the discriminating case and the one an existing test in
-        // qwen35_config does not cover: it is where `generated_so_far >= budget`
-        // comes closest to holding at step 0, so it is where a wrong baseline
-        // would first show. It must still not fire.
-        assert_eq!(
-            force_close_think(Some(1), true, false, 0, Some(close)),
-            None,
-            "budget 1 must not force on the first generated token"
-        );
-        assert_eq!(
-            force_close_think(Some(2), true, false, 0, Some(close)),
-            None,
-            "budget 2 must not force on the first generated token"
-        );
-
-        // Must-FIRE control. Without it this test would keep passing if
-        // `force_close_think` were changed to return None unconditionally.
-        assert_eq!(
-            force_close_think(Some(1), true, false, 1, Some(close)),
-            Some(close),
-            "budget 1 must force once one token has been generated"
-        );
-    }
-
-    #[test]
-    fn answer_budget_cannot_be_exhausted_by_the_first_generated_token() {
-        let close = 248_069_u32;
-        let cfg = cfg_with(1, Some(4));
-        let mut logprobs = Vec::new();
-        let logits = vec![0.0_f32; 8];
-
-        // The only way step 0 sets `reasoning_end_len` is by emitting `</think>`
-        // as the very first token, which gives end == 1 with exactly one token
-        // generated. That is the earliest the answer budget could possibly be
-        // exhausted, so it is the case to pin.
-        let policy = DecodePolicy::init(
-            &cfg,
-            Some(close),
-            &mut logprobs,
-            close,
-            &logits,
-            cfg.temperature,
-            1,
-            false,
-        );
-        assert_eq!(
-            policy.reasoning_end_len,
-            Some(1),
-            "a first token equal to the close ID must capture the reasoning end"
-        );
-        assert!(
-            !policy.answer_budget_exhausted(1),
-            "the answer budget must not be exhausted by the first generated token \
-             while max_new_tokens >= 1"
-        );
-
-        // Must-FIRE control at the boundary: with max_new_tokens == 1 and the
-        // reasoning block closed at length 1, length 2 is the first exhausted
-        // length. Without this arm the assertion above would survive
-        // `answer_budget_exhausted` being stubbed to false.
-        assert!(
-            policy.answer_budget_exhausted(2),
-            "one answer token past the reasoning end must exhaust a budget of 1"
-        );
-    }
-
-    #[test]
-    fn a_zero_length_request_never_reaches_the_first_token_path() {
-        // The proof above is conditional on `max_new_tokens >= 1`. That holds
-        // because the canonical entry returns before sampling when the request
-        // asks for nothing (`model/qwen35/generation.rs`, the
-        // `max_new_tokens == 0` guard). Pinned here as the premise it is: if the
-        // guard ever moves, `answer_budget_exhausted(1)` with max_new_tokens 0
-        // would be `0 >= 0`, i.e. true on the first token.
-        let cfg = cfg_with(0, Some(4));
-        let mut logprobs = Vec::new();
-        let logits = vec![0.0_f32; 8];
-        let policy = DecodePolicy::init(
-            &cfg,
-            Some(248_069),
-            &mut logprobs,
-            248_069,
-            &logits,
-            cfg.temperature,
-            1,
-            false,
-        );
-        assert!(
-            policy.answer_budget_exhausted(1),
-            "documents WHY the entry guard is load-bearing: with max_new_tokens 0 \
-             the first token would exhaust the answer budget immediately"
-        );
-    }
-
-    fn outcome_name(outcome: &StopCheckOutcome) -> &'static str {
-        match outcome {
-            StopCheckOutcome::Continue => "Continue",
-            StopCheckOutcome::Stopped => "Stopped",
-            StopCheckOutcome::Interrupted => "Interrupted",
-        }
-    }
-
-    /// Builds a streaming policy for `stop_strings`, pushes `first_delta` through the
-    /// per-step check (accepting everything it emits), then runs `finish_stop(tail)` with
-    /// a sink answering `accept`. Returns the outcome, every string the flush handed the
-    /// sink (one entry per call), and the accumulated `text`.
-    fn finish_after(
-        stop_strings: &[&str],
-        first_delta: &str,
-        tail: &str,
-        accept: bool,
-    ) -> (StopCheckOutcome, Vec<String>, String) {
-        let cfg = GenerateConfig {
-            stop_strings: stop_strings.iter().map(|s| (*s).to_string()).collect(),
-            ..cfg_with(8, None)
-        };
-        let mut policy = DecodePolicy::construct(&cfg, None, 1, 1, true);
-        let mut logprobs = Vec::new();
-        let mut offsets = Vec::new();
-        let mut text = String::new();
-        let initial =
-            policy.check_initial_stop(&mut logprobs, &mut text, &mut offsets, first_delta, |_| {
-                true
-            });
-        assert_eq!(outcome_name(&initial), "Continue");
-        let mut flushed = Vec::new();
-        let outcome = policy.finish_stop(&mut text, tail, |s| {
-            flushed.push(s.to_string());
-            accept
-        });
-        (outcome, flushed, text)
-    }
-
-    #[test]
-    fn finish_stop_streaming_reports_a_rejected_tail_flush() {
-        // "ZZ" holds back one byte, so "b" of "ab" is still unconfirmed when the loop ends
-        // and reaches the sink only through the tail flush.
-        let (outcome, flushed, text) = finish_after(&["ZZ"], "ab", "c", false);
-        assert_eq!(flushed, vec!["bc".to_string()]);
-        assert_eq!(outcome_name(&outcome), "Interrupted");
-        assert_eq!(text, "abc");
-
-        let (outcome, flushed, _) = finish_after(&["ZZ"], "ab", "c", true);
-        assert_eq!(flushed, vec!["bc".to_string()]);
-        assert_eq!(
-            outcome_name(&outcome),
-            "Continue",
-            "control: the same flush accepted by the sink is not an interruption"
-        );
-    }
-
-    #[test]
-    fn finish_stop_streaming_rejection_wins_over_a_stop_match_in_the_tail() {
-        // The tail completes "ZZ", and the flush emits the text before it ("ab").
-        let (outcome, flushed, text) = finish_after(&["ZZ"], "a", "bZZ", false);
-        assert_eq!(flushed, vec!["ab".to_string()]);
-        assert_eq!(
-            outcome_name(&outcome),
-            "Interrupted",
-            "per-step stop_check reports Interrupted over Stopped; the tail flush must agree"
-        );
-        assert_eq!(text, "ab");
-
-        let (outcome, _, _) = finish_after(&["ZZ"], "a", "bZZ", true);
-        assert_eq!(
-            outcome_name(&outcome),
-            "Stopped",
-            "control: an accepted flush that completes a stop match reports Stopped"
-        );
-    }
-
-    #[test]
-    fn finish_stop_disabled_reports_a_rejected_tail_flush() {
-        let run = |tail: &str, accept: bool| {
-            let cfg = cfg_with(8, None);
-            let mut policy = DecodePolicy::construct(&cfg, None, 1, 1, true);
-            let mut text = String::new();
-            let mut calls = 0;
-            let outcome = policy.finish_stop(&mut text, tail, |_| {
-                calls += 1;
-                accept
-            });
-            (outcome, calls, text)
-        };
-
-        let (outcome, calls, text) = run("xy", false);
-        assert_eq!(outcome_name(&outcome), "Interrupted");
-        assert_eq!(calls, 1);
-        assert_eq!(text, "xy");
-
-        let (outcome, calls, _) = run("xy", true);
-        assert_eq!(outcome_name(&outcome), "Continue", "control: accepted tail");
-        assert_eq!(calls, 1);
-
-        let (outcome, calls, _) = run("", false);
-        assert_eq!(
-            outcome_name(&outcome),
-            "Continue",
-            "an empty tail emits nothing, so nothing can be rejected"
-        );
-        assert_eq!(calls, 0);
-    }
-}
+mod tests;

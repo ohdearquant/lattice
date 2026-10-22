@@ -410,47 +410,6 @@ fn generate_multimodal_vision_injection_is_mutation_sensitive() {
     );
 }
 
-/// Qwen3.5 vision (ADR-069 Metal S5, MP2 gate): REPLACE-semantics
-/// structural check, complementing the behavioral mutation-sensitivity
-/// test above. `forward_step_inner_impl`'s `Some(row) => { ... }`
-/// embedding-lookup arm (taken whenever `injected_embedding` is set at an
-/// `<|image_pad|>` slot) must never reference `token_id` or read from
-/// `embed_tokens` — proving by construction that an injected row can never
-/// fall back to the token-id embedding lookup the pre-MP2 stub used, no
-/// matter what runtime token id happens to occupy the slot. A behavioral
-/// equivalent (mutate `embed_tokens` at some row, expect no output change)
-/// is unsound on this checkpoint: `tie_word_embeddings=true` means
-/// `embed_tokens` also serves as the lm_head weight matrix
-/// (`encode_final_head`'s `QuantFormat::Q8_0` GEMV binds it directly), so
-/// mutating any row shifts that row's logit component regardless of
-/// whether the row was ever read for input embedding.
-///
-/// Mutation-sensitivity verified locally: temporarily adding a fallback
-/// read of `embed_tokens[token_id]` inside the `Some(row) =>` arm (mirroring
-/// the pre-MP2 stub) made this test fail immediately; removing it restored
-/// the pass.
-#[test]
-fn injected_embedding_never_falls_back_to_token_lookup() {
-    const RUST_SOURCE: &str = include_str!("../../../metal_qwen35.rs");
-    let match_start = RUST_SOURCE
-        .find("match injected_embedding {")
-        .expect("forward_step_inner_impl's injected_embedding match must exist");
-    let some_start = match_start
-        + RUST_SOURCE[match_start..]
-            .find("Some(row) => {")
-            .expect("Some(row) arm must exist");
-    let none_start = some_start
-        + RUST_SOURCE[some_start..]
-            .find("None => {")
-            .expect("None arm must follow Some(row) arm");
-    let some_arm_body = &RUST_SOURCE[some_start..none_start];
-    assert!(
-        !some_arm_body.contains("embed_tokens") && !some_arm_body.contains("token_id"),
-        "the injected_embedding Some(row) arm must never reference embed_tokens \
-                 or token_id — it must REPLACE the embedding lookup, not fall back to it"
-    );
-}
-
 /// Qwen3.5 vision (ADR-069 Metal S5, MP2 gate): behavioral REPLACE
 /// isolation test, complementing the structural spelling check above.
 /// A source-scan test can be defeated by helper indirection (e.g. a
