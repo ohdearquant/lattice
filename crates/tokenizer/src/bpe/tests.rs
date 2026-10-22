@@ -108,7 +108,7 @@ fn test_gpt2_raw_vocab_defaults_to_gpt4_regex_pretokenize() {
 }
 
 /// Vocab/merges for the cross-space-merge discriminator used by the
-/// `validate_bpe_pretokenizer` fail-closed tests below (#330 finding 1).
+/// `validate_bpe_pretokenizer` fail-closed tests below (#330).
 /// Byte-level maps a literal space to `Ġ` (U+0120), so
 /// `"a b"` byte-encodes to `"aĠb"`. Base single-byte tokens (`a`, `Ġ`,
 /// `b`) plus staged merges `Ġ`+`b` -> `Ġb` -> (with `a`) `aĠb` let a
@@ -135,7 +135,7 @@ fn cross_space_merge_json(pre_tokenizer: &str) -> String {
 
 #[test]
 fn test_bytelevel_use_regex_false_rejected_without_supporting_split() {
-    // #330 finding 1 (major/fail-open): a tokenizer.json
+    // A tokenizer.json (#330)
     // that explicitly declares `ByteLevel(use_regex:false)` with no
     // preceding regex `Split` must be REJECTED, not silently tokenized
     // with the `Gpt4Regex` default. HF's ByteLevel `use_regex=false`
@@ -154,7 +154,7 @@ fn test_bytelevel_use_regex_false_rejected_without_supporting_split() {
 
 #[test]
 fn test_unknown_pretokenizer_type_rejected() {
-    // #330 finding 1: an unrecognized pre_tokenizer type
+    // An unrecognized pre_tokenizer type (#330)
     // (Metaspace, Whitespace, BertPreTokenizer, ...) on a BPE model must
     // also fail closed rather than silently defaulting to `Gpt4Regex`.
     let json = cross_space_merge_json(r#"{"type": "Metaspace", "replacement": "_"}"#);
@@ -168,7 +168,7 @@ fn test_unknown_pretokenizer_type_rejected() {
 
 #[test]
 fn test_bare_bytelevel_use_regex_true_or_absent_accepted() {
-    // #330 finding 1: bare `ByteLevel` with `use_regex`
+    // Bare `ByteLevel` with `use_regex` (#330)
     // absent or `true` is the common gpt2/roberta Hub shape and must
     // keep working exactly as the #330 fix intended — HF's own default
     // for `use_regex` is `true`, which is what `Gpt4Regex` approximates.
@@ -187,13 +187,10 @@ fn test_bare_bytelevel_use_regex_true_or_absent_accepted() {
 
 #[test]
 fn test_sequence_split_then_bytelevel_use_regex_false_accepted() {
-    // #330 finding 1: the real Qwen/Qwen3-Embedding
-    // shape is `Sequence[Split{pattern.Regex}, ByteLevel{use_regex:false}]`
-    // — a regex Split establishes the correct segmentation, and the
-    // trailing `ByteLevel(use_regex:false)` just means "don't split
-    // again". This must still be accepted and still dispatch to
-    // `Gpt4Regex` (the only implemented mode), matching pre-fix #519
-    // behavior for this specific shape.
+    // This Sequence[Split, ByteLevel(use_regex:false)] metadata shape
+    // remains accepted and dispatches to Gpt4Regex on the cross-space
+    // fixture (#330, #519). The synthetic regex/input pair checks that
+    // dispatch; it does not establish arbitrary declared regex semantics.
     let pre_tokenizer = r#"{
             "type": "Sequence",
             "pretokenizers": [
@@ -209,16 +206,10 @@ fn test_sequence_split_then_bytelevel_use_regex_false_accepted() {
 
 #[test]
 fn test_sequence_split_then_metaspace_rejected() {
-    // #330 residual finding: before this fix,
-    // `is_supported_bpe_pretokenizer` returned `true` as soon as
-    // `has_regex_split` found ANY descendant regex `Split`, so
-    // `Sequence[Split{pattern.Regex}, Metaspace]` was wrongly accepted
-    // — the unsupported `Metaspace` sibling never got a chance to reject
-    // the sequence. A `Split` earlier in the sequence does not make an
-    // unrelated, unimplemented sibling honest to run through
-    // `Gpt4Regex`: lattice would silently tokenize with GPT-2 byte
-    // encoding while HF applies `Metaspace`, producing a completely
-    // different token alphabet (wrong ids, not a subtle drift).
+    // A supported regex Split must not hide an unsupported Metaspace
+    // sibling (#330). Accepting this sequence would apply GPT-2 byte
+    // encoding where the declared tokenizer requires Metaspace,
+    // producing a different token alphabet and wrong IDs.
     let pre_tokenizer = r#"{
             "type": "Sequence",
             "pretokenizers": [
@@ -238,8 +229,8 @@ fn test_sequence_split_then_metaspace_rejected() {
 #[test]
 fn test_sequence_split_then_whitespace_rejected() {
     // Same class as `test_sequence_split_then_metaspace_rejected` above,
-    // with `Whitespace` (also named explicitly in the #330 finding 1
-    // reject list) as the unsupported sibling instead of `Metaspace`.
+    // with `Whitespace` as the unsupported sibling instead of `Metaspace`
+    // (#330).
     let pre_tokenizer = r#"{
             "type": "Sequence",
             "pretokenizers": [

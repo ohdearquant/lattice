@@ -99,7 +99,7 @@ class _FakeAdapter:
         self.calls: list[tuple[int, bool, str, str]] = []
         # Index-aligned with `calls`: the EXACT prompt string this call was
         # invoked with, so tests can assert per-engine measured/warmup
-        # prompt identity (round-4 blocker fix) without changing the
+        # prompt identity without changing the
         # `calls` tuple shape every other test already asserts against.
         self.prompts: list[str] = []
 
@@ -569,7 +569,7 @@ class ProfileConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(harness.ProfileConfigError, "warmup_repeats"):
             _profile(engines=[_engine(warmup_repeats=-1)])
 
-    # -- Warmup is an explicit pre-window batch (round-2 blocker fix):
+    # -- Warmup is an explicit pre-window batch:
     # warmup_tokens is the completion-token budget for that batch, and is
     # only meaningful together with a positive warmup_repeats. --
 
@@ -638,7 +638,7 @@ class ProfileConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(harness.ProfileConfigError, "quantization must be non-empty"):
             _profile(engines=[_engine(quantization="")])
 
-    # -- Round-3 blocker fix: measured_order / measured_calls, the
+    # -- measured_order / measured_calls define the
     # per-engine measured-schedule contract that windows/measured_repeats
     # alone could not represent (bench_compare_1k.py). --
 
@@ -755,7 +755,7 @@ class ProfileConfigTest(unittest.TestCase):
             ),
         )
 
-    # -- Round-4 major fix: an explicit measured_calls plan must cover
+    # -- An explicit measured_calls plan must cover
     # profile.windows exactly once each -- a missing window silently
     # erases a slope, an undeclared window produces an observation
     # outside the report contract, and a cross-call duplicate silently
@@ -812,7 +812,7 @@ class ProfileConfigTest(unittest.TestCase):
         )
         self.assertEqual(len(profile.engine_groups[0].measured_calls), 2)
 
-    # -- Round-4 blocker fix: measured_prompt, mirroring warmup_prompt,
+    # -- measured_prompt, mirroring warmup_prompt,
     # overrides profile.prompt for one engine's measured calls only. --
 
     def test_measured_prompt_defaults_to_none(self):
@@ -897,7 +897,7 @@ class ProfileConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(harness.ProfileConfigError, "description"):
             _profile(description=123)
 
-    # -- Fail-closed on unknown/misspelled profile keys (round-1 major: a
+    # -- Fail-closed on unknown/misspelled profile keys (a
     # typo in an optional methodology key must never silently fall back to
     # a default instead of being rejected). --
 
@@ -1072,7 +1072,7 @@ class RunProfileTest(unittest.TestCase):
         self.assertEqual(result.missing_engines, ())
 
     def test_warmup_executes_once_before_all_measured_windows(self):
-        # The round-2 blocker fix: warmup is a pre-window batch at its own
+        # Warmup is a pre-window batch at its own
         # token budget, not looped once per measured window.
         profile = _profile(
             engines=[_engine(warmup_repeats=2, warmup_tokens=8)], measured_repeats=3, windows=[32, 256]
@@ -1269,7 +1269,7 @@ class RunProfileTest(unittest.TestCase):
             self.assertEqual(obs.quantization, "q8")
 
     def test_heterogeneous_engine_schedule_exact_call_sequence_and_identities(self):
-        """The blocker fix: reproduce bench_q4_apples.sh (Lattice Q4, MLX
+        """Reproduce bench_q4_apples.sh (Lattice Q4, MLX
         Q4, Ollama Q8-reference) with bench_apples_to_apples.sh's single
         pre-loop 8-token MLX-only warmup, all inside one profile. MLX's
         warmup is scheduled once, at its OWN 8-token budget -- distinct
@@ -1278,10 +1278,9 @@ class RunProfileTest(unittest.TestCase):
 
         Engine order is Lattice -> Ollama -> MLX, matching
         `bench_q4_apples.sh`'s (and `bench_apples_to_apples.sh`'s,
-        `bench_apples_precise.sh`'s) actual script section order -- NOT
-        Lattice -> MLX -> Ollama (a round-3 review finding: an earlier
-        version of this test asserted the wrong global order while
-        claiming to reproduce the legacy schedule).
+        `bench_apples_precise.sh`'s) actual script section order. The full
+        call trace must preserve this order when the per-engine schedules
+        are combined.
         """
         profile = harness._parse_profile(
             "q4_apples",
@@ -1449,7 +1448,7 @@ class RunProfileTest(unittest.TestCase):
         self.assertEqual(measured_obs.prompt_hash, harness.prompt_hash("the measured prompt"))
         self.assertNotEqual(warmup_obs.prompt_hash, measured_obs.prompt_hash)
 
-    # -- Round-3 blocker fix: the MEASURED-side schedule contract
+    # -- The measured-side schedule contract
     # (`measured_calls` / `measured_order` / `AdapterRunResult.
     # component_ns`), added because windows/measured_repeats alone cannot
     # represent bench_compare_1k.py's three distinct measured shapes. --
@@ -1579,10 +1578,10 @@ class RunProfileTest(unittest.TestCase):
             )
 
     def test_agentic_style_global_flattened_sequence_lattice_ollama_mlx(self):
-        """The round-3 + round-4 blocker fixes, end to end: reproduce
+        """Reproduce
         `bench_compare_1k.py`'s complete Lattice -> Ollama -> MLX stream in
-        one profile, including per-engine MEASURED prompts (round-4's
-        remaining gap). Lattice is window-major (all 1-token then all
+        one profile, including per-engine measured prompts.
+        Lattice is window-major (all 1-token then all
         100-token calls, the default shape) using the shared
         tokenizer-padded `profile.prompt`. Ollama warms once at 4 tokens
         with its own 'hi' prompt, then issues ONE 100-token call per
@@ -1723,8 +1722,8 @@ class RunProfileTest(unittest.TestCase):
         # never carry the measured prompt's hash, or vice versa).
         self.assertNotEqual(ollama_warmup_obs[0].prompt_hash, ollama_measured_obs[0].prompt_hash)
         # Ollama's measured prompt hash must differ from Lattice/MLX's
-        # shared tokenizer-padded prompt hash (the exact defect round 4
-        # found: every engine's measured_prompt collapsing to one string).
+        # shared tokenizer-padded prompt hash, preventing per-engine
+        # measured_prompt values from collapsing to one shared string.
         self.assertNotEqual(
             ollama_measured_obs[0].prompt_hash, harness.prompt_hash(TOKENIZER_PADDED_PROMPT)
         )
@@ -1872,7 +1871,7 @@ class AggregateTest(unittest.TestCase):
         self.assertIsNone(slopes[0].slope_ci95_legacy)
 
     def test_slope_uses_native_duration_not_outer_wall_clock(self):
-        # issue #813 codex round-1 finding 1: the legacy per-process-loop
+        # Slopes use engine-native durations (#813). The legacy
         # scripts (bench_apples_precise.sh, bench_q4_apples.sh,
         # bench_context_scaling.sh) time only the engine's own reported
         # duration, never the harness's outer wall-clock wrapping a fresh
