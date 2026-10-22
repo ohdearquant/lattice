@@ -4,6 +4,7 @@ members = [
     "crates/inference",
     "crates/inference-core",
     "crates/tokenizer",
+    "crates/grammar",
     "crates/embed",
     "crates/fann",
     "crates/tune",
