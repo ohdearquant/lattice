@@ -22,7 +22,7 @@ use super::prepared_safetensors::PreparedSafetensorsHeaderPlan;
 const CANONICAL_INVENTORY_U32_FIELD_MAX: u64 = u32::MAX as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InventoryAxis {
+pub enum InventoryAxis {
     Tensors,
     TensorNameBytes,
     Rank,
@@ -33,7 +33,7 @@ pub(crate) enum InventoryAxis {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InventoryExpression {
+pub enum InventoryExpression {
     TensorCount,
     DecodedNameBytes,
     DimensionCount,
@@ -46,14 +46,14 @@ pub(crate) enum InventoryExpression {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TensorMember {
+pub enum TensorMember {
     Dtype,
     Shape,
     DataOffsets,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AllocationArena {
+pub enum AllocationArena {
     TensorRecords,
     TensorNameBytes,
     Dimensions,
@@ -73,7 +73,7 @@ impl AllocationArena {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HeaderSyntaxFault {
+pub enum HeaderSyntaxFault {
     ExpectedObjectStart,
     ExpectedString,
     ExpectedColon,
@@ -87,7 +87,7 @@ pub(crate) enum HeaderSyntaxFault {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PreparedSafetensorsInventoryError {
+pub enum PreparedSafetensorsInventoryError {
     HeaderLengthMismatch {
         expected: usize,
         actual: usize,
@@ -169,7 +169,7 @@ pub(crate) enum PreparedSafetensorsInventoryError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PreparedSafetensorsInventoryLimits {
+pub struct PreparedSafetensorsInventoryLimits {
     max_tensors: u64,
     max_tensor_name_bytes: u64,
     max_rank: u64,
@@ -181,7 +181,7 @@ pub(crate) struct PreparedSafetensorsInventoryLimits {
 
 impl PreparedSafetensorsInventoryLimits {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_new(
+    pub fn try_new(
         max_tensors: NonZeroU64,
         max_tensor_name_bytes: NonZeroU64,
         max_rank: NonZeroU64,
@@ -257,7 +257,7 @@ impl PreparedSafetensorsInventoryLimits {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PreparedSafetensorsDtype {
+pub enum PreparedSafetensorsDtype {
     F32,
     F16,
     Bf16,
@@ -273,13 +273,13 @@ impl PreparedSafetensorsDtype {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum F32FileOffsetAlignment {
+pub enum F32FileOffsetAlignment {
     FourByteAligned,
     Unaligned,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DecodedSpan {
+pub struct DecodedSpan {
     start: usize,
     len: usize,
 }
@@ -291,7 +291,7 @@ impl DecodedSpan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PreparedSafetensorsTensorRecord {
+pub struct PreparedSafetensorsTensorRecord {
     name: DecodedSpan,
     dimensions: DecodedSpan,
     dtype: PreparedSafetensorsDtype,
@@ -303,7 +303,7 @@ pub(crate) struct PreparedSafetensorsTensorRecord {
 }
 
 #[derive(Debug)]
-pub(crate) struct PreparedSafetensorsInventoryFacts {
+pub struct PreparedSafetensorsInventoryFacts {
     records: Vec<PreparedSafetensorsTensorRecord>,
     name_bytes: Vec<u8>,
     dimensions: Vec<u64>,
@@ -352,7 +352,7 @@ impl PartialEq for PreparedSafetensorsInventoryFacts {
 impl Eq for PreparedSafetensorsInventoryFacts {}
 
 impl PreparedSafetensorsInventoryFacts {
-    pub(crate) fn tensors(&self) -> impl Iterator<Item = PreparedSafetensorsTensorView<'_>> {
+    pub fn tensors(&self) -> impl Iterator<Item = PreparedSafetensorsTensorView<'_>> {
         self.records
             .iter()
             .map(|record| PreparedSafetensorsTensorView {
@@ -362,69 +362,69 @@ impl PreparedSafetensorsInventoryFacts {
             })
     }
 
-    pub(crate) fn tensor_count(&self) -> usize {
+    pub fn tensor_count(&self) -> usize {
         self.records.len()
     }
 
-    pub(crate) fn aggregate_elements(&self) -> u64 {
+    pub fn aggregate_elements(&self) -> u64 {
         self.aggregate_elements
     }
 
-    pub(crate) fn source_payload_bytes(&self) -> u64 {
+    pub fn source_payload_bytes(&self) -> u64 {
         self.source_payload_bytes
     }
 
-    pub(crate) fn logical_retained_inventory_metadata_bytes(&self) -> usize {
+    pub fn logical_retained_inventory_metadata_bytes(&self) -> usize {
         self.logical_retained_inventory_metadata_bytes
     }
 
-    pub(crate) fn logical_safetensors_parse_work_bytes(&self) -> usize {
+    pub fn logical_safetensors_parse_work_bytes(&self) -> usize {
         self.logical_safetensors_parse_work_bytes
     }
 
-    pub(crate) fn decoded_metadata_value_bytes(&self) -> usize {
+    pub fn decoded_metadata_value_bytes(&self) -> usize {
         self.decoded_metadata_value_bytes
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PreparedSafetensorsTensorView<'a> {
+pub struct PreparedSafetensorsTensorView<'a> {
     record: &'a PreparedSafetensorsTensorRecord,
     name_bytes: &'a [u8],
     dimensions: &'a [u64],
 }
 
 impl PreparedSafetensorsTensorView<'_> {
-    pub(crate) fn name_bytes(&self) -> &[u8] {
+    pub fn name_bytes(&self) -> &[u8] {
         span_bytes(self.name_bytes, self.record.name)
     }
 
-    pub(crate) fn dimensions(&self) -> &[u64] {
+    pub fn dimensions(&self) -> &[u64] {
         span_dimensions(self.dimensions, self.record.dimensions)
     }
 
-    pub(crate) fn dtype(&self) -> PreparedSafetensorsDtype {
+    pub fn dtype(&self) -> PreparedSafetensorsDtype {
         self.record.dtype
     }
 
-    pub(crate) fn data_range(&self) -> Range<u64> {
+    pub fn data_range(&self) -> Range<u64> {
         self.record.data_start..self.record.data_end
     }
 
-    pub(crate) fn elements(&self) -> u64 {
+    pub fn elements(&self) -> u64 {
         self.record.elements
     }
 
-    pub(crate) fn source_bytes(&self) -> u64 {
+    pub fn source_bytes(&self) -> u64 {
         self.record.source_bytes
     }
 
-    pub(crate) fn f32_file_offset_alignment(&self) -> Option<F32FileOffsetAlignment> {
+    pub fn f32_file_offset_alignment(&self) -> Option<F32FileOffsetAlignment> {
         self.record.f32_file_offset_alignment
     }
 }
 
-pub(crate) fn parse_prepared_safetensors_header_inventory(
+pub fn parse_prepared_safetensors_header_inventory(
     header: &[u8],
     plan: &PreparedSafetensorsHeaderPlan,
     limits: &PreparedSafetensorsInventoryLimits,

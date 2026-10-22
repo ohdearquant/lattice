@@ -410,7 +410,7 @@ fn fold_weight_file_into_hasher(
     // function's existing error path, same as any other unreadable shard.
     let path = crate::weights::contained_shard_path(dir, file_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-    let opened = crate::weights::mmap_trust::open_regular_file_no_hang(&path)
+    let opened = lattice_weights::mmap_trust::open_regular_file_no_hang(&path)
         .map_err(std::io::Error::other)?;
     let mut file = std::io::BufReader::new(opened);
     let len = file.get_ref().metadata()?.len();

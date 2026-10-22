@@ -4,8 +4,7 @@ use crate::error::InferenceError;
 use crate::forward::cpu::matmul_bt;
 use crate::weights::SafetensorsFile;
 
-#[path = "../../test_fixtures/bert_namespace.rs"]
-mod fixture;
+use lattice_weights::test_fixtures::bert_namespace as fixture;
 
 use fixture::{HIDDEN, INTERMEDIATE, LAYERS, Tensor, checkpoint, rename, safetensors_bytes};
 

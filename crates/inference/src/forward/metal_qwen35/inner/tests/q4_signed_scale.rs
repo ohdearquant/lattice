@@ -11,7 +11,7 @@ use crate::signed_scale_fixture::{
     abs_scales, assert_sign_honoured, block_bytes, matmul_magnitude, matmul_reference,
     negative_scale_tensor, positive_activations, reference, zero_scales,
 };
-use crate::weights::q4_weights::q4_f16_to_f32;
+use lattice_weights::q4_weights::q4_f16_to_f32;
 
 /// Same fail-closed rule as `dispatch_matmul_q4_writes_all_rows`: under
 /// `LATTICE_METAL_TEST_ENFORCE=1` a missing device is a failure, not a skip.

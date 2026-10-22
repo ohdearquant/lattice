@@ -1,9 +1,9 @@
 //! Safetensors metadata and f32 weight structs, including tensor, transformer-layer, BERT, cross-encoder, safetensors-file, and Qwen layer weights.
-use crate::error::InferenceError;
-use crate::weights::bounded_read::{BoundedReadError, read_text_bounded};
-use crate::weights::safetensors_layout::{
+use crate::bounded_read::{BoundedReadError, read_text_bounded};
+use crate::safetensors_layout::{
     SafetensorsLayoutEntry, safetensors_dtype, validate_safetensors_layout,
 };
+use lattice_inference_core::InferenceError;
 use memmap2::Mmap;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -212,34 +212,12 @@ pub struct SafetensorsFile {
     source: String,
 }
 
-/// Parse safetensors from an already-open file without reopening its path.
-pub(crate) fn safetensors_from_open_file(
-    file: File,
-    path: &Path,
-) -> Result<SafetensorsFile, InferenceError> {
-    SafetensorsFile::from_open_file(file, path)
-}
-
-/// Read a BF16 tensor payload without widening or copying its backing bytes.
-pub(crate) fn safetensors_bf16_payload<'a>(
-    file: &'a SafetensorsFile,
-    name: &str,
-) -> Result<&'a [u8], InferenceError> {
-    file.bf16_payload(name)
-}
-
-/// Count tensors currently holding a cached f32 conversion.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn safetensors_cached_f32_tensor_count(file: &SafetensorsFile) -> usize {
-    file.cached_f32_tensor_count()
-}
-
 impl SafetensorsFile {
     /// **Unstable**: open a safetensors file; error type and header parsing may change.
     ///
     /// Open and parse a safetensors file.
     pub fn open(path: &Path) -> Result<Self, InferenceError> {
-        let file = crate::weights::mmap_trust::open_regular_file_no_hang(path)
+        let file = crate::mmap_trust::open_regular_file_no_hang(path)
             .map_err(InferenceError::InvalidSafetensors)?;
         Self::from_open_file(file, path)
     }
@@ -250,12 +228,12 @@ impl SafetensorsFile {
     /// opens the file exactly once. Mapping the fd the caller already holds is what keeps
     /// that single open meaningful; reopening by path here would reintroduce the window
     /// between the open and the read. `path` is used both to run the mmap trust-boundary
-    /// guard (via [`crate::weights::mmap_trust::map_after_untrusted_open`]) and to name the
+    /// guard (via [`crate::mmap_trust::map_after_untrusted_open`]) and to name the
     /// file in error messages -- it should be the resolved real path when the caller has
     /// one, matching that guard's own `path` requirement.
     pub(crate) fn from_open_file(file: File, path: &Path) -> Result<Self, InferenceError> {
         let display_path = path.display().to_string();
-        let mmap = crate::weights::mmap_trust::map_after_untrusted_open(&file, path)
+        let mmap = crate::mmap_trust::map_after_untrusted_open(&file, path)
             .map_err(InferenceError::InvalidSafetensors)?;
 
         Self::from_backing(SafetensorsBacking::Mapped(mmap), display_path)
@@ -461,15 +439,15 @@ impl SafetensorsFile {
                         let (values, has_non_finite) = convert_f16_bytes_to_f32(bytes);
                         let _ = meta.validated.get_or_init(|| {
                             let tensor = if has_non_finite {
-                                crate::weights::ingress::IngestedTensor::decoded_f32(
+                                crate::ingress::IngestedTensor::decoded_f32(
                                     source, name, shape, dtype_name, &values,
                                 )
                             } else {
-                                crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                crate::ingress::IngestedTensor::decoded_f32_known_finite(
                                     source, name, shape, dtype_name, &values,
                                 )
                             };
-                            crate::weights::ingress::validate_ingested_tensor(tensor)
+                            crate::ingress::validate_ingested_tensor(tensor)
                                 .map_err(|e| e.to_string())
                         });
                         values.into_boxed_slice()
@@ -483,15 +461,15 @@ impl SafetensorsFile {
                         let (values, has_non_finite) = convert_bf16_bytes_to_f32(bytes);
                         let _ = meta.validated.get_or_init(|| {
                             let tensor = if has_non_finite {
-                                crate::weights::ingress::IngestedTensor::decoded_f32(
+                                crate::ingress::IngestedTensor::decoded_f32(
                                     source, name, shape, dtype_name, &values,
                                 )
                             } else {
-                                crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                crate::ingress::IngestedTensor::decoded_f32_known_finite(
                                     source, name, shape, dtype_name, &values,
                                 )
                             };
-                            crate::weights::ingress::validate_ingested_tensor(tensor)
+                            crate::ingress::validate_ingested_tensor(tensor)
                                 .map_err(|e| e.to_string())
                         });
                         values.into_boxed_slice()
@@ -508,15 +486,15 @@ impl SafetensorsFile {
                                 let (values, has_non_finite) = convert_f8_e4m3_bytes_to_f32(bytes);
                                 let _ = meta.validated.get_or_init(|| {
                                     let tensor = if has_non_finite {
-                                        crate::weights::ingress::IngestedTensor::decoded_f32(
+                                        crate::ingress::IngestedTensor::decoded_f32(
                                             source, name, shape, dtype_name, &values,
                                         )
                                     } else {
-                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                        crate::ingress::IngestedTensor::decoded_f32_known_finite(
                                             source, name, shape, dtype_name, &values,
                                         )
                                     };
-                                    crate::weights::ingress::validate_ingested_tensor(tensor)
+                                    crate::ingress::validate_ingested_tensor(tensor)
                                         .map_err(|e| e.to_string())
                                 });
                                 values.into_boxed_slice()
@@ -541,15 +519,15 @@ impl SafetensorsFile {
                                 let (values, has_non_finite) = convert_f8_e5m2_bytes_to_f32(bytes);
                                 let _ = meta.validated.get_or_init(|| {
                                     let tensor = if has_non_finite {
-                                        crate::weights::ingress::IngestedTensor::decoded_f32(
+                                        crate::ingress::IngestedTensor::decoded_f32(
                                             source, name, shape, dtype_name, &values,
                                         )
                                     } else {
-                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                        crate::ingress::IngestedTensor::decoded_f32_known_finite(
                                             source, name, shape, dtype_name, &values,
                                         )
                                     };
-                                    crate::weights::ingress::validate_ingested_tensor(tensor)
+                                    crate::ingress::validate_ingested_tensor(tensor)
                                         .map_err(|e| e.to_string())
                                 });
                                 values.into_boxed_slice()
@@ -585,8 +563,8 @@ impl SafetensorsFile {
             // `get_or_init` runs its closure at most once even under concurrent
             // first access, so zero-copy F32 pages are scanned by one caller.
             meta.validated.get_or_init(|| {
-                crate::weights::ingress::validate_ingested_tensor(
-                    crate::weights::ingress::IngestedTensor::decoded_f32(
+                crate::ingress::validate_ingested_tensor(
+                    crate::ingress::IngestedTensor::decoded_f32(
                         source, name, shape, dtype_name, slice,
                     ),
                 )
@@ -1103,7 +1081,7 @@ fn validate_bf16_payload(
     shape: &[usize],
     bytes: &[u8],
 ) -> Result<(), InferenceError> {
-    let validator = crate::weights::ingress::DecodedTensorValidator::safetensors(
+    let validator = crate::ingress::DecodedTensorValidator::safetensors(
         source,
         name,
         shape,
@@ -1131,8 +1109,7 @@ fn convert_f16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut has_non_finite = false;
     for chunk in bytes.chunks_exact(2) {
-        let value =
-            crate::weights::half_bits::f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+        let value = crate::half_bits::f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
         has_non_finite |= !value.is_finite();
         out.push(value);
     }
@@ -1144,8 +1121,7 @@ fn convert_bf16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut has_non_finite = false;
     for chunk in bytes.chunks_exact(2) {
-        let value =
-            crate::weights::half_bits::bf16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+        let value = crate::half_bits::bf16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
         has_non_finite |= !value.is_finite();
         out.push(value);
     }
@@ -1157,7 +1133,7 @@ fn convert_f8_e4m3_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     let mut out = Vec::with_capacity(bytes.len());
     let mut has_non_finite = false;
     for &byte in bytes {
-        let value = crate::weights::half_bits::f8_e4m3_bits_to_f32(byte);
+        let value = crate::half_bits::f8_e4m3_bits_to_f32(byte);
         has_non_finite |= !value.is_finite();
         out.push(value);
     }
@@ -1169,7 +1145,7 @@ fn convert_f8_e5m2_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     let mut out = Vec::with_capacity(bytes.len());
     let mut has_non_finite = false;
     for &byte in bytes {
-        let value = crate::weights::half_bits::f8_e5m2_bits_to_f32(byte);
+        let value = crate::half_bits::f8_e5m2_bits_to_f32(byte);
         has_non_finite |= !value.is_finite();
         out.push(value);
     }
@@ -1497,7 +1473,7 @@ pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError>
 /// are rejected, lexically, without consulting any filesystem state.
 ///
 /// The returned file has already passed
-/// [`crate::weights::mmap_trust::reject_if_open_mmap_file_untrusted`] against its resolved
+/// [`crate::mmap_trust::reject_if_open_mmap_file_untrusted`] against its resolved
 /// real path -- every caller mmaps this file read-only no-copy, so the same write-boundary
 /// gate every other checkpoint mmap goes through applies here too, without `open_trusted_mmap_file`'s
 /// `O_NOFOLLOW` (see that function's doc comment for why a hub-cache symlink must still resolve).
@@ -1520,15 +1496,15 @@ pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError>
 /// snapshots are symlink farms (`snapshots/<rev>/x.safetensors -> ../../blobs/<sha>`) and
 /// lattice loads such directories directly. Read that threat-model section before
 /// reintroducing a resolved-path containment check here.
-pub(crate) fn open_manifest_entry_once(
+pub fn open_manifest_entry_once(
     model_root: &Path,
     entry_name: &str,
 ) -> Result<(File, PathBuf), InferenceError> {
     let candidate = contained_shard_path(model_root, entry_name)?;
-    let file = crate::weights::mmap_trust::open_regular_file_no_hang(&candidate)
+    let file = crate::mmap_trust::open_regular_file_no_hang(&candidate)
         .map_err(InferenceError::InvalidSafetensors)?;
     let real_path = real_path_of_open_file(&file, &candidate)?;
-    crate::weights::mmap_trust::reject_if_open_mmap_file_untrusted(&file, &real_path)
+    crate::mmap_trust::reject_if_open_mmap_file_untrusted(&file, &real_path)
         .map_err(InferenceError::InvalidSafetensors)?;
     Ok((file, real_path))
 }

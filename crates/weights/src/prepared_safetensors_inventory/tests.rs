@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 
 use super::*;
-use crate::weights::prepared_safetensors::{
+use crate::prepared_safetensors::{
     PreparedSafetensorsFramingLimits, PreparedSafetensorsHeaderPlan,
     plan_prepared_safetensors_header,
 };

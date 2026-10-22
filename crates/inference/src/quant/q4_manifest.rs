@@ -40,7 +40,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::weights::bounded_read::{BoundedReadError, read_bytes_bounded};
+use lattice_weights::bounded_read::{BoundedReadError, read_bytes_bounded};
 
 /// Bounded size cap for `quantize_index.json` reads (#504 remaining slice
 /// 2). The index is a small per-tensor manifest (name/file/quantized/

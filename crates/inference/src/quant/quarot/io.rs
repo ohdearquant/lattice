@@ -30,7 +30,7 @@
 //! [`has_tensor`]: QuarotTensorReader::has_tensor
 //!
 //! On-disk decode for F32 / F16 / BF16 uses the always-compiled scalar
-//! conversion in `crate::weights::half_bits` (independent of the `f16`
+//! conversion in `lattice_weights::half_bits` (independent of the `f16`
 //! cargo feature, which only gates *loading permission* elsewhere), then
 //! widens the result to f64 (lossless from f32).
 //!
@@ -49,11 +49,11 @@ use crate::error::InferenceError;
 use crate::model::qwen35::qwen_layer_tensor_prefix;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::plan::{OnlineRotationSpec, OnlineTransformSite};
-use crate::weights::ingress::DecodedTensorValidator;
-use crate::weights::safetensors_layout::{
+use crate::weights::{contained_shard_path, parse_index};
+use lattice_weights::ingress::DecodedTensorValidator;
+use lattice_weights::safetensors_layout::{
     safetensors_dtype_name, safetensors_layout_entry, validate_safetensors_layout,
 };
-use crate::weights::{contained_shard_path, parse_index};
 
 /// On-disk storage dtype of a tensor.
 ///
@@ -130,7 +130,7 @@ struct ParsedEntry {
 
 impl Shard {
     fn open(path: &Path) -> Result<Self, InferenceError> {
-        let file = crate::weights::mmap_trust::open_regular_file_no_hang(path)
+        let file = lattice_weights::mmap_trust::open_regular_file_no_hang(path)
             .map_err(InferenceError::InvalidSafetensors)?;
         // This reader loads the same HuggingFace hub-cache checkpoints the
         // runtime baseline forward pass does (see `QuarotTensorReader::open`'s
@@ -138,7 +138,7 @@ impl Shard {
         // symlink -- `open_trusted_mmap_file`'s `O_NOFOLLOW` would reject
         // that. `map_after_untrusted_open` applies the same
         // mode/uid/ACL/parent-directory checks without it, then maps.
-        let mmap = crate::weights::mmap_trust::map_after_untrusted_open(&file, path)
+        let mmap = lattice_weights::mmap_trust::map_after_untrusted_open(&file, path)
             .map_err(InferenceError::InvalidSafetensors)?;
 
         if mmap.len() < 8 {
@@ -977,7 +977,7 @@ fn decode_bytes_to_f64(
                         let offset = $lane * 2;
                         let bits = u16::from_le_bytes([group[offset], group[offset + 1]]);
                         non_finite_lanes[$lane] |= bits & 0x7f80 == 0x7f80;
-                        decoded[$lane] = crate::weights::half_bits::bf16_bits_to_f32(bits) as f64;
+                        decoded[$lane] = lattice_weights::half_bits::bf16_bits_to_f32(bits) as f64;
                     }};
                 }
                 decode_lane!(0);
@@ -1001,7 +1001,7 @@ fn decode_bytes_to_f64(
             for bytes in groups.remainder().chunks_exact(2) {
                 let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
                 non_finite_lanes[0] |= bits & 0x7f80 == 0x7f80;
-                data.push(crate::weights::half_bits::bf16_bits_to_f32(bits) as f64);
+                data.push(lattice_weights::half_bits::bf16_bits_to_f32(bits) as f64);
             }
         }
         SourceDType::F16 => {
@@ -1013,7 +1013,7 @@ fn decode_bytes_to_f64(
                         let offset = $lane * 2;
                         let bits = u16::from_le_bytes([group[offset], group[offset + 1]]);
                         non_finite_lanes[$lane] |= bits & 0x7c00 == 0x7c00;
-                        decoded[$lane] = crate::weights::half_bits::f16_bits_to_f32(bits) as f64;
+                        decoded[$lane] = lattice_weights::half_bits::f16_bits_to_f32(bits) as f64;
                     }};
                 }
                 decode_lane!(0);
@@ -1037,7 +1037,7 @@ fn decode_bytes_to_f64(
             for bytes in groups.remainder().chunks_exact(2) {
                 let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
                 non_finite_lanes[0] |= bits & 0x7c00 == 0x7c00;
-                data.push(crate::weights::half_bits::f16_bits_to_f32(bits) as f64);
+                data.push(lattice_weights::half_bits::f16_bits_to_f32(bits) as f64);
             }
         }
     }

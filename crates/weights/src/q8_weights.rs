@@ -18,18 +18,8 @@
 
 #![forbid(unsafe_code)]
 
-use crate::error::InferenceError;
-use crate::weights::ingress::{IngestedTensor, validate_ingested_tensor};
-
-pub use crate::forward::cpu::q8_matmul::matmul_bt_q8;
-pub(crate) use crate::forward::cpu::q8_matmul::{Q8MatmulScratch, matmul_bt_q8_with_scratch};
-pub use crate::model::qwen35::q8_conversion::{
-    Q8AttentionWeights, Q8CommonLayerWeights, Q8FullAttentionLayerWeights,
-    Q8GatedDeltaNetWeights, Q8ModelWeights, memory_report, quantize_gdn_weights,
-};
-pub(crate) use crate::model::qwen35::q8_conversion::{
-    quantize_model_weights, validate_cfg_len, validate_gdn_shapes,
-};
+use crate::ingress::{IngestedTensor, validate_ingested_tensor};
+use lattice_inference_core::InferenceError;
 
 const Q8_MATRIX_SOURCE: &str = "in-memory Q8 quantization";
 
@@ -66,7 +56,7 @@ pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Result<Q8Matrix, 
     quantize_named_matrix(w, rows, cols, Q8_MATRIX_SOURCE, "matrix")
 }
 
-pub(crate) fn validate_source_geometry(
+pub fn validate_source_geometry(
     len: usize,
     rows: usize,
     cols: usize,
@@ -87,7 +77,7 @@ pub(crate) fn validate_source_geometry(
     Ok(())
 }
 
-pub(crate) fn quantize_named_matrix(
+pub fn quantize_named_matrix(
     w: &[f32],
     rows: usize,
     cols: usize,
@@ -170,8 +160,9 @@ fn dequantize_matrix(q: &Q8Matrix) -> Vec<f32> {
     out
 }
 
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub mod test_support;
 
 #[cfg(test)]
 mod tests;

@@ -1,16 +1,16 @@
-pub(super) const HIDDEN: usize = 4;
-pub(super) const INTERMEDIATE: usize = 6;
-pub(super) const LAYERS: usize = 2;
+pub const HIDDEN: usize = 4;
+pub const INTERMEDIATE: usize = 6;
+pub const LAYERS: usize = 2;
 
 #[derive(Clone)]
-pub(super) struct Tensor {
-    pub(super) name: String,
+pub struct Tensor {
+    pub name: String,
     shape: Vec<usize>,
     values: Vec<f32>,
 }
 
 impl Tensor {
-    pub(super) fn new(name: &str, shape: &[usize], values: Vec<f32>) -> Self {
+    pub fn new(name: &str, shape: &[usize], values: Vec<f32>) -> Self {
         assert_eq!(shape.iter().product::<usize>(), values.len(), "{name}");
         Self {
             name: name.to_owned(),
@@ -26,7 +26,7 @@ fn fill(count: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
-pub(super) fn checkpoint(prefix: &str, pooler: bool) -> Vec<Tensor> {
+pub fn checkpoint(prefix: &str, pooler: bool) -> Vec<Tensor> {
     let mut tensors = vec![
         Tensor::new(
             "embeddings.word_embeddings.weight",
@@ -116,7 +116,7 @@ pub(super) fn checkpoint(prefix: &str, pooler: bool) -> Vec<Tensor> {
     tensors
 }
 
-pub(super) fn safetensors_bytes(tensors: &[Tensor]) -> Vec<u8> {
+pub fn safetensors_bytes(tensors: &[Tensor]) -> Vec<u8> {
     let mut header = serde_json::Map::new();
     let mut payload = Vec::new();
     for tensor in tensors {
@@ -147,7 +147,7 @@ pub(super) fn safetensors_bytes(tensors: &[Tensor]) -> Vec<u8> {
     bytes
 }
 
-pub(super) fn rename(tensors: &mut [Tensor], old: &str, new: &str) {
+pub fn rename(tensors: &mut [Tensor], old: &str, new: &str) {
     tensors
         .iter_mut()
         .find(|tensor| tensor.name == old)

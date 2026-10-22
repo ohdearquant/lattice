@@ -408,7 +408,7 @@ mod inner {
             buffer: Buffer,
             payload_offset: u64,
             mmap: memmap2::Mmap,
-            _blocks_checked: crate::weights::q4_weights::Q4BlocksChecked,
+            _blocks_checked: lattice_weights::q4_weights::Q4BlocksChecked,
         ) -> Self {
             Q4WeightBuf {
                 buffer,
@@ -446,7 +446,7 @@ mod inner {
         label: &str,
         expected_shape: &[usize],
     ) -> Result<Q4WeightBuf, String> {
-        use crate::weights::q4_weights::{Q4BlockCheck, open_and_mmap_q4_file};
+        use lattice_weights::q4_weights::{Q4BlockCheck, open_and_mmap_q4_file};
 
         let tensor_name = path
             .file_name()
@@ -541,7 +541,7 @@ mod inner {
     ///
     /// # Safety invariant
     /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
-    /// modified while the process is running. [`crate::weights::mmap_trust::open_trusted_mmap_file`]
+    /// modified while the process is running. [`lattice_weights::mmap_trust::open_trusted_mmap_file`]
     /// enforces the write-boundary half of that invariant (group/other-writable,
     /// foreign ownership, a writable ancestor directory, or a permission-granting
     /// extended ACL) the same way [`mmap_q4_weight`] does; same-uid mutation
@@ -562,15 +562,15 @@ mod inner {
 
         validate_q3_mlp_role(tensor_name).map_err(|e| e.to_string())?;
 
-        let mut handle = crate::weights::mmap_trust::open_trusted_mmap_file(path)?;
+        let mut handle = lattice_weights::mmap_trust::open_trusted_mmap_file(path)?;
         let header = crate::weights::q3_weights::read_q3_header(&mut handle)
             .map_err(|e| format!("failed to parse Q3 header {}: {e}", path.display()))?;
         let file_len = handle
             .len()
             .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
-        crate::weights::q3_weights::validate_q3_header_payload_bounds(&header, file_len, path)
+        lattice_weights::q3_weights::validate_q3_header_payload_bounds(&header, file_len, path)
             .map_err(|e| format!("failed to validate Q3 payload {}: {e}", path.display()))?;
-        let mmap = crate::weights::mmap_trust::map_and_verify_trusted(&handle)?;
+        let mmap = lattice_weights::mmap_trust::map_and_verify_trusted(&handle)?;
 
         let buf = device.new_buffer_with_bytes_no_copy(
             mmap.as_ptr().cast(),
@@ -2400,21 +2400,21 @@ mod inner {
     /// Convert f32 to IEEE-754 half-precision (f16) stored as u16 bits.
     ///
     /// Thin wrapper over the single always-compiled scalar encoder in
-    /// [`crate::weights::half_bits`] (lattice#799) — this module used to
+    /// [`lattice_weights::half_bits`] (lattice#799) — this module used to
     /// carry its own independent copy of the bit-twiddling arithmetic.
     #[inline]
     fn f32_to_f16(x: f32) -> u16 {
-        crate::weights::half_bits::f32_to_f16_bits(x)
+        lattice_weights::half_bits::f32_to_f16_bits(x)
     }
 
     /// Convert f16 bits (u16) back to f32.
     ///
     /// Used for CPU-side reads of f16 weight buffers when needed (e.g., small
     /// GDN projections dispatched on CPU). Thin wrapper over
-    /// [`crate::weights::half_bits::f16_bits_to_f32`] (lattice#799).
+    /// [`lattice_weights::half_bits::f16_bits_to_f32`] (lattice#799).
     #[inline]
     fn f16_to_f32(bits: u16) -> f32 {
-        crate::weights::half_bits::f16_bits_to_f32(bits)
+        lattice_weights::half_bits::f16_bits_to_f32(bits)
     }
 
     /// Convert a contiguous slice of IEEE-754 half-precision values (stored as u16 bits)
@@ -11846,7 +11846,7 @@ mod inner {
             tensor: &crate::weights::q4_weights::Q4Tensor,
             label: &str,
         ) -> Buffer {
-            use crate::weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
+            use lattice_weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
             let mut f16_data: Vec<u16> = Vec::with_capacity(tensor.original_len);
             for block in &tensor.blocks {
                 let scale = q4_f16_to_f32(block.scale);
@@ -11877,7 +11877,7 @@ mod inner {
             path: &std::path::Path,
             expected_shape: &[usize],
         ) -> Result<(Vec<u8>, usize), String> {
-            use crate::weights::q4_weights::load_q4_file_checked;
+            use lattice_weights::q4_weights::load_q4_file_checked;
             let tensor = load_q4_file_checked(path, expected_shape)
                 .map_err(|e| format!("failed to load Q4 file {}: {e}", path.display()))?;
             let n_blocks = tensor.blocks.len();
@@ -11929,7 +11929,7 @@ mod inner {
             label: &str,
             expected_shape: &[usize],
         ) -> Result<Buffer, String> {
-            use crate::weights::q4_weights::{
+            use lattice_weights::q4_weights::{
                 Q4BlockCheck, open_and_mmap_q4_file, q4_f16_to_f32, q4_f32_to_f16,
                 validate_q4_block_metadata,
             };
@@ -11997,9 +11997,9 @@ mod inner {
             label: &str,
             expected_shape: &[usize],
         ) -> Result<Buffer, String> {
-            use crate::weights::q4_weights::{
-                Q4BlockCheck, dequantize_row_q4_0, open_and_mmap_q4_file,
-                validate_q4_block_metadata,
+            use crate::weights::q4_weights::dequantize_row_q4_0;
+            use lattice_weights::q4_weights::{
+                Q4BlockCheck, open_and_mmap_q4_file, validate_q4_block_metadata,
             };
             let (header, mmap, _) = open_and_mmap_q4_file(
                 path,
@@ -12566,19 +12566,20 @@ mod inner {
             // ----------------------------------------------------------------
             // Helper: load an F16 file, convert to f32, create a Metal f32 buffer.
             // ----------------------------------------------------------------
-            let load_f16_buf_f32 = |name: &str,
-                                    label: &str,
-                                    expected_shape: &[usize]|
-             -> Result<Buffer, String> {
-                let t = std::time::Instant::now();
-                let path = Self::q4_tensor_path(q4_dir, name, "f16");
-                let (values, _shape) =
-                    crate::weights::q4_weights::load_f16_tensor_file_checked(&path, expected_shape)
+            let load_f16_buf_f32 =
+                |name: &str, label: &str, expected_shape: &[usize]| -> Result<Buffer, String> {
+                    let t = std::time::Instant::now();
+                    let path = Self::q4_tensor_path(q4_dir, name, "f16");
+                    let (values, _shape) =
+                        lattice_weights::q4_weights::load_f16_tensor_file_checked(
+                            &path,
+                            expected_shape,
+                        )
                         .map_err(|e| format!("failed to load f16 file {}: {e}", path.display()))?;
-                let buf = make_buffer(&device, &values, label);
-                dur_b_cell.set(dur_b_cell.get() + t.elapsed());
-                Ok(buf)
-            };
+                    let buf = make_buffer(&device, &values, label);
+                    dur_b_cell.set(dur_b_cell.get() + t.elapsed());
+                    Ok(buf)
+                };
 
             // ----------------------------------------------------------------
             // H3: Merge-on-first-load for in_proj_qkvz.
@@ -12619,14 +12620,14 @@ mod inner {
                             // + qkv payload + z payload.  All source weight files are 2D
                             // so payload_offset=36 for each.
                             let expected_size =
-                                crate::weights::q4_weights::merged_qkvz_expected_size(qkv_size, z_size)
+                                lattice_weights::q4_weights::merged_qkvz_expected_size(qkv_size, z_size)
                                     .map_err(|e| format!("layer {i} merge size: {e}"))?;
                             // Content-integrity check (#504 remaining slice 1): size alone
                             // cannot catch a same-size stale/corrupted merged artifact, so
                             // this also verifies the merged file's payload hash against a
                             // hash freshly derived from the *current* qkv/z source files —
                             // fail closed to a rebuild on any mismatch or read error.
-                            let is_valid = crate::weights::q4_weights::merged_qkvz_cache_is_valid(
+                            let is_valid = lattice_weights::q4_weights::merged_qkvz_cache_is_valid(
                                 &merged_path,
                                 expected_size,
                                 &qkv_p,
@@ -12634,7 +12635,7 @@ mod inner {
                             );
                             if !is_valid {
                                 let _ = std::fs::remove_file(&merged_path);
-                                if let Err(e) = crate::weights::q4_weights::write_merged_qkvz(&qkv_p, &z_p, &merged_path) {
+                                if let Err(e) = lattice_weights::q4_weights::write_merged_qkvz(&qkv_p, &z_p, &merged_path) {
                                     eprintln!("[load] merge-on-first-load failed layer {i}: {e}; using CPU fallback");
                                     return Ok((i, None));
                                 }
@@ -12763,11 +12764,11 @@ mod inner {
                      -> Result<Buffer, String> {
                         let t = std::time::Instant::now();
                         let path = Self::q4_tensor_path(q4_dir, name, "q4");
-                        let tensor =
-                            crate::weights::q4_weights::load_q4_file_checked(&path, expected_shape)
-                                .map_err(|e| {
-                                    format!("failed to load Q4 file {}: {e}", path.display())
-                                })?;
+                        let tensor = lattice_weights::q4_weights::load_q4_file_checked(
+                            &path,
+                            expected_shape,
+                        )
+                        .map_err(|e| format!("failed to load Q4 file {}: {e}", path.display()))?;
                         let buf = Self::make_buffer_f16_from_q4(&device, &tensor, label);
                         dur_b_cell.set(dur_b_cell.get() + t.elapsed());
                         Ok(buf)

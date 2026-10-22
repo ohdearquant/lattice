@@ -48,7 +48,7 @@
 // the two transmute-equivalent slice casts in stream_quantize_shard and save/load.
 #![allow(clippy::cast_possible_truncation)]
 
-use crate::error::InferenceError;
+use lattice_inference_core::InferenceError;
 
 /// One Q4_0 quantization block: 32 weights packed as 4-bit unsigned integers.
 ///
@@ -98,7 +98,7 @@ pub const Q4_BLOCK_BYTES: usize = std::mem::size_of::<Q4Block>();
 /// expected-block-count check must agree on this value — a single constant
 /// keeps a future block-width change from updating one side and not the
 /// other.
-pub(crate) const Q4_BLOCK_WEIGHTS: usize = 32;
+pub const Q4_BLOCK_WEIGHTS: usize = 32;
 
 /// A Q4_0 quantized tensor.
 ///
@@ -118,7 +118,7 @@ pub struct Q4Tensor {
 // f16 ↔ f32 / bf16 → f32 helpers.
 //
 // Thin wrappers over the single always-compiled scalar decoder in
-// `crate::weights::half_bits` (lattice#799) — kept as separate `q4_`-prefixed
+// `crate::half_bits` (lattice#799) — kept as separate `q4_`-prefixed
 // functions here only to preserve this module's existing call-site names
 // and `pub(crate)` visibility; no conversion arithmetic lives in this file
 // anymore.
@@ -129,19 +129,19 @@ pub struct Q4Tensor {
 /// Uses round-to-nearest-even for mantissa truncation. Handles ±0, ±∞, NaN,
 /// subnormals, and overflow (→ ±∞).
 #[inline]
-pub(crate) fn q4_f32_to_f16(x: f32) -> u16 {
-    crate::weights::half_bits::f32_to_f16_bits(x)
+pub fn q4_f32_to_f16(x: f32) -> u16 {
+    crate::half_bits::f32_to_f16_bits(x)
 }
 
 #[inline]
-pub(crate) fn q4_f32_to_finite_f16(x: f32) -> Result<u16, u16> {
-    crate::weights::half_bits::f32_to_finite_f16_bits(x)
+pub fn q4_f32_to_finite_f16(x: f32) -> Result<u16, u16> {
+    crate::half_bits::f32_to_finite_f16_bits(x)
 }
 
 /// Convert an IEEE-754 f16 bit pattern (`u16`) back to `f32`.
 #[inline]
-pub(crate) fn q4_f16_to_f32(bits: u16) -> f32 {
-    crate::weights::half_bits::f16_bits_to_f32(bits)
+pub fn q4_f16_to_f32(bits: u16) -> f32 {
+    crate::half_bits::f16_bits_to_f32(bits)
 }
 
 /// Convert a BF16 bit pattern (`u16`) to `f32`.
@@ -150,7 +150,7 @@ pub(crate) fn q4_f16_to_f32(bits: u16) -> f32 {
 /// is a lossless widening. Handles ±0, ±∞, NaN, and subnormals correctly.
 #[inline]
 fn bf16_to_f32(v: u16) -> f32 {
-    crate::weights::half_bits::bf16_bits_to_f32(v)
+    crate::half_bits::bf16_bits_to_f32(v)
 }
 
 /// Whether `scale` survives serialization as a finite, strictly positive f16.
@@ -805,15 +805,13 @@ pub(crate) fn validate_q4_header_payload_bounds(
     }
 
     let source = path.display().to_string();
-    crate::weights::ingress::validate_ingested_tensor(
-        crate::weights::ingress::IngestedTensor::native_q4(
-            &source,
-            "native Q4 tensor",
-            &header.shape,
-            header.original_len,
-            header.original_len.div_ceil(Q4_BLOCK_WEIGHTS),
-        ),
-    )?;
+    crate::ingress::validate_ingested_tensor(crate::ingress::IngestedTensor::native_q4(
+        &source,
+        "native Q4 tensor",
+        &header.shape,
+        header.original_len,
+        header.original_len.div_ceil(Q4_BLOCK_WEIGHTS),
+    ))?;
     Ok(())
 }
 
@@ -861,8 +859,8 @@ pub(crate) fn validate_q4_file<R: std::io::Read + std::io::Seek>(
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("native Q4 tensor");
         let block_count = header.original_len.div_ceil(Q4_BLOCK_WEIGHTS);
-        crate::weights::ingress::validate_ingested_tensor(
-            crate::weights::ingress::IngestedTensor::native_q4(
+        crate::ingress::validate_ingested_tensor(
+            crate::ingress::IngestedTensor::native_q4(
                 &source,
                 tensor_name,
                 &header.shape,
@@ -882,22 +880,20 @@ pub(crate) fn validate_q4_file<R: std::io::Read + std::io::Seek>(
 ///
 /// `source`/`tensor_name`/`index` are provenance only, threaded through to
 /// the error message so a rejected block names its file and position.
-pub(crate) fn validate_q4_block_metadata(
+pub fn validate_q4_block_metadata(
     source: &str,
     tensor_name: &str,
     index: usize,
     scale_bits: u16,
     bias_bits: u16,
 ) -> Result<(), InferenceError> {
-    crate::weights::ingress::validate_ingested_tensor(
-        crate::weights::ingress::IngestedTensor::native_q4_block(
-            source,
-            tensor_name,
-            index,
-            scale_bits,
-            bias_bits,
-        ),
-    )
+    crate::ingress::validate_ingested_tensor(crate::ingress::IngestedTensor::native_q4_block(
+        source,
+        tensor_name,
+        index,
+        scale_bits,
+        bias_bits,
+    ))
 }
 
 /// Validate every Q4 block's scale/bias metadata in `payload`, one pass, for
@@ -912,7 +908,6 @@ pub(crate) fn validate_q4_block_metadata(
 ///
 /// Returns an error naming the first block whose scale is non-finite or
 /// zero, or whose bias is non-finite.
-#[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) fn validate_q4_block_metadata_scan(
     source: &str,
     tensor_name: &str,
@@ -933,8 +928,7 @@ pub(crate) fn validate_q4_block_metadata_scan(
 /// a new memory-mapping Q4 consumer forces an explicit answer to "who checks
 /// the block metadata for these bytes?". A consumer that never traverses the
 /// payload has no correct answer other than [`Q4BlockCheck::Now`].
-#[cfg(any(test, feature = "metal-gpu"))]
-pub(crate) enum Q4BlockCheck<'a> {
+pub enum Q4BlockCheck<'a> {
     /// Scan every block's scale/bias before the mapping is returned. Required
     /// for consumers that hand the mapped bytes to something other than a CPU
     /// decode loop — a no-copy GPU buffer, a DMA target, a raw slice — since
@@ -958,8 +952,7 @@ pub(crate) enum Q4BlockCheck<'a> {
 /// bytes to something which will never decode them on the CPU take this by
 /// value, so reaching such a constructor from a deferred check requires
 /// visibly unwrapping a `None` rather than simply not writing a line.
-#[cfg(any(test, feature = "metal-gpu"))]
-pub(crate) struct Q4BlocksChecked(());
+pub struct Q4BlocksChecked(());
 
 /// Open `path`, run the [`validate_q4_file`] preflight against
 /// `expected_shape`, discharge the per-block obligation per `check`, and
@@ -982,17 +975,16 @@ pub(crate) struct Q4BlocksChecked(());
 /// an mmap failure, a header whose `payload_offset` lies beyond the mapped
 /// length, or — under [`Q4BlockCheck::Now`] — a block with a non-finite or
 /// zero scale or a non-finite bias.
-#[cfg(any(test, feature = "metal-gpu"))]
-pub(crate) fn open_and_mmap_q4_file(
+pub fn open_and_mmap_q4_file(
     path: &std::path::Path,
     expected_shape: Option<&[usize]>,
     check: Q4BlockCheck<'_>,
 ) -> Result<(Q4FileHeader, memmap2::Mmap, Option<Q4BlocksChecked>), String> {
-    let mut handle = crate::weights::mmap_trust::open_trusted_mmap_file(path)?;
+    let mut handle = crate::mmap_trust::open_trusted_mmap_file(path)?;
     let header = validate_q4_file(&mut handle, path, expected_shape)
         .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
 
-    let mmap = crate::weights::mmap_trust::map_and_verify_trusted(&handle)?;
+    let mmap = crate::mmap_trust::map_and_verify_trusted(&handle)?;
 
     let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
         format!(
@@ -1028,26 +1020,25 @@ pub(crate) fn open_and_mmap_q4_file(
 ///
 /// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
 pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
-    let f = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
+    let f = crate::mmap_trust::open_regular_file_no_hang(path)?;
     load_q4_from_open_file(f, path, None)
 }
 
 /// [`load_q4_file`] with the caller's required shape checked against the file's
 /// own header, through the shared ingress seam, before any block is decoded.
-#[cfg(any(test, feature = "metal-gpu"))]
-pub(crate) fn load_q4_file_checked(
+pub fn load_q4_file_checked(
     path: &std::path::Path,
     expected_shape: &[usize],
 ) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
-    let f = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
+    let f = crate::mmap_trust::open_regular_file_no_hang(path)?;
     load_q4_from_open_file(f, path, Some(expected_shape))
 }
 
 /// Parse a [`Q4Tensor`] from an already-open `.q4` file. Callers that resolved this file
-/// through [`crate::weights::f32_weights::open_manifest_entry_once`] must read from that
+/// through [`crate::f32_weights::open_manifest_entry_once`] must read from that
 /// opened fd rather than reopen by path -- see that function's docs. `path` is used only
 /// for error messages and ingress provenance; this function never opens it.
-pub(crate) fn load_q4_from_open_file(
+pub fn load_q4_from_open_file(
     mut f: std::fs::File,
     path: &std::path::Path,
     expected_shape: Option<&[usize]>,
@@ -1222,7 +1213,7 @@ pub fn load_f16_tensor_file_expecting(
     path: &std::path::Path,
     expected: &[usize],
 ) -> Result<(Vec<f32>, Vec<usize>), F16LoadError> {
-    let f = crate::weights::mmap_trust::open_regular_file_no_hang(path)
+    let f = crate::mmap_trust::open_regular_file_no_hang(path)
         .map_err(|e| F16LoadError::Other(e.into()))?;
     load_f16_tensor_from_open_file_expecting(f, &path.display().to_string(), expected)
 }
@@ -1231,9 +1222,9 @@ pub fn load_f16_tensor_file_expecting(
 ///
 /// Both properties hold at once here: the header is compared against `expected` on the
 /// same handle the payload is read from, and that handle is the one the caller opened
-/// (see [`crate::weights::f32_weights::open_manifest_entry_once`]) rather than a pathname
+/// (see [`crate::f32_weights::open_manifest_entry_once`]) rather than a pathname
 /// reopened afterwards. `display_path` is used only for error messages.
-pub(crate) fn load_f16_tensor_from_open_file_expecting(
+pub fn load_f16_tensor_from_open_file_expecting(
     mut f: std::fs::File,
     display_path: &str,
     expected: &[usize],
@@ -1270,26 +1261,25 @@ pub(crate) fn load_f16_tensor_from_open_file_expecting(
 pub fn load_f16_tensor_file(
     path: &std::path::Path,
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
-    let f = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
+    let f = crate::mmap_trust::open_regular_file_no_hang(path)?;
     load_f16_tensor_from_open_file(f, &path.display().to_string(), None)
 }
 
 /// [`load_f16_tensor_file`] with the caller's required shape checked through the
 /// shared ingress seam.
-#[cfg(any(test, feature = "metal-gpu"))]
-pub(crate) fn load_f16_tensor_file_checked(
+pub fn load_f16_tensor_file_checked(
     path: &std::path::Path,
     expected_shape: &[usize],
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
-    let f = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
+    let f = crate::mmap_trust::open_regular_file_no_hang(path)?;
     load_f16_tensor_from_open_file(f, &path.display().to_string(), Some(expected_shape))
 }
 
 /// Parse an f32 tensor from an already-open `.f16` file. Callers that resolved this file
-/// through [`crate::weights::f32_weights::open_manifest_entry_once`] must read from that
+/// through [`crate::f32_weights::open_manifest_entry_once`] must read from that
 /// opened fd rather than reopen by path -- see that function's docs.
 /// `display_path` is used only for error messages and ingress provenance.
-pub(crate) fn load_f16_tensor_from_open_file(
+pub fn load_f16_tensor_from_open_file(
     mut f: std::fs::File,
     display_path: &str,
     expected_shape: Option<&[usize]>,
@@ -1351,7 +1341,7 @@ fn read_f16_payload(
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("native KHF1 tensor");
-    let tensor = crate::weights::ingress::IngestedTensor::decoded_f32(
+    let tensor = crate::ingress::IngestedTensor::decoded_f32(
         display_path,
         tensor_name,
         &shape,
@@ -1363,7 +1353,7 @@ fn read_f16_payload(
     } else {
         tensor
     };
-    crate::weights::ingress::validate_ingested_tensor(tensor)?;
+    crate::ingress::validate_ingested_tensor(tensor)?;
 
     Ok((values, shape))
 }
@@ -1392,7 +1382,6 @@ fn read_f16_payload(
 /// any single per-layer GatedDeltaNet `in_proj_qkv`/`in_proj_z` tensor, while
 /// still bounding the read so a corrupted or hostile file cannot drive an
 /// unbounded allocation.
-#[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) const MAX_Q4_MERGE_PAYLOAD_LEN: u64 = 1 << 31; // 2 GiB
 
 /// Read and validate a `.q4` file's header via [`read_q4_header`], then read
@@ -1406,14 +1395,13 @@ pub(crate) const MAX_Q4_MERGE_PAYLOAD_LEN: u64 = 1 << 31; // 2 GiB
 /// Only compiled for tests or the `metal-gpu` feature: its sole caller is
 /// the Metal merge-on-first-load `.q4` cache guard in
 /// `forward::metal_qwen35`, which itself only exists under `metal-gpu`.
-#[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) fn read_q4_payload_bounded(
     path: &std::path::Path,
     max_len: u64,
 ) -> Result<(Q4FileHeader, Vec<u8>), Box<dyn std::error::Error>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
+    let mut file = crate::mmap_trust::open_regular_file_no_hang(path)?;
     let header = read_q4_header(&mut file)?;
     let file_len = file.metadata()?.len();
     if file_len < header.payload_offset {
@@ -1450,7 +1438,6 @@ pub(crate) fn read_q4_payload_bounded(
 
 /// SHA-256 of `bytes`, formatted as lowercase hex. Mirrors
 /// `model::qwen::embedding_cache_sha256_hex` / `download::sha256_hex`.
-#[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) fn q4_sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1473,8 +1460,7 @@ pub(crate) fn q4_sha256_hex(bytes: &[u8]) -> String {
 /// smaller than its own 36-byte header (truncated/corrupt source), so a
 /// malformed source file fails closed here rather than wrapping to a bogus
 /// huge `u64` via unchecked subtraction.
-#[cfg(any(test, feature = "metal-gpu"))]
-pub(crate) fn merged_qkvz_expected_size(qkv_file_len: u64, z_file_len: u64) -> Result<u64, String> {
+pub fn merged_qkvz_expected_size(qkv_file_len: u64, z_file_len: u64) -> Result<u64, String> {
     const HEADER_LEN: u64 = 36;
     let qkv_payload_len = qkv_file_len.checked_sub(HEADER_LEN).ok_or_else(|| {
         format!("qkv source file too small: {qkv_file_len} bytes < {HEADER_LEN}-byte header")
@@ -1490,7 +1476,6 @@ pub(crate) fn merged_qkvz_expected_size(qkv_file_len: u64, z_file_len: u64) -> R
 /// [`write_merged_qkvz`] would concatenate into a fresh merged file.
 ///
 /// Reads both source payloads bounded by [`MAX_Q4_MERGE_PAYLOAD_LEN`].
-#[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) fn merged_qkvz_source_fingerprint(
     qkv_path: &std::path::Path,
     z_path: &std::path::Path,
@@ -1510,7 +1495,6 @@ pub(crate) fn merged_qkvz_source_fingerprint(
 /// same source files at write time.
 ///
 /// Reads the merged payload bounded by [`MAX_Q4_MERGE_PAYLOAD_LEN`].
-#[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) fn merged_qkvz_file_fingerprint(
     merged_path: &std::path::Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -1528,8 +1512,7 @@ pub(crate) fn merged_qkvz_file_fingerprint(
 /// always reports "rebuild from source" via `false`, so the caller
 /// re-derives the merge from trusted inputs instead of trusting a merged
 /// artifact it could not fully verify.
-#[cfg(any(test, feature = "metal-gpu"))]
-pub(crate) fn merged_qkvz_cache_is_valid(
+pub fn merged_qkvz_cache_is_valid(
     merged_path: &std::path::Path,
     expected_size: u64,
     qkv_path: &std::path::Path,
@@ -1559,8 +1542,7 @@ pub(crate) fn merged_qkvz_cache_is_valid(
 ///
 /// Returns `Err` if the model directory is read-only or I/O fails — callers
 /// must fall back to the CPU concat path in that case.
-#[cfg(any(test, feature = "metal-gpu"))]
-pub(crate) fn write_merged_qkvz(
+pub fn write_merged_qkvz(
     qkv_path: &std::path::Path,
     z_path: &std::path::Path,
     out_path: &std::path::Path,

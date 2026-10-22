@@ -1,7 +1,7 @@
 //! Bounded, identity-checked reading of checkpoint config files such as `config.json` and `preprocessor_config.json`.
 
 use super::bounded_read::{BoundedReadError, read_text_bounded};
-use crate::error::InferenceError;
+use lattice_inference_core::InferenceError;
 use std::path::Path;
 
 /// Upper bound, in bytes, on a checkpoint configuration file accepted from a checkpoint directory (FIX 5).
@@ -15,13 +15,13 @@ use std::path::Path;
 /// files, including ones with a nested `vision_config`, are well under 100 KiB; 8 MiB
 /// (8,388,608) leaves nearly two orders of magnitude of headroom while rejecting the
 /// unbounded case.
-pub(crate) const MAX_CONFIG_JSON_BYTES: u64 = 8_388_608;
+pub const MAX_CONFIG_JSON_BYTES: u64 = 8_388_608;
 
 /// Read a named config file into a `String`, rejecting an oversized file before it is
 /// materialized. The identity and size checks are made on the open handle, and the read
 /// is bounded by that same handle, so a path swapped between check and read cannot bypass
 /// the cap. See [`MAX_CONFIG_JSON_BYTES`] docs.
-pub(crate) fn read_config_json_bounded(path: &Path, what: &str) -> Result<String, InferenceError> {
+pub fn read_config_json_bounded(path: &Path, what: &str) -> Result<String, InferenceError> {
     read_text_bounded(path, MAX_CONFIG_JSON_BYTES).map_err(|error| match error {
         BoundedReadError::NotRegularFile => InferenceError::Inference(format!(
             "{what} at {} is not a regular file",

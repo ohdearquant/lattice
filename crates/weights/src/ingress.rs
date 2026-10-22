@@ -18,7 +18,7 @@
 //! conversion boundary as a whole. Other payload forms named in
 //! lattice#800 are added as their loaders start calling into this seam.
 
-use crate::error::InferenceError;
+use lattice_inference_core::InferenceError;
 
 #[cfg(test)]
 thread_local! {
@@ -48,7 +48,7 @@ fn record_decoded_f32_finite_check() {
 /// a call site cannot fabricate an already-"validated" value and skip
 /// [`validate_ingested_tensor`].
 #[derive(Debug)]
-pub(crate) struct IngestedTensor<'a> {
+pub struct IngestedTensor<'a> {
     source: &'a str,
     tensor_name: &'a str,
     shape: &'a [usize],
@@ -110,7 +110,7 @@ impl IngressErrorKind {
 /// each decode group, then use [`Self::finish_f64_materialization`].
 /// Narrowing writers use the shared finite-f16 encoder, then call
 /// [`Self::observe_finite`] before publishing a completed payload.
-pub(crate) struct DecodedTensorValidator<'a> {
+pub struct DecodedTensorValidator<'a> {
     source: &'a str,
     tensor_name: &'a str,
     shape: &'a [usize],
@@ -148,7 +148,7 @@ impl<'a> DecodedTensorValidator<'a> {
     }
 
     /// Construct a validator for one SafeTensors decode.
-    pub(crate) fn safetensors(
+    pub fn safetensors(
         source: &'a str,
         tensor_name: &'a str,
         shape: &'a [usize],
@@ -175,7 +175,7 @@ impl<'a> DecodedTensorValidator<'a> {
     }
 
     /// Construct a validator for derived values before they are serialized.
-    pub(crate) fn decoded_input(
+    pub fn decoded_input(
         source: &'a str,
         tensor_name: &'a str,
         shape: &'a [usize],
@@ -215,18 +215,18 @@ impl<'a> DecodedTensorValidator<'a> {
         self.reject_non_finite_at(self.seen, value)
     }
 
-    pub(crate) fn reject_f16_bits(&self, bits: u16) -> InferenceError {
-        let value = crate::weights::half_bits::f16_bits_to_f32(bits);
+    pub fn reject_f16_bits(&self, bits: u16) -> InferenceError {
+        let value = crate::half_bits::f16_bits_to_f32(bits);
         self.reject_non_finite(value as f64)
     }
 
-    pub(crate) fn reject_bf16_bits_at(&self, index: usize, bits: u16) -> InferenceError {
-        let value = crate::weights::half_bits::bf16_bits_to_f32(bits);
+    pub fn reject_bf16_bits_at(&self, index: usize, bits: u16) -> InferenceError {
+        let value = crate::half_bits::bf16_bits_to_f32(bits);
         self.reject_non_finite_at(index, value as f64)
     }
 
     #[inline(always)]
-    pub(crate) fn observe_finite(&mut self) {
+    pub fn observe_finite(&mut self) {
         self.seen += 1;
     }
 
@@ -235,7 +235,7 @@ impl<'a> DecodedTensorValidator<'a> {
     /// traverses the materialized tensor again; only an already-invalid
     /// input is scanned to recover its first offending index for diagnostics.
     #[inline]
-    pub(crate) fn finish_f64_materialization(
+    pub fn finish_f64_materialization(
         self,
         values: &[f64],
         has_non_finite: bool,
@@ -253,7 +253,7 @@ impl<'a> DecodedTensorValidator<'a> {
 
     /// Confirm the decoder observed exactly the declared element count.
     #[inline]
-    pub(crate) fn finish(self) -> Result<(), InferenceError> {
+    pub fn finish(self) -> Result<(), InferenceError> {
         if self.seen != self.numel {
             return Err(self.error_kind.error(format!(
                 "{}: tensor {} ({}) decoder observed {} elements, expected {} for shape {:?}",
@@ -266,7 +266,7 @@ impl<'a> DecodedTensorValidator<'a> {
 
 impl<'a> IngestedTensor<'a> {
     /// Wrap an already f32-widened tensor slice for validation.
-    pub(crate) fn decoded_f32(
+    pub fn decoded_f32(
         source: &'a str,
         tensor_name: &'a str,
         shape: &'a [usize],
@@ -311,7 +311,7 @@ impl<'a> IngestedTensor<'a> {
     }
 
     /// Wrap the decoded f32 source of an in-memory Q8 conversion.
-    pub(crate) fn q8_source(
+    pub fn q8_source(
         source: &'a str,
         tensor_name: &'a str,
         shape: &'a [usize],
@@ -332,7 +332,7 @@ impl<'a> IngestedTensor<'a> {
     }
 
     /// Wrap derived Q8 matrix data and scales for validation.
-    pub(crate) fn q8(
+    pub fn q8(
         source: &'a str,
         tensor_name: &'a str,
         shape: &'a [usize],
@@ -349,7 +349,7 @@ impl<'a> IngestedTensor<'a> {
     }
 
     /// Wrap native Q4 layout and optional per-block metadata for validation.
-    pub(crate) fn native_q4(
+    pub fn native_q4(
         source: &'a str,
         tensor_name: &'a str,
         shape: &'a [usize],
@@ -369,7 +369,7 @@ impl<'a> IngestedTensor<'a> {
     }
 
     /// Wrap one native Q4 block's serialized metadata for validation.
-    pub(crate) fn native_q4_block(
+    pub fn native_q4_block(
         source: &'a str,
         tensor_name: &'a str,
         index: usize,
@@ -390,7 +390,7 @@ impl<'a> IngestedTensor<'a> {
     }
 
     /// Require the declared tensor shape to match model-config geometry.
-    pub(crate) fn with_expected_shape(mut self, expected_shape: &'a [usize]) -> Self {
+    pub fn with_expected_shape(mut self, expected_shape: &'a [usize]) -> Self {
         self.expected_shape = Some(expected_shape);
         self
     }
@@ -419,7 +419,7 @@ fn checked_shape_numel(tensor: &IngestedTensor<'_>) -> Result<usize, InferenceEr
 /// conversion failures use `InferenceError::InvalidInput`. Both carry source
 /// label, tensor name, dtype, shape, and (for a finite-value failure) the
 /// first offending element index.
-pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(), InferenceError> {
+pub fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(), InferenceError> {
     if let Some(expected_shape) = tensor.expected_shape
         && tensor.shape != expected_shape
     {

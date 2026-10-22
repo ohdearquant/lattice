@@ -10,10 +10,10 @@
 
 use crate::error::InferenceError;
 use crate::weights::SafetensorsFile;
-use crate::weights::f32_weights::safetensors_bf16_payload;
+use lattice_weights::__internal::safetensors_bf16_payload;
 #[cfg(test)]
-use crate::weights::f32_weights::safetensors_cached_f32_tensor_count;
-use crate::weights::half_bits::bf16_bits_to_f32;
+use lattice_weights::__internal::safetensors_cached_f32_tensor_count;
+use lattice_weights::half_bits::bf16_bits_to_f32;
 
 /// Per-layer Gemma 4 weights.
 pub(crate) struct Gemma4LayerWeights {

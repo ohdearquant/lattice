@@ -1,9 +1,8 @@
 use super::*;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use crate::weights::q4_weights::{
-    dequantize_q4_to_f32, q4_f16_to_f32, q4_f32_to_f16, quantize_f64_to_q4,
-};
+use crate::weights::q4_weights::{dequantize_q4_to_f32, quantize_f64_to_q4};
+use lattice_weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
 
 fn synthetic_f64(n: usize, seed: u64) -> Vec<f64> {
     let mut state = seed;

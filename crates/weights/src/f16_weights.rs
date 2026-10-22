@@ -15,13 +15,10 @@
 //! deliberately preserving scalar accumulation order so normal-value results remain consistent
 //! with the scalar fallback.
 
-use crate::error::InferenceError;
 #[cfg(test)]
-use crate::weights::SafetensorsFile;
-use crate::weights::half_bits::{f16_bits_to_f32, f32_to_f16_bits};
-
-pub use crate::forward::cpu::f16_matmul::matmul_bt_f16;
-pub use crate::model::qwen35::f16_loading::load_f16_weights;
+use crate::SafetensorsFile;
+use crate::half_bits::{f16_bits_to_f32, f32_to_f16_bits};
+use lattice_inference_core::InferenceError;
 
 /// **Unstable**: IEEE 754 half-precision float wrapper; used for bandwidth-efficient weight storage.
 ///

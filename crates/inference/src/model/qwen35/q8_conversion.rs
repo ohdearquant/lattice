@@ -9,8 +9,9 @@ use crate::model::qwen35::{
     ModelWeights,
 };
 use crate::model::qwen35_config::{LayerType, Qwen35Config};
-use crate::weights::ingress::{IngestedTensor, validate_ingested_tensor};
-use crate::weights::q8_weights::{Q8Matrix, quantize_named_matrix, validate_source_geometry};
+use crate::weights::q8_weights::Q8Matrix;
+use lattice_weights::ingress::{IngestedTensor, validate_ingested_tensor};
+use lattice_weights::q8_weights::{quantize_named_matrix, validate_source_geometry};
 use std::mem::size_of;
 
 const Q8_GDN_SOURCE: &str = "GatedDeltaNet Q8 quantization";

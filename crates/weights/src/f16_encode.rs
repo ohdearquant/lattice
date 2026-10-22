@@ -25,7 +25,7 @@ fn round_shift_right_even(value: u32, shift: u32) -> u32 {
 /// Convert `f32` to an IEEE-754 binary16 bit pattern using
 /// round-to-nearest-even.
 #[inline]
-pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
+pub fn f32_to_f16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) as u16) & 0x8000;
     let exp = ((bits >> 23) & 0xff) as i32;
@@ -87,7 +87,7 @@ pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
 /// Convert `f32` to finite f16 bits, returning the non-finite encoding on
 /// NaN, infinity, or narrowing overflow.
 #[inline]
-pub(crate) fn f32_to_finite_f16_bits(v: f32) -> Result<u16, u16> {
+pub fn f32_to_finite_f16_bits(v: f32) -> Result<u16, u16> {
     let bits = f32_to_f16_bits(v);
     if bits & 0x7c00 == 0x7c00 {
         Err(bits)

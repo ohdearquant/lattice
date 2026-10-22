@@ -1,8 +1,7 @@
 use super::SafetensorsFile;
-use crate::error::InferenceError;
+use lattice_inference_core::InferenceError;
 
-#[path = "../../test_fixtures/bert_namespace.rs"]
-mod fixture;
+use crate::test_fixtures::bert_namespace as fixture;
 
 use fixture::{HIDDEN, LAYERS, Tensor, checkpoint, rename, safetensors_bytes};
 

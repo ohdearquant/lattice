@@ -1,4 +1,4 @@
-use crate::weights::bounded_read::{BoundedReadError, read_bytes_bounded, read_text_bounded};
+use lattice_weights::bounded_read::{BoundedReadError, read_bytes_bounded, read_text_bounded};
 use std::io;
 
 #[cfg(test)]

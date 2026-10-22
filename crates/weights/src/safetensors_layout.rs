@@ -1,12 +1,12 @@
-use crate::error::InferenceError;
+use lattice_inference_core::InferenceError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SafetensorsDType {
+pub struct SafetensorsDType {
     pub(crate) name: &'static str,
     pub(crate) bits_per_element: usize,
 }
 
-pub(crate) fn safetensors_dtype(name: &str) -> Option<SafetensorsDType> {
+pub fn safetensors_dtype(name: &str) -> Option<SafetensorsDType> {
     let (name, bits_per_element) = match name {
         "F4" => ("F4", 4),
         "F6_E2M3" => ("F6_E2M3", 6),
@@ -38,11 +38,11 @@ pub(crate) fn safetensors_dtype(name: &str) -> Option<SafetensorsDType> {
     })
 }
 
-pub(crate) fn safetensors_dtype_name(name: &str) -> Option<&'static str> {
+pub fn safetensors_dtype_name(name: &str) -> Option<&'static str> {
     safetensors_dtype(name).map(|dtype| dtype.name)
 }
 
-pub(crate) struct SafetensorsLayoutEntry<'a> {
+pub struct SafetensorsLayoutEntry<'a> {
     pub(crate) name: &'a str,
     pub(crate) dtype: &'a str,
     pub(crate) shape: &'a [usize],
@@ -50,7 +50,7 @@ pub(crate) struct SafetensorsLayoutEntry<'a> {
     pub(crate) end: usize,
 }
 
-pub(crate) fn safetensors_layout_entry<'a>(
+pub fn safetensors_layout_entry<'a>(
     name: &'a str,
     dtype: &'a str,
     shape: &'a [usize],
@@ -66,7 +66,7 @@ pub(crate) fn safetensors_layout_entry<'a>(
     }
 }
 
-pub(crate) fn validate_safetensors_layout(
+pub fn validate_safetensors_layout(
     source: &str,
     data_len: usize,
     entries: &[SafetensorsLayoutEntry<'_>],

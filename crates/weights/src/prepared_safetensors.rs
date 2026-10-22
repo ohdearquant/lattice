@@ -12,17 +12,17 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 
 /// Prepared mode cannot admit a header the existing ADR-003 loader rejects.
-pub(crate) const PREPARED_SAFETENSORS_HARD_MAX_HEADER_BYTES: u64 =
+pub const PREPARED_SAFETENSORS_HARD_MAX_HEADER_BYTES: u64 =
     super::f32_weights::max_safetensors_header_bytes() as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PreparedSafetensorsSizeAxis {
+pub enum PreparedSafetensorsSizeAxis {
     WeightFileBytes,
     HeaderBytes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PreparedSafetensorsHeaderError {
+pub enum PreparedSafetensorsHeaderError {
     Exceeded {
         axis: PreparedSafetensorsSizeAxis,
         actual: u64,
@@ -50,14 +50,14 @@ pub(crate) enum PreparedSafetensorsHeaderError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PreparedSafetensorsFramingLimits {
+pub struct PreparedSafetensorsFramingLimits {
     max_weight_file_bytes: NonZeroU64,
     max_header_bytes: NonZeroU64,
     platform_span_max: u64,
 }
 
 impl PreparedSafetensorsFramingLimits {
-    pub(crate) fn try_new(
+    pub fn try_new(
         max_weight_file_bytes: NonZeroU64,
         max_header_bytes: NonZeroU64,
     ) -> Result<Self, PreparedSafetensorsHeaderError> {
@@ -111,7 +111,7 @@ impl PreparedSafetensorsFramingLimits {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PreparedSafetensorsHeaderPlan {
+pub struct PreparedSafetensorsHeaderPlan {
     declared_file_len: usize,
     header_len: usize,
     header_end: usize,
@@ -119,32 +119,32 @@ pub(crate) struct PreparedSafetensorsHeaderPlan {
 }
 
 impl PreparedSafetensorsHeaderPlan {
-    pub(crate) fn declared_file_len(&self) -> usize {
+    pub fn declared_file_len(&self) -> usize {
         self.declared_file_len
     }
 
-    pub(crate) fn header_len(&self) -> usize {
+    pub fn header_len(&self) -> usize {
         self.header_len
     }
 
-    pub(crate) fn header_end(&self) -> usize {
+    pub fn header_end(&self) -> usize {
         self.header_end
     }
 
-    pub(crate) fn data_len(&self) -> usize {
+    pub fn data_len(&self) -> usize {
         self.data_len
     }
 
-    pub(crate) fn header_range(&self) -> Range<usize> {
+    pub fn header_range(&self) -> Range<usize> {
         8..self.header_end
     }
 
-    pub(crate) fn data_range(&self) -> Range<usize> {
+    pub fn data_range(&self) -> Range<usize> {
         self.header_end..self.declared_file_len
     }
 }
 
-pub(crate) fn plan_prepared_safetensors_header(
+pub fn plan_prepared_safetensors_header(
     prefix: [u8; 8],
     declared_file_len: u64,
     limits: &PreparedSafetensorsFramingLimits,

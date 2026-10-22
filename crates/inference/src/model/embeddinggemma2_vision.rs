@@ -6,8 +6,8 @@
 )]
 
 use crate::error::InferenceError;
-use crate::weights::f32_weights::safetensors_from_open_file;
 use crate::weights::{SafetensorsFile, TensorSource};
+use lattice_weights::__internal::safetensors_from_open_file;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::File;

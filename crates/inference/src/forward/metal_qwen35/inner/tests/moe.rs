@@ -326,7 +326,7 @@ fn from_q4_dir_loads_and_generates_on_synthetic_moe_checkpoint() {
     // rather than the pre-#682 global `e * ...` offsets into one giant
     // resident buffer.
     {
-        use crate::weights::q4_weights::q4_f16_to_f32;
+        use lattice_weights::q4_weights::q4_f16_to_f32;
         let (_, common) = &state.engine.layer_weights[0];
         let MetalFfnWeights::Moe(moe) = &common.ffn else {
             panic!("layer 0 must build MetalFfnWeights::Moe for an is_moe() config");

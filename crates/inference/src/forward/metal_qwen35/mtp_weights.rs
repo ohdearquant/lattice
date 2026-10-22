@@ -293,7 +293,7 @@ pub(super) mod mtp_resolve_tests {
     /// filled with copies of `1.0`, mirroring the format
     /// `load_f16_tensor_file` reads (crates/inference/src/weights/q4_weights.rs).
     pub(crate) fn write_tiny_f16_fixture(dir: &std::path::Path, name: &str, shape: &[usize]) {
-        use crate::weights::q4_weights::q4_f32_to_f16;
+        use lattice_weights::q4_weights::q4_f32_to_f16;
         let numel: usize = shape.iter().product();
         let path = mtp_tensor_path(dir, name, "f16");
         let mut buf = Vec::new();
@@ -399,7 +399,7 @@ pub(super) mod mtp_resolve_tests {
     // inner::tests`; dead in a default-feature (no metal-gpu) build.
     #[allow(dead_code)]
     pub(crate) fn q4_const_roundtrip(value: f32) -> f32 {
-        use crate::weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
+        use lattice_weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
         q4_f16_to_f32(q4_f32_to_f16(value))
     }
 

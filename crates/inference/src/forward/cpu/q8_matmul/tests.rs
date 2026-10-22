@@ -1,7 +1,7 @@
 use super::*;
 use crate::forward::cpu::matmul_bt;
 use crate::weights::q8_weights::quantize_matrix;
-use crate::weights::q8_weights::test_support::{approx_eq, uniform_signed};
+use lattice_weights::q8_weights::test_support::{approx_eq, uniform_signed};
 
 #[test]
 fn test_matmul_bt_q8_matches_f32() {

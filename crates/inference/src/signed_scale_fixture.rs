@@ -1,7 +1,9 @@
 use crate::weights::q4_weights::{
-    Q4_BLOCK_BYTES, Q4_BLOCK_WEIGHTS, Q4Block, Q4Tensor, dequantize_q4_to_f32,
-    dequantize_row_q4_0, load_q4_file, q4_f16_to_f32, q4_f32_to_f16, save_q4_file,
-    validate_q4_block_metadata,
+    Q4_BLOCK_BYTES, Q4Block, Q4Tensor, dequantize_q4_to_f32, dequantize_row_q4_0, load_q4_file,
+    save_q4_file,
+};
+use lattice_weights::q4_weights::{
+    Q4_BLOCK_WEIGHTS, q4_f16_to_f32, q4_f32_to_f16, validate_q4_block_metadata,
 };
 
 mod fixture;

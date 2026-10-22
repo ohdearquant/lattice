@@ -905,7 +905,7 @@ fn owned_read_hands_over_the_cached_conversion_instead_of_cloning_it() {
     write_tensor_with_payload_phase(&path, "BF16", bits.len(), &le_bytes_of_u16(&bits), 0);
     let expected: Vec<f32> = bits
         .iter()
-        .map(|&b| crate::weights::half_bits::bf16_bits_to_f32(b))
+        .map(|&b| crate::half_bits::bf16_bits_to_f32(b))
         .collect();
 
     let mut owned_only = SafetensorsFile::open(&path).expect("open: valid file");
@@ -1091,7 +1091,7 @@ fn sharded_owned_read_hands_over_the_shard_cache_and_keeps_the_refusal() {
     assert_eq!(shape, vec![good_bits.len()]);
     let expected: Vec<f32> = good_bits
         .iter()
-        .map(|&b| crate::weights::half_bits::bf16_bits_to_f32(b))
+        .map(|&b| crate::half_bits::bf16_bits_to_f32(b))
         .collect();
     assert_eq!(bit_patterns(&values), bit_patterns(&expected));
     let shard = st.shards.get("good.safetensors").expect("shard is open");
@@ -1473,7 +1473,7 @@ fn test_f16_widening_preserves_finite_edge_values() {
     let (values, shape) = sf
         .get_f32_tensor("t")
         .expect("finite F16 values must widen");
-    let expected = bits.map(crate::weights::half_bits::f16_bits_to_f32);
+    let expected = bits.map(crate::half_bits::f16_bits_to_f32);
     assert_eq!(shape, &[bits.len()]);
     assert_eq!(
         values
@@ -1506,12 +1506,12 @@ fn test_f16_widening_skips_second_finite_scan() {
         .collect::<Vec<_>>();
     write_raw_tensor(&path, "t", "F16", &[bits.len()], &raw);
 
-    crate::weights::ingress::reset_decoded_f32_finite_check_count();
+    crate::ingress::reset_decoded_f32_finite_check_count();
     let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
     sf.get_f32_tensor("t")
         .expect("finite F16 values must widen");
     assert_eq!(
-        crate::weights::ingress::decoded_f32_finite_check_count(),
+        crate::ingress::decoded_f32_finite_check_count(),
         0,
         "fused F16 validation must not rescan widened values"
     );
@@ -1531,7 +1531,7 @@ fn test_bf16_widening_preserves_finite_edge_values() {
     let (values, shape) = sf
         .get_f32_tensor("t")
         .expect("finite BF16 values must widen");
-    let expected = bits.map(crate::weights::half_bits::bf16_bits_to_f32);
+    let expected = bits.map(crate::half_bits::bf16_bits_to_f32);
     assert_eq!(shape, &[bits.len()]);
     assert_eq!(
         values
@@ -1564,12 +1564,12 @@ fn test_bf16_widening_skips_second_finite_scan() {
         .collect::<Vec<_>>();
     write_raw_tensor(&path, "t", "BF16", &[bits.len()], &raw);
 
-    crate::weights::ingress::reset_decoded_f32_finite_check_count();
+    crate::ingress::reset_decoded_f32_finite_check_count();
     let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
     sf.get_f32_tensor("t")
         .expect("finite BF16 values must widen");
     assert_eq!(
-        crate::weights::ingress::decoded_f32_finite_check_count(),
+        crate::ingress::decoded_f32_finite_check_count(),
         0,
         "fused BF16 validation must not rescan widened values"
     );

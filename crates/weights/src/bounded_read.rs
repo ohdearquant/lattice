@@ -4,7 +4,7 @@ use std::path::Path;
 
 /// Failure classes produced by the bounded file reader.
 #[derive(Debug)]
-pub(crate) enum BoundedReadError {
+pub enum BoundedReadError {
     /// The opened path does not identify a regular file.
     NotRegularFile,
     /// The file exceeded the requested byte cap.
@@ -19,7 +19,7 @@ pub(crate) enum BoundedReadError {
 /// `path` fails instead of hanging the caller. On other platforms only the
 /// regular-file check after `open` guards against special paths; opening one
 /// there may block, and the non-blocking guarantee is not claimed.
-pub(crate) fn read_bytes_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, BoundedReadError> {
+pub fn read_bytes_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, BoundedReadError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -51,7 +51,7 @@ pub(crate) fn read_bytes_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, Bound
 }
 
 /// Read bounded file bytes and decode them as UTF-8.
-pub(crate) fn read_text_bounded(path: &Path, cap: u64) -> Result<String, BoundedReadError> {
+pub fn read_text_bounded(path: &Path, cap: u64) -> Result<String, BoundedReadError> {
     let bytes = read_bytes_bounded(path, cap)?;
     String::from_utf8(bytes)
         .map_err(|error| BoundedReadError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))

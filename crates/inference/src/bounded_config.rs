@@ -1,4 +1,4 @@
-use crate::weights::bounded_config::read_config_json_bounded;
+use lattice_weights::bounded_config::read_config_json_bounded;
 
 #[cfg(test)]
 mod tests {

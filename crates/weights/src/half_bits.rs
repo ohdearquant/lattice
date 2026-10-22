@@ -14,14 +14,14 @@
 //! F16/BF16 model loading* is gated behind the crate's `f16` feature. Only
 //! the loading permission is feature-gated, never this bit conversion math.
 
-pub(crate) use super::f16_encode::{f32_to_f16_bits, f32_to_finite_f16_bits};
+pub use super::f16_encode::{f32_to_f16_bits, f32_to_finite_f16_bits};
 
 /// Widen an IEEE-754 binary16 (f16) bit pattern to `f32`, exactly.
 ///
 /// Handles signed zero, subnormals, infinities, and NaN (NaN payload is
 /// widened losslessly into the f32 mantissa, quiet/signaling bit preserved).
 #[inline]
-pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
+pub fn f16_bits_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 0x1) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
     let frac = (bits & 0x03ff) as u32;
@@ -58,7 +58,7 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
 /// widening is a lossless zero-extend of the top 16 bits into an f32 word —
 /// no rounding, no special-case branches needed.
 #[inline]
-pub(crate) fn bf16_bits_to_f32(bits: u16) -> f32 {
+pub fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
@@ -74,7 +74,7 @@ pub(crate) fn bf16_bits_to_f32(bits: u16) -> f32 {
 /// function does not decode (lattice#684).
 #[cfg(feature = "f16")]
 #[inline]
-pub(crate) fn f8_e4m3_bits_to_f32(bits: u8) -> f32 {
+pub fn f8_e4m3_bits_to_f32(bits: u8) -> f32 {
     let sign = ((bits >> 7) & 0x1) as u32;
     let exp = ((bits >> 3) & 0x0f) as u32;
     let frac = (bits & 0x07) as u32;
@@ -114,7 +114,7 @@ pub(crate) fn f8_e4m3_bits_to_f32(bits: u8) -> f32 {
 /// decode (lattice#684).
 #[cfg(feature = "f16")]
 #[inline]
-pub(crate) fn f8_e5m2_bits_to_f32(bits: u8) -> f32 {
+pub fn f8_e5m2_bits_to_f32(bits: u8) -> f32 {
     let sign = ((bits >> 7) & 0x1) as u32;
     let exp = ((bits >> 2) & 0x1f) as u32;
     let frac = (bits & 0x03) as u32;

@@ -154,7 +154,6 @@ use memmap2::Mmap;
 /// shape -- the actual trust concern is mutability (group/other-writable),
 /// not the specific non-root owning uid.
 #[cfg(unix)]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
 fn mmap_file_trust_boundary_issue(mode: u32, file_uid: u32, process_uid: u32) -> bool {
     let group_or_other_writable = mode & 0o022 != 0;
     let foreign_non_root_owner = file_uid != process_uid && file_uid != 0;
@@ -194,7 +193,6 @@ const S_ISVTX: u32 = 0o1000;
 /// root. See this module's "Parent-directory chain" doc comment for the
 /// full reasoning behind this exception.
 #[cfg(unix)]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
 fn mmap_parent_dir_trust_boundary_issue(mode: u32, dir_uid: u32, process_uid: u32) -> bool {
     let foreign_non_root_owner = dir_uid != process_uid && dir_uid != 0;
     let group_or_other_writable = mode & 0o022 != 0;
@@ -206,7 +204,6 @@ fn mmap_parent_dir_trust_boundary_issue(mode: u32, dir_uid: u32, process_uid: u3
 /// (no `libc`/`nix` crate dependency -- `getuid()` always links against the
 /// platform's libc, takes no arguments, and cannot fail).
 #[cfg(unix)]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
 fn current_uid() -> u32 {
     unsafe extern "C" {
         fn getuid() -> u32;
@@ -259,8 +256,7 @@ fn current_uid() -> u32 {
 /// See this module's "Parent-directory chain" doc comment for what this
 /// closes and the sticky-bit exception's rationale.
 #[cfg(unix)]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn reject_if_mmap_parent_directory_chain_weak(path: &Path) -> Result<(), String> {
+pub fn reject_if_mmap_parent_directory_chain_weak(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
     let canonical = path.canonicalize().map_err(|e| {
@@ -334,8 +330,7 @@ pub(crate) fn reject_if_mmap_parent_directory_chain_weak(path: &Path) -> Result<
 /// non-Unix doc comment for the one guard this posture does apply uniformly:
 /// the regular-file-type check via [`reject_if_not_regular_file`].
 #[cfg(not(unix))]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn reject_if_mmap_parent_directory_chain_weak(_path: &Path) -> Result<(), String> {
+pub fn reject_if_mmap_parent_directory_chain_weak(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -355,11 +350,7 @@ pub(crate) fn reject_if_mmap_parent_directory_chain_weak(_path: &Path) -> Result
 /// mmap -- see the module doc comment's "fd-binding invariant". `path` is
 /// used only to name the file in error messages; it is never re-resolved.
 #[cfg(unix)]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn reject_if_mmap_file_trust_boundary_weak(
-    file: &File,
-    path: &Path,
-) -> Result<(), String> {
+pub fn reject_if_mmap_file_trust_boundary_weak(file: &File, path: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
     let meta = file
@@ -417,11 +408,7 @@ pub(crate) fn reject_if_mmap_file_trust_boundary_weak(
 /// doc comment for the guard this posture does apply uniformly: the
 /// regular-file-type check via [`reject_if_not_regular_file`].
 #[cfg(not(unix))]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn reject_if_mmap_file_trust_boundary_weak(
-    _file: &File,
-    _path: &Path,
-) -> Result<(), String> {
+pub fn reject_if_mmap_file_trust_boundary_weak(_file: &File, _path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -446,7 +433,7 @@ pub(crate) fn reject_if_mmap_file_trust_boundary_weak(
 /// `path` should be the resolved real path when the caller has one (so the
 /// parent-directory walk inspects the directories the mapped file actually
 /// lives under, not a symlink's location).
-pub(crate) fn reject_if_open_mmap_file_untrusted(file: &File, path: &Path) -> Result<(), String> {
+pub fn reject_if_open_mmap_file_untrusted(file: &File, path: &Path) -> Result<(), String> {
     reject_if_mmap_parent_directory_chain_weak(path)?;
     reject_if_mmap_file_trust_boundary_weak(file, path)
 }
@@ -510,8 +497,7 @@ unsafe extern "C" {
 /// around: it is the only function that can see `prior` or construct a
 /// `Mmap` from `file`.
 #[derive(Debug)]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) struct TrustedMmapFile {
+pub struct TrustedMmapFile {
     file: File,
     prior: std::fs::Metadata,
     path: PathBuf,
@@ -521,8 +507,7 @@ impl TrustedMmapFile {
     /// The guarded file's current on-disk length, for a header parser that
     /// needs to bounds-check a declared payload against the real file size
     /// without a route to the `File` itself.
-    #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-    pub(crate) fn len(&self) -> std::io::Result<u64> {
+    pub fn len(&self) -> std::io::Result<u64> {
         Ok(self.file.metadata()?.len())
     }
 }
@@ -554,13 +539,6 @@ impl std::io::Seek for TrustedMmapFile {
 /// and directories are all rejected here, before any trust or shape check
 /// runs, so an attacker-planted node at the model path cannot block or
 /// misdirect the read-only load, on Unix or elsewhere.
-///
-/// Carries the same `#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]`
-/// [`open_trusted_mmap_file`] does: that function's only call site
-/// (`q4_weights.rs`) sits behind `cfg(any(test, feature = "metal-gpu"))`, so
-/// a plain, non-test, non-`metal-gpu` build reaches neither it nor this
-/// predicate.
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
 fn reject_if_not_regular_file(path: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
     if !meta.is_file() {
         return Err(format!(
@@ -628,8 +606,7 @@ fn reject_if_not_regular_file(path: &Path, meta: &std::fs::Metadata) -> Result<(
 /// last, after the regular-file guard, so a FIFO/device never reaches the
 /// ACL FFI calls at all.
 #[cfg(unix)]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, String> {
+pub fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, String> {
     use std::os::unix::fs::OpenOptionsExt;
 
     // `custom_flags` REPLACES the custom-flag bits on each call rather than
@@ -730,8 +707,7 @@ fn open_with_pipe_impersonation_guard(path: &Path) -> Result<File, String> {
 /// path is even reachable on a non-Unix target needs confirming (#1744,
 /// following on from the Unix-specific FIFO case in #1380).
 #[cfg(not(unix))]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, String> {
+pub fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, String> {
     let file = open_with_pipe_impersonation_guard(path)?;
     let meta = file
         .metadata()
@@ -833,7 +809,7 @@ fn reject_if_not_regular_file_no_hang(path: &Path, meta: &std::fs::Metadata) -> 
 /// those callers is a separate, broader hardening step this function does
 /// not take on their behalf.
 #[cfg(unix)]
-pub(crate) fn open_regular_file_no_hang(path: &Path) -> Result<File, String> {
+pub fn open_regular_file_no_hang(path: &Path) -> Result<File, String> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
@@ -866,7 +842,7 @@ pub(crate) fn open_regular_file_no_hang(path: &Path) -> Result<File, String> {
 /// node is refused. On Windows a directory is refused by the open itself, as
 /// in [`open_trusted_mmap_file`].
 #[cfg(not(unix))]
-pub(crate) fn open_regular_file_no_hang(path: &Path) -> Result<File, String> {
+pub fn open_regular_file_no_hang(path: &Path) -> Result<File, String> {
     let file = open_with_pipe_impersonation_guard(path)?;
     let meta = file
         .metadata()
@@ -898,8 +874,7 @@ pub(crate) fn open_regular_file_no_hang(path: &Path) -> Result<File, String> {
 /// See this module's "Trust-boundary scope" doc comment for what this does
 /// and does not defend against.
 #[cfg(unix)]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn verify_mmap_target_unchanged(
+pub fn verify_mmap_target_unchanged(
     file: &File,
     prior: &std::fs::Metadata,
     path: &Path,
@@ -944,8 +919,7 @@ pub(crate) fn verify_mmap_target_unchanged(
 /// function does not open a checkpoint itself, so it carries no
 /// regular-file-type check of its own to extend to this platform.
 #[cfg(not(unix))]
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn verify_mmap_target_unchanged(
+pub fn verify_mmap_target_unchanged(
     _file: &File,
     _prior: &std::fs::Metadata,
     _path: &Path,
@@ -983,8 +957,7 @@ pub(crate) fn verify_mmap_target_unchanged(
 /// defends, only *mapping* does -- and `Read`/`Seek` grant no route to a
 /// mapping, since `memmap2::Mmap::map` requires `&File` (or a raw
 /// descriptor), which this type never surrenders.
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn map_and_verify_trusted(handle: &TrustedMmapFile) -> Result<Mmap, String> {
+pub fn map_and_verify_trusted(handle: &TrustedMmapFile) -> Result<Mmap, String> {
     // SAFETY: this function is the only place in the crate that can name
     // `handle.file` -- the field is private to this module, `TrustedMmapFile`
     // has no public constructor besides `open_trusted_mmap_file`, and the
@@ -1024,7 +997,7 @@ pub(crate) fn map_and_verify_trusted(handle: &TrustedMmapFile) -> Result<Mmap, S
 /// `open_trusted_mmap_file` captured -- the two producers were asymmetric
 /// before this fix, with only the `open_trusted_mmap_file` flavor rechecking
 /// post-map identity; this closes that gap.
-pub(crate) fn map_after_untrusted_open(file: &File, path: &Path) -> Result<Mmap, String> {
+pub fn map_after_untrusted_open(file: &File, path: &Path) -> Result<Mmap, String> {
     // Snapshot before the guard, matching `open_trusted_mmap_file`'s
     // stat-then-check order, so the post-map recheck below has a baseline
     // taken before any of this function's own work could observe a change.

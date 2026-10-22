@@ -66,7 +66,7 @@
 // two transmute-equivalent slice casts in quantize_row_q3_0 and save_q3_file.
 #![allow(clippy::cast_possible_truncation)]
 
-use crate::error::InferenceError;
+use lattice_inference_core::InferenceError;
 
 /// One Q3 quantization block: 32 weights packed as 3-bit unsigned integers.
 ///
@@ -116,7 +116,7 @@ pub struct Q3Tensor {
 // f16 ↔ f32 / bf16 → f32 helpers.
 //
 // Thin wrappers over the single always-compiled scalar decoder in
-// `crate::weights::half_bits` (lattice#799) — kept as separate `q3_`-prefixed
+// `crate::half_bits` (lattice#799) — kept as separate `q3_`-prefixed
 // functions here only to preserve this module's call-site names; no conversion
 // arithmetic lives in this file.
 // ---------------------------------------------------------------------------
@@ -124,19 +124,19 @@ pub struct Q3Tensor {
 /// Convert `f32` to IEEE-754 half-precision stored as a `u16` bit pattern.
 #[inline]
 pub(crate) fn q3_f32_to_f16(x: f32) -> u16 {
-    crate::weights::half_bits::f32_to_f16_bits(x)
+    crate::half_bits::f32_to_f16_bits(x)
 }
 
 /// Convert an IEEE-754 f16 bit pattern (`u16`) back to `f32`.
 #[inline]
 pub(crate) fn q3_f16_to_f32(bits: u16) -> f32 {
-    crate::weights::half_bits::f16_bits_to_f32(bits)
+    crate::half_bits::f16_bits_to_f32(bits)
 }
 
 /// Convert a BF16 bit pattern (`u16`) to `f32`.
 #[inline]
 fn bf16_to_f32(v: u16) -> f32 {
-    crate::weights::half_bits::bf16_bits_to_f32(v)
+    crate::half_bits::bf16_bits_to_f32(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +652,7 @@ pub fn read_q3_header<R: std::io::Read + std::io::Seek>(
 /// Only called from `mmap_q3_weight` (crates/inference/src/forward/metal_qwen35.rs)
 /// today, which live checkpoint loading does not yet reach.
 #[allow(dead_code)]
-pub(crate) fn validate_q3_header_payload_bounds(
+pub fn validate_q3_header_payload_bounds(
     header: &Q3FileHeader,
     file_len: u64,
     path: &std::path::Path,
@@ -699,7 +699,7 @@ pub(crate) fn validate_q3_header_payload_bounds(
 /// version, or a header whose shape product disagrees with `original_len`.
 pub fn load_q3_file(path: &std::path::Path) -> Result<Q3Tensor, Box<dyn std::error::Error>> {
     use std::io::Read;
-    let mut f = crate::weights::mmap_trust::open_regular_file_no_hang(path)?;
+    let mut f = crate::mmap_trust::open_regular_file_no_hang(path)?;
     let file_len = f.metadata()?.len();
 
     let mut magic = [0u8; 4];

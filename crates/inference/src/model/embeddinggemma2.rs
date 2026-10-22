@@ -32,7 +32,7 @@ use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 #[cfg(test)]
 use crate::weights::SafetensorsFile;
 use crate::weights::TensorSource;
-use crate::weights::f32_weights::safetensors_from_open_file;
+use lattice_weights::__internal::safetensors_from_open_file;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -637,7 +637,7 @@ impl EmbeddingGemma2Model {
                 dir.display()
             )));
         }
-        let checkpoint = crate::weights::mmap_trust::open_regular_file_no_hang(&weights_path)
+        let checkpoint = lattice_weights::mmap_trust::open_regular_file_no_hang(&weights_path)
             .map_err(InferenceError::InvalidSafetensors)?;
         let vision_file = checkpoint.try_clone().map_err(InferenceError::Io)?;
         let weights = {
