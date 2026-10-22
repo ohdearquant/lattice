@@ -435,10 +435,18 @@ fn prefill_dimension_overflow_refuses_before_state_cache_or_scratch_mutation() {
     }
     let before_states: Vec<_> = states.iter().map(GatedDeltaNetState::snapshot).collect();
     let mut kv = KvCache::new(cfg.num_full_attention_layers());
+    // Below the two-token prompt's per-layer need, so a reservation made
+    // before the shape check would change capacity and pointer.
     for values in kv.k.iter_mut().chain(&mut kv.v) {
-        values.reserve_exact(1024);
+        values.reserve_exact(8);
     }
     let before_kv: Vec<_> = kv.k.iter().chain(&kv.v).map(vector_snapshot).collect();
+    assert!(
+        before_kv
+            .iter()
+            .all(|(_, cap, _)| *cap < 2 * cfg.full_kv_dim()),
+        "fixture capacity must stay below the prompt's KV need"
+    );
     model.config.hidden_size = usize::MAX;
     assert!(matches!(
         model.prefill_prompt(
