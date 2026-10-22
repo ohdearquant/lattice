@@ -111,8 +111,9 @@ lattice-transport = { version = "0.14.0", path = "../transport" }
 serde_json = { workspace = true }
 
 [features]
-default = ["native", "download"]
+default = ["native", "download", "image"]
 native = ["dep:lattice-inference"]
+image = ["native", "lattice-inference/image"]
 # First-use model downloads for the native `embed` binary (its `--download-only`
 # flag and the implicit fetch inside `BertModel::from_pretrained`). Implies
 # `native` (downloads need the inference compute dep) and forwards

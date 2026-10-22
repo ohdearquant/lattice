@@ -520,6 +520,7 @@ Measured performance on normalized vectors (internal benchmarks, subject to hard
 | Feature     | Default | Description                                                                                                                                                                                        |
 | ----------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `native`    | yes     | Pure Rust inference via `lattice-inference`                                                                                                                                                        |
+| `image`     | yes     | PNG/JPEG decoding for vision embeddings (implies `native`)                                                                                                                                         |
 | `download`  | yes     | First-use model downloads (implies `native`)                                                                                                                                                       |
 | `metal-gpu` | no      | Metal GPU acceleration (macOS)                                                                                                                                                                     |
 | `avx512`    | no      | Deprecated no-op — the AVX-512 VNNI int8 kernel is compiled unconditionally on stable x86_64 and is selected at runtime only when AVX-512F/BW/VNNI are all detected; otherwise AVX2 or scalar runs |
@@ -532,6 +533,7 @@ Measured performance on normalized vectors (internal benchmarks, subject to hard
 | `metal-gpu` | no      | Metal compute backend                                                   |
 | `wgpu-gpu`  | no      | WGPU cross-platform GPU backend                                         |
 | `download`  | yes     | HuggingFace weight download with checksum verification                  |
+| `image`     | yes     | PNG/JPEG decoding; also enabled by `serve`                              |
 | `serve`     | yes     | HTTP serving stack (axum/tokio) for `lattice serve` and `lattice_serve` |
 | `backfill`  | no      | Re-embedding coordinator (requires `rusqlite`)                          |
 
