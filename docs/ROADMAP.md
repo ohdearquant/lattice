@@ -3,7 +3,7 @@
 Lattice is a pure-Rust transformer inference engine for Apple Silicon and modern CPUs. This
 document is the forward-looking view: where the engine is, what is actively being worked, and
 the new capability lanes opening next. The issue tracker is the source of truth for status;
-this page explains how the issues fit together. Last revised: July 2026.
+this page explains how the issues fit together. Last revised: October 2026.
 
 ## Where the engine is
 
@@ -85,6 +85,27 @@ forward pass is family-specific. A ModelSpec to IR to KernelPlan layer is the pr
 the Gemma lane and pays for itself again with every family after that: new architectures become
 data (a spec) plus a small number of genuinely new kernels, instead of a parallel forward-path
 implementation. The Gemma lane begins by sizing the minimal IR slice its first milestone needs.
+
+**Inference crate decomposition.** `lattice-inference` has grown to about 353,000 lines of
+library source, roughly 84% of the workspace: tokenizers, weight and quantization formats, the
+CPU and Metal forward paths, model definitions, attention, grammar-constrained decoding,
+sampling, speculative decoding, serving and vision all live in one crate. That makes builds,
+review and ownership of any one area harder than it needs to be. The plan is to split it along
+module boundaries that already exist into focused crates, while `lattice-inference` stays the
+aggregator: a facade crate that depends on the new crates and re-exports them, so existing
+`lattice_inference::...` paths and feature flags keep working for downstream users.
+
+- Candidate boundaries, each sized before it moves: tokenizer; weight and quantization formats;
+  grammar; sampling and generation configuration; the shared Metal runtime (buffers, kernels,
+  KV cache, decode loop, adapter hot-swap) with per-model definitions above it; serving; vision.
+- Each extraction is a zero-behaviour move: same tests, same test count, no public path removed
+  (checked with `cargo semver-checks` against the published facade), features forwarded from
+  the facade, and a before/after benchmark comparison wherever a measured target is reachable.
+- Dependencies stay one-directional. Extracted crates never depend back on the facade, and the
+  publish order is re-derived from the new dependency graph for each release.
+- It pairs with two structural changes already under way inside the crate: moving the Metal
+  forward path to a shared runtime with thin per-model definitions, and a 3,000-line ceiling per
+  source file (existing larger files may only shrink).
 
 ## Research lanes
 

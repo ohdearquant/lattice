@@ -60,6 +60,7 @@ class Repository:
         self,
         *,
         event_name: str = "push",
+        comparison_mode: str | None = None,
         event_before: str = "",
         base_ref: str = "",
         head_ref: str = "",
@@ -75,6 +76,7 @@ class Repository:
                 str(self.root),
                 "--event-name",
                 event_name,
+                *(["--comparison-mode", comparison_mode] if comparison_mode else []),
                 "--event-before",
                 event_before,
                 "--base-ref",
@@ -160,6 +162,61 @@ class LastMeasuredBaseTests(unittest.TestCase):
         self.assertEqual(values, {})
         self.assertEqual(result.returncode, 2)
         self.assertIn("is not an ancestor", result.stderr)
+
+    def test_aa_empty_base_uses_resolved_head_without_progression(self) -> None:
+        first, head, _ = self.repo.commits
+        self.repo.push_state(first)
+
+        result, values = self.repo.resolve(
+            event_name="workflow_dispatch",
+            comparison_mode="aa",
+            head_ref="HEAD~1",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            values,
+            {
+                "comparison_mode": "aa",
+                "base": head,
+                "head": head,
+                "base_source": "dispatch-calibration",
+                "span_count": "0",
+                "state_branch": STATE_X86,
+                "state_before": "not-queried",
+            },
+        )
+
+    def test_aa_rejects_base_resolving_to_different_commit(self) -> None:
+        result, values = self.repo.resolve(
+            event_name="workflow_dispatch",
+            comparison_mode="aa",
+            base_ref="HEAD~1",
+            head_ref="HEAD",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(values, {})
+        self.assertIn("A/A calibration requires identical commits", result.stderr)
+
+    def test_aa_rejects_push_event(self) -> None:
+        result, values = self.repo.resolve(comparison_mode="aa")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(values, {})
+        self.assertIn("A/A calibration requires workflow_dispatch", result.stderr)
+
+    def test_ab_rejects_refs_resolving_to_same_commit(self) -> None:
+        result, values = self.repo.resolve(
+            event_name="workflow_dispatch",
+            comparison_mode="ab",
+            base_ref="main",
+            head_ref="HEAD",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(values, {})
+        self.assertIn("base and head resolve to the same commit", result.stderr)
 
 
 class WorkflowContractTests(unittest.TestCase):

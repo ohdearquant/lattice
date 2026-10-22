@@ -1,24 +1,42 @@
 //! Qwen serving provider and typed CPU loader facade.
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use self::vision::VisionRuntime;
 use crate::error::InferenceError;
 use crate::model::qwen35::Qwen35Model;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::model::qwen35_config::Qwen35Config;
-use crate::model_format::ModelFamily;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::serve::metal_worker::VisionRuntime;
+use crate::model_format::{ModelFamily, ModelFormat};
 use crate::serve::route::{RouteRefusal, ServedRoute, select_route, select_standalone_route};
+use crate::serving_embeddings::PooledEmbeddingHandle;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
-use crate::serving_provider::{CheckpointEvidence, ServingEntry, ServingProvider};
+use crate::serving_host::ServingHandle;
+use crate::serving_provider::{
+    CheckpointEvidence, ImplicitPooledEmbeddingPlan, LatticeOpenOptions, LatticeRoutePlan,
+    PooledEmbeddingLoadPlan, PooledEmbeddingProvider, RegisteredProvider, ServingEntry,
+    ServingProvider,
+};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_provider::{
-    StandaloneLoadOptions, StandaloneOptionPresence, StandaloneQwenLoader,
+    StandaloneLoadOptions, StandaloneLoadPlan, StandaloneOptionPresence, StandaloneQwenLoader,
+    StandaloneStartupDescription,
 };
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod adapters;
 pub(crate) mod cpu;
+pub(crate) mod embedding;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod lattice_worker;
 mod preparation;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod vision;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod worker;
 
 pub(crate) use preparation::{
     QwenChatDefaults, build_cfg, lattice_gen_cfg, prepare_chat_request,
@@ -26,6 +44,68 @@ pub(crate) use preparation::{
 };
 
 pub(in crate::serving_provider) struct QwenProvider;
+
+struct QwenLatticeRoutePlan {
+    evidence: CheckpointEvidence,
+}
+
+impl LatticeRoutePlan for QwenLatticeRoutePlan {
+    fn selection_marker(&self) -> String {
+        let backend = if self.evidence.format == ModelFormat::Q4 {
+            "metal"
+        } else {
+            "cpu"
+        };
+        let format = match self.evidence.format {
+            ModelFormat::Safetensors => "safetensors",
+            ModelFormat::Q4 => "q4",
+            _ => "unknown",
+        };
+        format!("[route] selected family=qwen35 backend={backend} format={format}")
+    }
+
+    fn implicit_embeddings(&self, _model: &str) -> ImplicitPooledEmbeddingPlan {
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: Some(self.evidence.directory.clone()),
+            disabled_line: None,
+        }
+    }
+
+    fn open(
+        self: Box<Self>,
+        options: LatticeOpenOptions,
+        generation_admission: Arc<tokio::sync::Semaphore>,
+    ) -> Result<ServingHandle, String> {
+        match self.evidence.format {
+            ModelFormat::Safetensors => {
+                let _ = options;
+                let cpu = cpu::load(&self.evidence)?;
+                Ok(ServingHandle::shared_cpu(cpu, generation_admission))
+            }
+            ModelFormat::Q4 => {
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                {
+                    let _ = generation_admission;
+                    lattice_worker::open(self.evidence.directory, options)
+                        .map_err(|error| format!("failed to load Q4 model: {error}"))
+                }
+                #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+                {
+                    let _ = (options, generation_admission);
+                    Err(crate::model_format::metal_gpu_required_message(
+                        &self.evidence.directory,
+                    ))
+                }
+            }
+            _ => {
+                let _ = (options, generation_admission);
+                Err(crate::model_format::unloadable_format_message(
+                    &self.evidence.directory,
+                ))
+            }
+        }
+    }
+}
 
 impl ServingProvider for QwenProvider {
     fn name(&self) -> &'static str {
@@ -37,6 +117,18 @@ impl ServingProvider for QwenProvider {
             evidence.model_type.as_deref(),
             Some("qwen3_5" | "qwen3_5_moe")
         )
+    }
+
+    fn admit_lattice(
+        &self,
+        evidence: &CheckpointEvidence,
+    ) -> Result<Box<dyn LatticeRoutePlan>, RouteRefusal> {
+        match evidence.format {
+            ModelFormat::Safetensors | ModelFormat::Q4 => Ok(Box::new(QwenLatticeRoutePlan {
+                evidence: evidence.clone(),
+            })),
+            _ => Err(RouteRefusal::UnrecognizedFormat),
+        }
     }
 
     fn legacy_route(
@@ -53,6 +145,17 @@ impl ServingProvider for QwenProvider {
                     Err(refusal) => Err(refusal),
                 }
             }
+        }
+    }
+
+    fn implicit_pooled_embeddings(
+        &self,
+        evidence: &CheckpointEvidence,
+        _model: &str,
+    ) -> crate::serving_provider::ImplicitPooledEmbeddingPlan {
+        crate::serving_provider::ImplicitPooledEmbeddingPlan {
+            directory_to_try: Some(evidence.directory.clone()),
+            disabled_line: None,
         }
     }
 
@@ -82,6 +185,72 @@ impl ServingProvider for QwenProvider {
     ) -> Result<ServingFactory, String> {
         qwen_standalone_factory(evidence, options, qwen_loader)
     }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_startup_description(
+        &self,
+        format: crate::model_format::ModelFormat,
+        route: Option<ServedRoute>,
+    ) -> StandaloneStartupDescription {
+        StandaloneStartupDescription {
+            route_marker: route.map(|route| route.selection_marker(format)),
+            loading_label: match format {
+                ModelFormat::Q4 => "q4",
+                ModelFormat::Safetensors => "bf16",
+                _ => "unknown",
+            },
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn prepare_standalone_load(
+        &self,
+        evidence: CheckpointEvidence,
+        _route: Option<ServedRoute>,
+        options: StandaloneLoadOptions,
+    ) -> Result<StandaloneLoadPlan, String> {
+        qwen_standalone_plan(evidence, options)
+    }
+}
+
+impl RegisteredProvider for QwenProvider {
+    fn generation(&self) -> Option<&dyn ServingProvider> {
+        Some(self)
+    }
+
+    fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider> {
+        Some(self)
+    }
+
+    fn text_embeddings(&self) -> Option<&dyn crate::serving_provider::TextEmbeddingProvider> {
+        None
+    }
+}
+
+impl PooledEmbeddingProvider for QwenProvider {
+    fn name(&self) -> &'static str {
+        ServingProvider::name(self)
+    }
+
+    fn claims(&self, evidence: &CheckpointEvidence) -> bool {
+        ServingProvider::claims(self, evidence)
+    }
+
+    fn plan(&self, directory: PathBuf) -> Box<dyn PooledEmbeddingLoadPlan> {
+        Box::new(QwenPooledEmbeddingPlan { directory })
+    }
+}
+
+struct QwenPooledEmbeddingPlan {
+    directory: PathBuf,
+}
+
+impl PooledEmbeddingLoadPlan for QwenPooledEmbeddingPlan {
+    fn load(self: Box<Self>) -> Result<PooledEmbeddingHandle, InferenceError> {
+        let model = embedding::EmbeddingModel::from_directory(&self.directory)
+            .map_err(InferenceError::InvalidInput)?;
+        Ok(PooledEmbeddingHandle::new(Arc::new(model)))
+    }
 }
 
 /// Load a Qwen safetensors CPU model using the existing model loader.
@@ -98,7 +267,17 @@ pub(in crate::serving_provider) fn qwen_standalone_factory(
 ) -> Result<ServingFactory, String> {
     let config = Qwen35Config::from_model_dir(&evidence.directory)
         .map_err(|error| format!("config.json load failed: {error}"))?;
-    let mut vision_runtime = VisionRuntime::from_model_config(evidence.directory.clone(), &config);
+    qwen_standalone_factory_with_config(evidence, &config, options, qwen_loader)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn qwen_standalone_factory_with_config(
+    evidence: CheckpointEvidence,
+    config: &Qwen35Config,
+    options: StandaloneLoadOptions,
+    qwen_loader: StandaloneQwenLoader,
+) -> Result<ServingFactory, String> {
+    let mut vision_runtime = VisionRuntime::from_model_config(evidence.directory.clone(), config);
     if options.preload_vision
         && let Err(error) = vision_runtime.preload()
     {
@@ -109,4 +288,28 @@ pub(in crate::serving_provider) fn qwen_standalone_factory(
     }
     let loader = qwen_loader(evidence.directory, options.tokenizer_path, evidence.format);
     Ok(ServingFactory::qwen_metal(loader, vision_runtime))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(in crate::serving_provider) fn qwen_standalone_plan(
+    evidence: CheckpointEvidence,
+    options: StandaloneLoadOptions,
+) -> Result<StandaloneLoadPlan, String> {
+    let vocabulary_model_dir = evidence.directory.clone();
+    let vocabulary_tokenizer_path = options.tokenizer_path.clone();
+    let config = Qwen35Config::from_model_dir(&evidence.directory)
+        .map_err(|error| format!("config.json load failed: {error}"))?;
+    let (served_context, context_source) = worker::resolve_serve_context(
+        worker::model_context_from_config(Some(&config)),
+        options.max_context,
+    );
+    let factory = qwen_standalone_factory_with_config(
+        evidence,
+        &config,
+        options,
+        worker::standalone_loader(served_context),
+    )?;
+    let post_ready =
+        worker::vocabulary_after_ready(vocabulary_tokenizer_path, vocabulary_model_dir);
+    Ok(StandaloneLoadPlan::new(factory, post_ready).with_context_source(context_source))
 }

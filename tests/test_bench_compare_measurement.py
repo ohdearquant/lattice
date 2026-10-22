@@ -304,8 +304,8 @@ PYTHON_ENTRYPOINTS_USING_DATETIME_UTC = (
     REPO / "scripts" / "bench_cpu_flagship_supervisor.py",
 )
 
-# Test helpers invoking real Git must disable repository hooks.
-GIT = ("git", "-c", "core.hooksPath=/dev/null")
+# Disable hooks and auto-gc so disposable Git fixtures have no automatic GC writer.
+GIT = ("git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0")
 
 STALE_CHANGE_CARGO = r"""#!/usr/bin/env bash
 set -euo pipefail
@@ -667,7 +667,7 @@ def _run(
             "CARGO_TARGET_DIR": str(root / "target"),
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "BENCH_IDLE_FLOOR": "0",
-            "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
+            "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id", "STUB_REPO_ROOT": str(root),
             **(extra_env or {}),
             "STUB_EMIT_CRITERION_HOME": "1" if emit_criterion_home else "0",
         }
@@ -900,7 +900,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         ]
         self.assertTrue(commands, "found 0 cargo bench invocations")
         self.assertEqual(
-            len(commands), 10,
+            len(commands), 14,
             f"found {len(commands)} cargo bench invocations:\n"
             + "\n".join(commands),
         )
@@ -1668,6 +1668,49 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"{inference_first} vs {inference_second}",
         )
 
+    def test_bench_source_without_literal_group_names_refuses_with_its_reason(self):
+        """A head bench source that names its groups only through expressions
+        (``benchmark_group(if forced { "a" } else { "b" })``) gives the declared-group
+        parser nothing to match. The run must reach the zero-groups refusal, exit 2
+        and say why.
+
+        Mutation-sensitive: drop the ``|| true`` on the declared-group substitution
+        in bench-compare-impl.sh and the empty grep fails the substitution under
+        pipefail. The run then exits 1 with no refusal message.
+        """
+        def name_groups_by_expression(root):
+            path = root / "crates" / "inference" / "benches" / "elementwise_cpu_bench.rs"
+            path.write_text(
+                'let mut group = c.benchmark_group(if forced { "rms_norm_forced" } '
+                'else { "rms_norm" });\n'
+            )
+            subprocess.run([*GIT, "-C", str(root), "add", "-f", str(path)], check=True)
+            subprocess.run(
+                [*GIT, "-C", str(root), "commit", "-qm", "name groups by expression"],
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                },
+            )
+
+        result = _run(
+            [],
+            stub_cargo=STALE_CHANGE_CARGO,
+            emit_criterion_home=True,
+            setup=name_groups_by_expression,
+        )
+        self.assertEqual(
+            result.returncode, 2,
+            f"expected exit 2 (zero declared groups), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn(
+            "elementwise_cpu_bench: found zero declared Criterion groups in",
+            result.stderr,
+        )
+
     def test_embed_bench_target_honors_caller_override(self):
         """BENCHES_EMBED selects an existing embed target for the whole run.
 
@@ -1693,7 +1736,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"embed target override failed\nstdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}",
         )
-        self.assertEqual(len(embed_argv), 4, embed_argv)
+        self.assertEqual(len(embed_argv), 8, embed_argv)
         for argv in embed_argv:
             bench_index = argv.index("--bench")
             self.assertEqual(argv[bench_index + 1], "embeddings", argv)
@@ -1742,7 +1785,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             )
             embed_argv = _captured_embed_argv(argv_file)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(embed_argv), 4, embed_argv)
+        self.assertEqual(len(embed_argv), 8, embed_argv)
         for argv in embed_argv:
             self.assertEqual(argv.count("--features"), 1, argv)
             feature_index = argv.index("--features")
@@ -2221,6 +2264,161 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
                 "expected exactly one sample for a near-instant arm, got "
                 f"{len(lines)}: {lines}",
             )
+
+
+class InPhaseLoadReport(unittest.TestCase):
+    """phase-load-report.py's foreign-vs-implied refusal rule.
+
+    The sampler reports two foreign figures per arm. `foreign_pct` sums the
+    `ps` pcpu of processes outside the bench's own tree; under a PID namespace
+    (a bwrap sandbox) `ps` lists only the namespace's own processes, so it
+    reads 0.0 however busy the host is while the idle reading still spans the
+    whole machine. The report therefore also judges an implied figure,
+    `max(0, 100 - idle - self)`: load the idle reading saw but the per-process
+    walk could not attribute to any process. Either figure over the ceiling
+    refuses the arm.
+
+    These drive the shipping script directly against JSONL fixtures, so the
+    rule is exercised where it is implemented rather than through a mirror.
+    """
+
+    def _report(self, samples, *, floor="70"):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stream = root / "arm.jsonl"
+            stream.write_text(
+                "".join(json.dumps(sample) + "\n" for sample in samples)
+            )
+            out = root / "verdict.jsonl"
+            result = subprocess.run(
+                [
+                    sys.executable, str(LIB / "phase-load-report.py"),
+                    "--arm", "head1", "--in", str(stream), "--floor", floor,
+                    "--jsonl-out", str(out),
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            record = None
+            if out.exists() and out.read_text().strip():
+                record = json.loads(out.read_text().splitlines()[-1])
+            return result, record
+
+    @staticmethod
+    def _sample(idle, self_pct, foreign, *, arm="head1"):
+        return {
+            "schema": "perf-phase-sample/v1",
+            "arm": arm,
+            "captured_utc": "2026-01-01T00:00:00Z",
+            "idle_pct": idle,
+            "foreign_pct": foreign,
+            "self_pct": self_pct,
+            "top_foreign": "none",
+            "top_foreign_pct": foreign,
+        }
+
+    def test_sandbox_foreign_reads_zero_and_implied_refuses(self):
+        """A PID-namespaced arm: `ps` sees no foreign process, idle sees the host.
+
+        Every sample has foreign 0.0 (the namespace hides the load) while the
+        machine-wide idle reading leaves 91.8% unaccounted for after the
+        bench's own 6.0%. The foreign figure alone certifies this arm; the
+        implied figure is the whole point of the rule, so it must refuse and
+        name the term that tripped.
+        """
+        result, record = self._report([self._sample(2.2, 6.0, 0.0)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("LOUD(implied)", result.stdout)
+        self.assertEqual(record["verdict"], "LOUD")
+        self.assertEqual(record["foreign_max_pct"], 0.0)
+        self.assertAlmostEqual(record["implied_foreign_max_pct"], 91.8, places=6)
+
+    def test_quiet_arm_is_certified(self):
+        """Foreign 0.0, self 6.0, idle 90.0 -> implied 4.0, well under ceiling."""
+        result, record = self._report([self._sample(90.0, 6.0, 0.0)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("(ceiling 30.0%) ok", result.stdout)
+        self.assertEqual(record["verdict"], "ok")
+        self.assertAlmostEqual(record["implied_foreign_max_pct"], 4.0, places=6)
+
+    def test_foreign_load_still_refuses(self):
+        """The pre-existing rule is unchanged: foreign 45.0 over the ceiling."""
+        result, record = self._report([self._sample(49.0, 6.0, 45.0)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("LOUD", result.stdout)
+        self.assertIn("foreign", result.stdout)
+        self.assertEqual(record["verdict"], "LOUD")
+        self.assertEqual(record["foreign_max_pct"], 45.0)
+
+    def test_foreign_only_trip_names_the_foreign_term(self):
+        """Foreign over the ceiling while implied stays under it."""
+        result, record = self._report([self._sample(65.0, 6.0, 45.0)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("LOUD(foreign)", result.stdout)
+        self.assertAlmostEqual(record["implied_foreign_max_pct"], 29.0, places=6)
+
+    def test_implied_exactly_at_the_ceiling_is_certified(self):
+        """A ceiling is a strict bound: implied == 30.0 with floor 70 is ok."""
+        result, record = self._report([self._sample(64.0, 6.0, 0.0)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(record["verdict"], "ok")
+        self.assertAlmostEqual(record["implied_foreign_max_pct"], 30.0, places=6)
+
+    def test_implied_a_tenth_above_the_ceiling_refuses(self):
+        result, record = self._report([self._sample(63.9, 6.0, 0.0)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("LOUD(implied)", result.stdout)
+        self.assertGreater(record["implied_foreign_max_pct"], 30.0)
+
+    def test_summary_line_keeps_the_existing_fields_and_adds_implied(self):
+        result, record = self._report([self._sample(90.0, 6.0, 1.0)])
+        self.assertIn(
+            "samples=1 idle min/mean=90.0%/90.0% "
+            "foreign max/mean=1.0%/1.0% self mean=6.0%",
+            result.stdout,
+        )
+        self.assertIn("implied max=4.0%", result.stdout)
+        self.assertEqual(
+            sorted(record),
+            ["arm", "floor_pct", "foreign_max_pct",
+             "implied_foreign_max_pct", "schema", "verdict"],
+        )
+
+    def test_gate_accepts_an_implied_only_loud_arm(self):
+        """The status consumer re-derives each arm's verdict from the record.
+
+        perf-bench-gate.py rejects a summary whose stored verdict disagrees
+        with the figures, so an implied-only LOUD arm must be accepted by the
+        same rule the report applied, not re-judged from foreign alone.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            stream = Path(tmp) / "summaries.jsonl"
+            stream.write_text("".join(json.dumps({
+                "schema": "perf-phase-load/v1",
+                "arm": arm,
+                "verdict": "LOUD" if arm == "head1" else "ok",
+                "foreign_max_pct": 0.0,
+                "implied_foreign_max_pct": 91.8 if arm == "head1" else 4.0,
+                "floor_pct": 70.0,
+            }) + "\n" for arm in ("base1", "head1", "head2", "base2")))
+            summaries = gate.load_phase_load_summaries(stream, 70.0)
+        self.assertEqual(
+            [summary["verdict"] for summary in summaries],
+            ["ok", "LOUD", "ok", "ok"],
+        )
+
+    def test_gate_still_reads_a_stream_without_the_implied_field(self):
+        """A record written before the implied rule existed is still valid."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stream = Path(tmp) / "legacy.jsonl"
+            stream.write_text("".join(json.dumps({
+                "schema": "perf-phase-load/v1",
+                "arm": arm,
+                "verdict": "ok",
+                "foreign_max_pct": 0.0,
+                "floor_pct": 70.0,
+            }) + "\n" for arm in ("base1", "head1", "head2", "base2")))
+            summaries = gate.load_phase_load_summaries(stream, 70.0)
+        self.assertEqual([s["verdict"] for s in summaries], ["ok"] * 4)
 
 
 class GpuBenchmarkAdmission(unittest.TestCase):

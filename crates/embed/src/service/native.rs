@@ -371,6 +371,15 @@ impl NativeEmbeddingService {
 
 /// Synchronous model loading (runs on blocking thread pool).
 fn load_model_sync(model_config: ModelConfig) -> std::result::Result<LoadedModel, String> {
+    load_model_sync_with_bert_acquisition(model_config, |model_name| {
+        BertModel::from_pretrained(model_name).map_err(|e| e.to_string())
+    })
+}
+
+fn load_model_sync_with_bert_acquisition(
+    model_config: ModelConfig,
+    acquire_bert: impl FnOnce(&str) -> std::result::Result<BertModel, String>,
+) -> std::result::Result<LoadedModel, String> {
     match model_config.model {
         EmbeddingModel::BgeSmallEnV15
         | EmbeddingModel::BgeBaseEnV15
@@ -392,7 +401,7 @@ fn load_model_sync(model_config: ModelConfig) -> std::result::Result<LoadedModel
                 _ => unreachable!(),
             };
             info!(model = model_name, "loading native BERT embedding model");
-            let mut bert = BertModel::from_pretrained(model_name).map_err(|e| e.to_string())?;
+            let mut bert = acquire_bert(model_name)?;
             // Route each model family through its correct pooling strategy.
             // BGE uses CLS pooling; E5 and MiniLM use mean pooling.
             if let Some(pooling) = model_config.model.bert_pooling() {
@@ -583,6 +592,10 @@ impl EmbeddingService for NativeEmbeddingService {
         "native-bert"
     }
 }
+
+#[cfg(test)]
+#[path = "native_pooling_tests.rs"]
+mod pooling_tests;
 
 #[cfg(test)]
 mod tests {

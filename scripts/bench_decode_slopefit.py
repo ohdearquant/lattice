@@ -118,7 +118,7 @@ def parse_stream(
 ) -> tuple[
     dict[int, list[float]], dict[int, list[int]], dict[int, int], dict[str, int] | None
 ]:
-    """Collect SLOPEFIT / SLOPEFIT_META records, ignoring every other line.
+    """Collect complete, uniquely identified measurements, ignoring other lines.
 
     The GPU handoff merges the binary's standard error (progress lines) and the
     supervisor's own notices into the stream, so only the tagged records count.
@@ -127,17 +127,24 @@ def parse_stream(
     tokens_by_ctx: dict[int, list[int]] = defaultdict(list)
     meta_ctx: dict[int, int] = {}
     meta_run: dict[str, int] | None = None
+    repeats_by_ctx: dict[int, set[int]] = defaultdict(set)
 
     for line in lines:
         m = SLOPEFIT_RE.search(line)
         if m:
             ctx, tokens, measure_ms = int(m.group(1)), int(m.group(2)), float(m.group(3))
+            repeat = int(m.group(4))
+            if repeat in repeats_by_ctx[ctx]:
+                raise ValueError(f"duplicate SLOPEFIT repeat: ctx={ctx} rep={repeat}")
+            repeats_by_ctx[ctx].add(repeat)
             tokens_by_ctx[ctx].append(tokens)
             if tokens > 0:
                 raw[ctx].append(measure_ms / tokens)
             continue
         m = META_RUN_RE.search(line)
         if m:
+            if meta_run is not None:
+                raise ValueError("duplicate SLOPEFIT_META run record")
             meta_run = {
                 "kv_cache_len": int(m.group(1)),
                 "warmup": int(m.group(2)),
@@ -147,8 +154,32 @@ def parse_stream(
             continue
         m = META_CTX_RE.search(line)
         if m:
-            meta_ctx[int(m.group(1))] = int(m.group(2))
+            ctx = int(m.group(1))
+            if ctx in meta_ctx:
+                raise ValueError(f"duplicate SLOPEFIT_META context record: ctx={ctx}")
+            meta_ctx[ctx] = int(m.group(2))
             continue
+
+    if meta_run is not None:
+        expected_repeats = meta_run["repeats"]
+        if expected_repeats <= 0:
+            raise ValueError("SLOPEFIT_META repeats must be positive")
+        for ctx in sorted(repeats_by_ctx.keys() | meta_ctx.keys()):
+            if ctx not in meta_ctx:
+                raise ValueError(f"missing SLOPEFIT_META context record: ctx={ctx}")
+            repeats = repeats_by_ctx.get(ctx, set())
+            if not repeats:
+                raise ValueError(f"missing SLOPEFIT measurements: ctx={ctx}")
+            if max(repeats) >= expected_repeats:
+                raise ValueError(
+                    f"SLOPEFIT repeat outside declared range: ctx={ctx} "
+                    f"rep={max(repeats)} repeats={expected_repeats}"
+                )
+            if len(repeats) != expected_repeats:
+                raise ValueError(
+                    f"incomplete SLOPEFIT repeats: ctx={ctx} "
+                    f"expected={expected_repeats} observed={len(repeats)}"
+                )
 
     return raw, tokens_by_ctx, meta_ctx, meta_run
 
@@ -160,7 +191,10 @@ def main() -> None:
 
     is_full = os.environ.get("SLOPEFIT_FULL", "") == "1"
 
-    raw, tokens_by_ctx, meta_ctx, meta_run = parse_stream(sys.stdin)
+    try:
+        raw, tokens_by_ctx, meta_ctx, meta_run = parse_stream(sys.stdin)
+    except ValueError as error:
+        fail(str(error))
 
     # --- TBV self-checks (ADR-064 harness spec) -----------------------------
     if meta_run is None:

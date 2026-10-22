@@ -56,10 +56,16 @@ pub mod weights;
 /// and [`model`].
 pub mod batch;
 pub(crate) mod bounded_read;
+/// Registered held-out evidence for router candidate admission.
+#[cfg(feature = "router-learning")]
+pub mod router_admission;
 pub mod router_episode;
 /// Provisioning a router state directory with an untrained bootstrap
 /// (ADR-096 decision 2).
 pub mod router_init;
+/// Bounded construction of router candidates from recorded feedback.
+#[cfg(feature = "router-learning")]
+pub mod router_refit;
 /// The on-disk router gate artifact: version, trained-adapter names, payload.
 /// Deliberately free of the `mixture` gate — see the module doc comment.
 pub mod router_state;
@@ -77,10 +83,17 @@ pub(crate) mod decoder;
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub use decoder::bench_support as decoder_bench_support;
+/// Synthetic checkpoint support for repository regression tests.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod bert_pooling_fixture;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
 /// Crate error taxonomy; see [`InferenceError`].
 pub mod error;
+/// Time-series forecasting: context preparation and native forecasting models. See
+/// [`forecast::Reverso`].
+pub mod forecast;
 /// Neutral generation types shared by every decoder path: request configuration and
 /// result struct, independent of model family. See [`GenerateConfig`] and
 /// [`GenerateOutput`].
@@ -129,6 +142,10 @@ pub mod pool;
 pub mod pruning;
 /// Quantization and pre-transform primitives. See [`weights`] and [`forward`].
 pub mod quant;
+/// Synthetic Qwen3.5 checkpoint support for repository regression tests.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod qwen35_checkpoint_fixture;
 /// Rotary position embedding tables and application helpers. See [`model`] and [`forward`].
 pub mod rope;
 /// Sampling configuration and token selection helpers. See [`model`] and [`speculative`].
@@ -149,11 +166,19 @@ pub mod serving_cpu;
 #[cfg(feature = "serve")]
 #[doc(hidden)]
 pub mod serving_cpu_host;
-/// Builds the Metal serving worker's runtime and request preparation for a
-/// loaded model. Not a stable API.
-#[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+/// Pooled embedding service interfaces used by serving entry points.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_embeddings;
+/// Builds the serving worker's runtime and request preparation for a loaded
+/// model. Not a stable API.
+#[cfg(feature = "serve")]
 #[doc(hidden)]
 pub mod serving_factory;
+/// Shared request facade for the HTTP serving binaries. Not a stable API.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_host;
 #[cfg(feature = "serve")]
 mod serving_preparation;
 /// Selects serving providers from bounded checkpoint metadata.
@@ -163,6 +188,10 @@ mod serving_preparation;
 pub mod serving_provider;
 #[cfg(feature = "serve")]
 pub(crate) mod serving_runtime_contract;
+/// Dedicated-thread host for thread-affine serving runtimes. Not a stable API.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_worker;
 /// N-gram prompt lookup speculative decoding. See [`sampling`] and [`model`].
 pub mod speculative;
 /// Generation stop reason taxonomy; see [`StopReason`] and [`model`].

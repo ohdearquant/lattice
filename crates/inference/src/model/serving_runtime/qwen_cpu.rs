@@ -57,7 +57,7 @@ impl ServingRuntime for QwenCpuRuntime<'_> {
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn control(
         &mut self,
-        _command: crate::serve::metal_worker::AdapterCommand,
+        _command: crate::serving_worker::AdapterCommand,
     ) -> Result<crate::serve::lora::AdapterControlResult, crate::serve::lora::AdapterControlError>
     {
         Err(crate::serve::lora::AdapterControlError::InvalidAdapter(

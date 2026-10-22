@@ -29,48 +29,52 @@ assert.deepEqual(
   'optionalDependencies must match the supported native prebuild packages'
 )
 
-const workflowTargets = Array.from(
-  workflow.matchAll(/^\s+-?\s*target:\s+([a-z0-9_-]+)\s*$/gm),
-  match => match[1]
-)
+const rows = JSON.parse(await readFile(new URL('./prebuild-matrix.json', import.meta.url), 'utf8'))
+const matrixTargets = rows.map(row => row.target)
 
 assert.deepEqual(
-  new Set(workflowTargets),
+  new Set(matrixTargets),
   new Set(targetPackages.keys()),
-  'the prebuild workflow must build every supported napi target'
+  'prebuild-matrix.json must build every supported napi target'
 )
 assert.equal(
-  workflowTargets.length,
+  matrixTargets.length,
   targetPackages.size,
-  'the prebuild workflow must contain exactly one build row per supported napi target'
+  'prebuild-matrix.json must contain exactly one row per supported napi target'
 )
 
-const forIndex = workflow.indexOf('for suffix in')
-const doIndex = workflow.indexOf('; do', forIndex)
+for (const row of rows) {
+  assert.equal(
+    row.suffix,
+    targetPackages.get(row.target).replace('@khive-ai/lattice-embed-', ''),
+    `prebuild-matrix.json row ${row.target} must name its platform package suffix`
+  )
+  assert.ok(typeof row.runner === 'string' && row.runner.length > 0, `row ${row.target} needs a runner`)
+  assert.equal(typeof row.args, 'string', `row ${row.target} needs an args string`)
+  assert.equal(typeof row.pull_request, 'boolean', `row ${row.target} needs a pull_request boolean`)
+}
 assert.ok(
-  forIndex !== -1 && doIndex !== -1,
-  'expected a "for suffix in ...; do" package-assembly loop in the prebuild workflow'
-)
-const suffixes = workflow
-  .slice(forIndex, doIndex)
-  .split('\n')
-  .slice(1)
-  .map(line => line.trim().replace(/\\$/, '').trim())
-  .filter(Boolean)
-const expectedSuffixes = new Set(
-  Array.from(targetPackages.values(), pkg => pkg.replace('@khive-ai/lattice-embed-', ''))
+  rows.some(row => row.pull_request),
+  'at least one prebuild target must build on pull requests'
 )
 
-assert.deepEqual(
-  new Set(suffixes),
-  expectedSuffixes,
-  'the package-assembly suffix loop must match the supported native prebuild matrix'
-)
+// The build matrix and the package-assembly loop must both come from the plan:
+// a static `target:` row or a literal suffix loop would bypass it.
 assert.equal(
-  suffixes.length,
-  expectedSuffixes.size,
-  'the package-assembly suffix loop must contain exactly one entry per supported napi target'
+  Array.from(workflow.matchAll(/^\s+-?\s*target:\s+([a-z0-9_-]+)\s*$/gm)).length,
+  0,
+  'the prebuild workflow must take its build rows from the plan, not static target rows'
 )
+for (const wiring of [
+  'scripts/plan-prebuild-matrix.mjs',
+  'include: ${{ fromJSON(needs.plan.outputs.include) }}',
+  'PLANNED_SUFFIXES: ${{ needs.plan.outputs.suffixes }}',
+  'for suffix in $PLANNED_SUFFIXES; do',
+  'PLANNED_NAPI_CONFIG: ${{ needs.plan.outputs.napi_config }}',
+  'npm run artifacts -- --config-path "$RUNNER_TEMP/napi-planned.json"'
+]) {
+  assert.ok(workflow.includes(wiring), `the prebuild workflow is missing: ${wiring}`)
+}
 
 for (const command of [
   'if-no-files-found: error',
@@ -84,4 +88,14 @@ for (const command of [
   assert.ok(workflow.includes(command), `the prebuild workflow is missing: ${command}`)
 }
 
-console.log(JSON.stringify({ ok: true, targets: workflowTargets }, null, 2))
+console.log(
+  JSON.stringify(
+    {
+      ok: true,
+      targets: matrixTargets,
+      pull_request: rows.filter(row => row.pull_request).map(row => row.target)
+    },
+    null,
+    2
+  )
+)

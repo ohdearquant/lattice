@@ -56,18 +56,22 @@ model library from a single window. To build and install it, follow the step-by-
 
 ## Benchmarks
 
-Decode throughput is measured **decode-only**: steady-state token generation speed with prompt
-prefill and one-time model load excluded. Per-token decode latency is fit as
-`t = intercept + slope * ctx` across several context lengths (the "slope method") and reported as
-`1000 / t` at each. `Context` is the number of tokens already in the KV cache when the measured
-token is decoded. Model load is kept out of the measured window per engine as follows: the
-Lattice leg times `generate()` after an in-process load, the MLX leg gets an explicit 4-token
-warmup, and the Ollama leg relies on the median across runs to shed a cold first request (its
-API's `total_duration` includes load time, so a single-run invocation can still include it — a
-known harness limitation noted in [#1060](https://github.com/ohdearquant/lattice/issues/1060)).
-The wall-clock speed you observe in an interactive chat is lower than decode-only numbers,
-because it also includes prefill of the whole prompt (see "Why throughput falls with context"
-below).
+The context-scaling benchmark estimates incremental generation throughput by comparing requested
+output-token budgets with an 8-token baseline. For each budget `N` (64, 128 and 256 by default),
+it reports `(N - 8) / (T(N) - T(8))` tokens/s, where `T(N)` is the median measured duration in
+seconds. The `Context` labels identify requested output-token budgets.
+
+Lattice times `chat_completion()` after model loading, including prompt processing, prefill and
+generation. Subtracting the baseline is intended to cancel common prefill and fixed per-call
+costs. The MLX leg receives an explicit 4-token warmup. The context-scaling Ollama leg uses the
+API's `eval_duration`, which records output-token generation separately from model loading and
+prompt evaluation. This excludes those durations even in a single-run invocation. Older
+context-scaling reports used Ollama's `total_duration`; their Ollama timings and derived slopes
+are not directly comparable with the corrected metric. Regenerate the measurements before
+making that comparison
+([#1060](https://github.com/ohdearquant/lattice/issues/1060)).
+These estimates do not measure end-to-end interactive latency, which also depends on model
+loading, prompt length and other request costs (see "Why throughput falls with context" below).
 
 The cross-engine decode table previously published here has been withdrawn. An audit traced its
 Lattice and Ollama columns to an arithmetic bug in a retired reporting script: the slope
@@ -124,17 +128,19 @@ regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
 
 ## Crates
 
-| Crate                                    | Description                                                                                                                                                           | crates.io                                                                                                |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| [`lattice-embed`](crates/embed/)         | Embedding service: `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill                                  | [![](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)         |
-| [`lattice-inference`](crates/inference/) | Transformer kernel: safetensors loading, BERT/BGE/Qwen3 forward pass, three tokenizers, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding, quantization | [![](https://img.shields.io/crates/v/lattice-inference.svg)](https://crates.io/crates/lattice-inference) |
-| [`lattice-fann`](crates/fann/)           | Fast neural network primitives: `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer                                                     | [![](https://img.shields.io/crates/v/lattice-fann.svg)](https://crates.io/crates/lattice-fann)           |
-| [`lattice-tune`](crates/tune/)           | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry                                                                | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune)           |
-| [`lattice-transport`](crates/transport/) | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport) |
+| Crate                                              | Description                                                                                                                                                           | crates.io                                                                                                          |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| [`lattice-embed`](crates/embed/)                   | Embedding service: `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill                                  | [![](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)                   |
+| [`lattice-inference`](crates/inference/)           | Transformer kernel: safetensors loading, BERT/BGE/Qwen3 forward pass, three tokenizers, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding, quantization | [![](https://img.shields.io/crates/v/lattice-inference.svg)](https://crates.io/crates/lattice-inference)           |
+| [`lattice-fann`](crates/fann/)                     | Fast neural network primitives: `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer                                                     | [![](https://img.shields.io/crates/v/lattice-fann.svg)](https://crates.io/crates/lattice-fann)                     |
+| [`lattice-tune`](crates/tune/)                     | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry                                                                | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune)                     |
+| [`lattice-tokenizer`](crates/tokenizer/)           | Pure Rust tokenizers: WordPiece, SentencePiece, Qwen and Gemma BPE, model-directory auto-detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-tokenizer.svg)](https://crates.io/crates/lattice-tokenizer)           |
+| [`lattice-inference-core`](crates/inference-core/) | Shared base types: `InferenceError`, re-exported by `lattice-inference`                                                                                               | [![](https://img.shields.io/crates/v/lattice-inference-core.svg)](https://crates.io/crates/lattice-inference-core) |
+| [`lattice-transport`](crates/transport/)           | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport)           |
 
-Two leaf crates (`fann`, `transport`) have zero intra-workspace dependencies. `inference` is
-standalone by default and pulls in `fann` only when the optional `mixture` feature is enabled.
-All three can be used on their own.
+Three leaf crates (`fann`, `transport`, `inference-core`) have zero intra-workspace
+dependencies. `tokenizer` depends only on `inference-core`. `inference` depends on both and pulls
+in `fann` only when the optional `mixture` feature is enabled. Each can be used on its own.
 
 ---
 
