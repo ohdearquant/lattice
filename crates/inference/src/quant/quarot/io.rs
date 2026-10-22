@@ -51,7 +51,7 @@ use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::plan::{OnlineRotationSpec, OnlineTransformSite};
 use crate::weights::ingress::DecodedTensorValidator;
 use crate::weights::safetensors_layout::{
-    SafetensorsLayoutEntry, safetensors_dtype, validate_safetensors_layout,
+    safetensors_dtype_name, safetensors_layout_entry, validate_safetensors_layout,
 };
 use crate::weights::{contained_shard_path, parse_index};
 
@@ -245,7 +245,7 @@ impl Shard {
                 ))
             })? as usize;
 
-            let dtype = safetensors_dtype(dtype_str).ok_or_else(|| {
+            let dtype = safetensors_dtype_name(dtype_str).ok_or_else(|| {
                 InferenceError::InvalidSafetensors(format!(
                     "tensor {name}: unrecognized SafeTensors dtype {dtype_str:?}"
                 ))
@@ -260,7 +260,7 @@ impl Shard {
 
             parsed.push(ParsedEntry {
                 name: name.clone(),
-                dtype: dtype.name,
+                dtype,
                 shape,
                 start,
                 end,
@@ -272,12 +272,14 @@ impl Shard {
         // data-section contract as the runtime SafeTensors loader.
         let layout: Vec<_> = parsed
             .iter()
-            .map(|entry| SafetensorsLayoutEntry {
-                name: &entry.name,
-                dtype: entry.dtype,
-                shape: &entry.shape,
-                start: entry.start,
-                end: entry.end,
+            .map(|entry| {
+                safetensors_layout_entry(
+                    &entry.name,
+                    entry.dtype,
+                    &entry.shape,
+                    entry.start,
+                    entry.end,
+                )
             })
             .collect();
         validate_safetensors_layout(&path.display().to_string(), data_len, &layout)?;

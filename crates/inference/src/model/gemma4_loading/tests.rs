@@ -1,6 +1,7 @@
 use super::super::gemma4_config::Gemma4LayerType;
 use super::super::gemma4_weights::synthetic_safetensors_bytes;
 use super::*;
+use crate::weights::f32_weights::safetensors_cached_f32_tensor_count;
 use std::collections::HashMap;
 
 /// In-memory [`TensorSource`] carrying an explicit per-tensor dtype
@@ -381,7 +382,7 @@ fn full_checkpoint_load_leaves_no_f32_copy_in_the_file_the_model_keeps() {
 
     load_weights(&mut file, &cfg).expect("an all-BF16 checkpoint must load");
     assert_eq!(
-        file.cached_f32_tensor_count(),
+        safetensors_cached_f32_tensor_count(&file),
         0,
         "the loader must take each converted tensor, leaving no second f32 copy in the file"
     );

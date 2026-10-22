@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::bounded_read::{BoundedReadError, read_bytes_bounded};
+use crate::weights::bounded_read::{BoundedReadError, read_bytes_bounded};
 
 mod storage;
 

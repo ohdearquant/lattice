@@ -66,8 +66,10 @@ mod signed_scale_fixture;
 /// Continuous batching and scheduler support for multi-sequence inference. See [`kv_cache`]
 /// and [`model`].
 pub mod batch;
-pub(crate) mod bounded_config;
-pub(crate) mod bounded_read;
+#[cfg(test)]
+mod bounded_config;
+#[cfg(test)]
+mod bounded_read;
 /// Registered held-out evidence for router candidate admission.
 #[cfg(feature = "router-learning")]
 pub mod router_admission;

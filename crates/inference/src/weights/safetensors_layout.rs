@@ -38,12 +38,32 @@ pub(crate) fn safetensors_dtype(name: &str) -> Option<SafetensorsDType> {
     })
 }
 
+pub(crate) fn safetensors_dtype_name(name: &str) -> Option<&'static str> {
+    safetensors_dtype(name).map(|dtype| dtype.name)
+}
+
 pub(crate) struct SafetensorsLayoutEntry<'a> {
     pub(crate) name: &'a str,
     pub(crate) dtype: &'a str,
     pub(crate) shape: &'a [usize],
     pub(crate) start: usize,
     pub(crate) end: usize,
+}
+
+pub(crate) fn safetensors_layout_entry<'a>(
+    name: &'a str,
+    dtype: &'a str,
+    shape: &'a [usize],
+    start: usize,
+    end: usize,
+) -> SafetensorsLayoutEntry<'a> {
+    SafetensorsLayoutEntry {
+        name,
+        dtype,
+        shape,
+        start,
+        end,
+    }
 }
 
 pub(crate) fn validate_safetensors_layout(

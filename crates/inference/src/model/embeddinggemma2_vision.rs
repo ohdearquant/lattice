@@ -6,6 +6,7 @@
 )]
 
 use crate::error::InferenceError;
+use crate::weights::f32_weights::safetensors_from_open_file;
 use crate::weights::{SafetensorsFile, TensorSource};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -530,7 +531,7 @@ impl LazyVision {
                 })?
                 .try_clone()
                 .map_err(InferenceError::Io)?;
-            let mut file = SafetensorsFile::from_open_file(descriptor, &checkpoint.path)?;
+            let mut file = safetensors_from_open_file(descriptor, &checkpoint.path)?;
             let records = metadata(&file)?;
             load_weights(&mut file, cfg, &records)
         })

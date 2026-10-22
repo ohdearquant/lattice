@@ -1,6 +1,6 @@
 //! Safetensors metadata and f32 weight structs, including tensor, transformer-layer, BERT, cross-encoder, safetensors-file, and Qwen layer weights.
-use crate::bounded_read::{BoundedReadError, read_text_bounded};
 use crate::error::InferenceError;
+use crate::weights::bounded_read::{BoundedReadError, read_text_bounded};
 use crate::weights::safetensors_layout::{
     SafetensorsLayoutEntry, safetensors_dtype, validate_safetensors_layout,
 };
@@ -210,6 +210,28 @@ pub struct SafetensorsFile {
     /// raised by the ingress validation seam (lattice#800) — the source
     /// path for `open()`, or a fixed label for `from_bytes()`.
     source: String,
+}
+
+/// Parse safetensors from an already-open file without reopening its path.
+pub(crate) fn safetensors_from_open_file(
+    file: File,
+    path: &Path,
+) -> Result<SafetensorsFile, InferenceError> {
+    SafetensorsFile::from_open_file(file, path)
+}
+
+/// Read a BF16 tensor payload without widening or copying its backing bytes.
+pub(crate) fn safetensors_bf16_payload<'a>(
+    file: &'a SafetensorsFile,
+    name: &str,
+) -> Result<&'a [u8], InferenceError> {
+    file.bf16_payload(name)
+}
+
+/// Count tensors currently holding a cached f32 conversion.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn safetensors_cached_f32_tensor_count(file: &SafetensorsFile) -> usize {
+    file.cached_f32_tensor_count()
 }
 
 impl SafetensorsFile {
