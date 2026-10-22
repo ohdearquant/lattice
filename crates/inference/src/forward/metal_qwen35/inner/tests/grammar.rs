@@ -252,7 +252,7 @@ fn terminal_step_zero_grammar_cfg() -> GenerateConfig {
     );
     let mut grammar_state = engine.initial_state();
     assert!(
-        engine.is_complete_without_continuation(&grammar_state),
+        lattice_grammar::__internal::is_complete_without_continuation(&engine, &grammar_state),
         "epsilon grammar must start complete with no legal continuation"
     );
     let mut logits = vec![0.0; 32];

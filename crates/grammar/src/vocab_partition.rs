@@ -38,8 +38,8 @@
 //!    under the aggregate capacity budget falls back to the global union
 //!    across every state.
 
-use crate::grammar::pda::{CompiledGrammar, GrammarState};
-use crate::grammar::trie::ByteTrie;
+use crate::pda::{CompiledGrammar, GrammarState};
+use crate::trie::ByteTrie;
 
 /// Maximum number of grammar states for v0.
 /// A grammar with more states triggers a warning at build time.

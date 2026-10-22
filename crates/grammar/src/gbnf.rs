@@ -29,7 +29,7 @@
 //! - Character class negation `[^...]` generates alternatives for every
 //!   byte NOT in the set — correct but potentially many alternatives.
 
-use crate::grammar::pda::{Alt, BuilderError, CompiledGrammar, GrammarBuilder, Symbol};
+use crate::pda::{Alt, BuilderError, CompiledGrammar, GrammarBuilder, Symbol};
 use std::collections::HashSet;
 
 /// Error from parsing a GBNF string.

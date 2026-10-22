@@ -344,7 +344,12 @@ fn run_inner(
     // pre-driver loops made.
     let grammar_complete = || -> bool {
         match (grammar_engine, &grammar_state) {
-            (Some(engine), Some(state)) => engine.is_complete_without_continuation(&state.borrow()),
+            (Some(engine), Some(state)) => {
+                lattice_grammar::__internal::is_complete_without_continuation(
+                    engine,
+                    &state.borrow(),
+                )
+            }
             _ => false,
         }
     };

@@ -81,9 +81,7 @@
 //! additionally clears it after every accepted byte, so its clones never copy
 //! the trie-prefix bytes either; `mark_allowed` only trims the root.
 
-use crate::grammar::pda::{
-    CompiledGrammar, GrammarState, StackLimitError, StepResult, advance_byte,
-};
+use crate::pda::{CompiledGrammar, GrammarState, StackLimitError, StepResult, advance_byte};
 
 // Reused across every `ByteTrie::mask` call on this thread so the hot
 // over-cap path doesn't heap-allocate a fresh `vocab_size / 64`-word bitvec

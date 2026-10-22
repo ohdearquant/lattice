@@ -1,0 +1,30 @@
+[package]
+name = "lattice-grammar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Grammar-constrained decoding for Lattice inference: JSON Schema and GBNF compiled to a byte-level pushdown automaton"
+keywords = ["grammar", "json-schema", "gbnf", "structured-output", "inference"]
+categories = ["science", "algorithms", "parsing"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+# Profiling probes for the grammar benchmark binaries (`BfsDedupProfile`, `profile_reachable_states`).
+bench-internals = []
+
+[dependencies]
+lattice-inference-core = { version = "0.14.0", path = "../inference-core" }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+lattice-tokenizer = { version = "0.14.0", path = "../tokenizer" }
+
+[lints]
+workspace = true
