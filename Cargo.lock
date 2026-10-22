@@ -1624,6 +1624,7 @@ version = "0.14.0"
 dependencies = [
  "lattice-inference-core",
  "lattice-tokenizer",
+ "proptest",
  "serde_json",
  "tracing",
 ]

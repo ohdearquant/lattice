@@ -25,6 +25,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 lattice-tokenizer = { version = "0.14.0", path = "../tokenizer" }
+proptest = { workspace = true }
 
 [lints]
 workspace = true
