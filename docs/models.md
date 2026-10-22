@@ -89,7 +89,7 @@ LoRA adapter can select per-token forward steps instead; these exceptions do not
 full-checkpoint parity. The legacy infallible `forward_prefill` wrapper can still panic on an
 unsupported input. Backend restrictions are implemented in the
 [Metal runtime](../crates/inference/src/forward/metal_qwen35.rs),
-[Q8 conversion](../crates/inference/src/weights/q8_weights.rs), and
+[Q8 conversion](../crates/inference/src/model/qwen35/q8_conversion.rs), and
 [QuaRot conversion](../crates/inference/src/quant/quarot/convert.rs).
 
 **Image input for chat completions is a separate capability.** CPU HTTP chat routes reject
