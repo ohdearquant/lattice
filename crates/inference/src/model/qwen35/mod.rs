@@ -21,6 +21,7 @@ mod loading;
 mod model;
 mod moe;
 mod norm;
+pub(crate) mod q8_conversion;
 mod rerank;
 mod sampling;
 pub(crate) mod stop_strings;

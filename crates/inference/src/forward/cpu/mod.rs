@@ -8,6 +8,7 @@ pub(crate) mod f16_matmul;
 mod gemm_validate;
 mod matmul;
 mod norm;
+pub(crate) mod q8_matmul;
 mod simd;
 mod softmax;
 mod tiled;
