@@ -4,6 +4,7 @@ mod arch_kernels;
 mod bert_policy;
 mod blas;
 mod elementwise;
+pub(crate) mod f16_matmul;
 mod gemm_validate;
 mod matmul;
 mod norm;

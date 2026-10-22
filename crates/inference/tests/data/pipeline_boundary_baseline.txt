@@ -92,6 +92,7 @@ src/serving_provider/providers/qwen.rs	crate::model::qwen35_config::Qwen35Config
 src/serving_provider/providers/qwen/adapters.rs	crate::forward::metal_qwen35::LoraLayerData
 src/serving_provider/providers/qwen/adapters.rs	crate::forward::metal_qwen35::MetalQwen35State
 src/serving_provider/providers/qwen/embedding.rs	crate::model::qwen35_config::Qwen35Config
+src/serving_provider/providers/qwen/embedding.rs	crate::model::qwen35::f16_loading::load_f16_weights
 src/serving_provider/providers/qwen/lattice_worker.rs	crate::forward::metal_qwen35::MetalQwen35State
 src/serving_provider/providers/qwen/lattice_worker.rs	crate::model::qwen35_config::Qwen35Config
 src/serving_provider/providers/qwen/vision.rs	crate::forward::metal_qwen35::ChatMessage

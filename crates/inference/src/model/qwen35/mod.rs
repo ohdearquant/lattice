@@ -13,6 +13,7 @@ mod cache;
 mod debug;
 mod embed;
 mod eval;
+pub(crate) mod f16_loading;
 mod forward;
 mod generation;
 mod generation_setup;
