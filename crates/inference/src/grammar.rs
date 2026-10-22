@@ -50,5 +50,7 @@ pub mod vocab_partition {
     pub use lattice_grammar::vocab_partition::{MAX_GRAMMAR_STATES, VocabPartition};
 }
 
+#[doc(no_inline)]
 pub use engine::{GrammarEngine, GrammarError};
+#[doc(no_inline)]
 pub use spec::GrammarSpec;
