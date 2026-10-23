@@ -212,12 +212,17 @@ fn serving_adapters_do_not_restate_standard_defaults() {
         include_str!("../../bin/lattice/doctor.rs"),
         include_str!("../../bin/lattice/serve.rs"),
     );
+    // `lattice_serve` keeps its argument parsing, router state and
+    // structured-output code in files under `imp/`; scan them with main.rs.
+    let lattice_serve_source = concat!(
+        include_str!("../../bin/lattice_serve/main.rs"),
+        include_str!("../../bin/lattice_serve/imp/args.rs"),
+        include_str!("../../bin/lattice_serve/imp/state.rs"),
+        include_str!("../../bin/lattice_serve/imp/response_schema.rs"),
+    );
     for (name, source) in [
         ("lattice", lattice_source),
-        (
-            "lattice_serve",
-            include_str!("../../bin/lattice_serve/main.rs"),
-        ),
+        ("lattice_serve", lattice_serve_source),
     ] {
         for literal in [
             "temperature: 0.7",
