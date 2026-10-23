@@ -476,6 +476,19 @@ impl Gemma4KvCache {
         Ok(&slot.v[..slot.seq_len * slot.kv_dim])
     }
 
+    /// Restore sequential sliding views after every consumer of a chunk finishes.
+    pub(crate) fn finish_prefill_chunk(&mut self) {
+        for slot in &mut self.slots {
+            if slot.kind == SlotKind::Sliding && slot.seq_len > slot.capacity {
+                let start = (slot.seq_len - slot.capacity) * slot.kv_dim;
+                let end = slot.seq_len * slot.kv_dim;
+                slot.k.copy_within(start..end, 0);
+                slot.v.copy_within(start..end, 0);
+                slot.seq_len = slot.capacity;
+            }
+        }
+    }
+
     fn slot_for_layer(&self, layer: usize) -> Result<&Slot, InferenceError> {
         let slot_idx = self.layer_slot(layer)?;
         Ok(&self.slots[slot_idx])
@@ -897,5 +910,202 @@ mod tests {
         assert!(cache.k_view(6).is_err());
         assert!(cache.v_view(6).is_err());
         assert!(cache.append_kv(6, &[1.0], &[1.0]).is_err());
+    }
+
+    mod prefill_completion {
+        use super::*;
+
+        fn config(window: usize) -> Gemma4Config {
+            let mut cfg = tiny_config(window);
+            cfg.num_key_value_heads = 2;
+            cfg
+        }
+
+        fn rows(
+            cfg: &Gemma4Config,
+            layer: usize,
+            start: usize,
+            length: usize,
+        ) -> (Vec<f32>, Vec<f32>) {
+            let width = cfg.num_key_value_heads * cfg.attn_head_dim(layer);
+            let k: Vec<f32> = (start..start + length)
+                .flat_map(|position| {
+                    (0..width).map(move |lane| {
+                        ((layer + 1) * 10_000 + (position + 1) * 100 + lane) as f32 / 8.0
+                    })
+                })
+                .collect();
+            let v = k.iter().map(|&value| -value - 0.25).collect();
+            (k, v)
+        }
+
+        fn assert_aliases(cache: &Gemma4KvCache) {
+            for (shared, donor) in [(4, 1), (5, 3)] {
+                assert_eq!(cache.layer_slot(shared).unwrap(), donor);
+                assert_eq!(
+                    cache.seq_len(shared).unwrap(),
+                    cache.seq_len(donor).unwrap()
+                );
+                assert_eq!(cache.k_view(shared).unwrap(), cache.k_view(donor).unwrap());
+                assert_eq!(cache.v_view(shared).unwrap(), cache.v_view(donor).unwrap());
+                assert_eq!(
+                    cache.k_view(shared).unwrap().as_ptr(),
+                    cache.k_view(donor).unwrap().as_ptr()
+                );
+                assert_eq!(
+                    cache.v_view(shared).unwrap().as_ptr(),
+                    cache.v_view(donor).unwrap().as_ptr()
+                );
+            }
+        }
+
+        fn assert_same_views(actual: &Gemma4KvCache, expected: &Gemma4KvCache) {
+            assert_eq!(actual.num_slots(), expected.num_slots());
+            for layer in 0..6 {
+                assert_eq!(
+                    actual.layer_slot(layer).unwrap(),
+                    expected.layer_slot(layer).unwrap()
+                );
+                assert_eq!(
+                    actual.seq_len(layer).unwrap(),
+                    expected.seq_len(layer).unwrap()
+                );
+                assert_eq!(
+                    actual.k_view(layer).unwrap(),
+                    expected.k_view(layer).unwrap()
+                );
+                assert_eq!(
+                    actual.v_view(layer).unwrap(),
+                    expected.v_view(layer).unwrap()
+                );
+            }
+            assert_aliases(actual);
+        }
+
+        #[test]
+        fn completion_trims_every_sliding_owner_and_preserves_global_aliases() {
+            let cfg = config(3);
+            let mut cache = Gemma4KvCache::new(&cfg, 32).unwrap();
+            for layer in 0..cfg.first_kv_shared_layer_idx() {
+                let (k, v) = rows(&cfg, layer, 0, 7);
+                cache.append_kv(layer, &k, &v).unwrap();
+                assert_eq!(cache.seq_len(layer).unwrap(), 7);
+                assert_eq!(cache.k_view(layer).unwrap(), k);
+                assert_eq!(cache.v_view(layer).unwrap(), v);
+            }
+            assert_aliases(&cache);
+
+            cache.finish_prefill_chunk();
+
+            for layer in 0..cfg.first_kv_shared_layer_idx() {
+                let (start, length) = if cfg.is_global_layer(layer) {
+                    (0, 7)
+                } else {
+                    (4, 3)
+                };
+                let (k, v) = rows(&cfg, layer, start, length);
+                assert_eq!(cache.seq_len(layer).unwrap(), length);
+                assert_eq!(cache.k_view(layer).unwrap(), k);
+                assert_eq!(cache.v_view(layer).unwrap(), v);
+            }
+            assert_aliases(&cache);
+        }
+
+        #[test]
+        fn completion_is_idempotent_for_empty_short_and_full_views() {
+            for window in [1, 3] {
+                let cfg = config(window);
+                for length in [0, 1, window, window + 4] {
+                    let mut cache = Gemma4KvCache::new(&cfg, 32).unwrap();
+                    for layer in 0..cfg.first_kv_shared_layer_idx() {
+                        let (k, v) = rows(&cfg, layer, 0, length);
+                        cache.append_kv(layer, &k, &v).unwrap();
+                    }
+                    let storage: Vec<_> = cache
+                        .slots
+                        .iter()
+                        .map(|slot| {
+                            (
+                                slot.k.as_ptr(),
+                                slot.k.len(),
+                                slot.k.capacity(),
+                                slot.v.as_ptr(),
+                                slot.v.len(),
+                                slot.v.capacity(),
+                            )
+                        })
+                        .collect();
+                    cache.finish_prefill_chunk();
+                    let completed: Vec<_> = cache
+                        .slots
+                        .iter()
+                        .map(|slot| (slot.seq_len, slot.k.clone(), slot.v.clone()))
+                        .collect();
+                    for layer in 0..cfg.first_kv_shared_layer_idx() {
+                        let retained = if cfg.is_global_layer(layer) {
+                            length
+                        } else {
+                            length.min(window)
+                        };
+                        let (k, v) = rows(&cfg, layer, length - retained, retained);
+                        assert_eq!(cache.seq_len(layer).unwrap(), retained);
+                        assert_eq!(cache.k_view(layer).unwrap(), k);
+                        assert_eq!(cache.v_view(layer).unwrap(), v);
+                    }
+                    cache.finish_prefill_chunk();
+                    cache.finish_prefill_chunk();
+                    for (index, slot) in cache.slots.iter().enumerate() {
+                        assert_eq!(slot.seq_len, completed[index].0);
+                        assert_eq!(slot.k, completed[index].1);
+                        assert_eq!(slot.v, completed[index].2);
+                        assert_eq!(
+                            (
+                                slot.k.as_ptr(),
+                                slot.k.len(),
+                                slot.k.capacity(),
+                                slot.v.as_ptr(),
+                                slot.v.len(),
+                                slot.v.capacity()
+                            ),
+                            storage[index]
+                        );
+                    }
+                    assert_aliases(&cache);
+                }
+            }
+        }
+
+        #[test]
+        fn completed_chunks_and_next_decode_match_scalar_appends() {
+            for window in [1, 3, 5] {
+                let cfg = config(window);
+                let mut batched = Gemma4KvCache::new(&cfg, 32).unwrap();
+                let mut scalar = Gemma4KvCache::new(&cfg, 32).unwrap();
+                let mut position = 0;
+                for length in [2, 6, 1, 5] {
+                    for layer in 0..cfg.first_kv_shared_layer_idx() {
+                        let (k, v) = rows(&cfg, layer, position, length);
+                        batched.append_kv(layer, &k, &v).unwrap();
+                    }
+                    for token in position..position + length {
+                        for layer in 0..cfg.first_kv_shared_layer_idx() {
+                            let (k, v) = rows(&cfg, layer, token, 1);
+                            scalar.append_kv(layer, &k, &v).unwrap();
+                        }
+                    }
+                    position += length;
+                    batched.finish_prefill_chunk();
+                    assert_same_views(&batched, &scalar);
+
+                    for layer in 0..cfg.first_kv_shared_layer_idx() {
+                        let (k, v) = rows(&cfg, layer, position, 1);
+                        batched.append_kv(layer, &k, &v).unwrap();
+                        scalar.append_kv(layer, &k, &v).unwrap();
+                    }
+                    position += 1;
+                    assert_same_views(&batched, &scalar);
+                }
+            }
+        }
     }
 }

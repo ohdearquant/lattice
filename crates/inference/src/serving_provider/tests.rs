@@ -2,7 +2,7 @@ use super::*;
 use crate::model_format::ModelFamily;
 use crate::serve::route::{select_route, select_standalone_route};
 use std::fs;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const FORMATS: [FormatFixture; 5] = [
     FormatFixture::SafetensorsFile,
@@ -274,6 +274,108 @@ fn provider_route_projections_match_the_existing_route_functions() {
 }
 
 #[test]
+fn lattice_plan_admission_preserves_route_markers_refusals_and_implicit_actions() {
+    let metadata = [
+        MetadataFixture::Qwen,
+        MetadataFixture::QwenMoe,
+        MetadataFixture::GemmaUnsupportedProfile,
+        MetadataFixture::Missing,
+        MetadataFixture::Unreadable,
+        MetadataFixture::Malformed,
+        MetadataFixture::Oversized,
+        MetadataFixture::WrongType,
+        MetadataFixture::NestedOnly,
+    ];
+
+    for format_fixture in FORMATS {
+        for metadata_fixture in metadata {
+            let temp = tempfile::tempdir().expect("create checkpoint tempdir");
+            let directory = temp.path().join("checkpoint");
+            fs::create_dir(&directory).expect("create checkpoint directory");
+            format_fixture.write(&directory);
+            metadata_fixture.write(&directory);
+
+            let evidence = inspect_checkpoint(&directory);
+            let family = if metadata_fixture.expected_provider() == "gemma" {
+                ModelFamily::Gemma4
+            } else {
+                ModelFamily::Qwen35
+            };
+            let expected_route = select_route(evidence.format, family);
+            let actual = select(evidence.clone(), ServingEntry::Lattice);
+
+            match expected_route {
+                Ok(route) => {
+                    let selected = actual.expect("supported route is admitted without loading");
+                    let expected_marker = route.selection_marker(evidence.format);
+                    assert_eq!(
+                        selected.lattice_selection_marker().as_deref(),
+                        Some(expected_marker.as_str()),
+                        "{format_fixture:?}, {metadata_fixture:?}"
+                    );
+                    assert_eq!(selected.legacy_route(), Some(route));
+                    assert_eq!(
+                        selected.implicit_embeddings("fixture model"),
+                        selected.implicit_pooled_embeddings("fixture model"),
+                        "{format_fixture:?}, {metadata_fixture:?}"
+                    );
+                }
+                Err(refusal) => {
+                    let error = actual.err().expect("unsupported route keeps its refusal");
+                    assert_eq!(
+                        error.message(),
+                        refusal.message(&directory),
+                        "{format_fixture:?}, {metadata_fixture:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[test]
+fn provider_standalone_descriptions_keep_the_existing_labels_and_markers() {
+    let formats = [
+        ModelFormat::Safetensors,
+        ModelFormat::Q4,
+        ModelFormat::Unknown,
+        ModelFormat::MlxQuantized,
+        ModelFormat::Gguf,
+        ModelFormat::Refused,
+    ];
+    let providers: [(&dyn ServingProvider, ModelFamily, &str); 2] = [
+        (&providers::QWEN_PROVIDER, ModelFamily::Qwen35, "qwen3_5"),
+        (&providers::GEMMA_PROVIDER, ModelFamily::Gemma4, "gemma4"),
+    ];
+
+    for (provider, family, model_type) in providers {
+        for format in formats {
+            let evidence = CheckpointEvidence {
+                directory: PathBuf::from("checkpoint"),
+                format,
+                model_type: Some(model_type.to_owned()),
+            };
+            let route = provider
+                .legacy_route(&evidence, ServingEntry::Standalone)
+                .ok()
+                .flatten();
+            let description = provider.standalone_startup_description(format, route);
+            let expected_route = select_standalone_route(format, family).ok();
+            let expected_marker = expected_route.map(|route| route.selection_marker(format));
+            let expected_label = match (family, format, expected_route) {
+                (ModelFamily::Gemma4, ModelFormat::Safetensors, Some(_)) => "safetensors",
+                (_, ModelFormat::Q4, _) => "q4",
+                (_, ModelFormat::Safetensors, _) => "bf16",
+                _ => "unknown",
+            };
+            assert_eq!(description.route_marker, expected_marker);
+            assert_eq!(description.loading_label, expected_label);
+        }
+    }
+}
+
+#[test]
 fn ambiguity_is_sorted_duplicate_sensitive_and_order_independent() {
     let alpha = TestProvider::new("alpha", true, Ok(Some(ServedRoute::QWEN35_CPU)));
     let zeta = TestProvider::new("zeta", true, Ok(Some(ServedRoute::GEMMA4_CPU)));
@@ -315,6 +417,8 @@ fn ambiguity_is_sorted_duplicate_sensitive_and_order_independent() {
     );
     assert_eq!(alpha.route_calls.load(Ordering::SeqCst), 0);
     assert_eq!(zeta.route_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(alpha.admission_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(zeta.admission_calls.load(Ordering::SeqCst), 0);
 
     let duplicated = [&alpha as &dyn RegisteredProvider, &alpha];
     let duplicate_error = select_with_registry(
@@ -360,7 +464,8 @@ fn positive_claim_refusal_does_not_reach_the_legacy_provider() {
             ..
         }
     ));
-    assert_eq!(claimant.route_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(claimant.admission_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(claimant.route_calls.load(Ordering::SeqCst), 0);
     assert_eq!(legacy.route_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -380,7 +485,11 @@ fn legacy_provider_route_is_reached_only_when_no_provider_claims() {
     .expect("zero claims binds the registered legacy provider");
 
     assert_eq!(selected.provider.name(), "legacy");
+    assert_eq!(nonclaimant.admission_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(legacy.admission_calls.load(Ordering::SeqCst), 1);
     assert_eq!(nonclaimant.route_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(legacy.route_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(selected.legacy_route(), Some(ServedRoute::QWEN35_CPU));
     assert_eq!(legacy.route_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -705,7 +814,7 @@ fn implicit_pooled_plan_preserves_qwen_directory_and_gemma_message() {
             model_type: Some("qwen3_5".to_owned()),
         },
         entry: ServingEntry::Lattice,
-        legacy_route: Some(ServedRoute::QWEN35_CPU),
+        lattice_plan: None,
     };
     assert_eq!(
         qwen.implicit_pooled_embeddings("qwen display"),
@@ -723,7 +832,7 @@ fn implicit_pooled_plan_preserves_qwen_directory_and_gemma_message() {
             model_type: Some("gemma4".to_owned()),
         },
         entry: ServingEntry::Lattice,
-        legacy_route: Some(ServedRoute::GEMMA4_CPU),
+        lattice_plan: None,
     };
     assert_eq!(
         gemma.implicit_pooled_embeddings("gemma display"),
@@ -735,6 +844,160 @@ fn implicit_pooled_plan_preserves_qwen_directory_and_gemma_message() {
             ),
         }
     );
+}
+
+#[test]
+fn lattice_plan_opens_without_a_legacy_route_projection() {
+    let opened = Arc::new(AtomicBool::new(false));
+    let provider = PlanOnlyProvider {
+        opened: Arc::clone(&opened),
+    };
+    let registered: [&dyn RegisteredProvider; 1] = [&provider];
+    let selected = select_with_registry(
+        CheckpointEvidence {
+            directory: PathBuf::from("checkpoint"),
+            format: ModelFormat::Safetensors,
+            model_type: Some("fixture".to_owned()),
+        },
+        ServingEntry::Lattice,
+        &ProviderRegistry {
+            providers: &registered,
+            legacy_generation: &providers::QWEN_PROVIDER,
+        },
+    )
+    .expect("the plan-only provider admits its checkpoint");
+
+    assert_eq!(selected.legacy_route(), None);
+    assert_eq!(
+        selected.lattice_selection_marker().as_deref(),
+        Some("[route] selected family=fixture backend=cpu format=safetensors")
+    );
+    let opened_route = selected.open_lattice(
+        LatticeOpenOptions {
+            tokenizer_dir: None,
+            max_pending: 1,
+            max_resident_adapters: 0,
+            max_resident_adapter_bytes: 0,
+            preload_vision: false,
+            context_window: 0,
+        },
+        Arc::new(Semaphore::new(1)),
+    );
+    assert!(opened_route.is_ok());
+    assert!(opened.load(Ordering::SeqCst));
+}
+
+struct PlanOnlyProvider {
+    opened: Arc<AtomicBool>,
+}
+
+struct PlanOnlyLatticeRoutePlan {
+    opened: Arc<AtomicBool>,
+    directory: PathBuf,
+}
+
+impl LatticeRoutePlan for PlanOnlyLatticeRoutePlan {
+    fn selection_marker(&self) -> String {
+        "[route] selected family=fixture backend=cpu format=safetensors".to_owned()
+    }
+
+    fn implicit_embeddings(&self, _model: &str) -> ImplicitPooledEmbeddingPlan {
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: Some(self.directory.clone()),
+            disabled_line: None,
+        }
+    }
+
+    fn open(
+        self: Box<Self>,
+        options: LatticeOpenOptions,
+        generation_admission: Arc<Semaphore>,
+    ) -> Result<crate::serving_host::ServingHandle, String> {
+        let _ = options;
+        self.opened.store(true, Ordering::SeqCst);
+        let model = crate::model::qwen35::test_support::tiny_zero_model_with_context(64);
+        let cpu = providers::qwen::cpu::from_model(model);
+        Ok(crate::serving_host::ServingHandle::shared_cpu(
+            cpu,
+            generation_admission,
+        ))
+    }
+}
+
+impl ServingProvider for PlanOnlyProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn claims(&self, evidence: &CheckpointEvidence) -> bool {
+        evidence.model_type.as_deref() == Some("fixture")
+    }
+
+    fn admit_lattice(
+        &self,
+        evidence: &CheckpointEvidence,
+    ) -> Result<Box<dyn LatticeRoutePlan>, RouteRefusal> {
+        Ok(Box::new(PlanOnlyLatticeRoutePlan {
+            opened: Arc::clone(&self.opened),
+            directory: evidence.directory.clone(),
+        }))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn validate_standalone_options(
+        &self,
+        _entry: ServingEntry,
+        _route: Option<ServedRoute>,
+        _presence: &StandaloneOptionPresence,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_startup_description(
+        &self,
+        _format: ModelFormat,
+        _route: Option<ServedRoute>,
+    ) -> StandaloneStartupDescription {
+        StandaloneStartupDescription {
+            route_marker: None,
+            loading_label: "unknown",
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn prepare_standalone_load(
+        &self,
+        _evidence: CheckpointEvidence,
+        _route: Option<ServedRoute>,
+        _options: StandaloneLoadOptions,
+    ) -> Result<StandaloneLoadPlan, String> {
+        Err("fixture provider does not load standalone models".to_owned())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_factory(
+        &self,
+        _evidence: CheckpointEvidence,
+        _options: StandaloneLoadOptions,
+        _qwen_loader: StandaloneQwenLoader,
+    ) -> Result<crate::serving_factory::ServingFactory, String> {
+        Err("fixture provider does not build standalone factories".to_owned())
+    }
+}
+
+impl RegisteredProvider for PlanOnlyProvider {
+    fn generation(&self) -> Option<&dyn ServingProvider> {
+        Some(self)
+    }
+
+    fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider> {
+        None
+    }
+
+    fn text_embeddings(&self) -> Option<&dyn TextEmbeddingProvider> {
+        None
+    }
 }
 
 struct PooledTestProvider {
@@ -794,6 +1057,7 @@ struct TestProvider {
     claim: bool,
     route: Result<Option<ServedRoute>, RouteRefusal>,
     route_calls: AtomicUsize,
+    admission_calls: AtomicUsize,
 }
 
 impl TestProvider {
@@ -807,7 +1071,36 @@ impl TestProvider {
             claim,
             route,
             route_calls: AtomicUsize::new(0),
+            admission_calls: AtomicUsize::new(0),
         }
+    }
+}
+
+struct TestLatticeRoutePlan {
+    route: Option<ServedRoute>,
+}
+
+impl LatticeRoutePlan for TestLatticeRoutePlan {
+    fn selection_marker(&self) -> String {
+        self.route
+            .map(|route| route.selection_marker(ModelFormat::Safetensors))
+            .unwrap_or_default()
+    }
+
+    fn implicit_embeddings(&self, _model: &str) -> ImplicitPooledEmbeddingPlan {
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: None,
+            disabled_line: None,
+        }
+    }
+
+    fn open(
+        self: Box<Self>,
+        options: LatticeOpenOptions,
+        generation_admission: Arc<Semaphore>,
+    ) -> Result<crate::serving_host::ServingHandle, String> {
+        let _ = (self, options, generation_admission);
+        Err("test provider does not open a lattice route".to_owned())
     }
 }
 
@@ -818,6 +1111,15 @@ impl ServingProvider for TestProvider {
 
     fn claims(&self, _evidence: &CheckpointEvidence) -> bool {
         self.claim
+    }
+
+    fn admit_lattice(
+        &self,
+        _evidence: &CheckpointEvidence,
+    ) -> Result<Box<dyn LatticeRoutePlan>, RouteRefusal> {
+        self.admission_calls.fetch_add(1, Ordering::SeqCst);
+        self.route
+            .map(|route| Box::new(TestLatticeRoutePlan { route }) as Box<dyn LatticeRoutePlan>)
     }
 
     fn legacy_route(
@@ -856,7 +1158,14 @@ impl ServingProvider for TestProvider {
         format: ModelFormat,
         route: Option<ServedRoute>,
     ) -> StandaloneStartupDescription {
-        super::standalone_startup_description(format, route)
+        StandaloneStartupDescription {
+            route_marker: route.map(|route| route.selection_marker(format)),
+            loading_label: match format {
+                ModelFormat::Q4 => "q4",
+                ModelFormat::Safetensors => "bf16",
+                _ => "unknown",
+            },
+        }
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -958,3 +1267,5 @@ impl TextEmbeddingLoadPlan for TestTextLoadPlan {
         Err("test text service is not loadable".to_owned())
     }
 }
+
+mod lattice_route_markers;

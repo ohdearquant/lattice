@@ -1,16 +1,15 @@
 //! Gemma serving provider and typed CPU loader facade.
 
 use crate::error::InferenceError;
-use crate::model_format::ModelFamily;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::model_format::ModelFormat;
+use crate::model_format::{ModelFamily, ModelFormat};
 use crate::serve::route::{RouteRefusal, ServedRoute, select_route, select_standalone_route};
 use crate::serving_cpu::GemmaCpuServing;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
+use crate::serving_host::ServingHandle;
 use crate::serving_provider::{
-    CheckpointEvidence, ImplicitPooledEmbeddingPlan, RegisteredProvider, ServingEntry,
-    ServingProvider,
+    CheckpointEvidence, ImplicitPooledEmbeddingPlan, LatticeOpenOptions, LatticeRoutePlan,
+    RegisteredProvider, ServingEntry, ServingProvider,
 };
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_provider::{
@@ -18,6 +17,7 @@ use crate::serving_provider::{
     StandaloneQwenLoader, StandaloneStartupDescription,
 };
 use std::path::Path;
+use std::sync::Arc;
 
 pub(crate) mod cpu;
 mod preparation;
@@ -30,6 +30,35 @@ pub(crate) use preparation::{lora_unsupported_backend, prepare_gemma_chat_reques
 
 pub(in crate::serving_provider) struct GemmaProvider;
 
+struct GemmaLatticeRoutePlan {
+    evidence: CheckpointEvidence,
+}
+
+impl LatticeRoutePlan for GemmaLatticeRoutePlan {
+    fn selection_marker(&self) -> String {
+        "[route] selected family=gemma4 backend=cpu format=safetensors".to_owned()
+    }
+
+    fn implicit_embeddings(&self, model: &str) -> ImplicitPooledEmbeddingPlan {
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: None,
+            disabled_line: Some(format!(
+                "Embeddings disabled ({model}): not available for Gemma 4 checkpoints."
+            )),
+        }
+    }
+
+    fn open(
+        self: Box<Self>,
+        options: LatticeOpenOptions,
+        generation_admission: Arc<tokio::sync::Semaphore>,
+    ) -> Result<ServingHandle, String> {
+        let _ = options;
+        let cpu = cpu::load(&self.evidence)?;
+        Ok(ServingHandle::shared_cpu(cpu, generation_admission))
+    }
+}
+
 impl ServingProvider for GemmaProvider {
     fn name(&self) -> &'static str {
         "gemma"
@@ -37,6 +66,19 @@ impl ServingProvider for GemmaProvider {
 
     fn claims(&self, evidence: &CheckpointEvidence) -> bool {
         evidence.model_type.as_deref() == Some("gemma4")
+    }
+
+    fn admit_lattice(
+        &self,
+        evidence: &CheckpointEvidence,
+    ) -> Result<Box<dyn LatticeRoutePlan>, RouteRefusal> {
+        match evidence.format {
+            ModelFormat::Safetensors => Ok(Box::new(GemmaLatticeRoutePlan {
+                evidence: evidence.clone(),
+            })),
+            ModelFormat::Q4 => Err(RouteRefusal::GemmaMetalUnsupported),
+            _ => Err(RouteRefusal::UnrecognizedFormat),
+        }
     }
 
     fn legacy_route(
@@ -130,7 +172,19 @@ impl ServingProvider for GemmaProvider {
         format: ModelFormat,
         route: Option<ServedRoute>,
     ) -> StandaloneStartupDescription {
-        crate::serving_provider::standalone_startup_description(format, route)
+        let loading_label = if format == ModelFormat::Safetensors && route.is_some() {
+            "safetensors"
+        } else {
+            match format {
+                ModelFormat::Q4 => "q4",
+                ModelFormat::Safetensors => "bf16",
+                _ => "unknown",
+            }
+        };
+        StandaloneStartupDescription {
+            route_marker: route.map(|route| route.selection_marker(format)),
+            loading_label,
+        }
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]

@@ -523,7 +523,7 @@ impl MetalQwen35State {
             let mut out = vec![0.0f32; hidden];
             self.engine
                 .embed_tokens
-                .write_row(last_id as usize, out.as_mut_ptr(), hidden);
+                .write_row(last_id as usize, &mut out);
             out
         };
 

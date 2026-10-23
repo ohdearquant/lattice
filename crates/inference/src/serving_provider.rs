@@ -3,8 +3,6 @@
 use crate::error::InferenceError;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::forward::metal_qwen35::MetalQwen35State;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::model_format::ModelFamily;
 use crate::model_format::ModelFormat;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serve::lora::ResidencyLimits;
@@ -110,7 +108,7 @@ pub enum SelectionError {
         /// The provider names, in sorted order.
         claimants: Vec<&'static str>,
     },
-    /// The selected provider's legacy route projection refused this entry.
+    /// The selected provider refused this serving entry.
     Route {
         /// The inspected checkpoint directory.
         directory: PathBuf,
@@ -197,6 +195,16 @@ pub struct ImplicitPooledEmbeddingPlan {
     pub directory_to_try: Option<PathBuf>,
     /// Startup line to emit when pooled embeddings are disabled.
     pub disabled_line: Option<String>,
+}
+
+pub(crate) trait LatticeRoutePlan {
+    fn selection_marker(&self) -> String;
+    fn implicit_embeddings(&self, model: &str) -> ImplicitPooledEmbeddingPlan;
+    fn open(
+        self: Box<Self>,
+        options: LatticeOpenOptions,
+        generation_admission: Arc<Semaphore>,
+    ) -> Result<crate::serving_host::ServingHandle, String>;
 }
 
 pub(crate) trait RegisteredProvider: Sync {
@@ -408,41 +416,23 @@ pub struct StartedStandalone {
     pub context_source: Option<ServeContextSource>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) fn standalone_startup_description(
-    format: ModelFormat,
-    route: Option<ServedRoute>,
-) -> StandaloneStartupDescription {
-    let loading_label = if route.is_some_and(|route| route.family == ModelFamily::Gemma4) {
-        "safetensors"
-    } else {
-        match format {
-            ModelFormat::Q4 => "q4",
-            ModelFormat::Safetensors => "bf16",
-            ModelFormat::Unknown => "unknown",
-            _ => "unknown",
-        }
-    };
-    StandaloneStartupDescription {
-        route_marker: route.map(|route| route.selection_marker(format)),
-        loading_label,
-    }
-}
-
-/// The provider selected for one checkpoint and its existing route projection.
+/// The provider selected for one checkpoint and its admitted serving entry.
 #[doc(hidden)]
 pub struct SelectedProvider<'a> {
     #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
     provider: &'a dyn ServingProvider,
     evidence: CheckpointEvidence,
     entry: ServingEntry,
-    legacy_route: Option<ServedRoute>,
+    lattice_plan: Option<Box<dyn LatticeRoutePlan>>,
 }
 
 impl SelectedProvider<'_> {
-    /// The route the entry has historically exposed, if the entry defers it.
+    /// The route exposed by the selected provider's historical interface.
     pub fn legacy_route(&self) -> Option<ServedRoute> {
-        self.legacy_route
+        self.provider
+            .legacy_route(&self.evidence, self.entry)
+            .ok()
+            .flatten()
     }
 
     /// Describes the selected provider's implicit pooled embedding action.
@@ -451,13 +441,33 @@ impl SelectedProvider<'_> {
             .implicit_pooled_embeddings(&self.evidence, model)
     }
 
+    /// Describes the selected provider's implicit pooled embedding action.
+    #[doc(hidden)]
+    pub fn implicit_embeddings(&self, model: &str) -> ImplicitPooledEmbeddingPlan {
+        self.lattice_plan
+            .as_ref()
+            .map(|plan| plan.implicit_embeddings(model))
+            .unwrap_or_else(|| {
+                self.provider
+                    .implicit_pooled_embeddings(&self.evidence, model)
+            })
+    }
+
+    /// Returns the startup marker for an admitted `lattice serve` route.
+    #[doc(hidden)]
+    pub fn lattice_selection_marker(&self) -> Option<String> {
+        self.lattice_plan
+            .as_ref()
+            .map(|plan| plan.selection_marker())
+    }
+
     /// Load the selected provider's CPU route for `lattice serve`.
     pub fn load_lattice_cpu(&self) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
         if self.entry != ServingEntry::Lattice {
             return Err("CPU loading requested for a non-lattice entry".to_owned());
         }
         if self
-            .legacy_route
+            .legacy_route()
             .is_none_or(|route| route.backend != ServedBackend::Cpu)
         {
             return Err("CPU loading requested for a non-CPU route".to_owned());
@@ -475,37 +485,12 @@ impl SelectedProvider<'_> {
         if self.entry != ServingEntry::Lattice {
             return Err("lattice loading requested for a non-lattice entry".to_owned());
         }
-        let Some(route) = self.legacy_route else {
+        let Some(plan) = self.lattice_plan else {
             return Err(crate::model_format::unloadable_format_message(
                 &self.evidence.directory,
             ));
         };
-        match route.backend {
-            ServedBackend::Cpu => {
-                #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-                let _ = options;
-                let cpu = self.load_lattice_cpu()?;
-                Ok(crate::serving_host::ServingHandle::shared_cpu(
-                    cpu,
-                    generation_admission,
-                ))
-            }
-            ServedBackend::Metal => {
-                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-                {
-                    self.provider
-                        .open_lattice_metal(self.evidence, options)
-                        .map_err(|error| format!("failed to load Q4 model: {error}"))
-                }
-                #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-                {
-                    let _ = (options, generation_admission);
-                    Err(crate::model_format::metal_gpu_required_message(
-                        &self.evidence.directory,
-                    ))
-                }
-            }
-        }
+        plan.open(options, generation_admission)
     }
 
     /// Validate standalone flag presence through the selected provider.
@@ -516,14 +501,14 @@ impl SelectedProvider<'_> {
         presence: &StandaloneOptionPresence,
     ) -> Result<(), String> {
         self.provider
-            .validate_standalone_options(entry, self.legacy_route, presence)
+            .validate_standalone_options(entry, self.legacy_route(), presence)
     }
 
     /// Describe the route before model loading starts.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub fn standalone_startup_description(&self) -> StandaloneStartupDescription {
         self.provider
-            .standalone_startup_description(self.evidence.format, self.legacy_route)
+            .standalone_startup_description(self.evidence.format, self.legacy_route())
     }
 
     /// Prepare the selected provider's staged standalone load plan.
@@ -535,8 +520,9 @@ impl SelectedProvider<'_> {
         if self.entry != ServingEntry::Standalone {
             return Err("standalone load plan requested for a non-standalone entry".to_owned());
         }
+        let route = self.legacy_route();
         self.provider
-            .prepare_standalone_load(self.evidence, self.legacy_route, options)
+            .prepare_standalone_load(self.evidence, route, options)
     }
 
     /// Build the standalone worker factory through the selected provider.
@@ -559,32 +545,36 @@ impl SelectedProvider<'_> {
 pub(crate) trait ServingProvider: Sync {
     fn name(&self) -> &'static str;
     fn claims(&self, evidence: &CheckpointEvidence) -> bool;
+    fn admit_lattice(
+        &self,
+        evidence: &CheckpointEvidence,
+    ) -> Result<Box<dyn LatticeRoutePlan>, RouteRefusal>;
     fn legacy_route(
         &self,
         evidence: &CheckpointEvidence,
         entry: ServingEntry,
-    ) -> Result<Option<ServedRoute>, RouteRefusal>;
+    ) -> Result<Option<ServedRoute>, RouteRefusal> {
+        let _ = (evidence, entry);
+        Ok(None)
+    }
 
     fn implicit_pooled_embeddings(
         &self,
         evidence: &CheckpointEvidence,
         model: &str,
-    ) -> ImplicitPooledEmbeddingPlan;
+    ) -> ImplicitPooledEmbeddingPlan {
+        let _ = model;
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: Some(evidence.directory.clone()),
+            disabled_line: None,
+        }
+    }
 
     fn load_lattice_cpu(
         &self,
         _evidence: &CheckpointEvidence,
     ) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
         Err("selected provider does not load a lattice CPU route".to_owned())
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    fn open_lattice_metal(
-        &self,
-        _evidence: CheckpointEvidence,
-        _options: LatticeOpenOptions,
-    ) -> Result<crate::serving_host::ServingHandle, String> {
-        Err("selected provider does not load a lattice Metal route".to_owned())
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -624,7 +614,7 @@ pub(crate) struct ProviderRegistry<'a> {
     legacy_generation: &'a dyn ServingProvider,
 }
 
-/// Select a provider and project the route for one serving entry.
+/// Select a provider and admit one serving entry.
 #[doc(hidden)]
 pub fn select(
     evidence: CheckpointEvidence,
@@ -659,19 +649,33 @@ pub(crate) fn select_with_registry<'a>(
             });
         }
     };
-    let legacy_route =
-        provider
-            .legacy_route(&evidence, entry)
-            .map_err(|refusal| SelectionError::Route {
-                directory: evidence.directory.clone(),
-                refusal,
-            })?;
+    let lattice_plan = match entry {
+        ServingEntry::Lattice => {
+            let plan =
+                provider
+                    .admit_lattice(&evidence)
+                    .map_err(|refusal| SelectionError::Route {
+                        directory: evidence.directory.clone(),
+                        refusal,
+                    })?;
+            Some(plan)
+        }
+        ServingEntry::Standalone => {
+            provider
+                .legacy_route(&evidence, entry)
+                .map_err(|refusal| SelectionError::Route {
+                    directory: evidence.directory.clone(),
+                    refusal,
+                })?;
+            None
+        }
+    };
 
     Ok(SelectedProvider {
         provider,
         evidence,
         entry,
-        legacy_route,
+        lattice_plan,
     })
 }
 

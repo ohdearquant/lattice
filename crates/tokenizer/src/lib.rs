@@ -2,7 +2,7 @@
 //!
 //! The crate provides WordPiece, SentencePiece, Qwen-style byte-level BPE, and
 //! Gemma BPE tokenizers behind the [`Tokenizer`] trait, together with model
-//! directory auto-detection and incremental detokenization.
+//! directory auto-detection.
 
 pub mod bpe;
 pub mod common;
