@@ -14,7 +14,7 @@ use super::prepared_facts::{
     BertGeometryLimits, BertPoolerMembers, PreparedBertFactError, PreparedBertGeometry,
     RawBertConfigFacts, RequiredBertTensorCensus, analyze_prepared_geometry,
 };
-use crate::weights::prepared_safetensors_inventory::{
+use lattice_weights::prepared_safetensors_inventory::{
     PreparedSafetensorsDtype, PreparedSafetensorsInventoryFacts, PreparedSafetensorsTensorView,
 };
 

@@ -113,8 +113,8 @@ shared `grammar` module.
 The training-side implementation lives in `crates/tune`. Backward-pass gradients are behind
 the `train-backward` feature in `backward/`.
 
-**Quantization.** Q4 and Q8 weight structs are in `weights/q4_weights.rs` and
-`weights/q8_weights.rs`. Pre-transform math (QuaRot) is in the `quant/quarot/` module
+**Quantization.** Q4 and Q8 weight structs are in `crates/weights/src/q4_weights.rs` and
+`crates/weights/src/q8_weights.rs`. Pre-transform math (QuaRot) is in the `quant/quarot/` module
 (`hadamard.rs`, `convert.rs`, `pipeline.rs`). Wiring QuaRot into the Q4 load path is tracked
 in ADR-044.
 

@@ -12,7 +12,7 @@ f16-resident buffers, so fake-quant reproduces the numerics the real
 container would produce without container/kernel changes.
 
 This script does NOT reimplement the Rust Q4 quantizer as a fresh design —
-it replicates crates/inference/src/weights/q4_weights.rs's
+it replicates crates/weights/src/q4_weights.rs's
 `quantize_block_with_mode_len` arithmetic exactly (same block chunking over
 the flattened tensor, same min/max-derived affine scale/bias, same
 abs_max/7 symmetric scale with bias=-8*scale, same f32::round-half-away-

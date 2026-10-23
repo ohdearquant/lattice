@@ -3,7 +3,7 @@ use crate::model::qwen35_config::{LayerType, compute_layer_types};
 use crate::quant::quarot::lm_head::{
     QWEN35_EMBED_TOKENS_NAME, QWEN35_FINAL_NORM_NAME, QWEN35_LM_HEAD_NAME,
 };
-use crate::weights::q4_weights::q4_f32_to_f16;
+use lattice_weights::q4_weights::q4_f32_to_f16;
 use serde_json::Value;
 use std::path::PathBuf;
 

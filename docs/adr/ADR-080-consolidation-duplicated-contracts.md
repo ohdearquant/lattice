@@ -16,7 +16,7 @@
   (merged 2026-07-11).
 - Amendment (#829) — canonical model-directory format detector (`ModelFormat`/
   `detect_format`, plus its two error-message helpers) consolidated into
-  `crates/inference/src/model_format.rs`, shared by `lattice`, `lattice_serve`,
+  `crates/weights/src/model_format.rs`, shared by `lattice`, `lattice_serve`,
   and `chat_metal`; see "Amendment: model-format detector consolidation" below.
 - Amendment (#1052) — request normalization now owns backend-independent
   normalized message/role types, both servers use one contract-to-engine adapter
@@ -287,7 +287,7 @@ establish.
 **Extraction plan.** `ModelFormat`, `detect_format`, and the two format-specific error-message
 helpers (`metal_gpu_required_message`, `unrecognized_format_message`) moved, unmodified in
 behavior for `lattice.rs`, `lattice_serve.rs`, and `chat_metal.rs` (their own detectors were
-already index-aware), into a new `crates/inference/src/model_format.rs` — a `pub mod` of the library crate
+already index-aware), into a new `crates/weights/src/model_format.rs` — a `pub mod` of the library crate
 rather than a `pub(crate)` module of one binary, because separate Cargo `[[bin]]` targets
 (`lattice`, `lattice_serve`, `chat_metal`) cannot see one another's `pub(crate)` items; only a
 library module is visible to all three. The module is a plain `pub mod` (externally nameable,
@@ -312,7 +312,7 @@ both an index file and stray `.q4` files therefore used to route those three bin
 loader; the canonical detector's index-aware precedence now routes the same directory to
 `Safetensors`. Ordinary safetensors-only, ordinary Q4-only, and Unknown/no-sentinel directories
 are unaffected. See `detect_format_prefers_safetensors_index_over_q4_files` in
-`model_format.rs` for the regression test covering this case.
+`crates/weights/src/model_format/tests.rs` for the regression test covering this case.
 
 **Resolves**: #829 — one canonical model-format detector, zero remaining local
 re-implementations in `lattice.rs`, `lattice_serve.rs`, `chat_metal.rs`, or the three
