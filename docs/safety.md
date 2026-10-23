@@ -42,8 +42,8 @@ The library's own unsafe Metal code sends Objective-C messages directly and read
 shared-storage buffers through the raw pointer that `contents()` returns. All of it is under
 `crates/inference/src/forward/`: `metal.rs`, `metal_gemm.rs`, `moe_expert_cache.rs`, and the
 `metal_qwen35`, `metal_ernie45` and `metal_embeddinggemma2` modules. Elsewhere, library code
-uses `metal-rs` through safe calls only; benchmarks and examples under `crates/inference/benches/`
-and `crates/inference/examples/` also use raw buffer pointers and direct message sends.
+uses `metal-rs` through safe calls only. Benchmarks under `crates/inference/benches/` also access
+buffers through raw pointers, and examples under `crates/inference/examples/` do both.
 
 **f16 bit-casts** — Half-precision weights are loaded as `u16` and reinterpreted as `f16`.
 The cast is done through `bytemuck::cast_slice` with the `Pod` bound, which is safe only for
