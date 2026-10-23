@@ -363,7 +363,7 @@ impl ExpertByteTable {
     /// writes; it is re-verified here, not just assumed, via the
     /// block-alignment check below.
     fn open(path: &Path, expected_shape: &[usize]) -> Result<Self, String> {
-        use crate::weights::q4_weights::{Q4BlockCheck, open_and_mmap_q4_file};
+        use lattice_weights::q4_weights::{Q4BlockCheck, open_and_mmap_q4_file};
 
         // Scale/bias is validated per expert in `dequant_expert_f16`, which
         // already walks that expert's blocks; an expert routing never selects
@@ -404,7 +404,7 @@ impl ExpertByteTable {
         // multiples of 32), but asserted here — not just claimed in a
         // comment — because a violation would silently corrupt or overrun
         // neighboring experts' bytes instead of failing to load.
-        if !per_expert_elems.is_multiple_of(crate::weights::q4_weights::Q4_BLOCK_WEIGHTS) {
+        if !per_expert_elems.is_multiple_of(lattice_weights::q4_weights::Q4_BLOCK_WEIGHTS) {
             return Err(format!(
                 "{}: per-expert element count {per_expert_elems} is not a multiple of the Q4 \
                  block size (32) — an expert's byte range would not be block-aligned within \
@@ -415,7 +415,7 @@ impl ExpertByteTable {
                 path.display()
             ));
         }
-        let per_expert_blocks = per_expert_elems / crate::weights::q4_weights::Q4_BLOCK_WEIGHTS;
+        let per_expert_blocks = per_expert_elems / lattice_weights::q4_weights::Q4_BLOCK_WEIGHTS;
         let per_expert_bytes = per_expert_blocks * 20;
 
         Ok(Self {
@@ -454,7 +454,7 @@ impl ExpertByteTable {
     /// doc comment), so no expert's bytes are scanned twice, and an expert
     /// that is never selected by routing is never scanned at all.
     fn dequant_expert_f16(&self, expert_id: usize) -> Result<Vec<u16>, String> {
-        use crate::weights::q4_weights::{
+        use lattice_weights::q4_weights::{
             q4_f16_to_f32, q4_f32_to_f16, validate_q4_block_metadata,
         };
 

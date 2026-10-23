@@ -18,7 +18,7 @@ Loading model weights is the dominant startup-latency operation for inference se
 3. **Type conversion**: F16 and BF16 tensors cannot be used in-place by the f32 compute kernels. They must be converted and cached.
 4. **Sharding**: Multi-shard checkpoints must be served transparently, opening each shard lazily to avoid holding all file descriptors simultaneously.
 
-Relevant implementation: `src/weights/f32_weights.rs`.
+Relevant implementation: `crates/weights/src/f32_weights.rs`.
 
 The file contains a hand-written structural `JsonParser` (with `serde_json` used only for one bounded string token at a time), `memmap2::Mmap` for the binary data, `TensorMeta` with an `OnceLock<Box<[f32]>>` for lazy conversion cache, and `ShardedSafetensors` for multi-file checkpoints.
 
@@ -177,8 +177,8 @@ after structural preflight.
 
 ## References
 
-- `src/weights/f32_weights.rs` — `SafetensorsFile`, `JsonParser`, `TensorMeta`, `ShardedSafetensors`
-- `src/weights/ingress.rs` — private external-bytes-to-tensor validation seam
+- `crates/weights/src/f32_weights.rs` — `SafetensorsFile`, `JsonParser`, `TensorMeta`, `ShardedSafetensors`
+- `crates/weights/src/ingress.rs` — private external-bytes-to-tensor validation seam
 - `src/model/{bert.rs,qwen.rs,qwen35/model.rs}` — atomic public construction facades
 - `src/model/qwen.rs` — `SafetensorsStorage`, `ShardedQwenBacking`, field drop order comment
 - `src/lib.rs` — stability note on 153 unsafe blocks

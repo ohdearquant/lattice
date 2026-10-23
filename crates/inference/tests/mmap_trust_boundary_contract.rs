@@ -15,8 +15,8 @@
 //! anything short of the compiler's own control-flow graph.
 //!
 //! This file replaces that walker with a property about **module
-//! boundaries** instead, which is a small, countable space: [`weights::mmap_trust`]
-//! is now the *only* place in this crate permitted to construct a memory map
+//! boundaries** instead, which is a small, countable space: `lattice_weights::mmap_trust`
+//! is now the *only* place in this crate or a crate split out of it permitted to construct a memory map
 //! (`memmap2::Mmap::map(..)` or `memmap2::MmapOptions::new()...map(..)`) from
 //! a checkpoint file. Every production construction site that used to call
 //! `Mmap::map`/`MmapOptions` directly (`quant/quarot/io.rs`,
@@ -128,10 +128,12 @@ mod workspace_metadata;
 const CONSTRUCTION_TOKENS: &[&str] = &["Mmap::map", "MmapOptions"];
 
 /// The sole file permitted to name a [`CONSTRUCTION_TOKENS`] token anywhere
-/// in this crate's `src/` tree (code, doc comment, or otherwise -- see the
-/// module doc comment's "plain per-line text scan" section for why this
-/// contract does not distinguish them).
-const TRUST_BOUNDARY_FILE: &str = "src/weights/mmap_trust.rs";
+/// in this crate's `src/` tree or an extracted workspace crate's source tree (code,
+/// doc comment, or otherwise -- see the module doc comment's "plain per-line
+/// text scan" section for why this contract does not distinguish them). It
+/// moved into `lattice-weights` with the rest of weight storage, so it is
+/// relative to this crate's manifest directory.
+const TRUST_BOUNDARY_FILE: &str = "../weights/src/mmap_trust.rs";
 
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
@@ -221,6 +223,8 @@ fn only_the_mmap_trust_boundary_names_a_construction_api() {
         "lattice-inference-core",
         "lattice-tokenizer",
         "lattice-grammar",
+        "lattice-weights",
+        "lattice-quant",
     ] {
         assert!(
             scanned.iter().any(|name| name == required),

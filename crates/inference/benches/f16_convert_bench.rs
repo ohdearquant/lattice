@@ -4,8 +4,8 @@
 //! Measures at N=1024 (the Qwen3.5-0.8B hidden size):
 //! - `scalar`: the crate's production scalar decoder
 //!   (`lattice_inference::weights::bench_support::f16_bits_to_f32`, which
-//!   `weights/mod.rs` re-exports behind `bench-internals` from the single
-//!   always-compiled `weights::half_bits` module every load/quant call site
+//!   `weights.rs` re-exports behind `bench-internals` from the single
+//!   always-compiled `lattice_weights::half_bits` module every load/quant call site
 //!   delegates to — lattice#799). This bench previously carried its own
 //!   copied decoder rather than exercising that migrated path, so its
 //!   numbers said nothing about the consolidation. Requires `--features bench-internals`.

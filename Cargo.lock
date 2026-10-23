@@ -1650,7 +1650,9 @@ dependencies = [
  "lattice-fann",
  "lattice-grammar",
  "lattice-inference-core",
+ "lattice-quant",
  "lattice-tokenizer",
+ "lattice-weights",
  "libc",
  "memmap2",
  "metal 0.33.0",
@@ -1681,6 +1683,18 @@ dependencies = [
 [[package]]
 name = "lattice-inference-core"
 version = "0.14.0"
+
+[[package]]
+name = "lattice-quant"
+version = "0.14.0"
+dependencies = [
+ "lattice-inference-core",
+ "lattice-weights",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "lattice-tokenizer"
@@ -1723,6 +1737,20 @@ dependencies = [
  "thiserror 2.0.19",
  "uuid",
  "wgpu 23.0.1",
+]
+
+[[package]]
+name = "lattice-weights"
+version = "0.14.0"
+dependencies = [
+ "half",
+ "lattice-inference-core",
+ "libc",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

@@ -23,6 +23,17 @@ that did not match the repository. Changed:
    Context counting method, the Context statement that `bytes_to_unicode` is public (its facade re-export is
    `cfg(test)` only), and the compile-scope consequence.
 
+## Amendment 2 (2026-10-22)
+
+The grammar extraction (lattice-grammar) met a case D5 did not cover: a consumer-feature gate on a public item that
+the facade re-exports. Changed:
+
+1. D5: such a gate is kept, as a feature of the new crate with the same name and meaning, forwarded by the facade's
+   feature of that name. Removing it would compile the item unconditionally and add it to the facade's default public
+   listing, which breaks D6.2's identical listing. First case: lattice-grammar `bench-internals` (`BfsDedupProfile`,
+   `profile_reachable_states`, and a test module gated `all(test, feature = "bench-internals")`, now run by its own
+   Linux CI step). The removal rule still applies to gates on items that are not on the facade's public listing.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
@@ -58,7 +69,7 @@ Measured at `main` b58ce287 with `wc -l` over the `.rs` files under each crate's
 | `lattice-fann`      |                                 13,516 |
 | `lattice-transport` |                                  5,723 |
 
-`lattice-inference` is about 84% of the workspace's library source. Its largest top-level modules are `forward`
+`lattice-inference` is about 84% of the workspace's source lines. Its largest top-level modules are `forward`
 (89,894 lines), `model` (57,355), `bin` (29,771), `weights` (22,509), `serve` (21,709), `attention` (16,348), `quant`
 (15,691), `grammar` (13,595), `vision` (11,033), `decoder` (9,282) and `tokenizer` (8,243). Every change to any of them
 recompiles the whole crate, review ownership is crate-wide, and a downstream user who needs one tokenizer compiles a
@@ -182,6 +193,13 @@ three tokenizer items listed under Context) is removed in the move, and the item
 a gate would require the new crate to declare consumer features it does not use, only so the facade can forward them.
 Where the gate also has a `cfg(test)` alternative, it cannot be kept at all: `cfg(test)` is false in a dependency when
 the facade's tests run, so a kept gate would break the CPU test suites that call these items today.
+
+A consumer-feature gate on a public item that the facade re-exports is kept, as a feature of the new crate with the
+same name and meaning, forwarded by the facade's feature of that name (Amendment 2). Removing it would compile the item
+unconditionally and add it to the facade's default public listing, which breaks D6.2's identical listing. First case:
+lattice-grammar `bench-internals`. The removal rule above still applies to gates on items that are not on the facade's
+public listing.
+
 New crates add no default features of their own; the facade's defaults are unchanged.
 
 ### D6. Acceptance of every extraction change

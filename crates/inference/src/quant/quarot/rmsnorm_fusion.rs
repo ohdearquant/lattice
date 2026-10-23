@@ -39,8 +39,8 @@
 //! ```text
 //!   1. read f64 tensors
 //!   2. fuse_per_layer_shifted_rmsnorm     ← THIS MODULE
-//!   3. absorb rotation plan               ← quant/quarot/rotation.rs
-//!   4. quantize                           ← weights/q4_weights.rs (step 3c-1)
+//!   3. absorb rotation plan               ← lattice-quant quarot/rotation.rs
+//!   4. quantize                           ← lattice-weights q4_weights.rs (step 3c-1)
 //! ```
 //!
 //! Fusion MUST happen before rotation absorption: input-side absorption

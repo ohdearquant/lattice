@@ -814,7 +814,7 @@ fn write_khf1_f16_file(path: &Path, shape: &[usize], values: &[f32]) {
     }
     buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
     for v in values {
-        buf.extend_from_slice(&crate::weights::half_bits::f32_to_f16_bits(*v).to_le_bytes());
+        buf.extend_from_slice(&lattice_weights::half_bits::f32_to_f16_bits(*v).to_le_bytes());
     }
     std::fs::write(path, &buf).expect("test setup: write f16 file");
 }

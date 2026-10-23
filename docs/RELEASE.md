@@ -16,11 +16,15 @@ lattice-fann, lattice-transport,  (leaf crates, no internal deps)
 lattice-inference-core
         │
         ▼  (wait for crates.io indexing)
-lattice-tokenizer, lattice-grammar (depend on lattice-inference-core)
+lattice-tokenizer, lattice-grammar, lattice-weights
+                                (depend on lattice-inference-core)
         │
         ▼  (wait for crates.io indexing)
-lattice-inference                 (depends on lattice-inference-core, lattice-tokenizer, lattice-grammar and on
-                                   lattice-fann via the `mixture` feature)
+lattice-quant                   (depends on lattice-inference-core and lattice-weights)
+        │
+        ▼  (wait for crates.io indexing)
+lattice-inference               (depends on lattice-inference-core, lattice-tokenizer, lattice-grammar,
+                                 lattice-weights, lattice-quant; optional lattice-fann via `mixture` or `metal-gpu`)
         │
         ▼  (wait for crates.io indexing)
 lattice-embed, lattice-tune       (depend on lattice-inference / lattice-transport / lattice-fann)
@@ -49,14 +53,14 @@ make ci  # fmt + clippy + doc lint + test + release build
 # 4. Dry-run publish (catches missing fields, version conflicts)
 make publish-dry
 
-# 5. Package size against the crates.io upload limit, all eight crates
+# 5. Package size against the crates.io upload limit, all ten crates
 scripts/package-size-check.sh
 ```
 
 `make publish-dry` only validates the leaf tier (`lattice-fann`, `lattice-transport`,
 `lattice-inference-core`) — Cargo cannot dry-run a crate whose internal path dependencies are not
-yet live on the registry, so `lattice-tokenizer`, `lattice-grammar`, `lattice-inference`, `lattice-embed`, and
-`lattice-tune` are not covered by the dry run.
+yet live on the registry, so `lattice-tokenizer`, `lattice-grammar`, `lattice-weights`,
+`lattice-quant`, `lattice-inference`, `lattice-embed`, and `lattice-tune` are not covered by the dry run.
 
 ### Package size
 
@@ -64,7 +68,7 @@ That same gap hides the registry's upload limit until publish time, which is the
 to find it: crates.io rejects an archive over 10 MiB (10,485,760 bytes), and a rejection in
 the second tier leaves the first tier already published and immutable.
 
-`scripts/package-size-check.sh` covers all eight crates and needs no registry access. It
+`scripts/package-size-check.sh` covers all ten crates and needs no registry access. It
 brackets each archive from `cargo package --list`, which builds nothing and names exactly the
 files that would ship, gzipped at level 6 — cargo's default, and the level to use here,
 because level 9 shaves enough off the estimate to flatter a crate that is close to the limit.
@@ -108,6 +112,11 @@ sleep 30   # wait for crates.io indexing
 
 cargo publish -p lattice-tokenizer
 cargo publish -p lattice-grammar
+cargo publish -p lattice-weights
+
+sleep 30   # wait for crates.io indexing
+
+cargo publish -p lattice-quant
 
 sleep 30   # wait for crates.io indexing
 
@@ -136,9 +145,9 @@ state and every remote asset before retrying.
 
 ## Post-release
 
-- [ ] Verify on crates.io: all eight crates (`lattice-fann`, `lattice-transport`,
-      `lattice-inference-core`, `lattice-tokenizer`, `lattice-grammar`, `lattice-inference`, `lattice-embed`,
-      `lattice-tune`) show `v{VERSION}`.
+- [ ] Verify on crates.io: all ten crates (`lattice-fann`, `lattice-transport`,
+      `lattice-inference-core`, `lattice-tokenizer`, `lattice-grammar`, `lattice-weights`,
+      `lattice-quant`, `lattice-inference`, `lattice-embed`, `lattice-tune`) show `v{VERSION}`.
 - [ ] Smoke test: `cargo add lattice-inference@{VERSION}` in a fresh project.
 - [ ] Update `docs/getting-started.md` only if the public API changed.
 - [ ] Close the relevant milestone/issues.
@@ -166,7 +175,7 @@ gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f ta
 
 # 4. Only after the replacement is live on crates.io and its GitHub asset workflow succeeds,
 #    yank the broken version from every published crate:
-for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-grammar lattice-inference lattice-embed lattice-tune; do
+for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-quant lattice-inference lattice-embed lattice-tune; do
   cargo yank --version {BROKEN_VERSION} "$c"
 done
 

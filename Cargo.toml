@@ -9,6 +9,8 @@ members = [
     "crates/fann",
     "crates/tune",
     "crates/transport",
+    "crates/weights",
+    "crates/quant",
 ]
 
 [workspace.package]

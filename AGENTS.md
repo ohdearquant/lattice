@@ -94,22 +94,25 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ```
 fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
                                        |
-                           tokenizer (8K)   grammar   ← depend on inference-core
+                     tokenizer (8K)   grammar   weights   ← depend on inference-core
+                                                 |
+                                               quant     ← depends on inference-core + weights
     |                                  |
-inference (~118K)                                 ← depends on inference-core + tokenizer + grammar;
-    |                                               optional dep on fann (`mixture` feature)
+inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant;
+    |                                               optional dep on fann (`mixture` or `metal-gpu` feature)
 embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
 ```
 
-`inference-core` (the shared `InferenceError`), `tokenizer` and `grammar` were split out of
-`inference`; all three edges into them are unconditional, and `inference` re-exports their
-public items at the paths they had before the split. Of the four edges among the
+`inference-core` (the shared `InferenceError`), `tokenizer`, `grammar`, `weights` and
+`quant` were split out of `inference`; all five edges into them are unconditional.
+`quant` depends on `inference-core` and `weights`. `inference` re-exports the extracted
+public items at their original paths. Of the four edges among the
 other crates, three are feature-gated, and the gates do not all default the
 same way, so "depends on" in the diagram is not one relationship. `tune` depends on
 `fann` unconditionally. The other three are optional deps: `embed` to `inference` is
 enabled through `native`, which is in embed's default set, so it is present in an
-ordinary build; `inference` to `fann` is behind `mixture` and `tune` to `inference` is
-behind `inference-hook` or `train-backward`, and neither of those is in its crate's
+ordinary build; `inference` to `fann` is behind `mixture` or `metal-gpu`, and `tune` to
+`inference` is behind `inference-hook` or `train-backward`, and neither of those is in its crate's
 default set. A default `cargo build -p lattice-tune` therefore does not compile
 `lattice-inference` at all — six targets pull it in through `required-features` and
 that is the whole of its reach. Check the manifest before assuming an edge is live in
@@ -147,22 +150,51 @@ the build you are looking at.
 Its only internal runtime dependency is `inference-core`; `tokenizer` is a test dependency.
 The `bench-internals` feature exposes profiling probes and is forwarded by the facade.
 
+### lattice-weights — Weight storage and model formats
+
+| Module            | Purpose                          | Key Exports                                      |
+| ----------------- | -------------------------------- | ------------------------------------------------ |
+| `f32_weights.rs`  | Safetensors loading and tensors  | `SafetensorsFile`, `TensorSource`, `BertWeights` |
+| `f16_weights.rs`  | Half-precision weight storage    | `F16`, `F16ModelWeights`                         |
+| `q3_weights.rs`   | Q3 storage and conversion        | `Q3Tensor`, `Q3Block`                            |
+| `q4_weights.rs`   | Q4 storage and conversion        | `Q4Tensor`, `Q4Block`                            |
+| `q8_weights.rs`   | Q8 storage and conversion        | `Q8Matrix`, `quantize_matrix`                    |
+| `model_format.rs` | Model-directory format detection | `ModelFormat`, `ModelFamily`, `inspect_format`   |
+
+Its only internal runtime dependency is `inference-core`. The inference facade retains
+its existing `weights` and `model_format` paths.
+
+### lattice-quant — Quantization primitives
+
+| Module               | Purpose                               | Key Exports                                       |
+| -------------------- | ------------------------------------- | ------------------------------------------------- |
+| `q4_manifest.rs`     | Bounded Q4 checkpoint manifest reads  | `Q4Manifest`, `Q4ManifestError`, `load_manifest`  |
+| `quarot/hadamard.rs` | Walsh-Hadamard transforms             | `RandomizedHadamard`, `BlockHadamard`             |
+| `quarot/rotation.rs` | Absorb rotations into weight matrices | `absorb_input_rotation`, `absorb_output_rotation` |
+
+Its internal runtime dependencies are `inference-core` and `weights`; the manifest
+reader uses the bounded file reader from `weights`. The inference facade retains the
+existing `quant::q4_manifest`, `quant::quarot::hadamard` and `quant::quarot::rotation`
+paths. Conversion orchestration and the remaining QuaRot modules stay in inference.
+
 ### lattice-inference — Transformer kernel
 
-| Module           | Purpose                      | Key Exports                                                                       |
-| ---------------- | ---------------------------- | --------------------------------------------------------------------------------- |
-| `model/`         | Model configs and loaders    | `BertConfig`, `BertModel`, `QwenConfig`, `QwenModel`, `CrossEncoderModel`         |
-| `tokenizer/`     | Re-exports lattice-tokenizer | `Tokenizer` trait, `WordPieceTokenizer`, `SentencePieceTokenizer`, `BpeTokenizer` |
-| `grammar/`       | Re-exports lattice-grammar   | `GrammarEngine`, `GrammarError`, `GrammarSpec`                                    |
-| `weights/`       | Weight storage formats       | `F32Weights`, `F16Weights`, `Q8Weights`, `Q4Weights`                              |
-| `attention/`     | Attention mechanisms         | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
-| `forward/`       | Compute backends             | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
-| `kv_cache/`      | KV cache for generation      | `FlatKVCache`, `PagedKVCache`                                                     |
-| `speculative.rs` | Speculative decoding         | `NgramSpeculator`, `MtpVerifier`                                                  |
-| `lora_hook.rs`   | LoRA adapter injection trait | `LoraHook`, `NoopLoraHook`                                                        |
-| `rope.rs`        | Rotary positional encoding   | `RopeTable`                                                                       |
-| `sampling.rs`    | Token sampling               | `SamplingConfig`, `sample_token`                                                  |
-| `download.rs`    | HuggingFace model download   | `ensure_model_files`                                                              |
+| Module            | Purpose                                             | Key Exports                                                                       |
+| ----------------- | --------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `model/`          | Model configs and loaders                           | `BertConfig`, `BertModel`, `QwenConfig`, `QwenModel`, `CrossEncoderModel`         |
+| `tokenizer/`      | Re-exports lattice-tokenizer                        | `Tokenizer` trait, `WordPieceTokenizer`, `SentencePieceTokenizer`, `BpeTokenizer` |
+| `grammar/`        | Re-exports lattice-grammar                          | `GrammarEngine`, `GrammarError`, `GrammarSpec`                                    |
+| `weights.rs`      | Re-exports lattice-weights                          | `SafetensorsFile`, `F16ModelWeights`, `Q8Matrix`, `Q4Tensor`                      |
+| `model_format.rs` | Re-exports format detection                         | `ModelFormat`, `ModelFamily`, `inspect_format`                                    |
+| `quant/`          | Quantization orchestration and primitive re-exports | `Q4Manifest`, `RandomizedHadamard`, `BlockHadamard`                               |
+| `attention/`      | Attention mechanisms                                | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
+| `forward/`        | Compute backends                                    | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
+| `kv_cache/`       | KV cache for generation                             | `FlatKVCache`, `PagedKVCache`                                                     |
+| `speculative.rs`  | Speculative decoding                                | `NgramSpeculator`, `MtpVerifier`                                                  |
+| `lora_hook.rs`    | LoRA adapter injection trait                        | `LoraHook`, `NoopLoraHook`                                                        |
+| `rope.rs`         | Rotary positional encoding                          | `RopeTable`                                                                       |
+| `sampling.rs`     | Token sampling                                      | `SamplingConfig`, `sample_token`                                                  |
+| `download.rs`     | HuggingFace model download                          | `ensure_model_files`                                                              |
 
 ### lattice-embed — Embedding service
 
@@ -269,7 +301,7 @@ GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Ru
 
 ### Bench-Compare Disposition
 
-Every PR that touches `crates/inference/`, `crates/inference-core/`, `crates/tokenizer/`, `crates/grammar/`,
+Every PR that touches `crates/inference/`, `crates/inference-core/`, `crates/tokenizer/`, `crates/grammar/`, `crates/weights/`, `crates/quant/`,
 `crates/embed/`, or `crates/fann/` must include a bench-compare disposition in its description.
 By default, run `make bench-compare` and paste its A/B table into the PR body. If the result shows no change, state that as the disposition.
 `crates/fann/` is covered both because it feeds inference through the optional `mixture` feature
@@ -283,7 +315,7 @@ sufficient.
 
 ### E2E Parity Gate
 
-PRs touching `crates/inference/src/`, `crates/inference-core/src/`, `crates/tokenizer/src/`, `crates/grammar/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
+PRs touching `crates/inference/src/`, `crates/inference-core/src/`, `crates/tokenizer/src/`, `crates/grammar/src/`, `crates/weights/src/`, `crates/quant/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
 
 The `perf-baselines` branch is still updated by `bench-update.yml` on merge to main for trend tracking.
 
