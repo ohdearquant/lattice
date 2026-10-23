@@ -349,7 +349,7 @@ The attention processes KV in three segments to avoid divergent per-token format
 
 **D8: int4 KV with Hadamard rotation using existing QuaRot machinery.**
 
-QuaRot's rotation infrastructure (`crates/inference/src/quant/quarot/` -- 11 source files: hadamard.rs, rotation.rs, pipeline.rs, etc.) provides Walsh-Hadamard transforms for power-of-2 dimensions. This extends naturally to KV cache rotation:
+QuaRot's rotation primitives (`crates/quant/src/quarot/hadamard.rs` and `crates/quant/src/quarot/rotation.rs`, with pipeline code under `crates/inference/src/quant/quarot/`) provide Walsh-Hadamard transforms for power-of-2 dimensions. This extends naturally to KV cache rotation:
 
 - **WHT block size**: 32 or 64 (power-of-two butterfly over head_dim).
 - **K rotation**: pair with Q rotation for dot-product invariance. `Q_rot @ K_rot^T = (R @ Q) @ (R @ K)^T = Q @ R^T @ R @ K^T = Q @ K^T` (orthogonality).
@@ -449,7 +449,7 @@ Realistic same-hardware target after f16 KV + MLX-style FA2: **~180-230 tok/s** 
 
 - **TTFT improvement**: FA2 tiling is the single biggest TTFT improvement available. Expect 2-5x prefill speedup at 4K+ context.
 - **KV quantization chain**: f16 -> int8 -> int4 gives 2x -> 4x -> 8x KV memory reduction, enabling longer contexts within the same memory budget.
-- **Reuses existing infrastructure**: WHT rotation reuses QuaRot's Hadamard machinery (quarot/hadamard.rs, quarot/rotation.rs). Paged KV reuses ADR-047's PagedKVCache and PrefixPageCache.
+- **Reuses existing infrastructure**: WHT rotation reuses QuaRot's Hadamard machinery (`crates/quant/src/quarot/hadamard.rs`, `crates/quant/src/quarot/rotation.rs`). Paged KV reuses ADR-047's PagedKVCache and PrefixPageCache.
 - **Shader extraction** enables per-kernel profiling, isolated testing, and future model architecture support (Llama, Gemma) without touching the monolithic file.
 
 ### Negative
@@ -501,7 +501,8 @@ Realistic same-hardware target after f16 KV + MLX-style FA2: **~180-230 tok/s** 
 - `crates/inference/src/kv_cache/flat.rs` -- FlatKVCache (f32-only)
 - `crates/inference/src/kv_cache/paged.rs` -- PagedKVCache with prefix integration
 - `crates/inference/src/kv_cache/prefix.rs` -- PrefixPageCache (built, unwired to forward path)
-- `crates/inference/src/quant/quarot/` -- QuaRot rotation infrastructure (WHT, absorption, pipeline)
+- `crates/quant/src/quarot/` -- QuaRot WHT and rotation absorption
+- `crates/inference/src/quant/quarot/` -- QuaRot conversion pipeline
 
 ### ADRs
 

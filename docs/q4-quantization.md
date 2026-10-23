@@ -344,7 +344,7 @@ your smaller checkpoint's actual tensors. Copy `config.json` in and re-run `doct
 the conversion itself is broken.
 
 The bounded, fail-closed read of `quantize_index.json` is centralized in one place: the
-`lattice_inference::quant::q4_manifest` module (`crates/inference/src/quant/q4_manifest.rs`).
+`lattice_inference::quant::q4_manifest` module (implemented in `crates/quant/src/q4_manifest.rs`).
 `doctor`'s tensor inventory and QuaRot rotation-seed detection (used by both `doctor` and
 the Metal Q4 loader's QuaRot-flavor detection) both read the file through this module's
 bounded reader, rather than each call site re-deriving its own copy of the read contract.
