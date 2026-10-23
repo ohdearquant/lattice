@@ -754,7 +754,7 @@ impl MetalErnie45State {
 
     fn attention(&self, enc: &ComputeCommandEncoderRef, rows: u32, q: u32, kv: u32) {
         #[repr(C)]
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, bytemuck::NoUninit)]
         struct Params {
             seq_len: u32,
             q_dim4: u32,

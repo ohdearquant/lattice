@@ -1,0 +1,31 @@
+[package]
+name = "lattice-metal-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared Metal buffer and pipeline helpers for Lattice"
+keywords = ["inference", "metal", "lattice"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = []
+features = ["metal-gpu"]
+
+[features]
+default = []
+metal-gpu = ["dep:metal", "dep:objc", "dep:bytemuck"]
+
+[dependencies]
+lattice-inference-core = { version = "0.14.0", path = "../inference-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.33", optional = true }
+objc = { version = "0.2", optional = true }
+bytemuck = { workspace = true, optional = true }
+
+[lints]
+workspace = true
