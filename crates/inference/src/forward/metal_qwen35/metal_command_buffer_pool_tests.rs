@@ -17,7 +17,7 @@ const EXEMPT: &[(&str, &str)] = &[("forward/metal_qwen35/inner/bench_support.rs"
 const EXPECTED_FILES: &[&str] = &[
     "forward/metal.rs",
     "forward/metal_gemm.rs",
-    "forward/metal_qwen35.rs",
+    "forward/metal_qwen35/inner/prefill_chunk.rs",
 ];
 
 /// Finds the end of the brace-delimited block opening at or after `from`, by depth
