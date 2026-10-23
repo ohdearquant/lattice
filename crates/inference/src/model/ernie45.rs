@@ -1623,6 +1623,10 @@ impl Ernie45KvCache {
 mod decode_scratch_tests;
 
 #[cfg(test)]
+#[path = "ernie45/decode_step_bench.rs"]
+mod decode_step_bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::gemma4_ops::gemma4_rope_cos_sin;
