@@ -237,8 +237,9 @@ New crates add no default features of their own; the facade's defaults are uncha
 5. **CI reach.** Workflow path filters that select work by source path (for example the end-to-end parity gate,
    which watches `crates/inference/src/**` and `crates/embed/src/**`) are extended to the new crate's paths in the same
    change, so moved code keeps triggering the gates it triggered before. The same holds for checked-in lists that
-   name the crate a measurement target lives in: GPU-handoff admission reads the bench targets declared in
-   `crates/inference/Cargo.toml`, `scripts/lib/bench_admission.py` keeps required-feature tables that must name the
+   name the crate a measurement target lives in: GPU-handoff admission reads the `[[bench]]` declarations and the
+   `targets` array in `[package.metadata.gpu-bench-handoff]` in `crates/inference/Cargo.toml`.
+   `scripts/lib/bench_admission.py` keeps required-feature tables that must name the
    same sets (admission refuses a revision where they differ), and `scripts/bench-measurements.toml` classifies
    binaries by path. A change that moves a bench target or a binary out of `crates/inference` updates all three in
    the same change. The measurement harness admits targets of `lattice-inference` only, so moving a GPU-driving
