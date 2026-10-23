@@ -24,9 +24,9 @@ esac
 
 # Publish order follows the internal dependency DAG (deps before dependents):
 #   fann, transport, inference-core   leaves, no internal deps
-#     -> tokenizer, grammar, weights  depend on inference-core
+#     -> tokenizer, grammar, weights, metal-runtime  depend on inference-core
 #       -> quant                      depends on inference-core, weights
-#         -> inference                depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant
+#         -> inference                depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, metal-runtime
 #           -> embed                  depends on inference
 #           -> tune                   depends on fann, inference
 # Each tier waits for crates.io indexing before the next tier resolves it.
@@ -37,7 +37,7 @@ esac
 # exceeds 10 MiB, and a rejection in tier 2 leaves tier 1 already published and
 # immutable. `cargo publish --dry-run` does not cover this: it can only validate
 # the leaf tier, because a crate whose internal path dependencies are not yet
-# live on the registry cannot be packaged at all. Measure all ten first.
+# live on the registry cannot be packaged at all. Measure all eleven first.
 echo "--- Pre-publish: package size against the crates.io upload limit ---"
 "$(dirname "$0")/package-size-check.sh"
 
@@ -53,10 +53,11 @@ fi
 echo "Waiting for crates.io indexing..."
 sleep 30
 
-echo "--- Tier 2: tokenizer, grammar and weights (depend on inference-core) ---"
+echo "--- Tier 2: tokenizer, grammar, weights and metal-runtime (depend on inference-core) ---"
 cargo publish -p lattice-tokenizer $FLAG
 cargo publish -p lattice-grammar $FLAG
 cargo publish -p lattice-weights $FLAG
+cargo publish -p lattice-metal-runtime $FLAG
 
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."
@@ -71,7 +72,7 @@ if [ -z "$FLAG" ]; then
     sleep 30
 fi
 
-echo "--- Tier 4: inference (depends on fann, inference-core, tokenizer, grammar, weights, quant) ---"
+echo "--- Tier 4: inference (depends on fann, inference-core, tokenizer, grammar, weights, quant, metal-runtime) ---"
 cargo publish -p lattice-inference $FLAG
 
 if [ -z "$FLAG" ]; then
