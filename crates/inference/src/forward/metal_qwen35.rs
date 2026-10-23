@@ -371,7 +371,6 @@ mod inner {
     use metal::*;
     use pipelines::build_pipelines;
     use prefix_cache::MetalCrossTurnPrefixCache;
-    #[cfg(test)]
     use prefix_cache::MetalGdnCheckpoint;
     pub use prefix_cache::{CachedChatCompletionOutput, CachedGenerateOutput, CrossTurnCacheStats};
     pub(crate) use sampling::{

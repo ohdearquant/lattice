@@ -1,4 +1,5 @@
 use super::*;
+use crate::tokenizer::common::Tokenizer as _;
 
 // -----------------------------------------------------------------------
 // Cross-turn KV prefix cache: Metal-specific runtime (#462)
