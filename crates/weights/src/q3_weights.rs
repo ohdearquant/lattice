@@ -649,7 +649,8 @@ pub fn read_q3_header<R: std::io::Read + std::io::Seek>(
 /// Returns an error if `shape.iter().product()` disagrees with `original_len`,
 /// or if `file_len` is smaller than `payload_offset + n_blocks * 16`.
 ///
-/// Only called from `mmap_q3_weight` (crates/inference/src/forward/metal_qwen35.rs)
+/// Only called from `mmap_q3_weight`
+/// (crates/inference/src/forward/metal_qwen35/inner/buffers.rs)
 /// today, which live checkpoint loading does not yet reach.
 #[allow(dead_code)]
 pub fn validate_q3_header_payload_bounds(

@@ -1060,7 +1060,7 @@ fn parser_accepts_linear_num_value_heads_at_max() {
 /// (both product budgets with `value_head_dim` as a factor) at values far above what
 /// `MAX_LINEAR_NUM_VALUE_HEADS` alone would allow through those two checks -- but a
 /// large, non-degenerate `linear_key_head_dim` still drives the GatedDeltaNet
-/// chunk-scratch buffers (`new_session_inner`, `forward/metal_qwen35.rs`) to multi-GiB
+/// chunk-scratch buffers (`new_session_inner`, `forward/metal_qwen35/inner/engine.rs`) to multi-GiB
 /// scale. This must be caught by `MAX_GDN_CHUNK_SCRATCH_BYTES`, not by the two
 /// pre-existing product budgets (which this config satisfies trivially).
 #[test]
