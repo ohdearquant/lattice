@@ -177,7 +177,7 @@ pub enum PrefixReuseMode {
 `plan_prefix_reuse` in `crates/inference/src/kv_cache/cross_turn.rs` selects
 `ReplayFromCheckpoint { checkpoint_len }` when the new prompt diverges at or after an exact,
 retained sparse GDN checkpoint boundary — the deepest valid one wins. In
-`crates/inference/src/forward/metal_qwen35.rs`, `plan_cross_turn_reuse` supplies those boundaries;
+`crates/inference/src/forward/metal_qwen35/inner/prefix_cache.rs`, `plan_cross_turn_reuse` supplies those boundaries;
 `restore_cross_turn_prefix` restores the checkpoint's GDN state, then the Metal path prefills
 from `checkpoint_len`. Divergence with no valid checkpoint falls back to `FullRefill`.
 

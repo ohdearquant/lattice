@@ -10,8 +10,9 @@
 //! PROVISIONAL until a maintainer re-verifies the harness fresh on an idle machine.
 //!
 //! Isolation method: dedicated command-buffer CPU wall-clock timing (spec's preferred
-//! method 1). `MetalQwen35State::forward_prefill_chunk_gdn_isolated` (metal_qwen35.rs,
-//! `bench-internals`-gated) is a structural copy of the production
+//! method 1). `MetalQwen35State::forward_prefill_chunk_gdn_isolated`
+//! (`forward/metal_qwen35/inner/prefill_chunk.rs`, `bench-internals`-gated) is a structural
+//! copy of the production
 //! `forward_prefill_batched_chunk` with command-buffer boundaries inserted immediately
 //! before/after each GDN layer's recurrence dispatch — same kernels, same dispatch
 //! args, same buffers, only the encoder/command-buffer split points differ. See that
@@ -86,8 +87,9 @@ fn model_identity(model_dir_str: &str) -> Option<&'static str> {
     }
 }
 
-/// Mirrors `forward::metal_qwen35::QuantFormat` (crates/inference/src/forward/
-/// metal_qwen35.rs, `from_env`/`from_model_size`/`resolve` ~1521-1558). That
+/// Mirrors `forward::metal_qwen35::QuantFormat` (defined with its
+/// `from_env`/`from_model_size`/`resolve` methods in
+/// crates/inference/src/forward/metal_qwen35/inner/engine.rs). That
 /// type and its resolver methods are `pub(crate)`/private, unreachable from
 /// this bin (a separate compilation unit from `lattice-inference`'s own
 /// integration tests/benches), so the parsing is duplicated here rather than
@@ -450,7 +452,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // --- Fixed prompt, deterministically repeated + truncated to EXACT token counts. ---
     // Real prose (not a numeric filler pattern) so tokenization exercises normal BPE
     // merge behavior, matching the pattern already used by this file's own
-    // `long_real_text_tokens` test helper (metal_qwen35.rs) for the same reason.
+    // `long_real_text_tokens` test helper (forward/metal_qwen35/inner/tests.rs) for the same
+    // reason.
     let paragraphs = [
         "During a late engineering review, the team walked through the inference trace \
          one layer at a time. They checked where state changed, which buffers were reused, \
@@ -510,7 +513,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_tokens[..n].to_vec()
         } else {
             // Pad with token id 1, matching the existing boundary-sweep test's filler
-            // convention (metal_qwen35.rs
+            // convention (forward/metal_qwen35/inner/tests/gdn_chunked_scan.rs
             // gdn_chunked_prefill_vs_serial_prefill_logit_parity).
             let mut v = base_tokens.clone();
             v.resize(n, 1u32);
