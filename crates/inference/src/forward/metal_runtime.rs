@@ -1,6 +1,9 @@
 //! Shared Metal helpers for the model states.
 
-use metal::{Buffer, ComputeCommandEncoderRef, Device, MTLResourceOptions, MTLSize};
+use metal::{
+    Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, Library,
+    MTLResourceOptions, MTLSize,
+};
 
 use crate::error::InferenceError;
 
@@ -136,6 +139,45 @@ pub(crate) fn upload(
         UploadCopy::Checked(write) => write(&buffer, values)?,
     }
     Ok(buffer)
+}
+
+pub(crate) fn compile_library(
+    device: &Device,
+    source: &str,
+    runtime: fn(String) -> InferenceError,
+) -> Result<Library, InferenceError> {
+    let options = CompileOptions::new();
+    options.set_fast_math_enabled(false);
+    device
+        .new_library_with_source(source, &options)
+        .map_err(|error| runtime(format!("shader compilation failed: {error}")))
+}
+
+pub(crate) fn make_pipeline(
+    device: &Device,
+    library: &Library,
+    name: &str,
+    threads: u64,
+    runtime: fn(String) -> InferenceError,
+) -> Result<ComputePipelineState, InferenceError> {
+    let function = library
+        .get_function(name, None)
+        .map_err(|error| runtime(format!("missing {name} kernel: {error}")))?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|error| runtime(format!("{name} pipeline failed: {error}")))?;
+    if pipeline.max_total_threads_per_threadgroup() < threads {
+        return Err(runtime(format!(
+            "{name} needs {threads} threads per group, pipeline permits {}",
+            pipeline.max_total_threads_per_threadgroup()
+        )));
+    }
+    if pipeline.static_threadgroup_memory_length() > device.max_threadgroup_memory_length() {
+        return Err(runtime(format!(
+            "{name} exceeds threadgroup memory capacity"
+        )));
+    }
+    Ok(pipeline)
 }
 
 #[cfg(test)]
