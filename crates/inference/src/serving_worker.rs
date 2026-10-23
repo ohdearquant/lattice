@@ -47,8 +47,9 @@
 //! `generate` success path has no equivalent GPU-free test (mirrors
 //! precedent: PR #666's `MetalHandle` wiring shipped without a call-site
 //! test requiring a real Q4 checkpoint fixture that doesn't exist, relying
-//! on `metal_qwen35.rs`'s own exhaustive Device-gated tests for the
-//! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
+//! on the Metal engine's own exhaustive Device-gated tests (under
+//! `forward/metal_qwen35/inner/tests/`) for the underlying
+//! `generate_streaming_with_prefix_cache_and_cancel` call).
 
 use crate::forward::metal_qwen35::ChatMessage;
 #[cfg(any(

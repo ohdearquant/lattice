@@ -319,7 +319,7 @@ fn mlp_role_rejects_near_miss_suffixes() {
 fn mlp_role_requires_terminal_weight_suffix() {
     // Real checkpoints always name dense MLP projections with a terminal
     // `.weight` (see the Q4 loader's `{prefix}.mlp.gate_proj.weight` call
-    // sites in metal_qwen35.rs); a role-correct name missing it is not a
+    // sites in forward/metal_qwen35/inner/weights.rs); a role-correct name missing it is not a
     // real tensor name and must fail closed.
     for name in [
         "model.layers.3.mlp.gate_proj",
