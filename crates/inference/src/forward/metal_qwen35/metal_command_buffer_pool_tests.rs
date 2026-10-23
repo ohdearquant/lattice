@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// `run_once`: a bench fixture, not a serving path — the process that runs it exits
 /// after the measurement, and pooling inside it would change a timed region. It would
 /// stop being exempt the moment anything long-lived called it.
-const EXEMPT: &[(&str, &str)] = &[("forward/metal_qwen35.rs", "run_once")];
+const EXEMPT: &[(&str, &str)] = &[("forward/metal_qwen35/inner/bench_support.rs", "run_once")];
 
 /// Files this guard must find `new_command_buffer` in on every run — a floor under
 /// the directory walk, not its ceiling: any other file the walk turns up is still
@@ -17,7 +17,7 @@ const EXEMPT: &[(&str, &str)] = &[("forward/metal_qwen35.rs", "run_once")];
 const EXPECTED_FILES: &[&str] = &[
     "forward/metal.rs",
     "forward/metal_gemm.rs",
-    "forward/metal_qwen35.rs",
+    "forward/metal_qwen35/inner/prefill_chunk.rs",
 ];
 
 /// Finds the end of the brace-delimited block opening at or after `from`, by depth
