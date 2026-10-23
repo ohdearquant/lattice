@@ -9,22 +9,6 @@
 # are read as data rather than source. Paths are exact: no globs, and no
 # directory entries.
 
-[[ratchet]]
-path = "crates/inference/benches/inference_perf.rs"
-ceiling = 3016
-
-[[ratchet]]
-path = "crates/inference/src/bin/lattice_serve/main.rs"
-ceiling = 3611
-
-[[ratchet]]
-path = "crates/inference/src/forward/shaders/qwen35.metal"
-ceiling = 3311
-
-[[ratchet]]
-path = "crates/inference/tests/metal_measurement_lock_contract.rs"
-ceiling = 4984
-
 [[data]]
 path = "Cargo.lock"
 
