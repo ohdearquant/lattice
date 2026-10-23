@@ -9,6 +9,11 @@ use sha2::{Digest, Sha256};
 use std::mem::size_of;
 use std::path::PathBuf;
 
+// On macOS `matmul_bt` runs on Accelerate, and there the batched and one-row paths measured up to
+// 9.3e-5 apart in the decode logits; 5e-5 holds on the other targets.
+#[cfg(target_os = "macos")]
+const ABS: f32 = 2e-4;
+#[cfg(not(target_os = "macos"))]
 const ABS: f32 = 5e-5;
 const REL: f32 = 5e-5;
 const OWNERS: [usize; 4] = [0, 1, 2, 3];
