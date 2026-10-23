@@ -257,6 +257,46 @@ fn dependency_paths_resolve_beside_a_glob_of_a_dependency() {
 }
 
 #[test]
+fn dependency_paths_resolve_through_a_parent_glob_that_does_not_bind_them() {
+    const CHILD: &str = "src/forward/metal_qwen35/buffers.rs";
+    let fixture = Fixture::new();
+    fixture.write(
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nexternal-dep = \"1\"\nglob-dep = \"1\"\n\n\
+         [workspace]\n",
+    );
+    fixture.write(ROOT, &format!("{LOCAL}use glob_dep::*;\nmod buffers;\n"));
+    let child = |body: &str| format!("use super::*;\npub fn bridge() {{ {body} }}\n");
+
+    fixture.write(CHILD, &child("external_dep::helper();"));
+    fixture
+        .load()
+        .require_calls(CALLS)
+        .expect("a dependency path must resolve through a parent glob that does not bind it");
+
+    fixture.write(CHILD, &child("missing_dep::helper();"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("an undeclared path head must stay unresolved through the parent glob");
+    assert!(
+        error.contains("unresolved symbol crate::forward::metal_qwen35::buffers::missing_dep"),
+        "wrong undeclared-head refusal: {error}"
+    );
+
+    fixture.write(CHILD, &child("sample();"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("a name the parent binds must still reach the child through the glob");
+    assert!(
+        error.contains("crate::forward::metal_qwen35::buffers::bridge"),
+        "the parent glob did not supply its own binding: {error}"
+    );
+}
+
+#[test]
 fn relocated_caller_bypass_is_rejected() {
     let fixture = Fixture::new();
     fixture.relocate();
