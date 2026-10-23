@@ -236,7 +236,9 @@ mod tests {
         for id in [rows, rows + 1, usize::MAX] {
             let message = refused_lookup(&embedding, id, cols);
             assert!(
-                message.contains("out of range"),
+                message.contains(&format!(
+                    "embedding row {id} is out of range for {rows} rows"
+                )),
                 "row {id}: unexpected panic: {message}"
             );
         }
@@ -249,7 +251,7 @@ mod tests {
         for len in [0, 1, cols - 1, cols + 1, 2 * cols] {
             let message = refused_lookup(&embedding, 1, len);
             assert!(
-                message.contains("width mismatch"),
+                message.contains("embedding destination width mismatch"),
                 "width {len}: unexpected panic: {message}"
             );
         }

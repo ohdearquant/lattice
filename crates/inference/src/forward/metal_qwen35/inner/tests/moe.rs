@@ -445,12 +445,7 @@ fn from_q4_dir_builds_the_cpu_embedding_lookup_from_the_q4_payload() {
         let mut actual = vec![0.0f32; hidden];
         // SAFETY: `actual` holds `hidden` f32 values and is disjoint from the
         // embedding table; `id` is below `vocab_size`.
-        unsafe {
-            state
-                .engine
-                .embed_tokens
-                .write_row(id, &mut actual)
-        };
+        unsafe { state.engine.embed_tokens.write_row(id, &mut actual) };
         let value = q4_const_roundtrip(embed_row_value(id));
         assert!(
             actual.iter().all(|&v| v == value),

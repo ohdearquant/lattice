@@ -139,10 +139,10 @@ mod tests {
         assert_eq!(row, [-1.0, 0.5]);
 
         for (id, len, expected) in [
-            (3, 2, "out of range"),
-            (usize::MAX, 2, "out of range"),
-            (0, 1, "width mismatch"),
-            (0, 3, "width mismatch"),
+            (3, 2, "embedding row 3 is out of range for 3 rows"),
+            (usize::MAX, 2, "is out of range for 3 rows"),
+            (0, 1, "embedding destination width mismatch"),
+            (0, 3, "embedding destination width mismatch"),
         ] {
             let mut dst = vec![f32::from_bits(SENTINEL_BITS); len];
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
