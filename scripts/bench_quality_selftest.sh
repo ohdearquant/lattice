@@ -3,7 +3,7 @@
 # script in a disposable repository against stub lattice/MLX scorers and a stub
 # bench-command.sh (the GPU-handoff launcher); no model, GPU, network, cargo
 # build, or benchmark is used. The real launcher is exercised end to end in
-# tests/test_bench_compare_measurement.py.
+# tests/test_bench_gpu_handoff.py.
 set -uo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)/scripts/bench_quality.sh"
