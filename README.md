@@ -19,7 +19,7 @@ on x86, NEON on ARM) handle the CPU path.
 
 Lattice is two things in one repo.
 
-**A Rust inference library.** Eight crates covering embeddings, generation, quantization,
+**A Rust inference library.** Nine crates covering embeddings, generation, quantization,
 LoRA fine-tuning, and optimal transport. Use `lattice-embed` as a library dependency, or run
 the `lattice` binary for interactive chat and an OpenAI-compatible HTTP server.
 
@@ -136,13 +136,14 @@ regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
 | [`lattice-tune`](crates/tune/)                     | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry                                                                | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune)                     |
 | [`lattice-tokenizer`](crates/tokenizer/)           | Pure Rust tokenizers: WordPiece, SentencePiece, Qwen and Gemma BPE, model-directory auto-detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-tokenizer.svg)](https://crates.io/crates/lattice-tokenizer)           |
 | [`lattice-grammar`](crates/grammar/)               | Grammar-constrained decoding: JSON Schema and GBNF compilation, byte-level PDA, vocabulary masks; re-exported by `lattice-inference`                                  | [![](https://img.shields.io/crates/v/lattice-grammar.svg)](https://crates.io/crates/lattice-grammar)               |
+| [`lattice-weights`](crates/weights/)               | Weight storage: safetensors, f32/f16/Q3/Q4/Q8 representations and model-directory format detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-weights.svg)](https://crates.io/crates/lattice-weights)               |
 | [`lattice-inference-core`](crates/inference-core/) | Shared base types: `InferenceError`, re-exported by `lattice-inference`                                                                                               | [![](https://img.shields.io/crates/v/lattice-inference-core.svg)](https://crates.io/crates/lattice-inference-core) |
 | [`lattice-transport`](crates/transport/)           | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport)           |
 
 Three leaf crates (`fann`, `transport`, `inference-core`) have zero intra-workspace
-dependencies. `tokenizer` and `grammar` each depend only on `inference-core` at runtime.
-`inference` depends on all three and pulls
-in `fann` when the optional `mixture` or `metal-gpu` feature is enabled. Each can be used on its own.
+dependencies. `tokenizer`, `grammar` and `weights` each depend only on `inference-core`
+at runtime. `inference` depends on all four unconditionally and pulls in `fann` through
+the optional `mixture` or `metal-gpu` features. Each can be used on its own.
 
 ---
 
@@ -548,6 +549,10 @@ flowchart TD
     Inference --> Tokenizer[lattice-tokenizer]
     Inference --> Core[lattice-inference-core]
     Tokenizer --> Core
+    Inference --> Grammar[lattice-grammar]
+    Inference --> Weights[lattice-weights]
+    Grammar --> Core
+    Weights --> Core
     Inference -.->|mixture or metal-gpu| Fann[lattice-fann]
     Tune[lattice-tune] --> Fann
     Tune -.->|inference-hook or train-backward| Inference
@@ -649,7 +654,7 @@ variable when the same requirement should apply to `make ci` or Git hooks.
 4. `embed` and `tune`.
 
 The script waits 30 seconds between tiers for registry indexing. Its dry-run mode
-checks package sizes for all eight crates, then runs `cargo publish --dry-run` for
+checks package sizes for all nine crates, then runs `cargo publish --dry-run` for
 the leaf tier only; later tiers require this release's dependencies on crates.io.
 
 ```bash

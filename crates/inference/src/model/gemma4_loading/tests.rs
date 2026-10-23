@@ -1,6 +1,7 @@
 use super::super::gemma4_config::Gemma4LayerType;
 use super::super::gemma4_weights::synthetic_safetensors_bytes;
 use super::*;
+use lattice_weights::__internal::safetensors_cached_f32_tensor_count;
 use std::collections::HashMap;
 
 /// In-memory [`TensorSource`] carrying an explicit per-tensor dtype
@@ -331,7 +332,7 @@ fn per_layer_table_is_read_in_place_from_the_checkpoint_file() {
         let got = table.scaled_row(row, 1.0).expect("row is in range");
         let want: Vec<f32> = bits[row * packed..(row + 1) * packed]
             .iter()
-            .map(|&b| crate::weights::half_bits::bf16_bits_to_f32(b))
+            .map(|&b| lattice_weights::half_bits::bf16_bits_to_f32(b))
             .collect();
         let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
         let want_bits: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
@@ -381,7 +382,7 @@ fn full_checkpoint_load_leaves_no_f32_copy_in_the_file_the_model_keeps() {
 
     load_weights(&mut file, &cfg).expect("an all-BF16 checkpoint must load");
     assert_eq!(
-        file.cached_f32_tensor_count(),
+        safetensors_cached_f32_tensor_count(&file),
         0,
         "the loader must take each converted tensor, leaving no second f32 copy in the file"
     );
@@ -393,7 +394,7 @@ fn full_checkpoint_load_leaves_no_f32_copy_in_the_file_the_model_keeps() {
     let got = table.scaled_row(row, 2.0).expect("row is in range");
     let want: Vec<f32> = table_bits[row * packed..(row + 1) * packed]
         .iter()
-        .map(|&b| crate::weights::half_bits::bf16_bits_to_f32(b) * 2.0)
+        .map(|&b| lattice_weights::half_bits::bf16_bits_to_f32(b) * 2.0)
         .collect();
     assert_eq!(
         got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),

@@ -423,10 +423,11 @@ fn from_env_zero_errors_loudly() {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[test]
 fn dequant_expert_f16_honours_negative_scales() {
-    use crate::weights::q4_weights::signed_scale_fixture::{
+    use crate::signed_scale_fixture::{
         abs_scales, assert_sign_honoured, negative_scale_tensor, reference, zero_scales,
     };
-    use crate::weights::q4_weights::{Q4Tensor, q4_f16_to_f32, save_q4_file};
+    use crate::weights::q4_weights::{Q4Tensor, save_q4_file};
+    use lattice_weights::q4_weights::q4_f16_to_f32;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let shape = [2usize, 4, 64];

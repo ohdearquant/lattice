@@ -20,7 +20,6 @@ exclude = [
     "tests/fixtures/gdn_chunk",
     "tests/fixtures/gemma4/tokenizer",
     "tests/fixtures/paddleocr_vl/tokenizer",
-    "tests/fixtures/mlx_headers",
 ]
 
 [package.metadata.docs.rs]
@@ -65,7 +64,7 @@ serve = [
     "dep:tower",
 ]
 std = []
-f16 = []
+f16 = ["lattice-weights/f16"]
 # lattice-fann supplies the shared LoRA descriptor/blend-validation module
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
 # be present whenever this feature is — not just under `mixture`.
@@ -143,15 +142,11 @@ lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
 lattice-grammar = { version = "0.15.0", path = "../grammar" }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
+lattice-weights = { version = "0.15.0", path = "../weights" }
 
-# Two independent unix-only uses: (1) `fcntl(F_GETPATH)` for `weights/f32_weights.rs`'s
-# `real_path_of_open_file`, which reports the real path of an already-open shard descriptor
-# for diagnostics and error text (Containment is lexical, in `contained_shard_path`; the
-# check-then-reopen window is closed by `open_manifest_entry_once` returning the opened
-# `File` rather than a path to reopen. Nothing security-relevant keys off the reported path.
-# F_GETPATH itself is Darwin/BSD-only); (2) `weights/mmap_trust.rs`'s `O_NONBLOCK`/
-# `O_NOFOLLOW`/`ELOOP` values for the trust-boundary open guard, which are per-architecture
-# and gated to `unix` generally rather than `macos` specifically.
+# Unix-only uses: `router_state/storage.rs` opens router state with `O_NOFOLLOW`/`O_NONBLOCK`,
+# and `measurement.rs` probes the bench supervisor with `kill(pid, 0)` and `futimes`. The
+# weight-loading uses (`F_GETPATH`, the trust-boundary open flags) moved with lattice-weights.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -420,6 +415,7 @@ required-features = ["f16", "metal-gpu", "gdn-state-counters"]
 ureq = { version = "3", optional = true }
 
 [dev-dependencies]
+lattice-weights = { version = "0.15.0", path = "../weights", features = ["test-utils"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
