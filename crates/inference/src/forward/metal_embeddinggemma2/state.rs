@@ -4,7 +4,7 @@
 //! the oracle for every kernel here.
 
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
+    Buffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device,
     MTLCommandBufferStatus, MTLGPUFamily, MTLSize,
 };
 
@@ -554,31 +554,9 @@ impl Pipelines {
         source.push_str(VISION_SHADER);
         source.push_str(GEMM_SG_SHADER);
         source.push_str(ATTENTION_SG_SHADER);
-        let options = CompileOptions::new();
-        options.set_fast_math_enabled(false);
-        let library = device
-            .new_library_with_source(&source, &options)
-            .map_err(|error| runtime(format!("shader compilation failed: {error}")))?;
+        let library = metal_runtime::compile_library(device, &source, runtime)?;
         let make = |name: &str, threads: u64| -> Result<ComputePipelineState, InferenceError> {
-            let function = library
-                .get_function(name, None)
-                .map_err(|error| runtime(format!("missing {name} kernel: {error}")))?;
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(|error| runtime(format!("{name} pipeline failed: {error}")))?;
-            if pipeline.max_total_threads_per_threadgroup() < threads {
-                return Err(runtime(format!(
-                    "{name} needs {threads} threads per group, pipeline permits {}",
-                    pipeline.max_total_threads_per_threadgroup()
-                )));
-            }
-            if pipeline.static_threadgroup_memory_length() > device.max_threadgroup_memory_length()
-            {
-                return Err(runtime(format!(
-                    "{name} exceeds threadgroup memory capacity"
-                )));
-            }
-            Ok(pipeline)
+            metal_runtime::make_pipeline(device, &library, name, threads, runtime)
         };
         let attention_threads = ATTENTION_ROWS * SIMD_WIDTH;
         let limits = device.max_threads_per_threadgroup();
