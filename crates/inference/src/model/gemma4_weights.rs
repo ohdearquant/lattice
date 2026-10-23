@@ -119,6 +119,45 @@ impl PerLayerEmbeddings {
             .collect())
     }
 
+    /// Widen and scale one mapped BF16 row into caller-owned storage.
+    pub(crate) fn scaled_row_into(
+        &self,
+        row: usize,
+        scale: f32,
+        output: &mut [f32],
+    ) -> Result<(), InferenceError> {
+        if row >= self.rows {
+            return Err(InferenceError::InvalidInput(format!(
+                "gemma4 per-layer embedding row {row} out of range ({} rows)",
+                self.rows
+            )));
+        }
+        if output.len() != self.row_len {
+            return Err(InferenceError::InvalidInput(format!(
+                "gemma4 per-layer embedding output length {} != row length {}",
+                output.len(),
+                self.row_len
+            )));
+        }
+        let extent_error = || {
+            InferenceError::InvalidInput("gemma4 per-layer embedding row extent overflow".into())
+        };
+        let row_bytes = self.row_len.checked_mul(2).ok_or_else(extent_error)?;
+        let start = row.checked_mul(row_bytes).ok_or_else(extent_error)?;
+        let end = start.checked_add(row_bytes).ok_or_else(extent_error)?;
+        let payload = self.file.bf16_payload(&self.tensor_name)?;
+        let bytes = payload.get(start..end).ok_or_else(|| {
+            InferenceError::InvalidSafetensors(format!(
+                "tensor {} payload is shorter than its declared {} rows",
+                self.tensor_name, self.rows
+            ))
+        })?;
+        for (value, pair) in output.iter_mut().zip(bytes.chunks_exact(2)) {
+            *value = bf16_bits_to_f32(u16::from_le_bytes([pair[0], pair[1]])) * scale;
+        }
+        Ok(())
+    }
+
     /// Number of tensors in the kept file that hold a cached f32 conversion.
     #[cfg(test)]
     pub(crate) fn cached_f32_tensor_count(&self) -> usize {
@@ -169,4 +208,82 @@ pub(crate) fn per_layer_embeddings_from_bits(
         row_len,
     )
     .expect("synthetic per-layer table is finite BF16 of the declared shape")
+}
+
+#[cfg(test)]
+mod prefill_rows {
+    use super::*;
+
+    const ROWS: usize = 3;
+    const WIDTH: usize = 5;
+    const POISON: u32 = 0x7fc0_1857;
+    const TABLE: [u16; ROWS * WIDTH] = [
+        0x0000, 0x8000, 0x3f80, 0xc020, 0x3eaa, 0x0001, 0x8001, 0x4080, 0xbf00, 0x3f01, 0x4128,
+        0xc0c0, 0x3e00, 0xbe40, 0x4200,
+    ];
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    #[test]
+    fn scaled_row_into_matches_allocating_rows_bitwise() {
+        let table = per_layer_embeddings_from_bits(ROWS, WIDTH, &TABLE);
+        assert_eq!(table.cached_f32_tensor_count(), 0);
+        for row in [2, 0, 1, 2] {
+            for scale in [1.0, 0.0, -0.0, -2.25, 3.0_f32.sqrt()] {
+                let expected = table.scaled_row(row, scale).unwrap();
+                let independent: Vec<f32> = TABLE[row * WIDTH..(row + 1) * WIDTH]
+                    .iter()
+                    .map(|&value| f32::from_bits(u32::from(value) << 16) * scale)
+                    .collect();
+                let mut guarded = [f32::from_bits(POISON); WIDTH + 2];
+                table
+                    .scaled_row_into(row, scale, &mut guarded[1..=WIDTH])
+                    .unwrap();
+                assert!(expected.iter().all(|value| value.is_finite()));
+                assert_eq!(bits(&guarded[1..=WIDTH]), bits(&expected));
+                assert_eq!(bits(&guarded[1..=WIDTH]), bits(&independent));
+                assert_eq!(guarded[0].to_bits(), POISON);
+                assert_eq!(guarded[WIDTH + 1].to_bits(), POISON);
+                assert_eq!(table.cached_f32_tensor_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_row_into_rejects_nonexact_output_without_writes() {
+        let table = per_layer_embeddings_from_bits(ROWS, WIDTH, &TABLE);
+        for length in [0, WIDTH - 1, WIDTH + 1] {
+            let mut output = vec![f32::from_bits(POISON); length];
+            let error = table.scaled_row_into(1, 1.5, &mut output).unwrap_err();
+            let InferenceError::InvalidInput(message) = error else {
+                panic!("expected an invalid output-length error")
+            };
+            assert_eq!(
+                message,
+                format!("gemma4 per-layer embedding output length {length} != row length {WIDTH}")
+            );
+            assert_eq!(bits(&output), vec![POISON; length]);
+            assert_eq!(table.cached_f32_tensor_count(), 0);
+        }
+    }
+
+    #[test]
+    fn scaled_row_into_rejects_invalid_rows_without_writes() {
+        let table = per_layer_embeddings_from_bits(ROWS, WIDTH, &TABLE);
+        for (row, length) in [(ROWS, WIDTH), (usize::MAX, WIDTH), (ROWS, WIDTH - 1)] {
+            let mut output = vec![f32::from_bits(POISON); length];
+            let error = table.scaled_row_into(row, 1.5, &mut output).unwrap_err();
+            let InferenceError::InvalidInput(message) = error else {
+                panic!("expected an invalid row error")
+            };
+            assert_eq!(
+                message,
+                format!("gemma4 per-layer embedding row {row} out of range ({ROWS} rows)")
+            );
+            assert_eq!(bits(&output), vec![POISON; length]);
+            assert_eq!(table.cached_f32_tensor_count(), 0);
+        }
+    }
 }
