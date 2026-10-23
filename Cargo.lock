@@ -1650,6 +1650,7 @@ dependencies = [
  "lattice-fann",
  "lattice-grammar",
  "lattice-inference-core",
+ "lattice-quant",
  "lattice-tokenizer",
  "lattice-weights",
  "libc",
@@ -1682,6 +1683,18 @@ dependencies = [
 [[package]]
 name = "lattice-inference-core"
 version = "0.15.0"
+
+[[package]]
+name = "lattice-quant"
+version = "0.15.0"
+dependencies = [
+ "lattice-inference-core",
+ "lattice-weights",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "lattice-tokenizer"

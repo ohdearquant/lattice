@@ -269,6 +269,7 @@ jobs:
           cargo clean -p lattice-inference 2>/dev/null || true
           cargo clean -p lattice-grammar 2>/dev/null || true
           cargo clean -p lattice-weights 2>/dev/null || true
+          cargo clean -p lattice-quant 2>/dev/null || true
           cargo clean -p lattice-embed 2>/dev/null || true
           cargo clean -p lattice-fann 2>/dev/null || true
           cargo clean -p lattice-tune 2>/dev/null || true
