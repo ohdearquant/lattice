@@ -355,9 +355,10 @@ fn qwen35_fusion_plan_targets_resolve_within_required_tensor_set() {
 // absorption) → quantize_f64_to_q4 → dequantize_q4_to_f32 → matmul,
 // and asserts correctness against an independent f64 reference that
 // manually mirrors each step. Mutation-sensitive: perturbing the rotation
-// dispatch (pipeline.rs:226-230), absorption helpers (rotation.rs:161-164
-// or rotation.rs:184-192), Q4 symmetric scale (q4_weights.rs:277 or :280),
-// or Q4 symmetric mode flag (q4_weights.rs:523) must cause failure.
+// dispatch in `absorb_rotations`, the absorption helpers
+// (`absorb_input_rotation_f64` or `absorb_output_rotation_f64` in lattice-quant),
+// the Q4 symmetric scale (`quantize_block_with_mode_len` in lattice-weights), or
+// the Q4 symmetric mode flag (`quantize_f64_to_q4`) must cause failure.
 // -----------------------------------------------------------------------
 #[test]
 fn quarot_rotated_q4_forward_matches_f64_reference() {
