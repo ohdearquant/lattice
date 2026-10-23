@@ -29,7 +29,7 @@
 //! - Arrays: `arr_{hash}`
 //! - `$ref`-defined schemas get rule names from their path segment
 
-use crate::grammar::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
+use crate::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -165,8 +165,8 @@ impl std::fmt::Display for SchemaError {
 
 impl std::error::Error for SchemaError {}
 
-impl From<crate::grammar::pda::BuilderError> for SchemaError {
-    fn from(e: crate::grammar::pda::BuilderError) -> Self {
+impl From<crate::pda::BuilderError> for SchemaError {
+    fn from(e: crate::pda::BuilderError) -> Self {
         SchemaError(e.0)
     }
 }
@@ -203,7 +203,7 @@ pub fn compile_json_schema(schema: &Value) -> Result<CompiledGrammar, SchemaErro
         for rule in &mut grammar.rules {
             for alt in &mut rule.alts {
                 for sym in alt.iter_mut() {
-                    if let crate::grammar::pda::Symbol::NonTerminal(rid) = sym {
+                    if let crate::pda::Symbol::NonTerminal(rid) = sym {
                         if *rid == root_id {
                             *rid = 0;
                         } else if *rid == 0 {

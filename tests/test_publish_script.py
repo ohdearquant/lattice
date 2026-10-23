@@ -68,8 +68,24 @@ class PublishScriptArgs(unittest.TestCase):
         proc, calls = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 7, calls)
+        self.assertEqual(len(publishes), 8, calls)
         self.assertFalse(any("--dry-run" in c for c in publishes), publishes)
+        self.assertEqual(
+            [c for c in calls if c.startswith(("cargo ", "sleep "))],
+            [
+                "cargo publish -p lattice-fann",
+                "cargo publish -p lattice-transport",
+                "cargo publish -p lattice-inference-core",
+                "sleep 30",
+                "cargo publish -p lattice-tokenizer",
+                "cargo publish -p lattice-grammar",
+                "sleep 30",
+                "cargo publish -p lattice-inference",
+                "sleep 30",
+                "cargo publish -p lattice-embed",
+                "cargo publish -p lattice-tune",
+            ],
+        )
 
     def test_dry_run_stops_after_the_leaf_tier(self) -> None:
         proc, calls = self._run("--dry-run")
@@ -77,6 +93,15 @@ class PublishScriptArgs(unittest.TestCase):
         publishes = self._publishes(calls)
         self.assertEqual(len(publishes), 3, calls)
         self.assertTrue(all(c.endswith(" --dry-run") for c in publishes), publishes)
+        self.assertEqual(
+            publishes,
+            [
+                "cargo publish -p lattice-fann --dry-run",
+                "cargo publish -p lattice-transport --dry-run",
+                "cargo publish -p lattice-inference-core --dry-run",
+            ],
+        )
+        self.assertFalse(any(c.startswith("sleep ") for c in calls), calls)
 
     def test_misspelled_flag_exits_before_any_command(self) -> None:
         for arg in ("--dryrun", "-n", "--dry-run=1", "dry-run", " --dry-run"):

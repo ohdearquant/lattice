@@ -1619,6 +1619,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-grammar"
+version = "0.14.0"
+dependencies = [
+ "lattice-inference-core",
+ "lattice-tokenizer",
+ "proptest",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "lattice-inference"
 version = "0.14.0"
 dependencies = [
@@ -1637,6 +1648,7 @@ dependencies = [
  "image",
  "indexmap",
  "lattice-fann",
+ "lattice-grammar",
  "lattice-inference-core",
  "lattice-tokenizer",
  "libc",

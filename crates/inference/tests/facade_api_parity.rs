@@ -399,3 +399,129 @@ fn functions_and_constants_are_the_same_items_at_both_paths() {
         GEMMA4_AUDIO_HOP_LENGTH_SAMPLES
     );
 }
+
+mod grammar_parity {
+    use lattice_grammar as extracted;
+    use lattice_inference::grammar as facade;
+
+    macro_rules! same_type {
+        ($($path:ident)::+) => {{
+            let _: fn(facade::$($path)::+) -> extracted::$($path)::+ = |value| value;
+            let _: fn(extracted::$($path)::+) -> facade::$($path)::+ = |value| value;
+        }};
+    }
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn grammar_types_are_the_same_type_at_both_paths() {
+        same_type!(engine::MaskProfile);
+        same_type!(engine::BuildProfile);
+        same_type!(engine::GrammarError);
+        same_type!(engine::GrammarEngine);
+        same_type!(gbnf::GbnfError);
+        same_type!(json_schema::SchemaError);
+        same_type!(pda::Alt);
+        same_type!(pda::Symbol);
+        same_type!(pda::Rule);
+        same_type!(pda::CompiledGrammar);
+        same_type!(pda::StackFrame);
+        same_type!(pda::GrammarState);
+        same_type!(pda::StackLimitError);
+        same_type!(pda::StepResult);
+        same_type!(pda::SimResult);
+        same_type!(pda::BuilderError);
+        same_type!(pda::GrammarBuilder);
+        same_type!(spec::GrammarSpec);
+        same_type!(trie::ByteTrie);
+        same_type!(vocab_partition::VocabPartition);
+        same_type!(GrammarEngine);
+        same_type!(GrammarError);
+        same_type!(GrammarSpec);
+    }
+
+    #[test]
+    fn grammar_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::engine::enable_mask_profiling,
+            extracted::engine::enable_mask_profiling,
+        );
+        same_function(
+            facade::engine::take_mask_profile,
+            extracted::engine::take_mask_profile,
+        );
+        same_function(
+            facade::engine::context_recheck_simulated,
+            extracted::engine::context_recheck_simulated,
+        );
+        same_function(
+            facade::engine::context_recheck_candidates,
+            extracted::engine::context_recheck_candidates,
+        );
+        same_function(
+            facade::engine::last_build_profile,
+            extracted::engine::last_build_profile,
+        );
+        same_function(
+            facade::engine::probe_reachable_states,
+            extracted::engine::probe_reachable_states,
+        );
+        same_function(facade::gbnf::parse_gbnf, extracted::gbnf::parse_gbnf);
+        same_function(
+            facade::json_schema::compile_json_schema,
+            extracted::json_schema::compile_json_schema,
+        );
+        same_function(
+            facade::json_schema::compile,
+            extracted::json_schema::compile,
+        );
+        same_function(facade::pda::advance_byte, extracted::pda::advance_byte);
+        same_function(facade::pda::simulate_token, extracted::pda::simulate_token);
+    }
+
+    #[test]
+    fn grammar_constants_are_equal_at_both_paths() {
+        assert_eq!(facade::pda::UNCHOSEN_ALT, extracted::pda::UNCHOSEN_ALT);
+        assert_eq!(
+            facade::vocab_partition::MAX_GRAMMAR_STATES,
+            extracted::vocab_partition::MAX_GRAMMAR_STATES
+        );
+    }
+
+    #[test]
+    fn grammar_error_conversions_and_thread_safety_are_preserved() {
+        fn send_sync<T: Send + Sync>() {}
+        fn error<T: std::error::Error + Send + Sync + 'static>() {}
+        fn from<T: From<U>, U>() {}
+
+        send_sync::<facade::GrammarEngine>();
+        send_sync::<facade::GrammarSpec>();
+        send_sync::<facade::pda::CompiledGrammar>();
+        send_sync::<facade::pda::GrammarState>();
+        send_sync::<facade::trie::ByteTrie>();
+        send_sync::<facade::vocab_partition::VocabPartition>();
+        error::<facade::GrammarError>();
+        error::<facade::gbnf::GbnfError>();
+        error::<facade::json_schema::SchemaError>();
+        error::<facade::pda::BuilderError>();
+        error::<facade::pda::StackLimitError>();
+        from::<facade::GrammarError, extracted::gbnf::GbnfError>();
+        from::<facade::GrammarError, extracted::json_schema::SchemaError>();
+        from::<facade::GrammarError, extracted::pda::BuilderError>();
+        from::<facade::GrammarError, extracted::pda::StackLimitError>();
+        from::<facade::gbnf::GbnfError, extracted::pda::BuilderError>();
+        from::<facade::json_schema::SchemaError, extracted::pda::BuilderError>();
+        from::<lattice_inference::InferenceError, extracted::GrammarError>();
+        from::<lattice_inference_core::InferenceError, facade::GrammarError>();
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn grammar_profiling_items_are_the_same_at_both_paths() {
+        same_type!(engine::BfsDedupProfile);
+        same_function(
+            facade::engine::profile_reachable_states,
+            extracted::engine::profile_reachable_states,
+        );
+    }
+}
