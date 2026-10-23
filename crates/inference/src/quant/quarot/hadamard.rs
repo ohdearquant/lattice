@@ -150,7 +150,8 @@ fn splitmix64_mix(state: u64) -> u64 {
 /// copies sharing `block_size - 1` PRNG states. Running the spaced seed through the
 /// full avalanche finalizer first decouples the streams: distinct block
 /// indexes land at pseudo-random, non-linearly-related stream origins.
-pub(crate) fn derive_block_seed(seed: u64, block_index: usize) -> u64 {
+#[doc(hidden)]
+pub fn derive_block_seed(seed: u64, block_index: usize) -> u64 {
     splitmix64_mix(seed.wrapping_add((block_index as u64).wrapping_mul(SPLITMIX64_GAMMA)))
 }
 
@@ -310,11 +311,10 @@ pub struct BlockHadamard {
 /// validation and then performed an allocation request for `usize::MAX`
 /// elements.
 ///
-/// `pub(crate)` (not private) so the artifact-level R3/R4 plan gates in
-/// `crate::quant::quarot::plan` can enforce this same bound ahead of
-/// [`BlockHadamard::new`] — see
-/// `plan::check_block_hadamard_num_blocks_cap`.
-pub(crate) const MAX_BLOCK_HADAMARD_LEN: usize = 1 << 24;
+/// Shared with artifact-level R3/R4 plan gates so they can enforce the same
+/// bound before constructing a rotation, including across crate boundaries.
+#[doc(hidden)]
+pub const MAX_BLOCK_HADAMARD_LEN: usize = 1 << 24;
 
 /// Upper bound on `num_blocks = n / block_size` accepted by
 /// [`BlockHadamard::new`], and the single source of truth for that bound
@@ -341,7 +341,8 @@ pub(crate) const MAX_BLOCK_HADAMARD_LEN: usize = 1 << 24;
 /// millions (at the smallest valid `block_size = 1`) to approach this cap,
 /// at which point `block_size = 1` would not be a realistic choice for a
 /// real rotation axis anyway.
-pub(crate) const MAX_BLOCK_HADAMARD_BLOCKS: usize = 4096;
+#[doc(hidden)]
+pub const MAX_BLOCK_HADAMARD_BLOCKS: usize = 4096;
 
 impl BlockHadamard {
     /// Build a block-diagonal randomized Hadamard for vectors of length `n`,

@@ -49,8 +49,8 @@
 //! Both routines support f32 (storage tier) and f64 (precision tier per
 //! ADR-044 §Risks).
 
+use super::hadamard::RandomizedHadamard;
 use crate::error::InferenceError;
-use crate::quant::quarot::hadamard::RandomizedHadamard;
 
 fn check_shape(
     fn_name: &str,
