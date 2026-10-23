@@ -10,10 +10,6 @@
 # directory entries.
 
 [[ratchet]]
-path = "crates/inference/benches/inference_perf.rs"
-ceiling = 3016
-
-[[ratchet]]
 path = "scripts/perf-bench-gate.py"
 ceiling = 3818
 
