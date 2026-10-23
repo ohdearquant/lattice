@@ -630,6 +630,12 @@ impl Index {
                     if !intersects(&binding.cfg, cfg)? {
                         continue;
                     }
+                    // A glob cannot supply the name its own path starts with: `use metal::*;`
+                    // needs `metal` resolved before it imports anything, so that name comes
+                    // from another binding or the extern prelude, never from this glob.
+                    if binding.target.split("::").next() == Some(name) {
+                        continue;
+                    }
                     let effective = CfgFormula::all([binding.cfg.clone(), cfg.clone()]);
                     match self.resolve_inner(module, &binding.target, &effective, stack) {
                         Ok(destination) => {
