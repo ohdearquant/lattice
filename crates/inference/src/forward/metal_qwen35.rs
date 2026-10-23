@@ -12566,20 +12566,19 @@ mod inner {
             // ----------------------------------------------------------------
             // Helper: load an F16 file, convert to f32, create a Metal f32 buffer.
             // ----------------------------------------------------------------
-            let load_f16_buf_f32 =
-                |name: &str, label: &str, expected_shape: &[usize]| -> Result<Buffer, String> {
-                    let t = std::time::Instant::now();
-                    let path = Self::q4_tensor_path(q4_dir, name, "f16");
-                    let (values, _shape) =
-                        lattice_weights::q4_weights::load_f16_tensor_file_checked(
-                            &path,
-                            expected_shape,
-                        )
+            let load_f16_buf_f32 = |name: &str,
+                                    label: &str,
+                                    expected: &[usize]|
+             -> Result<Buffer, String> {
+                let t = std::time::Instant::now();
+                let path = Self::q4_tensor_path(q4_dir, name, "f16");
+                let (values, _shape) =
+                    lattice_weights::q4_weights::load_f16_tensor_file_checked(&path, expected)
                         .map_err(|e| format!("failed to load f16 file {}: {e}", path.display()))?;
-                    let buf = make_buffer(&device, &values, label);
-                    dur_b_cell.set(dur_b_cell.get() + t.elapsed());
-                    Ok(buf)
-                };
+                let buf = make_buffer(&device, &values, label);
+                dur_b_cell.set(dur_b_cell.get() + t.elapsed());
+                Ok(buf)
+            };
 
             // ----------------------------------------------------------------
             // H3: Merge-on-first-load for in_proj_qkvz.
