@@ -137,6 +137,8 @@ lattice/
       examples/           — end-to-end bench_* programs
     weights/              — weight storage and model-format detection
       src/                — f32, f16, Q3, Q4 and Q8 storage; safetensors loading
+    quant/                — quantization primitives; depends on inference-core and weights
+      src/                — Q4 manifests, Hadamard transforms and rotation absorption
     embed/                — public embedding service
       src/
         model.rs          — EmbeddingModel enum + ModelConfig
