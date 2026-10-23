@@ -15,6 +15,8 @@ pub mod metal_embeddinggemma2;
 pub mod metal_ernie45;
 pub mod metal_gemm;
 pub mod metal_qwen35;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+mod metal_runtime;
 pub mod moe_expert_cache;
 pub mod neon;
 pub mod neon_forward;
