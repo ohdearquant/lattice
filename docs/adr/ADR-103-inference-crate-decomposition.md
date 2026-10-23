@@ -269,10 +269,9 @@ narrower crate in their own changes. A CI check over `cargo metadata` fails if a
    Because a dry run also passes when someone else already owns the name, that release re-checks on crates.io,
    immediately before the first upload, that each new name is still unowned or owned by the account that publishes
    the existing lattice crates. The check reads `https://crates.io/api/v1/crates/<name>` and its `owners` endpoint
-   with an identifying `User-Agent`, in the same pass as a control read of a crate that is known to exist, as the
-   registry check in `CLAUDE.md` (Publishing) does. Only a 404 for the name, with the control read succeeding, counts
-   as unowned. A refused, unreadable or timed-out answer, a failed control read, or an owner other than that account
-   stops the release before anything is uploaded.
+   with an identifying `User-Agent`, in the same pass as a control read of a crate that is known to exist. Only a
+   404 for the name, with the control read succeeding, counts as unowned. A refused, unreadable or timed-out answer,
+   a failed control read, or an owner other than that account stops the release before anything is uploaded.
 4. A new crate joins the semver job's package list in the first change after its first release, when a baseline
    exists. From then on the extracted crate is checked directly, which is where its API is now defined.
 
