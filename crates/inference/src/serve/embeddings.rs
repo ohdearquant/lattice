@@ -4,7 +4,7 @@
 //! `/v1/embeddings` wire contract for the standalone `lattice_serve` daemon's
 //! own `--embedding-model` (issue #584), which serves through
 //! `crate::model::bert::BertModel` rather than the vision-language loader
-//! below.
+//! (`crate::serving_provider::providers::qwen::embedding`).
 //!
 //! The two are intentionally independent code paths sharing only this file
 //! and the `ApiError` envelope: `lattice_serve`'s text-only route predates
@@ -13,46 +13,28 @@
 //! `TextEmbeddingsInput` below, vs. `EmbeddingsRequest`/`EmbeddingsInput` for
 //! the vision-language route).
 //!
-//! The model type here ([`EmbeddingModel`](crate::serve::embeddings::EmbeddingModel)) loads the same way
-//! `lattice-embed`'s `VisionEmbeddingModel` does -- an f16-packed decoder plus
-//! vision-encoder weights from one safetensors checkpoint -- but is defined
-//! in this crate rather than reused from `lattice-embed`, because
-//! `lattice-embed` depends on `lattice-inference` (not the other way around):
-//! a serving binary in this crate cannot name `lattice-embed`'s type without
-//! a dependency cycle. This loader calls the same public
-//! [`crate::vision::checkpoint`] / [`crate::weights::f16_weights`] functions
-//! `VisionEmbeddingModel::from_directory` wraps; no pooling or checkpoint
-//! math is duplicated, only the small amount of loading glue.
-//!
 //! `TextEmbeddingsRequest`/`TextEmbeddingsInput`/`parse_embeddings_input`/
 //! `check_embeddings_model`/`build_embeddings_response` below are
 //! deliberately independent of `lattice-embed`'s `EmbeddingService` trait for
-//! the same dependency-cycle reason (`lattice-embed` already depends on
+//! the dependency-cycle reason the loader's module documents (`lattice-embed` already depends on
 //! `lattice-inference` for `BertModel`/`QwenModel`); they normalize the wire
 //! request and build the wire response, while the actual embedding compute
 //! is `crate::model::bert::BertModel`, called directly by
 //! `lattice_serve.rs`'s own handler.
 
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 
 use crate::error::InferenceError;
-use crate::forward::cpu_f16::{PoolingStrategy, embed_text_vlm_f16};
-use crate::model::qwen35_config::Qwen35Config;
-use crate::tokenizer::bpe::BpeTokenizer;
-use crate::tokenizer::common::Tokenizer as _;
-use crate::vision::checkpoint::{
-    Qwen35VisionWeights, load_qwen35_vision_weights_from_safetensors,
-    open_qwen35_single_decoder_safetensors,
-};
-use crate::vision::qwen35_vit::preprocess_qwen35_image;
-use crate::vision::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
-use crate::weights::f16_weights::{F16ModelWeights, load_f16_weights};
+use crate::forward::cpu_f16::PoolingStrategy;
+use crate::serving_embeddings::{PooledEmbeddingHandle, PooledEmbeddingService};
 
 use super::ApiError;
 use super::contract::decode_inline_image;
 use serde_json::{Value, json};
+
+pub use crate::serving_provider::providers::qwen::embedding::{
+    EmbeddingModel, QWEN35_F16_DECODER_LOADER,
+};
 
 /// Maximum number of items accepted in one `/v1/embeddings` request's
 /// `input` array, mirroring [`super::contract::MAX_MESSAGE_COUNT`]'s role for
@@ -64,41 +46,6 @@ pub const MAX_EMBEDDING_INPUT_COUNT: usize = 4096;
 // Model loading and execution
 // ---------------------------------------------------------------------------
 
-/// Raises `tokenizer`'s own truncation cap to `max_context` when it sits
-/// below it, otherwise returns `tokenizer` unchanged.
-///
-/// This is the shared enforcement point for the invariant issue #1408
-/// requires: no constructed [`EmbeddingModel`] may have a tokenizer cap
-/// below its own [`EmbeddingModel::max_context`]. If it did,
-/// `check_item_fits_window`'s pre-truncation-count admission check (see
-/// [`embed_items`]) would still admit an over-window item -- its
-/// pre-truncation count is compared against `max_context`, which the
-/// tokenizer cap sits below -- but the tokenizer would then silently
-/// truncate it before the forward pass, embedding a truncated prefix
-/// instead of rejecting the input. Only ever raises the cap, never lowers
-/// it: a caller-supplied tokenizer already capped at or above
-/// `max_context` (e.g. a fixture deliberately testing a *narrower* cap
-/// than its own window) is left untouched.
-fn capped_tokenizer(tokenizer: BpeTokenizer, max_context: usize) -> BpeTokenizer {
-    if tokenizer.max_seq_len() < max_context {
-        tokenizer.with_max_seq_len(max_context)
-    } else {
-        tokenizer
-    }
-}
-
-/// How a loader reads a checkpoint, recorded in a router artifact's
-/// representation so a gate cannot be served by a loader it was not trained
-/// through. Two names exist because this workspace ships two serving binaries
-/// whose embedders really do read the bytes differently: one shared constant
-/// would make every cross-binary comparison pass by construction, which is
-/// the one way this check can be wrong without ever failing.
-///
-/// `EmbeddingModel::from_directory` in this module -- a Qwen3.5 f16 decoder.
-/// The `lattice` binary reads this one; it is the only binary that checks a
-/// router gate.
-pub const QWEN35_F16_DECODER_LOADER: &str = "qwen35-f16-decoder";
-
 /// `BertModel::from_directory`, which is what `lattice_serve` embeds through.
 /// That binary has no routing path today, so nothing compares against this
 /// value at startup. It is declared anyway for two reasons: it gives the
@@ -106,276 +53,6 @@ pub const QWEN35_F16_DECODER_LOADER: &str = "qwen35-f16-decoder";
 /// than invented, and it means a later wiring of routing into that binary
 /// names its own loader instead of silently inheriting this module's.
 pub const BERT_ENCODER_LOADER: &str = "bert-encoder";
-
-/// A loaded Qwen3.5 vision-language checkpoint used to serve pooled text and
-/// image embeddings. See the module doc comment for why this loader lives
-/// here instead of reusing `lattice-embed::vision::VisionEmbeddingModel`.
-///
-/// The two constants above used to sit between this comment and the struct,
-/// which silently reattached these three lines to a string constant and left
-/// the struct undocumented.
-pub struct EmbeddingModel {
-    weights: F16ModelWeights,
-    config: Qwen35Config,
-    vision_weights: Qwen35VisionWeights,
-    tokenizer: BpeTokenizer,
-}
-
-impl EmbeddingModel {
-    /// Compose a model from already-loaded components (no I/O). Used by
-    /// tests and by callers that share components with another in-process
-    /// model instance.
-    ///
-    /// Raises `tokenizer`'s own truncation cap to this checkpoint's
-    /// [`Self::max_context`] window when it sits below it (see
-    /// `capped_tokenizer`), so this constructor gives the same guarantee
-    /// [`Self::from_directory`] does: no `EmbeddingModel`, however
-    /// constructed, can have a tokenizer cap below its own `max_context()`.
-    /// Without this, a caller passing a default `BpeTokenizer` (whose
-    /// constructors cap at 4096) alongside a checkpoint config whose
-    /// `max_position_embeddings.min(8192)` exceeds 4096 would reproduce
-    /// exactly the #1408 bug through this constructor instead of the loader.
-    pub fn new(
-        weights: F16ModelWeights,
-        config: Qwen35Config,
-        vision_weights: Qwen35VisionWeights,
-        tokenizer: BpeTokenizer,
-    ) -> Self {
-        let max_context = config.max_position_embeddings.min(8192);
-        let tokenizer = capped_tokenizer(tokenizer, max_context);
-        Self {
-            weights,
-            config,
-            vision_weights,
-            tokenizer,
-        }
-    }
-
-    /// Load a Qwen3.5 vision-language checkpoint directory for embedding
-    /// service. Same layout and error conditions as `lattice-embed`'s
-    /// `VisionEmbeddingModel::from_directory`: `config.json` must declare a
-    /// `vision_config`, the directory must resolve to exactly one decoder
-    /// safetensors shard, and a `quantize_index.json` (native Q4) checkpoint
-    /// is rejected -- this loader only understands the f16 decoder format.
-    pub fn from_directory(dir: &Path) -> Result<Self, String> {
-        let quantized_index = dir.join("quantize_index.json");
-        if quantized_index.exists() {
-            return Err(format!(
-                "{} is present, but quantized checkpoints are not supported by the embeddings \
-                 f16 decoder loader",
-                quantized_index.display()
-            ));
-        }
-
-        let config = Qwen35Config::from_model_dir(dir).map_err(|e| format!("config.json: {e}"))?;
-        let vision_cfg = config.vision_config.clone().ok_or_else(|| {
-            format!(
-                "{} has no vision_config; not a vision-language checkpoint",
-                dir.display()
-            )
-        })?;
-
-        let tokenizer_path = dir.join("tokenizer.json");
-        let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path)
-            .map_err(|e| format!("{}: {e}", tokenizer_path.display()))?;
-
-        let (mut sf, shard_path) = open_qwen35_single_decoder_safetensors(dir)
-            .map_err(|e| format!("decoder checkpoint: {e}"))?;
-        let vision_weights =
-            load_qwen35_vision_weights_from_safetensors(&mut sf, &shard_path, &vision_cfg)
-                .map_err(|e| format!("vision weights: {e}"))?;
-        let weights =
-            load_f16_weights(&sf, &config).map_err(|e| format!("decoder weights: {e}"))?;
-
-        // Routed through `Self::new` (not a bare struct literal) so the
-        // tokenizer's truncation cap is raised to this checkpoint's context
-        // window exactly as any other construction path would be -- see
-        // `Self::new`'s and `capped_tokenizer`'s docs for why: otherwise,
-        // whenever `max_position_embeddings.min(8192)` exceeds
-        // `BpeTokenizer`'s `DEFAULT_BPE_MAX_SEQ_LEN` (4096), the tokenizer
-        // can silently truncate an input to 4096 tokens while
-        // `check_item_fits_window` admits it (its pre-truncation count is
-        // still under the wider window), embedding a truncated prefix
-        // instead of rejecting it.
-        Ok(Self::new(weights, config, vision_weights, tokenizer))
-    }
-
-    /// Output embedding dimension (the checkpoint's decoder hidden size).
-    pub fn dimensions(&self) -> usize {
-        self.config.hidden_size
-    }
-
-    /// Real (possibly truncated) tokenized length of `text`, used for
-    /// `usage.prompt_tokens` -- this must report what the pooled forward
-    /// pass actually consumes, not what the caller sent. Never use this for
-    /// a context-window admission check: see `Self::tokenize_lengths`.
-    pub fn tokenize_len(&self, text: &str) -> usize {
-        self.tokenizer.tokenize(text).real_length
-    }
-
-    /// Tokenizes `text` once, returning `(pre_truncation_len, real_length)`
-    /// -- the count the context-window admission guard
-    /// ([`check_item_fits_window`]) must compare against, and the count the
-    /// forward pass actually consumes for `usage.prompt_tokens`,
-    /// respectively. Exists so a caller that needs both counts (the
-    /// [`embed_items`] text branch) tokenizes once instead of twice;
-    /// [`Self::tokenize_len`] above remains the single-value accessor for a
-    /// caller (e.g. [`Self::image_scaffold_token_count`]) that only needs
-    /// the real, post-truncation count.
-    ///
-    /// `pre_truncation_len` must be used for admission, never `real_length`:
-    /// `real_length` can never exceed the tokenizer's `max_seq_len`, so
-    /// comparing it against `max_context()` can never observe an
-    /// over-window input once `max_seq_len <= max_context()` -- the
-    /// rejection becomes unreachable and an over-long input is silently
-    /// embedded from a truncated prefix instead. See
-    /// `TokenizedInput::pre_truncation_len`'s doc for the same reasoning
-    /// applied to the sibling `lattice_serve` text-embeddings route.
-    fn tokenize_lengths(&self, text: &str) -> (usize, usize) {
-        let tokenized = self.tokenizer.tokenize(text);
-        (tokenized.pre_truncation_len, tokenized.real_length)
-    }
-
-    /// Maximum decoder scaffold length this checkpoint can process in one
-    /// pooled prefill, mirroring the exact cap the chat serving path derives
-    /// from the same field for its RoPE table (`Qwen35Model::from_safetensors`:
-    /// `config.max_position_embeddings.min(8192)`). Used as the source of
-    /// truth for `check_item_fits_window`.
-    pub fn max_context(&self) -> usize {
-        self.config.max_position_embeddings.min(8192)
-    }
-
-    /// Real scaffold token count an image item consumes: one
-    /// `vision_start_token_id`, one `vision_end_token_id`, the checkpoint's
-    /// per-image pad-token count derived from the patch grid (mirroring
-    /// `pooled_embed.rs`'s own `image_pad_positions`/`num_pads` arithmetic,
-    /// via a separate, cheap preprocessing call rather than by reaching into
-    /// that module's internals), and `prompt`'s tokenized length. Used both
-    /// for `usage.prompt_tokens` accounting and (via the returned count) can
-    /// be compared against [`Self::max_context`] the same way a text item is.
-    ///
-    /// Uses [`Self::tokenize_len`] (the real, possibly-truncated count), not
-    /// the pre-truncation count `Self::tokenize_lengths` also exposes, for
-    /// the `prompt` component -- unlike the text item guard, this is not a
-    /// live gap today: this
-    /// method's one production call site ([`embed_items`]'s image branch)
-    /// always passes `prompt = ""`, whose tokenized length is `0` either
-    /// way, so no input can currently exercise the truncation-vs-window
-    /// mismatch through this path. A future caller that passes a real
-    /// `prompt` here would need the same admission/usage split the text
-    /// branch got; left as real-length-only for now rather than adding an
-    /// unexercised second accessor for a code path with no non-empty-prompt
-    /// caller.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InferenceError::InvalidInput`] if the checkpoint has no
-    /// `vision_config`, or if the image cannot be decoded/preprocessed (see
-    /// [`preprocess_qwen35_image`]'s error conditions).
-    pub fn image_scaffold_token_count(
-        &self,
-        image_bytes: &[u8],
-        prompt: &str,
-    ) -> Result<usize, InferenceError> {
-        let vision_cfg = self.config.vision_config.as_ref().ok_or_else(|| {
-            InferenceError::InvalidInput(
-                "checkpoint has no vision_config; cannot count image scaffold tokens".to_string(),
-            )
-        })?;
-        let (_pixel_values, grid) =
-            preprocess_qwen35_image(image_bytes, vision_cfg).map_err(|e| {
-                InferenceError::InvalidInput(format!("image preprocessing failed: {e}"))
-            })?;
-        let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
-        if merge_sq == 0 || !grid.num_patches().is_multiple_of(merge_sq) {
-            return Err(InferenceError::InvalidInput(format!(
-                "image grid {grid:?} patch count is not a multiple of spatial_merge_size^2"
-            )));
-        }
-        let pads = grid.num_patches() / merge_sq;
-        // vision_start + pads + vision_end + prompt tokens.
-        Ok(2 + pads + self.tokenize_len(prompt))
-    }
-
-    /// Pool a text-only prompt through the same decoder + pooling path used
-    /// for images, landing in the same vector space (see
-    /// [`embed_text_vlm_f16`]).
-    pub fn embed_text(
-        &self,
-        prompt: &str,
-        pooling: PoolingStrategy,
-    ) -> Result<Vec<f32>, InferenceError> {
-        embed_text_vlm_f16(
-            &self.weights,
-            &self.config,
-            &self.tokenizer,
-            prompt,
-            pooling,
-        )
-    }
-
-    /// Pool an image into a single L2-normalized embedding vector, running
-    /// the ViT forward pass on the CPU.
-    pub fn embed_image(
-        &self,
-        image_bytes: &[u8],
-        prompt: &str,
-        pooling: PoolingStrategy,
-    ) -> Result<Vec<f32>, InferenceError> {
-        embed_image_from_bytes_f16(
-            &self.weights,
-            &self.config,
-            &self.vision_weights,
-            &self.tokenizer,
-            image_bytes,
-            prompt,
-            pooling,
-        )
-    }
-
-    /// Metal-dispatching sibling of [`Self::embed_image`]: runs the ViT
-    /// forward pass on the Metal GPU. Returns
-    /// [`InferenceError::UnsupportedModel`] when no Metal device is
-    /// available (build-level or runtime) rather than silently falling back
-    /// -- see [`Self::embed_image_best_effort`] for the fallback policy this
-    /// module actually serves requests through.
-    pub fn embed_image_metal(
-        &self,
-        image_bytes: &[u8],
-        prompt: &str,
-        pooling: PoolingStrategy,
-    ) -> Result<Vec<f32>, InferenceError> {
-        embed_image_from_bytes_f16_metal(
-            &self.weights,
-            &self.config,
-            &self.vision_weights,
-            &self.tokenizer,
-            image_bytes,
-            prompt,
-            pooling,
-        )
-    }
-
-    /// Serving policy for image items: try the Metal ViT dispatch first,
-    /// falling back to the CPU ViT forward only when Metal is unavailable
-    /// (build-level or runtime) rather than for every error -- a real
-    /// inference failure (bad image, invalid assembled request) must still
-    /// surface as such, not retry silently on the CPU path and mask it.
-    pub fn embed_image_best_effort(
-        &self,
-        image_bytes: &[u8],
-        prompt: &str,
-        pooling: PoolingStrategy,
-    ) -> Result<Vec<f32>, InferenceError> {
-        match self.embed_image_metal(image_bytes, prompt, pooling) {
-            Err(InferenceError::UnsupportedModel(_)) => {
-                self.embed_image(image_bytes, prompt, pooling)
-            }
-            other => other,
-        }
-    }
-}
-
 /// Maps an [`InferenceError`] from the pooling machinery to the shared HTTP
 /// error envelope: caller-supplied-input problems (bad image geometry, empty
 /// prompt) become `HTTP 400`; everything else (including `UnsupportedModel`,
@@ -646,6 +323,24 @@ pub fn embed_items(
     items: Vec<NormalizedEmbeddingItem>,
     pooling: PoolingStrategy,
 ) -> Result<(Vec<EmbeddingDatum>, EmbeddingsUsage), ApiError> {
+    embed_pooled_service(embedder, items, pooling)
+}
+
+/// Runs normalized pooled inputs through a provider-owned embedding service.
+#[doc(hidden)]
+pub fn embed_pooled_items(
+    model: &PooledEmbeddingHandle,
+    items: Vec<NormalizedEmbeddingItem>,
+    pooling: PoolingStrategy,
+) -> Result<(Vec<EmbeddingDatum>, EmbeddingsUsage), ApiError> {
+    embed_pooled_service(model, items, pooling)
+}
+
+fn embed_pooled_service(
+    embedder: &dyn PooledEmbeddingService,
+    items: Vec<NormalizedEmbeddingItem>,
+    pooling: PoolingStrategy,
+) -> Result<(Vec<EmbeddingDatum>, EmbeddingsUsage), ApiError> {
     let max_context = embedder.max_context();
     let mut data = Vec::with_capacity(items.len());
     let mut prompt_tokens = 0usize;
@@ -658,18 +353,18 @@ pub fn embed_items(
                 // `usage.prompt_tokens` still reports the real (possibly
                 // truncated) count the forward pass actually consumes --
                 // see `tokenize_lengths`'s doc comment.
-                let (admission_count, token_count) = embedder.tokenize_lengths(text);
-                check_item_fits_window(index, admission_count, max_context)?;
-                prompt_tokens += token_count;
+                let counts = embedder.text_counts(text);
+                check_item_fits_window(index, counts.pre_truncation, max_context)?;
+                prompt_tokens += counts.embedded;
                 embedder.embed_text(text, pooling)
             }
             NormalizedEmbeddingItem::Image(bytes) => {
                 let token_count = embedder
-                    .image_scaffold_token_count(bytes, "")
+                    .image_scaffold_len(bytes)
                     .map_err(map_embedding_error)?;
                 check_item_fits_window(index, token_count, max_context)?;
                 prompt_tokens += token_count;
-                embedder.embed_image_best_effort(bytes, "", pooling)
+                embedder.embed_image(bytes, pooling)
             }
         }
         .map_err(map_embedding_error)?;
@@ -766,14 +461,33 @@ pub fn check_pooled_embedding_total_tokens(
     embedder: &EmbeddingModel,
     items: &[NormalizedEmbeddingItem],
 ) -> Result<(), ApiError> {
+    check_pooled_service(embedder, items)
+}
+
+/// Checks per-item windows and aggregate tokens through a pooled service.
+#[doc(hidden)]
+pub fn check_pooled_service_total_tokens(
+    model: &PooledEmbeddingHandle,
+    items: &[NormalizedEmbeddingItem],
+) -> Result<(), ApiError> {
+    check_pooled_service(model, items)
+}
+
+fn check_pooled_service(
+    embedder: &dyn PooledEmbeddingService,
+    items: &[NormalizedEmbeddingItem],
+) -> Result<(), ApiError> {
     let max_context = embedder.max_context();
     let mut total_tokens = 0usize;
     for (index, item) in items.iter().enumerate() {
         let (admission_count, real_count) = match item {
-            NormalizedEmbeddingItem::Text(text) => embedder.tokenize_lengths(text),
+            NormalizedEmbeddingItem::Text(text) => {
+                let counts = embedder.text_counts(text);
+                (counts.pre_truncation, counts.embedded)
+            }
             NormalizedEmbeddingItem::Image(bytes) => {
                 let count = embedder
-                    .image_scaffold_token_count(bytes, "")
+                    .image_scaffold_len(bytes)
                     .map_err(map_embedding_error)?;
                 (count, count)
             }
@@ -806,12 +520,14 @@ pub fn check_pooled_embedding_total_tokens(
 pub mod test_support {
     use super::EmbeddingModel;
     use crate::model::qwen35_config::{LayerType, Qwen35Config, RopeParams, VisionModelConfig};
+    use crate::serving_embeddings::PooledEmbeddingHandle;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::vision::checkpoint::{Qwen35VisionWeights, VisualBlockWeights, VisualMergerWeights};
     use crate::weights::f16_weights::{
         F16AttentionWeights, F16CommonLayerWeights, F16FeedForwardWeights,
         F16FullAttentionLayerWeights, F16ModelWeights,
     };
+    use std::sync::Arc;
 
     fn pseudo_random_fill(seed: u32, n: usize) -> Vec<f32> {
         let mut state = seed | 1;
@@ -990,6 +706,11 @@ pub mod test_support {
             BpeTokenizer::from_vocab_and_merges(vocab_map, vec![]).expect("tokenizer constructs");
 
         EmbeddingModel::new(weights, config, vision_weights, tokenizer)
+    }
+
+    /// Builds a pooled handle around the deterministic in-memory fixture.
+    pub fn tiny_embedding_handle(model: EmbeddingModel) -> PooledEmbeddingHandle {
+        PooledEmbeddingHandle::new(Arc::new(model))
     }
 
     /// An 8x8 synthetic PNG data URI, varied by `seed` so two calls produce
@@ -1305,1013 +1026,4 @@ pub fn build_embeddings_response(
             "total_tokens": prompt_tokens,
         },
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-    use test_support::{tiny_embedding_model, tiny_png_data_uri};
-
-    /// Tensor inventory a tiny f16-decoder + vision checkpoint must carry
-    /// for [`open_qwen35_single_decoder_safetensors`],
-    /// [`load_qwen35_vision_weights_from_safetensors`], and
-    /// [`load_f16_weights`] to all succeed. Mirrors
-    /// `lattice-embed::vision::tests::tiny_vlm_checkpoint_shapes` exactly:
-    /// both crates load through the same checkpoint-reading functions, so
-    /// the same on-disk shape works for either loader.
-    fn tiny_vlm_checkpoint_shapes() -> Vec<(String, Vec<usize>)> {
-        let hidden = 8usize;
-        let mut shapes = vec![
-            (
-                "model.language_model.embed_tokens.weight".to_string(),
-                vec![16, hidden],
-            ),
-            ("model.language_model.norm.weight".to_string(), vec![hidden]),
-            (
-                "model.language_model.layers.0.input_layernorm.weight".to_string(),
-                vec![hidden],
-            ),
-            (
-                "model.language_model.layers.0.post_attention_layernorm.weight".to_string(),
-                vec![hidden],
-            ),
-            (
-                "model.language_model.layers.0.mlp.gate_proj.weight".to_string(),
-                vec![4, hidden],
-            ),
-            (
-                "model.language_model.layers.0.mlp.up_proj.weight".to_string(),
-                vec![4, hidden],
-            ),
-            (
-                "model.language_model.layers.0.mlp.down_proj.weight".to_string(),
-                vec![hidden, 4],
-            ),
-            (
-                "model.language_model.layers.0.self_attn.q_proj.weight".to_string(),
-                vec![16, hidden],
-            ),
-            (
-                "model.language_model.layers.0.self_attn.k_proj.weight".to_string(),
-                vec![hidden, hidden],
-            ),
-            (
-                "model.language_model.layers.0.self_attn.v_proj.weight".to_string(),
-                vec![hidden, hidden],
-            ),
-            (
-                "model.language_model.layers.0.self_attn.o_proj.weight".to_string(),
-                vec![hidden, hidden],
-            ),
-            (
-                "model.language_model.layers.0.self_attn.q_norm.weight".to_string(),
-                vec![hidden],
-            ),
-            (
-                "model.language_model.layers.0.self_attn.k_norm.weight".to_string(),
-                vec![hidden],
-            ),
-            (
-                "model.visual.patch_embed.proj.weight".to_string(),
-                vec![hidden, 3, 1, 2, 2],
-            ),
-            (
-                "model.visual.patch_embed.proj.bias".to_string(),
-                vec![hidden],
-            ),
-            (
-                "model.visual.pos_embed.weight".to_string(),
-                vec![16, hidden],
-            ),
-            (
-                "model.visual.merger.linear_fc1.weight".to_string(),
-                vec![32, 32],
-            ),
-            ("model.visual.merger.linear_fc1.bias".to_string(), vec![32]),
-            (
-                "model.visual.merger.linear_fc2.weight".to_string(),
-                vec![hidden, 32],
-            ),
-            (
-                "model.visual.merger.linear_fc2.bias".to_string(),
-                vec![hidden],
-            ),
-            ("model.visual.merger.norm.weight".to_string(), vec![hidden]),
-            ("model.visual.merger.norm.bias".to_string(), vec![hidden]),
-        ];
-        for (suffix, shape) in [
-            ("attn.qkv.weight", vec![24, hidden]),
-            ("attn.qkv.bias", vec![24]),
-            ("attn.proj.weight", vec![hidden, hidden]),
-            ("attn.proj.bias", vec![hidden]),
-            ("mlp.linear_fc1.weight", vec![32, hidden]),
-            ("mlp.linear_fc1.bias", vec![32]),
-            ("mlp.linear_fc2.weight", vec![hidden, 32]),
-            ("mlp.linear_fc2.bias", vec![hidden]),
-            ("norm1.weight", vec![hidden]),
-            ("norm1.bias", vec![hidden]),
-            ("norm2.weight", vec![hidden]),
-            ("norm2.bias", vec![hidden]),
-        ] {
-            shapes.push((format!("model.visual.blocks.0.{suffix}"), shape));
-        }
-        shapes
-    }
-
-    fn write_f32_safetensors(path: &Path, shapes: &[(String, Vec<usize>)]) {
-        let mut header_parts = Vec::with_capacity(shapes.len());
-        let mut data = Vec::new();
-        for (i, (name, shape)) in shapes.iter().enumerate() {
-            let start = data.len();
-            let numel: usize = shape.iter().product();
-            for _ in 0..numel {
-                data.extend_from_slice(&((i + 1) as f32 / 100.0).to_le_bytes());
-            }
-            let end = data.len();
-            let shape = shape
-                .iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            header_parts.push(format!(
-                r#""{name}":{{"dtype":"F32","shape":[{shape}],"data_offsets":[{start},{end}]}}"#
-            ));
-        }
-        let header = format!("{{{}}}", header_parts.join(","));
-        let mut bytes = Vec::with_capacity(8 + header.len() + data.len());
-        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(header.as_bytes());
-        bytes.extend_from_slice(&data);
-        std::fs::write(path, bytes).expect("write safetensors fixture");
-    }
-
-    fn write_tiny_tokenizer_json(dir: &Path) {
-        let tokenizer = r#"{
-            "model": {
-                "type": "BPE",
-                "vocab": {
-                    "a": 0, "b": 1, "c": 2, "d": 3,
-                    "e": 4, "f": 5, "g": 6, "h": 7,
-                    "i": 8, "j": 9, "k": 10, "l": 11,
-                    "m": 12, "n": 13, "o": 14, "p": 15
-                },
-                "merges": []
-            }
-        }"#;
-        std::fs::write(dir.join("tokenizer.json"), tokenizer).expect("write tokenizer.json");
-    }
-
-    /// Writes a tiny on-disk VLM checkpoint (`config.json`,
-    /// `tokenizer.json`, single-file `model.safetensors`) with a
-    /// caller-chosen `max_position_embeddings`, so a test can pin it above
-    /// `BpeTokenizer`'s 4096 constructor default and exercise
-    /// [`EmbeddingModel::from_directory`]'s tokenizer-capping behavior end
-    /// to end.
-    fn write_tiny_vlm_checkpoint(dir: &Path, max_position_embeddings: usize) {
-        let config = format!(
-            r#"{{
-            "text_config": {{
-                "hidden_size": 8,
-                "num_hidden_layers": 1,
-                "vocab_size": 16,
-                "intermediate_size": 4,
-                "rms_norm_eps": 0.000001,
-                "num_attention_heads": 1,
-                "num_key_value_heads": 1,
-                "head_dim": 8,
-                "rope_theta": 10000000.0,
-                "partial_rotary_factor": 1.0,
-                "rope_parameters": {{
-                    "rope_theta": 10000000.0,
-                    "partial_rotary_factor": 1.0,
-                    "mrope_section": [2, 1, 1],
-                    "mrope_interleaved": true
-                }},
-                "linear_num_key_heads": 2,
-                "linear_num_value_heads": 2,
-                "linear_key_head_dim": 32,
-                "linear_value_head_dim": 32,
-                "linear_conv_kernel_dim": 4,
-                "tie_word_embeddings": true,
-                "full_attention_interval": 1,
-                "layer_types": ["full_attention"],
-                "layer_mask": [true],
-                "eos_token_id": 15,
-                "max_position_embeddings": {max_position_embeddings}
-            }},
-            "vision_config": {{
-                "depth": 1,
-                "hidden_size": 8,
-                "num_heads": 2,
-                "patch_size": 2,
-                "spatial_merge_size": 2,
-                "out_hidden_size": 8,
-                "temporal_patch_size": 1,
-                "num_position_embeddings": 16,
-                "in_channels": 3,
-                "deepstack_visual_indexes": []
-            }},
-            "image_token_id": 9,
-            "vision_start_token_id": 10,
-            "vision_end_token_id": 11,
-            "tie_word_embeddings": true
-        }}"#
-        );
-        std::fs::write(dir.join("config.json"), &config).expect("write config.json");
-        write_tiny_tokenizer_json(dir);
-        write_f32_safetensors(
-            &dir.join("model.safetensors"),
-            &tiny_vlm_checkpoint_shapes(),
-        );
-    }
-
-    /// Issue #1408, loader half: a `tokenizer.json` with no explicit cap
-    /// parses through `BpeTokenizer::from_tokenizer_json` at its
-    /// constructor default (4096). A checkpoint whose
-    /// `max_position_embeddings` sits above that default (here 5000, still
-    /// under the 8192 ceiling `capped_tokenizer` applies) must come out of
-    /// `from_directory` with its tokenizer cap raised to match. This is a
-    /// different property from
-    /// `embedding_model_new_raises_a_tokenizer_cap_below_max_context` below:
-    /// that test calls `EmbeddingModel::new` directly and would still pass
-    /// if `from_directory` stopped routing through `new` (e.g. reverted to
-    /// building `Self { .. }` directly); this test exercises
-    /// `from_directory`'s own path end to end and reddens on that revert.
-    #[test]
-    fn from_directory_raises_tokenizer_cap_to_context_window_above_tokenizer_default() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write_tiny_vlm_checkpoint(tmp.path(), 5000);
-
-        let model = EmbeddingModel::from_directory(tmp.path())
-            .expect("VLM checkpoint with a wide context window must load");
-        assert_eq!(
-            model.tokenizer.max_seq_len(),
-            5000,
-            "tokenizer cap must be raised to max_position_embeddings, not left at the \
-             tokenizer's own 4096 default"
-        );
-    }
-
-    /// Issue #1408, constructor half: `EmbeddingModel::new` itself -- not
-    /// just the `from_directory` loader -- must raise a caller-supplied
-    /// tokenizer's cap to at least `max_context()`. Without this, a caller
-    /// passing a default `BpeTokenizer` (cap 4096) alongside a config whose
-    /// `max_position_embeddings.min(8192)` exceeds 4096 reproduces the
-    /// #1408 bug through this constructor instead of the loader.
-    #[test]
-    fn embedding_model_new_raises_a_tokenizer_cap_below_max_context() {
-        let base = tiny_embedding_model();
-        let mut config = base.config.clone();
-        config.max_position_embeddings = 5000;
-        // `BpeTokenizer::from_vocab_and_merges` defaults to
-        // `DEFAULT_BPE_MAX_SEQ_LEN` (4096), strictly below the 5000-token
-        // window just configured -- exactly the mismatch `new` must close.
-        let mut vocab_map = std::collections::HashMap::new();
-        for (i, c) in ["a", "b", "c"].iter().enumerate() {
-            vocab_map.insert((*c).to_string(), i as u32);
-        }
-        let tokenizer =
-            BpeTokenizer::from_vocab_and_merges(vocab_map, vec![]).expect("tokenizer constructs");
-        assert!(tokenizer.max_seq_len() < 5000, "fixture precondition");
-
-        let model = EmbeddingModel::new(
-            base.weights.clone(),
-            config,
-            base.vision_weights.clone(),
-            tokenizer,
-        );
-        assert_eq!(model.max_context(), 5000);
-        assert_eq!(
-            model.tokenizer.max_seq_len(),
-            5000,
-            "new() must raise a below-window tokenizer cap to max_context()"
-        );
-    }
-
-    #[test]
-    fn embed_items_happy_path_text_only() {
-        let model = tiny_embedding_model();
-        let items =
-            normalize_embedding_items(vec![EmbeddingInputItem::Text("a".to_string())]).unwrap();
-        let (data, usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0].index, 0);
-        assert_eq!(data[0].embedding.len(), model.dimensions());
-        assert!(usage.prompt_tokens > 0);
-    }
-
-    #[test]
-    fn embed_items_rejects_text_item_over_context_window() {
-        let model = tiny_embedding_model();
-        assert_eq!(model.max_context(), 512);
-        // Single-character vocab, no merges: each "a" is its own token, so
-        // this tokenizes to 600 tokens, above the tiny fixture's 512-token
-        // context window.
-        let over_limit_text = "a".repeat(600);
-        let items =
-            normalize_embedding_items(vec![EmbeddingInputItem::Text(over_limit_text)]).unwrap();
-        let err = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap_err();
-        match err {
-            ApiError::BadRequest { message, code } => {
-                assert_eq!(code, "context_length_exceeded");
-                assert!(message.contains("input item 0"), "message: {message}");
-                assert!(message.contains("600"), "message: {message}");
-                assert!(message.contains("512"), "message: {message}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn embed_items_accepts_text_item_within_context_window() {
-        let model = tiny_embedding_model();
-        let items =
-            normalize_embedding_items(vec![EmbeddingInputItem::Text("a".repeat(10))]).unwrap();
-        let (data, usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
-        assert_eq!(data.len(), 1);
-        assert_eq!(usage.prompt_tokens, 10);
-    }
-
-    /// Builds a fixture with the OPPOSITE ordering of
-    /// `embed_items_rejects_text_item_over_context_window` above: that
-    /// test's `max_context() == 512` sits BELOW the tokenizer's default
-    /// (4096) truncation cap, so a long input survives tokenization intact
-    /// and trips the guard whether the guard reads the real or the
-    /// pre-truncation count -- it cannot distinguish the fix from a no-op.
-    /// This fixture pins a tokenizer cap (5) BELOW the context window
-    /// (1000), which is the ordering issue #1408 actually needs: a
-    /// comparison against `tokenize_len`'s real (post-truncation) count
-    /// would clamp to 5 tokens for any input and could never exceed the
-    /// 1000-token window, making the rejection unreachable.
-    ///
-    /// Built via a direct struct literal, not `EmbeddingModel::new`:
-    /// `new` now enforces the #1408 constructor invariant (tokenizer cap at
-    /// or above `max_context()`, see `capped_tokenizer`) and would silently
-    /// raise this fixture's deliberately-below-window cap back to 1000,
-    /// destroying the exact mismatch this fixture exists to construct.
-    /// This is a different property from the constructor invariant test
-    /// (`embedding_model_new_raises_a_tokenizer_cap_below_max_context`
-    /// below) -- that test asserts `new` closes this gap for real callers;
-    /// this fixture must keep it open to exercise the admission-count
-    /// semantics on their own. Same-crate private-field access from this
-    /// child `mod tests` is what makes the bypass possible.
-    fn context_window_above_tokenizer_cap_model() -> EmbeddingModel {
-        let base = tiny_embedding_model();
-        let mut config = base.config.clone();
-        config.max_position_embeddings = 1000;
-        let tokenizer = base.tokenizer.clone().with_max_seq_len(5);
-        EmbeddingModel {
-            weights: base.weights.clone(),
-            config,
-            vision_weights: base.vision_weights.clone(),
-            tokenizer,
-        }
-    }
-
-    #[test]
-    fn embed_items_rejects_text_item_whose_pre_truncation_length_exceeds_a_window_above_the_tokenizer_cap()
-     {
-        let model = context_window_above_tokenizer_cap_model();
-        assert_eq!(model.max_context(), 1000);
-        assert_eq!(model.tokenizer.max_seq_len(), 5);
-
-        // Pre-truncation length 1200 (above the 1000-token window), which
-        // the tokenizer would truncate to 5 real tokens before the forward
-        // pass. Under the pre-#1408 comparison (real length 5 vs. window
-        // 1000) this would be silently ACCEPTED and embedded from a
-        // 5-token truncated prefix. The admission guard must reject it.
-        let over_limit_text = "a".repeat(1200);
-        let items =
-            normalize_embedding_items(vec![EmbeddingInputItem::Text(over_limit_text)]).unwrap();
-        let err = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap_err();
-        match err {
-            ApiError::BadRequest { message, code } => {
-                assert_eq!(code, "context_length_exceeded");
-                assert!(message.contains("input item 0"), "message: {message}");
-                assert!(message.contains("1200"), "message: {message}");
-                assert!(message.contains("1000"), "message: {message}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn embed_items_accepted_prompt_tokens_matches_the_count_actually_embedded_when_truncated() {
-        // Same inverted fixture, but with an input whose pre-truncation
-        // length (12) still fits the window (1000) -- ACCEPTED -- while the
-        // tokenizer truncates it to 5 tokens before the forward pass.
-        // `usage.prompt_tokens` must report 5 (what was actually embedded),
-        // not 12: the naive one-liner fix (swap `tokenize_len` to always
-        // return the pre-truncation count) would report 12 here, billing
-        // tokens that were never embedded -- see `usage.prompt_tokens`'s own
-        // doc comment on `EmbeddingsUsage`.
-        let model = context_window_above_tokenizer_cap_model();
-        let text = "a".repeat(12);
-        let items = normalize_embedding_items(vec![EmbeddingInputItem::Text(text)]).unwrap();
-        let (data, usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
-        assert_eq!(data.len(), 1);
-        assert_eq!(
-            usage.prompt_tokens, 5,
-            "usage must report the real embedded count, not the pre-truncation count"
-        );
-    }
-
-    #[test]
-    fn embed_items_happy_path_image() {
-        let model = tiny_embedding_model();
-        let items = normalize_embedding_items(vec![EmbeddingInputItem::Image {
-            url: tiny_png_data_uri(0),
-        }])
-        .unwrap();
-        let (data, _usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
-        assert_eq!(data.len(), 1);
-        let norm: f32 = data[0].embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-4, "expected unit norm, got {norm}");
-    }
-
-    #[test]
-    fn embed_items_image_usage_matches_scaffold_token_formula() {
-        let model = tiny_embedding_model();
-        let data_uri = tiny_png_data_uri(2);
-        let image_bytes = decode_inline_image(&data_uri).unwrap();
-        let vision_cfg = model.config.vision_config.as_ref().unwrap();
-        let (_pixels, grid) = preprocess_qwen35_image(&image_bytes, vision_cfg).unwrap();
-        let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
-        let expected_tokens = 2 + grid.num_patches() / merge_sq;
-
-        let items =
-            normalize_embedding_items(vec![EmbeddingInputItem::Image { url: data_uri }]).unwrap();
-        let (_data, usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
-        assert_eq!(usage.prompt_tokens, expected_tokens);
-    }
-
-    #[test]
-    fn embed_items_rejects_image_item_over_context_window() {
-        let base = tiny_embedding_model();
-        let mut config = base.config.clone();
-        config.max_position_embeddings = 4;
-        let model = EmbeddingModel::new(
-            base.weights.clone(),
-            config,
-            base.vision_weights.clone(),
-            base.tokenizer.clone(),
-        );
-        assert_eq!(model.max_context(), 4);
-
-        let data_uri = tiny_png_data_uri(3);
-        let image_bytes = decode_inline_image(&data_uri).unwrap();
-        let vision_cfg = model.config.vision_config.as_ref().unwrap();
-        let (_pixels, grid) = preprocess_qwen35_image(&image_bytes, vision_cfg).unwrap();
-        let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
-        let expected_tokens = 2 + grid.num_patches() / merge_sq;
-        assert!(
-            expected_tokens > model.max_context(),
-            "fixture must exceed the tiny context window: {expected_tokens} tokens vs {} \
-             context",
-            model.max_context()
-        );
-
-        let items =
-            normalize_embedding_items(vec![EmbeddingInputItem::Image { url: data_uri }]).unwrap();
-        let err = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap_err();
-        match err {
-            ApiError::BadRequest { message, code } => {
-                assert_eq!(code, "context_length_exceeded");
-                assert!(message.contains("input item 0"), "message: {message}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn embed_items_mixed_batch_preserves_input_order() {
-        let model = tiny_embedding_model();
-        let items = normalize_embedding_items(vec![
-            EmbeddingInputItem::Text("a".to_string()),
-            EmbeddingInputItem::Image {
-                url: tiny_png_data_uri(1),
-            },
-            EmbeddingInputItem::Text("b".to_string()),
-        ])
-        .unwrap();
-        let (data, _usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
-        assert_eq!(data.len(), 3);
-        assert_eq!(data[0].index, 0);
-        assert_eq!(data[1].index, 1);
-        assert_eq!(data[2].index, 2);
-    }
-
-    #[test]
-    fn check_pooled_embedding_total_tokens_accepts_within_budget() {
-        let model = tiny_embedding_model();
-        let items =
-            normalize_embedding_items(vec![EmbeddingInputItem::Text("a".to_string())]).unwrap();
-        check_pooled_embedding_total_tokens(&model, &items).unwrap();
-    }
-
-    #[test]
-    fn check_pooled_embedding_total_tokens_rejects_over_budget() {
-        let model = tiny_embedding_model();
-        // Every item individually fits `model.max_context()` (512, see
-        // `tiny_embedding_model`'s config); the aggregate across all of them
-        // does not. Repeated single-character words tokenize to one token
-        // each for this vocab's no-merge tokenizer (see
-        // `tiny_embedding_model`'s doc comment), so 80 items of 480 "a"
-        // characters is 38,400 aggregate tokens against a 32,768 budget.
-        let item_len = 480;
-        assert!(item_len <= model.max_context());
-        let item_count = 80;
-        assert!(
-            item_count * item_len > MAX_EMBEDDING_TOTAL_TOKENS,
-            "fixture must actually exceed the budget it tests"
-        );
-        let items = normalize_embedding_items(
-            std::iter::repeat_with(|| EmbeddingInputItem::Text("a".repeat(item_len)))
-                .take(item_count)
-                .collect(),
-        )
-        .unwrap();
-        let err = check_pooled_embedding_total_tokens(&model, &items).unwrap_err();
-        match err {
-            ApiError::BadRequest { message, code } => {
-                assert_eq!(code, "batch_token_budget_exceeded");
-                assert!(
-                    message.contains(&MAX_EMBEDDING_TOTAL_TOKENS.to_string()),
-                    "message: {message}"
-                );
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_pooled_embedding_total_tokens_reports_the_oversized_item_first() {
-        // A single item whose OWN scaffold token count already exceeds
-        // `max_context` must be reported as `context_length_exceeded`
-        // (naming that item), not the coarser aggregate
-        // `batch_token_budget_exceeded` -- mirroring `embed_items`'s own
-        // per-item-first check order.
-        let base = tiny_embedding_model();
-        let mut config = base.config.clone();
-        config.max_position_embeddings = 4;
-        let model = EmbeddingModel::new(
-            base.weights.clone(),
-            config,
-            base.vision_weights.clone(),
-            base.tokenizer.clone(),
-        );
-        assert_eq!(model.max_context(), 4);
-
-        let items =
-            normalize_embedding_items(vec![EmbeddingInputItem::Text("a".repeat(10))]).unwrap();
-        let err = check_pooled_embedding_total_tokens(&model, &items).unwrap_err();
-        match err {
-            ApiError::BadRequest { message, code } => {
-                assert_eq!(code, "context_length_exceeded");
-                assert!(message.contains("input item 0"), "message: {message}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_pooling_defaults_to_mean_visual() {
-        assert_eq!(
-            parse_pooling(None).unwrap(),
-            PoolingStrategy::MeanVisualTokens
-        );
-        assert_eq!(
-            parse_pooling(Some("mean_visual")).unwrap(),
-            PoolingStrategy::MeanVisualTokens
-        );
-    }
-
-    #[test]
-    fn parse_pooling_accepts_last_token() {
-        assert_eq!(
-            parse_pooling(Some("last_token")).unwrap(),
-            PoolingStrategy::LastToken
-        );
-    }
-
-    #[test]
-    fn parse_pooling_rejects_unknown_value() {
-        let err = parse_pooling(Some("max")).unwrap_err();
-        assert!(matches!(
-            err,
-            ApiError::BadRequest {
-                code: "invalid_pooling",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn embeddings_input_single_item_becomes_one_element_vec() {
-        let input: EmbeddingsInput = serde_json::from_str(r#""hello""#).unwrap();
-        assert_eq!(input.into_items().len(), 1);
-    }
-
-    #[test]
-    fn embeddings_input_array_preserves_order() {
-        let input: EmbeddingsInput = serde_json::from_str(r#"["a", "b", "c"]"#).unwrap();
-        let items = input.into_items();
-        assert_eq!(items.len(), 3);
-        assert!(matches!(&items[0], EmbeddingInputItem::Text(s) if s == "a"));
-        assert!(matches!(&items[2], EmbeddingInputItem::Text(s) if s == "c"));
-    }
-
-    #[test]
-    fn embedding_input_item_parses_image_url_object() {
-        let item: EmbeddingInputItem = serde_json::from_str(
-            r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}"#,
-        )
-        .unwrap();
-        assert!(
-            matches!(item, EmbeddingInputItem::Image { url } if url == "data:image/png;base64,AA==")
-        );
-    }
-
-    #[test]
-    fn embedding_input_item_rejects_unknown_type() {
-        let err =
-            serde_json::from_str::<EmbeddingInputItem>(r#"{"type":"video_url"}"#).unwrap_err();
-        assert!(err.to_string().contains("video_url"));
-    }
-
-    #[test]
-    fn normalize_embedding_items_rejects_empty_input() {
-        let err = normalize_embedding_items(vec![]).unwrap_err();
-        assert!(matches!(
-            err,
-            ApiError::BadRequest {
-                code: "invalid_input",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn normalize_embedding_items_rejects_remote_url() {
-        let err = normalize_embedding_items(vec![EmbeddingInputItem::Image {
-            url: "https://example.com/cat.png".to_string(),
-        }])
-        .unwrap_err();
-        assert_eq!(err.code(), "unsupported_image_url_scheme");
-    }
-
-    #[test]
-    fn normalize_embedding_items_rejects_malformed_data_uri() {
-        let err = normalize_embedding_items(vec![EmbeddingInputItem::Image {
-            url: "data:image/png,not-base64-marked".to_string(),
-        }])
-        .unwrap_err();
-        assert!(matches!(err, ApiError::BadRequest { .. }));
-    }
-
-    /// Issue: a bare `"data:..."` string arriving as a plain-text `input`
-    /// item was silently tokenized as text instead of being rejected. A
-    /// well-formed image data URI passed as text must be caught exactly
-    /// like a malformed one below -- the defect is the *shape* (text vs.
-    /// `image_url` object), not the payload's validity.
-    #[test]
-    fn normalize_embedding_items_rejects_well_formed_data_uri_as_text() {
-        let err = normalize_embedding_items(vec![EmbeddingInputItem::Text(tiny_png_data_uri(0))])
-            .unwrap_err();
-        match err {
-            ApiError::BadRequest { code, message } => {
-                assert_eq!(code, "data_uri_as_text_item");
-                assert!(message.contains("data:"), "message: {message}");
-                assert!(message.contains("image_url"), "message: {message}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-    }
-
-    /// Same shape defect, malformed payload -- must be caught before any
-    /// attempt to parse it as an image, so the error names the shape
-    /// problem rather than a base64/format problem.
-    #[test]
-    fn normalize_embedding_items_rejects_malformed_data_uri_as_text() {
-        let err = normalize_embedding_items(vec![EmbeddingInputItem::Text(
-            "data:image/png;base64,@@not-base64@@".to_string(),
-        )])
-        .unwrap_err();
-        assert_eq!(err.code(), "data_uri_as_text_item");
-    }
-
-    /// The minimal data URI `data:,` (empty text/plain payload) is still a
-    /// data URI by shape, so it is refused as a text item like any other.
-    #[test]
-    fn normalize_embedding_items_rejects_empty_data_uri_as_text() {
-        let err = normalize_embedding_items(vec![EmbeddingInputItem::Text("data:,".to_string())])
-            .unwrap_err();
-        assert_eq!(err.code(), "data_uri_as_text_item");
-    }
-
-    /// Prose that opens with "data:" is not a data URI: whitespace before the
-    /// first comma, or no comma at all, keeps it an ordinary text item.
-    #[test]
-    fn normalize_embedding_items_accepts_prose_beginning_with_data_colon() {
-        for prose in [
-            "data: results show 3 rows, all valid",
-            "data:",
-            "data: none",
-        ] {
-            let items =
-                normalize_embedding_items(vec![EmbeddingInputItem::Text(prose.to_string())])
-                    .unwrap();
-            assert!(matches!(&items[0], NormalizedEmbeddingItem::Text(s) if s == prose));
-        }
-    }
-
-    /// Negative control: ordinary text is never affected by the new guard,
-    /// including text that merely mentions "data:" mid-string rather than
-    /// beginning with it.
-    #[test]
-    fn normalize_embedding_items_accepts_plain_text_mentioning_data_colon() {
-        let items = normalize_embedding_items(vec![EmbeddingInputItem::Text(
-            "see data: below for details".to_string(),
-        )])
-        .unwrap();
-        assert!(
-            matches!(&items[0], NormalizedEmbeddingItem::Text(s) if s == "see data: below for details")
-        );
-    }
-
-    #[test]
-    fn normalize_embedding_items_preserves_order_of_mixed_items() {
-        let items = normalize_embedding_items(vec![
-            EmbeddingInputItem::Text("first".to_string()),
-            EmbeddingInputItem::Text("second".to_string()),
-        ])
-        .unwrap();
-        assert!(matches!(&items[0], NormalizedEmbeddingItem::Text(s) if s == "first"));
-        assert!(matches!(&items[1], NormalizedEmbeddingItem::Text(s) if s == "second"));
-    }
-
-    #[test]
-    fn normalize_embedding_items_rejects_over_cap_input() {
-        let items = (0..MAX_EMBEDDING_INPUT_COUNT + 1)
-            .map(|_| EmbeddingInputItem::Text("x".to_string()))
-            .collect();
-        let err = normalize_embedding_items(items).unwrap_err();
-        assert!(matches!(
-            err,
-            ApiError::BadRequest {
-                code: "invalid_input",
-                ..
-            }
-        ));
-    }
-
-    fn one(s: &str) -> Option<TextEmbeddingsInput> {
-        Some(TextEmbeddingsInput::One(s.to_string()))
-    }
-
-    fn many(items: &[&str]) -> Option<TextEmbeddingsInput> {
-        Some(TextEmbeddingsInput::Many(
-            items.iter().map(ToString::to_string).collect(),
-        ))
-    }
-
-    #[test]
-    fn parse_embeddings_input_missing_is_invalid_request() {
-        let err = parse_embeddings_input(&None).unwrap_err();
-        assert_eq!(err.code(), "invalid_request");
-    }
-
-    #[test]
-    fn parse_embeddings_input_null_is_invalid_request() {
-        // `#[serde(default)]` maps an explicit JSON `null` to `None` before
-        // this function ever runs, same as an omitted field; this pins that
-        // the two are indistinguishable by the time validation sees them.
-        let req: TextEmbeddingsRequest = serde_json::from_str(r#"{"input":null}"#).unwrap();
-        let err = parse_embeddings_input(&req.input).unwrap_err();
-        assert_eq!(err.code(), "invalid_request");
-    }
-
-    #[test]
-    fn parse_embeddings_input_single_string_is_one_element_at_index_zero() {
-        let texts = parse_embeddings_input(&one("hello")).unwrap();
-        assert_eq!(texts, vec!["hello".to_string()]);
-    }
-
-    #[test]
-    fn parse_embeddings_input_array_preserves_order() {
-        let texts = parse_embeddings_input(&many(&["a", "b", "c"])).unwrap();
-        assert_eq!(
-            texts,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
-        );
-    }
-
-    #[test]
-    fn parse_embeddings_input_empty_string_is_invalid_input() {
-        let err = parse_embeddings_input(&one("")).unwrap_err();
-        assert_eq!(err.code(), "invalid_input");
-    }
-
-    #[test]
-    fn parse_embeddings_input_empty_array_is_invalid_input() {
-        let err = parse_embeddings_input(&many(&[])).unwrap_err();
-        assert_eq!(err.code(), "invalid_input");
-    }
-
-    #[test]
-    fn parse_embeddings_input_empty_string_inside_array_names_its_index() {
-        let err = parse_embeddings_input(&many(&["a", "", "c"])).unwrap_err();
-        assert_eq!(err.code(), "invalid_input");
-        assert!(
-            err.message().contains("input[1]"),
-            "message must name the offending index: {}",
-            err.message()
-        );
-    }
-
-    #[test]
-    fn parse_embeddings_input_over_batch_limit_is_rejected() {
-        let items: Vec<String> = (0..MAX_EMBEDDINGS_BATCH_SIZE + 1)
-            .map(|i| i.to_string())
-            .collect();
-        let input = Some(TextEmbeddingsInput::Many(items));
-        let err = parse_embeddings_input(&input).unwrap_err();
-        assert_eq!(err.code(), "batch_size_exceeds_limit");
-    }
-
-    #[test]
-    fn parse_embeddings_input_at_batch_limit_is_accepted() {
-        let items: Vec<String> = (0..MAX_EMBEDDINGS_BATCH_SIZE)
-            .map(|i| i.to_string())
-            .collect();
-        let input = Some(TextEmbeddingsInput::Many(items));
-        let texts = parse_embeddings_input(&input).unwrap();
-        assert_eq!(texts.len(), MAX_EMBEDDINGS_BATCH_SIZE);
-    }
-
-    #[test]
-    fn check_embeddings_total_tokens_accepts_at_limit() {
-        check_embeddings_total_tokens(MAX_EMBEDDINGS_TOTAL_TOKENS).unwrap();
-    }
-
-    #[test]
-    fn check_embeddings_total_tokens_rejects_over_limit() {
-        let err = check_embeddings_total_tokens(MAX_EMBEDDINGS_TOTAL_TOKENS + 1).unwrap_err();
-        match err {
-            ApiError::BadRequest { message, code } => {
-                assert_eq!(code, "batch_token_budget_exceeded");
-                assert!(
-                    message.contains(&(MAX_EMBEDDINGS_TOTAL_TOKENS + 1).to_string()),
-                    "message: {message}"
-                );
-                assert!(
-                    message.contains(&MAX_EMBEDDINGS_TOTAL_TOKENS.to_string()),
-                    "message: {message}"
-                );
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_embeddings_item_fits_window_accepts_at_limit() {
-        check_embeddings_item_fits_window(0, 512, 512).unwrap();
-    }
-
-    #[test]
-    fn check_embeddings_item_fits_window_rejects_over_limit() {
-        let err = check_embeddings_item_fits_window(2, 513, 512).unwrap_err();
-        match err {
-            ApiError::BadRequest { message, code } => {
-                assert_eq!(code, "context_length_exceeded");
-                assert!(message.contains("item 2"), "message: {message}");
-                assert!(message.contains("513"), "message: {message}");
-                assert!(message.contains("512"), "message: {message}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_embeddings_unsupported_fields_accepts_absent() {
-        let req: TextEmbeddingsRequest = serde_json::from_str(r#"{"input":"hi"}"#).unwrap();
-        check_embeddings_unsupported_fields(&req).unwrap();
-    }
-
-    #[test]
-    fn check_embeddings_unsupported_fields_accepts_user_and_float_encoding() {
-        let req: TextEmbeddingsRequest =
-            serde_json::from_str(r#"{"input":"hi","user":"trace-123","encoding_format":"float"}"#)
-                .unwrap();
-        check_embeddings_unsupported_fields(&req).unwrap();
-    }
-
-    #[test]
-    fn check_embeddings_unsupported_fields_rejects_dimensions() {
-        let req: TextEmbeddingsRequest =
-            serde_json::from_str(r#"{"input":"hi","dimensions":3}"#).unwrap();
-        let err = check_embeddings_unsupported_fields(&req).unwrap_err();
-        assert_eq!(err.code(), "unsupported_parameter");
-        assert!(err.message().contains("dimensions"), "{}", err.message());
-    }
-
-    #[test]
-    fn check_embeddings_unsupported_fields_rejects_non_float_encoding_format() {
-        let req: TextEmbeddingsRequest =
-            serde_json::from_str(r#"{"input":"hi","encoding_format":"base64"}"#).unwrap();
-        let err = check_embeddings_unsupported_fields(&req).unwrap_err();
-        assert_eq!(err.code(), "unsupported_parameter");
-        assert!(
-            err.message().contains("encoding_format"),
-            "{}",
-            err.message()
-        );
-    }
-
-    #[test]
-    fn text_embeddings_request_rejects_unknown_field() {
-        // `pooling` is not a field of this wire type (unlike the sibling
-        // vision-language `/v1/embeddings` route's `EmbeddingsRequest`,
-        // which does accept one) -- `deny_unknown_fields` must reject it
-        // rather than silently drop it.
-        let err =
-            serde_json::from_str::<TextEmbeddingsRequest>(r#"{"input":"hi","pooling":"cls"}"#)
-                .unwrap_err();
-        let _ = err; // presence of an Err is the assertion; message shape is serde's own.
-    }
-
-    #[test]
-    fn check_embeddings_model_accepts_omitted() {
-        check_embeddings_model(None, "served-model").unwrap();
-    }
-
-    #[test]
-    fn check_embeddings_model_accepts_exact_match() {
-        check_embeddings_model(Some("served-model"), "served-model").unwrap();
-    }
-
-    #[test]
-    fn check_embeddings_model_rejects_mismatch() {
-        let err = check_embeddings_model(Some("other-model"), "served-model").unwrap_err();
-        assert_eq!(err.code(), "model_not_found");
-    }
-
-    #[test]
-    fn check_embeddings_model_rejects_explicit_empty_string() {
-        // Matches contract::validate_model_name's OptionalExact policy: an
-        // explicit empty string is a present-but-wrong model, not absence.
-        let err = check_embeddings_model(Some(""), "served-model").unwrap_err();
-        assert_eq!(err.code(), "model_not_found");
-    }
-
-    #[test]
-    fn build_embeddings_response_shape() {
-        // 0.5/0.25 (not 0.1/0.2/0.3): exactly representable in both f32 and
-        // f64, so the f32 -> serde_json::Value (f64) widening this function
-        // performs can't introduce a false mismatch against the literal
-        // JSON array below.
-        let body = build_embeddings_response("served-model", &[vec![0.5, 0.25, 1.0]], 4);
-        assert_eq!(body["object"], "list");
-        assert_eq!(body["model"], "served-model");
-        assert_eq!(body["usage"]["prompt_tokens"], 4);
-        assert_eq!(body["usage"]["total_tokens"], 4);
-        assert_eq!(body["data"][0]["object"], "embedding");
-        assert_eq!(body["data"][0]["index"], 0);
-        assert_eq!(
-            body["data"][0]["embedding"],
-            serde_json::json!([0.5, 0.25, 1.0])
-        );
-    }
-
-    #[test]
-    fn build_embeddings_response_single_string_case_gets_index_zero() {
-        let body = build_embeddings_response("served-model", &[vec![1.0]], 1);
-        assert_eq!(body["data"].as_array().unwrap().len(), 1);
-        assert_eq!(body["data"][0]["index"], 0);
-    }
-
-    #[test]
-    fn build_embeddings_response_indices_reflect_input_order() {
-        // Mutation-proven: hardcoding `"index": 0` for every
-        // element in `build_embeddings_response` leaves this test red while
-        // `build_embeddings_response_single_string_case_gets_index_zero`
-        // above stays green (its only correct index already is 0) --
-        // exactly the reason this test uses three distinct vectors instead
-        // of one.
-        let body = build_embeddings_response("served-model", &[vec![0.0], vec![1.0], vec![2.0]], 3);
-        let data = body["data"].as_array().unwrap();
-        assert_eq!(data.len(), 3);
-        for (expected_index, item) in data.iter().enumerate() {
-            assert_eq!(
-                item["index"], expected_index,
-                "data[{expected_index}] must carry index {expected_index}"
-            );
-            assert_eq!(
-                item["embedding"],
-                serde_json::json!([expected_index as f32]),
-                "data[{expected_index}] must carry the embedding at that input position"
-            );
-        }
-    }
 }

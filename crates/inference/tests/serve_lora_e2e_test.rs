@@ -268,6 +268,16 @@ impl Drop for Server {
     }
 }
 
+// Statuses come back as responses so a refusal's body can be reported, and an
+// ambient proxy setting never sees a loopback request.
+fn loopback_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .proxy(None)
+        .build()
+        .into()
+}
+
 fn free_loopback_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("ephemeral port must bind")
@@ -336,7 +346,7 @@ impl Server {
         let started = Instant::now();
         let url = format!("http://127.0.0.1:{port}/health");
         loop {
-            if let Ok(response) = ureq::get(&url).call()
+            if let Ok(response) = loopback_agent().get(&url).call()
                 && response.status() == 200
             {
                 break;
@@ -369,20 +379,25 @@ impl Server {
     }
 
     fn request(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, String) {
-        let request = ureq::request(method, &self.url(path));
+        let request = ureq::http::Request::builder()
+            .method(method)
+            .uri(self.url(path));
         let outcome = match body {
-            Some(body) => request
-                .set("content-type", "application/json")
-                .send_bytes(&serde_json::to_vec(body).expect("request body must serialize")),
-            None => request.call(),
+            Some(body) => loopback_agent().run(
+                request
+                    .header("content-type", "application/json")
+                    .body(serde_json::to_vec(body).expect("request body must serialize"))
+                    .expect("request must build"),
+            ),
+            None => loopback_agent().run(request.body(()).expect("request must build")),
         };
         match outcome {
             Ok(response) => {
-                let status = response.status();
-                (status, response.into_string().unwrap_or_default())
-            }
-            Err(ureq::Error::Status(status, response)) => {
-                (status, response.into_string().unwrap_or_default())
+                let status = response.status().as_u16();
+                (
+                    status,
+                    response.into_body().read_to_string().unwrap_or_default(),
+                )
             }
             Err(err) => panic!(
                 "{method} {path} failed at the transport level: {err}; stderr:\n{}",

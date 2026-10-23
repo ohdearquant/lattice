@@ -1,0 +1,1162 @@
+//! Shared tokenizer types, utilities, and auto-detection.
+//!
+//! This module contains the model-facing `TokenizedInput` representation,
+//! the object-safe `Tokenizer` trait used by `BertModel`, a tiny JSON parser
+//! used for dependency-free `tokenizer.json` loading, a thread-safe LRU cache,
+//! and tokenizer auto-detection helpers.
+
+use crate::bpe::BpeTokenizer;
+use crate::sentencepiece::SentencePieceTokenizer;
+use crate::wordpiece::WordPieceTokenizer;
+use lattice_inference_core::InferenceError;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs;
+use std::hash::Hash;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+/// **Stable**: tokenized representation passed into model forward calls; field
+/// layout is stable once `BertModel::encode` is stable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenizedInput {
+    /// Token IDs: tokenizer-specific special tokens plus the payload tokens,
+    /// padded to the requested sequence length.
+    pub input_ids: Vec<u32>,
+    /// Attention mask: 1 for real tokens, 0 for padding.
+    pub attention_mask: Vec<u32>,
+    /// Token type IDs: all zeros for single-sequence encoding.
+    pub token_type_ids: Vec<u32>,
+    /// Number of real tokens before padding.
+    pub real_length: usize,
+    /// Number of tokens produced before any max-sequence-length truncation
+    /// was applied. Equal to `real_length` when the tokenizer did not
+    /// truncate; larger than `real_length` (and than `input_ids.len()`) when
+    /// it did. Context-window admission checks must compare against this
+    /// field, not `real_length`, since `real_length` can never exceed the
+    /// tokenizer's own `max_seq_len` and so cannot signal an over-limit
+    /// input when `max_seq_len <= max_position_embeddings`.
+    pub pre_truncation_len: usize,
+}
+
+/// **Unstable**: token counts for one embedding input, measured on the sequence the
+/// embedding model consumes.
+///
+/// Special tokens and any end-of-sequence token the model appends are counted. A
+/// model-specific `embedding_token_counts` method fills this in from the tokenizer's
+/// own pre-truncation length, so measuring costs no second tokenization pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingTokenCounts {
+    /// Length of the sequence before any limit was applied.
+    pub before_truncation: usize,
+    /// Length of the sequence the model embeds. Never above `before_truncation`.
+    pub embedded: usize,
+}
+
+/// **Stable**: object-safe tokenizer trait; concrete impls (`WordPieceTokenizer`,
+/// `BpeTokenizer`, `SentencePieceTokenizer`) are boxed behind this.
+pub trait Tokenizer: Send + Sync {
+    /// **Stable**: tokenize a single text, padded to the configured maximum.
+    fn tokenize(&self, text: &str) -> TokenizedInput;
+
+    /// **Stable**: tokenize a batch, padding to batch-local max.
+    fn tokenize_batch(&self, texts: &[&str]) -> Vec<TokenizedInput>;
+
+    /// **Stable**: vocabulary size, used for config validation.
+    fn vocab_size(&self) -> usize;
+
+    /// **Stable**: configured maximum sequence length.
+    fn max_seq_len(&self) -> usize;
+
+    /// Whether this tokenizer supports BERT-style query/document pair encoding.
+    ///
+    /// Returns `false` by default; only `WordPieceTokenizer` overrides to `true`.
+    fn supports_pair_tokenization(&self) -> bool {
+        false
+    }
+
+    /// Encode a query/document pair as `[CLS] query [SEP] doc [SEP]` with token type IDs.
+    ///
+    /// `token_type_ids` are 0 for the query segment and 1 for the document segment.
+    ///
+    /// # Panics
+    ///
+    /// The default implementation panics.  Callers must check
+    /// [`supports_pair_tokenization`](Self::supports_pair_tokenization) before
+    /// calling this method.  Use [`try_tokenize_pair`](Self::try_tokenize_pair)
+    /// to avoid the panic.
+    fn tokenize_pair(&self, query: &str, document: &str) -> TokenizedInput {
+        self.try_tokenize_pair(query, document)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Non-panicking variant of [`tokenize_pair`](Self::tokenize_pair).
+    ///
+    /// Returns `Err(InferenceError::UnsupportedOperation)` when the tokenizer
+    /// does not support pair encoding.  Implementors that support pair
+    /// encoding should override both this method and `tokenize_pair`.
+    fn try_tokenize_pair(
+        &self,
+        query: &str,
+        document: &str,
+    ) -> Result<TokenizedInput, InferenceError> {
+        let _ = (query, document);
+        Err(InferenceError::Tokenizer(
+            "tokenize_pair is not implemented for this tokenizer".into(),
+        ))
+    }
+
+    /// **Stable**: decode token IDs back to text.
+    ///
+    /// Returns `None` for tokenizers that do not support detokenization —
+    /// encoder-only embedding tokenizers (WordPiece/SentencePiece for
+    /// BERT/BGE) have no generative decode use. Generative tokenizers
+    /// (`BpeTokenizer`) override this with a real implementation.
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        let _ = ids;
+        None
+    }
+}
+
+/// Pad an ID sequence and explicit token type IDs to a fixed target length.
+///
+/// `pre_truncation_len` is the token count before any max-sequence-length
+/// truncation the caller applied; it must be `>= ids.len()` before padding.
+/// Required rather than defaulted so a construction site cannot silently omit
+/// it and make the context-window admission guard unreachable (see
+/// `TokenizedInput::pre_truncation_len`'s doc for why the guard depends on it).
+pub(crate) fn pad_ids_with_token_types(
+    mut ids: Vec<u32>,
+    mut token_type_ids: Vec<u32>,
+    pad_to: usize,
+    pad_id: u32,
+    pre_truncation_len: usize,
+) -> TokenizedInput {
+    let real_length = ids.len();
+    assert_eq!(
+        token_type_ids.len(),
+        real_length,
+        "token_type_ids length must match input_ids before padding"
+    );
+    let mut attention_mask = vec![1u32; real_length];
+    ids.resize(pad_to, pad_id);
+    attention_mask.resize(pad_to, 0);
+    token_type_ids.resize(pad_to, 0);
+    TokenizedInput {
+        input_ids: ids,
+        attention_mask,
+        token_type_ids,
+        real_length,
+        pre_truncation_len,
+    }
+}
+
+/// Pad an ID sequence to a fixed target length.
+///
+/// `pre_truncation_len` is the token count before any max-sequence-length
+/// truncation the caller applied; it must be `>= ids.len()` before padding.
+/// Required rather than defaulted so a construction site cannot silently omit
+/// it and make the context-window admission guard unreachable (see
+/// `TokenizedInput::pre_truncation_len`'s doc for why the guard depends on it).
+pub(crate) fn pad_ids(
+    mut ids: Vec<u32>,
+    pad_to: usize,
+    pad_id: u32,
+    pre_truncation_len: usize,
+) -> TokenizedInput {
+    let real_length = ids.len();
+    let mut attention_mask = vec![1u32; real_length];
+    ids.resize(pad_to, pad_id);
+    attention_mask.resize(pad_to, 0);
+    let token_type_ids = vec![0u32; pad_to];
+
+    TokenizedInput {
+        input_ids: ids,
+        attention_mask,
+        token_type_ids,
+        real_length,
+        pre_truncation_len,
+    }
+}
+
+pub(crate) fn push_eos_preserving_limit(ids: &mut Vec<u32>, eos_id: u32, max_seq_len: usize) {
+    if max_seq_len == 0 {
+        ids.clear();
+        return;
+    }
+
+    if ids.len() >= max_seq_len {
+        ids.truncate(max_seq_len - 1);
+    }
+    ids.push(eos_id);
+}
+
+/// Best-effort model max-length inference from `config.json` / `tokenizer_config.json`.
+pub(crate) fn infer_model_max_seq_len(model_dir: &Path, default_value: usize) -> usize {
+    let candidates = [
+        model_dir.join("tokenizer_config.json"),
+        model_dir.join("config.json"),
+    ];
+
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+
+        let Ok(json) = parse_json(&text) else {
+            continue;
+        };
+
+        let keys = [
+            &["model_max_length"][..],
+            &["max_position_embeddings"][..],
+            &["n_positions"][..],
+            &["max_seq_len"][..],
+            &["truncation", "max_length"][..],
+        ];
+
+        for path in keys {
+            if let Some(value) = json_path(&json, path).and_then(JsonValue::as_u64)
+                && value > 0
+            {
+                // Cap at 2048 for embedding workloads. Models like Qwen3 advertise
+                // 32K positions, but the tokenizer truncates input to this limit, so
+                // the model embeds at most 2048 tokens however large the config value.
+                // This is a fixed limit, not a buffer size: the Metal buffers follow
+                // `ModelInferenceConfig::gpu_max_seq_len`, and a longer Metal forward
+                // falls back to the CPU path.
+                let capped = (value as usize).min(2048);
+                return capped;
+            }
+        }
+    }
+
+    default_value
+}
+
+/// **Stable**: auto-detect and load a tokenizer from a model directory.
+///
+/// Priority order:
+/// 1. `tokenizer.json`
+/// 2. `vocab.json` + `merges.txt` or `vocab.txt` + `merges.txt`
+/// 3. `vocab.txt`
+/// 4. `tokenizer.model`
+pub fn load_tokenizer(model_dir: &Path) -> Result<Box<dyn Tokenizer>, InferenceError> {
+    let tokenizer_json = model_dir.join("tokenizer.json");
+    if tokenizer_json.exists() {
+        let text = fs::read_to_string(&tokenizer_json).map_err(|e| {
+            InferenceError::Tokenizer(format!("failed to read {}: {e}", tokenizer_json.display()))
+        })?;
+        let root = parse_json(&text)?;
+        let model_type = json_path(&root, &["model", "type"])
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        let max_seq_len = infer_model_max_seq_len(model_dir, 512);
+
+        match model_type {
+            "WordPiece" => {
+                return Ok(Box::new(
+                    WordPieceTokenizer::from_tokenizer_json_str(&text)?
+                        .with_max_seq_len(max_seq_len),
+                ));
+            }
+            "BPE" => {
+                return Ok(Box::new(
+                    BpeTokenizer::from_tokenizer_json_str(&text)?.with_max_seq_len(max_seq_len),
+                ));
+            }
+            "Unigram" | "SentencePieceUnigram" => {
+                return Ok(Box::new(
+                    SentencePieceTokenizer::from_tokenizer_json_str(&text)?
+                        .with_max_seq_len(max_seq_len),
+                ));
+            }
+            other if !other.is_empty() => {
+                return Err(InferenceError::UnsupportedModel(format!(
+                    "unsupported tokenizer model type {other:?} in {}",
+                    tokenizer_json.display()
+                )));
+            }
+            _ => {
+                // Fall through to file-based probing when tokenizer.json is missing a model type.
+            }
+        }
+    }
+
+    let max_seq_len = infer_model_max_seq_len(model_dir, 512);
+
+    let vocab_json = model_dir.join("vocab.json");
+    let vocab_txt = model_dir.join("vocab.txt");
+    let merges_txt = model_dir.join("merges.txt");
+    let tokenizer_model = model_dir.join("tokenizer.model");
+
+    if merges_txt.exists() && vocab_json.exists() {
+        return Ok(Box::new(
+            BpeTokenizer::from_files(&vocab_json, &merges_txt)?.with_max_seq_len(max_seq_len),
+        ));
+    }
+
+    if merges_txt.exists() && vocab_txt.exists() {
+        return Ok(Box::new(
+            BpeTokenizer::from_vocab_txt_and_merges(&vocab_txt, &merges_txt)?
+                .with_max_seq_len(max_seq_len),
+        ));
+    }
+
+    if vocab_txt.exists() {
+        return Ok(Box::new(
+            WordPieceTokenizer::from_file(&vocab_txt)?.with_max_seq_len(max_seq_len),
+        ));
+    }
+
+    if tokenizer_model.exists() {
+        return Ok(Box::new(
+            SentencePieceTokenizer::from_model_file(&tokenizer_model)?
+                .with_max_seq_len(max_seq_len),
+        ));
+    }
+
+    Err(InferenceError::ModelNotFound(format!(
+        "no supported tokenizer files found in {}",
+        model_dir.display()
+    )))
+}
+
+/// **Unstable**: build a tokenizer directly from `tokenizer.json` text, without
+/// touching the filesystem; signature may change as the from-bytes model
+/// loading API matures.
+///
+/// This covers the primary (and by far most common) branch of
+/// [`load_tokenizer`]'s auto-detection: models that ship a `tokenizer.json`.
+/// The legacy fallback formats `load_tokenizer` also understands
+/// (`vocab.json`+`merges.txt`, `vocab.txt`, `tokenizer.model`) are file-based
+/// constructions with no in-memory equivalent here: a caller with only those
+/// formats in hand cannot use this function.
+///
+/// `max_seq_len` is taken as an explicit parameter rather than inferred from
+/// `tokenizer_config.json`/`config.json` (as `load_tokenizer` does via
+/// `infer_model_max_seq_len`) because callers using this path already have
+/// the model's config in hand (that is how they got here without a
+/// filesystem) and can pass its `max_position_embeddings` directly.
+pub fn tokenizer_from_json_str(
+    tokenizer_json: &str,
+    max_seq_len: usize,
+) -> Result<Box<dyn Tokenizer>, InferenceError> {
+    let root = parse_json(tokenizer_json)?;
+    let model_type = json_path(&root, &["model", "type"])
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+
+    match model_type {
+        "WordPiece" => Ok(Box::new(
+            WordPieceTokenizer::from_tokenizer_json_str(tokenizer_json)?
+                .with_max_seq_len(max_seq_len),
+        )),
+        "BPE" => Ok(Box::new(
+            BpeTokenizer::from_tokenizer_json_str(tokenizer_json)?.with_max_seq_len(max_seq_len),
+        )),
+        "Unigram" | "SentencePieceUnigram" => Ok(Box::new(
+            SentencePieceTokenizer::from_tokenizer_json_str(tokenizer_json)?
+                .with_max_seq_len(max_seq_len),
+        )),
+        other => Err(InferenceError::UnsupportedModel(format!(
+            "unsupported or missing tokenizer model type {other:?} in tokenizer.json"
+        ))),
+    }
+}
+
+/// **Unstable**: internal JSON representation for tokenizer metadata parsing;
+/// not intended for direct use outside this crate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<JsonValue>),
+    Object(BTreeMap<String, JsonValue>),
+}
+
+impl JsonValue {
+    /// **Unstable**: accessor for the internal JSON parser; subject to removal.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            JsonValue::String(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    /// **Unstable**: accessor for the internal JSON parser.
+    pub fn as_array(&self) -> Option<&[JsonValue]> {
+        match self {
+            JsonValue::Array(values) => Some(values.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// **Unstable**: accessor for the internal JSON parser.
+    pub fn as_object(&self) -> Option<&BTreeMap<String, JsonValue>> {
+        match self {
+            JsonValue::Object(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    /// **Unstable**: accessor for the internal JSON parser.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            JsonValue::Number(value) if *value >= 0.0 && value.fract() == 0.0 => {
+                Some(*value as u64)
+            }
+            _ => None,
+        }
+    }
+
+    /// **Unstable**: accessor for the internal JSON parser.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            JsonValue::Number(value) if value.fract() == 0.0 => Some(*value as i64),
+            _ => None,
+        }
+    }
+
+    /// **Unstable**: accessor for the internal JSON parser.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            JsonValue::Number(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// **Unstable**: accessor for the internal JSON parser.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            JsonValue::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// **Unstable**: accessor for the internal JSON parser.
+    pub fn get(&self, key: &str) -> Option<&JsonValue> {
+        match self {
+            JsonValue::Object(map) => map.get(key),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn json_path<'a>(root: &'a JsonValue, path: &[&str]) -> Option<&'a JsonValue> {
+    let mut current = root;
+    for key in path {
+        current = current.get(key)?;
+    }
+    Some(current)
+}
+
+pub(crate) fn parse_json(text: &str) -> Result<JsonValue, InferenceError> {
+    let mut parser = JsonParser::new(text);
+    let value = parser.parse_value()?;
+    parser.skip_whitespace();
+    if !parser.is_eof() {
+        return Err(InferenceError::Tokenizer(format!(
+            "unexpected trailing JSON data at byte {}",
+            parser.pos
+        )));
+    }
+    Ok(value)
+}
+
+/// Maximum number of nested JSON arrays and objects [`parse_json`] accepts.
+///
+/// The parser recurses once per container, so without a bound a deeply nested
+/// `tokenizer.json` exhausts the thread stack and aborts the process. Real
+/// tokenizer and model config files nest at most about ten containers deep,
+/// so 64 leaves ample headroom.
+const MAX_JSON_DEPTH: usize = 64;
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    /// Containers currently open, checked against [`MAX_JSON_DEPTH`] in [`Self::parse_nested`].
+    depth: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            bytes: text.as_bytes(),
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    fn is_eof(&self) -> bool {
+        self.pos >= self.bytes.len()
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn next(&mut self) -> Option<u8> {
+        let byte = self.peek()?;
+        self.pos += 1;
+        Some(byte)
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(byte) = self.peek() {
+            if matches!(byte, b' ' | b'\n' | b'\r' | b'\t') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn parse_value(&mut self) -> Result<JsonValue, InferenceError> {
+        self.skip_whitespace();
+        match self.peek() {
+            Some(b'n') => self.parse_literal(b"null", JsonValue::Null),
+            Some(b't') => self.parse_literal(b"true", JsonValue::Bool(true)),
+            Some(b'f') => self.parse_literal(b"false", JsonValue::Bool(false)),
+            Some(b'"') => self.parse_string().map(JsonValue::String),
+            Some(b'[') => self.parse_nested(Self::parse_array),
+            Some(b'{') => self.parse_nested(Self::parse_object),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            Some(other) => Err(InferenceError::Tokenizer(format!(
+                "unexpected JSON byte 0x{other:02x} at offset {}",
+                self.pos
+            ))),
+            None => Err(InferenceError::Tokenizer(
+                "unexpected end of JSON input".into(),
+            )),
+        }
+    }
+
+    fn parse_nested(
+        &mut self,
+        parse: fn(&mut Self) -> Result<JsonValue, InferenceError>,
+    ) -> Result<JsonValue, InferenceError> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(InferenceError::Tokenizer(format!(
+                "JSON nesting exceeds depth limit of {MAX_JSON_DEPTH} at offset {}",
+                self.pos
+            )));
+        }
+        self.depth += 1;
+        let value = parse(self);
+        self.depth -= 1;
+        value
+    }
+
+    fn parse_literal(
+        &mut self,
+        literal: &[u8],
+        value: JsonValue,
+    ) -> Result<JsonValue, InferenceError> {
+        if self.bytes.get(self.pos..self.pos + literal.len()) == Some(literal) {
+            self.pos += literal.len();
+            Ok(value)
+        } else {
+            Err(InferenceError::Tokenizer(format!(
+                "invalid JSON literal at offset {}",
+                self.pos
+            )))
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String, InferenceError> {
+        if self.next() != Some(b'"') {
+            return Err(InferenceError::Tokenizer(format!(
+                "expected JSON string at offset {}",
+                self.pos
+            )));
+        }
+
+        let mut out = String::new();
+        while let Some(byte) = self.next() {
+            match byte {
+                b'"' => return Ok(out),
+                b'\\' => {
+                    let escaped = self.next().ok_or_else(|| {
+                        InferenceError::Tokenizer("unterminated JSON escape sequence".into())
+                    })?;
+                    match escaped {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{0008}'),
+                        b'f' => out.push('\u{000C}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let code = self.parse_u16_hex()?;
+                            if (0xD800..=0xDBFF).contains(&code) {
+                                if self.next() != Some(b'\\') || self.next() != Some(b'u') {
+                                    return Err(InferenceError::Tokenizer(
+                                        "invalid JSON surrogate pair".into(),
+                                    ));
+                                }
+                                let low = self.parse_u16_hex()?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(InferenceError::Tokenizer(
+                                        "invalid JSON low surrogate".into(),
+                                    ));
+                                }
+                                let high_ten = (code as u32) - 0xD800;
+                                let low_ten = (low as u32) - 0xDC00;
+                                let scalar = 0x10000 + ((high_ten << 10) | low_ten);
+                                let ch = char::from_u32(scalar).ok_or_else(|| {
+                                    InferenceError::Tokenizer("invalid JSON unicode scalar".into())
+                                })?;
+                                out.push(ch);
+                            } else {
+                                let ch = char::from_u32(code as u32).ok_or_else(|| {
+                                    InferenceError::Tokenizer("invalid JSON unicode scalar".into())
+                                })?;
+                                out.push(ch);
+                            }
+                        }
+                        other => {
+                            return Err(InferenceError::Tokenizer(format!(
+                                "invalid JSON escape 0x{other:02x}"
+                            )));
+                        }
+                    }
+                }
+                byte if byte < 0x20 => {
+                    return Err(InferenceError::Tokenizer(
+                        "control byte inside JSON string".into(),
+                    ));
+                }
+                _ => {
+                    let start = self.pos - 1;
+                    let mut end = self.pos;
+                    while end < self.bytes.len()
+                        && self.bytes[end] != b'"'
+                        && self.bytes[end] != b'\\'
+                        && self.bytes[end] >= 0x20
+                    {
+                        end += 1;
+                    }
+                    out.push_str(std::str::from_utf8(&self.bytes[start..end]).map_err(|e| {
+                        InferenceError::Tokenizer(format!("invalid UTF-8 in JSON string: {e}"))
+                    })?);
+                    self.pos = end;
+                }
+            }
+        }
+
+        Err(InferenceError::Tokenizer("unterminated JSON string".into()))
+    }
+
+    fn parse_u16_hex(&mut self) -> Result<u16, InferenceError> {
+        let digits = self
+            .bytes
+            .get(self.pos..self.pos + 4)
+            .ok_or_else(|| InferenceError::Tokenizer("truncated JSON unicode escape".into()))?;
+        self.pos += 4;
+        let raw = std::str::from_utf8(digits)
+            .map_err(|e| InferenceError::Tokenizer(format!("invalid JSON unicode escape: {e}")))?;
+        u16::from_str_radix(raw, 16)
+            .map_err(|e| InferenceError::Tokenizer(format!("invalid JSON unicode escape: {e}")))
+    }
+
+    fn parse_number(&mut self) -> Result<JsonValue, InferenceError> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => {
+                return Err(InferenceError::Tokenizer(format!(
+                    "invalid JSON number at offset {start}"
+                )));
+            }
+        }
+
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(InferenceError::Tokenizer(format!(
+                    "invalid JSON fractional part at offset {}",
+                    self.pos
+                )));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(InferenceError::Tokenizer(format!(
+                    "invalid JSON exponent at offset {}",
+                    self.pos
+                )));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+
+        let raw = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|e| InferenceError::Tokenizer(format!("invalid JSON number UTF-8: {e}")))?;
+        let value = raw.parse::<f64>().map_err(|e| {
+            InferenceError::Tokenizer(format!("failed to parse JSON number {raw:?}: {e}"))
+        })?;
+        Ok(JsonValue::Number(value))
+    }
+
+    fn parse_array(&mut self) -> Result<JsonValue, InferenceError> {
+        if self.next() != Some(b'[') {
+            return Err(InferenceError::Tokenizer(format!(
+                "expected JSON array at offset {}",
+                self.pos
+            )));
+        }
+
+        let mut values = Vec::new();
+        loop {
+            self.skip_whitespace();
+            if self.peek() == Some(b']') {
+                self.pos += 1;
+                return Ok(JsonValue::Array(values));
+            }
+            values.push(self.parse_value()?);
+            self.skip_whitespace();
+            match self.next() {
+                Some(b',') => continue,
+                Some(b']') => return Ok(JsonValue::Array(values)),
+                _ => {
+                    return Err(InferenceError::Tokenizer(format!(
+                        "expected ',' or ']' in JSON array at offset {}",
+                        self.pos
+                    )));
+                }
+            }
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<JsonValue, InferenceError> {
+        if self.next() != Some(b'{') {
+            return Err(InferenceError::Tokenizer(format!(
+                "expected JSON object at offset {}",
+                self.pos
+            )));
+        }
+
+        let mut map = BTreeMap::new();
+        loop {
+            self.skip_whitespace();
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+                return Ok(JsonValue::Object(map));
+            }
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            if self.next() != Some(b':') {
+                return Err(InferenceError::Tokenizer(format!(
+                    "expected ':' after JSON object key at offset {}",
+                    self.pos
+                )));
+            }
+            let value = self.parse_value()?;
+            map.insert(key, value);
+            self.skip_whitespace();
+            match self.next() {
+                Some(b',') => continue,
+                Some(b'}') => return Ok(JsonValue::Object(map)),
+                _ => {
+                    return Err(InferenceError::Tokenizer(format!(
+                        "expected ',' or '}}' in JSON object at offset {}",
+                        self.pos
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Extract a token->id vocabulary map from a JSON object.
+pub(crate) fn json_object_to_vocab(
+    value: &JsonValue,
+) -> Result<HashMap<String, u32>, InferenceError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| InferenceError::Tokenizer("expected JSON object for vocabulary".into()))?;
+
+    let mut vocab = HashMap::with_capacity(object.len());
+    for (token, id_value) in object {
+        let id = id_value.as_u64().ok_or_else(|| {
+            InferenceError::Tokenizer(format!("invalid non-integer token id for {token:?}"))
+        })?;
+        // Token ids are stored as u32 everywhere downstream. A JSON value past u32::MAX
+        // would silently wrap under `as u32` (e.g. 2^32 -> 0) and alias an unrelated
+        // token; reject it instead of corrupting the vocabulary.
+        let id = u32::try_from(id).map_err(|_| {
+            InferenceError::Tokenizer(format!("token id {id} for {token:?} exceeds u32 range"))
+        })?;
+        vocab.insert(token.clone(), id);
+    }
+    Ok(vocab)
+}
+
+/// Extract a token->id vocabulary map from a `vocab.txt`-style line list.
+pub(crate) fn vocab_txt_to_map(vocab_text: &str) -> HashMap<String, u32> {
+    let mut vocab = HashMap::new();
+    for (idx, line) in vocab_text.lines().enumerate() {
+        let token = line.trim_end_matches('\r').to_string();
+        // The line index is the token id. Stop rather than wrap if it would exceed u32
+        // range (a vocab.txt past 2^32 lines is malformed); enumerate is monotonic, so no
+        // later line could fit either.
+        let Ok(id) = u32::try_from(idx) else {
+            break;
+        };
+        vocab.insert(token, id);
+    }
+    vocab
+}
+
+/// Convert a token->id vocabulary map into an ID-indexed token table.
+pub(crate) fn invert_vocab(vocab: &HashMap<String, u32>) -> Result<Vec<String>, InferenceError> {
+    let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
+    // `id_to_token` is a dense table sized to the largest id. Real tokenizer vocabs are
+    // dense (ids 0..len), so gaps are small and tolerated. A malformed tokenizer.json with
+    // a single sparse huge id (e.g. 4_294_967_295) would otherwise force a ~100 GB
+    // allocation here and abort the process at load. Cap the table at 16x the entry count:
+    // generous headroom for any real gap, a hard ceiling on the malformed-input blast radius.
+    let max_slots = vocab.len().saturating_mul(16);
+    if max_id >= max_slots {
+        return Err(InferenceError::Tokenizer(format!(
+            "vocabulary id {max_id} out of range for {} entries (sparse or malformed)",
+            vocab.len()
+        )));
+    }
+    let mut id_to_token = vec![String::new(); max_id + 1];
+    for (token, &id) in vocab {
+        let slot = &mut id_to_token[id as usize];
+        if !slot.is_empty() {
+            return Err(InferenceError::Tokenizer(format!(
+                "duplicate token id {id} for {token:?}"
+            )));
+        }
+        *slot = token.clone();
+    }
+    Ok(id_to_token)
+}
+
+/// Parse `added_tokens` special-token metadata from `tokenizer.json`.
+pub(crate) fn parse_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
+    let mut tokens = HashMap::new();
+    let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
+        return tokens;
+    };
+
+    for item in array {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let Some(content) = object.get("content").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        // Skip an id past u32::MAX rather than wrap it under `as u32` into a colliding
+        // id (parse_added_tokens is lenient by contract and already skips malformed entries).
+        let Some(id) = object
+            .get("id")
+            .and_then(JsonValue::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+        else {
+            continue;
+        };
+        tokens.insert(content.to_string(), id);
+    }
+
+    tokens
+}
+
+/// Parse the subset of `added_tokens` that should be **rendered as literal text**
+/// when decoding, i.e. those whose `"special"` flag is `false` (or absent).
+///
+/// HF's `decode(skip_special_tokens=True)` — the chat default — skips only the
+/// `special=true` set (control/chat/vision markers like `<|im_end|>`), while
+/// `special=false` added tokens (`<think>`/`</think>`, `<tool_call>`, FIM markers)
+/// are emitted verbatim. The base BPE vocab does not contain any added-token ids,
+/// so without this map their decode falls through to nothing and they are silently
+/// swallowed from the output stream. Returns `id -> content`.
+///
+/// Keyed by ID, not by content, and the direction is load-bearing rather than a
+/// convenience for the callers that used to invert it. `added_tokens` may declare
+/// the same content twice at two ids, and keying by content silently kept only
+/// whichever entry parsed last. Every consumer wants `id -> content` anyway
+/// (decode-side rendering, and the alias set behind reasoning-close-marker
+/// validation), so the content-keyed intermediate existed only to lose the
+/// duplicate on the way. An id can render exactly one spelling, so this direction
+/// collapses nothing.
+pub(crate) fn parse_rendered_added_tokens(root: &JsonValue) -> HashMap<u32, String> {
+    let mut tokens = HashMap::new();
+    let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
+        return tokens;
+    };
+
+    for item in array {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        // Absent "special" defaults to false (matches HF AddedToken), so render it.
+        // A "special" value that parses as neither true nor false (a string, a
+        // number, ...) fails closed to special rather than reusing `false` via
+        // `unwrap_or` -- a malformed flag must never silently admit a token to
+        // literal-text rendering (#1722).
+        let is_special = match object.get("special") {
+            None => false,
+            Some(JsonValue::Bool(value)) => *value,
+            Some(_) => true,
+        };
+        if is_special {
+            continue;
+        }
+        let Some(content) = object.get("content").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(id) = object
+            .get("id")
+            .and_then(JsonValue::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+        else {
+            continue;
+        };
+        tokens.insert(id, content.to_string());
+    }
+
+    tokens
+}
+
+pub(crate) fn known_special_id(vocab: &HashMap<String, u32>, names: &[&str]) -> Option<u32> {
+    names.iter().find_map(|name| vocab.get(*name).copied())
+}
+
+pub(crate) struct PostProcessorFlags {
+    pub add_bos: bool,
+    pub add_eos: bool,
+    pub bos_id: Option<u32>,
+    pub eos_id: Option<u32>,
+}
+
+pub(crate) fn parse_post_processor_flags(root: &JsonValue) -> PostProcessorFlags {
+    let default = PostProcessorFlags {
+        add_bos: false,
+        add_eos: false,
+        bos_id: None,
+        eos_id: None,
+    };
+
+    let Some(pp) = root.get("post_processor") else {
+        return default;
+    };
+
+    let Some(template) = find_template_processing(pp) else {
+        return default;
+    };
+
+    let Some(single) = template.get("single").and_then(JsonValue::as_array) else {
+        return default;
+    };
+
+    let special_tokens = template.get("special_tokens");
+    let mut add_bos = false;
+    let mut add_eos = false;
+    let mut bos_id = None;
+    let mut eos_id = None;
+    let mut seen_sequence = false;
+
+    for item in single {
+        if let Some(st) = item.get("SpecialToken") {
+            let token_name = st.get("id").and_then(JsonValue::as_str);
+            if !seen_sequence {
+                add_bos = true;
+                if let Some(name) = token_name {
+                    bos_id = resolve_template_token_id(special_tokens, name);
+                }
+            } else {
+                add_eos = true;
+                if let Some(name) = token_name {
+                    eos_id = resolve_template_token_id(special_tokens, name);
+                }
+            }
+        } else if item.get("Sequence").is_some() {
+            seen_sequence = true;
+        }
+    }
+
+    PostProcessorFlags {
+        add_bos,
+        add_eos,
+        bos_id,
+        eos_id,
+    }
+}
+
+fn find_template_processing(pp: &JsonValue) -> Option<&JsonValue> {
+    let pp_type = pp.get("type")?.as_str()?;
+    match pp_type {
+        "TemplateProcessing" => Some(pp),
+        "Sequence" => {
+            let processors = pp.get("processors")?.as_array()?;
+            processors
+                .iter()
+                .find(|p| p.get("type").and_then(JsonValue::as_str) == Some("TemplateProcessing"))
+        }
+        _ => None,
+    }
+}
+
+fn resolve_template_token_id(special_tokens: Option<&JsonValue>, name: &str) -> Option<u32> {
+    let ids = special_tokens?.get(name)?.get("ids")?.as_array()?;
+    // An id past u32::MAX is treated as absent rather than wrapped into a wrong id.
+    ids.first()?.as_u64().and_then(|v| u32::try_from(v).ok())
+}
+
+/// **Unstable**: internal LRU cache used by tokenizer implementations;
+/// not part of the public embedding API.
+///
+/// The cache uses a monotonic stamp plus a duplicate-tolerant queue to avoid
+/// per-entry linked-list pointers while preserving LRU behavior.
+#[derive(Debug)]
+pub struct ThreadSafeLruCache<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    capacity: usize,
+    state: Mutex<LruState<K, V>>,
+}
+
+#[derive(Debug)]
+struct LruState<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    clock: u64,
+    map: HashMap<K, LruEntry<V>>,
+    order: VecDeque<(K, u64)>,
+}
+
+#[derive(Debug)]
+struct LruEntry<V> {
+    stamp: u64,
+    value: Arc<V>,
+}
+
+impl<K, V> ThreadSafeLruCache<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    /// **Unstable**: construct with given capacity.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Mutex::new(LruState {
+                clock: 0,
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// **Unstable**: returns configured capacity.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// **Unstable**: get a cached value by key.
+    pub fn get(&self, key: &K) -> Option<Arc<V>> {
+        if self.capacity == 0 {
+            return None;
+        }
+
+        let mut state = self.state.lock().ok()?;
+        let value = state.map.get(key)?.value.clone();
+        state.clock = state.clock.wrapping_add(1);
+        let stamp = state.clock;
+        if let Some(entry) = state.map.get_mut(key) {
+            entry.stamp = stamp;
+        }
+        state.order.push_back((key.clone(), stamp));
+        Self::evict_if_needed(self.capacity, &mut state);
+        Some(value)
+    }
+
+    /// **Unstable**: insert a value, returns an `Arc` to it.
+    pub fn insert(&self, key: K, value: V) -> Arc<V> {
+        let value = Arc::new(value);
+        self.insert_arc(key, value.clone());
+        value
+    }
+
+    /// **Unstable**: insert a pre-boxed `Arc` value.
+    pub fn insert_arc(&self, key: K, value: Arc<V>) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        if let Ok(mut state) = self.state.lock() {
+            state.clock = state.clock.wrapping_add(1);
+            let stamp = state.clock;
+            state.map.insert(
+                key.clone(),
+                LruEntry {
+                    stamp,
+                    value: value.clone(),
+                },
+            );
+            state.order.push_back((key, stamp));
+            Self::evict_if_needed(self.capacity, &mut state);
+        }
+    }
+
+    fn evict_if_needed(capacity: usize, state: &mut LruState<K, V>) {
+        while state.map.len() > capacity {
+            let Some((key, stamp)) = state.order.pop_front() else {
+                break;
+            };
+            let should_remove = match state.map.get(&key) {
+                Some(entry) => entry.stamp == stamp,
+                None => false,
+            };
+            if should_remove {
+                state.map.remove(&key);
+            }
+        }
+    }
+}
+
+impl<K, V> Clone for ThreadSafeLruCache<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    fn clone(&self) -> Self {
+        Self::new(self.capacity)
+    }
+}
+
+#[cfg(test)]
+mod tests;

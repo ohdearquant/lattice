@@ -1,0 +1,1193 @@
+use super::*;
+
+fn make_config(num_layers: usize, max_seq_len: usize) -> FlatKVCacheConfig {
+    FlatKVCacheConfig {
+        num_layers,
+        num_kv_heads: 8,
+        head_dim: 128,
+        max_seq_len,
+    }
+}
+
+/// f16 tolerance: ~3.3 decimal digits relative precision (eps ≈ 9.77e-4).
+/// We use max(absolute_tol, relative_tol * max(|a|, |b|)) to handle both
+/// near-zero and large values correctly.
+fn approx_eq(a: f32, b: f32) -> bool {
+    let abs_tol = 1e-3_f32;
+    let rel_tol = 2e-3_f32; // 2× f16 epsilon for rounding slack
+    let scale = a.abs().max(b.abs()).max(1.0);
+    (a - b).abs() <= abs_tol.max(rel_tol * scale)
+}
+
+#[test]
+fn append_get_roundtrip() {
+    let config = make_config(2, 64);
+    let kv_dim = config.kv_dim(); // 8 * 128 = 1024
+    let mut cache = FlatKVCache::new(config);
+
+    // Append one token to layer 0.
+    // Use small values well within f16 range to avoid precision loss.
+    let k: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.01).collect();
+    let v: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.02 + 1.0).collect();
+    cache.append_kv(0, &k, &v).unwrap();
+
+    // Also append to layer 1.
+    let k1: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.03).collect();
+    let v1: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.04 + 2.0).collect();
+    cache.append_kv(1, &k1, &v1).unwrap();
+
+    cache.advance().unwrap();
+    assert_eq!(cache.seq_len(), 1);
+
+    // Verify roundtrip with f16 tolerance.
+    let got_k = cache.get_k(0);
+    assert_eq!(got_k.len(), kv_dim);
+    for (i, (&orig, &got)) in k.iter().zip(got_k.iter()).enumerate() {
+        assert!(
+            approx_eq(orig, got),
+            "k[{i}]: expected {orig}, got {got}, diff {}",
+            (orig - got).abs()
+        );
+    }
+
+    let got_v = cache.get_v(0);
+    for (i, (&orig, &got)) in v.iter().zip(got_v.iter()).enumerate() {
+        assert!(approx_eq(orig, got), "v[{i}]: expected {orig}, got {got}");
+    }
+
+    let got_k1 = cache.get_k(1);
+    for (i, (&orig, &got)) in k1.iter().zip(got_k1.iter()).enumerate() {
+        assert!(approx_eq(orig, got), "k1[{i}]: expected {orig}, got {got}");
+    }
+
+    let got_v1 = cache.get_v(1);
+    for (i, (&orig, &got)) in v1.iter().zip(got_v1.iter()).enumerate() {
+        assert!(approx_eq(orig, got), "v1[{i}]: expected {orig}, got {got}");
+    }
+}
+
+#[test]
+fn per_layer_isolation() {
+    let config = make_config(4, 32);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    // Append different data to each layer.
+    for layer in 0..4 {
+        let marker = (layer + 1) as f32;
+        let k = vec![marker; kv_dim];
+        let v = vec![marker + 0.5; kv_dim];
+        cache.append_kv(layer, &k, &v).unwrap();
+    }
+    cache.advance().unwrap();
+
+    // Each layer should have its own data (with f16 tolerance).
+    for layer in 0..4 {
+        let marker = (layer + 1) as f32;
+        let got_k = cache.get_k(layer);
+        assert!(
+            got_k.iter().all(|&x| approx_eq(x, marker)),
+            "layer {layer} K mismatch"
+        );
+        let got_v = cache.get_v(layer);
+        assert!(
+            got_v.iter().all(|&x| approx_eq(x, marker + 0.5)),
+            "layer {layer} V mismatch"
+        );
+    }
+}
+
+#[test]
+fn reset_clears_state() {
+    let config = make_config(2, 16);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    let k = vec![1.0f32; kv_dim];
+    let v = vec![2.0f32; kv_dim];
+    cache.append_kv(0, &k, &v).unwrap();
+    cache.append_kv(1, &k, &v).unwrap();
+    cache.advance().unwrap();
+    assert_eq!(cache.seq_len(), 1);
+
+    cache.reset();
+    assert_eq!(cache.seq_len(), 0);
+    // After reset, get_k/get_v return empty Vec.
+    assert_eq!(cache.get_k(0).len(), 0);
+    assert_eq!(cache.get_v(1).len(), 0);
+}
+
+#[test]
+fn capacity_limit() {
+    let config = make_config(1, 4);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    let k = vec![1.0f32; kv_dim];
+    let v = vec![2.0f32; kv_dim];
+
+    // Fill to capacity.
+    for _ in 0..4 {
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.advance().unwrap();
+    }
+    assert!(cache.is_full());
+    assert_eq!(cache.seq_len(), 4);
+}
+
+#[test]
+fn append_beyond_capacity_returns_err() {
+    let config = make_config(1, 2);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    let k = vec![1.0f32; kv_dim];
+    let v = vec![2.0f32; kv_dim];
+    cache.append_kv(0, &k, &v).unwrap();
+    cache.advance().unwrap();
+    cache.append_kv(0, &k, &v).unwrap();
+    cache.advance().unwrap();
+    // Cache is now full; next append must return Err.
+    let r = cache.append_kv(0, &k, &v);
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput error, got {r:?}"
+    );
+}
+
+#[test]
+fn prefill_then_decode() {
+    let config = make_config(2, 64);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    let prompt_len = 10;
+
+    // Prefill: 10 tokens, each layer.
+    for layer in 0..2 {
+        let marker = (layer + 1) as f32;
+        let k_prefill: Vec<f32> = (0..prompt_len * kv_dim)
+            .map(|i| marker + (i as f32) * 0.001)
+            .collect();
+        let v_prefill: Vec<f32> = (0..prompt_len * kv_dim)
+            .map(|i| marker + 0.5 + (i as f32) * 0.001)
+            .collect();
+        cache
+            .prefill_layer(layer, &k_prefill, &v_prefill, prompt_len)
+            .unwrap();
+    }
+    cache.advance_by(prompt_len).unwrap();
+    assert_eq!(cache.seq_len(), prompt_len);
+
+    // Decode: append 5 more tokens one at a time.
+    for step in 0..5 {
+        for layer in 0..2 {
+            let marker = 100.0 + step as f32;
+            let k = vec![marker; kv_dim];
+            let v = vec![marker + 0.5; kv_dim];
+            cache.append_kv(layer, &k, &v).unwrap();
+        }
+        cache.advance().unwrap();
+    }
+    assert_eq!(cache.seq_len(), 15);
+
+    // Verify decode tokens are at correct positions.
+    let k0 = cache.get_k(0);
+    assert_eq!(k0.len(), 15 * kv_dim);
+
+    // Check the first decode token (at position 10), f16 roundtrip of 100.0 is exact.
+    let decode_start = 10 * kv_dim;
+    assert!(
+        approx_eq(k0[decode_start], 100.0),
+        "expected ~100.0, got {}",
+        k0[decode_start]
+    );
+
+    // Check last decode token (at position 14).
+    let last_start = 14 * kv_dim;
+    assert!(
+        approx_eq(k0[last_start], 104.0),
+        "expected ~104.0, got {}",
+        k0[last_start]
+    );
+}
+
+#[test]
+fn memory_bytes_calculation() {
+    // Qwen3-0.6B: 28 layers, 8 KV heads, head_dim=128, max 4096
+    // kv_dim = 8 * 128 = 1024
+    // Per side: 28 * 4096 * 1024 * 2 bytes (f16)
+    // Total: 2 * that = 469,762,048 bytes ~ 448 MB (was 896 MB with f32)
+    let config = FlatKVCacheConfig::for_qwen3(28, 8, 128, 4096);
+    let kv_dim = 8 * 128; // 1024
+    let expected = 2 * 28 * 4096 * kv_dim * 2; // 2 bytes per f16
+    assert_eq!(config.total_bytes(), expected);
+    let mb = config.total_bytes() as f64 / (1024.0 * 1024.0);
+    assert!((mb - 448.0).abs() < 1.0, "expected ~448 MB, got {mb:.1} MB");
+}
+
+#[test]
+fn truncate_to_rewinds_seq_len_without_deallocating() {
+    let config = FlatKVCacheConfig {
+        num_layers: 2,
+        num_kv_heads: 4,
+        head_dim: 64,
+        max_seq_len: 8,
+    };
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    cache.advance_by(5).unwrap();
+    let k_len_before = cache.k_buffer(0).len();
+    let v_len_before = cache.v_buffer(0).len();
+
+    cache.truncate_to(3);
+    assert_eq!(cache.seq_len(), 3);
+    // Buffer lengths must be unchanged (no deallocation)
+    assert_eq!(cache.k_buffer(0).len(), k_len_before);
+    assert_eq!(cache.v_buffer(0).len(), v_len_before);
+    // Valid slice (f16) shrinks accordingly
+    assert_eq!(cache.get_k_f16(0).len(), 3 * kv_dim);
+}
+
+#[test]
+fn reset_fast_preserves_buffer() {
+    let config = make_config(1, 8);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    let k = vec![42.0f32; kv_dim];
+    let v = vec![43.0f32; kv_dim];
+    cache.append_kv(0, &k, &v).unwrap();
+    cache.advance().unwrap();
+
+    cache.reset_fast();
+    assert_eq!(cache.seq_len(), 0);
+    // Stale data is still there in the raw f16 buffer (this is expected).
+    assert!(approx_eq(cache.k[0][0].to_f32(), 42.0));
+}
+
+#[test]
+fn get_k_mut_allows_modification() {
+    let config = make_config(1, 8);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    let k = vec![1.0f32; kv_dim];
+    let v = vec![2.0f32; kv_dim];
+    cache.append_kv(0, &k, &v).unwrap();
+    cache.advance().unwrap();
+
+    // Modify K in-place via f16 mutation.
+    let k_mut = cache.get_k_mut(0);
+    k_mut[0] = f16::from_f32(99.0);
+
+    let got_k = cache.get_k(0);
+    assert!(approx_eq(got_k[0], 99.0));
+}
+
+#[test]
+fn read_k_into_dequantizes_correctly() {
+    let config = make_config(1, 8);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    let k: Vec<f32> = (0..kv_dim).map(|i| i as f32 * 0.5).collect();
+    let v = vec![0.0f32; kv_dim];
+    cache.append_kv(0, &k, &v).unwrap();
+    cache.advance().unwrap();
+
+    let mut buf = vec![0.0f32; kv_dim];
+    cache.read_k_into(0, &mut buf);
+
+    for (i, (&orig, &got)) in k.iter().zip(buf.iter()).enumerate() {
+        assert!(
+            approx_eq(orig, got),
+            "read_k_into[{i}]: expected {orig}, got {got}"
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "layer index out of bounds")]
+fn read_k_into_out_of_range_layer_panics_clearly() {
+    // Regression for #244: read accessors guarded `layer` with `debug_assert!`,
+    // which compiled out in release and degraded to a bare `index out of bounds`
+    // panic. Now a runtime `assert!` gives the same descriptive message in both
+    // profiles, matching the write path (`append_kv` / `prefill_layer`).
+    let config = make_config(2, 8);
+    let kv_dim = config.kv_dim();
+    let cache = FlatKVCache::new(config);
+    let mut buf = vec![0.0f32; kv_dim];
+    cache.read_k_into(2, &mut buf); // valid layers are 0..2
+}
+
+#[test]
+#[should_panic(expected = "output buffer too small")]
+fn read_k_into_undersized_buffer_panics_clearly() {
+    // Regression for #244: the `buf.len() >= end` precondition was a
+    // `debug_assert!` and so unchecked in release. It is now a runtime
+    // `assert!` with a descriptive message.
+    let config = make_config(1, 8);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+    let k = vec![1.0f32; kv_dim];
+    let v = vec![0.0f32; kv_dim];
+    cache.append_kv(0, &k, &v).unwrap();
+    cache.advance().unwrap();
+
+    let mut too_small = vec![0.0f32; kv_dim - 1];
+    cache.read_k_into(0, &mut too_small);
+}
+
+#[test]
+fn f16_storage_halves_memory() {
+    // Verify the storage byte count matches f16 (not f32).
+    let config = FlatKVCacheConfig {
+        num_layers: 1,
+        num_kv_heads: 2,
+        head_dim: 4,
+        max_seq_len: 16,
+    };
+    let kv_dim = 2 * 4; // 8
+    // f16: 2 * 1 * 16 * 8 * 2 = 512 bytes
+    let expected_f16 = 2 * 16 * kv_dim * std::mem::size_of::<f16>();
+    assert_eq!(config.total_bytes(), expected_f16);
+    // Would have been 1024 with f32
+    let would_be_f32 = 2 * 16 * kv_dim * std::mem::size_of::<f32>();
+    assert_eq!(config.total_bytes() * 2, would_be_f32);
+}
+
+// -----------------------------------------------------------------------
+// Boundary / special-value conversion tests (f32→f16→f32 contract).
+//
+// These tests assert the *chosen contract* for each boundary rather than
+// relying on roundtrip tolerance alone.  `f16::from_f32` follows IEEE-754:
+//
+//  * NaN input  → f16 NaN  → f32 NaN  (is_nan() propagates)
+//  * ±∞ input   → f16 ±∞  → f32 ±∞  (exact preservation)
+//  * +0.0 / -0.0 → f16 ±0 → f32 ±0  (sign bit preserved)
+//  * f16::MAX (65504.0) roundtrips exactly within f16 representable range
+//  * f32 values above f16 range (e.g. 1e38) overflow → f16::INFINITY
+//  * f32 subnormals flush to ±0 in f16 (magnitude below f16 MIN_POSITIVE)
+// -----------------------------------------------------------------------
+
+/// Helper: store a single f32 value in layer 0, advance, read back via get_k.
+fn roundtrip_single(val: f32) -> f32 {
+    let config = FlatKVCacheConfig {
+        num_layers: 1,
+        num_kv_heads: 1,
+        head_dim: 1,
+        max_seq_len: 4,
+    };
+    let mut cache = FlatKVCache::new(config);
+    cache.append_kv(0, &[val], &[0.0f32]).unwrap();
+    cache.advance().unwrap();
+    cache.get_k(0)[0]
+}
+
+#[test]
+fn boundary_nan_propagates() {
+    // Contract: NaN input → NaN stored and read back.
+    let out = roundtrip_single(f32::NAN);
+    assert!(out.is_nan(), "expected NaN, got {out}");
+}
+
+#[test]
+fn boundary_positive_infinity() {
+    // Contract: +∞ input → +∞ stored and read back.
+    let out = roundtrip_single(f32::INFINITY);
+    assert!(
+        out.is_infinite() && out.is_sign_positive(),
+        "expected +∞, got {out}"
+    );
+}
+
+#[test]
+fn boundary_negative_infinity() {
+    // Contract: -∞ input → -∞ stored and read back.
+    let out = roundtrip_single(f32::NEG_INFINITY);
+    assert!(
+        out.is_infinite() && out.is_sign_negative(),
+        "expected -∞, got {out}"
+    );
+}
+
+#[test]
+fn boundary_positive_zero() {
+    // Contract: +0.0 roundtrips as zero (sign not guaranteed by f16 spec but
+    // practically preserved; assert at minimum the value is zero).
+    let out = roundtrip_single(0.0f32);
+    assert_eq!(out, 0.0f32, "expected 0.0, got {out}");
+}
+
+#[test]
+fn boundary_negative_zero() {
+    // Contract: -0.0 roundtrips as zero (sign preserved in IEEE-754 f16).
+    let out = roundtrip_single(-0.0f32);
+    assert_eq!(out, 0.0f32, "expected -0.0 (==0.0), got {out}");
+    assert!(
+        out.is_sign_negative(),
+        "expected sign bit to be negative for -0.0"
+    );
+}
+
+#[test]
+fn boundary_f16_max_exact() {
+    // f16::MAX = 65504.0; this value is exactly representable in f16,
+    // so the roundtrip must be exact.
+    let f16_max = f16::MAX.to_f32(); // 65504.0
+    let out = roundtrip_single(f16_max);
+    assert_eq!(out, f16_max, "f16::MAX roundtrip must be exact, got {out}");
+}
+
+#[test]
+fn boundary_overflow_to_infinity() {
+    // f32 values above f16 range (> 65504) overflow to ±∞ in f16.
+    // Contract: store overflows to +∞ and is read back as +∞.
+    let out = roundtrip_single(1e38_f32);
+    assert!(
+        out.is_infinite() && out.is_sign_positive(),
+        "expected +∞ (f32→f16 overflow), got {out}"
+    );
+}
+
+#[test]
+fn boundary_f32_subnormal_flushes() {
+    // A real f32 subnormal (nonzero, below f32::MIN_POSITIVE) is too small
+    // for f16 and flushes to ±0. Use from_bits(1) = smallest positive f32 subnormal.
+    let tiny = f32::from_bits(1); // ~1.4e-45, a real subnormal
+    assert!(
+        tiny > 0.0 && tiny < f32::MIN_POSITIVE,
+        "should be a real f32 subnormal"
+    );
+    let out = roundtrip_single(tiny);
+    assert_eq!(
+        out, 0.0f32,
+        "f32 subnormal below f16 range should flush to 0, got {out}"
+    );
+}
+
+#[test]
+fn boundary_f16_min_positive_subnormal_survives() {
+    // The smallest nonzero f16 value should survive the roundtrip.
+    let smallest_f16 = half::f16::MIN_POSITIVE_SUBNORMAL.to_f32();
+    assert!(
+        smallest_f16 > 0.0,
+        "f16 MIN_POSITIVE_SUBNORMAL should be positive"
+    );
+    let out = roundtrip_single(smallest_f16);
+    assert_eq!(
+        out, smallest_f16,
+        "f16 MIN_POSITIVE_SUBNORMAL should survive roundtrip, got {out}"
+    );
+}
+
+// -- Exact bit-pattern overflow and RNE tests (Defect 3 fix) ---------
+
+#[test]
+fn boundary_requested_overflow_inputs_map_to_infinity() {
+    // 65536.0 = 2^16 is above f16::MAX (65504.0) and must overflow to ±inf.
+    // These are the *exact* boundary values requested in the hardening pass.
+    assert_eq!(
+        f16::from_f32(65536.0_f32).to_bits(),
+        f16::INFINITY.to_bits(),
+        "65536.0 must overflow to +inf in f16"
+    );
+    assert_eq!(
+        f16::from_f32(-65536.0_f32).to_bits(),
+        f16::NEG_INFINITY.to_bits(),
+        "-65536.0 must overflow to -inf in f16"
+    );
+}
+
+#[test]
+fn boundary_round_to_nearest_even_ties() {
+    // Verify IEEE-754 round-to-nearest-even at the exact halfway points.
+    //
+    // Case 1: 2^-25 is below the smallest f16 subnormal (2^-24); rounds to 0.
+    assert_eq!(
+        f16::from_f32(2.0_f32.powi(-25)).to_bits(),
+        0x0000,
+        "2^-25 must round to 0 (below subnormal range)"
+    );
+    // Case 2: 1.5 * 2^-24 is the midpoint between subnormal bit=1 and bit=2.
+    // RNE selects even mantissa → bit=2 → 0x0002.
+    assert_eq!(
+        f16::from_f32(1.5 * 2.0_f32.powi(-24)).to_bits(),
+        0x0002,
+        "1.5*2^-24 must round to subnormal bit=2 (RNE)"
+    );
+    // Case 3: 1.0 + 2^-11 is the midpoint between 0x3C00 (1.0) and 0x3C01.
+    // 0x3C00 has even mantissa LSB; RNE rounds to 0x3C00.
+    assert_eq!(
+        f16::from_f32(1.0_f32 + 2.0_f32.powi(-11)).to_bits(),
+        0x3c00,
+        "1.0 + 2^-11 must round to 1.0 = 0x3C00 (RNE, even mantissa wins)"
+    );
+    // Case 4: 1.0 + 3*2^-11 is the midpoint between 0x3C01 and 0x3C02.
+    // 0x3C02 has even mantissa LSB; RNE rounds to 0x3C02.
+    assert_eq!(
+        f16::from_f32(1.0_f32 + 3.0 * 2.0_f32.powi(-11)).to_bits(),
+        0x3c02,
+        "1.0 + 3*2^-11 must round to 0x3C02 (RNE, even mantissa wins)"
+    );
+}
+
+// -- Allocation-contract test (Defect 2 fix, Option B) ---------------
+
+#[test]
+fn constructed_cache_eagerly_initializes_configured_len() {
+    // Verifies that FlatKVCache::new immediately materializes all buffers
+    // at max_seq_len capacity (eager-allocation contract; callers must provide
+    // their bounded capacity up front).
+    let config = FlatKVCacheConfig::for_qwen3(2, 2, 4, 16);
+    let cache = FlatKVCache::new(config);
+    let kv_dim = cache.kv_dim(); // 2 * 4 = 8
+    let max_seq = cache.max_seq_len(); // 16
+    // num_layers * (K-side + V-side) * max_seq * kv_dim
+    // = 2 * 2 * 16 * 8 = 512
+    let expected_elems = cache.num_layers() * 2 * max_seq * kv_dim;
+    let actual_elems: usize = (0..cache.num_layers())
+        .map(|layer| cache.k_buffer(layer).len() + cache.v_buffer(layer).len())
+        .sum();
+    assert_eq!(
+        actual_elems, expected_elems,
+        "FlatKVCache eagerly allocates max_seq_len * kv_dim per layer per side"
+    );
+}
+
+/// Quality measurement: f32→f16→f32 roundtrip error over representative KV value ranges.
+///
+/// Reports max absolute error, max relative error, and confirms they are within
+/// the bounds implied by IEEE-754 binary16 (f16 epsilon = 2^-10 ≈ 9.77e-4).
+#[test]
+fn quality_measurement_f16_roundtrip_error() {
+    let n = 200_000usize;
+
+    // Ranges representing typical KV values in transformer models
+    let ranges: &[(&str, f32, f32)] = &[
+        ("tiny [-0.1, 0.1]", -0.1, 0.1),
+        ("small [-1.0, 1.0]", -1.0, 1.0),
+        ("typical [-5.0, 5.0]", -5.0, 5.0),
+        ("large [-10.0, 10.0]", -10.0, 10.0),
+    ];
+
+    // f16::MIN_POSITIVE is the smallest *normal* f16 value (~6.1e-5).
+    // Values below this may flush to a subnormal or zero — relative error near zero
+    // is by-design large (subnormal flush is expected behavior). We check only
+    // normal f16 values for the relative-error invariant.
+    let f16_min_normal = f16::MIN_POSITIVE.to_f32();
+
+    for (label, lo, hi) in ranges {
+        let mut max_abs = 0.0f32;
+        let mut max_rel_normal = 0.0f32;
+        for i in 0..n {
+            let t = i as f32 / (n - 1) as f32;
+            let v = lo + t * (hi - lo);
+            let v_h = f16::from_f32(v).to_f32();
+            let abs_err = (v - v_h).abs();
+            if abs_err > max_abs {
+                max_abs = abs_err;
+            }
+            // Relative error only meaningful for normal f16 inputs
+            if v.abs() >= f16_min_normal {
+                let rel_err = abs_err / v.abs();
+                if rel_err > max_rel_normal {
+                    max_rel_normal = rel_err;
+                }
+            }
+        }
+        // Max relative error for normal inputs must be <= 0.5 * f16::EPSILON
+        let half_eps = f16::EPSILON.to_f32() / 2.0;
+        assert!(
+            max_rel_normal <= half_eps + 1e-7,
+            "{label}: max relative error (normal inputs) {max_rel_normal:.2e} exceeds 0.5*ε ({half_eps:.2e})"
+        );
+    }
+
+    // Confirm the specific "< 0.1% relative error" claim for [-10, 10]
+    let mut max_rel_kv = 0.0f32;
+    for i in 0..n {
+        let t = i as f32 / (n - 1) as f32;
+        let v = -10.0 + t * 20.0_f32;
+        let v_h = f16::from_f32(v).to_f32();
+        let rel_err = if v.abs() > 1e-10 {
+            (v - v_h).abs() / v.abs()
+        } else {
+            (v - v_h).abs()
+        };
+        if rel_err > max_rel_kv {
+            max_rel_kv = rel_err;
+        }
+    }
+    // Measured relative error must be < 0.1% (0.001)
+    assert!(
+        max_rel_kv < 0.001,
+        "max relative error for KV in [-10,10] is {max_rel_kv:.4e}, expected < 0.001"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Tensor oracle: f32-KV reference vs f16-KV-via-FlatKVCache logit diff.
+//
+// Implements the mandatory fallback harness from quality_measurement_design.md:
+//   - Builds deterministic Q/K/V tensors (xorshift32 PRNG, no model weights).
+//   - Runs scaled dot-product attention with f32 KV directly.
+//   - Stores same K/V in FlatKVCache (quantizes to f16), dequantizes via
+//     the production-style scratch loop, runs the same attention.
+//   - Projects both outputs through a deterministic W_out to produce logits.
+//   - Asserts: logit_max_abs_diff < 0.02, top1_match_rate >= 0.95,
+//              nan_count == 0, synthetic_nll_delta_abs < 0.01.
+//
+// This is NOT a PPL measurement. It is the CI tensor oracle only.
+// -----------------------------------------------------------------------
+
+/// Deterministic xorshift32 PRNG (Marsaglia 2003).
+fn xorshift32(state: &mut u32) -> u32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    x
+}
+
+/// Sample a f32 uniformly in [lo, hi] using xorshift32.
+fn rand_f32(state: &mut u32, lo: f32, hi: f32) -> f32 {
+    let bits = xorshift32(state);
+    let t = (bits as f32) / (u32::MAX as f32);
+    lo + t * (hi - lo)
+}
+
+/// Scaled dot-product attention (q_seq_len=1 decode, GQA).
+///
+/// Q:      [num_heads * head_dim]            (single query token)
+/// K, V:   [kv_seq_len * num_kv_heads * head_dim]
+/// output: [num_heads * head_dim]
+///
+/// Groups = num_heads / num_kv_heads; each KV head is shared across `groups` Q heads.
+fn sdpa_decode(
+    output: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    kv_seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) {
+    let groups = num_heads / num_kv_heads;
+    let kv_dim = num_kv_heads * head_dim;
+    let q_dim = num_heads * head_dim;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    output[..q_dim].fill(0.0);
+    let mut scores = vec![0.0f32; kv_seq_len];
+
+    for h in 0..num_heads {
+        let kv_h = h / groups;
+        let q_off = h * head_dim;
+
+        // Phase 1: QK^T
+        for ki in 0..kv_seq_len {
+            let k_off = ki * kv_dim + kv_h * head_dim;
+            let dot: f32 = (0..head_dim).map(|d| q[q_off + d] * k[k_off + d]).sum();
+            scores[ki] = dot * scale;
+        }
+
+        // Phase 2: stable softmax
+        let max_s = scores[..kv_seq_len]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = scores[..kv_seq_len]
+            .iter_mut()
+            .map(|s| {
+                *s = (*s - max_s).exp();
+                *s
+            })
+            .sum();
+        if sum > 0.0 {
+            scores[..kv_seq_len].iter_mut().for_each(|s| *s /= sum);
+        }
+
+        // Phase 3: weighted V sum
+        let out_off = h * head_dim;
+        for ki in 0..kv_seq_len {
+            let v_off = ki * kv_dim + kv_h * head_dim;
+            let w = scores[ki];
+            for d in 0..head_dim {
+                output[out_off + d] += w * v[v_off + d];
+            }
+        }
+    }
+}
+
+/// Top-1 token choice for the f16-vs-f32 KV-cache logits oracle below.
+///
+/// Delegates to the shared first-wins `crate::speculative::argmax` so
+/// the oracle's tie-break matches the engine's documented greedy
+/// contract (lowest index wins on an exact tie — see
+/// `forward::metal_qwen35`, `sampling`, and `torch.argmax`, all
+/// first-wins per #280). `Iterator::max_by` resolves ties to the *last*
+/// index instead, which let the oracle silently score a different top-1
+/// token than production would pick on an exact tie (#861).
+fn oracle_top1(logits: &[f32]) -> usize {
+    crate::speculative::argmax(logits)
+}
+
+/// The mandatory tensor oracle: compare f32-KV reference vs f16-KV-via-FlatKVCache.
+///
+/// Produces actual measured logit_max_abs_diff and top1_match_rate.
+#[test]
+fn f16_kv_tensor_oracle_logit_diff() {
+    // Oracle parameters (matching design doc).
+    const NUM_HEADS: usize = 4;
+    const NUM_KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 16;
+    const VOCAB: usize = 257;
+    const Q_DIM: usize = NUM_HEADS * HEAD_DIM; // 64
+    const KV_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 32
+
+    // KV context lengths and value ranges per design doc.
+    let seq_lens: &[usize] = &[1, 8, 64, 256];
+    let kv_ranges: &[(&str, f32, f32)] = &[
+        ("tiny", -0.1, 0.1),
+        ("typical", -5.0, 5.0),
+        ("outlier", -10.0, 10.0),
+    ];
+
+    // Deterministic W_out: [VOCAB, Q_DIM], scaled to [-0.05, 0.05].
+    let mut w_seed: u32 = 0xDEAD_BEEF;
+    let w_out: Vec<f32> = (0..VOCAB * Q_DIM)
+        .map(|_| rand_f32(&mut w_seed, -0.05, 0.05))
+        .collect();
+
+    let mut global_max_logit_diff = 0.0f32;
+    let mut top1_match_count = 0usize;
+    let mut total_cases = 0usize;
+    let mut nan_count = 0usize;
+    let mut max_synth_nll_delta = 0.0f32;
+
+    for &seq_len in seq_lens {
+        for &(range_name, lo, hi) in kv_ranges {
+            let mut seed: u32 = 0x1234_5678u32
+                .wrapping_add(seq_len as u32)
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add(range_name.len() as u32);
+
+            // Build deterministic Q (seq_len=1 decode query).
+            let q: Vec<f32> = (0..Q_DIM).map(|_| rand_f32(&mut seed, -1.0, 1.0)).collect();
+
+            // Build deterministic K_f32, V_f32.
+            let k_f32: Vec<f32> = (0..seq_len * KV_DIM)
+                .map(|_| rand_f32(&mut seed, lo, hi))
+                .collect();
+            let v_f32: Vec<f32> = (0..seq_len * KV_DIM)
+                .map(|_| rand_f32(&mut seed, lo, hi))
+                .collect();
+
+            // ---- Reference path: f32 KV directly ----
+            let mut out_f32 = vec![0.0f32; Q_DIM];
+            sdpa_decode(
+                &mut out_f32,
+                &q,
+                &k_f32,
+                &v_f32,
+                seq_len,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            );
+
+            // ---- f16 path: store in FlatKVCache, dequantize via k_buffer/v_buffer ----
+            let cfg = FlatKVCacheConfig {
+                num_layers: 1,
+                num_kv_heads: NUM_KV_HEADS,
+                head_dim: HEAD_DIM,
+                max_seq_len: seq_len,
+            };
+            let mut cache = FlatKVCache::new(cfg);
+
+            // Write K/V row by row, matching the flat-cache prefill pattern.
+            {
+                let k_layer = cache.k_buffer_mut(0);
+                for (i, &val) in k_f32.iter().enumerate() {
+                    k_layer[i] = f16::from_f32(val);
+                }
+                let v_layer = cache.v_buffer_mut(0);
+                for (i, &val) in v_f32.iter().enumerate() {
+                    v_layer[i] = f16::from_f32(val);
+                }
+            }
+            cache.advance_by(seq_len).unwrap();
+
+            // Dequantize through the same scratch-loop pattern used by CPU paths.
+            let k_end = seq_len * KV_DIM;
+            let mut k_dequant = vec![0.0f32; k_end];
+            let mut v_dequant = vec![0.0f32; k_end];
+            for (i, &h) in cache.k_buffer(0)[..k_end].iter().enumerate() {
+                k_dequant[i] = h.to_f32();
+            }
+            for (i, &h) in cache.v_buffer(0)[..k_end].iter().enumerate() {
+                v_dequant[i] = h.to_f32();
+            }
+
+            let mut out_f16 = vec![0.0f32; Q_DIM];
+            sdpa_decode(
+                &mut out_f16,
+                &q,
+                &k_dequant,
+                &v_dequant,
+                seq_len,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            );
+
+            // ---- Project both outputs to logits via W_out ----
+            let mut logits_f32 = vec![0.0f32; VOCAB];
+            let mut logits_f16 = vec![0.0f32; VOCAB];
+            for v_idx in 0..VOCAB {
+                let row_off = v_idx * Q_DIM;
+                logits_f32[v_idx] = (0..Q_DIM)
+                    .map(|d| out_f32[d] * w_out[row_off + d])
+                    .sum::<f32>();
+                logits_f16[v_idx] = (0..Q_DIM)
+                    .map(|d| out_f16[d] * w_out[row_off + d])
+                    .sum::<f32>();
+            }
+
+            // ---- Measure diff ----
+            let case_max_diff = logits_f32
+                .iter()
+                .zip(logits_f16.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+
+            let nans = logits_f16.iter().filter(|&&x| x.is_nan()).count();
+            nan_count += nans;
+
+            let top1_f32 = oracle_top1(&logits_f32);
+            let top1_f16 = oracle_top1(&logits_f16);
+
+            // Synthetic NLL delta on deterministic target token.
+            let target = (seq_len * 37 + 11) % VOCAB;
+            let nll_f32 = -softmax_log_prob(&logits_f32, target);
+            let nll_f16 = -softmax_log_prob(&logits_f16, target);
+            let nll_delta = (nll_f16 - nll_f32).abs();
+
+            if case_max_diff > global_max_logit_diff {
+                global_max_logit_diff = case_max_diff;
+            }
+            if top1_f32 == top1_f16 {
+                top1_match_count += 1;
+            }
+            if nll_delta > max_synth_nll_delta {
+                max_synth_nll_delta = nll_delta;
+            }
+            total_cases += 1;
+
+            eprintln!(
+                "  oracle seq={:3} range={:<8} logit_max_diff={:.2e}  top1={}  nll_delta={:.2e}",
+                seq_len,
+                range_name,
+                case_max_diff,
+                if top1_f32 == top1_f16 {
+                    "MATCH"
+                } else {
+                    "DIFF"
+                },
+                nll_delta
+            );
+        }
+    }
+
+    let top1_rate = top1_match_count as f32 / total_cases as f32;
+    eprintln!(
+        "\n=== Tensor Oracle Summary ===\n  logit_max_abs_diff = {global_max_logit_diff:.4e}  (gate: < 0.02)\n  top1_match_rate    = {top1_rate:.4}    (gate: >= 0.95)\n  nan_count          = {nan_count}\n  max_synth_nll_delta= {max_synth_nll_delta:.4e}  (gate: < 0.01)"
+    );
+
+    assert_eq!(nan_count, 0, "f16 KV dequant introduced NaN in logits");
+    assert!(
+        global_max_logit_diff < 0.02,
+        "logit_max_abs_diff {global_max_logit_diff:.4e} >= 0.02 gate"
+    );
+    assert!(
+        top1_rate >= 0.95,
+        "top1_match_rate {top1_rate:.4} < 0.95 gate"
+    );
+    assert!(
+        max_synth_nll_delta < 0.01,
+        "max synthetic NLL delta {max_synth_nll_delta:.4e} >= 0.01"
+    );
+}
+
+/// Regression test for #861: the top-1 oracle used in
+/// `f16_kv_tensor_oracle_logit_diff` (via `oracle_top1`) must resolve
+/// exact ties the same way the production greedy sampler does — first
+/// occurrence wins (lowest index). This fixture constructs a logits
+/// vector with an exact tie between the lowest-index and a higher-index
+/// entry so that first-wins and `Iterator::max_by`'s last-wins behavior
+/// disagree on the winner; it goes red if `oracle_top1` regresses to
+/// `max_by`.
+#[test]
+fn top1_oracle_tie_break_matches_first_wins_contract() {
+    // Two entries tie for the maximum: index 1 (first) and index 4 (last).
+    let logits = [0.5_f32, 2.0, 1.0, 0.25, 2.0, -3.0];
+
+    let top1 = oracle_top1(&logits);
+
+    assert_eq!(
+        top1, 1,
+        "tie between indices 1 and 4 must resolve to the FIRST (lowest) \
+             index per the greedy contract; got {top1}. `Iterator::max_by` \
+             would return 4 (last-wins), which is the #861 regression."
+    );
+}
+
+/// Compute log softmax probability for target token (for synthetic NLL).
+fn softmax_log_prob(logits: &[f32], target: usize) -> f32 {
+    let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits.iter().map(|&l| (l - max_l).exp()).sum();
+    let log_sum = sum.ln();
+    (logits[target] - max_l) - log_sum
+}
+
+// -----------------------------------------------------------------------
+// Regression tests for Result-returning mutators (issue #290).
+// Each asserts Err(InferenceError::InvalidInput(_)) on the boundary case.
+// -----------------------------------------------------------------------
+
+#[test]
+fn advance_past_capacity_returns_err() {
+    let config = make_config(1, 2);
+    let mut cache = FlatKVCache::new(config);
+    cache.advance_by(2).unwrap();
+    // Cache is now full; advance must return Err.
+    let r = cache.advance();
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput error, got {r:?}"
+    );
+}
+
+#[test]
+fn advance_by_overflow_returns_err() {
+    let config = make_config(1, 4);
+    let mut cache = FlatKVCache::new(config);
+    // Requesting n that exceeds max_seq_len.
+    let r = cache.advance_by(5);
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput error for over-capacity advance_by, got {r:?}"
+    );
+    // Also verify the usize overflow path: seq_len + usize::MAX overflows.
+    cache.advance_by(2).unwrap();
+    let r2 = cache.advance_by(usize::MAX);
+    assert!(
+        matches!(r2, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput error for usize::MAX advance_by, got {r2:?}"
+    );
+}
+
+#[test]
+fn prefill_layer_over_capacity_returns_err() {
+    let config = make_config(1, 4);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+    // Prefill 3 tokens first.
+    let data = vec![0.0f32; 3 * kv_dim];
+    cache.prefill_layer(0, &data, &data, 3).unwrap();
+    cache.advance_by(3).unwrap();
+    // Now try to prefill 2 more tokens (only 1 slot left).
+    let data2 = vec![0.0f32; 2 * kv_dim];
+    let r = cache.prefill_layer(0, &data2, &data2, 2);
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput error, got {r:?}"
+    );
+}
+
+#[test]
+fn prefill_layer_overflow_returns_err() {
+    // A pathological num_tokens whose `num_tokens * kv_dim` overflows usize must
+    // return Err (not arithmetic-overflow-panic in debug builds) before the
+    // length comparison. Empty slices so we never allocate the absurd length.
+    let config = make_config(1, 4);
+    let mut cache = FlatKVCache::new(config);
+    let r = cache.prefill_layer(0, &[], &[], usize::MAX);
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput error for overflowing num_tokens, got {r:?}"
+    );
+}
+
+#[test]
+fn append_kv_all_layers_wrong_layer_count_returns_err() {
+    let config = make_config(3, 8);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+    let tok = vec![0.0f32; kv_dim];
+    // Pass only 2 layers' worth of data when num_layers == 3.
+    let k_all: Vec<&[f32]> = vec![tok.as_slice(), tok.as_slice()];
+    let v_all: Vec<&[f32]> = vec![tok.as_slice(), tok.as_slice()];
+    let r = cache.append_kv_all_layers(&k_all, &v_all);
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput error, got {r:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Regression tests for #407: try_new() overflow guard + advance()
+// layer-completeness contract.
+//
+// Mutation-sensitivity contract:
+//   - Remove the checked_mul in try_new()  → try_new_overflow_* tests FAIL
+//     (would return Ok, not Err).
+//   - Remove the layers_written check in advance() → advance_requires_all_layers_written
+//     FAILS (advance would return Ok, not Err).
+// -----------------------------------------------------------------------
+
+/// try_new rejects configs whose num_kv_heads * head_dim overflows usize.
+#[test]
+fn try_new_overflow_kv_dim_returns_err() {
+    let config = FlatKVCacheConfig {
+        num_layers: 1,
+        num_kv_heads: usize::MAX,
+        head_dim: 2,
+        max_seq_len: 1,
+    };
+    let r = FlatKVCache::try_new(config);
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput on kv_dim overflow, got {r:?}"
+    );
+}
+
+/// try_new rejects configs whose max_seq_len * kv_dim overflows usize.
+///
+/// This is the exact overflow described in issue #407:
+/// `for_qwen3(1, 8, 128, usize::MAX / kv_dim + 2)` wraps layer_capacity
+/// to 1024 in the infallible `new()`, silently under-allocating the buffer
+/// and causing an out-of-bounds index on a later `append_kv`. `try_new`
+/// must return Err before any allocation.
+#[test]
+fn try_new_overflow_layer_capacity_returns_err() {
+    // kv_dim = 8 * 128 = 1024; max_seq_len chosen so max_seq_len * 1024 overflows usize.
+    let kv_dim: usize = 8 * 128;
+    let overflow_seq = usize::MAX / kv_dim + 2;
+    let config = FlatKVCacheConfig::for_qwen3(1, 8, 128, overflow_seq);
+    let r = FlatKVCache::try_new(config);
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput on layer_capacity overflow, got {r:?}"
+    );
+}
+
+/// try_new rejects configs whose total element count (2 * num_layers * layer_cap)
+/// overflows usize even when individual dimension products do not.
+#[test]
+fn try_new_overflow_total_elements_returns_err() {
+    // Construct a config where kv_dim and layer_cap are each reasonable,
+    // but 2 * num_layers * layer_cap overflows.
+    // layer_cap = 4 * 4 = 16; 2 * (usize::MAX / 32 + 2) * 16 overflows.
+    let n_layers = usize::MAX / 32 + 2;
+    let config = FlatKVCacheConfig {
+        num_layers: n_layers,
+        num_kv_heads: 1,
+        head_dim: 4,
+        max_seq_len: 4,
+    };
+    let r = FlatKVCache::try_new(config);
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput on total-elements overflow, got {r:?}"
+    );
+}
+
+/// try_new succeeds for a valid config and produces a correctly-sized cache.
+///
+/// Confirms the happy path is not broken by the overflow guards.
+#[test]
+fn try_new_valid_config_succeeds() {
+    let config = FlatKVCacheConfig::for_qwen3(2, 4, 8, 16);
+    let cache = FlatKVCache::try_new(config).expect("valid config must succeed");
+    assert_eq!(cache.seq_len(), 0);
+    assert_eq!(cache.num_layers(), 2);
+    assert_eq!(cache.max_seq_len(), 16);
+    assert_eq!(cache.kv_dim(), 4 * 8);
+}
+
+/// advance() returns Err when not all layers have been written at the current position.
+///
+/// Regression for #407 Finding 2: a caller that writes only a subset of layers
+/// before calling advance() silently publishes positions where the remaining
+/// layers contain stale (zero-initialized) data.
+#[test]
+fn advance_requires_all_layers_written() {
+    // Two-layer cache; write only layer 0 then try to advance.
+    let config = FlatKVCacheConfig::for_qwen3(2, 1, 4, 4);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    let k = vec![1.0f32; kv_dim];
+    let v = vec![2.0f32; kv_dim];
+    cache.append_kv(0, &k, &v).unwrap(); // only layer 0
+
+    let r = cache.advance();
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "advance() must Err when layer 1 was not written; got {r:?}"
+    );
+    // seq_len must NOT have advanced.
+    assert_eq!(
+        cache.seq_len(),
+        0,
+        "seq_len must not advance on layer-incomplete step"
+    );
+}
+
+/// advance() succeeds once all layers have been written.
+#[test]
+fn advance_succeeds_when_all_layers_written() {
+    let config = FlatKVCacheConfig::for_qwen3(2, 1, 4, 4);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    let k = vec![1.0f32; kv_dim];
+    let v = vec![2.0f32; kv_dim];
+    cache.append_kv(0, &k, &v).unwrap();
+    cache.append_kv(1, &k, &v).unwrap();
+    cache
+        .advance()
+        .expect("advance must succeed when all layers written");
+    assert_eq!(cache.seq_len(), 1);
+}
+
+/// After a successful advance(), layers_written is reset so the next step
+/// starts clean and requires all layers to be written again.
+#[test]
+fn advance_resets_layer_tracking_between_steps() {
+    let config = FlatKVCacheConfig::for_qwen3(2, 1, 4, 4);
+    let kv_dim = config.kv_dim();
+    let mut cache = FlatKVCache::new(config);
+
+    let k = vec![1.0f32; kv_dim];
+    let v = vec![2.0f32; kv_dim];
+
+    // Step 0: write both layers, advance.
+    cache.append_kv(0, &k, &v).unwrap();
+    cache.append_kv(1, &k, &v).unwrap();
+    cache.advance().unwrap();
+
+    // Step 1: write only layer 0 — advance must still Err.
+    cache.append_kv(0, &k, &v).unwrap();
+    let r = cache.advance();
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "advance must Err on step 1 when layer 1 not written; got {r:?}"
+    );
+}

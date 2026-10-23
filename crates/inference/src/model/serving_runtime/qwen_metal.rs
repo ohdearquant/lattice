@@ -8,13 +8,14 @@ use crate::serve::lora::{
     AdapterControlError, AdapterControlResult, AdapterIndex, ResidencyLimits,
 };
 use crate::serve::lora_registry::ResidencyRegistry;
-use crate::serve::metal_worker::{
-    AdapterCommand, JobRoute, VisionRequestBuild, VisionRuntime, WorkerFailure, WorkerMetadata,
-    build_vision_request, cancelled_output, check_prompt_fits_window, classify_job,
-    render_text_prompt_within_window,
-};
+use crate::serve::metal_worker::{check_prompt_fits_window, render_text_prompt_within_window};
 use crate::serve::route::{DriverEvidence, ServedRoute};
+use crate::serving_provider::providers::qwen::vision::{
+    JobRoute, VisionRequestBuild, VisionRuntime, build_vision_request, classify_job,
+};
 use crate::serving_runtime_contract::RuntimeInput;
+use crate::serving_runtime_contract::{WorkerFailure, WorkerMetadata, cancelled_output};
+use crate::serving_worker::AdapterCommand;
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
@@ -63,7 +64,12 @@ impl ServingRuntime for QwenMetalRuntime {
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure> {
-        let RuntimeInput::ChatMessages { messages, lora } = input else {
+        let RuntimeInput::ChatMessages {
+            messages,
+            lora,
+            explicitly_thinking,
+        } = input
+        else {
             return Err(WorkerFailure::Failed(
                 "prepared text is not supported by the Metal runtime".to_owned(),
             ));
@@ -88,6 +94,7 @@ impl ServingRuntime for QwenMetalRuntime {
                 messages,
                 image_message_index,
                 cfg.enable_thinking,
+                explicitly_thinking,
                 should_cancel,
                 |prompt_len| {
                     check_prompt_fits_window(
@@ -135,6 +142,7 @@ impl ServingRuntime for QwenMetalRuntime {
             meta.context_window_policy,
             meta.model_max_context,
             cfg,
+            explicitly_thinking,
         )
         .map_err(WorkerFailure::Rejected)?;
 

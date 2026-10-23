@@ -183,7 +183,9 @@ else
 fi
 
 target_guard_ln=$(grep -nF "$target_call" "$COMPARE_CALLER" | head -1 | cut -d: -f1)
-compare_build_ln=$(grep -nE '^[[:space:]]*(if[[:space:]]+)?cargo bench[[:space:]]' "$COMPARE_CALLER" | head -1 | cut -d: -f1)
+# The first uncommented line naming `cargo bench` or `--no-run` bounds the first build, including a
+# command array that a later prebuild expands.
+compare_build_ln=$(grep -nE '^[^#]*(cargo bench[[:space:]]|--no-run)' "$COMPARE_CALLER" | head -1 | cut -d: -f1)
 if [ -n "$target_guard_ln" ] && [ -n "$compare_build_ln" ] && [ "$target_guard_ln" -lt "$compare_build_ln" ]; then
   echo "  PASS: target guard precedes bench-compare build (line $target_guard_ln < $compare_build_ln)"; pass=$((pass+1))
 else

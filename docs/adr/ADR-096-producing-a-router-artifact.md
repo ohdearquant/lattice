@@ -266,6 +266,55 @@ The bootstrap of decision 2 does not pass through the learned-candidate quality 
 for structure and provenance and reported untrained. That exemption is written here so that it cannot
 be widened by an implementation that finds an ordinary refit inconvenient.
 
+**Amended 2026-10-15: the admission contract, written out.** "A predeclared held-out metric, a
+base-task regression limit, a minimum evidence population, and an explicit pass rule" names four
+things without defining any of them, and the admission code cannot be written from the names. This
+amendment fixes their form. It fixes no number: the open list below says the numbers come from the
+qualification experiment, so every number here is a registered input with no default in code.
+
+- **Held-out split.** Each judged, on-policy event of the parent's epoch is assigned to training or to
+  held-out by a hash of a registered salt and its completion identity against a registered fraction.
+  Held-out events never enter the round's gradient. The split is reproducible and no caller chooses it.
+- **Held-out metric.** Reward is 1 for helpful and 0 for unhelpful. For each held-out event the
+  parent's logits are recomputed from the recorded context vector and compared with the recorded
+  ones under a registered tolerance, which may be zero; a mismatch rejects, so a difference between
+  the build that served and the build that evaluates cannot pass or reject silently. The candidate's
+  logits `z_c` are computed through the same path that will serve them, and each event is weighted
+  by the ratio of the Gaussian densities of its recorded draw `z'` under the candidate and under the
+  parent, at the recorded scale `s`. The candidate's value `V_c` is the self-normalised weighted mean
+  reward, the parent's value `V_p` is the plain mean reward, and `Delta = V_c - V_p`. The effective
+  sample size is `(sum of weights)^2 / (sum of squared weights)`. The lower bound `LB` is the
+  registered quantile of `Delta` over a registered number of bootstrap replicates with a registered
+  seed; each replicate resamples the held-out events once and computes `V_c` and `V_p` on that same
+  resample, so the bound is on the paired difference. This is off-policy **evaluation** only.
+  Training stays on-policy as decision 3 says, and the open question below about training a newer
+  gate on late events is not decided here. The Gaussian has full support, so every weight is finite;
+  a candidate that moved far from the parent relative to `s` loses effective sample size and is
+  rejected for insufficient evidence, which is intended.
+- **Base-task regression.** An operator supplies a reference set of prompts and completions; its
+  content hash is recorded. The metric is the mean per-token negative log-likelihood of the reference
+  completions, teacher-forced, under the candidate's applied mixture (deterministic, floor applied, no
+  draw) minus the same under the parent's, and it must not exceed a registered limit `L`. The base
+  model's value is computed and recorded but not gated: the serving question is whether the candidate
+  is worse than what serves now. It runs inside the refit's bounded task, never on the request path.
+- **Minimum evidence.** The held-out count, the effective sample size and the reference token count
+  each have a registered floor. Any one short of its floor rejects as insufficient evidence, naming
+  which.
+- **Pass rule.** A candidate is admitted only if every floor holds, the provenance check passes,
+  `LB > 0`, the regression is within `L`, and the entropy guard passes. Every other case rejects.
+  There is no inconclusive pass and no fallback to the parent's judgement.
+- **Admission record.** The record whose identity enters the hashed contract carries the contract's
+  own hash, every registered value, the computed counts, values, bound and regression, the base
+  model's value, and the verdict with its reason.
+- **No defaults.** The contract type has no default and no constructor that fills a number. An absent
+  or unreadable contract rejects, because insufficient evidence is a rejection.
+
+Rejected for the metric: serving the candidate to a share of traffic and comparing on-policy, which
+activates a candidate before admission; unnormalised importance weighting, whose variance is
+unbounded as the candidate moves; scoring the round's own training events, which is the replay
+accuracy refused above; and measuring regression as a shift in weights on probe contexts, which is
+not a quality measure.
+
 ### 6. The gate's output is per-adapter weights, and the contract it must satisfy already exists
 
 This decision serves a product instruction given on 2026-09-16: load LoRA adapters at

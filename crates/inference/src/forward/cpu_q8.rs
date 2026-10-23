@@ -23,7 +23,7 @@ use crate::rope::RopeTable;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::weights::q8_weights::{
     Q8AttentionWeights, Q8CommonLayerWeights, Q8FullAttentionLayerWeights, Q8GatedDeltaNetWeights,
-    Q8ModelWeights, matmul_bt_q8,
+    Q8MatmulScratch, Q8ModelWeights, matmul_bt_q8_with_scratch,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,6 +74,26 @@ pub fn gated_delta_net_step_fused_q8(
     scratch: &mut GatedDeltaNetFusedScratch,
     output: &mut [f32],
 ) {
+    gated_delta_net_step_fused_q8_with_scratch(
+        input,
+        state,
+        weights,
+        cfg,
+        scratch,
+        output,
+        &mut Q8MatmulScratch::default(),
+    );
+}
+
+fn gated_delta_net_step_fused_q8_with_scratch(
+    input: &[f32],
+    state: &mut GatedDeltaNetState,
+    weights: &Q8GatedDeltaNetWeights,
+    cfg: &Qwen35Config,
+    scratch: &mut GatedDeltaNetFusedScratch,
+    output: &mut [f32],
+    q8_scratch: &mut Q8MatmulScratch,
+) {
     let hidden = cfg.hidden_size;
     let num_heads = cfg.linear_num_key_heads;
     let value_heads = cfg.linear_num_value_heads();
@@ -95,40 +115,44 @@ pub fn gated_delta_net_step_fused_q8(
     scratch.ensure_capacity(qkv_dim, output_dim, value_heads, key_dim, value_dim);
 
     // 1. Projections (Q8 weights)
-    matmul_bt_q8(
+    matmul_bt_q8_with_scratch(
         input,
         &weights.in_proj_qkv,
         &mut scratch.qkv_proj[..qkv_dim],
         1,
         hidden,
         qkv_dim,
+        q8_scratch,
     );
 
-    matmul_bt_q8(
+    matmul_bt_q8_with_scratch(
         input,
         &weights.in_proj_z,
         &mut scratch.z_proj[..output_dim],
         1,
         hidden,
         output_dim,
+        q8_scratch,
     );
 
-    matmul_bt_q8(
+    matmul_bt_q8_with_scratch(
         input,
         &weights.in_proj_b,
         &mut scratch.beta_proj[..value_heads],
         1,
         hidden,
         value_heads,
+        q8_scratch,
     );
 
-    matmul_bt_q8(
+    matmul_bt_q8_with_scratch(
         input,
         &weights.in_proj_a,
         &mut scratch.alpha_proj[..value_heads],
         1,
         hidden,
         value_heads,
+        q8_scratch,
     );
 
     // sigmoid(beta)
@@ -232,13 +256,14 @@ pub fn gated_delta_net_step_fused_q8(
     }
 
     // Output projection (Q8 weights)
-    matmul_bt_q8(
+    matmul_bt_q8_with_scratch(
         &scratch.gated_norm_buf[..output_dim],
         &weights.out_proj,
         &mut output[..hidden],
         1,
         output_dim,
         hidden,
+        q8_scratch,
     );
 }
 
@@ -250,6 +275,7 @@ pub fn gated_delta_net_step_fused_q8(
 ///
 /// Input is read from `scratch.attn_out[..hidden]`, output written back to
 /// `scratch.attn_out[..hidden]`.
+#[cfg(test)]
 fn full_attention_step_q8(
     weights: &Q8FullAttentionLayerWeights,
     cache_idx: usize,
@@ -259,6 +285,30 @@ fn full_attention_step_q8(
     cfg: &Qwen35Config,
     rope: &RopeTable,
     hidden: usize,
+) {
+    full_attention_step_q8_with_scratch(
+        weights,
+        cache_idx,
+        position,
+        kv_cache,
+        scratch,
+        cfg,
+        rope,
+        hidden,
+        &mut Q8MatmulScratch::default(),
+    );
+}
+
+fn full_attention_step_q8_with_scratch(
+    weights: &Q8FullAttentionLayerWeights,
+    cache_idx: usize,
+    position: usize,
+    kv_cache: &mut KvCache,
+    scratch: &mut ForwardScratch,
+    cfg: &Qwen35Config,
+    rope: &RopeTable,
+    hidden: usize,
+    q8_scratch: &mut Q8MatmulScratch,
 ) {
     // Read input from attn_out (where caller placed it). Scoped destructure so
     // the `attn_out` read and `input_tmp` write borrow disjoint fields instead
@@ -288,13 +338,14 @@ fn full_attention_step_q8(
             q_and_gate,
             ..
         } = scratch;
-        matmul_bt_q8(
+        matmul_bt_q8_with_scratch(
             &input_tmp[..hidden],
             &weights.q_proj,
             &mut q_and_gate[..q_proj_dim],
             1,
             hidden,
             q_proj_dim,
+            q8_scratch,
         );
     }
     // Scatter per-head: each head has [Q_h, gate_h] of size head_dim*2. The
@@ -304,26 +355,28 @@ fn full_attention_step_q8(
         let ForwardScratch {
             input_tmp, k_buf, ..
         } = scratch;
-        matmul_bt_q8(
+        matmul_bt_q8_with_scratch(
             &input_tmp[..hidden],
             &weights.k_proj,
             &mut k_buf[..kv_dim],
             1,
             hidden,
             kv_dim,
+            q8_scratch,
         );
     }
     {
         let ForwardScratch {
             input_tmp, v_buf, ..
         } = scratch;
-        matmul_bt_q8(
+        matmul_bt_q8_with_scratch(
             &input_tmp[..hidden],
             &weights.v_proj,
             &mut v_buf[..kv_dim],
             1,
             hidden,
             kv_dim,
+            q8_scratch,
         );
     }
 
@@ -453,13 +506,14 @@ fn full_attention_step_q8(
     }
 
     // Output projection: context [1, q_dim] @ o_proj^T [hidden, q_dim] (Q8 weights)
-    matmul_bt_q8(
+    matmul_bt_q8_with_scratch(
         &scratch.context[..q_dim],
         &weights.o_proj,
         &mut scratch.attn_out[..hidden],
         1,
         q_dim,
         hidden,
+        q8_scratch,
     );
 }
 
@@ -477,6 +531,7 @@ fn ffn_step_q8(
     scratch: &mut ForwardScratch,
     cfg: &Qwen35Config,
     hidden: usize,
+    q8_scratch: &mut Q8MatmulScratch,
 ) {
     let inter = cfg.intermediate_size;
 
@@ -498,26 +553,28 @@ fn ffn_step_q8(
             gate_buf,
             ..
         } = scratch;
-        matmul_bt_q8(
+        matmul_bt_q8_with_scratch(
             &input_tmp[..hidden],
             &common.gate_proj,
             &mut gate_buf[..inter],
             1,
             hidden,
             inter,
+            q8_scratch,
         );
     }
     {
         let ForwardScratch {
             input_tmp, up_buf, ..
         } = scratch;
-        matmul_bt_q8(
+        matmul_bt_q8_with_scratch(
             &input_tmp[..hidden],
             &common.up_proj,
             &mut up_buf[..inter],
             1,
             hidden,
             inter,
+            q8_scratch,
         );
     }
 
@@ -526,13 +583,14 @@ fn ffn_step_q8(
     elementwise_mul(&mut scratch.gate_buf[..inter], &scratch.up_buf[..inter]);
 
     // down_proj (Q8 weights)
-    matmul_bt_q8(
+    matmul_bt_q8_with_scratch(
         &scratch.gate_buf[..inter],
         &common.down_proj,
         &mut scratch.ffn_out[..hidden],
         1,
         inter,
         hidden,
+        q8_scratch,
     );
 }
 
@@ -547,6 +605,7 @@ fn ffn_step_q8(
 /// The embedding table remains f32 because it is tied to the LM head.
 ///
 /// Writes logits into `scratch.logits`.
+#[cfg(test)]
 pub(crate) fn forward_step_q8(
     weights: &Q8ModelWeights,
     cfg: &Qwen35Config,
@@ -556,6 +615,30 @@ pub(crate) fn forward_step_q8(
     gdn_states: &mut [GatedDeltaNetState],
     kv_cache: &mut KvCache,
     scratch: &mut ForwardScratch,
+) {
+    forward_step_q8_with_scratch(
+        weights,
+        cfg,
+        rope,
+        token_id,
+        position,
+        gdn_states,
+        kv_cache,
+        scratch,
+        &mut Q8MatmulScratch::default(),
+    );
+}
+
+pub(crate) fn forward_step_q8_with_scratch(
+    weights: &Q8ModelWeights,
+    cfg: &Qwen35Config,
+    rope: &RopeTable,
+    token_id: u32,
+    position: usize,
+    gdn_states: &mut [GatedDeltaNetState],
+    kv_cache: &mut KvCache,
+    scratch: &mut ForwardScratch,
+    q8_scratch: &mut Q8MatmulScratch,
 ) {
     let hidden = cfg.hidden_size;
 
@@ -586,20 +669,21 @@ pub(crate) fn forward_step_q8(
         // Attention
         match attn_weights {
             Q8AttentionWeights::Linear(gdn_w) => {
-                gated_delta_net_step_fused_q8(
+                gated_delta_net_step_fused_q8_with_scratch(
                     &scratch.hidden[..hidden],
                     &mut gdn_states[linear_idx],
                     gdn_w,
                     cfg,
                     &mut scratch.gdn_scratch,
                     &mut scratch.attn_out[..hidden],
+                    q8_scratch,
                 );
                 linear_idx += 1;
             }
             Q8AttentionWeights::Full(full_w) => {
                 // Copy hidden to attn_out as temp input to avoid borrow conflict
                 scratch.attn_out[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
-                full_attention_step_q8(
+                full_attention_step_q8_with_scratch(
                     full_w,
                     cache_idx_of(full_idx),
                     position,
@@ -608,6 +692,7 @@ pub(crate) fn forward_step_q8(
                     cfg,
                     rope,
                     hidden,
+                    q8_scratch,
                 );
                 full_idx += 1;
             }
@@ -631,7 +716,7 @@ pub(crate) fn forward_step_q8(
 
         // SwiGLU FFN: copy hidden into ffn_out as temp input to avoid borrow conflict
         scratch.ffn_out[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
-        ffn_step_q8(common, scratch, cfg, hidden);
+        ffn_step_q8(common, scratch, cfg, hidden, q8_scratch);
 
         // Residual connection
         for i in 0..hidden {
@@ -677,7 +762,7 @@ fn cache_idx_of(full_idx: usize) -> usize {
 /// Generate text from a prompt using Q8 weight matrices.
 ///
 /// Equivalent to `Qwen35Model::generate` but runs the shared decoder driver over a
-/// standalone CPU session whose forward step is `forward_step_q8`. The tokenizer,
+/// standalone CPU session whose forward step is `forward_step_q8_with_scratch`. The tokenizer,
 /// RoPE table, and generate config are passed explicitly since we operate as
 /// standalone functions rather than methods on the model struct.
 pub fn generate_q8(
@@ -704,9 +789,30 @@ pub fn generate_q8(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "cpu_q8_scratch_bench.rs"]
+mod scratch_bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::decoder::standalone_cpu::parity;
+    use crate::weights::q8_weights::matmul_bt_q8;
+
+    #[test]
+    fn q8_request_scratch_survives_poisoned_prefill_and_decode() {
+        let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
+        crate::decoder::standalone_cpu::q8_scratch_checks::assert_q8_session_scratch_reuse(
+            &weights, &cfg, &rope,
+        );
+    }
+
+    #[test]
+    fn q8_request_scratch_prepares_every_projection_width() {
+        let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
+        crate::decoder::standalone_cpu::q8_scratch_checks::assert_q8_projection_widths(
+            &weights, &cfg, &rope,
+        );
+    }
 
     /// Regression test for #392: cpu Q8 RoPE must use stride-half pairing (i, half+i), not
     /// interleaved (2i, 2i+1).
@@ -1305,7 +1411,7 @@ mod tests {
     //     forward::cpu_q8::tests::print_q8_generate_goldens -- --ignored --nocapture
     // and copy the printed `token_ids`/`stop_reason`/`stopped`/`text` lines into
     // the four `#[test]` functions below.
-    fn make_nonzero_q8_generate_fixture() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
+    pub(super) fn make_nonzero_q8_generate_fixture() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
         use crate::model::qwen35_config::LayerType;
         use crate::weights::q8_weights::quantize_matrix;
 
@@ -1506,7 +1612,7 @@ mod tests {
     /// already rely on; the golden prompt `"world"` encodes to five of them. Ids 8..128 get
     /// distinct two-character printable tokens so every id the decode loop can
     /// produce has real text instead of falling through to an empty string.
-    fn nonzero_fixture_tokenizer_q8() -> BpeTokenizer {
+    pub(super) fn nonzero_fixture_tokenizer_q8() -> BpeTokenizer {
         use std::collections::HashMap;
         let mut vocab_map: HashMap<String, u32> = HashMap::new();
         for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {

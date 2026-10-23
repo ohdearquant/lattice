@@ -653,6 +653,26 @@ Keep shader assembly bytes and compile options fixed. The production shader sour
 external; changing translation units, compiler concurrency or library routing is a separate measured
 build/behavior change, not source-file housekeeping.
 
+#### Amendment, 2026-10-16: a pure test move may land before R13
+
+A change that only moves test code out of `metal_qwen35.rs` may land before R13 and before the derived-population
+checker exists, when all of the following hold and its pull request shows each one:
+
+1. Every byte outside the items gated on `cfg(test)` is identical to the base. The production code each source
+   guard reads is then unchanged, which is the risk this decision's population rule protects against.
+2. The test-name inventory is identical under a path map: `cargo test -p lattice-inference --lib -- --list` at the
+   base and at the head, under every feature set the moved tests compile in, with the unmapped lists differing as a
+   control.
+3. Each self-source probe in the rollout ledger's migration manifest carries a before/after population or an
+   explicit no-impact disposition: the source region it reads, compared at the base and the head.
+4. Under 1 to 3, several test families may move in one change. Otherwise R16's rule stands: one family per change,
+   starting with `rms_reduce_854_parity`.
+
+The derived-population checker still gates every move of production code (R14, R17 and any later production
+extraction), and the documentation rule above applies unchanged. The first change under this amendment moves 21
+inline test sections of `inner::tests` into child modules under `forward/metal_qwen35/inner/tests/` and leaves
+`rms_reduce_854_parity` in the parent.
+
 ### D10. The serving surface stops naming concrete model types
 
 Added at sign-off, 2026-09-15. The rest of this ADR proves the shared route by EXECUTION: R13

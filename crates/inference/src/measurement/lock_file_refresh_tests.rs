@@ -1,8 +1,8 @@
 use super::*;
-use std::fs::Metadata;
+use std::fs::{FileTimes, Metadata};
 use std::os::unix::net::UnixListener;
 use std::process::{Child, Command, Stdio};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const OLD_AGE: Duration = Duration::from_secs(4 * 24 * 60 * 60);
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);

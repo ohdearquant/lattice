@@ -7,9 +7,14 @@ Run with: python3 tests/test_bench_decode_adapters_context_scaling.py -v
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
+import io
+import json
+import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +37,7 @@ def _load_module(name: str, filename: str):
 
 harness = _load_module("bench_decode_harness", "bench_decode_harness.py")
 adapters = _load_module("bench_decode_adapters_context_scaling", "bench_decode_adapters_context_scaling.py")
+chart = adapters.chart
 
 DEFAULT_PROFILES_FILE = _SCRIPTS / "bench_decode_profiles.toml"
 
@@ -171,7 +177,7 @@ class LegacyTsvRenderingTest(unittest.TestCase):
         )
         slopes, medians = adapters.compute_context_scaling_aggregate(result)
         tsv = adapters.render_legacy_tsv(result, slopes, medians)
-        lines = tsv.strip("\n").split("\n")
+        lines = [line for line in tsv.strip("\n").split("\n") if not line.startswith("#")]
         self.assertEqual(lines[0], "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope")
         self.assertEqual(len(lines), 1 + len(slopes))
         for line in lines[1:]:
@@ -323,7 +329,7 @@ class ContextScalingEvenRunsLegacyMedianTest(unittest.TestCase):
         self.assertAlmostEqual(mlx_slope.slope_tok_per_s, 56 / 0.36, places=6)
 
         tsv = adapters.render_legacy_tsv(result, slopes, medians)
-        for line in tsv.strip("\n").split("\n")[1:]:
+        for line in [line for line in tsv.strip("\n").split("\n") if not line.startswith("#")][1:]:
             engine, _ctx, _slope, t1_ms, t2_ms, _runs, _scope = line.split("\t")
             if engine == "lattice":
                 self.assertAlmostEqual(float(t1_ms), 30.0, places=3)
@@ -362,12 +368,211 @@ class ContextScalingSkewedFiveSampleTsvTest(unittest.TestCase):
         )
         slopes, medians = adapters.compute_context_scaling_aggregate(result)
         tsv = adapters.render_legacy_tsv(result, slopes, medians)
-        line = tsv.strip("\n").split("\n")[1]
+        line = [line for line in tsv.strip("\n").split("\n") if not line.startswith("#")][1]
         _engine, _ctx, _slope, t1_ms, t2_ms, _runs, _scope = line.split("\t")
         self.assertAlmostEqual(float(t1_ms), 20.0, places=3)
         self.assertAlmostEqual(float(t2_ms), 205.0, places=3)
         self.assertNotAlmostEqual(float(t1_ms), 40.0, places=1)
         self.assertNotAlmostEqual(float(t2_ms), 322.0, places=1)
+
+
+def _base_numeric_tsv(run_result, slopes, window_medians):
+    """Frozen render_legacy_tsv body from d94daf81530b42cac7871166aaa1c8859b4d7c6d."""
+    lines = ["engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope"]
+    baseline_window = run_result.profile.windows[0]
+    for s in slopes:
+        t1_ms = window_medians[(s.engine, baseline_window)] * 1000
+        t2_ms = window_medians[(s.engine, s.window)] * 1000
+        scope = harness.OLLAMA_SCOPE if s.engine == "ollama" else ""
+        lines.append(
+            f"{s.engine}\t{s.window}\t{s.slope_tok_per_s:.1f}\t{t1_ms:.3f}\t{t2_ms:.3f}\t{s.window_n}\t{scope}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+class ProvenanceRenderingTest(unittest.TestCase):
+    def setUp(self):
+        _, profiles = harness.load_profiles_file(DEFAULT_PROFILES_FILE)
+        self.result = harness.run_profile(
+            profiles["context_scaling"],
+            {"lattice": _FakeAdapter(), "ollama": _FakeAdapter(), "mlx": _FakeAdapter()},
+            clock=_FakeClock(),
+            git_sha_value="a" * 40,
+            hardware_id_value="Linux-x86_64-recorded-host",
+            timestamp_fn=lambda: "2001-02-03T04:05:06+00:00",
+        )
+        self.slopes, self.medians = adapters.compute_context_scaling_aggregate(self.result)
+
+    def render(self, result=None):
+        return adapters.render_legacy_tsv(self.result if result is None else result, self.slopes, self.medians)
+
+    def test_numeric_output_matches_frozen_base_formatter_byte_for_byte(self):
+        rendered = self.render()
+        numeric = "".join(line for line in rendered.splitlines(keepends=True) if not line.startswith("#"))
+        baseline = _base_numeric_tsv(self.result, self.slopes, self.medians)
+        self.assertEqual(numeric.encode(), baseline.encode())
+        self.assertEqual(rendered.splitlines()[0], baseline.splitlines()[0])
+        self.assertEqual(len(numeric.splitlines()), 1 + len(self.slopes))
+        self.assertTrue(all(len(line.split("\t")) == 7 for line in numeric.splitlines()))
+
+    def test_metadata_records_original_measurement_timestamp(self):
+        _, provenance = chart.parse_tsv(self.render())
+        self.assertEqual(provenance["schema_version"], 1)
+        self.assertEqual(provenance["observation_schema_versions"], [harness.SCHEMA_VERSION])
+        self.assertEqual(provenance["harness"], "bench_decode_harness.py")
+        self.assertEqual(provenance["git_shas"], ["a" * 40])
+        self.assertEqual(provenance["hardware_ids"], ["Linux-x86_64-recorded-host"])
+        self.assertEqual(provenance["observation_timestamps"], ["2001-02-03T04:05:06+00:00"])
+
+    def test_all_distinct_recorded_identities_and_timestamps_are_retained(self):
+        observations = list(self.result.observations)
+        observations[-1] = dataclasses.replace(
+            observations[-1], git_sha="b" * 40, hardware_id="Darwin-arm64-other-host",
+            timestamp="2001-02-04T04:05:06+00:00",
+        )
+        mixed = dataclasses.replace(self.result, observations=tuple(observations))
+        _, provenance = chart.parse_tsv(self.render(mixed))
+        self.assertEqual(provenance["git_shas"], ["a" * 40, "b" * 40])
+        self.assertEqual(provenance["hardware_ids"], ["Darwin-arm64-other-host", "Linux-x86_64-recorded-host"])
+        self.assertEqual(provenance["observation_timestamps"], [
+            "2001-02-03T04:05:06+00:00", "2001-02-04T04:05:06+00:00",
+        ])
+
+    def test_metadata_escapes_control_characters_and_round_trips(self):
+        hardware = 'host\twith\n"quotes" and $math$'
+        observations = tuple(dataclasses.replace(obs, hardware_id=hardware) for obs in self.result.observations)
+        rendered = self.render(dataclasses.replace(self.result, observations=observations))
+        comments = [line for line in rendered.splitlines() if line.startswith("#")]
+        self.assertEqual(len(comments), 1)
+        self.assertNotIn("\t", comments[0])
+        self.assertIn("\\t", comments[0])
+        self.assertIn("\\n", comments[0])
+        _, provenance = chart.parse_tsv(rendered)
+        self.assertEqual(provenance["hardware_ids"], [hardware])
+
+    def test_new_reports_refuse_missing_or_invalid_recorded_provenance(self):
+        with self.assertRaises(ValueError):
+            self.render(dataclasses.replace(self.result, observations=()))
+        for field, value in (("timestamp", ""), ("timestamp", "not-a-date"),
+                             ("timestamp", "2001-02-03T04:05:06"), ("hardware_id", ""), ("git_sha", "")):
+            with self.subTest(field=field, value=value):
+                observations = tuple(dataclasses.replace(obs, **{field: value}) for obs in self.result.observations)
+                with self.assertRaises(ValueError):
+                    self.render(dataclasses.replace(self.result, observations=observations))
+
+
+class ChartProvenanceTest(unittest.TestCase):
+    HEADER = "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope\n"
+    ROW = "lattice\t64\t123.4\t1.000\t2.000\t5\t\n"
+
+    def setUp(self):
+        self.metadata = {
+            "schema_version": 1,
+            "harness": "bench_decode_harness.py",
+            "observation_schema_versions": [1],
+            "git_shas": ["a" * 40, "b" * 40],
+            "hardware_ids": ["Linux-x86_64-recorded-host", "host\twith\n$math$"],
+            "observation_timestamps": ["2001-02-03T04:05:06+00:00", "2001-02-04T04:05:06+00:00"],
+        }
+
+    def tsv(self, comments):
+        return self.HEADER + "\n".join(comments) + "\n" + self.ROW
+
+    def test_saved_metadata_is_used_by_chart_only(self):
+        text = self.tsv([chart.provenance_comment(self.metadata)])
+        with tempfile.TemporaryDirectory() as tmp:
+            source, output = Path(tmp) / "old.tsv", Path(tmp) / "chart.png"
+            source.write_text(text)
+            with mock.patch.object(chart, "render_chart") as render:
+                self.assertEqual(chart.main([str(source), str(output)]), 0)
+            render.assert_called_once_with({"lattice": {64: 123.4}}, self.metadata, output)
+
+    def test_legacy_six_column_and_historical_comment_files_remain_readable(self):
+        legacy = "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\n"
+        legacy += "# PROVENANCE (2026-07-20): historical freeform prose\n"
+        legacy += "# comment\twith\ttabs\n"
+        legacy += "lattice\t64\t123.4\t1.000\t2.000\t5\n"
+        engines, provenance = chart.parse_tsv(legacy)
+        self.assertEqual(engines, {"lattice": {64: 123.4}})
+        self.assertIsNone(provenance)
+        self.assertIn("timestamps, hardware and harness revision are unknown", chart.provenance_caption(provenance))
+        committed = (_REPO_ROOT / "docs/bench_results/context_scaling.tsv").read_text()
+        engines, provenance = chart.parse_tsv(committed)
+        self.assertEqual(set(engines), {"lattice", "ollama", "mlx"})
+        self.assertIsNone(provenance)
+
+    def test_malformed_or_unsupported_metadata_is_not_legacy_unknown(self):
+        invalid = [
+            {}, [], {**self.metadata, "schema_version": 2}, {**self.metadata, "schema_version": True},
+            {**self.metadata, "extra": "field"}, {**self.metadata, "harness": "other.py"},
+            {**self.metadata, "hardware_ids": []}, {**self.metadata, "hardware_ids": ["same", "same"]},
+            {**self.metadata, "git_shas": [""]}, {**self.metadata, "git_shas": "a" * 40},
+            {**self.metadata, "observation_schema_versions": [True]},
+            {**self.metadata, "observation_timestamps": ["bad"]},
+        ]
+        for value in invalid:
+            with self.subTest(value=value):
+                text = self.tsv([chart.PROVENANCE_PREFIX + json.dumps(value)])
+                with self.assertRaises(ValueError):
+                    chart.parse_tsv(text)
+        for comment in (chart.PROVENANCE_PREFIX + "{", chart.PROVENANCE_TAG + " missing colon"):
+            with self.subTest(comment=comment), self.assertRaises(ValueError):
+                chart.parse_tsv(self.tsv([comment]))
+
+    def test_duplicate_and_conflicting_metadata_records_and_fields_are_rejected(self):
+        first = chart.provenance_comment(self.metadata)
+        second = chart.provenance_comment({**self.metadata, "hardware_ids": ["different"]})
+        for other in (first, second):
+            with self.subTest(other=other), self.assertRaises(ValueError):
+                chart.parse_tsv(self.tsv([first, other]))
+        duplicate_key = json.dumps(self.metadata).replace('"schema_version": 1', '"schema_version": 1, "schema_version": 1')
+        with self.assertRaisesRegex(ValueError, "duplicate provenance field"):
+            chart.parse_tsv(self.tsv([chart.PROVENANCE_PREFIX + duplicate_key]))
+
+    def test_bad_metadata_exits_nonzero_before_rendering_or_writing_chart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, output = Path(tmp) / "bad.tsv", Path(tmp) / "chart.png"
+            source.write_text(self.tsv([chart.PROVENANCE_PREFIX + "{}"]))
+            with mock.patch.object(chart, "render_chart") as render:
+                self.assertEqual(chart.main([str(source), str(output)]), 1)
+            render.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_caption_timestamp_range_uses_instants_and_retains_original_offset_text(self):
+        metadata = {**self.metadata, "observation_timestamps": [
+            "2000-12-31T23:30:00+00:00", "2001-01-01T01:00:00+02:00",
+        ]}
+        caption = chart.provenance_caption(metadata)
+        self.assertIn("2001-01-01T01:00:00+02:00 to 2000-12-31T23:30:00+00:00", caption)
+
+    def test_actual_chart_attaches_literal_recorded_or_unknown_caption(self):
+        for provenance in (self.metadata, None):
+            with self.subTest(provenance=provenance):
+                plt, fig, ax = mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
+                plt.subplots.return_value = (fig, ax)
+                ax.bar.return_value = []
+                mpl, numpy = types.ModuleType("matplotlib"), types.ModuleType("numpy")
+                mpl.pyplot = plt
+                numpy.arange = mock.Mock(return_value=mock.MagicMock())
+                with mock.patch.dict(sys.modules, {"matplotlib": mpl, "matplotlib.pyplot": plt, "numpy": numpy}):
+                    chart.render_chart({"lattice": {64: 123.4}}, provenance, Path("chart.png"))
+                title = ax.set_title.call_args.args[0]
+                self.assertNotIn("Apple M2 Max", title)
+                fig.text.assert_called_once()
+                caption = fig.text.call_args.args[2]
+                self.assertFalse(fig.text.call_args.kwargs["parse_math"])
+                self.assertFalse(fig.text.call_args.kwargs["usetex"])
+                if provenance is None:
+                    self.assertIn("timestamps, hardware and harness revision are unknown", caption)
+                    self.assertNotIn("Apple M2 Max", caption)
+                else:
+                    for identity in provenance["hardware_ids"] + provenance["git_shas"]:
+                        self.assertIn(json.dumps(identity, ensure_ascii=True), caption)
+                    for timestamp in provenance["observation_timestamps"]:
+                        self.assertIn(timestamp, caption)
+                    self.assertIn("bench_decode_harness.py", caption)
+                    self.assertNotIn("host\twith\n", caption)
+                plt.savefig.assert_called_once_with(Path("chart.png"), dpi=150, bbox_inches="tight")
 
 
 class OllamaResponseParsingTest(unittest.TestCase):
@@ -376,11 +581,111 @@ class OllamaResponseParsingTest(unittest.TestCase):
             {"eval_count": 64, "eval_duration": 500_000_000, "total_duration": 800_000_000}
         )
         self.assertEqual(result.actual_completion_tokens, 64)
-        self.assertEqual(result.native_ns, 800_000_000)
+        self.assertEqual(result.native_ns, 500_000_000)
 
     def test_error_body_raises(self):
         with self.assertRaises(adapters.OllamaResponseError):
             adapters.ollama_response_to_result({"error": "boom"})
+
+    def test_required_fields_keep_type_presence_and_range_validation(self):
+        valid = {"eval_count": 64, "eval_duration": 500_000_000, "total_duration": 800_000_000}
+        for field in valid:
+            with self.subTest(field=field, missing=True):
+                data = {name: value for name, value in valid.items() if name != field}
+                with self.assertRaisesRegex(adapters.OllamaResponseError, field):
+                    adapters.ollama_response_to_result(data)
+            for invalid in (True, False, 1.5, "1", None, -1):
+                with self.subTest(field=field, value=invalid):
+                    with self.assertRaisesRegex(adapters.OllamaResponseError, field):
+                        adapters.ollama_response_to_result({**valid, field: invalid})
+        with self.assertRaisesRegex(adapters.OllamaResponseError, "total_duration.*positive"):
+            adapters.ollama_response_to_result({**valid, "total_duration": 0})
+        result = adapters.ollama_response_to_result({**valid, "eval_count": 0})
+        self.assertEqual(result.actual_completion_tokens, 0)
+
+    def test_zero_eval_duration_is_rejected(self):
+        with self.assertRaisesRegex(adapters.OllamaResponseError, "eval_duration.*positive"):
+            adapters.ollama_response_to_result(
+                {"eval_count": 64, "eval_duration": 0, "total_duration": 800_000_000}
+            )
+
+
+class OllamaContextScalingDurationTest(unittest.TestCase):
+    def _run_profile(self, load_durations, prompt_durations):
+        _, profiles = harness.load_profiles_file(DEFAULT_PROFILES_FILE)
+        profile = dataclasses.replace(profiles["context_scaling"], measured_repeats=1)
+        calls = []
+
+        def respond(request, *, timeout):
+            self.assertEqual(request.full_url, "http://127.0.0.1:11434/api/generate")
+            self.assertEqual(request.get_method(), "POST")
+            self.assertEqual(timeout, 600)
+            payload = json.loads(request.data)
+            calls.append(payload)
+            index = len(calls) - 1
+            tokens = payload["options"]["num_predict"]
+            decode_duration = tokens * 15_625_000
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = json.dumps({
+                "eval_count": tokens,
+                "eval_duration": decode_duration,
+                "total_duration": decode_duration + load_durations[index] + prompt_durations[index],
+                "load_duration": load_durations[index],
+                "prompt_eval_duration": prompt_durations[index],
+            }).encode("utf-8")
+            return response
+
+        with mock.patch.object(adapters.urllib.request, "urlopen", side_effect=respond) as urlopen:
+            result = harness.run_profile(
+                profile,
+                {"ollama": adapters.OllamaAdapter("http://127.0.0.1:11434")},
+                allow_missing_engine=True,
+                clock=_FakeClock(),
+                git_sha_value="fixture-revision",
+                hardware_id_value="fixture-host",
+                timestamp_fn=lambda: "2001-02-03T04:05:06+00:00",
+            )
+        self.assertEqual(urlopen.call_count, 4)
+        self.assertEqual(calls, [{
+            "model": "qwen3.5:0.8b", "prompt": profile.prompt, "stream": False,
+            "options": {"num_predict": tokens, "temperature": 0, "seed": 42},
+        } for tokens in (8, 64, 128, 256)])
+        self.assertEqual([obs.engine_native_ns for obs in result.observations], [125_000_000, 1_000_000_000, 2_000_000_000, 4_000_000_000])
+        slopes, medians = adapters.compute_context_scaling_aggregate(result)
+        return result, slopes, medians, adapters.render_legacy_tsv(result, slopes, medians)
+
+    def test_cold_single_repeat_uses_decode_duration_through_tsv(self):
+        result, slopes, medians, tsv = self._run_profile(
+            [10_000_000_000, 0, 0, 0], [7_000_000_000, 1_000_000_000, 2_000_000_000, 3_000_000_000],
+        )
+        self.assertEqual([obs.requested_completion_tokens for obs in result.observations], [8, 64, 128, 256])
+        self.assertEqual([obs.actual_completion_tokens for obs in result.observations], [8, 64, 128, 256])
+        self.assertEqual([obs.warmup for obs in result.observations], [False] * 4)
+        self.assertEqual([obs.run_index for obs in result.observations], [1] * 4)
+        self.assertEqual(medians, {("ollama", 8): 0.125, ("ollama", 64): 1.0, ("ollama", 128): 2.0, ("ollama", 256): 4.0})
+        self.assertEqual([(s.baseline_window, s.window, s.slope_tok_per_s, s.baseline_n, s.window_n) for s in slopes],
+                         [(8, 64, 64.0, 1, 1), (8, 128, 64.0, 1, 1), (8, 256, 64.0, 1, 1)])
+        _, provenance = chart.parse_tsv(tsv)
+        self.assertEqual(provenance["git_shas"], ["fixture-revision"])
+        self.assertEqual(provenance["hardware_ids"], ["fixture-host"])
+        self.assertEqual(provenance["observation_timestamps"], ["2001-02-03T04:05:06+00:00"])
+        numeric = "".join(line for line in tsv.splitlines(keepends=True) if not line.startswith("#"))
+        self.assertEqual(numeric, "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope\n"
+                         f"ollama\t64\t64.0\t125.000\t1000.000\t1\t{harness.OLLAMA_SCOPE}\n"
+                         f"ollama\t128\t64.0\t125.000\t2000.000\t1\t{harness.OLLAMA_SCOPE}\n"
+                         f"ollama\t256\t64.0\t125.000\t4000.000\t1\t{harness.OLLAMA_SCOPE}\n")
+
+    def test_decode_tsv_is_invariant_to_load_and_prompt_overhead(self):
+        _, first_slopes, first_medians, first_tsv = self._run_profile(
+            [10_000_000_000, 0, 0, 0], [7_000_000_000, 1_000_000_000, 2_000_000_000, 3_000_000_000],
+        )
+        _, second_slopes, second_medians, second_tsv = self._run_profile(
+            [0, 1_234_567_890_123, 99_999_999_999, 500], [50_000_000_000, 0, 123, 9_876_543_210],
+        )
+        self.assertEqual(first_medians, second_medians)
+        self.assertEqual(first_slopes, second_slopes)
+        self.assertEqual(first_tsv, second_tsv)
 
 
 class LatticeResultParsingTest(unittest.TestCase):
@@ -404,18 +709,23 @@ class WrapperExitStatusTest(unittest.TestCase):
     """
 
     def _run_main(self, registry: dict, tmp: Path) -> int:
+        def render_chart(command, **_kwargs):
+            Path(command[3]).write_bytes(b"synthetic chart")
+            return subprocess.CompletedProcess(command, 0)
+
         saved = dict(harness.ADAPTER_REGISTRY)
         harness.ADAPTER_REGISTRY.clear()
         harness.ADAPTER_REGISTRY.update(registry)
         try:
             with (
                 mock.patch.object(adapters, "register_available_adapters"),
+                mock.patch.object(adapters, "REPO_ROOT", tmp),
                 mock.patch.object(adapters, "OUT_DIR", tmp),
                 mock.patch.object(adapters, "DATA_TSV", tmp / "data.tsv"),
                 mock.patch.object(adapters, "CHART_PNG", tmp / "chart.png"),
                 mock.patch.object(adapters, "subprocess") as fake_subprocess,
             ):
-                fake_subprocess.run.return_value = None
+                fake_subprocess.run.side_effect = render_chart
                 return adapters.main(["--allow-missing-engine"])
         finally:
             harness.ADAPTER_REGISTRY.clear()
@@ -428,6 +738,99 @@ class WrapperExitStatusTest(unittest.TestCase):
     def test_one_live_engine_with_missing_peers_exits_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(self._run_main({"lattice": _FakeAdapter()}, Path(tmp)), 0)
+
+
+class ChartPublicationTest(unittest.TestCase):
+    OLD_TSV = b"previous canonical TSV\n"
+    OLD_PNG = b"previous canonical PNG\n"
+    NEW_TSV = "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns\tscope\nlattice\t64\t100.0\t80.000\t640.000\t1\t\n"
+    NEW_PNG = b"synthetic staged PNG\n"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.out_dir = self.root / "published"
+        self.out_dir.mkdir()
+        self.data_tsv = self.out_dir / "data.tsv"
+        self.chart_png = self.out_dir / "chart.png"
+        self.data_tsv.write_bytes(self.OLD_TSV)
+        self.chart_png.write_bytes(self.OLD_PNG)
+
+    def _run_main(self, *, returncode: int, create_png: bool):
+        def render_chart(command, *, cwd, check):
+            self.assertEqual(command[:2], [sys.executable, str(adapters.CHART_SCRIPT)])
+            self.assertEqual(cwd, self.root)
+            self.assertFalse(check)
+            self.staged_tsv = Path(command[2])
+            self.staged_png = Path(command[3])
+            self.stage_dir = self.staged_tsv.parent
+            self.assertEqual(self.stage_dir.parent, self.root / ".cache")
+            self.assertEqual(self.staged_png.parent, self.stage_dir)
+            self.assertNotEqual(self.staged_tsv, self.data_tsv)
+            self.assertNotEqual(self.staged_png, self.chart_png)
+            self.assertEqual(self.staged_tsv.read_bytes(), self.NEW_TSV.encode())
+            if create_png:
+                self.staged_png.write_bytes(self.NEW_PNG)
+            return subprocess.CompletedProcess(command, returncode)
+
+        with (
+            mock.patch.object(harness, "coordinator_is_supervised", return_value=False),
+            mock.patch.object(adapters, "register_available_adapters"),
+            mock.patch.object(adapters, "REPO_ROOT", self.root),
+            mock.patch.object(adapters, "OUT_DIR", self.out_dir),
+            mock.patch.object(adapters, "DATA_TSV", self.data_tsv),
+            mock.patch.object(adapters, "CHART_PNG", self.chart_png),
+            mock.patch.object(harness, "run_profile", return_value=mock.sentinel.result) as run_profile,
+            mock.patch.object(adapters, "compute_context_scaling_aggregate", return_value=([], {})),
+            mock.patch.object(harness, "render_report", return_value="synthetic report"),
+            mock.patch.object(adapters, "render_legacy_tsv", return_value=self.NEW_TSV),
+            mock.patch.object(adapters, "subprocess") as fake_subprocess,
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
+            mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
+        ):
+            fake_subprocess.run.side_effect = render_chart
+            try:
+                status = adapters.main(["--allow-missing-engine"])
+            except FileNotFoundError:
+                self.fail("wrapper raised FileNotFoundError instead of returning a publication status")
+            run_profile.assert_called_once()
+            fake_subprocess.run.assert_called_once()
+            return status, stdout.getvalue(), stderr.getvalue()
+
+    def _assert_failure_preserved_outputs(self, stdout: str, stderr: str):
+        self.assertEqual(self.data_tsv.read_bytes(), self.OLD_TSV)
+        self.assertEqual(self.chart_png.read_bytes(), self.OLD_PNG)
+        self.assertTrue(self.stage_dir.is_dir())
+        self.assertEqual(self.staged_tsv.read_bytes(), self.NEW_TSV.encode())
+        self.assertEqual((self.stage_dir / "report.txt").read_text(), "synthetic report\n")
+        self.assertIn(f"staged data retained at {self.stage_dir}", stderr)
+        self.assertNotIn("Raw data (chart-compatible TSV):", stdout)
+        self.assertNotIn("Chart:", stdout)
+
+    def test_nonzero_renderer_preserves_outputs_even_with_staged_png(self):
+        status, stdout, stderr = self._run_main(returncode=23, create_png=True)
+        self.assertEqual(status, 23, "renderer failure status must propagate")
+        self._assert_failure_preserved_outputs(stdout, stderr)
+        self.assertEqual(self.staged_png.read_bytes(), self.NEW_PNG)
+        self.assertIn("FAIL: chart generation exited with status 23;", stderr)
+
+    def test_success_without_png_refuses_publication_and_retains_stage(self):
+        status, stdout, stderr = self._run_main(returncode=0, create_png=False)
+        self.assertEqual(status, 1, "missing PNG must return failure")
+        self._assert_failure_preserved_outputs(stdout, stderr)
+        self.assertFalse(self.staged_png.exists())
+        self.assertIn("FAIL: chart generation produced no PNG;", stderr)
+
+    def test_success_publishes_exact_outputs_and_removes_stage(self):
+        status, stdout, stderr = self._run_main(returncode=0, create_png=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(self.data_tsv.read_bytes(), self.NEW_TSV.encode())
+        self.assertEqual(self.chart_png.read_bytes(), self.NEW_PNG)
+        self.assertFalse(self.stage_dir.exists())
+        self.assertEqual(stderr, "")
+        self.assertIn(f"Raw data (chart-compatible TSV): {self.data_tsv}\n", stdout)
+        self.assertIn(f"Chart: {self.chart_png}\n", stdout)
 
 
 if __name__ == "__main__":

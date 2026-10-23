@@ -17,8 +17,14 @@ pub(crate) enum RuntimeInput<'a> {
         entry: TextGenerationEntry,
     },
     ChatMessages {
+        // Read by runtimes that only the Metal serving worker constructs.
+        #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
         messages: &'a [ChatMessage],
+        #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
         lora: &'a [LoraSelection],
+        // Only the Qwen Metal runtime renders the thinking prime.
+        #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
+        explicitly_thinking: bool,
     },
 }
 
@@ -36,10 +42,10 @@ pub enum ContextWindowPolicy {
     PromptAndDecodeWithDelimiter,
 }
 
-/// Everything a successful `MetalWorker::spawn` resolves to describe the
+/// Everything a successful `AffineWorker::spawn` resolves to describe the
 /// loaded model, beyond the client handle itself: the format string, the
 /// actual KV context the loader allocated, and the adapter's window policy.
-// The Metal serving factory creates this metadata.
+// The serving factory creates this metadata.
 #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct WorkerMetadata {

@@ -46,7 +46,7 @@ make publish-dry
 git tag -a v{VERSION} -m "v{VERSION}"
 git push origin v{VERSION}
 
-# 6. Publish to crates.io (leaf → embed → tune, with indexing waits)
+# 6. Publish to crates.io (leaves → tokenizer → inference → embed, tune, with indexing waits)
 make publish
 
 # 7. Create the tagged GitHub release as a draft
@@ -84,7 +84,7 @@ gh release create v{NEW_VERSION} --draft --title "v{NEW_VERSION}" --notes-file d
 gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f tag=v{NEW_VERSION}
 
 # Only after the replacement is live and the asset workflow succeeds:
-for c in lattice-fann lattice-transport lattice-inference lattice-embed lattice-tune; do
+for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-inference lattice-embed lattice-tune; do
   cargo yank --version {VERSION} "$c"
 done
 ```

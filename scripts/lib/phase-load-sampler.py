@@ -21,8 +21,9 @@ SELF VS FOREIGN. The bench itself is load: one core busy on a 2-core CI
 runner is 50% of `100 - idle`, so a raw idle floor applied mid-arm would
 refuse every honest run. Each sample therefore also walks the process tree
 rooted at --self-pid and splits total CPU% between that tree (self) and
-everything else (foreign). Only foreign load is judged against the refusal
-ceiling; self is recorded for context. --self-pid is ordinarily the impl
+everything else (foreign). The report judges both foreign load and an
+implied foreign load, max(0, 100 - idle - self), against the refusal
+ceiling; self is otherwise recorded for context. --self-pid is ordinarily the impl
 script's own PID, but under --gpu-handoff (lattice#1732) the admitted
 benchmark executable is launched by the cooperative supervisor as a SIBLING of
 the impl script, not a descendant of it, so bench-compare-impl.sh passes its

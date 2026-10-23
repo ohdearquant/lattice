@@ -5,12 +5,22 @@
 
 Reads the perf-phase-sample/v1 JSONL that phase-load-sampler.py wrote during
 one measured arm and prints a single summary line: sample count, machine idle
-min/mean, foreign-load max/mean, self-load mean, and the top foreign process
-at the foreign-max sample.
+min/mean, foreign-load max/mean, implied-foreign-load max, self-load mean, and
+the top foreign process at the foreign-max sample.
+
+TWO LOAD FIGURES. `foreign_pct` sums the `ps` pcpu of every process outside
+the bench's own tree, divided by logical cores. Under a PID namespace (a bwrap
+sandbox) `ps` lists only the namespace's own processes, so that figure reads
+0.0 however busy the host is, while the idle reading still covers the whole
+machine. The implied figure closes that gap: whatever the machine-wide idle
+share leaves after this bench's own tree is accounted for,
+`max(0.0, 100.0 - idle_pct - self_pct)`, is load that idle saw but `ps` could
+not attribute to any process.
 
 Exit codes:
-  0 - ok, foreign load stayed at or below the ceiling (100 - floor) throughout
-  1 - LOUD, some sample's foreign load exceeded the ceiling
+  0 - ok, foreign AND implied-foreign load stayed at or below the ceiling
+      (100 - floor) throughout
+  1 - LOUD, some sample's foreign or implied-foreign load exceeded the ceiling
   2 - the sampler produced no usable samples (dead instrument) -- this is
       never certifiable, in any mode: a sampler that measured nothing is not
       weaker evidence of a quiet arm, it is no evidence at all.
@@ -62,17 +72,32 @@ def main() -> int:
     self_load = [r["self_pct"] for r in records]
     top_record = max(records, key=lambda r: r["foreign_pct"])
 
+    # Load the idle reading saw but `ps` could not attribute to a process:
+    # under a PID namespace foreign_pct is 0.0 while idle still spans the
+    # whole machine, so the two together bound what the bench cannot explain.
+    implied = [max(0.0, 100.0 - i - s) for i, s in zip(idle, self_load)]
+
     ceiling = 100.0 - args.floor
-    loud = max(foreign) > ceiling
-    verdict = "LOUD" if loud else "ok"
+    foreign_over = max(foreign) > ceiling
+    implied_over = max(implied) > ceiling
+    loud = foreign_over or implied_over
+    if not loud:
+        verdict = "ok"
+    elif foreign_over and implied_over:
+        verdict = "LOUD(foreign+implied)"
+    elif foreign_over:
+        verdict = "LOUD(foreign)"
+    else:
+        verdict = "LOUD(implied)"
     if args.jsonl_out is not None:
         try:
             with args.jsonl_out.open("a", encoding="utf-8") as output:
                 output.write(json.dumps({
                     "schema": "perf-phase-load/v1",
                     "arm": args.arm,
-                    "verdict": verdict,
+                    "verdict": "LOUD" if loud else "ok",
                     "foreign_max_pct": max(foreign),
+                    "implied_foreign_max_pct": max(implied),
                     "floor_pct": args.floor,
                 }, allow_nan=False) + "\n")
         except (OSError, ValueError) as error:
@@ -84,6 +109,7 @@ def main() -> int:
         f"idle min/mean={min(idle):.1f}%/{sum(idle) / len(idle):.1f}% "
         f"foreign max/mean={max(foreign):.1f}%/{sum(foreign) / len(foreign):.1f}% "
         f"self mean={sum(self_load) / len(self_load):.1f}% "
+        f"implied max={max(implied):.1f}% "
         f"(ceiling {ceiling:.1f}%) {verdict} | "
         f"top foreign at max: {top_record['top_foreign']} "
         f"{top_record['top_foreign_pct']:.1f}% @ {top_record['captured_utc']} "

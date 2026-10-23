@@ -17,7 +17,7 @@ This codebase has **two** separately built HTTP servers with confusingly similar
   history (unified-CLI ADR-063, SSE streaming, stop sequences, native Q4 checkpoint support,
   `lattice doctor` preflight). **This document is about `lattice serve`.**
 - **`lattice_serve`** — a separate, standalone binary
-  (`crates/inference/src/bin/lattice_serve.rs`), purpose-built as the internal HTTP daemon the
+  (`crates/inference/src/bin/lattice_serve/main.rs`), purpose-built as the internal HTTP daemon the
   macOS Lattice Studio app spawns and talks to (introduced in PR #435). It has its own, narrower
   route set (`GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`,
   `POST /v1/embeddings`, `GET /v1/lora`, `POST /v1/lora/load`, `POST /v1/lora/unload`,
@@ -173,18 +173,18 @@ per unit time.
   Q4/Metal backend ignores this flag.
 - **Metal/Q4 backend: effectively concurrency-1, with a bounded pending-job admission cap.** All
   Metal generation is funneled through one dedicated worker thread (an `mpsc` channel into a
-  single OS thread holding the `!Send` Metal state, `crates/inference/src/serve/metal_worker.rs`)
-  — a deliberate design choice matching how one local GPU device actually works, not an oversight.
+  single OS thread holding the `!Send` Metal state, `crates/inference/src/serving_worker.rs`),
+  a deliberate design choice matching how one local GPU device actually works, not an oversight.
   Two concurrent requests against a Q4-backed `lattice serve` run back-to-back, not in parallel;
   the later request's connection simply stays open until its turn in the channel comes up, up to
   `DEFAULT_MAX_PENDING_JOBS = 32` jobs queued or in flight at once by default (issue #932). This is
   the only cap on this backend: `--max-cpu-generations` does not apply to it. Both `lattice serve`
   and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
   default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/inference/src/bin/lattice/main.rs`,
-  `crates/inference/src/bin/lattice_serve.rs`). A request submitted while the cap is already full
+  `crates/inference/src/bin/lattice_serve/main.rs`). A request submitted while the cap is already full
   is rejected at the worker's admission boundary (`MetalWorkerClient::submit_with_lora`'s
-  `try_acquire_owned`, `crates/inference/src/serve/metal_worker.rs`) before any Metal
-  generation work happens — the HTTP handler has already tokenized the rendered prompt during
+  `try_acquire_owned`, `crates/inference/src/serving_worker.rs`) before any Metal
+  generation work happens. The HTTP handler has already tokenized the rendered prompt during
   request preparation ahead of that point (`prepare_chat_request`'s `tokenize_len` call in
   `crates/inference/src/bin/lattice/serve.rs`, versus the later `submit_with_lora` call in the
   same handler), so this is not an end-to-end pre-tokenization guarantee, with:
@@ -790,15 +790,25 @@ requests that never touched the field.
 The CPU (safetensors) backend doesn't have this particular cap — its `max_context()` comes from
 the model's own config — but the 4096 `max_tokens_cap` still applies to both backends equally.
 
+The standalone `lattice_serve` daemon serves Qwen checkpoints with a 32768-token context window by
+default, or the model's `max_position_embeddings` when that is smaller. Its Metal worker allocates
+the KV cache for the whole window at startup, so serving the full 262144-token window of
+Qwen3.5 would reserve several GiB before the first request. Pass `--max-context <N>` to choose the
+window; a value above the model's own window is reduced to it. The startup line names the served
+window and where it came from, for example
+`ready (context=32768, from default cap, raise with --max-context)`. The clamp on `max_tokens`, the
+tokenizer limit and the `context_length_exceeded` threshold all use that one value. Gemma 4
+checkpoints keep their model window and refuse `--max-context`.
+
 ## A realistic multi-turn example
 
 The server is stateless per request — there is no session/conversation ID — so every request must
 carry the full conversation history in `messages`. That doesn't mean every request re-prefills that
 history from scratch: on a Metal/Q4-backed server, a text request that safely extends the previous
 turn reuses the retained KV/GDN prefix via `generate_streaming_with_prefix_cache_and_cancel`
-(called from `crates/inference/src/serve/metal_worker.rs`) instead of a full re-prefill; a
+(called from `crates/inference/src/model/serving_runtime/qwen_metal.rs`) instead of a full re-prefill; a
 vision-classified request always takes the separate `generate_multimodal_vision_with_cancel` path
-(also called from `crates/inference/src/serve/metal_worker.rs`) and never participates in that cache. The CPU
+(also called from `crates/inference/src/model/serving_runtime/qwen_metal.rs`) and never participates in that cache. The CPU
 (safetensors) backend has no such cache and always re-prefills the full history. See
 [`docs/cross-turn-cache.md`](cross-turn-cache.md) for what counts as a safe extension:
 
