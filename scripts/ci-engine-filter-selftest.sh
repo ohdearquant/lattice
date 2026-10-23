@@ -28,7 +28,7 @@ extract_re() {  # $1 = anchor substring unique to the wanted line
     | sed -E "s/^ *if grep -E '//; s/' <<<.*$//"
 }
 
-ENGINE_RE="$(extract_re 'crates/(inference|inference-core|tokenizer|grammar|weights|embed)/')"
+ENGINE_RE="$(extract_re 'crates/(inference|inference-core|tokenizer|grammar|weights|quant|embed)/')"
 TUNE_RE="$(extract_re 'crates/tune/')"
 
 # FAIL CLOSED ON EMPTY. An extraction that resolved nothing would make every
@@ -95,6 +95,12 @@ check "weights manifest -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/weights/Cargo.toml')"
 check "weights README alone -> engine" false \
   "$(classify "$ENGINE_RE" <<<'crates/weights/README.md')"
+check "quant source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/quant/src/q4_manifest.rs')"
+check "quant manifest -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/quant/Cargo.toml')"
+check "quant README alone -> engine" false \
+  "$(classify "$ENGINE_RE" <<<'crates/quant/README.md')"
 check "embed source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/embed/src/simd/mod.rs')"
 check "Cargo.lock -> engine" true \

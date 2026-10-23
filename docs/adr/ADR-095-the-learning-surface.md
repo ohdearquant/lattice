@@ -272,7 +272,7 @@ policy that learned something nobody sent.
 names an operator-selected path, head records, renames and persistence, and says nothing about what
 happens when a local principal can write that directory. Replacing the artifact, or redirecting the
 head record through a symlink, activates an untrusted gate on the next start with no signal. The
-mechanism is not new work: `quant/q4_manifest.rs` already reads manifests with
+mechanism is not new work: `crates/quant/src/q4_manifest.rs` already reads manifests with
 `fs::symlink_metadata`, refuses to follow a symlink at the named path, and fails closed on a
 dangling target or a permission error rather than reporting absence. Router state takes the same
 treatment — no-follow open, refusal when the state directory is writable by a principal other than
