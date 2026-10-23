@@ -47,20 +47,20 @@
 #[test]
 fn e2e_forward_matches_hf_reference() {
     // BF16/F16 safetensors tensors decode to f32 unconditionally (no feature
-    // gate); this gate still requires --features f16 as its pinned invocation
-    // contract, enforced below exactly like a missing checkpoint, mirroring
+    // gate); this gate requires f16 for its pinned invocation and image for
+    // decoding, enforced below exactly like a missing checkpoint, mirroring
     // `paddleocr_vl_decoder_goldens_test.rs`.
-    #[cfg(not(feature = "f16"))]
+    #[cfg(not(all(feature = "f16", feature = "image")))]
     {
         if std::env::var("LATTICE_POCR_GATE_ENFORCE").as_deref() == Ok("1") {
             panic!(
-                "LATTICE_POCR_GATE_ENFORCE=1 but the `f16` feature is not enabled — this \
-                 gate's pinned invocation contract requires --features f16"
+                "LATTICE_POCR_GATE_ENFORCE=1 but the `f16` and `image` features are not both enabled — this \
+                 gate's pinned invocation contract requires --features f16,image"
             );
         }
-        eprintln!("SKIP paddleocr_vl_e2e_goldens_test: f16 feature disabled");
+        eprintln!("SKIP paddleocr_vl_e2e_goldens_test: f16 or image feature disabled");
     }
-    #[cfg(feature = "f16")]
+    #[cfg(all(feature = "f16", feature = "image"))]
     gate::run();
 }
 
@@ -115,11 +115,11 @@ fn greedy_fixture_decides_every_step_by_more_than_tolerance() {
     );
 
     // ATOL and RTOL are the gated module's, duplicated here because that module
-    // is `f16`-only and this test deliberately is not. A duplicated constant
+    // requires `f16,image` and this test deliberately does not. A duplicated constant
     // drifts, so where both exist the equality is checked rather than trusted.
     const ATOL: f32 = 2e-3;
     const RTOL: f32 = 2e-3;
-    #[cfg(feature = "f16")]
+    #[cfg(all(feature = "f16", feature = "image"))]
     {
         assert_eq!(
             (ATOL, RTOL),
@@ -155,12 +155,11 @@ fn greedy_fixture_decides_every_step_by_more_than_tolerance() {
     );
 }
 
-/// Gated on `f16` as this gate's pinned invocation contract, not because the
-/// checkpoint read or comparison logic needs it (BF16 decodes to f32
-/// unconditionally). Kept together so the default-feature build carries no
+/// Requires `image` for decoding and `f16` as the pinned invocation contract;
+/// checkpoint tensors decode to f32 unconditionally. Kept together so the default-feature build carries no
 /// unreachable items — `cargo clippy --all-targets -D warnings` without
 /// `f16` is a CI gate.
-#[cfg(feature = "f16")]
+#[cfg(all(feature = "f16", feature = "image"))]
 mod gate {
     use crate::gate_types::*;
     use lattice_inference::model::paddleocr_vl::PaddleOcrVlModel;
@@ -460,7 +459,7 @@ mod gate {
     }
 }
 
-#[cfg(feature = "f16")]
+#[cfg(all(feature = "f16", feature = "image"))]
 mod gate_types {
     use serde::Deserialize;
     use sha2::{Digest, Sha256};

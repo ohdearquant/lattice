@@ -180,6 +180,7 @@ fn tiny_vlm_fixture() -> (Qwen35Config, F16ModelWeights, Qwen35VisionWeights) {
     (cfg, weights, vision_weights)
 }
 
+#[cfg(feature = "image")]
 fn make_test_png(w: u32, h: u32, seed: u8) -> Vec<u8> {
     use image::RgbImage;
     let mut img = RgbImage::new(w, h);
@@ -195,6 +196,7 @@ fn make_test_png(w: u32, h: u32, seed: u8) -> Vec<u8> {
     buf
 }
 
+#[cfg(feature = "image")]
 fn tiny_tokenizer() -> BpeTokenizer {
     let mut vocab_map = std::collections::HashMap::new();
     for (i, c) in ["describe", "this", "image"].iter().enumerate() {
@@ -448,6 +450,7 @@ fn write_tiny_vlm_checkpoint_with_max_position_embeddings(
 /// the raw inference-crate primitive directly: wiring adds no numerical
 /// difference. This is the core claim of this module (a wire-through,
 /// not a reimplementation).
+#[cfg(feature = "image")]
 #[test]
 fn embed_image_matches_raw_inference_primitive() {
     let (cfg, weights, vision_weights) = tiny_vlm_fixture();
@@ -490,6 +493,7 @@ fn embed_image_matches_raw_inference_primitive() {
 /// point: the crate wrapper must add no numerical difference relative to
 /// calling `embed_image_from_bytes_f16_metal` directly.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[cfg(feature = "image")]
 #[test]
 fn embed_image_metal_matches_raw_inference_primitive() {
     use lattice_inference::vision::embed_image_from_bytes_f16_metal;
@@ -534,6 +538,7 @@ fn embed_image_metal_matches_raw_inference_primitive() {
 /// UnsupportedModel`) as `EmbedError::InferenceFailed`, never silently
 /// substituting `embed_image`'s CPU output.
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+#[cfg(feature = "image")]
 #[test]
 fn embed_image_metal_fails_closed_without_metal_gpu() {
     let (cfg, weights, vision_weights) = tiny_vlm_fixture();
@@ -551,6 +556,7 @@ fn embed_image_metal_fails_closed_without_metal_gpu() {
     assert!(matches!(err, EmbedError::InferenceFailed(_)));
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn embed_image_is_deterministic_and_normalized() {
     let (cfg, weights, vision_weights) = tiny_vlm_fixture();
@@ -583,6 +589,7 @@ fn embed_image_is_deterministic_and_normalized() {
     assert!((norm - 1.0).abs() < 1e-4, "expected unit norm, got {norm}");
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn embed_image_rejects_non_vlm_checkpoint() {
     let (mut cfg, weights, vision_weights) = tiny_vlm_fixture();
@@ -606,6 +613,7 @@ fn embed_image_rejects_non_vlm_checkpoint() {
     );
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn embed_image_rejects_misaligned_image() {
     let (cfg, weights, vision_weights) = tiny_vlm_fixture();
@@ -635,6 +643,7 @@ fn embed_image_rejects_misaligned_image() {
 /// `vision_end`) is 6 tokens -- already over a 5-token window with an
 /// empty prompt, so this exercises the scaffold-only side of the
 /// admission check without needing any text tokens at all.
+#[cfg(feature = "image")]
 #[test]
 fn embed_image_rejects_when_scaffold_exceeds_context_window() {
     let (mut cfg, weights, vision_weights) = tiny_vlm_fixture();
@@ -661,6 +670,7 @@ fn embed_image_rejects_when_scaffold_exceeds_context_window() {
 /// Sibling boundary case: scaffold tokens landing exactly at the context
 /// window (empty prompt, so no text tokens add to the total) must still
 /// embed successfully.
+#[cfg(feature = "image")]
 #[test]
 fn embed_image_accepts_when_scaffold_exactly_fits_context_window() {
     let (mut cfg, weights, vision_weights) = tiny_vlm_fixture();
@@ -679,6 +689,7 @@ fn embed_image_accepts_when_scaffold_exactly_fits_context_window() {
 /// reject) before `embed_image_metal` ever attempts a Metal dispatch, so
 /// this must reject identically on a build/platform with no Metal
 /// support at all -- no GPU is touched by this test.
+#[cfg(feature = "image")]
 #[test]
 fn embed_image_metal_rejects_when_scaffold_exceeds_context_window() {
     let (mut cfg, weights, vision_weights) = tiny_vlm_fixture();
@@ -901,6 +912,7 @@ fn from_directory_raises_tokenizer_cap_to_context_window_above_tokenizer_default
     );
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn single_file_and_one_shard_index_produce_identical_image_embeddings() {
     let single = tempfile::tempdir().expect("single tempdir");

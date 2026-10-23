@@ -117,6 +117,7 @@ fn conversions_validate_dimensions_and_mode_byte_counts() {
     );
 }
 
+#[cfg(feature = "image")]
 fn png_bytes(image: image::DynamicImage) -> Vec<u8> {
     let mut output = std::io::Cursor::new(Vec::new());
     image
@@ -125,6 +126,7 @@ fn png_bytes(image: image::DynamicImage) -> Vec<u8> {
     output.into_inner()
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn encoded_rgb_rgba_and_grayscale_pngs_reuse_validated_conversion() {
     let cases = [
@@ -155,6 +157,7 @@ fn encoded_rgb_rgba_and_grayscale_pngs_reuse_validated_conversion() {
     }
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn encoded_failures_use_typed_invalid_input() {
     for bytes in [
@@ -169,6 +172,7 @@ fn encoded_failures_use_typed_invalid_input() {
     }
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn encoded_higher_bit_depth_is_rejected() {
     let pixels =
