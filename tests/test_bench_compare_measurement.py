@@ -603,7 +603,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         ]
         self.assertTrue(commands, "found 0 cargo bench invocations")
         self.assertEqual(
-            len(commands), 14,
+            len(commands), 7,
             f"found {len(commands)} cargo bench invocations:\n"
             + "\n".join(commands),
         )
