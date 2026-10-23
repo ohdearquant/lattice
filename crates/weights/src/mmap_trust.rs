@@ -53,7 +53,7 @@
 //! write permission, not the target file's. [`reject_if_mmap_parent_directory_chain_weak`]
 //! walks every ancestor of the canonicalized checkpoint path and applies the
 //! same group/other-writable-or-foreign-owner rule
-//! [`mmap_file_trust_boundary_issue`] applies to the file, with one
+//! `mmap_file_trust_boundary_issue` applies to the file, with one
 //! deliberate exception: a world-writable directory that also carries the
 //! sticky bit (`S_ISVTX`, the `/tmp` pattern) is accepted despite being
 //! group/other-writable. The sticky bit restricts `unlink`/`rename` within
@@ -214,7 +214,7 @@ fn current_uid() -> u32 {
 }
 
 /// Walk every ancestor directory of `path` and refuse the load if any of
-/// them falls outside [`mmap_parent_dir_trust_boundary_issue`]'s trust
+/// them falls outside `mmap_parent_dir_trust_boundary_issue`'s trust
 /// boundary, or -- macOS only -- carries a macOS extended ACL entry that
 /// grants a directory-mutating permission to any principal. `path` is
 /// canonicalized first so the walk follows the real filesystem chain
@@ -223,7 +223,7 @@ fn current_uid() -> u32 {
 /// the directories the kernel will actually resolve through, not a textual
 /// approximation of them.
 ///
-/// The macOS ACL check reuses [`macos_acl::acl_grants_rejected_permission`] --
+/// The macOS ACL check reuses `macos_acl::acl_grants_rejected_permission` --
 /// the same scan the target file itself goes through in
 /// [`reject_if_mmap_file_trust_boundary_weak`] -- applied to each ancestor's
 /// own fd instead of the checkpoint file's. `REJECTED_PERMS` is the correct
@@ -250,7 +250,7 @@ fn current_uid() -> u32 {
 /// Anything the FFI cannot enumerate or classify -- an unrecognized
 /// `acl_get_entry`/`acl_get_perm_np` return -- fails the whole check closed
 /// rather than treating the unparsed entry as benign; see
-/// [`macos_acl::acl_grants_rejected_permission`]'s doc comment for the
+/// `macos_acl::acl_grants_rejected_permission`'s doc comment for the
 /// itemized fail-closed behavior this inherits verbatim.
 ///
 /// See this module's "Parent-directory chain" doc comment for what this
