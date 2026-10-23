@@ -7,7 +7,8 @@
 // (`Qwen35Config::kv_bytes_per_token`) the real loaders and the Metal
 // forward pass already use, so its numbers describe the actual load path
 // rather than a separate approximation. It never touches
-// `metal_qwen35.rs`'s KV-cache allocator or `new_session`/`new_session_inner`
+// the Metal KV-cache allocator or `new_session`/`new_session_inner`
+// (`forward/metal_qwen35/inner/engine.rs`)
 // — only their inputs (`Qwen35Config`) and already-published formula.
 // ---------------------------------------------------------------------------
 
@@ -17,9 +18,10 @@ use std::path::{Path, PathBuf};
 use lattice_inference::model::qwen35::qwen_required_tensor_names;
 use lattice_inference::model::qwen35_config::Qwen35Config;
 
-/// Bytes per KV-cache element `MetalQwen35State::new_session` would use:
+/// Bytes per KV-cache element `MetalQwen35Engine::new_session` would use:
 /// f32 (4 bytes) unless `LATTICE_KV_F16=1`/`true` — matches that
-/// function's own `use_kv_f16` check exactly (`metal_qwen35.rs`).
+/// function's own `use_kv_f16` check exactly
+/// (`forward/metal_qwen35/inner/engine.rs`).
 fn kv_cache_dtype_bytes() -> usize {
     if matches!(
         std::env::var("LATTICE_KV_F16").as_deref(),
@@ -413,7 +415,8 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
 // -----------------------------------------------------------------------
 
 /// Estimate a Q4-checkpoint tensor's RESIDENT byte footprint once loaded
-/// by `MetalQwen35State::from_q4_dir` (`crates/inference/src/forward/metal_qwen35.rs`),
+/// by `MetalQwen35State::from_q4_dir`
+/// (`crates/inference/src/forward/metal_qwen35/inner/weights.rs`),
 /// given its on-disk byte length. Mirrors `cpu_resident_bytes` above for
 /// the Q4/Metal path: on-disk bytes alone are not a safe RAM/VRAM proxy
 /// here either, for two independent reasons — dequantization expansion

@@ -22,7 +22,8 @@
 //! composes correctly with string-level `stop_strings` truncation, which by
 //! construction already drops the matched suffix. [`crate::generation::GenerateOutput`]
 //! records this explicitly. The MTP and self-spec loops were the two sites
-//! that needed a production change; see `crates/inference/src/forward/metal_qwen35.rs`.
+//! that needed a production change; see
+//! `crates/inference/src/forward/metal_qwen35/inner/speculative.rs`.
 //!
 //! ## Entry-point manifest
 //!
@@ -49,14 +50,16 @@
 //! autoregressive decode loop), so no production change was needed here —
 //! only manifest + test coverage.
 //!
-//! The Metal-family tests (6-11) live inside `metal_qwen35.rs`'s existing
-//! `mod tests` rather than here because its GPU test fixtures
-//! (`tiny_hybrid_fixture`, `minimal_bpe_tokenizer`, `with_self_spec_env`) are
-//! private to that module and already proven correct by dozens of existing
+//! The Metal-family tests (6-11) live in the Metal engine's test tree
+//! (`forward/metal_qwen35/inner/tests/stop_token_sweep.rs`) rather than here
+//! because its GPU test fixtures (`tiny_hybrid_fixture`,
+//! `minimal_bpe_tokenizer`, `with_self_spec_env`, in
+//! `forward/metal_qwen35/inner/tests.rs`) are private to that module and
+//! already proven correct by dozens of existing
 //! tests; duplicating or relocating them would add risk (see the module's
 //! `MetalQwen35State` construction path, which needs a live `MTLDevice`) for
 //! no contract-coverage benefit. Grep `stop_token_contract` or `#613` in
-//! `metal_qwen35.rs` to find them.
+//! `forward/metal_qwen35/inner/tests/` to find them.
 //!
 //! ## What "sweep" means here
 //!
