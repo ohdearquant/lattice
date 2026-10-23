@@ -14,10 +14,6 @@ path = "crates/inference/benches/inference_perf.rs"
 ceiling = 3016
 
 [[ratchet]]
-path = "crates/inference/src/bin/lattice_serve/main.rs"
-ceiling = 3611
-
-[[ratchet]]
 path = "crates/inference/src/forward/shaders/qwen35.metal"
 ceiling = 3311
 
