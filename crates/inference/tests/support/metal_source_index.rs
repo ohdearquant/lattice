@@ -687,7 +687,7 @@ impl Index {
     ) -> Result<bool, String> {
         let key = format!("provides:{module}::{name}");
         if !stack.insert(key.clone()) {
-            return Ok(false);
+            return Err(format!("glob cycle resolving {module}::{name}"));
         }
         let result = (|| {
             for binding in self
