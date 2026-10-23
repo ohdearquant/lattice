@@ -265,15 +265,7 @@ jobs:
           fi
           rg --version
       - name: Clean lattice crates (force rebuild, keep dep cache)
-        run: |
-          cargo clean -p lattice-inference 2>/dev/null || true
-          cargo clean -p lattice-grammar 2>/dev/null || true
-          cargo clean -p lattice-weights 2>/dev/null || true
-          cargo clean -p lattice-quant 2>/dev/null || true
-          cargo clean -p lattice-embed 2>/dev/null || true
-          cargo clean -p lattice-fann 2>/dev/null || true
-          cargo clean -p lattice-tune 2>/dev/null || true
-          cargo clean -p lattice-transport 2>/dev/null || true
+        run: cargo clean --workspace
       - run: ./scripts/ci.sh
         env:
           LATTICE_REQUIRE_DENO: '1'
