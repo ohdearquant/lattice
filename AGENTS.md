@@ -94,15 +94,15 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ```
 fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
                                        |
-                                 tokenizer (8K)   ← depends on inference-core
+                           tokenizer (8K)   grammar   ← depend on inference-core
     |                                  |
-inference (~118K)                                 ← depends on inference-core + tokenizer;
+inference (~118K)                                 ← depends on inference-core + tokenizer + grammar;
     |                                               optional dep on fann (`mixture` feature)
 embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
 ```
 
-`inference-core` (the shared `InferenceError`) and `tokenizer` were split out of
-`inference`; both edges into them are unconditional, and `inference` re-exports their
+`inference-core` (the shared `InferenceError`), `tokenizer` and `grammar` were split out of
+`inference`; all three edges into them are unconditional, and `inference` re-exports their
 public items at the paths they had before the split. Of the four edges among the
 other crates, three are feature-gated, and the gates do not all default the
 same way, so "depends on" in the diagram is not one relationship. `tune` depends on
@@ -132,12 +132,28 @@ the build you are looking at.
 | `gemma_bpe.rs`     | Gemma BPE                   | `GemmaBpeTokenizer`                                   |
 | `detokenize.rs`    | Incremental detokenization  | used by the engine through `lattice-inference`        |
 
+### lattice-grammar — Grammar-constrained decoding
+
+| Module               | Purpose                             | Key Exports                                         |
+| -------------------- | ----------------------------------- | --------------------------------------------------- |
+| `engine.rs`          | Token masks and grammar advancement | `GrammarEngine`, `GrammarError`                     |
+| `spec.rs`            | Grammar input formats               | `GrammarSpec`                                       |
+| `gbnf.rs`            | GBNF compiler                       | `parse_gbnf`, `GbnfError`                           |
+| `json_schema.rs`     | JSON Schema compiler                | `compile_json_schema`, `SchemaError`                |
+| `pda.rs`             | Byte-level pushdown automaton       | `CompiledGrammar`, `GrammarState`, `GrammarBuilder` |
+| `trie.rs`            | Vocabulary byte trie                | `ByteTrie`                                          |
+| `vocab_partition.rs` | Precomputed vocabulary masks        | `VocabPartition`                                    |
+
+Its only internal runtime dependency is `inference-core`; `tokenizer` is a test dependency.
+The `bench-internals` feature exposes profiling probes and is forwarded by the facade.
+
 ### lattice-inference — Transformer kernel
 
 | Module           | Purpose                      | Key Exports                                                                       |
 | ---------------- | ---------------------------- | --------------------------------------------------------------------------------- |
 | `model/`         | Model configs and loaders    | `BertConfig`, `BertModel`, `QwenConfig`, `QwenModel`, `CrossEncoderModel`         |
 | `tokenizer/`     | Re-exports lattice-tokenizer | `Tokenizer` trait, `WordPieceTokenizer`, `SentencePieceTokenizer`, `BpeTokenizer` |
+| `grammar.rs`     | Re-exports lattice-grammar   | `GrammarEngine`, `GrammarError`, `GrammarSpec`                                    |
 | `weights/`       | Weight storage formats       | `F32Weights`, `F16Weights`, `Q8Weights`, `Q4Weights`                              |
 | `attention/`     | Attention mechanisms         | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
 | `forward/`       | Compute backends             | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
@@ -253,7 +269,7 @@ GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Ru
 
 ### Bench-Compare Disposition
 
-Every PR that touches `crates/inference/`, `crates/inference-core/`, `crates/tokenizer/`,
+Every PR that touches `crates/inference/`, `crates/inference-core/`, `crates/tokenizer/`, `crates/grammar/`,
 `crates/embed/`, or `crates/fann/` must include a bench-compare disposition in its description.
 By default, run `make bench-compare` and paste its A/B table into the PR body. If the result shows no change, state that as the disposition.
 `crates/fann/` is covered both because it feeds inference through the optional `mixture` feature
@@ -267,7 +283,7 @@ sufficient.
 
 ### E2E Parity Gate
 
-PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
+PRs touching `crates/inference/src/`, `crates/inference-core/src/`, `crates/tokenizer/src/`, `crates/grammar/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
 
 The `perf-baselines` branch is still updated by `bench-update.yml` on merge to main for trend tracking.
 

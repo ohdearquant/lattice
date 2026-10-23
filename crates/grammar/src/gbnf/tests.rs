@@ -1,5 +1,5 @@
 use super::*;
-use crate::grammar::pda::{GrammarState, SimResult, simulate_token};
+use crate::pda::{GrammarState, SimResult, simulate_token};
 
 fn accepts(grammar: &CompiledGrammar, input: &[u8]) -> bool {
     let state = GrammarState::initial();

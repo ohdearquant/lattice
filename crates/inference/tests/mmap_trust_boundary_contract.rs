@@ -166,7 +166,11 @@ fn construction_token_hits(source: &str) -> Vec<(usize, &'static str)> {
 /// Source trees of the crates split out of this one, relative to this
 /// crate's manifest directory. Code that moved there left this crate's `src/`
 /// but still loads checkpoint data, so the contract scans them too.
-const SPLIT_CRATE_SOURCE_ROOTS: &[&str] = &["../inference-core/src", "../tokenizer/src"];
+const SPLIT_CRATE_SOURCE_ROOTS: &[&str] = &[
+    "../inference-core/src",
+    "../tokenizer/src",
+    "../grammar/src",
+];
 
 /// The contract: outside [`TRUST_BOUNDARY_FILE`], no file under this crate's
 /// `src/` or a [`SPLIT_CRATE_SOURCE_ROOTS`] tree names a mmap construction

@@ -1,5 +1,5 @@
 use super::*;
-use crate::grammar::pda::{GrammarBuilder, Symbol};
+use crate::pda::{GrammarBuilder, Symbol};
 
 /// Grammar: root = 'a' | 'b'
 fn or_grammar() -> CompiledGrammar {
