@@ -639,11 +639,7 @@ impl Index {
                     let effective = CfgFormula::all([binding.cfg.clone(), cfg.clone()]);
                     match self.resolve_inner(module, &binding.target, &effective, stack) {
                         Ok(destination) => {
-                            if self
-                                .bindings
-                                .contains_key(&(destination.clone(), name.to_string()))
-                                || self.globs.contains_key(&destination)
-                            {
+                            if self.provides(&destination, name, &effective, stack)? {
                                 answers.insert(self.lookup(
                                     &destination,
                                     name,
@@ -673,6 +669,50 @@ impl Index {
                     "ambiguous ownership of {module}::{name}: {answers:?}"
                 )),
             }
+        })();
+        stack.remove(&key);
+        result
+    }
+
+    /// Whether a glob of `module` imports `name`: `module` binds it, or one of its own globs
+    /// imports it. A glob imports only what its destination can name, never the extern prelude,
+    /// so a destination without the name adds nothing and a path head goes on to the extern
+    /// prelude, as `use super::*;` beside `lattice_weights::...` does in rustc.
+    fn provides(
+        &self,
+        module: &str,
+        name: &str,
+        cfg: &CfgFormula,
+        stack: &mut BTreeSet<String>,
+    ) -> Result<bool, String> {
+        let key = format!("provides:{module}::{name}");
+        if !stack.insert(key.clone()) {
+            return Ok(false);
+        }
+        let result = (|| {
+            for binding in self
+                .bindings
+                .get(&(module.to_string(), name.to_string()))
+                .into_iter()
+                .flatten()
+            {
+                if intersects(&binding.cfg, cfg)? {
+                    return Ok(true);
+                }
+            }
+            for binding in self.globs.get(module).into_iter().flatten() {
+                if !intersects(&binding.cfg, cfg)?
+                    || binding.target.split("::").next() == Some(name)
+                {
+                    continue;
+                }
+                let effective = CfgFormula::all([binding.cfg.clone(), cfg.clone()]);
+                let destination = self.resolve_inner(module, &binding.target, &effective, stack)?;
+                if self.provides(&destination, name, &effective, stack)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         })();
         stack.remove(&key);
         result
