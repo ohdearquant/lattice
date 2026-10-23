@@ -3200,7 +3200,7 @@ mod inner {
             let embed_tokens = EmbeddingTable::f16(
                 make_buffer_f16(&device, &weights.embed_tokens, "embed_tokens.f16"),
                 cfg.vocab_size,
-                hidden,
+                cfg.hidden_size,
             )?;
             let embed_tokens_q8 = Q4WeightBuf::from_buffer(make_buffer_quant(
                 &device,
