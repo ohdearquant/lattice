@@ -15,7 +15,6 @@
 //! deliberately preserving scalar accumulation order so normal-value results remain consistent
 //! with the scalar fallback.
 
-#[cfg(test)]
 use crate::SafetensorsFile;
 use crate::half_bits::{f16_bits_to_f32, f32_to_f16_bits};
 use lattice_inference_core::InferenceError;
