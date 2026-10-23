@@ -98,11 +98,9 @@ impl MetalQwen35State {
         assert!((pending_token as usize) < cfg.vocab_size);
         // SAFETY: normed_embed holds hidden f32 values, disjoint from the embedding table.
         unsafe {
-            self.engine.embed_tokens.write_row(
-                pending_token as usize,
-                normed_embed.as_mut_ptr(),
-                hidden,
-            );
+            self.engine
+                .embed_tokens
+                .write_row(pending_token as usize, &mut normed_embed);
         }
 
         if let Some(ref rot) = self.engine.quarot_rotation {
@@ -610,11 +608,9 @@ impl MetalQwen35State {
         assert!((token_id as usize) < cfg.vocab_size);
         unsafe {
             // SAFETY: normed_embed holds hidden f32 values, disjoint from the table.
-            self.engine.embed_tokens.write_row(
-                token_id as usize,
-                normed_embed.as_mut_ptr(),
-                hidden,
-            );
+            self.engine
+                .embed_tokens
+                .write_row(token_id as usize, &mut normed_embed);
         }
         if let Some(ref rot) = self.engine.quarot_rotation {
             debug_assert_eq!(rot.dim(), normed_embed.len());

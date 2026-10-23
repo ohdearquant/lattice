@@ -34,6 +34,51 @@ fn greedy(max_new_tokens: usize) -> GenerateConfig {
 }
 
 #[test]
+fn neutral_factory_constructor_builds_a_runtime() {
+    let factory = ServingFactory::new(Box::new(PreloadedGemma(tiny_zero_serving())));
+    let built = factory.build(
+        Arc::new(RwLock::new(AdapterIndex::default())),
+        ResidencyLimits::default(),
+    );
+    let (runtime, metadata, preparation) = built.expect("the factory builds its runtime");
+
+    assert_eq!(metadata.format, "safetensors");
+    assert!(
+        !runtime
+            .vision_supported()
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert!(!preparation.supports_adapters());
+}
+
+#[test]
+fn family_constructors_delegate_to_the_neutral_factory_constructor() {
+    let source = include_str!("../serving_factory.rs");
+    let qwen = source
+        .split_once("pub fn qwen_metal(")
+        .map(|(_, body)| body)
+        .and_then(|body| body.split_once("/// Bind a Gemma 4"))
+        .map(|(body, _)| body)
+        .expect("the Qwen constructor source is present");
+    let gemma = source
+        .split_once("pub fn gemma_cpu(")
+        .map(|(_, body)| body)
+        .and_then(|body| body.split_once("pub(crate) fn legacy_qwen("))
+        .map(|(body, _)| body)
+        .expect("the Gemma constructor source is present");
+    let legacy = source
+        .split_once("pub(crate) fn legacy_qwen(")
+        .map(|(_, body)| body)
+        .and_then(|body| body.split_once("pub(crate) fn build("))
+        .map(|(body, _)| body)
+        .expect("the compatibility constructor source is present");
+
+    assert!(qwen.contains("Self::new("));
+    assert!(gemma.contains("Self::new("));
+    assert!(legacy.contains("Self::new("));
+}
+
+#[test]
 fn a_gemma_worker_serves_streamed_and_unstreamed_jobs_and_refuses_what_it_cannot() {
     let factory = ServingFactory {
         inner: Box::new(PreloadedGemma(tiny_zero_serving())),

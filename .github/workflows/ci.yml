@@ -2138,6 +2138,10 @@ jobs:
       # cargo, uv and Python modules; no benchmark, model or GPU is used.
       - name: python3 tests/test_bench_gpu_handoff.py
         run: python3 tests/test_bench_gpu_handoff.py -v
+      # Declared group names reconciled in Criterion's directory form; same
+      # stub-cargo scope, its own module for the same line-ceiling reason.
+      - name: python3 tests/test_bench_compare_group_dirs.py
+        run: python3 tests/test_bench_compare_group_dirs.py -v
       - name: python3 tests/test_bench_decode_slopefit.py
         run: python3 tests/test_bench_decode_slopefit.py -v
       # The in-phase load sampler's self/foreign split under --gpu-handoff,
