@@ -21,10 +21,10 @@ use crate::generation::{GenerateConfig, TopLogprob};
 /// `NEG_INFINITY`) input — the dense-array form of the engine-wide
 /// fail-closed-to-first-in-set contract, never a panic.
 ///
-/// Its only production callers today (`generate_greedy_mtp`,
-/// `generate_greedy_self_spec` in `forward/metal_qwen35.rs`) live behind the
-/// `metal-gpu` feature, so a default-feature build never calls it outside
-/// this module's own tests.
+/// Its production callers today (the Metal MTP and self-speculative paths in
+/// `forward/metal_qwen35/inner/speculative.rs` and `inner/mtp.rs`, and
+/// `decoder/qwen_metal.rs`) all live behind the `metal-gpu` feature, so a
+/// default-feature build never calls it outside this module's own tests.
 #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
 pub(crate) fn argmax_f32_first_wins(logits: &[f32]) -> u32 {
     let mut best_idx = 0u32;
@@ -728,7 +728,7 @@ thread_local! {
     /// Reused scratch for [`sample_full_logits`], the shared engine behind the
     /// stateless `(logits, cfg, previous_ids, rng_state)` call sites that have
     /// no owning struct to hold per-generation buffers: the Metal CPU fallback
-    /// (`forward/metal_qwen35.rs`'s private `sample_token`) and the Qwen CPU
+    /// (the crate-private `sample_token` in `forward/metal_qwen35/inner/sampling.rs`) and the Qwen CPU
     /// decode loops (`model/qwen35/sampling.rs::sample_token`, shared by the
     /// f16/q8/NEON forward paths). Kept thread-local instead of
     /// per-call so vocab-sized buffers are allocated once per thread and
