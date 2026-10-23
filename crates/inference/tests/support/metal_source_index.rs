@@ -1,11 +1,91 @@
 use crate::source_graph::{
     CfgFormula, item_attributes, literal_module_path, path_label, syn_attributes_formula_with_test,
 };
+use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
+
+#[derive(Deserialize)]
+struct DependencyMetadata {
+    packages: Vec<DependencyPackage>,
+}
+
+#[derive(Deserialize)]
+struct DependencyPackage {
+    manifest_path: PathBuf,
+    dependencies: Vec<DeclaredDependency>,
+}
+
+#[derive(Deserialize)]
+struct DeclaredDependency {
+    name: String,
+    rename: Option<String>,
+    kind: Option<String>,
+}
+
+/// Crate names that library source can use as the first segment of a path because the
+/// package declares them as normal dependencies. A root without a manifest declares none,
+/// so every such path stays unresolved there.
+fn dependency_roots(root: &Path) -> Result<BTreeSet<String>, String> {
+    let manifest = root.join("Cargo.toml");
+    if !manifest.is_file() {
+        return Ok(BTreeSet::new());
+    }
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .output()
+        .map_err(|error| format!("could not run cargo metadata: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata failed for {}: {}",
+            manifest.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let metadata: DependencyMetadata = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("cargo metadata output could not be parsed: {error}"))?;
+    let expected = manifest
+        .canonicalize()
+        .map_err(|error| format!("{}: {error}", manifest.display()))?;
+    let mut packages = metadata.packages.into_iter().filter(|package| {
+        package
+            .manifest_path
+            .canonicalize()
+            .is_ok_and(|path| path == expected)
+    });
+    let package = packages
+        .next()
+        .ok_or_else(|| format!("cargo metadata did not list {}", manifest.display()))?;
+    if packages.next().is_some() {
+        return Err(format!(
+            "cargo metadata listed {} twice",
+            manifest.display()
+        ));
+    }
+    Ok(package
+        .dependencies
+        .into_iter()
+        .filter(|dependency| dependency.kind.is_none())
+        .map(|dependency| {
+            dependency
+                .rename
+                .unwrap_or(dependency.name)
+                .replace('-', "_")
+        })
+        .collect())
+}
 
 #[derive(Clone)]
 pub(super) struct Binding {
@@ -47,6 +127,7 @@ pub(super) struct Index {
     pub types: BTreeMap<String, Vec<TypeInfo>>,
     pub module_files: BTreeMap<String, BTreeSet<String>>,
     modules: BTreeSet<String>,
+    dependency_roots: BTreeSet<String>,
     visiting: BTreeSet<PathBuf>,
 }
 
@@ -95,6 +176,7 @@ impl Index {
         let root = root
             .canonicalize()
             .map_err(|error| format!("crate root: {error}"))?;
+        let dependency_roots = dependency_roots(&root)?;
         let mut index = Self {
             root,
             sources: BTreeMap::new(),
@@ -105,6 +187,7 @@ impl Index {
             types: BTreeMap::new(),
             module_files: BTreeMap::new(),
             modules: BTreeSet::new(),
+            dependency_roots,
             visiting: BTreeSet::new(),
         };
         let path = index.root.join("src/lib.rs");
@@ -470,10 +553,15 @@ impl Index {
                     .rsplit_once("::")
                     .map(|(parent, _)| parent.to_string())
                     .ok_or_else(|| format!("super escapes root in {path}"))?,
-                name => self.lookup(module, name, cfg, stack)?,
+                name => self.lookup_head(module, name, cfg, stack)?,
             };
             for name in segments {
-                if name == "super" {
+                if current.starts_with("::") {
+                    if name == "super" {
+                        return Err(format!("super inside dependency path {path}"));
+                    }
+                    current = format!("{current}::{name}");
+                } else if name == "super" {
                     current = current
                         .rsplit_once("::")
                         .map(|(parent, _)| parent.to_string())
@@ -488,12 +576,35 @@ impl Index {
         result
     }
 
+    /// Resolves the first segment of a path. A name with no binding in scope falls back to a
+    /// declared dependency crate, as the extern prelude does, and resolves to `::name`.
+    fn lookup_head(
+        &self,
+        module: &str,
+        name: &str,
+        cfg: &CfgFormula,
+        stack: &mut BTreeSet<String>,
+    ) -> Result<String, String> {
+        self.lookup_with(module, name, cfg, stack, true)
+    }
+
     fn lookup(
         &self,
         module: &str,
         name: &str,
         cfg: &CfgFormula,
         stack: &mut BTreeSet<String>,
+    ) -> Result<String, String> {
+        self.lookup_with(module, name, cfg, stack, false)
+    }
+
+    fn lookup_with(
+        &self,
+        module: &str,
+        name: &str,
+        cfg: &CfgFormula,
+        stack: &mut BTreeSet<String>,
+        head: bool,
     ) -> Result<String, String> {
         let key = format!("lookup:{module}::{name}");
         if !stack.insert(key.clone()) {
@@ -550,6 +661,7 @@ impl Index {
                     .into_iter()
                     .next()
                     .ok_or_else(|| "missing resolved symbol".into()),
+                0 if head && self.dependency_roots.contains(name) => Ok(format!("::{name}")),
                 0 => Err(format!("unresolved symbol {module}::{name}")),
                 _ => Err(format!(
                     "ambiguous ownership of {module}::{name}: {answers:?}"
