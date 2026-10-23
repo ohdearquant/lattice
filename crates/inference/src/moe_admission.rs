@@ -602,7 +602,7 @@ impl AdmissionPolicy for FreqAdmissionPolicy {
 /// layer — no cross-layer cache sharing. This models ONE logical
 /// (layer, tensor) cache per layer, NOT the two physical
 /// `ExpertSlotCache` instances (gate_up and down) production actually
-/// runs per MoE layer (`metal_qwen35.rs` constructs both with the same
+/// runs per MoE layer (`forward/metal_qwen35/inner/weights.rs` constructs both with the same
 /// `num_slots` and plans both against the same `selected` id sequence —
 /// see [`LayerStats`]'s doc comment for what this means for reported raw
 /// counts). Adding a new challenger is one new variant plus one
@@ -644,8 +644,8 @@ impl PolicySpec {
 /// **These counts are per single LOGICAL (layer, tensor) cache, not
 /// physical runtime events.** Production instantiates two `ExpertSlotCache`
 /// instances per MoE layer (gate_up and down) and replays the same
-/// selected-expert id sequence into both (`metal_qwen35.rs`'s
-/// `encode_moe_ffn`), so each miss and eviction reported here happens
+/// selected-expert id sequence into both (`encode_moe_ffn` in
+/// `forward/metal_qwen35/inner/layers/mod.rs`), so each miss and eviction reported here happens
 /// TWICE physically — once per tensor — with identical resident histories
 /// in both (same ids, same order, same `num_slots`). `hit_rate` and
 /// `delta_vs_baseline_pp` are unaffected by this (both tensors compute the

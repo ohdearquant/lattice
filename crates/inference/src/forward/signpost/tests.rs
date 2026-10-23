@@ -82,7 +82,8 @@ fn nested_intervals_emit_begin_end_in_order() {
 }
 
 // Mutation-sensitive: pairing regression for `Label::DecodeSample`, the
-// exact label `sample_decode_traced` in `metal_qwen35.rs` opens --
+// exact label `sample_decode_traced` in `forward/metal_qwen35/inner/sampling.rs`
+// opens --
 // that call site is the *only* place any
 // of the five decode loops open a `decode.sample` interval (previously
 // five independent copies, two of which had already drifted with no

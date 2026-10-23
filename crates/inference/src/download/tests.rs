@@ -120,7 +120,8 @@ fn offline_cache_miss_errors_without_download() {
 /// Serializes tests in this module that mutate `LATTICE_OFFLINE` in the real
 /// process environment. `set_var`/`remove_var` are `unsafe` because they can race
 /// with a read on another thread; this is the same per-variable lock convention
-/// `metal_qwen35.rs`'s `with_self_spec_env` uses for `LATTICE_SELF_SPEC`. Restores
+/// `forward/metal_qwen35/inner/tests.rs`'s `with_self_spec_env` uses for
+/// `LATTICE_SELF_SPEC`. Restores
 /// the prior value (including "was unset") on the way out, even if `f` panics.
 fn with_lattice_offline_env<R>(value: &str, f: impl FnOnce() -> R) -> R {
     use std::sync::Mutex;
