@@ -1212,7 +1212,7 @@ fn has_regex_split(pt: &JsonValue) -> bool {
 }
 
 /// Fail closed on explicit `tokenizer.json` `pre_tokenizer` metadata this
-/// parser cannot honestly model (#330 finding 1).
+/// parser does not support (#330).
 ///
 /// `from_vocab_and_merges_with_config` always defaults to `Gpt4Regex`
 /// pre-tokenization, and `detect_gpt4_regex_pretokenizer` above only ever
@@ -1239,8 +1239,7 @@ fn has_regex_split(pt: &JsonValue) -> bool {
 ///   the trailing `ByteLevel(use_regex:false)` is just "don't split again".
 ///   Any other/unsupported sibling (e.g. `Metaspace`, `Whitespace`) rejects
 ///   the whole sequence even when another child is a regex `Split` — a
-///   `Split` does not honestly dominate later pre-tokenizers (#330 residual
-///   finding).
+///   `Split` does not override later pre-tokenizer behavior (#330).
 /// - Bare top-level `ByteLevel` with `use_regex` absent or `true` -> accept
 ///   (HF's default `use_regex=true` is exactly what `Gpt4Regex`
 ///   approximates; this is the common gpt2/roberta Hub shape).
@@ -1284,7 +1283,7 @@ fn is_regex_split_node(pt: &JsonValue) -> bool {
 /// Deliberately does NOT use `has_regex_split`'s `any()`-over-descendants
 /// shortcut here: a regex `Split` earlier in a `Sequence` does not make an
 /// unrelated, unsupported sibling (e.g. `Metaspace`) honest to run through
-/// `Gpt4Regex` (#330 residual finding).
+/// `Gpt4Regex` (#330).
 fn is_supported_bpe_pretokenizer(pt: &JsonValue) -> bool {
     if is_regex_split_node(pt) {
         return true;

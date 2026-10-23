@@ -408,12 +408,8 @@ async fn main() {
 
             let model_path = Path::new(&model);
             let evidence = lattice_inference::serving_provider::inspect_checkpoint(model_path);
-            let format = evidence.format();
 
             eprintln!("Loading model from {model}...");
-            // The format picks the backend and `config.json` picks the family.
-            // A Gemma 4 checkpoint in the Q4 format has no route and is refused
-            // here, before any loader runs.
             let selected = match lattice_inference::serving_provider::select(
                 evidence,
                 lattice_inference::serving_provider::ServingEntry::Lattice,
@@ -424,12 +420,12 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let Some(route) = selected.legacy_route() else {
+            let Some(marker) = selected.lattice_selection_marker() else {
                 eprintln!("Error: {}", backend::unloadable_format_message(model_path));
                 std::process::exit(1);
             };
-            eprintln!("{}", route.selection_marker(format));
-            let implicit_embedding_plan = selected.implicit_pooled_embeddings(&model);
+            eprintln!("{marker}");
+            let implicit_embedding_plan = selected.implicit_embeddings(&model);
             #[cfg(feature = "metal-gpu")]
             let context_window = chat::chat_max_cache_len();
             #[cfg(not(feature = "metal-gpu"))]
@@ -842,51 +838,55 @@ mod cpu_serve_prompt_tests {
     #[cfg(feature = "test-utils")]
     use lattice_inference::{GenerateConfig, Tokenizer};
 
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        &source[source.find(start).unwrap() + start.len()..source.find(end).unwrap()]
+    }
+
     #[test]
     fn cpu_serve_load_keeps_tokenizer_initialization() {
         let startup = include_str!("main.rs")
-            .split("Command::Serve {")
-            .nth(1)
-            .unwrap();
+            .split_once("Command::Serve {")
+            .unwrap()
+            .1;
+        assert!(startup.contains("selected.lattice_selection_marker()"));
+        assert!(startup.contains("selected.implicit_embeddings(&model)"));
+        assert!(startup.contains("let context_window = chat::chat_max_cache_len();"));
+        assert!(startup.contains("                    context_window,\n                },"));
         assert!(startup.contains("selected.open_lattice("));
         let provider_api = include_str!("../../serving_provider.rs");
-        let open_lattice = provider_api
-            .split_once("pub fn open_lattice(")
-            .map(|(_, body)| body)
-            .expect("the selected provider exposes the lattice route opener");
-        let open_lattice_body = open_lattice
-            .split_once("\n    /// Validate standalone flag presence")
-            .map(|(body, _)| body)
-            .expect("the lattice route opener ends before standalone validation");
-        assert!(open_lattice_body.contains("self.load_lattice_cpu()?"));
-        let cpu_loader = provider_api
-            .split_once("pub fn load_lattice_cpu(")
-            .map(|(_, body)| body)
-            .expect("the selected provider exposes its CPU loader");
-        let cpu_loader_body = cpu_loader
-            .split_once("\n    /// Open the selected route")
-            .map(|(body, _)| body)
-            .expect("the CPU loader body ends before the lattice route opener");
-        assert!(cpu_loader_body.contains("self.provider.load_lattice_cpu(&self.evidence)"));
+        assert!(provider_api.contains("pub fn open_lattice("));
+        assert!(provider_api.contains("plan.open(options, generation_admission)"));
+        let qwen_provider = include_str!("../../serving_provider/providers/qwen.rs");
+        let qwen_plan = source_between(
+            qwen_provider,
+            "impl LatticeRoutePlan for QwenLatticeRoutePlan",
+            "impl ServingProvider for QwenProvider",
+        );
+        let qwen_open = qwen_plan.split_once("fn open(").unwrap().1;
+        let cpu_arm = source_between(
+            qwen_open,
+            "ModelFormat::Safetensors => {",
+            "ModelFormat::Q4 => {",
+        );
+        let metal_arm = source_between(qwen_open, "ModelFormat::Q4 => {", "_ => {");
+        assert!(cpu_arm.contains("cpu::load(&self.evidence)?"));
+        assert!(cpu_arm.contains("ServingHandle::shared_cpu(cpu, generation_admission)"));
+        assert!(!cpu_arm.contains("lattice_worker::open"));
+        assert!(metal_arm.contains("lattice_worker::open(self.evidence.directory, options)"));
         let provider = include_str!("../../serving_provider/providers/qwen/cpu.rs");
-        let loader = provider
-            .split_once("pub(super) fn load(")
-            .map(|(_, loader)| loader)
-            .expect("the Qwen CPU provider exposes its selected loader");
-        let loader_body = loader
-            .split_once("\n}\n\npub(crate) fn from_model")
-            .map(|(body, _)| body)
-            .expect("the Qwen CPU loader body ends before from_model");
+        let loader_body = source_between(
+            provider,
+            "pub(super) fn load(",
+            "\n}\n\npub(crate) fn from_model",
+        );
         assert!(
             loader_body.contains("Ok(from_model(model))"),
             "the production loader must use the tokenizer-initializing constructor"
         );
         let initialization = provider
             .find("model.ensure_tokenizer_max_seq_len(model.max_context());")
-            .expect("the Qwen CPU provider initializes tokenizer capacity");
-        let sharing = provider
-            .find("let model = Arc::new(model);")
-            .expect("the Qwen CPU provider shares the initialized model");
+            .unwrap();
+        let sharing = provider.find("let model = Arc::new(model);").unwrap();
         assert!(initialization < sharing);
     }
 
