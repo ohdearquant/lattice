@@ -372,7 +372,7 @@ dense fp16/bf16 model
 
 Do **NOT** apply QuaRot's Hadamard first and then expect PCA slicing to work. Hadamard deliberately spreads information across all coordinates, making dimensions look similarly important. After slicing, the reduced model can be rotated for quantization.
 
-**Implementation detail**: lattice's current `RandomizedHadamard` (ADR-044) requires **power-of-two** dimensions (`hadamard.rs:139`). `d'=896` and `d'=768` are NOT powers of two — they require a `BlockHadamard` basis (block-diagonal Hadamard with block_size being a power of two). The SliceGPT→QuaRot composition is therefore gated on P9's `BlockHadamard` implementation. Until then, the SliceGPT+QuaRot pipeline is restricted to power-of-two `d'` values (e.g., `d'=512` for Qwen3.5-0.8B with d=1024 — a 50% slice, which may be too aggressive). For Qwen3.5-0.8B: d'=896 (12.5% slice) and d'=768 (25%) are the target ratios, but both require `BlockHadamard`.
+**Implementation detail**: lattice's current `RandomizedHadamard` (ADR-044) requires **power-of-two** dimensions (`crates/quant/src/quarot/hadamard.rs`). `d'=896` and `d'=768` are NOT powers of two — they require a `BlockHadamard` basis (block-diagonal Hadamard with block_size being a power of two). The SliceGPT→QuaRot composition is therefore gated on P9's `BlockHadamard` implementation. Until then, the SliceGPT+QuaRot pipeline is restricted to power-of-two `d'` values (e.g., `d'=512` for Qwen3.5-0.8B with d=1024 — a 50% slice, which may be too aggressive). For Qwen3.5-0.8B: d'=896 (12.5% slice) and d'=768 (25%) are the target ratios, but both require `BlockHadamard`.
 
 **Why SliceGPT on Qwen3.5-0.8B is experimental.** The original SliceGPT ICLR paper reports OPT, LLaMA-2, and Phi-2 results; it does NOT provide Qwen-family tables. No published Qwen-family SliceGPT results exist. Treat as research path with strict PPL gates and conservative slice ratios (5-15% for 0.5-1B models).
 
@@ -639,7 +639,8 @@ lattice_pruning.json        # method, sparsity stats
 
 ### Lattice Code
 
-- QuaRot infrastructure: `crates/inference/src/quant/quarot/` (ADR-044)
+- QuaRot infrastructure: `crates/quant/src/quarot/` (Hadamard and rotation primitives),
+  `crates/inference/src/quant/quarot/` (conversion pipeline; ADR-044)
 - Rotation absorption: `quant::quarot::rotation` (input-side and output-side)
 - Rotation plan: `quant::quarot::plan` (per-tensor recipe for Qwen3.5 hybrid)
 - Qwen3.5 config: `crates/inference/src/model/qwen35_config.rs` (AttentionTag via ADR-059, layer_mask field)

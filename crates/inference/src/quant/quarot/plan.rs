@@ -273,7 +273,7 @@ impl OnlineTransformSite {
 
 /// Artifact-level record of a single online (runtime) rotation: which
 /// physical site it attaches to, which side of the consuming weight
-/// absorbs its transpose (per `rotation.rs`'s documented `y = W R^T (R x)`
+/// absorbs its transpose (per `lattice_quant::quarot::rotation`'s documented `y = W R^T (R x)`
 /// algebra), its seed(s)/block size, and the explicit layer scope.
 ///
 /// **v0 scope (issue #703 PR1): validated at load, not yet executed.** The
@@ -296,7 +296,7 @@ pub struct OnlineRotationSpec {
     /// for R4) absorbs the counter-rotation. Both R3 and R4 use
     /// `InputSide`: the *runtime* activation is rotated by `R`, and the
     /// weight's input side absorbs `R^T` offline — matching
-    /// `rotation.rs`'s `y = W · R^T · (R · x)` identity exactly, because
+    /// `lattice_quant::quarot::rotation`'s `y = W · R^T · (R · x)` identity exactly, because
     /// in both cases the transform sits on an activation that is the
     /// weight's *input*, not its output onto the residual stream.
     pub side: AbsorptionSide,

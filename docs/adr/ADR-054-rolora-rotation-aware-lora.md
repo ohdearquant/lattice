@@ -41,7 +41,7 @@ alignment problem reduces to a metadata handshake.
 | ----------------------------- | ------------------------------------------- | -------------------------------------------------- |
 | `LoraAdapter` / `LoraLayer`   | `crates/tune/src/lora/mod.rs`               | Active                                             |
 | `LoraConfig`                  | `crates/tune/src/lora/mod.rs`               | Active                                             |
-| `RandomizedHadamard`          | `crates/inference/src/quant/quarot/`        | Active — deterministic from seed                   |
+| `RandomizedHadamard`          | `crates/quant/src/quarot/hadamard.rs`       | Active — deterministic from seed                   |
 | QuaRot rotation plan          | `crates/inference/src/quant/quarot/plan.rs` | Active — per-projection side rules                 |
 | QuaRot seed in artifact       | `config.json` of `quantize_quarot` output   | **NOT YET PERSISTED** (see ADR-045 §Prerequisites) |
 | Serving-side counter-rotation | `crates/inference/src/…`                    | Active (ADR-045, PRs #35-#37)                      |
