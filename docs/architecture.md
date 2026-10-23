@@ -13,8 +13,10 @@ lattice-transport   (standalone — optimal transport math, Sinkhorn-Knopp)
        │
        ▼
 lattice-tokenizer   ←── lattice-inference-core   (WordPiece, SentencePiece, BPE tokenizers)
+lattice-grammar     ←── lattice-inference-core   (JSON Schema, GBNF, constrained decoding)
 lattice-inference   ←── lattice-inference-core
                     ←── lattice-tokenizer
+                    ←── lattice-grammar
                     ←── lattice-fann (optional, `mixture` feature)
                                      (transformer forward pass, weights)
        │
@@ -25,9 +27,10 @@ lattice-tune    ←── lattice-fann
 ```
 
 The three leaf crates (`inference-core`, `fann`, `transport`) have zero intra-workspace
-dependencies and can be used standalone. `tokenizer` depends only on `inference-core`, and
-`inference` builds on both (plus `fann` under the optional `mixture` feature), re-exporting the
-tokenizer and error types at their original paths. Consumer crates (`embed`, `tune`) compose them.
+dependencies and can be used standalone. `tokenizer` and `grammar` each depend only on
+`inference-core` at runtime; grammar uses tokenizer in tests. `inference` builds on all three
+(plus `fann` under the optional `mixture` feature), re-exporting tokenizer, grammar and error
+items at their original paths. Consumer crates (`embed`, `tune`) compose them.
 
 ## Design Philosophy
 
@@ -47,6 +50,14 @@ Async lives in `lattice-embed`'s service layer where I/O (model download, cache 
 justifies it.
 
 ## Crate Descriptions
+
+### lattice-grammar
+
+Grammar-constrained decoding: JSON Schema and GBNF compilers, a byte-level pushdown
+automaton, byte trie and vocabulary masks. Its only internal runtime dependency is
+`lattice-inference-core`; `lattice-tokenizer` is a test dependency. The facade retains
+every `lattice_inference::grammar::...` path. Profiling probes use `bench-internals`,
+forwarded by the facade feature of the same name.
 
 ### lattice-inference
 

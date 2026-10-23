@@ -43,15 +43,15 @@
 //! - `mask_logits` on a state past the cap: reuses the trie built in `new`,
 //!   with no build cost on the first such call.
 
-use crate::grammar::gbnf::parse_gbnf;
-use crate::grammar::json_schema::compile;
-use crate::grammar::pda::{
+use crate::gbnf::parse_gbnf;
+use crate::json_schema::compile;
+use crate::pda::{
     CompiledGrammar, GrammarState, SimResult, StackLimitError, StepResult, advance_byte,
     initial_grammar_state, simulate_token,
 };
-use crate::grammar::spec::GrammarSpec;
-use crate::grammar::trie::ByteTrie;
-use crate::grammar::vocab_partition::VocabPartition;
+use crate::spec::GrammarSpec;
+use crate::trie::ByteTrie;
+use crate::vocab_partition::VocabPartition;
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -319,26 +319,26 @@ impl fmt::Display for GrammarError {
 }
 impl std::error::Error for GrammarError {}
 
-impl From<GrammarError> for crate::error::InferenceError {
+impl From<GrammarError> for lattice_inference_core::InferenceError {
     fn from(error: GrammarError) -> Self {
         Self::InvalidInput(error.0)
     }
 }
 
-impl From<crate::grammar::json_schema::SchemaError> for GrammarError {
-    fn from(e: crate::grammar::json_schema::SchemaError) -> Self {
+impl From<crate::json_schema::SchemaError> for GrammarError {
+    fn from(e: crate::json_schema::SchemaError) -> Self {
         GrammarError(e.0)
     }
 }
 
-impl From<crate::grammar::gbnf::GbnfError> for GrammarError {
-    fn from(e: crate::grammar::gbnf::GbnfError) -> Self {
+impl From<crate::gbnf::GbnfError> for GrammarError {
+    fn from(e: crate::gbnf::GbnfError) -> Self {
         GrammarError(e.0)
     }
 }
 
-impl From<crate::grammar::pda::BuilderError> for GrammarError {
-    fn from(e: crate::grammar::pda::BuilderError) -> Self {
+impl From<crate::pda::BuilderError> for GrammarError {
+    fn from(e: crate::pda::BuilderError) -> Self {
         GrammarError(e.0)
     }
 }
@@ -527,16 +527,15 @@ impl GrammarEngine {
         let states = enumerate_grammar_states(
             &grammar,
             &vocab_bytes,
-            crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
+            crate::vocab_partition::MAX_GRAMMAR_STATES,
         )?;
         let bfs_ns = bfs_t0.elapsed().as_nanos() as u64;
 
-        let state_limit_exceeded =
-            states.len() >= crate::grammar::vocab_partition::MAX_GRAMMAR_STATES;
+        let state_limit_exceeded = states.len() >= crate::vocab_partition::MAX_GRAMMAR_STATES;
         if state_limit_exceeded {
             tracing::warn!(
                 "grammar state count hit limit ({}); some states may fall back to context-dependent checks",
-                crate::grammar::vocab_partition::MAX_GRAMMAR_STATES
+                crate::vocab_partition::MAX_GRAMMAR_STATES
             );
         }
         let reachable_states = states.len();
@@ -560,7 +559,7 @@ impl GrammarEngine {
                 bfs_ns,
                 partition_build_ns,
                 reachable_states,
-                capped_states: crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
+                capped_states: crate::vocab_partition::MAX_GRAMMAR_STATES,
             }
         });
 
@@ -803,7 +802,7 @@ impl GrammarEngine {
 
     /// Compute the grammar mask for `state` via the byte trie.
     ///
-    /// Same contract as `mask_by_simulation` (see [`crate::grammar::trie`]),
+    /// Same contract as `mask_by_simulation` (see [`crate::trie`]),
     /// used as the over-cap fallback in `mask_logits` in place of the
     /// full-vocab independent simulation. Uses the trie `new` built; the
     /// initializer below only runs if that cell were ever left empty.

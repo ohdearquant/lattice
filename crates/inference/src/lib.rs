@@ -254,6 +254,7 @@ pub use crate::generation::TokenLogprob;
 pub use crate::generation::TopLogprob;
 /// Grammar-constrained decoding engine, reachable from the root because
 /// [`GenerateConfig::grammar`] carries one. See [`grammar`].
+#[doc(no_inline)]
 pub use crate::grammar::GrammarEngine;
 /// BERT encoder configuration. See [`BertModel`] and [`model`].
 pub use crate::model::BertConfig;
