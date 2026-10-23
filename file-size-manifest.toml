@@ -25,10 +25,6 @@ ceiling = 3311
 path = "crates/inference/tests/metal_measurement_lock_contract.rs"
 ceiling = 4984
 
-[[ratchet]]
-path = "scripts/perf-bench-gate.py"
-ceiling = 3818
-
 [[data]]
 path = "Cargo.lock"
 
