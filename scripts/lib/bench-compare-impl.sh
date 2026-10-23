@@ -1167,23 +1167,27 @@ criterion_group_dir() {
 }
 
 declared_groups_from_source() {
-  local bench_source="$1" name
-  command grep -oE 'benchmark_group\("[^"]+"\)' "$bench_source" \
-    | command sed -E 's/^benchmark_group\("(.*)"\)$/\1/' \
-    | while IFS= read -r name; do
-        criterion_group_dir "$name" || exit 2
-      done \
-    | LC_ALL=C sort -u
+  local bench_source="$1" names name mapped out=""
+  # A source declaring no literal group makes the grep exit 1, and under pipefail a
+  # failing substitution would end the script here with no message. Let the empty
+  # result reach the caller's refusal, which names the file and the reason.
+  names="$(command grep -oE 'benchmark_group\("[^"]+"\)' "$bench_source" \
+    | command sed -E 's/^benchmark_group\("(.*)"\)$/\1/' || true)"
+  [ -n "$names" ] || return 0
+  # The loop reads a here-string rather than a pipe so a name whose directory
+  # cannot be derived returns from this function instead of ending a subshell.
+  while IFS= read -r name; do
+    mapped="$(criterion_group_dir "$name")" || return 2
+    out+="$mapped"$'\n'
+  done <<< "$names"
+  printf '%s' "$out" | LC_ALL=C sort -u
 }
 
 reconcile_criterion_groups() {
   local target="$1" criterion_root="$2" bench_source="$3"
   local declared actual stray
 
-  # A source declaring no literal group makes the grep exit 1, and under pipefail a
-  # failing substitution would end the script here with no message. Let the empty
-  # result reach the refusal below, which names the file and the reason.
-  declared="$(declared_groups_from_source "$bench_source" || true)"
+  declared="$(declared_groups_from_source "$bench_source")" || exit 2
   if [ -z "$declared" ]; then
     echo "bench-compare: $target: found zero declared Criterion groups in" \
          "$bench_source — refusing. An empty declared set would let every" \
