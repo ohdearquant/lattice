@@ -552,8 +552,8 @@ fn anyof_typed_mixed_enum_folded() {
 /// must be a string AND equal a numeric enum member, so it accepts no string.
 /// `string_class_of` must classify it as the empty literal set (a dead
 /// branch), NOT `None` — `None` routes it through `compile_string_type`'s
-/// `json_string` fallback and over-accepts arbitrary strings (issue #472,
-/// finding 2). Mutation guard: returning `None` accepts "zzz".
+/// `json_string` fallback and over-accepts arbitrary strings (issue #472).
+/// Mutation guard: returning `None` accepts "zzz".
 #[test]
 fn anyof_typed_enum_no_string_members_rejected() {
     let g = compile_ok(r#"{"anyOf":[{"type":"integer"},{"type":"string","enum":[1,2]}]}"#);
@@ -567,8 +567,8 @@ fn anyof_typed_enum_no_string_members_rejected() {
 /// `const` and `enum` are conjunctive, so `{"type":"string","const":"x","enum":["y"]}`
 /// accepts no value (nothing equals both "x" and "y"). `string_class_of` must
 /// fold the const only when a present enum contains it, classifying this
-/// conflicting branch as the empty literal set (issue #472,
-/// finding 1). Mutation guard: folding the const before checking the enum
+/// conflicting branch as the empty literal set (issue #472).
+/// Mutation guard: folding the const before checking the enum
 /// accepts "x"; folding the enum before checking the const accepts "y".
 #[test]
 fn anyof_const_conflicting_enum_rejected() {
@@ -1428,7 +1428,7 @@ fn anyof_mixed_type_array_sibling_accepts_strings() {
     );
 }
 
-/// DoS bound (issue #473 extends issue #474 finding 2): a small
+/// DoS bound (issues #473 and #474): a small
 /// top-level `anyOf` (2 branches) whose SECOND branch is a nested pure
 /// union containing MAX_ANYOF_BRANCHES sibling branches must still be
 /// rejected by the branch-count cap — proving `flatten_any_of_branches`
