@@ -1145,21 +1145,49 @@ bench_source_for_target() {
   printf '%s' "$resolved"
 }
 
+# The comparison runs in Criterion's directory namespace, not the source's.
+# Criterion 0.5.1 (`make_filename_safe`, src/report.rs) writes a group named
+# `backward_stage0/gdn_backward` to the directory `backward_stage0_gdn_backward`:
+# each of ? " / \ * < > : | ^ becomes `_`, and the result is cut to 64 bytes at
+# a character boundary. Each declared name is mapped the same way before the
+# comparison. A declared name that needs the cut and contains a non-ASCII byte
+# refuses rather than guessing where the boundary falls.
+criterion_group_dir() {
+  local mapped
+  mapped="$(printf '%s' "$1" | LC_ALL=C tr '?"/\\*<>:|^' '__________')"
+  if [ "$(printf '%s' "$mapped" | LC_ALL=C wc -c | tr -d ' ')" -gt 64 ]; then
+    if printf '%s' "$mapped" | LC_ALL=C command grep -q '[^ -~]'; then
+      echo "bench-compare: declared group '$1' is longer than 64 bytes and" \
+           "not ASCII, so its Criterion directory cannot be derived; refusing." >&2
+      return 1
+    fi
+    mapped="$(printf '%s' "$mapped" | LC_ALL=C cut -c1-64)"
+  fi
+  printf '%s\n' "$mapped"
+}
+
 declared_groups_from_source() {
-  local bench_source="$1"
-  command grep -oE 'benchmark_group\("[^"]+"\)' "$bench_source" \
-    | command sed -E 's/^benchmark_group\("(.*)"\)$/\1/' \
-    | LC_ALL=C sort -u
+  local bench_source="$1" names name mapped out=""
+  # A source declaring no literal group makes the grep exit 1, and under pipefail a
+  # failing substitution would end the script here with no message. Let the empty
+  # result reach the caller's refusal, which names the file and the reason.
+  names="$(command grep -oE 'benchmark_group\("[^"]+"\)' "$bench_source" \
+    | command sed -E 's/^benchmark_group\("(.*)"\)$/\1/' || true)"
+  [ -n "$names" ] || return 0
+  # The loop reads a here-string rather than a pipe so a name whose directory
+  # cannot be derived returns from this function instead of ending a subshell.
+  while IFS= read -r name; do
+    mapped="$(criterion_group_dir "$name")" || return 2
+    out+="$mapped"$'\n'
+  done <<< "$names"
+  printf '%s' "$out" | LC_ALL=C sort -u
 }
 
 reconcile_criterion_groups() {
   local target="$1" criterion_root="$2" bench_source="$3"
   local declared actual stray
 
-  # A source declaring no literal group makes the grep exit 1, and under pipefail a
-  # failing substitution would end the script here with no message. Let the empty
-  # result reach the refusal below, which names the file and the reason.
-  declared="$(declared_groups_from_source "$bench_source" || true)"
+  declared="$(declared_groups_from_source "$bench_source")" || exit 2
   if [ -z "$declared" ]; then
     echo "bench-compare: $target: found zero declared Criterion groups in" \
          "$bench_source — refusing. An empty declared set would let every" \

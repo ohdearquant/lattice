@@ -148,7 +148,7 @@ if [[ "$args" == *" --no-run "* ]]; then
 fi
 if [[ "$args" == *" --list "* ]]; then
   if [[ "$args" == *" lattice-inference "* ]]; then
-    printf '%s\n' 'rms_norm/896: benchmark'
+    printf '%s\n' "${STUB_INFERENCE_GROUP_DIR:-rms_norm}/896: benchmark"
   else
     printf '%s\n' 'simd_dot_product/scalar/384: benchmark'
   fi
@@ -159,16 +159,16 @@ if [[ "$args" == *" --save-baseline "* ]]; then
   baseline_name="${args#* --save-baseline }"
   baseline_name="${baseline_name%% *}"
   if [[ "$args" == *" lattice-inference "* ]]; then
-    write_baseline "rms_norm/896" "$baseline_name"
-    write_baseline "rms_norm/4096" "$baseline_name"
+    write_baseline "${STUB_INFERENCE_GROUP_DIR:-rms_norm}/896" "$baseline_name"
+    write_baseline "${STUB_INFERENCE_GROUP_DIR:-rms_norm}/4096" "$baseline_name"
   else
     write_baseline "simd_dot_product/scalar/384" "$baseline_name"
   fi
 else
   if [[ "$args" == *" lattice-inference "* ]]; then
-    write_head "rms_norm/896"
+    write_head "${STUB_INFERENCE_GROUP_DIR:-rms_norm}/896"
     if [[ "${STUB_REMOVE_RMS_4096:-0}" != "1" ]]; then
-      write_head "rms_norm/4096"
+      write_head "${STUB_INFERENCE_GROUP_DIR:-rms_norm}/4096"
     fi
   else
     write_head "simd_dot_product/scalar/384"
