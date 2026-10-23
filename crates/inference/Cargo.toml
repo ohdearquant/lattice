@@ -60,6 +60,7 @@ serve = [
     "dep:mime",
     "dep:http-body-util",
     "dep:hyper",
+    "dep:clap",
     "dep:hyper-util",
     "dep:tower",
 ]
@@ -113,7 +114,7 @@ serde_json.workspace = true
 base64.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-clap = { workspace = true }
+clap = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
