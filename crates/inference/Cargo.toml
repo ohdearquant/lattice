@@ -141,6 +141,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 lattice-fann = { version = "0.14.0", path = "../fann", optional = true }
 lattice-grammar = { version = "0.14.0", path = "../grammar" }
 lattice-inference-core = { version = "0.14.0", path = "../inference-core" }
+lattice-quant = { version = "0.14.0", path = "../quant" }
 lattice-tokenizer = { version = "0.14.0", path = "../tokenizer" }
 lattice-weights = { version = "0.14.0", path = "../weights" }
 

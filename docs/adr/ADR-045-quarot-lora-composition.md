@@ -20,7 +20,7 @@ The next step is **LoRA adapter injection on top of the QuaRot Q4 base**. This c
 | CPU forward LoRA injection          | `crates/inference/src/model/qwen35/model.rs:17` | Active — `Qwen35Model.lora` field, called per projection                                                                                                                       |
 | Metal Q4 forward path               | `crates/inference/src/forward/metal_qwen35.rs`  | Active — LoRA dispatch after each projection (PR #37)                                                                                                                          |
 | QuaRot seed in artifact             | `config.json` in quantize_quarot output         | Shipped — `inject_quarot_seed` at `crates/inference/src/quant/quarot/convert.rs:136` writes the seed into the output `config.json` under both `text_config` and top-level keys |
-| `RandomizedHadamard` reconstruction | `crates/inference/src/quant/quarot/`            | Active — deterministic from seed                                                                                                                                               |
+| `RandomizedHadamard` reconstruction | `crates/quant/src/quarot/hadamard.rs`           | Active — deterministic from seed                                                                                                                                               |
 
 ### Gaps (remaining)
 

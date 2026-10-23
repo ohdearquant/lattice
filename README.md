@@ -137,12 +137,14 @@ regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
 | [`lattice-tokenizer`](crates/tokenizer/)           | Pure Rust tokenizers: WordPiece, SentencePiece, Qwen and Gemma BPE, model-directory auto-detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-tokenizer.svg)](https://crates.io/crates/lattice-tokenizer)           |
 | [`lattice-grammar`](crates/grammar/)               | Grammar-constrained decoding: JSON Schema and GBNF compilation, byte-level PDA, vocabulary masks; re-exported by `lattice-inference`                                  | [![](https://img.shields.io/crates/v/lattice-grammar.svg)](https://crates.io/crates/lattice-grammar)               |
 | [`lattice-weights`](crates/weights/)               | Weight storage: safetensors, f32/f16/Q3/Q4/Q8 representations and model-directory format detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-weights.svg)](https://crates.io/crates/lattice-weights)               |
+| [`lattice-quant`](crates/quant/)                   | Quantization primitives: bounded Q4 manifest reading, Hadamard transforms and rotation absorption; re-exported by `lattice-inference`                                 | [![](https://img.shields.io/crates/v/lattice-quant.svg)](https://crates.io/crates/lattice-quant)                   |
 | [`lattice-inference-core`](crates/inference-core/) | Shared base types: `InferenceError`, re-exported by `lattice-inference`                                                                                               | [![](https://img.shields.io/crates/v/lattice-inference-core.svg)](https://crates.io/crates/lattice-inference-core) |
 | [`lattice-transport`](crates/transport/)           | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport)           |
 
 Three leaf crates (`fann`, `transport`, `inference-core`) have zero intra-workspace
 dependencies. `tokenizer`, `grammar` and `weights` each depend only on `inference-core`
-at runtime. `inference` depends on all four unconditionally and pulls in `fann` through
+at runtime. `quant` depends on `inference-core` and `weights`. `inference` depends on
+all five unconditionally and pulls in `fann` through
 the optional `mixture` or `metal-gpu` features. Each can be used on its own.
 
 ---
@@ -555,6 +557,7 @@ lattice-inference      (transformer kernel: BERT/Qwen3 forward pass)
     +---> lattice-tokenizer      (tokenizers; depends on inference-core)
     +---> lattice-grammar        (constrained decoding; depends on inference-core)
     +---> lattice-weights        (weight storage and format detection; depends on inference-core)
+    +---> lattice-quant          (quantization primitives; depends on inference-core and weights)
     |
     +---> CPU (primary)      Metal (macOS)     WGPU (fallback)
           AVX2/NEON kernels   Apple Silicon      Vulkan/DX12

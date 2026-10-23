@@ -173,6 +173,7 @@ const SPLIT_CRATE_SOURCE_ROOTS: &[&str] = &[
     "../tokenizer/src",
     "../grammar/src",
     "../weights/src",
+    "../quant/src",
 ];
 
 /// The contract: outside [`TRUST_BOUNDARY_FILE`], no file under this crate's
