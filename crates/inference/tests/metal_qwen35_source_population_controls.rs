@@ -782,7 +782,9 @@ fn check_rows(rows: &[Row], setup: impl Fn(&Fixture)) {
         });
         let matched = match (&row.expect, &actual) {
             (Expect::Owner(file), Ok(found)) => found == file,
-            (Expect::Refused(parts), Err(error)) => parts.iter().all(|part| error.contains(part)),
+            (Expect::Refused(parts), Err(error)) => {
+                !parts.is_empty() && parts.iter().all(|part| error.contains(part))
+            }
             _ => false,
         };
         if !matched {
@@ -994,11 +996,17 @@ fn call_site_shapes_are_counted_or_refused_by_rule() {
             },
             Row {
                 name: "a call through a local glob",
-                files: &[(
-                    ROOT,
-                    "pub fn sample() {}\npub fn generate() {\n\
-                     use crate::forward::metal_qwen35::*;\nsample();\n}\n",
-                )],
+                files: &[
+                    ("src/forward/mod.rs", "pub mod metal_qwen35; mod caller;\n"),
+                    (
+                        "src/forward/caller.rs",
+                        "pub fn generate() {\nuse super::metal_qwen35::*;\nsample();\n}\n",
+                    ),
+                    (
+                        ROOT,
+                        "pub fn sample() {}\npub use super::caller::generate;\n",
+                    ),
+                ],
                 expect: Expect::Owner(ROOT),
             },
             Row {
@@ -1055,9 +1063,9 @@ fn call_site_shapes_are_counted_or_refused_by_rule() {
                 name: "a call written inside a string is not a call",
                 files: &[(
                     ROOT,
-                    "pub fn sample() {}\npub fn generate() { let _text = \"sample()\"; }\n",
+                    "pub fn sample() {}\npub fn generate() { sample(); let _text = \"sample()\"; }\n",
                 )],
-                expect: Expect::Refused(&["caller manifest differs"]),
+                expect: Expect::Owner(ROOT),
             },
         ],
         |_| {},
