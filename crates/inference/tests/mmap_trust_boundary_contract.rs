@@ -113,6 +113,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "support/workspace_metadata.rs"]
+mod workspace_metadata;
+
 /// The two lexical tokens that name lattice's mmap **construction** API:
 /// `memmap2::Mmap::map(..)` and `memmap2::MmapOptions::new()...`. Naming the
 /// *type* (`memmap2::Mmap` as a struct field, a function parameter or return
@@ -163,17 +166,8 @@ fn construction_token_hits(source: &str) -> Vec<(usize, &'static str)> {
     hits
 }
 
-/// Source trees of the crates split out of this one, relative to this
-/// crate's manifest directory. Code that moved there left this crate's `src/`
-/// but still loads checkpoint data, so the contract scans them too.
-const SPLIT_CRATE_SOURCE_ROOTS: &[&str] = &[
-    "../inference-core/src",
-    "../tokenizer/src",
-    "../grammar/src",
-];
-
 /// The contract: outside [`TRUST_BOUNDARY_FILE`], no file under this crate's
-/// `src/` or a [`SPLIT_CRATE_SOURCE_ROOTS`] tree names a mmap construction
+/// `src/` or an extracted workspace crate's source tree names a mmap construction
 /// API -- and, in the same invocation, the
 /// scan finds at least one such name *inside* that file. The second half is
 /// the must-MATCH arm: a scan that finds nothing exits the same way whether
@@ -183,13 +177,40 @@ const SPLIT_CRATE_SOURCE_ROOTS: &[&str] = &[
 #[test]
 fn only_the_mmap_trust_boundary_names_a_construction_api() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut sources = rust_sources_under(&manifest_dir.join("src"));
-    for root in SPLIT_CRATE_SOURCE_ROOTS {
-        let split_sources = rust_sources_under(&manifest_dir.join(root));
+    let boundary = manifest_dir
+        .join(TRUST_BOUNDARY_FILE)
+        .canonicalize()
+        .expect("resolve mmap trust boundary");
+    let metadata = workspace_metadata::read_workspace_metadata();
+    let packages = workspace_metadata::workspace_packages(metadata)
+        .expect("discover complete workspace source population");
+    let workspace_root = Path::new(
+        metadata["workspace_root"]
+            .as_str()
+            .expect("cargo metadata workspace_root is a path"),
+    );
+    let mut sources = Vec::new();
+    for (name, package) in packages {
+        if name != "lattice-inference" && !workspace_metadata::is_extracted(&name) {
+            continue;
+        }
+        let manifest = Path::new(
+            package["manifest_path"]
+                .as_str()
+                .expect("cargo metadata manifest_path is a path"),
+        );
+        let root = manifest
+            .parent()
+            .expect("package manifest has a parent")
+            .join("src")
+            .canonicalize()
+            .unwrap_or_else(|reason| panic!("could not resolve {name} source root: {reason}"));
+        let split_sources = rust_sources_under(&root);
         assert!(
             !split_sources.is_empty(),
-            "{root} holds no Rust sources: the split crate moved or the scan root is wrong, so \
-             this contract would silently stop covering it"
+            "{name} at {} holds no Rust sources: the crate moved or the scan root is wrong, so \
+             this contract would silently stop covering it",
+            root.display()
         );
         sources.extend(split_sources);
     }
@@ -199,15 +220,15 @@ fn only_the_mmap_trust_boundary_names_a_construction_api() {
 
     for path in sources {
         let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
+            .strip_prefix(workspace_root)
+            .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|reason| panic!("could not read {relative}: {reason}"));
         let hits = construction_token_hits(&source);
 
-        if relative == TRUST_BOUNDARY_FILE {
+        if path == boundary {
             boundary_hits += hits.len();
             continue;
         }
