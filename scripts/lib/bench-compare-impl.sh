@@ -1145,10 +1145,34 @@ bench_source_for_target() {
   printf '%s' "$resolved"
 }
 
+# The comparison runs in Criterion's directory namespace, not the source's.
+# Criterion 0.5.1 (`make_filename_safe`, src/report.rs) writes a group named
+# `backward_stage0/gdn_backward` to the directory `backward_stage0_gdn_backward`:
+# each of ? " / \ * < > : | ^ becomes `_`, and the result is cut to 64 bytes at
+# a character boundary. Each declared name is mapped the same way before the
+# comparison. A declared name that needs the cut and contains a non-ASCII byte
+# refuses rather than guessing where the boundary falls.
+criterion_group_dir() {
+  local mapped
+  mapped="$(printf '%s' "$1" | LC_ALL=C tr '?"/\\*<>:|^' '__________')"
+  if [ "$(printf '%s' "$mapped" | LC_ALL=C wc -c | tr -d ' ')" -gt 64 ]; then
+    if printf '%s' "$mapped" | LC_ALL=C command grep -q '[^ -~]'; then
+      echo "bench-compare: declared group '$1' is longer than 64 bytes and" \
+           "not ASCII, so its Criterion directory cannot be derived; refusing." >&2
+      return 1
+    fi
+    mapped="$(printf '%s' "$mapped" | LC_ALL=C cut -c1-64)"
+  fi
+  printf '%s\n' "$mapped"
+}
+
 declared_groups_from_source() {
-  local bench_source="$1"
+  local bench_source="$1" name
   command grep -oE 'benchmark_group\("[^"]+"\)' "$bench_source" \
     | command sed -E 's/^benchmark_group\("(.*)"\)$/\1/' \
+    | while IFS= read -r name; do
+        criterion_group_dir "$name" || exit 2
+      done \
     | LC_ALL=C sort -u
 }
 
