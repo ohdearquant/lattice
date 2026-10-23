@@ -267,6 +267,7 @@ jobs:
       - name: Clean lattice crates (force rebuild, keep dep cache)
         run: |
           cargo clean -p lattice-inference 2>/dev/null || true
+          cargo clean -p lattice-grammar 2>/dev/null || true
           cargo clean -p lattice-embed 2>/dev/null || true
           cargo clean -p lattice-fann 2>/dev/null || true
           cargo clean -p lattice-tune 2>/dev/null || true
@@ -618,6 +619,19 @@ jobs:
             echo "GUARD FAILED: expected one complete 95-test router-state result."
             exit 1
           fi
+      - name: grammar — bench-internals unit tests (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/grammar-bench-internals-tests.log"
+          if cargo test --locked -p lattice-grammar --features bench-internals --lib >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]+ ignored; 0 measured; 0 filtered out;' "$log"
       - name: inference — router bootstrap publication (CPU, mixture)
         run: |
           log="${RUNNER_TEMP:-/tmp}/inference-router-bootstrap-tests.log"

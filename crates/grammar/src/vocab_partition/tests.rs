@@ -1,7 +1,7 @@
 use super::*;
-use crate::grammar::gbnf::parse_gbnf;
-use crate::grammar::json_schema::compile;
-use crate::grammar::pda::{
+use crate::gbnf::parse_gbnf;
+use crate::json_schema::compile;
+use crate::pda::{
     CompiledGrammar, GrammarBuilder, GrammarState, Rule, SimResult, StepResult, Symbol,
     advance_byte, initial_grammar_state, simulate_token,
 };
@@ -47,7 +47,7 @@ fn build_records_a_token_that_exceeds_the_stack_limit() {
             name: "root".to_string(),
             alts: vec![
                 vec![Symbol::Terminal(b'a'), Symbol::Terminal(b'b')];
-                crate::grammar::pda::MAX_LIVE_STACKS + 1
+                crate::pda::MAX_LIVE_STACKS + 1
             ],
         }],
     };
@@ -618,10 +618,8 @@ fn trie_build_matches_oracle_past_the_state_cap() {
 /// allows and the others do not: `root ::= "c" big | "xyz"` where `big`
 /// has `MAX_LIVE_STACKS + 1` alternatives that all start with "d".
 fn partly_over_the_stack_limit_grammar() -> CompiledGrammar {
-    let big = vec![
-        vec![Symbol::Terminal(b'd'), Symbol::Terminal(b'e')];
-        crate::grammar::pda::MAX_LIVE_STACKS + 1
-    ];
+    let big =
+        vec![vec![Symbol::Terminal(b'd'), Symbol::Terminal(b'e')]; crate::pda::MAX_LIVE_STACKS + 1];
     CompiledGrammar {
         rules: vec![
             Rule {
