@@ -38,10 +38,6 @@ ceiling = 3249
 path = "scripts/perf-bench-gate.py"
 ceiling = 3818
 
-[[ratchet]]
-path = "tests/test_bench_measurement_supervision.py"
-ceiling = 4426
-
 [[data]]
 path = "Cargo.lock"
 

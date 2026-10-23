@@ -2182,10 +2182,13 @@ jobs:
       # Temporary lock paths only; no benchmark runs.
       - name: python3 tests/test_lock_file_refresh.py
         run: python3 tests/test_lock_file_refresh.py -v
-      # Advisory local measurement inventory + fail-closed lock/idle supervision.
-      # Uses disposable lock paths and stub commands; no benchmark runs.
+      # Advisory local measurement inventory and its source classifiers; no benchmark runs.
       - name: python3 tests/test_bench_measurement_supervision.py
         run: python3 tests/test_bench_measurement_supervision.py -v
+      # Fail-closed lock/idle supervision and the GPU handoff.
+      # Uses disposable lock paths and stub commands; no benchmark runs.
+      - name: python3 tests/test_bench_measurement_supervision_runtime.py
+        run: python3 tests/test_bench_measurement_supervision_runtime.py -v
       # scripts/lib/bench-python.sh's PYTHON_BIN override (lattice#1551): drives
       # bench_require_python3 directly via a bash subprocess against fixture
       # PATH/PYTHON_BIN combinations; no benchmark or cargo runs.
