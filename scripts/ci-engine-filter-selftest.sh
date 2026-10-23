@@ -28,7 +28,7 @@ extract_re() {  # $1 = anchor substring unique to the wanted line
     | sed -E "s/^ *if grep -E '//; s/' <<<.*$//"
 }
 
-ENGINE_RE="$(extract_re 'crates/(inference|embed)/src/')"
+ENGINE_RE="$(extract_re 'crates/(inference|inference-core|tokenizer|embed)/')"
 TUNE_RE="$(extract_re 'crates/tune/')"
 
 # FAIL CLOSED ON EMPTY. An extraction that resolved nothing would make every
@@ -79,6 +79,10 @@ tests/fixtures/vision/README.md')"
 # Without these, deleting the whole regex would make this file pass.
 check "inference source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/inference/src/rope.rs')"
+check "inference core source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/inference-core/src/error.rs')"
+check "tokenizer source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/tokenizer/src/bpe.rs')"
 check "embed source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/embed/src/simd/mod.rs')"
 check "Cargo.lock -> engine" true \

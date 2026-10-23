@@ -10,6 +10,9 @@ use syn::{Attribute, ItemFn, Meta, Token};
 mod source_graph;
 use source_graph::*;
 
+#[path = "support/measurement_lock_helpers.rs"]
+mod measurement_lock_helpers;
+
 #[derive(Clone, Copy)]
 enum CallSelector {
     Path(&'static [&'static str]),
@@ -419,7 +422,6 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "src/bin/eval_perplexity.rs",
     "src/bin/gramperf_profile.rs",
     "src/bin/lattice/main.rs",
-    "src/bin/lattice_serve/main.rs",
     "src/bin/ppl_metal.rs",
 ];
 const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
@@ -450,6 +452,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "examples/load_cross_encoder.rs",
     "src/bin/bench_gemma4_driver_pair.rs",
     "src/bin/gramtime_profile.rs",
+    "src/bin/lattice_serve/main.rs",
     "src/bin/moe_admission_sim.rs",
     "src/bin/quantize_q4.rs",
     "src/bin/quantize_quarot.rs",
@@ -458,7 +461,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
 ];
 const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
     "src/forward/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
-    "src/forward/metal_qwen35.rs::test_gemv_decode_numerical",
+    "src/forward/metal_qwen35/inner/tests.rs::test_gemv_decode_numerical",
     "src/forward/metal_qwen35/inner/tests/decode_attention.rs::test_gpu_argmax_parity_k1",
     "src/forward/metal_qwen35/inner/tests/gdn_chunked_scan.rs::decode_attention_reference_fails_closed_on_nan_q",
     "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
@@ -517,12 +520,12 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     },
     ConstructionExemption {
         site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::new()#1",
-        recorded_position: "examples/bench_serve_prepare.rs:690:47",
+        recorded_position: "examples/bench_serve_prepare.rs:688:47",
         reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
     },
     ConstructionExemption {
         site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "examples/bench_serve_prepare.rs:700:47",
+        recorded_position: "examples/bench_serve_prepare.rs:698:47",
         reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
     },
     ConstructionExemption {
@@ -546,18 +549,18 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
         reason: "MetalChatBackend::load belongs to an interactive or one-shot product process outside the measurement-harness contract",
     },
     ConstructionExemption {
-        site: "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/serve.rs::ModelBackend::spawn_metal::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/lattice/serve.rs:336:85",
-        reason: "ModelBackend::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
+        site: "bin:lattice:src/bin/lattice/main.rs=>src/serving_provider/providers/qwen/lattice_worker.rs::open::MetalQwen35State::from_q4_dir()#1",
+        recorded_position: "src/serving_provider/providers/qwen/lattice_worker.rs:64:47",
+        reason: "the Qwen lattice worker initializes a long-running server worker outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
-        site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/bin/lattice_serve/main.rs::imp::load_model::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/lattice_serve/main.rs:1899:47",
+        site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::from_q4_dir()#1",
+        recorded_position: "src/serving_provider/providers/qwen/worker.rs:116:43",
         reason: "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
-        site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/bin/lattice_serve/main.rs::imp::load_model::MetalQwen35State::new()#1",
-        recorded_position: "src/bin/lattice_serve/main.rs:1919:47",
+        site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::new()#1",
+        recorded_position: "src/serving_provider/providers/qwen/worker.rs:135:43",
         reason: "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
 ];
@@ -3764,46 +3767,6 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
     );
 }
 
-fn assert_helper_mediated_test_holds_function_lifetime_lock(relative: &str, function_name: &str) {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = std::fs::read_to_string(manifest_dir.join(relative))
-        .expect("read helper-mediated Metal tests");
-    let parsed = StructuredSource::parse(relative, &source, true)
-        .unwrap_or_else(|reason| panic!("{reason}"));
-    let function = parsed
-        .test_functions()
-        .unwrap_or_else(|reason| panic!("{reason}"))
-        .into_iter()
-        .find(|function| function.name == function_name)
-        .unwrap_or_else(|| panic!("checked helper-mediated test `{function_name}` was not found"));
-    parsed
-        .validate_selector(
-            function.body.clone(),
-            DEVICE_SYSTEM_DEFAULT,
-            LOCAL_LOCK_SELECTOR,
-            GuardRequirement::Function {
-                closing_brace: function.body.end,
-            },
-        )
-        .unwrap_or_else(|reason| panic!("{relative}::{function_name}: {reason}"));
-}
-
-#[test]
-fn mtp_draft_logit_equivalence_test_holds_a_function_lifetime_lock() {
-    assert_helper_mediated_test_holds_function_lifetime_lock(
-        "src/forward/metal_qwen35/inner/tests/decode_attention.rs",
-        "mtp_draft_logit_equivalence_with_quarot_counter_rotation",
-    );
-}
-
-#[test]
-fn metal_engine_session_isolation_test_holds_a_function_lifetime_lock() {
-    assert_helper_mediated_test_holds_function_lifetime_lock(
-        "src/forward/metal_qwen35/inner/tests/mtp_verify.rs",
-        "test_metal_qwen35_engine_session_isolation",
-    );
-}
-
 /// Records the pre-expansion boundary of the checked binding convention.
 ///
 /// Macro metavariables can expand into protected Metal work after this scanner
@@ -4840,12 +4803,7 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
             .expect("source under manifest directory")
             .to_string_lossy()
             .into_owned();
-        let sources = parsed_module_closure(
-            manifest_dir,
-            &target.path,
-            matches!(target.kind.as_str(), "test" | "lib"),
-        )
-        .unwrap_or_else(|reason| panic!("{reason}"));
+        let sources = measurement_lock_helpers::construction_scan_sources(manifest_dir, &target);
         let caller_owned = BENCH_HARNESSES
             .iter()
             .find(|contract| contract.path == target_relative && !contract.calls.is_empty());
@@ -5005,7 +4963,7 @@ fn prior_lock_owners_and_existing_bench_use_the_shared_module() {
             "use crate::measurement::gpu_test_lock;",
         ),
         (
-            "src/forward/metal_qwen35.rs",
+            "src/forward/metal_qwen35/inner/tests.rs",
             "use crate::measurement::gpu_test_lock;",
         ),
         (

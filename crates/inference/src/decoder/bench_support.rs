@@ -24,7 +24,7 @@
 //!   the per-token interface cannot be hidden behind a removal elsewhere in a model.
 //!
 //! The probed entry mirrors `Qwen35Model::generate_streaming_via_driver` step for step
-//! (tokenize, preflight, session, `driver::run`) for requests without a reasoning budget. The bench proves the mirror is faithful
+//! (tokenize, preflight, session, `driver::run_into`) for requests without a reasoning budget. The bench proves the mirror is faithful
 //! rather than assuming it: an unchanged probe must reproduce the production entry's
 //! token ids and allocation counts.
 
@@ -39,7 +39,9 @@ use crate::error::InferenceError;
 use crate::generation::GenerateConfig;
 use crate::model::qwen35::{Qwen35Model, RawGenEvent, check_prompt_not_empty};
 use crate::tokenizer::Tokenizer;
-use crate::tokenizer::detokenize::IncrementalDetokenizer;
+use lattice_tokenizer::__internal::{
+    incremental_detokenizer_finish, incremental_detokenizer_new, incremental_detokenizer_push_into,
+};
 
 /// Hooks fired by the wrapped session, in the worker that runs the call, immediately
 /// after the real `select` / `decode` returns. They sit inside the per-token interface:
@@ -163,8 +165,11 @@ pub fn run_qwen_cpu_probed(
     }
     let think_close_id = None;
 
+    let mut inner =
+        QwenCpuSession::new(model, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
+    inner.reserve_generation(prompt_len.saturating_add(gen_cfg.max_new_tokens));
     let mut session = ProbedSession {
-        inner: QwenCpuSession::new(model, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed),
+        inner,
         probe,
         capacity_of: QwenCpuSession::first_layer_key_capacity,
         initial_capacity: None,
@@ -172,14 +177,15 @@ pub fn run_qwen_cpu_probed(
 
     let never_cancel = || false;
     let on_raw_event_cell = std::cell::RefCell::new(on_raw_event);
-    let detok_cell = std::cell::RefCell::new(IncrementalDetokenizer::new());
+    let detok_cell = std::cell::RefCell::new(incremental_detokenizer_new());
     let mut text = String::new();
     let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
-    let result = driver::run(
+    let result = driver::run_into(
         &mut session,
         gen_cfg,
         think_close_id,
+        None,
         &prompt_ids,
         cfg.eos_token_id,
         true,
@@ -189,12 +195,19 @@ pub fn run_qwen_cpu_probed(
                 index: generated_len,
             });
         },
-        |next_id| detok_cell.borrow_mut().push(&model.tokenizer, next_id),
+        |next_id, out| {
+            incremental_detokenizer_push_into(
+                &mut detok_cell.borrow_mut(),
+                &model.tokenizer,
+                next_id,
+                out,
+            )
+        },
         &mut text,
         &mut token_logprob_end_offsets,
         |_delta, _next_id| true,
         || (*on_raw_event_cell.borrow_mut())(RawGenEvent::PrefillEnd),
-        || detok_cell.borrow_mut().finish(),
+        || incremental_detokenizer_finish(&mut detok_cell.borrow_mut()),
     )?;
 
     Ok(RouteRun {
@@ -297,6 +310,7 @@ pub fn run_interface_only(
     let result = driver::run(
         &mut session,
         gen_cfg,
+        None,
         None,
         &prompt_ids,
         u32::MAX,

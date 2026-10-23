@@ -175,92 +175,162 @@ fn thinking_tokenizer() -> BpeTokenizer {
 }
 
 #[test]
-fn text_worker_renders_closed_thinking_before_tokenization_and_admission() {
+fn text_worker_renders_omitted_thinking_as_a_closed_block() {
     let messages = [ChatMessage::user("hello")];
     let tokenizer = thinking_tokenizer();
-    let plain = format_chat_template(&messages);
-    let expected =
-        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
-    let prompt_tokens = tokenizer.tokenize(expected).pre_truncation_len;
     let cfg = GenerateConfig {
         enable_thinking: false,
-        reasoning_budget: Some(4096),
+        reasoning_budget: None,
         max_new_tokens: 9,
         ..GenerateConfig::default()
-    };
-    let context = prompt_tokens + 9 + 1;
-    let (prompt, count) = render_text_prompt_within_window(
-        &tokenizer,
-        &messages,
-        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-        context,
-        &cfg,
-    )
-    .expect("disabled budget consumes no window");
-    assert_eq!(prompt, expected);
-    assert_eq!(count, prompt_tokens);
-    let enabled = GenerateConfig {
-        enable_thinking: true,
-        reasoning_budget: None,
-        ..cfg.clone()
     };
     let (prompt, _) = render_text_prompt_within_window(
         &tokenizer,
         &messages,
         ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-        context,
-        &enabled,
+        4096,
+        &cfg,
+        false,
     )
-    .expect("legacy true prompt");
-    assert_eq!(prompt, plain);
-    let enabled_budget = GenerateConfig {
-        enable_thinking: true,
-        ..cfg
-    };
-    assert!(matches!(
-        render_text_prompt_within_window(
-            &tokenizer,
-            &messages,
-            ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-            context,
-            &enabled_budget,
-        ),
-        Err(ApiError::BadRequest {
-            code: "context_length_exceeded",
-            ..
-        })
-    ));
+    .expect("omitted thinking is off");
+    assert_eq!(
+        prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
 }
 
 #[test]
-fn vision_worker_renders_and_tokenizes_the_closed_thinking_tail() {
+fn text_worker_renders_positive_request_budget_with_the_thinking_prime() {
+    let messages = [ChatMessage::user("hello")];
+    let tokenizer = thinking_tokenizer();
+    let cfg = GenerateConfig {
+        enable_thinking: true,
+        reasoning_budget: Some(16),
+        max_new_tokens: 9,
+        ..GenerateConfig::default()
+    };
+    let (prompt, _) = render_text_prompt_within_window(
+        &tokenizer,
+        &messages,
+        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+        4096,
+        &cfg,
+        false,
+    )
+    .expect("positive request budget enables thinking");
+    assert_eq!(
+        prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    );
+}
+
+#[test]
+fn text_worker_renders_explicit_thinking_true_with_the_thinking_prime() {
+    let messages = [ChatMessage::user("hello")];
+    let tokenizer = thinking_tokenizer();
+    let cfg = GenerateConfig {
+        enable_thinking: true,
+        max_new_tokens: 9,
+        ..GenerateConfig::default()
+    };
+    let (prompt, _) = render_text_prompt_within_window(
+        &tokenizer,
+        &messages,
+        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+        4096,
+        &cfg,
+        true,
+    )
+    .expect("explicit thinking prime");
+    assert_eq!(
+        prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    );
+}
+
+#[test]
+fn text_worker_renders_explicit_thinking_false_as_a_closed_block() {
+    let messages = [ChatMessage::user("hello")];
+    let tokenizer = thinking_tokenizer();
+    let cfg = GenerateConfig {
+        enable_thinking: false,
+        max_new_tokens: 9,
+        ..GenerateConfig::default()
+    };
+    let (prompt, _) = render_text_prompt_within_window(
+        &tokenizer,
+        &messages,
+        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+        4096,
+        &cfg,
+        false,
+    )
+    .expect("explicit thinking off");
+    assert_eq!(
+        prompt,
+        "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
+}
+
+#[test]
+fn vision_worker_renders_omitted_thinking_as_a_closed_block() {
     let messages = [ChatMessage::user_with_image(
         "beforeafter",
         vec![1],
         "before".len(),
     )];
     let tokenizer = thinking_tokenizer();
-    let (before, after) = build_vision_prompt_text(&messages, 0, false).expect("vision text");
+    let (before, after) =
+        build_vision_prompt_text(&messages, 0, false, false).expect("vision text");
     assert_eq!(before, "<|im_start|>user\nbefore");
     assert_eq!(
         after,
         "after<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
-    let ids = build_vision_prompt_ids(&messages, 0, &tokenizer, 90, 91, 92, 3, false)
+    let ids = build_vision_prompt_ids(&messages, 0, &tokenizer, 90, 91, 92, 3, false, false)
         .expect("closed vision prompt");
-    let expected = tokenizer.tokenize_fragments_with_inserted_ids(
+    let expected = lattice_tokenizer::__internal::tokenize_fragments_with_inserted_ids(
+        &tokenizer,
         "<|im_start|>user\nbefore",
         &[90, 92, 92, 92, 91],
         "after<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     );
     assert_eq!(ids, expected);
-    let (_, enabled_after) =
-        build_vision_prompt_text(&messages, 0, true).expect("legacy vision text");
-    assert_eq!(enabled_after, "after<|im_end|>\n<|im_start|>assistant\n");
-    assert_ne!(
-        ids,
-        build_vision_prompt_ids(&messages, 0, &tokenizer, 90, 91, 92, 3, true)
-            .expect("legacy vision prompt")
+}
+
+#[test]
+fn vision_worker_renders_enabled_thinking_with_the_thinking_prime() {
+    let messages = [ChatMessage::user_with_image(
+        "beforeafter",
+        vec![1],
+        "before".len(),
+    )];
+    let (_, after) = build_vision_prompt_text(&messages, 0, true, false).expect("vision text");
+    assert_eq!(after, "after<|im_end|>\n<|im_start|>assistant\n<think>\n");
+}
+
+#[test]
+fn vision_worker_renders_explicit_thinking_true_with_the_thinking_prime() {
+    let messages = [ChatMessage::user_with_image(
+        "beforeafter",
+        vec![1],
+        "before".len(),
+    )];
+    let (_, after) = build_vision_prompt_text(&messages, 0, true, true).expect("vision text");
+    assert_eq!(after, "after<|im_end|>\n<|im_start|>assistant\n<think>\n");
+}
+
+#[test]
+fn vision_worker_renders_explicit_thinking_false_as_a_closed_block() {
+    let messages = [ChatMessage::user_with_image(
+        "beforeafter",
+        vec![1],
+        "before".len(),
+    )];
+    let (_, after) = build_vision_prompt_text(&messages, 0, false, false).expect("vision text");
+    assert_eq!(
+        after,
+        "after<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
 }
 
@@ -283,6 +353,7 @@ fn vision_thinking_mode_reaches_exact_token_window_preflight() {
             &messages,
             0,
             enabled,
+            false,
             &mut || false,
             |count| {
                 counts.push(count);
@@ -370,11 +441,12 @@ fn vision_prompt_splices_tokens_at_original_content_part_position() {
         ChatMessage::user_with_image("beforeafter", vec![1], "before".len()),
         ChatMessage::assistant("prior"),
     ];
-    let actual = build_vision_prompt_ids(&messages, 1, &tokenizer, 90, 91, 92, 3, true)
+    let actual = build_vision_prompt_ids(&messages, 1, &tokenizer, 90, 91, 92, 3, true, false)
         .expect("vision prompt");
 
     let before = "<|im_start|>system\npolicy<|im_end|>\n<|im_start|>user\nbefore";
-    let after = "after<|im_end|>\n<|im_start|>assistant\nprior<|im_end|>\n<|im_start|>assistant\n";
+    let after =
+        "after<|im_end|>\n<|im_start|>assistant\nprior<|im_end|>\n<|im_start|>assistant\n<think>\n";
     let mut expected = tokenize_text(&tokenizer, before);
     expected.extend([90, 92, 92, 92, 91]);
     expected.extend(tokenize_text(&tokenizer, after));
@@ -388,10 +460,14 @@ fn vision_prompt_text_matches_plain_template_around_image_splice() {
         ChatMessage::user_with_image("beforeafter", vec![1], "before".len()),
         ChatMessage::assistant("prior"),
     ];
-    let (before, after) = build_vision_prompt_text(&messages, 1, true).expect("vision text");
+    let (before, after) =
+        build_vision_prompt_text(&messages, 1, false, false).expect("vision text");
     let plain = format_chat_template(&messages);
     assert_eq!(
-        before.clone() + &after,
+        before.clone()
+            + after
+                .strip_suffix("<think>\n\n</think>\n\n")
+                .expect("closed suffix"),
         plain,
         "vision splice fragments must reconstruct exactly the canonical text-only template"
     );
@@ -407,9 +483,9 @@ fn vision_prompt_tokenizes_the_complete_sequence_before_window_validation() {
         vec![1],
         before.len(),
     )];
-    let actual = build_vision_prompt_ids(&messages, 0, &capped, 90, 91, 92, 3, true)
+    let actual = build_vision_prompt_ids(&messages, 0, &capped, 90, 91, 92, 3, true, false)
         .expect("capped tokenizer must not truncate prompt fragments");
-    let expected = build_vision_prompt_ids(&messages, 0, &unbounded, 90, 91, 92, 3, true)
+    let expected = build_vision_prompt_ids(&messages, 0, &unbounded, 90, 91, 92, 3, true, false)
         .expect("unbounded tokenizer");
     assert_eq!(actual, expected);
     assert!(actual.len() > 4);
@@ -441,6 +517,7 @@ fn vision_request_build_cancels_before_image_preprocessing() {
         &messages,
         0,
         true,
+        false,
         &mut || {
             polls += 1;
             true
@@ -470,6 +547,7 @@ fn vision_request_build_cancels_after_preprocess_and_prompt_before_window_check(
         &messages,
         0,
         true,
+        false,
         &mut || {
             polls += 1;
             polls == 3
@@ -503,6 +581,7 @@ fn vision_request_build_cancels_after_window_check_before_lazy_load() {
         &messages,
         0,
         true,
+        false,
         &mut || {
             polls += 1;
             polls == 4
@@ -575,6 +654,7 @@ fn vision_request_build_rejects_oversized_image_with_dimensions_exceeded_code() 
         &messages,
         0,
         true,
+        false,
         &mut || false,
         |_| Ok(()),
     )
@@ -612,6 +692,7 @@ fn vision_request_build_rejects_malformed_image_bytes_with_invalid_image_code() 
         &messages,
         0,
         true,
+        false,
         &mut || false,
         |_| Ok(()),
     )
@@ -669,6 +750,7 @@ fn vision_request_build_maps_a_lazy_load_failure_to_a_retryable_client_rejection
         &messages,
         0,
         true,
+        false,
         &mut || false,
         |_| Ok(()),
     )
@@ -1014,10 +1096,11 @@ fn fake_generate(
 ) -> impl FnMut(
     &[ChatMessage],
     &GenerateConfig,
+    bool,
     &mut dyn FnMut(&str, u32) -> bool,
     &mut dyn FnMut() -> bool,
 ) -> Result<GenerateOutput, WorkerFailure> {
-    move |_messages, _cfg, on_token, should_cancel| {
+    move |_messages, _cfg, _explicitly_thinking, on_token, should_cancel| {
         started.fetch_add(1, Ordering::SeqCst);
         let mut n = 0usize;
         for i in 0..cap {
@@ -1051,10 +1134,11 @@ fn fake_generate_with_prefill_gap(
 ) -> impl FnMut(
     &[ChatMessage],
     &GenerateConfig,
+    bool,
     &mut dyn FnMut(&str, u32) -> bool,
     &mut dyn FnMut() -> bool,
 ) -> Result<GenerateOutput, WorkerFailure> {
-    move |_messages, _cfg, on_token, should_cancel| {
+    move |_messages, _cfg, _explicitly_thinking, on_token, should_cancel| {
         for _ in 0..prefill_steps {
             std::thread::sleep(Duration::from_millis(5));
             if should_cancel() {
@@ -1100,10 +1184,11 @@ fn fake_generate_fails_once_then_succeeds(
 ) -> impl FnMut(
     &[ChatMessage],
     &GenerateConfig,
+    bool,
     &mut dyn FnMut(&str, u32) -> bool,
     &mut dyn FnMut() -> bool,
 ) -> Result<GenerateOutput, WorkerFailure> {
-    move |_messages, _cfg, on_token, _should_cancel| {
+    move |_messages, _cfg, _explicitly_thinking, on_token, _should_cancel| {
         if call_count.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(WorkerFailure::Failed(message.to_string()));
         }
@@ -1146,6 +1231,7 @@ fn make_job() -> (
         messages: vec![ChatMessage::user("hi")],
         cfg: GenerateConfig::default(),
         lora: Vec::new(),
+        explicitly_thinking: false,
         stream: false,
         tx,
         cancel: cancel_rx,
@@ -1174,10 +1260,11 @@ fn epoch_reporting_generate(
 ) -> impl FnMut(
     &[ChatMessage],
     &GenerateConfig,
+    bool,
     &mut dyn FnMut(&str, u32) -> bool,
     &mut dyn FnMut() -> bool,
 ) -> Result<GenerateOutput, WorkerFailure> {
-    move |_messages, _cfg, on_token, should_cancel| {
+    move |_messages, _cfg, _explicitly_thinking, on_token, should_cancel| {
         let mut text = String::new();
         for i in 0..tokens {
             // Polled every iteration, as this module's contract for an
@@ -1509,6 +1596,7 @@ fn job_whose_event_receiver_is_already_closed_is_cancelled_without_running_gener
         messages: vec![ChatMessage::user("hi")],
         cfg: GenerateConfig::default(),
         lora: Vec::new(),
+        explicitly_thinking: false,
         stream: false,
         tx,
         cancel: cancel_rx,
@@ -1711,33 +1799,43 @@ fn running_job_whose_event_receiver_closes_during_prefill_like_phase_never_calls
             let mut prefill_gap = fake_generate_with_prefill_gap(50, 50, entered_decode);
             let mut follow_up = fake_generate(50, Arc::new(AtomicUsize::new(0)), ran_tokens);
             let mut calls = 0usize;
-            run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
-                calls += 1;
-                if calls > 1 {
-                    return follow_up(messages, cfg, on_token, should_cancel);
-                }
-                let _ = entered_tx.try_send(());
-                if closed_rx.recv_timeout(WAIT).is_err() {
-                    return Err(WorkerFailure::Failed(
-                        "the test never closed job 1's event receiver".to_string(),
-                    ));
-                }
-                let mut counted_on_token = |delta: &str, token_id: u32| {
-                    on_token_calls.fetch_add(1, Ordering::SeqCst);
-                    on_token(delta, token_id)
-                };
-                let mut recorded_should_cancel = || {
-                    let cancelled = should_cancel();
-                    lock_unpoisoned(&job1_polls).push(cancelled);
-                    cancelled
-                };
-                prefill_gap(
-                    messages,
-                    cfg,
-                    &mut counted_on_token,
-                    &mut recorded_should_cancel,
-                )
-            });
+            run_worker_loop(
+                job_rx,
+                move |messages, cfg, explicitly_thinking, on_token, should_cancel| {
+                    calls += 1;
+                    if calls > 1 {
+                        return follow_up(
+                            messages,
+                            cfg,
+                            explicitly_thinking,
+                            on_token,
+                            should_cancel,
+                        );
+                    }
+                    let _ = entered_tx.try_send(());
+                    if closed_rx.recv_timeout(WAIT).is_err() {
+                        return Err(WorkerFailure::Failed(
+                            "the test never closed job 1's event receiver".to_string(),
+                        ));
+                    }
+                    let mut counted_on_token = |delta: &str, token_id: u32| {
+                        on_token_calls.fetch_add(1, Ordering::SeqCst);
+                        on_token(delta, token_id)
+                    };
+                    let mut recorded_should_cancel = || {
+                        let cancelled = should_cancel();
+                        lock_unpoisoned(&job1_polls).push(cancelled);
+                        cancelled
+                    };
+                    prefill_gap(
+                        messages,
+                        cfg,
+                        explicitly_thinking,
+                        &mut counted_on_token,
+                        &mut recorded_should_cancel,
+                    )
+                },
+            );
             let _ = done_tx.send(());
         }
     });
@@ -2580,10 +2678,63 @@ fn run_text_job(
 }
 
 #[test]
+fn thinking_mode_reaches_generation_independent_of_legacy_flag() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_by_generate = Arc::clone(&seen);
+    let client = spawn_fake(
+        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+        4096,
+        thinking_tokenizer(),
+        move |_messages, _cfg, prompt_tokens, _on_token, _should_cancel| {
+            seen_by_generate
+                .lock()
+                .expect("prompt length slot")
+                .push(prompt_tokens);
+            Ok(GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens,
+                generated_tokens: 0,
+                stopped: true,
+                stop_reason: None,
+                token_logprobs: vec![],
+            })
+        },
+    );
+    let messages = vec![ChatMessage::user("hello")];
+    for (enable_thinking, explicitly_thinking) in [(true, true), (true, false), (false, true)] {
+        let (_guard, cancel) = crate::serve::cancel_pair();
+        let mut rx = client
+            .submit_with_lora_mode_and_thinking(
+                messages.clone(),
+                GenerateConfig {
+                    enable_thinking,
+                    ..GenerateConfig::default()
+                },
+                cancel,
+                Vec::new(),
+                false,
+                explicitly_thinking,
+            )
+            .expect("thinking job is admitted");
+        assert!(matches!(rx.blocking_recv(), Some(WorkerEvent::Complete(_))));
+    }
+    let lengths = seen.lock().expect("prompt length slot");
+    assert_eq!(
+        lengths[0], lengths[1],
+        "the legacy flag must not change the prompt: {lengths:?}"
+    );
+    assert_ne!(
+        lengths[0], lengths[2],
+        "the configured thinking mode must change the prompt: {lengths:?}"
+    );
+}
+
+#[test]
 fn text_prompt_above_the_default_tokenizer_cap_reaches_generation_in_full() {
     let messages = long_text_prompt(10_000);
     let full_len = untruncated_prompt_len(&messages);
-    let default_cap = crate::tokenizer::bpe::DEFAULT_BPE_MAX_SEQ_LEN;
+    let default_cap = lattice_tokenizer::__internal::DEFAULT_BPE_MAX_SEQ_LEN;
     let window = 16_384;
     assert_eq!(tiny_tokenizer().max_seq_len(), default_cap);
     assert!(
@@ -2680,3 +2831,5 @@ fn text_prompt_beyond_the_window_is_refused_with_its_full_token_count() {
         "expected a context-window refusal, got {terminal:?}"
     );
 }
+
+mod characterization;

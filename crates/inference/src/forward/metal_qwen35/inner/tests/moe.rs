@@ -397,6 +397,68 @@ fn from_q4_dir_loads_and_generates_on_synthetic_moe_checkpoint() {
     );
 }
 
+#[test]
+fn from_q4_dir_builds_the_cpu_embedding_lookup_from_the_q4_payload() {
+    let Some(_) = Device::system_default() else {
+        return;
+    };
+    let _guard = gpu_test_lock();
+
+    let cfg = synthetic_moe_test_config();
+    let hidden = cfg.hidden_size;
+    let vocab = cfg.vocab_size;
+    let dir = tempfile::tempdir().expect("tempdir create");
+    // Distinct values per row, so a lookup that read the wrong row or the
+    // wrong stride cannot match. `hidden` is a multiple of 32, so each row
+    // occupies whole blocks and the quantization reconstructs its constant
+    // exactly (mod one f16 rounding -- `q4_const_roundtrip`).
+    let embed_row_value = |row: usize| 0.001 * (row as f32 + 1.0);
+    // Every other tensor is irrelevant to this test; fill the rest of the
+    // checkpoint so `from_q4_dir`'s existence preflight and loaders see a
+    // complete directory. The synthetic MoE writer rewrites embed_tokens
+    // with its own constant, so the row-specific table is written after.
+    write_synthetic_moe_checkpoint(
+        dir.path(),
+        &cfg,
+        moe_fixture_gate_const,
+        moe_fixture_up_const,
+        moe_fixture_down_const,
+    );
+    write_tiny_q4_fixture_per_row(
+        dir.path(),
+        "model.language_model.embed_tokens.weight",
+        vocab,
+        hidden,
+        embed_row_value,
+    );
+
+    let state =
+        MetalQwen35State::from_q4_dir(dir.path(), std::path::Path::new("/dev/null"), &cfg, 16)
+            .expect("from_q4_dir must load the synthetic Q4 checkpoint");
+    assert!(
+        matches!(&state.engine.embed_tokens, EmbeddingTable::Q4(_)),
+        "a Q4 checkpoint must keep the CPU embedding lookup on the Q4 payload, \
+         not build an f16 copy"
+    );
+
+    for id in [0usize, 1, 41, 42, vocab - 1] {
+        let mut actual = vec![0.0f32; hidden];
+        // SAFETY: `actual` holds `hidden` f32 values and is disjoint from the
+        // embedding table; `id` is below `vocab_size`.
+        unsafe {
+            state
+                .engine
+                .embed_tokens
+                .write_row(id, actual.as_mut_ptr(), hidden)
+        };
+        let value = q4_const_roundtrip(embed_row_value(id));
+        assert!(
+            actual.iter().all(|&v| v == value),
+            "token {id} must read the checkpoint's own row #{id}"
+        );
+    }
+}
+
 // --- (c) mutation sensitivity: an "expert swap" corruption changes decode output ---
 //
 // Builds a second checkpoint identical to the one above except that

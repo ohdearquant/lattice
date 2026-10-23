@@ -890,6 +890,7 @@ mod tests {
                 session,
                 &GenerateConfig::default(),
                 None,
+                None,
                 prompt_ids,
                 999,
                 false,

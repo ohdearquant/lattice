@@ -142,6 +142,10 @@ pub mod pool;
 pub mod pruning;
 /// Quantization and pre-transform primitives. See [`weights`] and [`forward`].
 pub mod quant;
+/// Synthetic Qwen3.5 checkpoint support for repository regression tests.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod qwen35_checkpoint_fixture;
 /// Rotary position embedding tables and application helpers. See [`model`] and [`forward`].
 pub mod rope;
 /// Sampling configuration and token selection helpers. See [`model`] and [`speculative`].
@@ -162,11 +166,19 @@ pub mod serving_cpu;
 #[cfg(feature = "serve")]
 #[doc(hidden)]
 pub mod serving_cpu_host;
-/// Builds the Metal serving worker's runtime and request preparation for a
-/// loaded model. Not a stable API.
-#[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+/// Pooled embedding service interfaces used by serving entry points.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_embeddings;
+/// Builds the serving worker's runtime and request preparation for a loaded
+/// model. Not a stable API.
+#[cfg(feature = "serve")]
 #[doc(hidden)]
 pub mod serving_factory;
+/// Shared request facade for the HTTP serving binaries. Not a stable API.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_host;
 #[cfg(feature = "serve")]
 mod serving_preparation;
 /// Selects serving providers from bounded checkpoint metadata.
@@ -176,6 +188,10 @@ mod serving_preparation;
 pub mod serving_provider;
 #[cfg(feature = "serve")]
 pub(crate) mod serving_runtime_contract;
+/// Dedicated-thread host for thread-affine serving runtimes. Not a stable API.
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub mod serving_worker;
 /// N-gram prompt lookup speculative decoding. See [`sampling`] and [`model`].
 pub mod speculative;
 /// Generation stop reason taxonomy; see [`StopReason`] and [`model`].

@@ -1,28 +1,63 @@
 //! Gemma serving provider and typed CPU loader facade.
 
 use crate::error::InferenceError;
-use crate::model_format::ModelFamily;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::model_format::ModelFormat;
+use crate::model_format::{ModelFamily, ModelFormat};
 use crate::serve::route::{RouteRefusal, ServedRoute, select_route, select_standalone_route};
 use crate::serving_cpu::GemmaCpuServing;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
-use crate::serving_provider::{CheckpointEvidence, ServingEntry, ServingProvider};
+use crate::serving_host::ServingHandle;
+use crate::serving_provider::{
+    CheckpointEvidence, ImplicitPooledEmbeddingPlan, LatticeOpenOptions, LatticeRoutePlan,
+    RegisteredProvider, ServingEntry, ServingProvider,
+};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_provider::{
-    StandaloneLoadOptions, StandaloneOptionPresence, StandaloneQwenLoader,
+    StandaloneLoadOptions, StandaloneLoadPlan, StandaloneOptionPresence, StandalonePostReady,
+    StandaloneQwenLoader, StandaloneStartupDescription,
 };
 use std::path::Path;
+use std::sync::Arc;
 
 pub(crate) mod cpu;
 mod preparation;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) mod worker;
 
 #[cfg(test)]
 pub(crate) use preparation::template_trim;
 pub(crate) use preparation::{lora_unsupported_backend, prepare_gemma_chat_request};
 
 pub(in crate::serving_provider) struct GemmaProvider;
+
+struct GemmaLatticeRoutePlan {
+    evidence: CheckpointEvidence,
+}
+
+impl LatticeRoutePlan for GemmaLatticeRoutePlan {
+    fn selection_marker(&self) -> String {
+        "[route] selected family=gemma4 backend=cpu format=safetensors".to_owned()
+    }
+
+    fn implicit_embeddings(&self, model: &str) -> ImplicitPooledEmbeddingPlan {
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: None,
+            disabled_line: Some(format!(
+                "Embeddings disabled ({model}): not available for Gemma 4 checkpoints."
+            )),
+        }
+    }
+
+    fn open(
+        self: Box<Self>,
+        options: LatticeOpenOptions,
+        generation_admission: Arc<tokio::sync::Semaphore>,
+    ) -> Result<ServingHandle, String> {
+        let _ = options;
+        let cpu = cpu::load(&self.evidence)?;
+        Ok(ServingHandle::shared_cpu(cpu, generation_admission))
+    }
+}
 
 impl ServingProvider for GemmaProvider {
     fn name(&self) -> &'static str {
@@ -31,6 +66,19 @@ impl ServingProvider for GemmaProvider {
 
     fn claims(&self, evidence: &CheckpointEvidence) -> bool {
         evidence.model_type.as_deref() == Some("gemma4")
+    }
+
+    fn admit_lattice(
+        &self,
+        evidence: &CheckpointEvidence,
+    ) -> Result<Box<dyn LatticeRoutePlan>, RouteRefusal> {
+        match evidence.format {
+            ModelFormat::Safetensors => Ok(Box::new(GemmaLatticeRoutePlan {
+                evidence: evidence.clone(),
+            })),
+            ModelFormat::Q4 => Err(RouteRefusal::GemmaMetalUnsupported),
+            _ => Err(RouteRefusal::UnrecognizedFormat),
+        }
     }
 
     fn legacy_route(
@@ -47,6 +95,19 @@ impl ServingProvider for GemmaProvider {
                     Err(refusal) => Err(refusal),
                 }
             }
+        }
+    }
+
+    fn implicit_pooled_embeddings(
+        &self,
+        _evidence: &CheckpointEvidence,
+        model: &str,
+    ) -> ImplicitPooledEmbeddingPlan {
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: None,
+            disabled_line: Some(format!(
+                "Embeddings disabled ({model}): not available for Gemma 4 checkpoints."
+            )),
         }
     }
 
@@ -103,6 +164,64 @@ impl ServingProvider for GemmaProvider {
         } else {
             super::qwen::qwen_standalone_factory(evidence, options, qwen_loader)
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_startup_description(
+        &self,
+        format: ModelFormat,
+        route: Option<ServedRoute>,
+    ) -> StandaloneStartupDescription {
+        let loading_label = if format == ModelFormat::Safetensors && route.is_some() {
+            "safetensors"
+        } else {
+            match format {
+                ModelFormat::Q4 => "q4",
+                ModelFormat::Safetensors => "bf16",
+                _ => "unknown",
+            }
+        };
+        StandaloneStartupDescription {
+            route_marker: route.map(|route| route.selection_marker(format)),
+            loading_label,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn prepare_standalone_load(
+        &self,
+        evidence: CheckpointEvidence,
+        _route: Option<ServedRoute>,
+        options: StandaloneLoadOptions,
+    ) -> Result<StandaloneLoadPlan, String> {
+        if evidence.format == ModelFormat::Safetensors {
+            if options.max_context.is_some() {
+                return Err(
+                    "unsupported_feature: --max-context is not supported for Gemma 4 checkpoints"
+                        .to_owned(),
+                );
+            }
+            Ok(StandaloneLoadPlan::new(
+                ServingFactory::gemma_cpu(evidence.directory),
+                StandalonePostReady::new(|| Ok(std::sync::Arc::new(Vec::new()))),
+            ))
+        } else {
+            super::qwen::qwen_standalone_plan(evidence, options)
+        }
+    }
+}
+
+impl RegisteredProvider for GemmaProvider {
+    fn generation(&self) -> Option<&dyn ServingProvider> {
+        Some(self)
+    }
+
+    fn pooled_embeddings(&self) -> Option<&dyn crate::serving_provider::PooledEmbeddingProvider> {
+        None
+    }
+
+    fn text_embeddings(&self) -> Option<&dyn crate::serving_provider::TextEmbeddingProvider> {
+        None
     }
 }
 

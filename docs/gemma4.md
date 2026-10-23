@@ -122,7 +122,7 @@ and `jinja2` packages used to generate the goldens.
 Read directly from the downloaded `tokenizer.json` (not guessed): `model.type == "BPE"` with
 `byte_fallback: true`, a `Replace(" " -> "▁")` normalizer, and a literal-string `Split`
 pre-tokenizer (`pattern.String`, not the regex `pattern.Regex` shape the existing Qwen BPE loader
-accepts). `crates/inference/src/tokenizer/gemma_bpe.rs` implements this as a new, additive
+accepts). `crates/tokenizer/src/gemma_bpe.rs` implements this as a new, additive
 `GemmaBpeTokenizer` — selected by an explicit constructor call, never reached through
 `load_tokenizer`'s model-type sniffing. The existing loader's `validate_bpe_pretokenizer`
 continues to reject this same `tokenizer.json` (`crates/inference/tests/gemma4_tokenizer_goldens_test.rs::existing_qwen_bpe_loader_rejects_gemma_tokenizer_json`),

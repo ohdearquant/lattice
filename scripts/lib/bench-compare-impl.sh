@@ -583,6 +583,10 @@ BENCH_GROUPS_INFERENCE="${BENCH_GROUPS_INFERENCE:-}"
 BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
 BENCH_BASELINE_NAME="compare-base"
 BENCH_HEAD_BASELINE_NAME="compare-head"
+EMBED_BENCH_COMMAND=(cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED")
+if [ -n "$CARGO_FEATURES_EMBED" ]; then
+  EMBED_BENCH_COMMAND+=(--features "$CARGO_FEATURES_EMBED")
+fi
 
 # Full-resolution gating is an allowlist because choosing another target or
 # feature selection changes the instrument before any benchmark function
@@ -757,9 +761,39 @@ require_measured() {
   fi
 }
 
+prebuild_embed() {
+  local what="$1" rc=0
+  "${EMBED_BENCH_COMMAND[@]}" --no-run || rc=$?
+  require_measured "$what" "$rc"
+}
+
+# The GPU handoff builds into its own target directory, and `measure` builds
+# from inside the sampled window. Warm that exact build before the window
+# opens: same frozen-plan entry, same argv, cwd, environment and target
+# directory, without launching the executable or acknowledging a handoff.
+prebuild_handoff() {
+  local what="$1" home="$2" entry="$3" revision="$4" rc=0 output
+  shift 4
+  output="$(mktemp)"
+  if env CRITERION_HOME="$home" \
+       "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" prebuild \
+       --entry "$entry" --revision "$revision" --target "$BENCHES_INFERENCE" \
+       --features "$CARGO_FEATURES_INFERENCE" -- "$@" >"$output" 2>&1; then
+    rc=0
+  else
+    rc=$?
+    cat "$output" >&2
+  fi
+  rm -f "$output"
+  require_measured "$what" "$rc"
+}
+
 # --- Build + bench base ---
 echo ""
 echo "--- Building + benching BASE ($BASE_SHA) ---"
+# Handoff admission already checks each revision's target declaration and required
+# features without compiling. Only its own prebuild should warm the admitted target
+# directory; probing Cargo's default directory would compile a second copy.
 BASE_PHASE_RC=0
 (
   cd "$WT"
@@ -768,11 +802,17 @@ BASE_PHASE_RC=0
   # the enforcing lane, where "absent" and "failed to compile" arrive on the
   # same channel and one of them silently deletes half the comparison.
   BASE_INFERENCE_PRESENT=0
-  if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
+  if [ -n "$handoff_broker" ] || cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
     BASE_INFERENCE_PRESENT=1
   fi
+  prebuild_embed "base lattice-embed:$BENCHES_EMBED build (--no-run)"
   # Sampler starts AFTER the --no-run build check: that build is self load
   # anyway, but the window boundaries must be the measurement, not the build.
+  if [ -n "$handoff_broker" ] && [ "$BASE_INFERENCE_PRESENT" = "1" ]; then
+    prebuild_handoff "base lattice-inference:$BENCHES_INFERENCE prebuild" \
+      "$BASE_INFERENCE_CRITERION_ROOT" base1 "$BASE_FULL_SHA" \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  fi
   phase_sampler_start "base1"
   if [ "$BASE_INFERENCE_PRESENT" = "1" ]; then
     if [ -n "$handoff_broker" ]; then
@@ -791,7 +831,7 @@ BASE_PHASE_RC=0
     require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $BASE_SHA — skipping)"
   fi
-  run_bench "time:" env CRITERION_HOME="$BASE_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:" env CRITERION_HOME="$BASE_EMBED_CRITERION_ROOT" "${EMBED_BENCH_COMMAND[@]}" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_PHASE_RC=$?
 # `exit` inside `( ... )` leaves the SUBSHELL, so the status has to be caught
@@ -855,8 +895,14 @@ HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
   HEAD_INFERENCE_PRESENT=0
-  if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
+  if [ -n "$handoff_broker" ] || cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
     HEAD_INFERENCE_PRESENT=1
+  fi
+  prebuild_embed "head lattice-embed:$BENCHES_EMBED build (--no-run)"
+  if [ -n "$handoff_broker" ] && [ "$HEAD_INFERENCE_PRESENT" = "1" ]; then
+    prebuild_handoff "head lattice-inference:$BENCHES_INFERENCE prebuild" \
+      "$INFERENCE_CRITERION_ROOT" head1 "$HEAD_FULL_SHA" \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
   phase_sampler_start "head1"
   if [ "$HEAD_INFERENCE_PRESENT" = "1" ]; then
@@ -876,7 +922,7 @@ HEAD_PHASE_RC=0
     require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
-  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" "${EMBED_BENCH_COMMAND[@]}" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
@@ -891,6 +937,12 @@ echo "--- Re-benching HEAD for reverse-order control ($HEAD_SHA) ---"
 HEAD_CONTROL_PHASE_RC=0
 (
   cd "$HEAD_DIR"
+  prebuild_embed "head control lattice-embed:$BENCHES_EMBED build (--no-run)"
+  if [ -n "$handoff_broker" ]; then
+    prebuild_handoff "head control lattice-inference:$BENCHES_INFERENCE prebuild" \
+      "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" head2 "$HEAD_FULL_SHA" \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  fi
   phase_sampler_start "head2"
   if [ -n "$handoff_broker" ]; then
     run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
@@ -904,7 +956,7 @@ HEAD_CONTROL_PHASE_RC=0
     run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
   require_measured "head control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
-  run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_EMBED_CRITERION_ROOT" "${EMBED_BENCH_COMMAND[@]}" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_CONTROL_PHASE_RC=$?
 if [ "$HEAD_CONTROL_PHASE_RC" -ne 0 ]; then exit "$HEAD_CONTROL_PHASE_RC"; fi
@@ -926,6 +978,12 @@ echo "--- Re-benching BASE for reverse-order control ($BASE_SHA) ---"
 BASE_CONTROL_PHASE_RC=0
 (
   cd "$WT"
+  prebuild_embed "base control lattice-embed:$BENCHES_EMBED build (--no-run)"
+  if [ -n "$handoff_broker" ]; then
+    prebuild_handoff "base control lattice-inference:$BENCHES_INFERENCE prebuild" \
+      "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" base2 "$BASE_FULL_SHA" \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  fi
   phase_sampler_start "base2"
   if [ -n "$handoff_broker" ]; then
     run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
@@ -939,7 +997,7 @@ BASE_CONTROL_PHASE_RC=0
     run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
   require_measured "base control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
-  run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_EMBED_CRITERION_ROOT" "${EMBED_BENCH_COMMAND[@]}" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_CONTROL_PHASE_RC=$?
 if [ "$BASE_CONTROL_PHASE_RC" -ne 0 ]; then exit "$BASE_CONTROL_PHASE_RC"; fi

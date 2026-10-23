@@ -121,13 +121,15 @@ async fn chat_completions_non_streaming_observation_captures_real_config_and_mes
     let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
         .tokenizer()
         .clone();
-    let expected_prompt_tokens = tokenizer
-        .tokenize(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
-        .real_length;
+    let rendered_prompt =
+        format!("{OBSERVATION_GOLDEN_USER_HI_THERE_CHATML}<think>\n\n</think>\n\n");
+    let expected_prompt_tokens = tokenizer.tokenize(&rendered_prompt).real_length;
+    let mut expected_gen_cfg = expected_gen_cfg();
+    expected_gen_cfg.enable_thinking = false;
     assert_observation_matches(
         &obs,
         &ExpectedObservation {
-            gen_cfg: expected_gen_cfg(),
+            gen_cfg: expected_gen_cfg,
             rendered_prompt: None,
             messages: Some(&[("user", "hi there")]),
             prompt_tokens: expected_prompt_tokens,
