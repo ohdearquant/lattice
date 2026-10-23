@@ -9,6 +9,7 @@ use metal::{
 };
 
 use crate::error::InferenceError;
+use crate::forward::metal_runtime::{ELEMENT_THREADS, bind, element_dispatch, scalar};
 use crate::model::embeddinggemma2::{EmbeddingGemma2Model, LayerWeights, Weights};
 use crate::model::embeddinggemma2_config::{EmbeddingGemma2Config, EmbeddingGemma2LayerKind};
 use crate::model::gemma4_ops::{gemma4_rope_cos_sin, gemma4_rope_inv_freq};
@@ -30,7 +31,6 @@ const ATTENTION_SHADER: &str = include_str!("../shaders/embeddinggemma2_attentio
 const VISION_SHADER: &str = include_str!("../shaders/embeddinggemma2_vision.metal");
 const GEMM_SG_SHADER: &str = include_str!("../shaders/gemm_f32_sg.metal");
 const ATTENTION_SG_SHADER: &str = include_str!("../shaders/attention_sg_hd64.metal");
-const ELEMENT_THREADS: u64 = 256;
 const ATTENTION_ROWS: u64 = 8;
 /// Threads of the simdgroup-matrix kernels: four simdgroups.
 const MATRIX_THREADS: u64 = 128;
@@ -522,25 +522,6 @@ fn read_f32(buffer: &Buffer, count: usize) -> Result<Vec<f32>, InferenceError> {
     // SAFETY: the length check above proves the buffer holds at least count aligned f32
     // elements, initialized by the command that completed before this CPU read.
     Ok(unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), count) }.to_vec())
-}
-
-fn bind(enc: &ComputeCommandEncoderRef, index: u64, buffer: &Buffer) {
-    enc.set_buffer(index, Some(buffer), 0);
-}
-
-fn scalar<T: Copy>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
-    enc.set_bytes(
-        index,
-        size_of::<T>() as u64,
-        std::ptr::from_ref(value).cast(),
-    );
-}
-
-fn element_dispatch(enc: &ComputeCommandEncoderRef, count: u32) {
-    enc.dispatch_thread_groups(
-        MTLSize::new(u64::from(count).div_ceil(ELEMENT_THREADS), 1, 1),
-        MTLSize::new(ELEMENT_THREADS, 1, 1),
-    );
 }
 
 // ---------------------------------------------------------------------------
