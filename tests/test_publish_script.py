@@ -68,7 +68,7 @@ class PublishScriptArgs(unittest.TestCase):
         proc, calls = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 8, calls)
+        self.assertEqual(len(publishes), 9, calls)
         self.assertFalse(any("--dry-run" in c for c in publishes), publishes)
         self.assertEqual(
             [c for c in calls if c.startswith(("cargo ", "sleep "))],
@@ -80,6 +80,7 @@ class PublishScriptArgs(unittest.TestCase):
                 "cargo publish -p lattice-tokenizer",
                 "sleep 30",
                 "cargo publish -p lattice-grammar",
+                "cargo publish -p lattice-weights",
                 "sleep 30",
                 "cargo publish -p lattice-inference",
                 "sleep 30",

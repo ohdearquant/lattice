@@ -100,12 +100,12 @@ class LatticeAdapter:
     def _assert_q4_identity(self) -> None:
         """Refuse to run unless the resolved dir is what `bench_decode_ab`'s
         `detect_format` will actually load as Q4. Mirrors
-        `crates/inference/src/model_format.rs::detect_format` precedence:
+        `crates/weights/src/model_format.rs::detect_format` precedence:
         safetensors markers win over `.q4` files, so their presence means the
         binary would silently benchmark the full-precision checkpoint under a
         Q4 label -- exactly the historical legacy Q4 comparison consumer failure mode.
 
-        `detect_format` (crates/inference/src/model_format.rs) suppresses
+        `detect_format` (crates/weights/src/model_format.rs) suppresses
         `read_dir` errors with `.ok()`, resolving an unreadable or
         concurrently-removed directory to `Unknown` rather than panicking --
         this method fails closed the same way, raising

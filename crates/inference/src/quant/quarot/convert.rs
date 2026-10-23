@@ -50,8 +50,9 @@ use crate::quant::quarot::pipeline::{
 };
 use crate::quant::quarot::plan::RotationPlan;
 use crate::quant::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use crate::weights::ingress::DecodedTensorValidator;
-use crate::weights::q4_weights::{q4_f32_to_finite_f16, quantize_f64_to_q4, save_q4_file};
+use crate::weights::q4_weights::{quantize_f64_to_q4, save_q4_file};
+use lattice_weights::ingress::DecodedTensorValidator;
+use lattice_weights::q4_weights::q4_f32_to_finite_f16;
 
 /// Upper bound on `hidden_size` accepted by [`convert_quarot_qwen35`], well above any
 /// real Qwen3.5 checkpoint, guarding `RandomizedHadamard::new`'s config-sized allocation

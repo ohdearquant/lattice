@@ -14,23 +14,27 @@ lattice-transport   (standalone — optimal transport math, Sinkhorn-Knopp)
        ▼
 lattice-tokenizer   ←── lattice-inference-core   (WordPiece, SentencePiece, BPE tokenizers)
 lattice-grammar     ←── lattice-inference-core   (JSON Schema, GBNF, constrained decoding)
+lattice-weights     ←── lattice-inference-core   (weight storage, model-directory format detection)
 lattice-inference   ←── lattice-inference-core
                     ←── lattice-tokenizer
                     ←── lattice-grammar
-                    ←── lattice-fann (optional, `mixture` feature)
+                    ←── lattice-weights
+                    ←── lattice-fann (optional, `mixture` or `metal-gpu` feature)
                                      (transformer forward pass, weights)
        │
        ▼
 lattice-embed   ←── lattice-inference   (embedding service, SIMD distance ops)
 lattice-tune    ←── lattice-fann
-                ←── lattice-inference   (training, LoRA, knowledge distillation)
+                ←── lattice-inference (optional, `inference-hook` or `train-backward`)
+                                        (training, LoRA, knowledge distillation)
 ```
 
 The three leaf crates (`inference-core`, `fann`, `transport`) have zero intra-workspace
-dependencies and can be used standalone. `tokenizer` and `grammar` each depend only on
-`inference-core` at runtime; grammar uses tokenizer in tests. `inference` builds on all three
-(plus `fann` under the optional `mixture` feature), re-exporting tokenizer, grammar and error
-items at their original paths. Consumer crates (`embed`, `tune`) compose them.
+dependencies and can be used standalone. `tokenizer`, `grammar` and `weights` each depend
+only on `inference-core` at runtime; grammar uses tokenizer in tests. `inference` depends
+on all four unconditionally (plus `fann` under the optional `mixture` or `metal-gpu`
+features), re-exporting tokenizer, grammar, weight, model-format and error items at their
+original paths. Consumer crates (`embed`, `tune`) compose them.
 
 ## Design Philosophy
 
@@ -59,6 +63,14 @@ automaton, byte trie and vocabulary masks. Its only internal runtime dependency 
 every `lattice_inference::grammar::...` path. Profiling probes use `bench-internals`,
 forwarded by the facade feature of the same name.
 
+### lattice-weights
+
+Weight storage and conversion for f32, f16, Q3, Q4 and Q8, safetensors loading for
+single-file and sharded checkpoints, and model-directory format detection. Its only
+internal runtime dependency is `lattice-inference-core`. The facade retains the
+existing `lattice_inference::weights::...` and `lattice_inference::model_format::...`
+paths. Model loading and forward execution remain in `lattice-inference`.
+
 ### lattice-inference
 
 The transformer kernel. Stability tier: Experimental (high churn).
@@ -70,7 +82,8 @@ Contains two architecture paths:
 - **Qwen3 (decoder-only)**: causal GQA, RoPE, RMSNorm, SwiGLU FFN, last-token pooling,
   BPE tokenizer. Covers Qwen3-Embedding-0.6B and 4B.
 
-Modules: `model` (configs + loaders), `tokenizer`, `weights` (f32/f16/Q8/Q4), `attention`
+Modules: `model` (configs + loaders), `tokenizer`, `grammar`, `weights` and `model_format`
+(re-exports from their lower-level crates), `attention`
 (standard, GQA, Flash, GDN), `forward` (CPU/NEON/Metal/WGPU backends), `pool`, `rope`,
 `kv_cache`, `lora_hook`, `download`, `speculative`, `sampling`.
 
@@ -145,7 +158,7 @@ lattice-embed           ← public API for embedding generation
 lattice-inference        ← transformer forward pass
     │   BERT/BGE encoder path (WordPiece/BPE tokenizers, mean pooling)
     │   Qwen3 decoder path (BPE, GQA, RoPE, SwiGLU, last-token pooling)
-    │   Weight formats: f32, f16, Q8, Q4
+    │   lattice-weights: f32, f16, Q3, Q4, Q8 storage and model-format detection
     ▼
 CPU backends             Metal (macOS)    WGPU (cross-platform GPU)
 AVX2 / NEON kernels      Metal MSL kernels WGSL compute shaders
