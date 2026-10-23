@@ -289,7 +289,7 @@ kernel void logits_topk_select64_merge(
 // ---------------------------------------------------------------------------
 // Hierarchical k=50 SIMD-group tournament kernels (R2 benchmark baseline)
 // Same logic as logits_topk_select50_first / logits_topk_select50_merge
-// in metal_qwen35.rs — kept here so benchmarks can self-compile.
+// in forward/shaders/qwen35.metal — kept here so benchmarks can self-compile.
 // ---------------------------------------------------------------------------
 constant uint TOPK50 = 50u;
 constant uint SELECT50_THREADS = 256u;
@@ -730,8 +730,9 @@ fn bench_topk_selection(c: &mut Criterion) {
 //
 // Allocates a StorageModeShared MTLBuffer containing 248_320 synthetic f32
 // logits and benchmarks the same ptr::copy_nonoverlapping used by read_buffer()
-// in metal_qwen35.rs. Confirms that the CPU memcpy benchmark above is a valid
-// proxy for unified-memory readback on the current device.
+// in forward/metal_qwen35/inner/buffers.rs. Confirms that the CPU memcpy
+// benchmark above is a valid proxy for unified-memory readback on the current
+// device.
 // ---------------------------------------------------------------------------
 
 fn bench_full_logit_readback_metal(c: &mut Criterion) {
@@ -759,7 +760,7 @@ fn bench_full_logit_readback_metal(c: &mut Criterion) {
         group.measurement_time(Duration::from_secs(5));
         group.throughput(Throughput::Bytes(FULL_READBACK_BYTES));
 
-        // Same pattern as read_buffer() in metal_qwen35.rs.
+        // Same pattern as read_buffer() in forward/metal_qwen35/inner/buffers.rs.
         group.bench_function("metal_shared_buf_248320_f32", |b| {
             b.iter(|| {
                 let mut dst = vec![0.0f32; QWEN35_VOCAB_SIZE];
