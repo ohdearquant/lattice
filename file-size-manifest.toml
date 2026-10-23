@@ -18,11 +18,6 @@ path = "crates/inference/src/bin/lattice_serve/main.rs"
 ceiling = 3611
 
 [[ratchet]]
-path = "crates/inference/src/forward/metal_qwen35.rs"
-ceiling = 16268
-retired_by = "ADR-102 M8"
-
-[[ratchet]]
 path = "crates/inference/src/forward/shaders/qwen35.metal"
 ceiling = 3311
 

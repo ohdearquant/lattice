@@ -21,14 +21,14 @@
 //! a checkpoint file. Every production construction site that used to call
 //! `Mmap::map`/`MmapOptions` directly (`quant/quarot/io.rs`,
 //! `weights/f32_weights.rs`, `weights/q4_weights.rs`,
-//! `forward/metal_qwen35.rs`) now calls one of `mmap_trust`'s own
+//! `forward/metal_qwen35/inner/buffers.rs`) now calls one of `mmap_trust`'s own
 //! `map_and_verify_trusted` / `map_after_untrusted_open` functions, which
 //! fold the trust-boundary guard call and the map into a single function --
 //! see their doc comments for why that makes "guarded before mapped"
 //! structural rather than a per-call-site convention an external walker has
 //! to keep reverifying. Storing an already-constructed mapping (a
 //! `memmap2::Mmap` struct field, as `forward/moe_expert_cache.rs` and
-//! `forward/metal_qwen35.rs`'s `Q3WeightBuf`/`Q4WeightBuf` types both do)
+//! `forward/metal_qwen35/inner/buffers.rs`'s `Q3WeightBuf`/`Q4WeightBuf` types both do)
 //! stays legal everywhere: construction is what this boundary protects, not
 //! possession.
 //!
@@ -279,7 +279,7 @@ fn only_the_mmap_trust_boundary_names_a_construction_api() {
 /// banned outside the boundary", not "the word `Mmap` is banned outside the
 /// boundary" -- a struct field storing an already-built `memmap2::Mmap`
 /// (`forward/moe_expert_cache.rs::ExpertByteTable::mmap`,
-/// `forward/metal_qwen35.rs`'s `Q3WeightBuf`/`Q4WeightBuf`) must not be
+/// `forward/metal_qwen35/inner/buffers.rs`'s `Q3WeightBuf`/`Q4WeightBuf`) must not be
 /// flagged. Synthetic fixture, not a real file, so this test's own use of
 /// the word `Mmap` in a code sample does not depend on -- or drift with --
 /// any real source file's exact contents.
