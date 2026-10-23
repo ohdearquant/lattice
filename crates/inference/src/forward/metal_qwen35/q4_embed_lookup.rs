@@ -75,7 +75,10 @@ impl Q4Embedding {
 
     /// Return the table's row count and stored width.
     pub(crate) fn dimensions(&self) -> (usize, usize) {
-        (self.rows, self.row_bytes / Q4_BLOCK_BYTES * Q4_BLOCK_WEIGHTS)
+        (
+            self.rows,
+            self.row_bytes / Q4_BLOCK_BYTES * Q4_BLOCK_WEIGHTS,
+        )
     }
 
     /// Dequantize row `id` into `dst`.
@@ -90,7 +93,10 @@ impl Q4Embedding {
     /// contain exactly the table's stored number of columns.
     pub(crate) fn write_row(&self, id: usize, dst: &mut [f32]) {
         let (rows, cols) = self.dimensions();
-        assert!(id < rows, "embedding row {id} is out of range for {rows} rows");
+        assert!(
+            id < rows,
+            "embedding row {id} is out of range for {rows} rows"
+        );
         assert_eq!(dst.len(), cols, "embedding destination width mismatch");
         let start = self.payload_offset + id * self.row_bytes;
         let row = &self.mmap[start..start + self.row_bytes];
@@ -181,5 +187,71 @@ mod tests {
             panic!("a shape mismatch must be rejected");
         };
         assert!(err.contains("shape"), "unexpected error: {err}");
+    }
+
+    const SENTINEL_BITS: u32 = 0x7fc0_1234;
+
+    fn open_fixture(rows: usize, cols: usize, seed: u64) -> (tempfile::TempDir, Q4Embedding) {
+        let tensor = negative_scale_tensor(rows, cols, seed);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("embed.q4");
+        save_q4_file(&path, &tensor).expect("write fixture");
+        let embedding =
+            Q4Embedding::open(&path, rows, cols, "embed_tokens.weight").expect("open Q4 embedding");
+        (dir, embedding)
+    }
+
+    fn refused_lookup(embedding: &Q4Embedding, id: usize, len: usize) -> String {
+        let mut dst = vec![f32::from_bits(SENTINEL_BITS); len];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            embedding.write_row(id, &mut dst)
+        }));
+        let payload = result.expect_err("the lookup must refuse this row and destination");
+        assert!(
+            dst.iter().all(|value| value.to_bits() == SENTINEL_BITS),
+            "row {id}, destination width {len}: the lookup wrote before refusing"
+        );
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn row_lookup_reports_the_opened_geometry() {
+        let (_dir, embedding) = open_fixture(5, 64, 3);
+        assert_eq!(embedding.dimensions(), (5, 64));
+    }
+
+    #[test]
+    fn row_lookup_refuses_an_out_of_range_row_before_writing() {
+        let rows = 3;
+        let cols = 96;
+        let (_dir, embedding) = open_fixture(rows, cols, 5);
+        for id in [rows, rows + 1, usize::MAX] {
+            let message = refused_lookup(&embedding, id, cols);
+            assert!(
+                message.contains("out of range"),
+                "row {id}: unexpected panic: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_lookup_refuses_a_destination_of_the_wrong_width_before_writing() {
+        let cols = 96;
+        let (_dir, embedding) = open_fixture(2, cols, 9);
+        for len in [0, 1, cols - 1, cols + 1, 2 * cols] {
+            let message = refused_lookup(&embedding, 1, len);
+            assert!(
+                message.contains("width mismatch"),
+                "width {len}: unexpected panic: {message}"
+            );
+        }
     }
 }
