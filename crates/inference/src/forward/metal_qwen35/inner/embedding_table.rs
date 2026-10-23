@@ -30,7 +30,7 @@ impl EmbeddingTable {
                 unsafe {
                     let src = (buffer.contents() as *const u16).add(id * cols);
                     for i in 0..cols {
-                        *dst.add(i) = crate::weights::half_bits::f16_bits_to_f32(*src.add(i));
+                        *dst.add(i) = lattice_weights::half_bits::f16_bits_to_f32(*src.add(i));
                     }
                 }
             }

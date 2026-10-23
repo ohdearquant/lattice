@@ -10,7 +10,10 @@
 
 use crate::error::InferenceError;
 use crate::weights::SafetensorsFile;
-use crate::weights::half_bits::bf16_bits_to_f32;
+use lattice_weights::__internal::safetensors_bf16_payload;
+#[cfg(test)]
+use lattice_weights::__internal::safetensors_cached_f32_tensor_count;
+use lattice_weights::half_bits::bf16_bits_to_f32;
 
 /// Per-layer Gemma 4 weights.
 pub(crate) struct Gemma4LayerWeights {
@@ -86,7 +89,7 @@ impl PerLayerEmbeddings {
             }
             None => return Err(InferenceError::MissingTensor(tensor_name)),
         }
-        file.bf16_payload(&tensor_name)?;
+        safetensors_bf16_payload(&file, &tensor_name)?;
         Ok(Self {
             file,
             tensor_name,
@@ -103,7 +106,7 @@ impl PerLayerEmbeddings {
                 self.rows
             )));
         }
-        let payload = self.file.bf16_payload(&self.tensor_name)?;
+        let payload = safetensors_bf16_payload(&self.file, &self.tensor_name)?;
         let row_bytes = self.row_len * 2;
         let bytes = payload
             .get(row * row_bytes..(row + 1) * row_bytes)
@@ -122,7 +125,7 @@ impl PerLayerEmbeddings {
     /// Number of tensors in the kept file that hold a cached f32 conversion.
     #[cfg(test)]
     pub(crate) fn cached_f32_tensor_count(&self) -> usize {
-        self.file.cached_f32_tensor_count()
+        safetensors_cached_f32_tensor_count(&self.file)
     }
 }
 

@@ -136,13 +136,14 @@ regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
 | [`lattice-tune`](crates/tune/)                     | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry                                                                | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune)                     |
 | [`lattice-tokenizer`](crates/tokenizer/)           | Pure Rust tokenizers: WordPiece, SentencePiece, Qwen and Gemma BPE, model-directory auto-detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-tokenizer.svg)](https://crates.io/crates/lattice-tokenizer)           |
 | [`lattice-grammar`](crates/grammar/)               | Grammar-constrained decoding: JSON Schema and GBNF compilation, byte-level PDA, vocabulary masks; re-exported by `lattice-inference`                                  | [![](https://img.shields.io/crates/v/lattice-grammar.svg)](https://crates.io/crates/lattice-grammar)               |
+| [`lattice-weights`](crates/weights/)               | Weight storage: safetensors, f32/f16/Q3/Q4/Q8 representations and model-directory format detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-weights.svg)](https://crates.io/crates/lattice-weights)               |
 | [`lattice-inference-core`](crates/inference-core/) | Shared base types: `InferenceError`, re-exported by `lattice-inference`                                                                                               | [![](https://img.shields.io/crates/v/lattice-inference-core.svg)](https://crates.io/crates/lattice-inference-core) |
 | [`lattice-transport`](crates/transport/)           | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport)           |
 
 Three leaf crates (`fann`, `transport`, `inference-core`) have zero intra-workspace
-dependencies. `tokenizer` and `grammar` each depend only on `inference-core` at runtime.
-`inference` depends on all three and pulls
-in `fann` only when the optional `mixture` feature is enabled. Each can be used on its own.
+dependencies. `tokenizer`, `grammar` and `weights` each depend only on `inference-core`
+at runtime. `inference` depends on all four unconditionally and pulls in `fann` through
+the optional `mixture` or `metal-gpu` features. Each can be used on its own.
 
 ---
 
@@ -548,7 +549,12 @@ Application
 lattice-embed          (public API: embedding service, SIMD distance ops, LRU cache)
     |
     v
-lattice-inference      (transformer kernel: BERT/Qwen3 forward pass, tokenizers, weights)
+lattice-inference      (transformer kernel: BERT/Qwen3 forward pass)
+    |
+    +---> lattice-inference-core (shared error type)
+    +---> lattice-tokenizer      (tokenizers; depends on inference-core)
+    +---> lattice-grammar        (constrained decoding; depends on inference-core)
+    +---> lattice-weights        (weight storage and format detection; depends on inference-core)
     |
     +---> CPU (primary)      Metal (macOS)     WGPU (fallback)
           AVX2/NEON kernels   Apple Silicon      Vulkan/DX12
@@ -556,7 +562,7 @@ lattice-inference      (transformer kernel: BERT/Qwen3 forward pass, tokenizers,
 
 lattice-fann           (standalone: tiny network primitives, <5ms CPU inference)
 lattice-transport      (standalone: optimal transport math, Wasserstein distances)
-lattice-tune           (depends on fann + inference: LoRA, distillation, model registry)
+lattice-tune           (depends on fann; optional inference: LoRA, distillation, model registry)
 ```
 
 ---

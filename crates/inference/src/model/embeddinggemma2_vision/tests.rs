@@ -771,7 +771,7 @@ fn vision_lazy_holder_retains_original_descriptor_and_config() {
     std::fs::write(&weights_path, empty_checkpoint()).unwrap();
     std::fs::write(&config_path, CONFIG).unwrap();
     let config_json = std::fs::read_to_string(&config_path).unwrap();
-    let file = crate::weights::mmap_trust::open_regular_file_no_hang(&weights_path).unwrap();
+    let file = lattice_weights::mmap_trust::open_regular_file_no_hang(&weights_path).unwrap();
     let original = file.metadata().unwrap();
     let holder = LazyVision::from_checkpoint(config_json, file, weights_path.clone(), 512);
     std::fs::rename(&weights_path, directory.path().join("original.safetensors")).unwrap();
@@ -803,7 +803,7 @@ fn vision_checkpoint_defers_parsing_and_retries_after_failure() {
     let directory = tempfile::tempdir().unwrap();
     let weights_path = directory.path().join("model.safetensors");
     std::fs::write(&weights_path, b"invalid").unwrap();
-    let file = crate::weights::mmap_trust::open_regular_file_no_hang(&weights_path).unwrap();
+    let file = lattice_weights::mmap_trust::open_regular_file_no_hang(&weights_path).unwrap();
     let holder = LazyVision::from_checkpoint(CONFIG.into(), file, weights_path.clone(), 512);
     assert!(!holder.is_loaded());
     assert!(matches!(
@@ -828,7 +828,7 @@ fn vision_checkpoint_rechecks_original_descriptor_trust_on_retry() {
     let original_path = directory.path().join("original.safetensors");
     std::fs::write(&weights_path, empty_checkpoint()).unwrap();
     std::fs::set_permissions(&weights_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let file = crate::weights::mmap_trust::open_regular_file_no_hang(&weights_path).unwrap();
+    let file = lattice_weights::mmap_trust::open_regular_file_no_hang(&weights_path).unwrap();
     let holder = LazyVision::from_checkpoint(CONFIG.into(), file, weights_path.clone(), 512);
     std::fs::rename(&weights_path, &original_path).unwrap();
     std::fs::write(&weights_path, empty_checkpoint()).unwrap();
@@ -850,7 +850,7 @@ fn vision_checkpoint_lock_poison_returns_a_typed_error() {
     let directory = tempfile::tempdir().unwrap();
     let weights_path = directory.path().join("model.safetensors");
     std::fs::write(&weights_path, empty_checkpoint()).unwrap();
-    let file = crate::weights::mmap_trust::open_regular_file_no_hang(&weights_path).unwrap();
+    let file = lattice_weights::mmap_trust::open_regular_file_no_hang(&weights_path).unwrap();
     let holder = Arc::new(LazyVision::from_checkpoint(
         CONFIG.into(),
         file,
