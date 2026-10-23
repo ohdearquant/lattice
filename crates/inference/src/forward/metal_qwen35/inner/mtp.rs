@@ -105,7 +105,7 @@ impl MetalQwen35State {
 
         if let Some(ref rot) = self.engine.quarot_rotation {
             // Rotation dim is built from `cfg.hidden_size` at session construction
-            // (see `from_q4_dir` line ~10112), and `normed_embed` is `vec![0.0f32; hidden]`,
+            // (see `from_q4_dir` in `weights.rs`), and `normed_embed` is `vec![0.0f32; hidden]`,
             // so dimensions cannot mismatch here. The `Result` API is preserved for
             // type compatibility; `debug_assert` catches programming errors in tests.
             debug_assert_eq!(rot.dim(), normed_embed.len());

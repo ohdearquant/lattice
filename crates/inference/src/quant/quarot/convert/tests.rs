@@ -1343,7 +1343,7 @@ fn tiny_config_json_with_mtp(cfg: &Qwen35Config) -> String {
 /// scaled down to the tiny test config's `hidden_size=8`) into `path`.
 ///
 /// Shapes are derived from the loader expectations in
-/// `metal_qwen35.rs:load_mtp_q4_weights`:
+/// `load_mtp_q4_weights` (`forward/metal_qwen35/inner/weights.rs`):
 ///   - fc.weight:              [hidden, 2*hidden]   → fc projects concat(embed, hidden)
 ///   - q_proj.weight:          [num_heads*head_dim*4, hidden]  — use 4*hidden rows
 ///   - k_proj.weight:          [num_kv_heads*head_dim, hidden] — use hidden rows

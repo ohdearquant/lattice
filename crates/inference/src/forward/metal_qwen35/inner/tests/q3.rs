@@ -305,11 +305,13 @@ fn gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries() {
     // Shape C: M=5,N=9,K=96 small odd M/N with a 3-block K depth.
     // Shape D: M=16,N=32,K=1024 — Qwen3.5-0.8B's dense gate/up
     //   projection input depth (`hidden_size=1024`, dispatch uses
-    //   `K=hidden` — metal_qwen35.rs:5086), a production K-depth but
+    //   `K=hidden` — `encode_mlp_block` in `inner/layers/mod.rs`), a
+    //   production K-depth but
     //   not the deepest Q3-eligible one.
     // Shape E: M=16,N=1024,K=3584 — Qwen3.5-0.8B's down-projection
     //   depth (`intermediate_size=3584`, dispatch uses
-    //   `K=intermediate` — metal_qwen35.rs:5112), 112 `BK=32`
+    //   `K=intermediate` — `encode_mlp_block` in `inner/layers/mod.rs`),
+    //   112 `BK=32`
     //   iterations — the deepest Q3-eligible production MLP shape.
     //
     // `max_abs_diff` is the same NaN-honest helper used by the Q4 twin

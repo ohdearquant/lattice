@@ -15,7 +15,7 @@
 //!
 //! The low nibble holds `q[2b]`, the high nibble `q[2b+1]`. This matches the
 //! nibble convention used by the `gemv_q4_decode` Metal kernel in
-//! `forward/metal_qwen35.rs`.
+//! `forward/shaders/qwen35.metal`.
 //!
 //! ### Dequantization (both encode modes share this)
 //!
