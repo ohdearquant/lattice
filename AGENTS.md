@@ -149,35 +149,35 @@ The `bench-internals` feature exposes profiling probes and is forwarded by the f
 
 ### lattice-weights — Weight storage and model formats
 
-| Module             | Purpose                           | Key Exports                                    |
-| ------------------ | --------------------------------- | ---------------------------------------------- |
-| `f32_weights.rs`   | Safetensors loading and tensors   | `SafetensorsFile`, `TensorSource`, `BertWeights` |
-| `f16_weights.rs`   | Half-precision weight storage     | `F16`, `F16ModelWeights`                        |
-| `q3_weights.rs`    | Q3 storage and conversion         | `Q3Tensor`, `Q3Block`                           |
-| `q4_weights.rs`    | Q4 storage and conversion         | `Q4Tensor`, `Q4Block`                           |
-| `q8_weights.rs`    | Q8 storage and conversion         | `Q8Matrix`, `quantize_matrix`                   |
-| `model_format.rs`  | Model-directory format detection  | `ModelFormat`, `ModelFamily`, `inspect_format`  |
+| Module            | Purpose                          | Key Exports                                      |
+| ----------------- | -------------------------------- | ------------------------------------------------ |
+| `f32_weights.rs`  | Safetensors loading and tensors  | `SafetensorsFile`, `TensorSource`, `BertWeights` |
+| `f16_weights.rs`  | Half-precision weight storage    | `F16`, `F16ModelWeights`                         |
+| `q3_weights.rs`   | Q3 storage and conversion        | `Q3Tensor`, `Q3Block`                            |
+| `q4_weights.rs`   | Q4 storage and conversion        | `Q4Tensor`, `Q4Block`                            |
+| `q8_weights.rs`   | Q8 storage and conversion        | `Q8Matrix`, `quantize_matrix`                    |
+| `model_format.rs` | Model-directory format detection | `ModelFormat`, `ModelFamily`, `inspect_format`   |
 
 Its only internal runtime dependency is `inference-core`. The inference facade retains
 its existing `weights` and `model_format` paths.
 
 ### lattice-inference — Transformer kernel
 
-| Module           | Purpose                      | Key Exports                                                                       |
-| ---------------- | ---------------------------- | --------------------------------------------------------------------------------- |
-| `model/`         | Model configs and loaders    | `BertConfig`, `BertModel`, `QwenConfig`, `QwenModel`, `CrossEncoderModel`         |
-| `tokenizer/`     | Re-exports lattice-tokenizer | `Tokenizer` trait, `WordPieceTokenizer`, `SentencePieceTokenizer`, `BpeTokenizer` |
-| `grammar/`       | Re-exports lattice-grammar   | `GrammarEngine`, `GrammarError`, `GrammarSpec`                                    |
-| `weights.rs`     | Re-exports lattice-weights   | `SafetensorsFile`, `F16ModelWeights`, `Q8Matrix`, `Q4Tensor`                      |
-| `model_format.rs` | Re-exports format detection | `ModelFormat`, `ModelFamily`, `inspect_format`                                 |
-| `attention/`     | Attention mechanisms         | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
-| `forward/`       | Compute backends             | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
-| `kv_cache/`      | KV cache for generation      | `FlatKVCache`, `PagedKVCache`                                                     |
-| `speculative.rs` | Speculative decoding         | `NgramSpeculator`, `MtpVerifier`                                                  |
-| `lora_hook.rs`   | LoRA adapter injection trait | `LoraHook`, `NoopLoraHook`                                                        |
-| `rope.rs`        | Rotary positional encoding   | `RopeTable`                                                                       |
-| `sampling.rs`    | Token sampling               | `SamplingConfig`, `sample_token`                                                  |
-| `download.rs`    | HuggingFace model download   | `ensure_model_files`                                                              |
+| Module            | Purpose                      | Key Exports                                                                       |
+| ----------------- | ---------------------------- | --------------------------------------------------------------------------------- |
+| `model/`          | Model configs and loaders    | `BertConfig`, `BertModel`, `QwenConfig`, `QwenModel`, `CrossEncoderModel`         |
+| `tokenizer/`      | Re-exports lattice-tokenizer | `Tokenizer` trait, `WordPieceTokenizer`, `SentencePieceTokenizer`, `BpeTokenizer` |
+| `grammar/`        | Re-exports lattice-grammar   | `GrammarEngine`, `GrammarError`, `GrammarSpec`                                    |
+| `weights.rs`      | Re-exports lattice-weights   | `SafetensorsFile`, `F16ModelWeights`, `Q8Matrix`, `Q4Tensor`                      |
+| `model_format.rs` | Re-exports format detection  | `ModelFormat`, `ModelFamily`, `inspect_format`                                    |
+| `attention/`      | Attention mechanisms         | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
+| `forward/`        | Compute backends             | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
+| `kv_cache/`       | KV cache for generation      | `FlatKVCache`, `PagedKVCache`                                                     |
+| `speculative.rs`  | Speculative decoding         | `NgramSpeculator`, `MtpVerifier`                                                  |
+| `lora_hook.rs`    | LoRA adapter injection trait | `LoraHook`, `NoopLoraHook`                                                        |
+| `rope.rs`         | Rotary positional encoding   | `RopeTable`                                                                       |
+| `sampling.rs`     | Token sampling               | `SamplingConfig`, `sample_token`                                                  |
+| `download.rs`     | HuggingFace model download   | `ensure_model_files`                                                              |
 
 ### lattice-embed — Embedding service
 
