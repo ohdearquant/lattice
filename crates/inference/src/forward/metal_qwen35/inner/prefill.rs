@@ -338,9 +338,10 @@ impl MetalQwen35State {
         unsafe {
             let dst_base = self.session.activations.hidden.contents() as *mut f32;
             for (t, &id) in token_ids.iter().enumerate() {
-                self.engine
-                    .embed_tokens
-                    .write_row(id as usize, dst_base.add(t * hidden), hidden);
+                self.engine.embed_tokens.write_row(
+                    id as usize,
+                    std::slice::from_raw_parts_mut(dst_base.add(t * hidden), hidden),
+                );
             }
         }
     }

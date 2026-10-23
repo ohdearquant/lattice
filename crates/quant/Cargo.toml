@@ -14,8 +14,8 @@ categories = ["science", "mathematics"]
 all-features = true
 
 [dependencies]
-lattice-inference-core = { version = "0.14.0", path = "../inference-core" }
-lattice-weights = { version = "0.14.0", path = "../weights" }
+lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+lattice-weights = { version = "0.15.0", path = "../weights" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

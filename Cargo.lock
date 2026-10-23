@@ -1575,7 +1575,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "lattice-embed"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-fann"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "approx",
  "bytemuck",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-grammar"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "lattice-inference-core",
  "lattice-tokenizer",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "approx",
  "axum",
@@ -1683,21 +1683,21 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference-core"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "lattice-metal-runtime"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "bytemuck",
  "lattice-inference-core",
- "metal",
+ "metal 0.33.0",
  "objc",
 ]
 
 [[package]]
 name = "lattice-quant"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "lattice-inference-core",
  "lattice-weights",
@@ -1709,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-tokenizer"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "lattice-inference-core",
  "rayon",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-transport"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-tune"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-weights"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "half",
  "lattice-inference-core",

@@ -344,9 +344,10 @@ impl MetalQwen35State {
             );
             // SAFETY: dst row t holds hidden f32 values and is disjoint from the table.
             unsafe {
-                self.engine
-                    .embed_tokens
-                    .write_row(id as usize, dst_base.add(t * hidden), hidden);
+                self.engine.embed_tokens.write_row(
+                    id as usize,
+                    std::slice::from_raw_parts_mut(dst_base.add(t * hidden), hidden),
+                );
             }
         }
 

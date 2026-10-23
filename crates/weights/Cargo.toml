@@ -25,7 +25,7 @@ f16 = []
 test-utils = []
 
 [dependencies]
-lattice-inference-core = { version = "0.14.0", path = "../inference-core" }
+lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 memmap2 = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }

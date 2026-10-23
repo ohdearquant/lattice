@@ -138,13 +138,13 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-lattice-fann = { version = "0.14.0", path = "../fann", optional = true }
-lattice-grammar = { version = "0.14.0", path = "../grammar" }
-lattice-inference-core = { version = "0.14.0", path = "../inference-core" }
-lattice-metal-runtime = { version = "0.14.0", path = "../metal-runtime", optional = true }
-lattice-quant = { version = "0.14.0", path = "../quant" }
-lattice-tokenizer = { version = "0.14.0", path = "../tokenizer" }
-lattice-weights = { version = "0.14.0", path = "../weights" }
+lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
+lattice-grammar = { version = "0.15.0", path = "../grammar" }
+lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+lattice-metal-runtime = { version = "0.15.0", path = "../metal-runtime", optional = true }
+lattice-quant = { version = "0.15.0", path = "../quant" }
+lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
+lattice-weights = { version = "0.15.0", path = "../weights" }
 
 # Unix-only uses: `router_state/storage.rs` opens router state with `O_NOFOLLOW`/`O_NONBLOCK`,
 # and `measurement.rs` probes the bench supervisor with `kill(pid, 0)` and `futimes`. The
@@ -417,7 +417,7 @@ required-features = ["f16", "metal-gpu", "gdn-state-counters"]
 ureq = { version = "3", optional = true }
 
 [dev-dependencies]
-lattice-weights = { version = "0.14.0", path = "../weights", features = ["test-utils"] }
+lattice-weights = { version = "0.15.0", path = "../weights", features = ["test-utils"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }

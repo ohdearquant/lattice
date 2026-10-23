@@ -300,9 +300,10 @@ impl MetalQwen35State {
                 // SAFETY: token_id < vocab_size; hidden buffer row holds hidden f32 values.
                 unsafe {
                     let dst = self.session.activations.hidden.contents() as *mut f32;
-                    self.engine
-                        .embed_tokens
-                        .write_row(token_id as usize, dst, hidden);
+                    self.engine.embed_tokens.write_row(
+                        token_id as usize,
+                        std::slice::from_raw_parts_mut(dst, hidden),
+                    );
                 }
             }
         }
@@ -1395,9 +1396,10 @@ impl MetalQwen35State {
         // SAFETY: token_id < vocab_size; hidden buffer row holds hidden f32 values.
         unsafe {
             let dst = self.session.activations.hidden.contents() as *mut f32;
-            self.engine
-                .embed_tokens
-                .write_row(token_id as usize, dst, hidden);
+            self.engine.embed_tokens.write_row(
+                token_id as usize,
+                std::slice::from_raw_parts_mut(dst, hidden),
+            );
         }
 
         let mut active_layer_idx = 0usize;

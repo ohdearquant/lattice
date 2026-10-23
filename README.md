@@ -19,7 +19,7 @@ on x86, NEON on ARM) handle the CPU path.
 
 Lattice is two things in one repo.
 
-**A Rust inference library.** Five published crates covering embeddings, generation, quantization,
+**A Rust inference library.** Eleven crates covering embeddings, generation, quantization,
 LoRA fine-tuning, and optimal transport. Use `lattice-embed` as a library dependency, or run
 the `lattice` binary for interactive chat and an OpenAI-compatible HTTP server.
 
@@ -39,7 +39,7 @@ model library from a single window. To build and install it, follow the step-by-
 | Metal GPU backend      | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform.                                                                                                                                                                                                                           |
 | Generation models      | Qwen3.5-0.8B / 2B via `lattice chat`/`serve`. Qwen3.6-27B via `lattice chat`/`serve` from a native Q4 checkpoint (requires the Metal GPU build, `--features "f16 metal-gpu"`); safetensors 27B is loader-level only. Qwen3.6-35B-A3B (MoE): config + weight loader support. Hybrid GatedDeltaNet + GQA architecture. |
 | Embedding models       | 9 models: BGE, E5, MiniLM, Qwen3-Embedding families. Auto-download for 7 BERT-family variants.                                                                                                                                                                                                                       |
-| Three tokenizers       | WordPiece, SentencePiece, BPE. No Hugging Face tokenizers C extension.                                                                                                                                                                                                                                               |
+| Tokenizers             | WordPiece, SentencePiece, Qwen-style BPE, and Gemma BPE. No Hugging Face tokenizers C extension.                                                                                                                                                                                                                     |
 | Quantization           | Q8, Q4, and QuaRot (rotation-based 4-bit), including Q4 + LoRA inference on Qwen3.5.                                                                                                                                                                                                                                 |
 | LoRA                   | Inference hooks, load-time adapter selection, PEFT safetensors format, training via `lattice-tune`.                                                                                                                                                                                                                  |
 | HTTP API               | OpenAI-compatible `/v1/chat/completions` via `lattice serve`.                                                                                                                                                                                                                                                        |
@@ -131,7 +131,7 @@ regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
 | Crate                                              | Description                                                                                                                                                           | crates.io                                                                                                          |
 | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | [`lattice-embed`](crates/embed/)                   | Embedding service: `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill                                  | [![](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)                   |
-| [`lattice-inference`](crates/inference/)           | Transformer kernel: safetensors loading, BERT/BGE/Qwen3 forward pass, three tokenizers, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding, quantization | [![](https://img.shields.io/crates/v/lattice-inference.svg)](https://crates.io/crates/lattice-inference)           |
+| [`lattice-inference`](crates/inference/)           | Transformer kernel: safetensors loading, BERT/BGE/Qwen3 forward pass, tokenizer facade, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding, quantization | [![](https://img.shields.io/crates/v/lattice-inference.svg)](https://crates.io/crates/lattice-inference)           |
 | [`lattice-fann`](crates/fann/)                     | Fast neural network primitives: `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer                                                     | [![](https://img.shields.io/crates/v/lattice-fann.svg)](https://crates.io/crates/lattice-fann)                     |
 | [`lattice-tune`](crates/tune/)                     | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry                                                                | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune)                     |
 | [`lattice-tokenizer`](crates/tokenizer/)           | Pure Rust tokenizers: WordPiece, SentencePiece, Qwen and Gemma BPE, model-directory auto-detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-tokenizer.svg)](https://crates.io/crates/lattice-tokenizer)           |
@@ -139,14 +139,14 @@ regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
 | [`lattice-weights`](crates/weights/)               | Weight storage: safetensors, f32/f16/Q3/Q4/Q8 representations and model-directory format detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-weights.svg)](https://crates.io/crates/lattice-weights)               |
 | [`lattice-quant`](crates/quant/)                   | Quantization primitives: bounded Q4 manifest reading, Hadamard transforms and rotation absorption; re-exported by `lattice-inference`                                 | [![](https://img.shields.io/crates/v/lattice-quant.svg)](https://crates.io/crates/lattice-quant)                   |
 | [`lattice-inference-core`](crates/inference-core/) | Shared base types: `InferenceError`, re-exported by `lattice-inference`                                                                                               | [![](https://img.shields.io/crates/v/lattice-inference-core.svg)](https://crates.io/crates/lattice-inference-core) |
-| [`lattice-metal-runtime`](crates/metal-runtime/) | Shared Metal buffers, command encoding and pipeline construction; macOS with the optional `metal-gpu` feature | [![](https://img.shields.io/crates/v/lattice-metal-runtime.svg)](https://crates.io/crates/lattice-metal-runtime) |
+| [`lattice-metal-runtime`](crates/metal-runtime/)   | Shared Metal buffers, command encoding and pipeline construction; macOS with the optional `metal-gpu` feature                                                         | [![](https://img.shields.io/crates/v/lattice-metal-runtime.svg)](https://crates.io/crates/lattice-metal-runtime)   |
 | [`lattice-transport`](crates/transport/)           | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport)           |
 
 Three leaf crates (`fann`, `transport`, `inference-core`) have zero intra-workspace
-dependencies. `tokenizer`, `grammar` and `weights` each depend only on `inference-core`
-at runtime. `quant` depends on `inference-core` and `weights`. `inference` depends on
-all five unconditionally and pulls in `fann` through
-the optional `mixture` or `metal-gpu` features. Each can be used on its own.
+dependencies. `tokenizer`, `grammar`, `weights` and `metal-runtime` each depend only on
+`inference-core` at runtime. `quant` depends on `inference-core` and `weights`. `inference` depends on
+all five unconditionally, pulls in `fann` through the optional `mixture` or `metal-gpu`
+features, and pulls in `metal-runtime` through `metal-gpu`. Each can be used on its own.
 
 ---
 
@@ -545,30 +545,37 @@ Measured performance on normalized vectors (internal benchmarks, subject to hard
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    App[Application] --> Embed[lattice-embed]
+    Embed -.->|native, enabled by default| Inference[lattice-inference]
+    Inference --> Tokenizer[lattice-tokenizer]
+    Inference --> Core[lattice-inference-core]
+    Tokenizer --> Core
+    Inference --> Grammar[lattice-grammar]
+    Inference --> Weights[lattice-weights]
+    Inference --> Quant[lattice-quant]
+    Grammar --> Core
+    Weights --> Core
+    Quant --> Core
+    Quant --> Weights
+    Inference -.->|metal-gpu| MetalRuntime[lattice-metal-runtime]
+    MetalRuntime --> Core
+    Inference -.->|mixture or metal-gpu| Fann[lattice-fann]
+    Tune[lattice-tune] --> Fann
+    Tune -.->|inference-hook or train-backward| Inference
+    Transport[lattice-transport]
 ```
-Application
-    |
-    v
-lattice-embed          (public API: embedding service, SIMD distance ops, LRU cache)
-    |
-    v
-lattice-inference      (transformer kernel: BERT/Qwen3 forward pass)
-    |
-    +---> lattice-inference-core (shared error type)
-    +---> lattice-tokenizer      (tokenizers; depends on inference-core)
-    +---> lattice-grammar        (constrained decoding; depends on inference-core)
-    +---> lattice-weights        (weight storage and format detection; depends on inference-core)
-    +---> lattice-quant          (quantization primitives; depends on inference-core and weights)
-    +---> lattice-metal-runtime  (optional metal-gpu helpers; depends on inference-core)
-    |
-    +---> CPU (primary)      Metal (macOS)     WGPU (fallback)
-          AVX2/NEON kernels   Apple Silicon      Vulkan/DX12
 
+Arrows point from consumers to dependencies; dashed arrows are feature-gated.
+The diagram shows production dependencies. `lattice-tokenizer` owns tokenization,
+with supported compatibility exports under `lattice-inference::tokenizer`.
+`lattice-inference-core` owns shared base types such as `InferenceError`.
 
-lattice-fann           (standalone: tiny network primitives, <5ms CPU inference)
-lattice-transport      (standalone: optimal transport math, Wasserstein distances)
-lattice-tune           (depends on fann; optional inference: LoRA, distillation, model registry)
-```
+Inference uses CPU kernels (AVX2/NEON) by default. Metal on macOS (`metal-gpu`) and
+WGPU for cross-platform acceleration (`wgpu-gpu`) are opt-in backends. `lattice-tune`
+builds without inference by default; its inference integration requires
+`inference-hook` or `train-backward`.
 
 ---
 
@@ -647,9 +654,17 @@ variable when the same requirement should apply to `make ci` or Git hooks.
 
 ## Publishing
 
-Publish order follows the internal dependency DAG (dependencies before dependents): `fann` and
-`transport` (leaves), wait 30s, then `inference` (depends on `fann`), wait 30s, then `embed`
-and `tune`.
+[`scripts/publish.sh`](scripts/publish.sh) publishes dependencies before dependents:
+
+1. `fann`, `transport`, and `inference-core` (leaves).
+2. `tokenizer`, `grammar`, `weights`, and `metal-runtime`.
+3. `quant`.
+4. `inference`.
+5. `embed` and `tune`.
+
+The script waits 30 seconds between tiers for registry indexing. Its dry-run mode
+checks package sizes for all eleven crates, then runs `cargo publish --dry-run` for
+the leaf tier only; later tiers require this release's dependencies on crates.io.
 
 ```bash
 make publish

@@ -559,11 +559,11 @@ impl MetalQwen35Engine {
         }
 
         // Embedding matrix: f16, shared by the CPU row lookup and the Q8_0 logits kernels.
-        let embed_tokens = EmbeddingTable::F16(make_buffer_f16(
-            &device,
-            &weights.embed_tokens,
-            "embed_tokens.f16",
-        ));
+        let embed_tokens = EmbeddingTable::f16(
+            make_buffer_f16(&device, &weights.embed_tokens, "embed_tokens.f16"),
+            cfg.vocab_size,
+            cfg.hidden_size,
+        )?;
         let embed_tokens_q8 = Q4WeightBuf::from_buffer(make_buffer_quant(
             &device,
             &weights.embed_tokens,
