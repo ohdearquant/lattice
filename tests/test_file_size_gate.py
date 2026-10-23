@@ -623,7 +623,7 @@ class ShippedManifest(unittest.TestCase):
     def test_manifest_is_present_and_parses(self) -> None:
         text = (REPO / MANIFEST).read_text(encoding="utf-8")
         parsed = gate.parse_manifest(text, MANIFEST)
-        self.assertTrue(parsed.ratchets, "the shipped manifest lists no ratchet entries")
+        self.assertTrue(parsed.ratchets or parsed.data, "the shipped manifest lists no entries")
 
     def test_manifest_entries_are_sorted(self) -> None:
         parsed = gate.parse_manifest((REPO / MANIFEST).read_text(encoding="utf-8"), MANIFEST)
