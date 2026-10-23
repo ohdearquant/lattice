@@ -17,7 +17,8 @@
 //! on dequeue-time cancellation, `lattice.rs`'s worker sent an empty
 //! interrupted `GenerateOutput` before moving on; `lattice_serve.rs`'s
 //! worker silently dropped the job with no reply at all. This module picks
-//! ONE contract -- an explicit [`WorkerEvent::Cancelled`] terminal event --
+//! ONE contract -- an explicit
+//! [`WorkerEvent::Cancelled`](crate::serving_worker::WorkerEvent::Cancelled) terminal event --
 //! and both binaries now go through the exact same loop to get it.
 //!
 //! # Bounded shutdown
@@ -34,7 +35,7 @@
 //!
 //! # Testability without a GPU
 //!
-//! [`run_worker_loop`] -- the FIFO/cancellation/terminal-event state
+//! `run_worker_loop` -- the FIFO/cancellation/terminal-event state
 //! machine -- is generic over an injected `generate` closure, exactly like
 //! `lattice_serve.rs`'s pre-existing `run_worker_loop` was. Production
 //! supplies callbacks from a model-owned runtime; the worker tests in
@@ -47,8 +48,9 @@
 //! `generate` success path has no equivalent GPU-free test (mirrors
 //! precedent: PR #666's `MetalHandle` wiring shipped without a call-site
 //! test requiring a real Q4 checkpoint fixture that doesn't exist, relying
-//! on `metal_qwen35.rs`'s own exhaustive Device-gated tests for the
-//! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
+//! on the Metal engine's own exhaustive Device-gated tests (under
+//! `forward/metal_qwen35/inner/tests/`) for the underlying
+//! `generate_streaming_with_prefix_cache_and_cancel` call).
 
 use crate::forward::metal_qwen35::ChatMessage;
 #[cfg(any(
@@ -299,7 +301,7 @@ impl std::fmt::Debug for ControlRequest {
 /// What the worker thread's single channel carries.
 ///
 /// One channel rather than two is what makes the ordering contract in
-/// [`run_worker_loop_with_control`]'s doc comment expressible at all: a second
+/// `run_worker_loop_with_control`'s doc comment expressible at all: a second
 /// channel would need a select, and the worker thread has no runtime to select
 /// on -- it is a bare `std::thread` blocking on one receiver.
 ///
@@ -997,7 +999,7 @@ pub(crate) fn run_worker_loop_with_lora(
     }
 }
 
-/// Namespace for [`AffineWorker::spawn`] -- a zero-sized marker type (never
+/// Namespace for `AffineWorker::spawn` -- a zero-sized marker type (never
 /// constructed) so the shared worker's entry point reads as
 /// `AffineWorker::spawn(..)` at every call site, matching the association
 /// `lattice.rs`'s prior `MetalHandle::spawn` and `lattice_serve.rs`'s prior

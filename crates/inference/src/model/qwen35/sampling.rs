@@ -6,8 +6,8 @@ use crate::generation::GenerateConfig;
 /// Sample a token from logits using temperature, top-k, min-p, top-p, and repetition penalty.
 ///
 /// Delegates to `crate::sampling::sample_full_logits`, the shared engine also
-/// used by the Metal CPU fallback (`forward/metal_qwen35.rs`'s private
-/// `sample_token`). See that function's doc comment for the three
+/// used by the Metal CPU fallback (the crate-private `sample_token` in
+/// `forward/metal_qwen35/inner/sampling.rs`). See that function's doc comment for the three
 /// optimization levers (context-id-set repetition penalty, partial-select
 /// top-k with softmax over the surviving k only, thread-local buffer reuse
 /// across decode steps) applied here relative to the old per-call allocating

@@ -70,7 +70,7 @@ mod gpu {
     /// feature (see `Cargo.toml`), so the normal production `metal-gpu` build
     /// carries neither the storage nor the `fetch_add` at each dispatch site
     /// — unlike the opt-in-flag `PathProofCounters` pattern in
-    /// `forward/metal_qwen35.rs` (issue #239), which stays compiled in and
+    /// `forward/metal_qwen35/inner/diagnostics.rs` (issue #239), which stays compiled in and
     /// gates the atomic op behind a runtime check instead. Read via
     /// [`metal_dispatch_count`] / zeroed via [`reset_metal_dispatch_count`];
     /// see `tests/vision_s3b_vit_metal_gate_test.rs`.

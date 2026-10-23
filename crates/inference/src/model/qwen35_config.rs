@@ -200,7 +200,7 @@ pub(crate) const MAX_HIDDEN_SIZE: usize = 1_048_576;
 /// all. It is a free multiplier in `linear_qkv_dim()` (`2 * linear_num_key_heads *
 /// linear_key_head_dim + linear_num_value_heads() * linear_value_head_dim`), which sizes the
 /// GatedDeltaNet QKV projection weight, conv1d weight, and conv/activation scratch buffers
-/// throughout `attention/gdn.rs`, `model/qwen35/loading.rs`, and `forward/metal_qwen35.rs` --
+/// throughout `attention/gdn.rs`, `model/qwen35/loading.rs`, and `forward/metal_qwen35/` --
 /// none of those call sites re-validate it. Real Qwen3.5/3.6 GDN configs use
 /// `linear_num_key_heads = 16`; 8,192 matches the existing [`MAX_ATTENTION_HEADS`] scale while
 /// leaving 512x headroom above that for future architectures.
@@ -214,7 +214,7 @@ pub(crate) const MAX_LINEAR_NUM_KEY_HEADS: usize = 8_192;
 /// -- but both are products, and with the *other* factor pinned at 1 (a value real
 /// checkpoints never carry, but a parseable config can), `value_heads` alone can reach
 /// 1,048,576 while still passing both checks. `new_session_inner`
-/// (`forward/metal_qwen35.rs`) uses `linear_num_value_heads()` directly as a free
+/// (`forward/metal_qwen35/inner/engine.rs`) uses `linear_num_value_heads()` directly as a free
 /// multiplier in its GatedDeltaNet chunk-scratch geometry (`chunk_rows = num_chunks *
 /// num_vh * GDN_CHUNK_SIZE`), independent of those two products, so this is the only
 /// remaining guard bounding that multiplier on its own. Real Qwen3.5/3.6 GDN configs use
@@ -225,8 +225,8 @@ pub(crate) const MAX_LINEAR_NUM_KEY_HEADS: usize = 8_192;
 /// small `value_heads` still reaches multi-gigabyte chunk-scratch allocation).
 pub(crate) const MAX_LINEAR_NUM_VALUE_HEADS: usize = 8_192;
 
-/// Mirror of `forward/metal_qwen35.rs`'s `GDN_CHUNK_SIZE` constant (defined at
-/// `metal_qwen35.rs:1426`). `new_session_inner`'s GatedDeltaNet chunk-scratch geometry
+/// Mirror of `forward/metal_qwen35.rs`'s `GDN_CHUNK_SIZE` constant. `new_session_inner`'s
+/// GatedDeltaNet chunk-scratch geometry
 /// tiles the prefill window into chunks of this size; duplicated here (rather than
 /// imported) because `forward/metal_qwen35.rs` is behind the `metal-gpu` feature and
 /// `qwen35_config.rs` must validate on every build, including CPU-only ones. If the
@@ -239,8 +239,9 @@ pub(crate) const MAX_LINEAR_NUM_VALUE_HEADS: usize = 8_192;
 /// changes; a `metal-gpu`-gated drift test is tracked as follow-up work.
 const GDN_CHUNK_SIZE_MIRROR: usize = 32;
 
-/// Mirror of `forward/metal_qwen35.rs`'s hardcoded `max_cache_len.min(512)` prefill cap
-/// used in both `new_session_inner` call sites (`metal_qwen35.rs:3682`, `:15676`). The
+/// Mirror of the Metal engine's hardcoded `max_cache_len.min(512)` prefill cap, used by
+/// `new_session_inner` (`forward/metal_qwen35/inner/engine.rs`) and `from_q4_dir`
+/// (`forward/metal_qwen35/inner/weights.rs`). The
 /// number of GatedDeltaNet chunks (`num_chunks = bp.div_ceil(GDN_CHUNK_SIZE)`) is bounded
 /// by this literal regardless of `max_position_embeddings`, since `bp` is always
 /// `min(max_cache_len, 512)`. Duplicated here for the same reason as
@@ -248,7 +249,8 @@ const GDN_CHUNK_SIZE_MIRROR: usize = 32;
 const GDN_MAX_PREFILL_MIRROR: usize = 512;
 
 /// Upper bound, in bytes, on the largest single GatedDeltaNet chunk-scratch buffer
-/// (`new_session_inner`'s `GdnChunkScratch`, `forward/metal_qwen35.rs`) accepted from
+/// (`GdnChunkScratch` in `forward/metal_qwen35.rs`, allocated by `new_session_inner` in
+/// `forward/metal_qwen35/inner/engine.rs`) accepted from
 /// `config.json`.
 ///
 /// [`MAX_LINEAR_NUM_VALUE_HEADS`] bounds `linear_num_value_heads()` alone, but the
@@ -270,7 +272,8 @@ const GDN_MAX_PREFILL_MIRROR: usize = 512;
 pub(crate) const MAX_GDN_CHUNK_SCRATCH_BYTES: usize = 1_073_741_824;
 
 /// Upper bound, in bytes, on the SUM of every per-session GatedDeltaNet scratch/qkv
-/// buffer `new_session_inner` (`forward/metal_qwen35.rs`) allocates together (CLASS A2).
+/// buffer `new_session_inner` (`forward/metal_qwen35/inner/engine.rs`) allocates together
+/// (CLASS A2).
 ///
 /// [`MAX_GDN_CHUNK_SCRATCH_BYTES`] only bounds the largest *single* `GdnChunkScratch`
 /// buffer, but `new_session_inner` allocates several key-dimension buffers
@@ -304,7 +307,8 @@ pub(crate) const MAX_CONV_KERNEL_DIM: usize = 512;
 /// [`MAX_CONV_KERNEL_DIM`] and [`MAX_LINEAR_NUM_KEY_HEADS`] bound their respective factors
 /// individually, but their product still drives `GatedDeltaNetState::new`'s `conv_buffer =
 /// vec![0.0; conv_dim * buf_len]` (mirrored in the Metal GDN conv buffer allocation in
-/// `forward/metal_qwen35.rs`) -- two generously-headroomed per-factor caps can still compose
+/// `forward/metal_qwen35/inner/gdn_state.rs`) -- two generously-headroomed per-factor caps can
+/// still compose
 /// into a multi-gigabyte allocation. Real Qwen3.5/3.6 GDN configs have `linear_qkv_dim() ~
 /// 6144` and `linear_conv_kernel_dim - 1 = 3` (~18,432 elements); 16,777,216 (2^24) matches the
 /// [`MAX_GDN_STATE_SIZE`] scale while leaving roughly 900x headroom above that for future
@@ -330,7 +334,7 @@ pub(crate) const MAX_GDN_CROSS_LAYER_STATE_BYTES: u128 = 4_294_967_296;
 
 /// Upper bound, in bytes, on the Metal RoPE cos/sin table pair accepted from `config.json`.
 ///
-/// `build_rope_interleaved` (`forward/metal_qwen35.rs`) allocates two `Vec<f32>` of
+/// `build_rope_interleaved` (`forward/metal_qwen35/inner/engine.rs`) allocates two `Vec<f32>` of
 /// `max_position_embeddings * (rope_dim / 2)` entries each (cos and sin tables) --
 /// `4 * max_position_embeddings * rope_dim` bytes total. [`MAX_POSITION_EMBEDDINGS`] bounds
 /// `max_position_embeddings` and [`MAX_HEAD_DIM`] bounds `rope_dim` transitively (via
@@ -1469,8 +1473,7 @@ impl Qwen35Config {
     }
 
     /// Parse HF config.json text into a `Qwen35Config`. Stable signature kept for existing
-    /// callers (e.g. `forward/metal_qwen35.rs`'s `from_q4_dir`, deferred to the #1037
-    /// rebase per the CLASS C ingress table in the PR body); runs the identical validation
+    /// callers (e.g. `quant/quarot/convert.rs`); runs the identical validation
     /// as [`Self::from_config_json_str_validated`], just unwrapping the newtype.
     pub fn from_config_json_str(json: &str) -> Result<Self, InferenceError> {
         Self::from_config_json_str_validated(json).map(ValidatedQwen35Config::into_inner)
@@ -1777,7 +1780,8 @@ impl Qwen35Config {
                 prf = cfg.partial_rotary_factor,
             )));
         }
-        // `build_rope_interleaved` (`forward/metal_qwen35.rs`) allocates two `Vec<f32>` of
+        // `build_rope_interleaved` (`forward/metal_qwen35/inner/engine.rs`) allocates two
+        // `Vec<f32>` of
         // `max_position_embeddings * (rope_dim / 2)` entries each (cos and sin tables) --
         // `4 * max_position_embeddings * rope_dim` bytes total. `max_position_embeddings` and
         // `rope_dim` are each individually bounded above, but not their product. Mirror the
@@ -1898,7 +1902,8 @@ impl Qwen35Config {
             )));
         }
         // `MAX_LINEAR_NUM_VALUE_HEADS` bounds `value_heads` alone, but
-        // `new_session_inner`'s GatedDeltaNet chunk-scratch buffers (`forward/metal_qwen35.rs`)
+        // `new_session_inner`'s GatedDeltaNet chunk-scratch buffers
+        // (`forward/metal_qwen35/inner/engine.rs`)
         // multiply it by `linear_key_head_dim` / `linear_value_head_dim`, which
         // `MAX_GDN_STATE_SIZE` only bounds as a three-factor product with `value_heads` --
         // a config with `value_heads` small and either head-dim field huge satisfies that
@@ -1981,7 +1986,8 @@ impl Qwen35Config {
         // individually, but their product (via `linear_qkv_dim()`) still drives
         // `GatedDeltaNetState::new`'s `conv_buffer = vec![0.0; conv_dim * buf_len]`
         // (`attention/gdn.rs`, mirrored in the Metal GDN conv buffer allocation in
-        // `forward/metal_qwen35.rs`), unconditional at first generation regardless of layer
+        // `forward/metal_qwen35/inner/gdn_state.rs`), unconditional at first generation
+        // regardless of layer
         // mix. Validate the checked product globally for the same reason as the
         // `linear_output_dim` / `gdn_state_size` budgets above. See
         // `MAX_GDN_CONV_BUFFER_SIZE` docs.

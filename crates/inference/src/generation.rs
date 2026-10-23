@@ -426,9 +426,9 @@ impl DecodePolicy {
     // family): CPU production code now calls `init_with_metadata`/`transition_with_metadata`
     // instead, which share this method's internals via `construct`/`transition_inner` but
     // route metadata through a session rather than a direct logits slice. `init`/`transition`
-    // themselves stay byte-identical on purpose -- the Metal prefix-cache loop kept under
-    // `#[cfg(test)]` in `metal_qwen35.rs` still calls them directly, so outside a test build
-    // they have no caller.
+    // themselves stay byte-identical on purpose -- their remaining callers are the unit tests
+    // in `generation/tests.rs` and `model/qwen35/generation/tests.rs`, so outside a test
+    // build they have no caller.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn init(
         gen_cfg: &GenerateConfig,
