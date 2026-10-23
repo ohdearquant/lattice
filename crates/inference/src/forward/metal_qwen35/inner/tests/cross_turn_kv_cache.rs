@@ -537,3 +537,92 @@ fn cross_turn_cache_clear_forces_full_refill_next_call() {
         "a cleared cache slot must never be treated as a valid cached entry"
     );
 }
+
+/// #2072: the serving routes end a thinking-off generation prompt with an
+/// empty think block, while the next turn renders the answer as plain history
+/// right after the assistant opener. The two prompts part there, so each later
+/// turn must replay from the GDN checkpoint kept at the previous turn's start,
+/// and give the tokens a full re-prefill gives. Mutation sensitivity: without
+/// the split prefill in `QwenMetalSession::prefill` no checkpoint sits at the
+/// turn start and every later turn plans `FullRefill`.
+#[test]
+fn cross_turn_thinking_off_continuation_replays_from_the_turn_start() {
+    let Some(_) = metal::Device::system_default() else {
+        return;
+    };
+    let _gpu_guard = gpu_test_lock();
+
+    const EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
+    const CONTEXT: usize = 192;
+
+    let tokenizer = single_char_vocab_tokenizer();
+    let (mut cfg, weights) = tiny_hybrid_fixture();
+    cfg.eos_token_id = u32::MAX;
+    cfg.max_position_embeddings = CONTEXT;
+
+    let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+    let mut cached_state =
+        MetalQwen35State::new(&weights, &cfg, CONTEXT).expect("tiny hybrid fixture");
+
+    let mut history: Vec<(&str, String)> = Vec::new();
+    let mut previous_turn_start = None;
+    for (turn_idx, user_text) in ["ab", "cd", "e"].iter().enumerate() {
+        history.push(("user", (*user_text).to_string()));
+        let opened = crate::forward::metal_qwen35::format_chat_template_parts(
+            history
+                .iter()
+                .map(|(role, content)| (*role, content.as_str())),
+        );
+        let prompt = format!("{opened}{EMPTY_THINK}");
+        let turn_start = tokenizer.tokenize(&opened).real_length;
+        assert!(
+            turn_start < tokenizer.tokenize(&prompt).real_length,
+            "turn {turn_idx}: the think block must add tokens after the opener"
+        );
+
+        let cached_out = cached_state
+            .generate_streaming_with_prefix_cache(
+                slot_id,
+                &prompt,
+                &tokenizer,
+                &cross_turn_test_gen_cfg(42, 3),
+                |_delta, _id| true,
+            )
+            .expect("cache-aware generation must not error on a valid conversation");
+
+        let mut reference_state =
+            MetalQwen35State::new(&weights, &cfg, CONTEXT).expect("tiny hybrid fixture");
+        let reference_out = reference_state
+            .generate_streaming(
+                &prompt,
+                &tokenizer,
+                &cross_turn_test_gen_cfg(42, 3),
+                |_delta, _id| true,
+            )
+            .expect("no grammar configured; must not fail closed");
+        assert_eq!(
+            cached_out.output.token_ids, reference_out.token_ids,
+            "turn {turn_idx}: cache-aware token IDs must match full re-prefill"
+        );
+
+        match previous_turn_start {
+            None => assert_eq!(
+                cached_out.cache.mode,
+                crate::kv_cache::PrefixReuseMode::FullRefill,
+                "turn {turn_idx}: a cold slot refills"
+            ),
+            Some(checkpoint_len) => {
+                assert_eq!(
+                    cached_out.cache.mode,
+                    crate::kv_cache::PrefixReuseMode::ReplayFromCheckpoint { checkpoint_len },
+                    "turn {turn_idx}: the plain-history continuation must replay from the \
+                     previous turn's start"
+                );
+                assert_eq!(cached_out.cache.reused_tokens, checkpoint_len);
+            }
+        }
+
+        previous_turn_start = Some(turn_start);
+        history.push(("assistant", cached_out.output.text.clone()));
+    }
+}

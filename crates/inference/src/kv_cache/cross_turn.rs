@@ -190,6 +190,26 @@ pub fn plan_prefix_reuse(
     full_refill(shared, entry.represented_len)
 }
 
+/// Where a chat prompt's generation turn begins: the token length just past the
+/// last occurrence of `opener_ids` (the tokens of the assistant turn opener) in
+/// `prompt_ids`. `None` when `opener_ids` is empty or does not occur.
+///
+/// A client sends the next turn with the answer as plain history, rendered right
+/// after the same opener, so the next prompt shares the prompt up to this length
+/// even when the generation prompt continues past the opener, as a thinking-off
+/// prompt does with its empty think block. A GDN checkpoint retained here lets
+/// that next turn plan `PrefixReuseMode::ReplayFromCheckpoint` instead of
+/// `FullRefill` (#2072).
+pub fn generation_turn_start(prompt_ids: &[u32], opener_ids: &[u32]) -> Option<usize> {
+    if opener_ids.is_empty() || opener_ids.len() > prompt_ids.len() {
+        return None;
+    }
+    prompt_ids
+        .windows(opener_ids.len())
+        .rposition(|window| window == opener_ids)
+        .map(|start| start + opener_ids.len())
+}
+
 /// Whether a retained sparse checkpoint at `len` remains valid when the
 /// slot's entry is replaced by a save at `new_represented_len` whose token
 /// history shares `common_prefix_len` tokens with the old entry's history

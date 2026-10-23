@@ -242,3 +242,57 @@ fn checkpoint_survival_requires_all_three_conditions() {
     // Degenerate save at len 0 retains nothing.
     assert!(!checkpoint_survives_save(1, 5, 0));
 }
+
+// #2072: the turn start is the end of the LAST opener, so a history that
+// already holds earlier assistant turns still names the generation turn.
+#[test]
+fn generation_turn_start_ends_at_the_last_opener() {
+    let opener = [4, 5];
+    assert_eq!(generation_turn_start(&[1, 4, 5, 6, 7], &opener), Some(3));
+    assert_eq!(
+        generation_turn_start(&[1, 4, 5, 8, 9, 4, 5, 6], &opener),
+        Some(7)
+    );
+    assert_eq!(generation_turn_start(&[1, 2, 4, 5], &opener), Some(4));
+    assert_eq!(generation_turn_start(&[1, 4, 6, 5], &opener), None);
+    assert_eq!(generation_turn_start(&[4], &opener), None);
+    assert_eq!(generation_turn_start(&[1, 4, 5], &[]), None);
+}
+
+// #2072: a thinking-off prompt continues past the opener with an empty think
+// block, and the next turn renders the answer right after the opener instead.
+// The two prompts part at the turn start, so only a checkpoint retained there
+// lets the next turn reuse the conversation so far.
+#[test]
+fn a_checkpoint_at_the_turn_start_replays_a_plain_history_continuation() {
+    let opener = [4, 5];
+    let think = [6, 7];
+    let first_prompt: Vec<u32> = [&[1, 2, 3][..], &opener, &think].concat();
+    let turn_start = generation_turn_start(&first_prompt, &opener).expect("opener present");
+    assert_eq!(turn_start, 5);
+    let answer = [8, 9];
+    let held: Vec<u32> = [&first_prompt[..], &answer].concat();
+    let e = entry(held.clone(), held.len(), held.len());
+    let next_prompt: Vec<u32> = [
+        &[1, 2, 3][..],
+        &opener,
+        &answer,
+        &[10, 1, 2, 11],
+        &opener,
+        &think,
+    ]
+    .concat();
+
+    let plan = plan_prefix_reuse(Some(&e), &metadata(), &next_prompt, &[turn_start]);
+    assert_eq!(
+        plan.mode,
+        PrefixReuseMode::ReplayFromCheckpoint {
+            checkpoint_len: turn_start
+        }
+    );
+    assert_eq!(plan.reusable_len, turn_start);
+    assert_eq!(plan.suffix_len, next_prompt.len() - turn_start);
+
+    let plan = plan_prefix_reuse(Some(&e), &metadata(), &next_prompt, &[]);
+    assert_eq!(plan.mode, PrefixReuseMode::FullRefill);
+}

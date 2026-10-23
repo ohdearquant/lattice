@@ -484,6 +484,7 @@ impl MetalQwen35State {
         metadata: crate::kv_cache::CrossTurnPrefixMetadata,
         represented_token_ids: Vec<u32>,
         consumed_entry: Option<MetalCrossTurnPrefixEntry>,
+        turn_checkpoint: Option<MetalGdnCheckpoint>,
     ) -> Result<(), crate::error::InferenceError> {
         use crate::error::InferenceError;
 
@@ -514,7 +515,17 @@ impl MetalQwen35State {
         // no prior snapshot is byte-consistent with the live buffers
         // (chunk boundaries differ between the original and the
         // re-prefill), and the ring starts empty by design.
+        //
+        // #2072: `turn_checkpoint` was taken by this generation's own
+        // prefill, so the live KV rows below it are the ones it was taken
+        // against, whatever the plan was; it joins the ring under the
+        // same rule as a carried checkpoint.
         let mut checkpoints: Vec<MetalGdnCheckpoint> = Vec::new();
+        if let Some(cp) = turn_checkpoint
+            && crate::kv_cache::checkpoint_survives_save(cp.len, represented_len, represented_len)
+        {
+            checkpoints.push(cp);
+        }
         if let Some(old) = consumed_entry {
             let common = crate::kv_cache::longest_common_token_prefix(
                 &old.generic.token_ids,
@@ -537,14 +548,14 @@ impl MetalQwen35State {
                     snapshot: old.gdn_snapshot,
                 });
             }
-            checkpoints.sort_by_key(|c| c.len);
-            checkpoints.dedup_by_key(|c| c.len);
-            // Evict the shallowest boundaries first — see
-            // CROSS_TURN_GDN_CHECKPOINT_CAP for the tradeoff.
-            if checkpoints.len() > CROSS_TURN_GDN_CHECKPOINT_CAP {
-                let excess = checkpoints.len() - CROSS_TURN_GDN_CHECKPOINT_CAP;
-                checkpoints.drain(..excess);
-            }
+        }
+        checkpoints.sort_by_key(|c| c.len);
+        checkpoints.dedup_by_key(|c| c.len);
+        // Evict the shallowest boundaries first — see
+        // CROSS_TURN_GDN_CHECKPOINT_CAP for the tradeoff.
+        if checkpoints.len() > CROSS_TURN_GDN_CHECKPOINT_CAP {
+            let excess = checkpoints.len() - CROSS_TURN_GDN_CHECKPOINT_CAP;
+            checkpoints.drain(..excess);
         }
 
         let generic = crate::kv_cache::CrossTurnPrefixEntry {
@@ -573,9 +584,16 @@ impl MetalQwen35State {
         metadata: crate::kv_cache::CrossTurnPrefixMetadata,
         represented_token_ids: Vec<u32>,
         consumed_entry: Option<MetalCrossTurnPrefixEntry>,
+        turn_checkpoint: Option<MetalGdnCheckpoint>,
     ) {
         if self
-            .save_cross_turn_prefix(slot_id, metadata, represented_token_ids, consumed_entry)
+            .save_cross_turn_prefix(
+                slot_id,
+                metadata,
+                represented_token_ids,
+                consumed_entry,
+                turn_checkpoint,
+            )
             .is_err()
         {
             self.cross_turn_prefix_cache.remove(slot_id);

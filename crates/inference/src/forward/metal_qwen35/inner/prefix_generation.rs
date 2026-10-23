@@ -298,18 +298,32 @@ impl MetalQwen35State {
             }
         };
 
+        // The next turn renders this answer as plain history right after the
+        // generation turn's opener, so a prompt that continues past the opener
+        // (a thinking-off prompt's empty think block) diverges from it there.
+        // Prefill keeps a GDN snapshot at that length for the save below, so the
+        // next turn can replay from it instead of refilling (#2072).
+        let mut opener = String::new();
+        crate::forward::metal_qwen35::push_chat_generation_open(&mut opener);
+        let opener = tokenizer.tokenize(&opener);
+        let turn_checkpoint_at = crate::kv_cache::generation_turn_start(
+            &prompt_ids,
+            &opener.input_ids[..opener.real_length],
+        );
+
         // The session borrows the state for the whole run and tears the
         // sampling route down when it drops, before the commit below.
         let eos_token_id = self.engine.config.eos_token_id;
-        let run = {
+        let (run, turn_checkpoint) = {
             let mut session = QwenMetalSession::over_restored_state(
                 self,
                 gen_plan,
                 plan.suffix_start,
                 gen_cfg,
                 SamplingRouteEnvironment::current(),
-            )?;
-            run_prefix_cache_streaming(
+            )?
+            .with_turn_checkpoint_at(turn_checkpoint_at);
+            let run = run_prefix_cache_streaming(
                 &mut session,
                 gen_cfg,
                 think_close_id,
@@ -318,7 +332,8 @@ impl MetalQwen35State {
                 tokenizer,
                 on_token,
                 should_cancel,
-            )?
+            )?;
+            (run, session.take_turn_checkpoint())
         };
 
         match run.commit {
@@ -345,6 +360,7 @@ impl MetalQwen35State {
                     metadata,
                     represented_token_ids,
                     consumed_entry.take(),
+                    turn_checkpoint.map(|(len, snapshot)| MetalGdnCheckpoint { len, snapshot }),
                 );
             }
         }

@@ -237,6 +237,11 @@ pub(crate) struct QwenMetalSession<'state> {
     prompt_ids: Vec<u32>,
     /// Where the suffix the prefix-cache profile prefills begins; 0 otherwise.
     suffix_start: usize,
+    /// A prompt length strictly inside the suffix at which the prefix-cache
+    /// profile splits its prefill to keep a GDN snapshot (#2072).
+    turn_checkpoint_at: Option<usize>,
+    /// The GDN snapshot taken at `turn_checkpoint_at`, with its length.
+    turn_checkpoint: Option<(usize, crate::attention::gdn::GdnSnapshot)>,
     rng_state: u64,
     temperature: f32,
     ledger: PredictionLedger,
@@ -394,6 +399,8 @@ impl<'state> QwenMetalSession<'state> {
             mode,
             prompt_ids: plan.prompt_ids,
             suffix_start,
+            turn_checkpoint_at: None,
+            turn_checkpoint: None,
             rng_state: plan.rng_state,
             temperature: gen_cfg.temperature,
             ledger: PredictionLedger::new(),
@@ -402,6 +409,24 @@ impl<'state> QwenMetalSession<'state> {
             route_engaged,
             thread_bound: PhantomData,
         })
+    }
+
+    /// Splits the prefix-cache profile's prefill at prompt length `at` and keeps
+    /// the GDN snapshot taken there, for the caller to retain as a cross-turn
+    /// checkpoint. Only a length inside the suffix (`suffix_start < at <` prompt
+    /// length) splits it; any other length leaves the prefill whole and keeps
+    /// nothing. Other profiles ignore it.
+    pub(crate) fn with_turn_checkpoint_at(mut self, at: Option<usize>) -> Self {
+        self.turn_checkpoint_at = at;
+        self
+    }
+
+    /// The snapshot [`Self::with_turn_checkpoint_at`] asked for, once prefill
+    /// has taken it.
+    pub(crate) fn take_turn_checkpoint(
+        &mut self,
+    ) -> Option<(usize, crate::attention::gdn::GdnSnapshot)> {
+        self.turn_checkpoint.take()
     }
 
     /// The readback mode fixed at construction.
@@ -436,18 +461,29 @@ impl DecoderSession for QwenMetalSession<'_> {
     /// leaves nothing to undo except the route, which `Drop` tears down. The
     /// prefix-cache profile prefills its suffix through `forward_prefill_from`
     /// at the restored boundary, as the prefix-cache loop does, because
-    /// `try_forward_prefill` refuses any session that is not fresh.
+    /// `try_forward_prefill` refuses any session that is not fresh, in two calls
+    /// around the snapshot when [`Self::with_turn_checkpoint_at`] names a length
+    /// inside the suffix.
     fn prefill(&mut self, cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
         if cancel.is_cancelled() {
             return Err(InferenceError::Inference("cancelled before prefill".into()));
         }
         self.ledger.reset();
         let logits = if self.profile == MetalEntryProfile::PrefixCacheStreaming {
-            self.state.forward_prefill_from(
-                &self.prompt_ids[self.suffix_start..],
-                self.suffix_start,
-                false,
-            )?
+            let mut start = self.suffix_start;
+            if let Some(at) = self.turn_checkpoint_at
+                && start < at
+                && at < self.prompt_ids.len()
+            {
+                self.state
+                    .forward_prefill_from(&self.prompt_ids[start..at], start, false)?;
+                let snapshot =
+                    crate::speculative::MtpTargetVerifier::snapshot_gdn_states(&*self.state);
+                self.turn_checkpoint = Some((at, snapshot));
+                start = at;
+            }
+            self.state
+                .forward_prefill_from(&self.prompt_ids[start..], start, false)?
         } else {
             self.state.try_forward_prefill(&self.prompt_ids)?
         };

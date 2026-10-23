@@ -13,8 +13,8 @@ pub(crate) mod prefix;
 
 pub use cross_turn::{
     CrossTurnPrefixEntry, CrossTurnPrefixMetadata, CrossTurnSlotId, KvPrefixHandle,
-    PrefixRestorePlan, PrefixReuseMode, checkpoint_survives_save, longest_common_token_prefix,
-    plan_prefix_reuse,
+    PrefixRestorePlan, PrefixReuseMode, checkpoint_survives_save, generation_turn_start,
+    longest_common_token_prefix, plan_prefix_reuse,
 };
 pub use flat::{FlatKVCache, FlatKVCacheConfig};
 pub use paged::{CacheType, EvictionPolicy, PagePool, PageTable, PagedKVCache, PagedKVCacheConfig};
