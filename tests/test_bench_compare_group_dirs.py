@@ -3,8 +3,8 @@
 
 Criterion writes each group to a directory whose name it makes filename-safe:
 it replaces `?"/\\*<>:|^` with `_` and cuts the name to 64 bytes. These cases
-live apart from tests/test_bench_compare_measurement.py because that module is
-above ADR-102's line cap and may only shrink. The runner and stubs come from
+live in their own module, apart from tests/test_bench_compare_measurement.py.
+The runner and stubs come from
 bench_compare_support.
 """
 import os
