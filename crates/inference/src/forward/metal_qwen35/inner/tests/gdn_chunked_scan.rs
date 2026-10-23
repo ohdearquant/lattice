@@ -1008,7 +1008,7 @@ fn gdn175_s1b_chunkwise_oracle_real_activations() {
         // space cumprod the CPU oracle computes (`chunkwise_gdn`'s
         // `running *= a_c[i]`) is underflowing, which is a fundamentally
         // different failure mode than a solve-conditioning error: the
-        // kernel's log-alpha floor (-88, see qwen35.metal
+        // kernel's log-alpha floor (-88, see qwen35_prefill.metal
         // gdn_chunk_materialize_c32) only keeps ITS OWN log-space
         // cumulative scan finite; it says nothing about a linear-space
         // cumprod reference computing 1.0/gamma downstream.
