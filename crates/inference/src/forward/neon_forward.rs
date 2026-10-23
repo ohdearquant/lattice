@@ -30,8 +30,8 @@ use crate::model::qwen35::{
 use crate::model::qwen35_config::Qwen35Config;
 use crate::rope::RopeTable;
 use crate::tokenizer::bpe::BpeTokenizer;
-use crate::weights::ingress::{IngestedTensor, validate_ingested_tensor};
 use crate::weights::q8_weights::{validate_cfg_len, validate_gdn_shapes};
+use lattice_weights::ingress::{IngestedTensor, validate_ingested_tensor};
 
 /// Source label for NEON full-attention ingress validation errors.
 const Q8_NEON_ATTENTION_SOURCE: &str = "full-attention Q8 NEON quantization";

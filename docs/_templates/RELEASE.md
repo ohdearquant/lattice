@@ -40,9 +40,10 @@ make publish-dry
 ```
 
 `make publish-dry` validates only the three leaf crates (`lattice-fann`,
-`lattice-transport`, `lattice-inference-core`). The five dependent crates, including
-`lattice-tokenizer` and `lattice-grammar`, need their dependencies published first.
-Run `scripts/package-size-check.sh` for all eight crates before publishing.
+`lattice-transport`, `lattice-inference-core`). The six dependent crates, including
+`lattice-tokenizer`, `lattice-grammar` and `lattice-weights`, need their dependencies
+published first.
+Run `scripts/package-size-check.sh` for all nine crates before publishing.
 
 ## Publish
 
@@ -51,7 +52,7 @@ Run `scripts/package-size-check.sh` for all eight crates before publishing.
 git tag -a v{VERSION} -m "v{VERSION}"
 git push origin v{VERSION}
 
-# 6. Publish to crates.io (leaves → tokenizer, grammar → inference → embed, tune, with indexing waits)
+# 6. Publish to crates.io (leaves → tokenizer, grammar, weights → inference → embed, tune, with indexing waits)
 make publish
 
 # 7. Create the tagged GitHub release as a draft
@@ -70,7 +71,7 @@ state and every remote asset before retrying.
 
 ## Post-release
 
-- [ ] Verify on crates.io: all eight crates show v{VERSION}
+- [ ] Verify on crates.io: all nine crates show v{VERSION}
 - [ ] Smoke test: `cargo add lattice-inference@{VERSION}` in a fresh project
 - [ ] Update getting-started.md if API changed
 - [ ] Close relevant milestone/issues
@@ -89,7 +90,7 @@ gh release create v{NEW_VERSION} --draft --title "v{NEW_VERSION}" --notes-file d
 gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f tag=v{NEW_VERSION}
 
 # Only after the replacement is live and the asset workflow succeeds:
-for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-grammar lattice-inference lattice-embed lattice-tune; do
+for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-inference lattice-embed lattice-tune; do
   cargo yank --version {VERSION} "$c"
 done
 ```

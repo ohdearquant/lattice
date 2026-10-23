@@ -1,0 +1,50 @@
+[package]
+name = "lattice-weights"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Weight storage for Lattice inference: safetensors parsing and validation, q3/q4/q8/f16 weight formats, trusted mmap"
+keywords = ["safetensors", "quantization", "weights", "inference", "mmap"]
+categories = ["science", "encoding", "filesystem"]
+# Real MLX checkpoint headers used only by the detection tests.
+exclude = [
+    "tests/fixtures/mlx_headers",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+# Keep BF16 safetensors payloads as f16 instead of widening them to f32.
+f16 = []
+# Test fixtures shared with the lattice-inference test suites.
+test-utils = []
+
+[dependencies]
+lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+memmap2 = "0.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+# Two independent unix-only uses: (1) `fcntl(F_GETPATH)` for `f32_weights.rs`'s
+# `real_path_of_open_file`, which reports the real path of an already-open shard descriptor
+# for diagnostics and error text (Containment is lexical, in `contained_shard_path`; the
+# check-then-reopen window is closed by `open_manifest_entry_once` returning the opened
+# `File` rather than a path to reopen. Nothing security-relevant keys off the reported path.
+# F_GETPATH itself is Darwin/BSD-only); (2) `mmap_trust.rs`'s `O_NONBLOCK`/
+# `O_NOFOLLOW`/`ELOOP` values for the trust-boundary open guard, which are per-architecture
+# and gated to `unix` generally rather than `macos` specifically.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+half = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

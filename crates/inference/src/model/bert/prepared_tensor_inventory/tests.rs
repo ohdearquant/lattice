@@ -5,11 +5,11 @@ use super::super::prepared_facts::{
     RequiredBertTensorCensus, checked_logical_weight_payload_footprint,
 };
 use super::*;
-use crate::weights::prepared_safetensors::{
+use lattice_weights::prepared_safetensors::{
     PreparedSafetensorsFramingLimits, PreparedSafetensorsHeaderPlan,
     plan_prepared_safetensors_header,
 };
-use crate::weights::prepared_safetensors_inventory::{
+use lattice_weights::prepared_safetensors_inventory::{
     F32FileOffsetAlignment, PreparedSafetensorsInventoryFacts, PreparedSafetensorsInventoryLimits,
     parse_prepared_safetensors_header_inventory,
 };

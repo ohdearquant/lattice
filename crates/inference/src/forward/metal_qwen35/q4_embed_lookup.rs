@@ -9,9 +9,9 @@
 //! the table type that pairs it with the f16 Metal arm lives in `inner`,
 //! where the Metal types are available.
 
-use crate::weights::q4_weights::{
-    Q4_BLOCK_BYTES, Q4_BLOCK_WEIGHTS, Q4BlockCheck, open_and_mmap_q4_file, q4_f16_to_f32,
-    q4_f32_to_f16,
+use crate::weights::q4_weights::Q4_BLOCK_BYTES;
+use lattice_weights::q4_weights::{
+    Q4_BLOCK_WEIGHTS, Q4BlockCheck, open_and_mmap_q4_file, q4_f16_to_f32, q4_f32_to_f16,
 };
 
 /// A `[rows, cols]` Q4 tensor whose blocks are read from a read-only mapping
@@ -118,8 +118,8 @@ impl Q4Embedding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signed_scale_fixture::negative_scale_tensor;
     use crate::weights::q4_weights::save_q4_file;
-    use crate::weights::q4_weights::signed_scale_fixture::negative_scale_tensor;
 
     fn expected_row(
         tensor: &crate::weights::q4_weights::Q4Tensor,
