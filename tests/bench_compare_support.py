@@ -148,7 +148,7 @@ if [[ "$args" == *" --no-run "* ]]; then
 fi
 if [[ "$args" == *" --list "* ]]; then
   if [[ "$args" == *" lattice-inference "* ]]; then
-    printf '%s\n' '${STUB_INFERENCE_GROUP_DIR:-rms_norm}/896: benchmark'
+    printf '%s\n' "${STUB_INFERENCE_GROUP_DIR:-rms_norm}/896: benchmark"
   else
     printf '%s\n' 'simd_dot_product/scalar/384: benchmark'
   fi

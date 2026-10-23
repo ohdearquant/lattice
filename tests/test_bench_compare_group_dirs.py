@@ -105,8 +105,8 @@ class BenchCompareGroupDirectories(unittest.TestCase):
         another declared group.
 
         Mutation-sensitive: let the caller swallow the mapping's failure (the earlier
-        `|| true` form) and the declared set is cut at that name, `rms_norm` still
-        reconciles, and the run exits 0.
+        `|| true` form) and the declared set reads as empty, so the run refuses for
+        that reason instead and the last assertion fails.
         """
         result = _run(
             [],
@@ -120,6 +120,7 @@ class BenchCompareGroupDirectories(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertIn("its Criterion directory cannot be derived", result.stderr)
+        self.assertNotIn("found zero declared Criterion groups", result.stderr)
 
 
 if __name__ == "__main__":
