@@ -128,6 +128,7 @@ class DecodeSupervisorFixture:
             "scripts/bench-command.sh",
             "scripts/bench_decode_harness.py",
             "scripts/bench_gate_math.py",
+            "scripts/bench_run_record.py",
             "scripts/bench_decode_profiles.toml",
             "scripts/bench_decode_adapters_agentic.py",
             "scripts/bench_decode_adapters_apples_to_apples.py",
