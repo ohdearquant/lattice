@@ -70,8 +70,8 @@ fn rand_f32_vec(len: usize, seed: u32) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 // OPT-002: Sampler allocation
 //
-// The Metal `sample_token` function (private to metal_qwen35.rs) and the
-// public `Sampler::sample` share the same allocation pattern:
+// The Metal `sample_token` (crate-private, forward/metal_qwen35/inner/sampling.rs)
+// and the public `Sampler::sample` share the same allocation pattern:
 //   1. `.to_vec()` clone of the full logit vector  (vocab_size * 4 bytes)
 //   2. Full-vocab indexed pair allocation for top-k sort
 //   3. Softmax probability vector allocation

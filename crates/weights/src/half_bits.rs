@@ -5,7 +5,7 @@
 //! bit-twiddling was independently reimplemented in five places across
 //! `crates/inference/src` (`weights/f32_weights.rs`, `quant/quarot/io.rs`,
 //! `weights/q4_weights.rs`, `weights/f16_weights.rs`, and
-//! `forward/metal_qwen35.rs`). A precision-edge-case fix in one copy never
+//! `forward/metal_qwen35/inner/buffers.rs`). A precision-edge-case fix in one copy never
 //! propagated to the others. This module is the one decoder every call site
 //! now delegates to (lattice#799).
 //!

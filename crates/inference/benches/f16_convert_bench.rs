@@ -12,7 +12,8 @@
 //!
 //! A NEON fast path (`vcvt_f32_f16`, 4 lanes/instruction) was removed in #568: it
 //! required the nightly-only `stdarch_neon_f16` feature and broke stable-toolchain
-//! builds. `convert_f16_row` in `metal_qwen35.rs` is scalar-only for the same reason.
+//! builds. `convert_f16_row` in `forward/metal_qwen35/inner/buffers.rs` is scalar-only for
+//! the same reason.
 //!
 //! Run: `cargo bench -p lattice-inference --bench f16_convert_bench --features bench-internals`
 //!
