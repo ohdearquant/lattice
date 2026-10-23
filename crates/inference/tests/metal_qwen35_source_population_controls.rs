@@ -269,13 +269,13 @@ fn dependency_paths_resolve_through_a_parent_glob_that_does_not_bind_them() {
     fixture.write(ROOT, &format!("{LOCAL}use glob_dep::*;\nmod buffers;\n"));
     let child = |body: &str| format!("use super::*;\npub fn bridge() {{ {body} }}\n");
 
-    fixture.write(CHILD, &child("external_dep::helper();"));
+    fixture.write(CHILD, &child("use external_dep::helper; helper();"));
     fixture
         .load()
         .require_calls(CALLS)
         .expect("a dependency path must resolve through a parent glob that does not bind it");
 
-    fixture.write(CHILD, &child("missing_dep::helper();"));
+    fixture.write(CHILD, &child("use missing_dep::helper; helper();"));
     let error = fixture
         .load()
         .require_calls(CALLS)
