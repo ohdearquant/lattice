@@ -172,6 +172,52 @@ fn qualified_reexport_calls_resolve_the_external_owner() {
 }
 
 #[test]
+fn dependency_paths_resolve_only_through_declared_normal_dependencies() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "src/lib.rs",
+        "pub mod forward; pub mod decoder; pub mod facade;\n",
+    );
+    fixture.write(
+        "src/facade.rs",
+        "pub use external_dep::helper;\npub use dev_only::fixture_helper;\n",
+    );
+    let bridge =
+        |name: &str| format!("{LOCAL}pub fn bridge() {{ use crate::facade::{name}; {name}(); }}\n");
+    fixture.write(ROOT, &bridge("helper"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("a dependency path without a manifest must stay unresolved");
+    assert!(
+        error.contains("unresolved symbol crate::facade::external_dep"),
+        "wrong manifest-less refusal: {error}"
+    );
+
+    fixture.write(
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nexternal-dep = \"1\"\n\n\
+         [dev-dependencies]\ndev-only = \"1\"\n\n\
+         [workspace]\n",
+    );
+    fixture
+        .load()
+        .require_calls(CALLS)
+        .expect("a declared dependency path must resolve outside the crate");
+
+    fixture.write(ROOT, &bridge("fixture_helper"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("a development dependency is not visible to library source");
+    assert!(
+        error.contains("unresolved symbol crate::facade::dev_only"),
+        "wrong development-dependency refusal: {error}"
+    );
+}
+
+#[test]
 fn relocated_caller_bypass_is_rejected() {
     let fixture = Fixture::new();
     fixture.relocate();
