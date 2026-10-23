@@ -5,11 +5,14 @@
 
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLGPUFamily, MTLResourceOptions, MTLSize,
+    MTLCommandBufferStatus, MTLGPUFamily, MTLSize,
 };
 
 use crate::error::InferenceError;
-use crate::forward::metal_runtime::{ELEMENT_THREADS, bind, element_dispatch, scalar};
+use crate::forward::metal_runtime::{
+    self, BufferPolicy, ELEMENT_THREADS, UploadCopy, ZeroLengthPolicy, bind, element_dispatch,
+    scalar,
+};
 use crate::model::embeddinggemma2::{EmbeddingGemma2Model, LayerWeights, Weights};
 use crate::model::embeddinggemma2_config::{EmbeddingGemma2Config, EmbeddingGemma2LayerKind};
 use crate::model::gemma4_ops::{gemma4_rope_cos_sin, gemma4_rope_inv_freq};
@@ -54,17 +57,7 @@ fn runtime(message: impl Into<String>) -> InferenceError {
 }
 
 fn elements(name: &str, rows: usize, width: usize) -> Result<usize, InferenceError> {
-    let count = rows
-        .checked_mul(width)
-        .ok_or_else(|| invalid(format!("{name} element count overflow")))?;
-    u32::try_from(count).map_err(|_| invalid(format!("{name} exceeds u32 indexing")))?;
-    let bytes = count
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| invalid(format!("{name} byte count overflow")))?;
-    if bytes > isize::MAX as usize {
-        return Err(invalid(format!("{name} exceeds host slice capacity")));
-    }
-    Ok(count)
+    metal_runtime::elements(name, rows, width, invalid)
 }
 
 /// The distinct attention head widths the device pipelines must cover.
@@ -432,43 +425,24 @@ fn gpu_span(
     (end - start).max(0.0)
 }
 
+const BUFFER_POLICY: BufferPolicy = BufferPolicy {
+    zero_length: ZeroLengthPolicy::MinimumF32,
+    invalid,
+    runtime,
+};
+
 fn allocate(device: &Device, count: usize, label: &str) -> Result<Buffer, InferenceError> {
-    let count = elements(label, count, 1)?;
-    let bytes = (count * size_of::<f32>()) as u64;
-    if bytes > device.max_buffer_length() {
-        return Err(runtime(format!(
-            "{label} exceeds the device buffer capacity"
-        )));
-    }
-    let selector = objc::runtime::Sel::register("newBufferWithLength:options:");
-    // SAFETY: this is the Metal allocation selector with its documented NSUInteger
-    // length/options ABI and nullable object return. A raw pointer preserves nil
-    // until it can be checked, unlike metal-rs's non-null Buffer return type.
-    let raw: *mut metal::MTLBuffer = unsafe {
-        objc::Message::send_message(
-            &**device,
-            selector,
-            (bytes.max(4), MTLResourceOptions::StorageModeShared),
-        )
-    }
-    .map_err(|error| runtime(format!("{label} allocation message failed: {error}")))?;
-    if raw.is_null() {
-        return Err(runtime(format!("{label} allocation failed")));
-    }
-    // SAFETY: Metal returned a non-null owned (+1) MTLBuffer. Transferring that
-    // ownership exactly once to Buffer pairs it with metal-rs's release on drop.
-    let buffer = unsafe { <Buffer as metal::foreign_types::ForeignType>::from_ptr(raw) };
-    buffer.set_label(label);
-    if buffer.contents().is_null() || buffer.length() < bytes {
-        return Err(runtime(format!("{label} allocation is not CPU accessible")));
-    }
-    Ok(buffer)
+    metal_runtime::allocate(device, count, label, BUFFER_POLICY)
 }
 
 fn upload(device: &Device, values: &[f32], label: &str) -> Result<Buffer, InferenceError> {
-    let buffer = allocate(device, values.len(), label)?;
-    write_f32(&buffer, values)?;
-    Ok(buffer)
+    metal_runtime::upload(
+        device,
+        values,
+        label,
+        BUFFER_POLICY,
+        UploadCopy::Checked(write_f32),
+    )
 }
 
 /// A read-only `f32` view over the first `count` elements of a shared buffer, without a copy.
