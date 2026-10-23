@@ -190,6 +190,7 @@ fn only_the_mmap_trust_boundary_names_a_construction_api() {
             .expect("cargo metadata workspace_root is a path"),
     );
     let mut sources = Vec::new();
+    let mut scanned = Vec::new();
     for (name, package) in packages {
         if name != "lattice-inference" && !workspace_metadata::is_extracted(&name) {
             continue;
@@ -213,6 +214,18 @@ fn only_the_mmap_trust_boundary_names_a_construction_api() {
             root.display()
         );
         sources.extend(split_sources);
+        scanned.push(name);
+    }
+    for required in [
+        "lattice-inference",
+        "lattice-inference-core",
+        "lattice-tokenizer",
+        "lattice-grammar",
+    ] {
+        assert!(
+            scanned.iter().any(|name| name == required),
+            "{required} source tree was not scanned"
+        );
     }
 
     let mut boundary_hits = 0usize;

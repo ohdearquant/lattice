@@ -265,34 +265,7 @@ jobs:
           fi
           rg --version
       - name: Clean lattice crates (force rebuild, keep dep cache)
-        run: |
-          set -euo pipefail
-          metadata_file="$(mktemp)"
-          trap 'rm -f "$metadata_file"' EXIT
-          cargo metadata --no-deps --format-version 1 --locked > "$metadata_file"
-          packages="$(python3 - "$metadata_file" <<'PY'
-          import json, sys
-          with open(sys.argv[1], encoding="utf-8") as handle:
-              metadata = json.load(handle)
-          members = metadata["workspace_members"]
-          by_id = {package["id"]: package for package in metadata["packages"]}
-          if not members or len(set(members)) != len(members):
-              sys.exit("workspace cleanup: empty or duplicate workspace membership")
-          if len(by_id) != len(metadata["packages"]):
-              sys.exit("workspace cleanup: duplicate package IDs")
-          names = [by_id[member]["name"] for member in members]
-          if (not all(isinstance(name, str) and name for name in names)
-                  or len(set(names)) != len(names)
-                  or "lattice-inference" not in names):
-              sys.exit("workspace cleanup: invalid names or missing inference control")
-          print("\n".join(sorted(names)))
-          PY
-          )"
-          clean_args=()
-          while IFS= read -r package; do
-            clean_args+=(-p "$package")
-          done <<< "$packages"
-          cargo clean "${clean_args[@]}"
+        run: cargo clean --workspace
       - run: ./scripts/ci.sh
         env:
           LATTICE_REQUIRE_DENO: '1'
