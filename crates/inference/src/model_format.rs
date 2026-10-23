@@ -9,5 +9,5 @@ pub use lattice_weights::model_format::{
     metal_gpu_required_message, unloadable_format_message, unrecognized_format_message,
 };
 
-#[cfg(all(test, not(feature = "metal-gpu")))]
+#[cfg(test)]
 mod tests;

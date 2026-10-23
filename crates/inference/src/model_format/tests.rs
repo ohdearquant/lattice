@@ -1,6 +1,9 @@
+#[cfg(not(feature = "metal-gpu"))]
 use super::*;
+#[cfg(not(feature = "metal-gpu"))]
 use std::fs;
 
+#[cfg(not(feature = "metal-gpu"))]
 fn tempdir(name: &str) -> std::path::PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!(
