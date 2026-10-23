@@ -400,10 +400,13 @@ mod inner {
     // #854: the shared RMS-norm reduction helper is assembled as a prefix
     // fragment ahead of the kernel bodies that call it (Metal requires the
     // callee be visible textually before its call sites in the same
-    // translation unit).
+    // translation unit). The batched prefill kernels continue the same unit
+    // from `qwen35_prefill.metal`, which uses `qwen35.metal` definitions
+    // (`gdn_softplus`, `GDN_QK_NORM_EPS`) and so follows it.
     const MSL_SOURCE: &str = concat!(
         include_str!("shaders/rms_reduce.metal"),
-        include_str!("shaders/qwen35.metal")
+        include_str!("shaders/qwen35.metal"),
+        include_str!("shaders/qwen35_prefill.metal")
     );
 
     const MSL_Q4_TILED_SOURCE: &str = include_str!("shaders/gemm_q4_tiled.metal");
