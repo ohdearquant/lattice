@@ -40,7 +40,7 @@ ceiling = 3818
 
 [[ratchet]]
 path = "tests/test_bench_compare_measurement.py"
-ceiling = 3741
+ceiling = 3387
 
 [[ratchet]]
 path = "tests/test_bench_measurement_supervision.py"
