@@ -922,7 +922,7 @@ pub(crate) fn validate_q4_block_metadata_scan(
 }
 
 /// How a caller of [`open_and_mmap_q4_file`] discharges the per-block
-/// scale/bias obligation that [`validate_q4_file`] deliberately leaves open.
+/// scale/bias obligation that `validate_q4_file` deliberately leaves open.
 ///
 /// This is a required argument rather than a defaulted option so that adding
 /// a new memory-mapping Q4 consumer forces an explicit answer to "who checks
@@ -954,7 +954,7 @@ pub enum Q4BlockCheck<'a> {
 /// visibly unwrapping a `None` rather than simply not writing a line.
 pub struct Q4BlocksChecked(());
 
-/// Open `path`, run the [`validate_q4_file`] preflight against
+/// Open `path`, run the `validate_q4_file` preflight against
 /// `expected_shape`, discharge the per-block obligation per `check`, and
 /// return the header, a read-only mapping of the whole file, and — when
 /// `check` was [`Q4BlockCheck::Now`] — a [`Q4BlocksChecked`] witness.
@@ -971,7 +971,7 @@ pub struct Q4BlocksChecked(());
 ///
 /// # Errors
 ///
-/// Returns an error on I/O failure, a failed [`validate_q4_file`] preflight,
+/// Returns an error on I/O failure, a failed `validate_q4_file` preflight,
 /// an mmap failure, a header whose `payload_offset` lies beyond the mapped
 /// length, or — under [`Q4BlockCheck::Now`] — a block with a non-finite or
 /// zero scale or a non-finite bias.
