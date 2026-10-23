@@ -17,7 +17,8 @@
 //! on dequeue-time cancellation, `lattice.rs`'s worker sent an empty
 //! interrupted `GenerateOutput` before moving on; `lattice_serve.rs`'s
 //! worker silently dropped the job with no reply at all. This module picks
-//! ONE contract -- an explicit [`WorkerEvent::Cancelled`] terminal event --
+//! ONE contract -- an explicit
+//! [`WorkerEvent::Cancelled`](crate::serving_worker::WorkerEvent::Cancelled) terminal event --
 //! and both binaries now go through the exact same loop to get it.
 //!
 //! # Bounded shutdown
@@ -34,7 +35,7 @@
 //!
 //! # Testability without a GPU
 //!
-//! [`run_worker_loop`] -- the FIFO/cancellation/terminal-event state
+//! `run_worker_loop` -- the FIFO/cancellation/terminal-event state
 //! machine -- is generic over an injected `generate` closure, exactly like
 //! `lattice_serve.rs`'s pre-existing `run_worker_loop` was. Production
 //! supplies callbacks from a model-owned runtime; the worker tests in
@@ -300,7 +301,7 @@ impl std::fmt::Debug for ControlRequest {
 /// What the worker thread's single channel carries.
 ///
 /// One channel rather than two is what makes the ordering contract in
-/// [`run_worker_loop_with_control`]'s doc comment expressible at all: a second
+/// `run_worker_loop_with_control`'s doc comment expressible at all: a second
 /// channel would need a select, and the worker thread has no runtime to select
 /// on -- it is a bare `std::thread` blocking on one receiver.
 ///
@@ -998,7 +999,7 @@ pub(crate) fn run_worker_loop_with_lora(
     }
 }
 
-/// Namespace for [`AffineWorker::spawn`] -- a zero-sized marker type (never
+/// Namespace for `AffineWorker::spawn` -- a zero-sized marker type (never
 /// constructed) so the shared worker's entry point reads as
 /// `AffineWorker::spawn(..)` at every call site, matching the association
 /// `lattice.rs`'s prior `MetalHandle::spawn` and `lattice_serve.rs`'s prior
