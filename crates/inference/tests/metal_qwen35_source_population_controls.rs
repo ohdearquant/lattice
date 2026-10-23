@@ -218,6 +218,45 @@ fn dependency_paths_resolve_only_through_declared_normal_dependencies() {
 }
 
 #[test]
+fn dependency_paths_resolve_beside_a_glob_of_a_dependency() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nexternal-dep = \"1\"\nglob-dep = \"1\"\n\n\
+         [workspace]\n",
+    );
+    let bridge = |glob: &str, name: &str| {
+        format!("{LOCAL}use {glob}::*;\npub fn bridge() {{ use {name}::helper; helper(); }}\n")
+    };
+    fixture.write(ROOT, &bridge("glob_dep", "external_dep"));
+    fixture
+        .load()
+        .require_calls(CALLS)
+        .expect("a dependency path must resolve beside a glob of another dependency");
+
+    fixture.write(ROOT, &bridge("glob_dep", "missing_dep"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("an undeclared path head must stay unresolved beside a dependency glob");
+    assert!(
+        error.contains("unresolved symbol crate::forward::metal_qwen35::missing_dep"),
+        "wrong undeclared-head refusal: {error}"
+    );
+
+    fixture.write(ROOT, &bridge("missing_dep", "external_dep"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("a glob of an undeclared crate must leave the lookup unresolved");
+    assert!(
+        error.contains("unresolved symbol crate::forward::metal_qwen35::missing_dep"),
+        "wrong undeclared-glob refusal: {error}"
+    );
+}
+
+#[test]
 fn relocated_caller_bypass_is_rejected() {
     let fixture = Fixture::new();
     fixture.relocate();
