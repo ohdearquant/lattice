@@ -139,6 +139,7 @@ regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
 | [`lattice-weights`](crates/weights/)               | Weight storage: safetensors, f32/f16/Q3/Q4/Q8 representations and model-directory format detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-weights.svg)](https://crates.io/crates/lattice-weights)               |
 | [`lattice-quant`](crates/quant/)                   | Quantization primitives: bounded Q4 manifest reading, Hadamard transforms and rotation absorption; re-exported by `lattice-inference`                                 | [![](https://img.shields.io/crates/v/lattice-quant.svg)](https://crates.io/crates/lattice-quant)                   |
 | [`lattice-inference-core`](crates/inference-core/) | Shared base types: `InferenceError`, re-exported by `lattice-inference`                                                                                               | [![](https://img.shields.io/crates/v/lattice-inference-core.svg)](https://crates.io/crates/lattice-inference-core) |
+| [`lattice-metal-runtime`](crates/metal-runtime/) | Shared Metal buffers, command encoding and pipeline construction; macOS with the optional `metal-gpu` feature | [![](https://img.shields.io/crates/v/lattice-metal-runtime.svg)](https://crates.io/crates/lattice-metal-runtime) |
 | [`lattice-transport`](crates/transport/)           | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport)           |
 
 Three leaf crates (`fann`, `transport`, `inference-core`) have zero intra-workspace
@@ -559,6 +560,8 @@ flowchart TD
     Quant --> Core
     Quant --> Weights
     Inference -.->|mixture or metal-gpu| Fann[lattice-fann]
+    Inference -.->|metal-gpu| MetalRuntime[lattice-metal-runtime]
+    MetalRuntime --> Core
     Tune[lattice-tune] --> Fann
     Tune -.->|inference-hook or train-backward| Inference
     Transport[lattice-transport]

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/inference",
     "crates/inference-core",
+    "crates/metal-runtime",
     "crates/tokenizer",
     "crates/grammar",
     "crates/embed",

@@ -1650,6 +1650,7 @@ dependencies = [
  "lattice-fann",
  "lattice-grammar",
  "lattice-inference-core",
+ "lattice-metal-runtime",
  "lattice-quant",
  "lattice-tokenizer",
  "lattice-weights",
@@ -1683,6 +1684,16 @@ dependencies = [
 [[package]]
 name = "lattice-inference-core"
 version = "0.15.0"
+
+[[package]]
+name = "lattice-metal-runtime"
+version = "0.14.0"
+dependencies = [
+ "bytemuck",
+ "lattice-inference-core",
+ "metal",
+ "objc",
+]
 
 [[package]]
 name = "lattice-quant"
