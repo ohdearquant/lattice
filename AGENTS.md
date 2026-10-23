@@ -128,8 +128,8 @@ the build you are looking at.
 
 ### lattice-metal-runtime — Shared Metal helpers
 
-| Module | Purpose | Key Exports |
-| ------ | ------- | ----------- |
+| Module   | Purpose                                            | Key Exports                                                        |
+| -------- | -------------------------------------------------- | ------------------------------------------------------------------ |
 | `lib.rs` | Shared buffers, encoding and pipeline construction | `allocate`, `upload`, `scalar`, `compile_library`, `make_pipeline` |
 
 The API is enabled only on macOS with `metal-gpu`. GPU tests remain in inference
