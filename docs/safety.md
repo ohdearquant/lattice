@@ -39,7 +39,7 @@ auditable location.
 
 **Metal FFI** — The Metal GPU backend calls into `metal-rs` which itself uses `objc::msg_send!`.
 These are isolated to `crates/inference/src/forward/metal.rs` and
-`crates/inference/src/forward/metal_qwen35.rs`.
+`crates/inference/src/forward/metal_qwen35.rs`, plus `crates/inference/src/forward/metal_runtime.rs`.
 
 **f16 bit-casts** — Half-precision weights are loaded as `u16` and reinterpreted as `f16`.
 The cast is done through `bytemuck::cast_slice` with the `Pod` bound, which is safe only for
