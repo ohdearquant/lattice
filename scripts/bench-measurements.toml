@@ -330,6 +330,11 @@ role = "policy-check"
 supervision = "none"
 
 [[entry]]
+path = "scripts/bench_run_record.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
 path = "scripts/bench_wasm_simd.mjs"
 role = "measurement"
 supervision = "both-locks+quiet"
