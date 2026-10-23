@@ -265,15 +265,7 @@ jobs:
           fi
           rg --version
       - name: Clean lattice crates (force rebuild, keep dep cache)
-        run: |
-          cargo clean -p lattice-inference 2>/dev/null || true
-          cargo clean -p lattice-grammar 2>/dev/null || true
-          cargo clean -p lattice-weights 2>/dev/null || true
-          cargo clean -p lattice-quant 2>/dev/null || true
-          cargo clean -p lattice-embed 2>/dev/null || true
-          cargo clean -p lattice-fann 2>/dev/null || true
-          cargo clean -p lattice-tune 2>/dev/null || true
-          cargo clean -p lattice-transport 2>/dev/null || true
+        run: cargo clean --workspace
       - run: ./scripts/ci.sh
         env:
           LATTICE_REQUIRE_DENO: '1'
@@ -2136,11 +2128,16 @@ jobs:
       # invoked, which keeps it in the same harness-plumbing scope as above.
       - name: python3 tests/test_bench_compare_measurement.py
         run: python3 tests/test_bench_compare_measurement.py -v
-      # The prebuild ordering cases live in their own module because the
-      # measurement suite above is frozen at its ADR-102 line ceiling. Same
-      # stub-cargo scope: they drive the shipping script and run no benchmark.
+      # The prebuild ordering cases live in their own module and import the
+      # runner and stubs of the measurement suite above. Same stub-cargo scope:
+      # they drive the shipping script and run no benchmark.
       - name: python3 tests/test_bench_compare_prebuild.py
         run: python3 tests/test_bench_compare_prebuild.py -v
+      # The GPU-handoff launches of the shipping scripts, split out of the
+      # measurement suite above. Same scope: disposable repositories with stub
+      # cargo, uv and Python modules; no benchmark, model or GPU is used.
+      - name: python3 tests/test_bench_gpu_handoff.py
+        run: python3 tests/test_bench_gpu_handoff.py -v
       - name: python3 tests/test_bench_decode_slopefit.py
         run: python3 tests/test_bench_decode_slopefit.py -v
       # The in-phase load sampler's self/foreign split under --gpu-handoff,
@@ -2177,10 +2174,13 @@ jobs:
       # Temporary lock paths only; no benchmark runs.
       - name: python3 tests/test_lock_file_refresh.py
         run: python3 tests/test_lock_file_refresh.py -v
-      # Advisory local measurement inventory + fail-closed lock/idle supervision.
-      # Uses disposable lock paths and stub commands; no benchmark runs.
+      # Advisory local measurement inventory and its source classifiers; no benchmark runs.
       - name: python3 tests/test_bench_measurement_supervision.py
         run: python3 tests/test_bench_measurement_supervision.py -v
+      # Fail-closed lock/idle supervision and the GPU handoff.
+      # Uses disposable lock paths and stub commands; no benchmark runs.
+      - name: python3 tests/test_bench_measurement_supervision_runtime.py
+        run: python3 tests/test_bench_measurement_supervision_runtime.py -v
       # scripts/lib/bench-python.sh's PYTHON_BIN override (lattice#1551): drives
       # bench_require_python3 directly via a bash subprocess against fixture
       # PATH/PYTHON_BIN combinations; no benchmark or cargo runs.

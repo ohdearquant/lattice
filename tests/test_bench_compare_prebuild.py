@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Regression tests for prebuilding benchmarks before an arm's sampler starts.
 
-These cases live apart from tests/test_bench_compare_measurement.py because that
-module is already above ADR-102's line cap and may only shrink. The script-level
-runner and the shared stubs stay in that module; this one imports them rather
+These cases live apart from tests/test_bench_compare_measurement.py, which keeps
+the script-level runner and the shared stubs; this module imports them rather
 than copying them.
 """
 import importlib.util

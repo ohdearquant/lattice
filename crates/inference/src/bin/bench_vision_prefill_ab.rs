@@ -11,7 +11,7 @@
 //!     last_prefill_pos`).
 //!
 //! Both arms call `bench_support::run_multimodal_prefill`
-//! (`forward/metal_qwen35.rs`), which drives the exact same
+//! (`forward/metal_qwen35/inner/bench_support.rs`), which drives the exact same
 //! `forward_step_mrope`/`forward_step_injected_mrope` functions the
 //! production path calls. There is no recompile between arms: one process,
 //! one binary, the flag is a function argument selected per repeat.
