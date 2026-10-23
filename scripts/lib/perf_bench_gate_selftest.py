@@ -8,7 +8,6 @@ and rendering functions in process and run the gate script as a subprocess.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -30,7 +29,10 @@ GATE_NAMES = (
 
 
 def run(gate: dict) -> int:
-    """Run the self-test against the gate whose module namespace is `gate`."""
+    """Run the self-test against the gate whose module namespace is `gate`.
+
+    The fixtures read the gate names bound here, so `run_selftest` is only callable through `run`.
+    """
     globals().update({name: gate[name] for name in GATE_NAMES})
     globals()["GATE_FILE"] = gate["__file__"]
     return run_selftest()
