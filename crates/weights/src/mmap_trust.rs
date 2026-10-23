@@ -507,6 +507,7 @@ impl TrustedMmapFile {
     /// The guarded file's current on-disk length, for a header parser that
     /// needs to bounds-check a declared payload against the real file size
     /// without a route to the `File` itself.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> std::io::Result<u64> {
         Ok(self.file.metadata()?.len())
     }
