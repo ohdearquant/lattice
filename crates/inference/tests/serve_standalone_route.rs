@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 const ENFORCE_ENV: &str = "LATTICE_SERVE_STANDALONE_GATE_ENFORCE";
 const GEMMA_DIR_ENV: &str = "LATTICE_SERVE_STANDALONE_GEMMA_DIR";
 const QWEN_DIR_ENV: &str = "LATTICE_SERVE_STANDALONE_QWEN_DIR";
+const QWEN_Q4_DIR_ENV: &str = "LATTICE_SERVE_CHARACTERIZATION_QWEN_Q4_DIR";
 const HEALTH_TIMEOUT_ENV: &str = "LATTICE_SERVE_STANDALONE_HEALTH_TIMEOUT_SECS";
 const STARTUP_ERROR_DEADLINE: Duration = Duration::from_secs(120);
 
@@ -120,6 +121,44 @@ fn start(model: &Path, extra: &[&str]) -> Run {
         run.stderr.trim_end()
     );
     run
+}
+
+fn assert_real_startup_order(
+    stderr: &str,
+    model_id: &str,
+    route_format: &str,
+    display_format: &str,
+) {
+    let lines = stderr.lines().collect::<Vec<_>>();
+    let route = lines
+        .iter()
+        .position(|line| line.starts_with("[route] selected family=qwen35 backend=metal format="))
+        .expect("provider route marker");
+    let loading = lines
+        .iter()
+        .position(|line| line.starts_with("[lattice_serve] loading model from "))
+        .expect("model loading marker");
+    let ready = lines
+        .iter()
+        .position(|line| line.starts_with("[lattice_serve] model '"))
+        .expect("model ready marker");
+    assert!(
+        route < loading && loading < ready,
+        "startup marker order: {stderr}"
+    );
+    assert_eq!(
+        lines[route],
+        format!("[route] selected family=qwen35 backend=metal format={route_format}")
+    );
+    assert!(
+        lines[loading].ends_with(&format!(" ({display_format}) ...")),
+        "{stderr}"
+    );
+    assert!(
+        lines[ready].starts_with(&format!("[lattice_serve] model '{model_id}' ("))
+            && lines[ready].contains(") ready (context="),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -457,6 +496,48 @@ impl Server {
         })
     }
 
+    fn raw_chat(&self, body: &str) -> (u16, String) {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", self.port)).expect("chat request must connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(900)))
+            .expect("set chat response timeout");
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .expect("write chat request headers");
+        stream
+            .write_all(body.as_bytes())
+            .expect("write chat request body");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read chat response");
+        let split = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response headers must be complete");
+        let head = String::from_utf8_lossy(&raw[..split]);
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .expect("response status")
+            .parse()
+            .expect("numeric response status");
+        let bytes = &raw[split + 4..];
+        let bytes = if head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            dechunk(bytes)
+        } else {
+            bytes.to_vec()
+        };
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     fn chat(&self, extra: Value) -> (u16, String) {
         let mut body = json!({
             "messages": [{"role": "user", "content": "Name three primary colors."}],
@@ -604,6 +685,25 @@ fn gemma_e2b_is_served_on_the_cpu_by_the_standalone_server() {
         assert_eq!(status, 400, "{extra}: {body}");
         assert_eq!(error_code(&body), code, "{extra}: {body}");
     }
+
+    for body in [
+        r#"{"messages":[{"role":"user","content":"hi"}],"lora":[{"id":1,"scale":1.0}],"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"boolean"}}}}"#,
+        r#"{"messages":[],"lora":[{"id":1,"scale":1.0}]}"#,
+    ] {
+        let (status, body) = server.raw_chat(body);
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("refusal envelope is JSON"),
+            json!({"error":{"message":"runtime LoRA adapters are not supported for this model","type":"invalid_request_error","code":"lora_unsupported_backend","param":null}})
+        );
+    }
+    let (status, body) = server.raw_chat(r#"{"messages":[],"lora":[{"id":1,"scale":1.0}"#);
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("body error envelope is JSON"),
+        json!({"error":{"message":"invalid JSON request body","type":"invalid_request_error","code":"invalid_request_body","param":null}})
+    );
+
     let (status, body) = server.request("GET", "/v1/lora", None);
     assert_eq!(
         (status, error_code(&body).as_str()),
@@ -649,6 +749,14 @@ fn qwen_is_served_on_the_metal_worker_by_the_standalone_server() {
         "{}",
         server.diagnostics()
     );
+    assert_real_startup_order(
+        &server.diagnostics(),
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("lattice"),
+        format,
+        if format == "q4" { "q4" } else { "bf16" },
+    );
 
     assert_answers_chat(&server);
     let seen = server.stderr_with("mode=stream driver=shared");
@@ -658,4 +766,94 @@ fn qwen_is_served_on_the_metal_worker_by_the_standalone_server() {
     assert_eq!(status, 200, "{body}");
     let (status, body) = server.request("GET", "/v1/lora", None);
     assert_eq!(status, 200, "{body}");
+    if format == "safetensors" {
+        assert_strict_boolean_response_on_server(&server);
+    } else {
+        assert!(
+            !enforce(),
+            "{QWEN_DIR_ENV} must point to a safetensors checkpoint while {ENFORCE_ENV}=1"
+        );
+        eprintln!(
+            "LATTICE_SERVE_STANDALONE_SKIPPED reason=not_safetensors path={} ({QWEN_DIR_ENV})",
+            dir.display()
+        );
+    }
+}
+
+#[test]
+fn qwen_q4_accepts_a_strict_boolean_schema_with_the_safetensors_tokenizer() {
+    let Some(q4_dir) = require_checkpoint(QWEN_Q4_DIR_ENV, "qwen3.5-0.8b-q4") else {
+        return;
+    };
+    if !std::fs::read_dir(&q4_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().ends_with(".q4"))
+    {
+        assert!(
+            !enforce(),
+            "{QWEN_Q4_DIR_ENV} must contain Q4 tensor files while {ENFORCE_ENV}=1"
+        );
+        eprintln!(
+            "LATTICE_SERVE_STANDALONE_SKIPPED reason=no_q4_weights path={} ({QWEN_Q4_DIR_ENV})",
+            q4_dir.display()
+        );
+        return;
+    }
+    let Some(tokenizer_dir) = require_checkpoint(QWEN_DIR_ENV, "qwen3.5-0.8b") else {
+        return;
+    };
+    if !tokenizer_dir.join("tokenizer.json").is_file() {
+        assert!(
+            !enforce(),
+            "Qwen safetensors tokenizer is missing at {} while {ENFORCE_ENV}=1",
+            tokenizer_dir.display()
+        );
+        eprintln!(
+            "LATTICE_SERVE_STANDALONE_SKIPPED reason=no_safetensors_tokenizer path={} ({QWEN_DIR_ENV})",
+            tokenizer_dir.display()
+        );
+        return;
+    }
+    let staged = common::stage_q4_with_tokenizer(&q4_dir, &tokenizer_dir);
+    assert_strict_boolean_response(staged.path(), "q4");
+}
+
+fn assert_strict_boolean_response(model_dir: &Path, format: &str) {
+    let _gpu_guard = gpu_test_lock();
+    let server = Server::spawn(model_dir);
+    assert!(
+        server.diagnostics().contains(&format!(
+            "[route] selected family=qwen35 backend=metal format={format}"
+        )),
+        "{}",
+        server.diagnostics()
+    );
+    assert_strict_boolean_response_on_server(&server);
+}
+
+fn assert_strict_boolean_response_on_server(server: &Server) {
+    let (status, body) = server.chat(json!({
+        "max_tokens": 8,
+        "temperature": 0.0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "strict": true,
+                "schema": {"type": "boolean"}
+            }
+        }
+    }));
+    assert_eq!(status, 200, "{body}\n{}", server.diagnostics());
+    let value: Value = serde_json::from_str(&body).expect("strict response must be JSON");
+    assert_eq!(value["constraint_applied"], true, "{body}");
+    let content = value["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("strict response content must be a string");
+    assert!(
+        matches!(serde_json::from_str::<Value>(content), Ok(Value::Bool(_))),
+        "strict boolean response must contain a boolean: {body}"
+    );
 }

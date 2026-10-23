@@ -10,6 +10,8 @@ workspace version; the workspace release notes are in
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-18
+
 ### Changed
 
 - **Breaking:** `DriftReport` is `#[non_exhaustive]`. Code outside the crate can no longer

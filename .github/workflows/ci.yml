@@ -181,6 +181,50 @@ jobs:
             echo 'featureoslist=["ubuntu-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
             echo "→ full matrix including macOS"
           fi
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      # ADR-102 D4 file-size gate. This is the only job in the workflow that both
+      # checks out with `fetch-depth: 0` and has the base revision, and the gate
+      # needs the base to recompute each ratchet's effective ceiling and to read
+      # the manifest diff. The real check reads both revisions through git, so a
+      # dirty checkout cannot change its verdict.
+      #
+      # On a pull_request the checked-out HEAD is the merge ref, and
+      # `github.event.pull_request.base.sha` is the tip of main when the PR was
+      # last updated, which can be older than the main the merge ref was built
+      # on. A merge ref is built against current main, so its first parent is
+      # that main tip; using the event's base would diff in commits that main
+      # received after the PR was pushed and charge them to the PR, failing a
+      # gate over changes the PR never made. So the base is HEAD's first parent,
+      # and a HEAD that is not a two-parent merge commit is a hard error rather
+      # than a silently wrong comparison.
+      #
+      # On merge_group and push there is no merge ref: the base is the queue's
+      # base and the previously pushed tip respectively, the same expressions
+      # the change detector above uses.
+      - name: ADR-102 file-size gate
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            # `git rev-list --parents -n1 HEAD` prints "HEAD <parent> <parent>"
+            # for a merge commit, so three fields mean exactly two parents.
+            parents=$(git rev-list --parents -n1 HEAD | wc -w)
+            if [ "$parents" -ne 3 ]; then
+              echo "::error::pull_request checkout is not a two-parent merge commit: 'git rev-list --parents -n1 HEAD' printed $parents field(s), expected 3" >&2
+              exit 2
+            fi
+            base=$(git rev-parse HEAD^1)
+            head=$(git rev-parse HEAD)
+          else
+            base="$CI_BASE_SHA"
+            head="$CI_HEAD_SHA"
+          fi
+          python3 -m unittest tests.test_file_size_gate -v
+          python3 scripts/file_size_gate.py --base "$base" --head "$head"
 
   ci:
     name: CI
@@ -518,8 +562,140 @@ jobs:
             echo "GUARD FAILED: no passing test-result line with a non-zero count."
             exit 1
           }
+      - name: inference — mixture-only LoRA list reports the served router
+        run: |
+          set -euo pipefail
+          run_one() {
+            local log="$1"; shift
+            if "$@" >"$log" 2>&1; then cat "$log"; else status=$?; cat "$log"; exit "$status"; fi
+            grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || {
+              echo "GUARD FAILED: expected exactly one passing test in $log."
+              exit 1
+            }
+          }
+          run_one "${RUNNER_TEMP:-/tmp}/lora-shared-mixture.log" \
+            cargo test --locked -p lattice-inference --features mixture --lib \
+            serve::lora::orchestration_tests::list_reports_the_served_router_beside_residency -- --exact
+          run_one "${RUNNER_TEMP:-/tmp}/lora-unified-mixture.log" \
+            cargo test --locked -p lattice-inference --features mixture --bin lattice \
+            serve::tests::lora_orchestration::lora_list_wrapper_preserves_served_router_report -- --exact
       - name: inference — mixture clippy
         run: cargo clippy -p lattice-inference --all-targets --features mixture -- -D warnings
+      # Bin-linked fixtures need test-utils; mixture also changes which fixture
+      # fields compile, so lint the portable surface with and without it.
+      - name: inference - test-utils clippy (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p lattice-inference --all-targets --features test-utils -- -D warnings
+      - name: inference - mixture + test-utils clippy (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p lattice-inference --all-targets --features mixture,test-utils -- -D warnings
+      - name: inference — router storage and selection (CPU, no default features)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-router-storage-tests.log"
+          if cargo test --locked -p lattice-inference --no-default-features --lib router_state:: \
+            -- --nocapture --test-threads=1 --color never >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          for name in \
+            failure_after_head_replacement_reports_an_uncertain_commit \
+            legacy_post_link_sync_failure_reports_the_visible_uncertain_version \
+            directory_sync_stops_at_the_observed_creation_boundary \
+            publication_below_a_0711_ancestor_syncs_only_the_writable_boundary \
+            concurrent_existing_target_retries_only_its_failed_parent_sync
+          do
+            grep -Fxq "test router_state::storage::tests::${name} ... ok" "$log" || {
+              echo "GUARD FAILED: the storage control ${name} did not run and pass."
+              exit 1
+            }
+          done
+          count=$(grep -Ec '^test result: ok\. 95 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
+          if [ "$count" -ne 1 ]; then
+            echo "GUARD FAILED: expected one complete 95-test router-state result."
+            exit 1
+          fi
+      - name: inference — router bootstrap publication (CPU, mixture)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-router-bootstrap-tests.log"
+          if cargo test --locked -p lattice-inference --no-default-features --features mixture --lib router_init:: \
+            -- --nocapture --test-threads=1 --color never >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -Fxq 'test router_init::tests::with_a_gate_backend::concurrent_initializers_serialize_and_only_one_commits ... ok' "$log" || {
+            echo "GUARD FAILED: concurrent bootstrap initialization did not run and pass."
+            exit 1
+          }
+          count=$(grep -Ec '^test result: ok\. 15 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
+          if [ "$count" -ne 1 ]; then
+            echo "GUARD FAILED: expected one complete 15-test router-bootstrap result."
+            exit 1
+          fi
+      - name: inference — router storage clippy (no default features)
+        run: cargo clippy --locked -p lattice-inference --no-default-features --lib -- -D warnings
+      - name: inference router-learning clippy
+        run: cargo clippy --locked -p lattice-inference --all-targets --features router-learning -- -D warnings
+      - name: inference router-learning without serving
+        run: cargo clippy --locked -p lattice-inference --lib --no-default-features --features router-learning -- -D warnings
+      - name: inference router candidate construction
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-router-refit-tests.log"
+          if cargo test --locked -p lattice-inference --lib --features serve,router-learning router_refit::tests:: -- --nocapture >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -Eq '^test result: ok\. 21 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || {
+            echo "GUARD FAILED: expected all 21 router candidate construction tests."
+            exit 1
+          }
+      - name: inference registered router admission (CPU)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-router-admission-tests.log"
+          if cargo test --locked -p lattice-inference --lib --features serve,f16,router-learning router_admission:: \
+            -- --nocapture --test-threads=1 --color never >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          for name in \
+            statistics::tests::paired_bootstrap_uses_the_same_resampled_parent_population \
+            reference::scoring::tests::reference_scoring_teacher_forcing_alignment_and_count \
+            tests::real_candidate_positive_paired_bound_admits_without_changing_the_live_parent \
+            tests::parent_logit_tolerance_is_registered_and_inclusive_without_relaxing_draw_replay \
+            tests::entropy_history_advances_once_per_completed_round_and_not_on_errors
+          do
+            grep -Fxq "test router_admission::${name} ... ok" "$log" || {
+              echo "GUARD FAILED: admission control ${name} did not run and pass."
+              exit 1
+            }
+          done
+          count=$(grep -Ec '^test result: ok\. 47 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log" || true)
+          if [ "$count" -ne 1 ]; then
+            echo "GUARD FAILED: expected one complete 47-test router admission result."
+            exit 1
+          fi
+      - name: inference router admission Metal integration clippy
+        if: runner.os == 'macOS'
+        run: cargo clippy --locked -p lattice-inference --all-targets --features serve,f16,metal-gpu,router-learning -- -D warnings
+      - name: Router trainer artifact probe unit tests
+        run: python3 tests/test_router_learning_artifacts.py -v
+      - name: Router trainer feature isolation in emitted artifacts
+        run: python3 scripts/check-router-learning-artifacts.py
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
       # wgpu-gpu is excluded from default builds and was silently broken under
@@ -548,6 +724,33 @@ jobs:
         run: cargo clippy -p lattice-inference --all-targets -- -D warnings
       - name: inference — bench-internals clippy without f16
         run: cargo clippy -p lattice-inference --all-targets --features bench-internals -- -D warnings
+      # The qwen_cpu_driver_allocations group in inference_perf compiles only with both
+      # bench-internals and test-utils, a pair no other step enables, so a change to the
+      # shared allocation support could break it without any check going red.
+      - name: inference — bench-internals,test-utils clippy for inference_perf
+        run: cargo clippy --locked -p lattice-inference --features bench-internals,test-utils --bench inference_perf -- -D warnings
+      # The control target runs without libtest and exits non-zero unless all of its controls pass.
+      - name: inference allocation sampler controls
+        run: cargo test --locked -p lattice-inference --no-default-features --features bench-internals --test inference_perf_allocation_gate
+      # Counted samples run on a one-thread pool, so the allocation gate holds on a multicore host; the bench prints
+      # the pool widths it saw.
+      - name: inference allocation sampler multicore smoke
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        env:
+          RAYON_NUM_THREADS: "8"
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/inference-allocation-smoke.log"
+          if cargo bench --locked -p lattice-inference --no-default-features --features bench-internals \
+            --bench inference_perf -- '^generate_forward_with_cache/(allocating_current|scratch_dispatch)$' --test >"$log" 2>&1; then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -q '^ALLOCATION_SMOKE mode=generate_forward_with_cache rayon_threads=8 counted_executor_threads=1$' "$log"
       - name: inference — contiguous CPU attention value controls
         run: |
           log="${RUNNER_TEMP:-/tmp}/inference-contiguous-value-tests.log"
@@ -570,7 +773,7 @@ jobs:
           assert_ran forward::cpu_f16::tests::contiguous_value_f16_matches_scalar_with_gqa_and_reused_scratch
           assert_ran forward::cpu_q8::tests::contiguous_value_q8_matches_scalar_with_gqa_and_reused_scratch
           assert_ran forward::neon_forward::tests::contiguous_value_q8_neon_matches_scalar_with_gqa_and_reused_scratch
-          assert_ran speculative::tests::contiguous_value_mtp_matches_scalar_after_cache_rollback
+          assert_ran speculative::tests::mtp_rejection::contiguous_value_mtp_matches_scalar_after_cache_rollback
           assert_ran attention::decode::tests::contiguous_value_row_matches_ordered_scalar_and_preserves_tails
           assert_ran attention::decode::tests::contiguous_value_row_keeps_zero_products_and_token_order
           assert_ran forward::neon_forward::bench_support::tests::contiguous_value_bench_fresh_scratch_preserves_warmed_state
@@ -753,8 +956,8 @@ jobs:
             exit 1
           fi
           passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p')
-          if [ -z "$passed" ] || [ "$passed" -lt 32 ]; then
-            echo "expected at least 32 passing bench_serve_http tests, parsed '${passed:-<none>}'" >&2
+          if [ -z "$passed" ] || [ "$passed" -lt 48 ]; then
+            echo "expected at least 48 passing bench_serve_http tests, parsed '${passed:-<none>}'" >&2
             exit 1
           fi
       # The unit tests classify a missing checkpoint as a skip with exit code 2,
@@ -800,9 +1003,16 @@ jobs:
       # gate to examples, benches, and #[cfg(test)] modules — the same surface
       # where a second wave of lint debt (manual_let_else, approx_constant,
       # dead bench fields) had silently accumulated past the lib+bins gate.
-      - name: inference — metal-gpu clippy (macOS only)
+      # The router subcommand also requires mixture; separate Metal and mixture
+      # builds leave their combined production branch uncompiled.
+      - name: inference — metal-gpu + mixture clippy (macOS only)
         if: runner.os == 'macOS'
-        run: cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings
+        run: cargo clippy --locked -p lattice-inference --all-targets --features f16,metal-gpu,mixture -- -D warnings
+      # Linux cannot lint Metal-gated serving fixtures. Keep the feature-off
+      # step above as well: some integration fixtures exclude test-utils.
+      - name: inference - metal-gpu + mixture + test-utils clippy (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo clippy --locked -p lattice-inference --all-targets --features f16,metal-gpu,mixture,test-utils -- -D warnings
       # `bench-internals` gates the bench binaries under `src/bin/` (e.g.
       # `bench_vision_prefill_ab`) and their `bench_support` module — without
       # it in this feature list, `--all-targets` never compiles that surface,
@@ -818,6 +1028,37 @@ jobs:
       - name: inference — metal-gpu bench clippy, release (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy --release -p lattice-inference --all-targets --features f16,metal-gpu,bench-internals -- -D warnings
+      # The timestamp regressions for #1882 need the macOS/Metal module but use
+      # temporary lock paths without GPU work. The handoff test also runs a
+      # one-test child harness; only the parent has a two-test summary.
+      - name: inference — measurement lock timestamp regressions (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          lock_refresh_log="${RUNNER_TEMP:-/tmp}/measurement-lock-refresh-tests.log"
+          if cargo test --locked -p lattice-inference --lib --features f16,metal-gpu \
+            measurement::lock_file_refresh_tests:: \
+            -- --nocapture --test-threads=1 --color never >"$lock_refresh_log" 2>&1
+          then
+            cat "$lock_refresh_log"
+          else
+            lock_refresh_status=$?
+            cat "$lock_refresh_log"
+            exit "$lock_refresh_status"
+          fi
+          for lock_refresh_test in \
+            measurement::lock_file_refresh_tests::native_acquisition_refreshes_old_lock_timestamps_without_replacing_inode \
+            measurement::lock_file_refresh_tests::handoff_refreshes_old_lock_timestamps_before_ready_without_replacing_inode
+          do
+            if ! grep -Fxq "test ${lock_refresh_test} ... ok" "$lock_refresh_log"; then
+              echo "::error::${lock_refresh_test} did not run; check the macOS/Metal module gate"
+              exit 1
+            fi
+          done
+          lock_refresh_summaries=$(grep -Ec '^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$' "$lock_refresh_log") || lock_refresh_summaries=0
+          if [ "$lock_refresh_summaries" -ne 1 ]; then
+            echo "::error::expected exactly one passing two-test parent summary for measurement lock timestamp regressions"
+            exit 1
+          fi
       # The worker module is macOS/metal-gpu-gated, but this lifecycle test
       # uses only a blocking thread-local destructor and never acquires a
       # Metal device. Run it explicitly so compiling the test is not mistaken
@@ -838,6 +1079,24 @@ jobs:
           fi
           grep -q 'test serve::metal_worker::tests::owner_shutdown_deadline_covers_blocking_thread_local_destructor ... ok' "$log"
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # The measurement guard moves the shared GPU lock onto the worker thread
+      # so a detached worker keeps it through model construction, every queued
+      # request and runtime destruction. These three tests exercise that
+      # lifetime with plain threads and normal locks, so they need no Metal
+      # device and run wherever the module compiles. The selector filter can
+      # match zero tests without failing, so the passed count is checked
+      # explicitly (at least the three named cases must actually run).
+      - name: inference - measurement worker guard lifetime (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/measurement-worker-guard-lifetime-test.log"
+          cargo test --locked -p lattice-inference --features f16,metal-gpu \
+            --lib serve::metal_worker::tests::measurement_worker_guard_ \
+            -- --test-threads=1 2>&1 | tee "$log"
+          passed=$(grep -Eo 'test result: ok\. [0-9]+ passed' "$log" | grep -Eo '[0-9]+' | tail -n 1)
+          test -n "$passed"
+          test "$passed" -ge 3
       - name: embed — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-embed --features metal-gpu -- -D warnings
@@ -917,7 +1176,8 @@ jobs:
           # -> generate_streaming_with_cancel composition; without it here
           # that test would silently not compile/run under this job.
           # Same if/else form as lattice_serve above, same `-e` reasoning.
-          if cargo test -p lattice-inference --bin lattice --features f16,metal-gpu,test-utils > lattice_test.log 2>&1; then
+          # Router feedback and census handlers additionally require mixture.
+          if cargo test --locked -p lattice-inference --bin lattice --features f16,metal-gpu,mixture,test-utils -- --color never > lattice_test.log 2>&1; then
             cat lattice_test.log
           else
             lattice_status=$?
@@ -926,9 +1186,40 @@ jobs:
             exit "$lattice_status"
           fi
           check_test_utils_modules_ran lattice_test.log lattice
+          for test_name in \
+            serve::tests::the_feedback_handler_separates_its_three_outcomes_and_two_refusals \
+            serve::tests::the_episode_census_publishes_unjudged_separately_from_judged
+          do
+            if ! grep -Fxq "test ${test_name} ... ok" lattice_test.log; then
+              echo "::error::lattice: ${test_name} did not run; check Metal, mixture and test-utils feature gates"
+              exit 1
+            fi
+          done
+      # The target is excluded from default tests because its other cases load checkpoints.
+      - name: inference - CPU logprobs golden comparator controls
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/serve-cpu-logprobs-contract.log"
+          if cargo test --locked -p lattice-inference --test serve_cpu_isolation --features serve \
+            -- logprobs_contract_ --nocapture --color never >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          for test_name in \
+            logprobs_contract_accepts_cpu_drift \
+            logprobs_contract_rejects_bad_numeric_leaves \
+            logprobs_contract_rejects_structure_changes
+          do
+            grep -Fx "test ${test_name} ... ok" "$log"
+          done
+          test "$(grep -c '^test result: ' "$log")" -eq 1
+          grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$' "$log"
       # The standalone server's startup routing, Gemma refusals and unchanged
       # startup errors run against the shipped `lattice_serve` binary with stub
-      # model directories. The two real-checkpoint cases report
+      # model directories. The three real-checkpoint cases report
       # `LATTICE_SERVE_STANDALONE_SKIPPED` and pass when no checkpoint is
       # present on the runner; the exact count keeps a renamed or deleted test
       # from turning this step into a no-op.
@@ -942,7 +1233,7 @@ jobs:
             exit 1
           fi
           cat "$log"
-          grep -Eq '^test result: ok\. 10 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          grep -Eq '^test result: ok\. 11 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: inference - serving startup error goldens (macOS only)
         if: runner.os == 'macOS'
         run: |
@@ -953,13 +1244,28 @@ jobs:
             exit 1
           fi
           cat "$log"
-          grep -Eq '^test result: ok\. 61 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          grep -Eq '^test result: ok\. 64 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # Embedding-model startup through both shipped binaries, on synthetic Qwen3.5
+      # and BERT checkpoints written by the test-utils fixtures. The exact count
+      # keeps a renamed or deleted test from turning this step into a no-op.
+      - name: inference - embedding startup goldens (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/serve-startup-embedding-golden.log"
+          if ! cargo test -p lattice-inference --features f16,metal-gpu,serve,test-utils --test serve_startup_embedding_golden -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # These checkpoint targets are test = false, so --all-targets does not
       # compile them. Lint each target by name with the features it requires.
       - name: inference - serving checkpoint target lint (macOS only)
         if: runner.os == 'macOS'
         run: |
           cargo clippy -p lattice-inference --test serve_request_refusals --features f16,metal-gpu,serve -- -D warnings
+          cargo clippy -p lattice-inference --test serve_worker_live --features f16,metal-gpu,serve -- -D warnings
           cargo clippy -p lattice-inference --test serve_cpu_isolation --features serve -- -D warnings
       # The metal-gpu surface was BUILT and linted above but never RUN, so Metal
       # correctness tests (e.g. the Q4 decode dispatch-geometry regression #384)
@@ -1071,7 +1377,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-prefill-gdn-refusal.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1092,7 +1398,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-prefix-cache-grammar-rejection.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_saves_consistent_boundary' \
+            'forward::metal_qwen35::inner::tests::grammar::generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_saves_consistent_boundary' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1140,7 +1446,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-gdn-qk-eps-scale.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::gdn_850_failclosed::gdn_qk_l2_norm_is_not_scale_invariant_1583' \
+            'forward::metal_qwen35::inner::tests::gdn_chunked_scan::gdn_850_failclosed::gdn_qk_l2_norm_is_not_scale_invariant_1583' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1157,7 +1463,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-gdn-qk-eps-cliff.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::gdn_850_failclosed::gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583' \
+            'forward::metal_qwen35::inner::tests::gdn_chunked_scan::gdn_850_failclosed::gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1201,7 +1507,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-mtp-cursor-preflight.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::mtp_verifier_boundaries_reject_mismatched_live_cursor' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::mtp_verifier_boundaries_reject_mismatched_live_cursor' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1220,7 +1526,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-raw-step-cursor-preflight.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::raw_step_with_mtp_rejects_stale_live_cursor_without_mutation' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::raw_step_with_mtp_rejects_stale_live_cursor_without_mutation' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1239,7 +1545,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-raw-prefill-fresh-session.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::raw_prefills_with_mtp_reject_live_session_without_mutation' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::raw_prefills_with_mtp_reject_live_session_without_mutation' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1260,7 +1566,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-bench-prefill-cursor-preflight.log"
           if cargo test -p lattice-inference --features f16,metal-gpu,bench-internals --lib \
-            'forward::metal_qwen35::inner::tests::bench_prefill_helpers_reject_stale_cursor_without_mutation' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::bench_prefill_helpers_reject_stale_cursor_without_mutation' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1283,7 +1589,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-step-proof.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1300,7 +1606,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-prefill-proof.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1320,26 +1626,7 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-hybrid-gdn-proof.log"
           if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback' \
-            -- --exact --nocapture >"$log" 2>&1; then
-            cat "$log"
-          else
-            test_status=$?
-            cat "$log"
-            exit "$test_status"
-          fi
-          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
-      # Guards that the Metal decode loops still sample through `sample_decode_traced`. No filter
-      # above selects this test, and a drifted call-site count stayed unnoticed because of it.
-      - name: inference - Metal decode loops sample through sample_decode_traced (macOS only)
-        if: runner.os == 'macOS'
-        env:
-          LATTICE_METAL_TEST_ENFORCE: '1'
-        run: |
-          set -euo pipefail
-          log="${RUNNER_TEMP:-/tmp}/metal-decode-loops-sample-traced.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'forward::metal_qwen35::inner::tests::all_five_decode_loops_call_sample_decode_traced' \
+            'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1737,6 +2024,11 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
+      - uses: ./.github/actions/rust-setup
+        with:
+          pin-cargo-path: true
+          shared-key: actionlint
+          cache-on-failure: true
       - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
         with:
           version: '1.7.12'
@@ -1757,6 +2049,13 @@ jobs:
         run: python3 tests/test_lint_docs.py -v
       - name: semver disclosure workflow tests
         run: python3 tests/test_semver_checks_disclose.py -v
+      - name: publish script argument tests
+        run: python3 tests/test_publish_script.py -v
+      # The fixture generator builds tiny local crates with `cargo rustdoc` to
+      # produce the rustdoc JSON the listing tests read, so this step needs the
+      # pinned Rust toolchain installed above.
+      - name: public API listing tests
+        run: python3 -m unittest tests.test_public_api_listing -v
       # A test module that no workflow step runs is a suite nobody is reading, and
       # two were found by hand on one day. The selftest arm runs first so a broken
       # gate refuses instead of passing everything.
@@ -1852,6 +2151,13 @@ jobs:
       # invoked, which keeps it in the same harness-plumbing scope as above.
       - name: python3 tests/test_bench_compare_measurement.py
         run: python3 tests/test_bench_compare_measurement.py -v
+      # The prebuild ordering cases live in their own module because the
+      # measurement suite above is frozen at its ADR-102 line ceiling. Same
+      # stub-cargo scope: they drive the shipping script and run no benchmark.
+      - name: python3 tests/test_bench_compare_prebuild.py
+        run: python3 tests/test_bench_compare_prebuild.py -v
+      - name: python3 tests/test_bench_decode_slopefit.py
+        run: python3 tests/test_bench_decode_slopefit.py -v
       # The in-phase load sampler's self/foreign split under --gpu-handoff,
       # driven against a real process tree shaped like the supervisor's.
       - name: python3 tests/test_bench_phase_sampler_handoff_attribution.py

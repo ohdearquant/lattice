@@ -6,6 +6,7 @@
 //! lattice chat --model /path/to/model [--prompt "Hello"] [--max-tokens 256] [--temperature 0.7]
 //! lattice serve --model /path/to/model [--host 127.0.0.1] [--port 8080] [--max-tokens 256]
 //! lattice doctor --model /path/to/model [--context 4096]
+//! lattice forecast --model /path/to/reverso [--input series.jsonl] [--output forecasts.jsonl]
 //! lattice prune-score --q4-dir /path/to/model-q4 --tokenizer-dir /path/to/model \
 //!   --calibration-corpus calibration.txt --validation-corpus validation.txt \
 //!   --prune-layers 4 --output lattice_pruning.json
@@ -15,6 +16,7 @@ use clap::{Parser, Subcommand};
 
 mod chat;
 mod doctor;
+mod forecast;
 mod prune_score;
 mod router;
 mod serve;
@@ -29,6 +31,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Chat interactively or generate one response to --prompt
+    #[command(after_help = r#"Examples:
+  lattice chat --model /models/qwen3.5-0.8b
+  lattice chat --model /models/qwen3.5-0.8b -p "Hello" --max-tokens 32 --temperature 0
+
+Use an existing local Qwen checkpoint directory. Native Q4 checkpoints require
+a macOS Metal build. Add --tokenizer-dir when the Q4 directory lacks tokenizer.json.
+With -p, the prompt is used literally and stdin is not read."#)]
     Chat {
         /// Path to model directory (SafeTensors, or a native Q4 quantized
         /// directory produced by `quantize_q4`)
@@ -50,6 +59,13 @@ enum Command {
         tokenizer_dir: Option<String>,
     },
     /// Start HTTP server with OpenAI-compatible API
+    #[command(after_help = r#"Examples:
+  lattice serve --model /models/qwen3.5-0.8b --port 8080
+  lattice serve --model /models/qwen3.5-0.8b-q4 \
+    --tokenizer-dir /models/qwen3.5-0.8b --port 8080
+
+Use an existing local checkpoint directory. Native Q4 checkpoints require
+a macOS Metal build. The default bind address is 127.0.0.1."#)]
     Serve {
         /// Path to model directory (SafeTensors, or a native Q4 quantized
         /// directory produced by `quantize_q4`). If this directory is a
@@ -223,6 +239,13 @@ enum Command {
     },
     /// Preflight check: memory fit and artifact compatibility, without
     /// loading any model weights (config + tensor index inspection only).
+    #[command(after_help = r#"Examples:
+  lattice doctor --model /models/qwen3.5-0.8b
+  lattice doctor --model /models/qwen3.5-0.8b --context 4096
+  lattice doctor --model /models/qwen3.5-0.8b-q4 --tokenizer-dir /models/qwen3.5-0.8b
+
+Inspects existing Qwen checkpoint files without loading model weights.
+A failed inspection or an unusable configuration returns a nonzero exit status."#)]
     Doctor {
         /// Path to model directory (SafeTensors, or a native Q4 quantized
         /// directory produced by `quantize_q4`)
@@ -244,11 +267,38 @@ enum Command {
     /// prompt, not the per-token-averaged metric that
     /// `lattice_inference::pruning::BlockInfluenceAccumulator` implements. The
     /// output artifact's `method` field names the estimator actually used.
+    #[command(after_help = r#"Example:
+  lattice prune-score --q4-dir /models/qwen3.5-0.8b-q4 \
+    --tokenizer-dir /models/qwen3.5-0.8b \
+    --calibration-corpus calibration.txt --validation-corpus validation.txt \
+    --prune-layers 1 --output pruning-plan.json
+
+Requires macOS, a build with metal-gpu, and an existing native Q4 Qwen checkpoint.
+Calibration and validation must be separate UTF-8 files.
+The command writes a pruning plan; a failed perplexity gate returns a nonzero exit status."#)]
     PruneScore {
         #[command(flatten)]
         args: prune_score::Args,
     },
+    /// Point forecasts for univariate series read as JSON lines.
+    #[command(after_help = r#"Examples:
+  lattice forecast --model /models/chronos-2 --input series.jsonl --output forecasts.jsonl
+  lattice forecast --model /models/chronos-2 --input series.jsonl
+
+Use an existing Chronos-2, Toto 2.0, or Reverso checkpoint directory.
+Each input line is a JSON object with target values and a horizon, for example:
+  {"target":[1.0,2.0,3.0,4.0],"horizon":2}
+Input and output default to stdin and stdout; use "-" explicitly for either."#)]
+    Forecast {
+        #[command(flatten)]
+        args: forecast::Args,
+    },
     /// Provision and inspect a router state directory.
+    #[command(after_help = r#"Example:
+  lattice router init --help
+
+The init subcommand provisions an untrained router state directory.
+It requires macOS and a build with metal-gpu and mixture."#)]
     Router {
         #[command(subcommand)]
         command: RouterCommand,
@@ -263,6 +313,15 @@ enum RouterCommand {
     /// uniform policy with nothing learned. It is legitimate to serve as a
     /// baseline and is not evidence of learning: the artifact says so, and
     /// `GET /v1/lora` reports it. Initialising does not enable learning.
+    #[command(after_help = r#"Example:
+  lattice router init --state ./router-state --adapters adapter-a,adapter-b \
+    --schema-id example-v1 --base-model qwen3.5-0.8b \
+    --embedding-model /models/gme-qwen35
+
+Requires macOS and a build with metal-gpu and mixture.
+The embedding checkpoint must be a supported local Qwen3.5 vision-language
+safetensors directory. An existing router artifact is refused.
+This creates an untrained uniform bootstrap; it does not enable learning."#)]
     Init {
         #[command(flatten)]
         args: router::InitArgs,
@@ -332,7 +391,6 @@ async fn main() {
             embedding_model: embedding_model_dir,
             embedding_model_id,
         } => {
-            use lattice_inference::serve::route::ServedBackend;
             use std::path::Path;
             use std::sync::Arc;
             use std::sync::atomic::AtomicU64;
@@ -350,12 +408,8 @@ async fn main() {
 
             let model_path = Path::new(&model);
             let evidence = lattice_inference::serving_provider::inspect_checkpoint(model_path);
-            let format = evidence.format();
 
             eprintln!("Loading model from {model}...");
-            // The format picks the backend and `config.json` picks the family.
-            // A Gemma 4 checkpoint in the Q4 format has no route and is refused
-            // here, before any loader runs.
             let selected = match lattice_inference::serving_provider::select(
                 evidence,
                 lattice_inference::serving_provider::ServingEntry::Lattice,
@@ -366,91 +420,88 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let Some(route) = selected.legacy_route() else {
+            let Some(marker) = selected.lattice_selection_marker() else {
                 eprintln!("Error: {}", backend::unloadable_format_message(model_path));
                 std::process::exit(1);
             };
-            eprintln!("{}", route.selection_marker(format));
-            let model_backend: serve::ModelBackend = match route.backend {
-                ServedBackend::Cpu => match selected.load_lattice_cpu() {
-                    Ok(cpu) => serve::ModelBackend::Cpu(cpu),
-                    Err(error) => {
-                        eprintln!("Error: {error}");
-                        std::process::exit(1);
-                    }
+            eprintln!("{marker}");
+            let implicit_embedding_plan = selected.implicit_embeddings(&model);
+            #[cfg(feature = "metal-gpu")]
+            let context_window = chat::chat_max_cache_len();
+            #[cfg(not(feature = "metal-gpu"))]
+            let context_window = 0;
+            let cpu_generation_admission = Arc::new(Semaphore::new(max_cpu_generations));
+            let serving_model = match selected.open_lattice(
+                lattice_inference::serving_provider::LatticeOpenOptions {
+                    tokenizer_dir: tokenizer_dir.map(std::path::PathBuf::from),
+                    max_pending,
+                    max_resident_adapters,
+                    max_resident_adapter_bytes,
+                    preload_vision,
+                    context_window,
                 },
-                ServedBackend::Metal => {
-                    #[cfg(feature = "metal-gpu")]
-                    {
-                        let tokenizer_dir_path =
-                            tokenizer_dir.as_ref().map(std::path::PathBuf::from);
-                        match serve::ModelBackend::spawn_metal(
-                            model_path.to_path_buf(),
-                            tokenizer_dir_path,
-                            max_pending,
-                            lattice_inference::serve::lora::ResidencyLimits {
-                                max_adapters: max_resident_adapters,
-                                max_bytes: max_resident_adapter_bytes,
-                            },
-                            preload_vision,
-                        ) {
-                            Ok((backend, _max_context)) => backend,
-                            Err(e) => {
-                                eprintln!("Error: failed to load Q4 model: {e}");
-                                std::process::exit(1);
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "metal-gpu"))]
-                    {
-                        let _ = &tokenizer_dir;
-                        let _ = (
-                            max_pending,
-                            max_resident_adapters,
-                            max_resident_adapter_bytes,
-                        );
-                        let _ = preload_vision;
-                        eprintln!("Error: {}", backend::metal_gpu_required_message(model_path));
-                        std::process::exit(1);
-                    }
+                Arc::clone(&cpu_generation_admission),
+            ) {
+                Ok(model) => model,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
                 }
             };
             eprintln!("Model loaded. Serving as '{served_model_id}'.");
 
             // `/v1/embeddings` needs its own f16-packed vision-language
-            // checkpoint load, independent of `model_backend` above (see
-            // `lattice_inference::serve::embeddings`'s module doc comment
-            // for why the two loaders can't share weights).
+            // checkpoint load, independent of the serving model opened above (see
+            // the pooled loader's module doc comment for why the two loaders
+            // can't share weights).
             //
             // Two policies, because the two cases are different asks. An
             // explicitly named directory is an instruction and fails closed:
             // the operator said where the embedder is, so "it did not load"
             // is an error, not a downgrade. The implicit case keeps the
             // best-effort policy described above, since a chat-only
-            // checkpoint having no embedder is ordinary and expected.
-            let embedding_source = embedding_model_dir.as_deref().unwrap_or(&model);
-            // The embedder is a Qwen3.5 vision-language loader; a Gemma 4
-            // directory is never one, so the implicit attempt is skipped
-            // rather than reporting a Qwen config error about a Gemma file.
-            // An explicitly named `--embedding-model` is still honored.
-            let embedding_model = if route.family == backend::ModelFamily::Gemma4
-                && embedding_model_dir.is_none()
+            // checkpoint having no embedder is ordinary and expected. Which
+            // implicit attempt to make is the selected provider's answer: a
+            // provider with no pooled embedder names its disabled line
+            // instead of reporting another loader's config error about its
+            // own files. An explicitly named `--embedding-model` is still
+            // honored.
+            let explicit_embedding_source = embedding_model_dir.as_deref();
+            let implicit_embedding_directory = implicit_embedding_plan.directory_to_try.as_deref();
+            let embedding_source = explicit_embedding_source
+                .or_else(|| implicit_embedding_directory.map(|_| model.as_str()));
+            let embedding_directory = explicit_embedding_source
+                .map(Path::new)
+                .or(implicit_embedding_directory);
+            let embedding_model = if let Some(disabled_line) =
+                implicit_embedding_plan.disabled_line.as_deref()
+                && explicit_embedding_source.is_none()
             {
-                eprintln!("Embeddings disabled ({model}): not available for Gemma 4 checkpoints.");
+                eprintln!("{disabled_line}");
                 None
-            } else {
-                match lattice_inference::serve::embeddings::EmbeddingModel::from_directory(
-                    Path::new(embedding_source),
-                ) {
+            } else if let (Some(embedding_source), Some(embedding_directory)) =
+                (embedding_source, embedding_directory)
+            {
+                let result = lattice_inference::serving_provider::plan_pooled_embeddings(
+                    embedding_directory,
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|plan| {
+                    plan.load().map_err(|error| match error {
+                        lattice_inference::error::InferenceError::InvalidInput(message) => message,
+                        other => other.to_string(),
+                    })
+                });
+                match result {
                     Ok(embedding_model) => {
                         eprintln!(
                             "Embeddings enabled: pooled {}-dim vectors from {embedding_source}.",
-                            embedding_model.dimensions()
+                            embedding_model.representation().dimensions
                         );
-                        Some(Arc::new(embedding_model))
+                        Some(embedding_model)
                     }
                     Err(err) => {
-                        if embedding_model_dir.is_some() {
+                        if explicit_embedding_source.is_some() {
                             eprintln!(
                                 "Error: --embedding-model {embedding_source} cannot serve as an embedding model: {err}"
                             );
@@ -464,6 +515,8 @@ async fn main() {
                         None
                     }
                 }
+            } else {
+                None
             };
 
             // Fail closed: a configured router that will not load stops the
@@ -550,6 +603,7 @@ async fn main() {
                             );
                             std::process::exit(1);
                         };
+                        let representation = embedder.representation();
                         // The identity RECORDED for the embedder, and it is
                         // the embedder's, never the chat model's. A NAME, so
                         // it catches a misconfigured server and not a
@@ -570,10 +624,10 @@ async fn main() {
                         // only against the gate the artifact ships with: the
                         // two are different pairings and the constructor can
                         // only see one of them.
-                        match lattice_inference::serve::routing::ServedRouter::new(
+                        match lattice_inference::serve::routing::ServedRouter::new_with_representation(
                             *resolved,
                             &embedder_identity,
-                            embedder.dimensions(),
+                            &representation,
                             router_learn,
                         ) {
                             Ok(served) => {
@@ -597,14 +651,14 @@ async fn main() {
             };
 
             let state = serve::AppState {
-                model: model_backend,
+                model: serving_model,
                 default_max_tokens: max_tokens,
                 max_tokens_cap: 4096,
                 model_id: served_model_id.clone(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model,
                 embedding_admission: Arc::new(Semaphore::new(serve::EMBEDDING_MAX_CONCURRENT_JOBS)),
-                cpu_generation_admission: Arc::new(Semaphore::new(max_cpu_generations)),
+                cpu_generation_admission,
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: router_artifact,
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -663,6 +717,12 @@ async fn main() {
                 }
             }
         },
+        Command::Forecast { args } => {
+            if let Err(e) = forecast::run(&args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::PruneScore { args } => match prune_score::run(&args) {
             Ok(true) => {}
             Ok(false) => std::process::exit(1),
@@ -778,32 +838,55 @@ mod cpu_serve_prompt_tests {
     #[cfg(feature = "test-utils")]
     use lattice_inference::{GenerateConfig, Tokenizer};
 
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        &source[source.find(start).unwrap() + start.len()..source.find(end).unwrap()]
+    }
+
     #[test]
     fn cpu_serve_load_keeps_tokenizer_initialization() {
         let startup = include_str!("main.rs")
-            .split("Command::Serve {")
-            .nth(1)
-            .unwrap();
-        assert!(startup.contains("selected.load_lattice_cpu()"));
+            .split_once("Command::Serve {")
+            .unwrap()
+            .1;
+        assert!(startup.contains("selected.lattice_selection_marker()"));
+        assert!(startup.contains("selected.implicit_embeddings(&model)"));
+        assert!(startup.contains("let context_window = chat::chat_max_cache_len();"));
+        assert!(startup.contains("                    context_window,\n                },"));
+        assert!(startup.contains("selected.open_lattice("));
+        let provider_api = include_str!("../../serving_provider.rs");
+        assert!(provider_api.contains("pub fn open_lattice("));
+        assert!(provider_api.contains("plan.open(options, generation_admission)"));
+        let qwen_provider = include_str!("../../serving_provider/providers/qwen.rs");
+        let qwen_plan = source_between(
+            qwen_provider,
+            "impl LatticeRoutePlan for QwenLatticeRoutePlan",
+            "impl ServingProvider for QwenProvider",
+        );
+        let qwen_open = qwen_plan.split_once("fn open(").unwrap().1;
+        let cpu_arm = source_between(
+            qwen_open,
+            "ModelFormat::Safetensors => {",
+            "ModelFormat::Q4 => {",
+        );
+        let metal_arm = source_between(qwen_open, "ModelFormat::Q4 => {", "_ => {");
+        assert!(cpu_arm.contains("cpu::load(&self.evidence)?"));
+        assert!(cpu_arm.contains("ServingHandle::shared_cpu(cpu, generation_admission)"));
+        assert!(!cpu_arm.contains("lattice_worker::open"));
+        assert!(metal_arm.contains("lattice_worker::open(self.evidence.directory, options)"));
         let provider = include_str!("../../serving_provider/providers/qwen/cpu.rs");
-        let loader = provider
-            .split_once("pub(super) fn load(")
-            .map(|(_, loader)| loader)
-            .expect("the Qwen CPU provider exposes its selected loader");
-        let loader_body = loader
-            .split_once("\n}\n\npub(crate) fn from_model")
-            .map(|(body, _)| body)
-            .expect("the Qwen CPU loader body ends before from_model");
+        let loader_body = source_between(
+            provider,
+            "pub(super) fn load(",
+            "\n}\n\npub(crate) fn from_model",
+        );
         assert!(
             loader_body.contains("Ok(from_model(model))"),
             "the production loader must use the tokenizer-initializing constructor"
         );
         let initialization = provider
             .find("model.ensure_tokenizer_max_seq_len(model.max_context());")
-            .expect("the Qwen CPU provider initializes tokenizer capacity");
-        let sharing = provider
-            .find("let model = Arc::new(model);")
-            .expect("the Qwen CPU provider shares the initialized model");
+            .unwrap();
+        let sharing = provider.find("let model = Arc::new(model);").unwrap();
         assert!(initialization < sharing);
     }
 
@@ -1033,8 +1116,8 @@ mod preload_vision_cli_tests {
 
     /// Lazy loading is the default: omitting `--preload-vision` must not
     /// flip it on. This is the CLI-level half of the "lazy stays the
-    /// default" contract the issue asks for -- the startup-behavior half is
-    /// structural (`ModelBackend::spawn_metal` only calls
+    /// default" contract -- the startup behavior is structural (the serving
+    /// command's Metal loader only calls
     /// `VisionRuntime::preload()` inside `if preload_vision { .. }`).
     #[test]
     fn preload_vision_omitted_defaults_to_false() {

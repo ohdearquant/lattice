@@ -13,85 +13,19 @@
 //! Run all baselines here:
 //!   cargo bench -p lattice-inference --bench inference_perf 2>&1
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-// ---------------------------------------------------------------------------
-// Counting allocator — wraps the system allocator to track per-call statistics.
-// Only active in this bench binary; does not affect production code.
-// ---------------------------------------------------------------------------
-
-struct CountingAlloc;
-
-static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
-static DEALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
-static REALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
-static BYTES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
-static BYTES_DEALLOCATED: AtomicU64 = AtomicU64::new(0);
-
-#[global_allocator]
-static GLOBAL: CountingAlloc = CountingAlloc;
-
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        BYTES_ALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        BYTES_DEALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        BYTES_ALLOCATED.fetch_add(new_size as u64, Ordering::Relaxed);
-        BYTES_DEALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[allow(dead_code)]
-struct AllocationSnapshot {
-    alloc_calls: u64,
-    realloc_calls: u64,
-    bytes_allocated: u64,
-}
-
-#[allow(dead_code)]
-impl AllocationSnapshot {
-    fn capture() -> Self {
-        Self {
-            alloc_calls: ALLOC_CALLS.load(Ordering::Relaxed),
-            realloc_calls: REALLOC_CALLS.load(Ordering::Relaxed),
-            bytes_allocated: BYTES_ALLOCATED.load(Ordering::Relaxed),
-        }
-    }
-
-    fn delta_since(start: &AllocationSnapshot) -> AllocationDelta {
-        AllocationDelta {
-            alloc_calls: ALLOC_CALLS.load(Ordering::Relaxed) - start.alloc_calls,
-            realloc_calls: REALLOC_CALLS.load(Ordering::Relaxed) - start.realloc_calls,
-            bytes_allocated: BYTES_ALLOCATED.load(Ordering::Relaxed) - start.bytes_allocated,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
-struct AllocationDelta {
-    alloc_calls: u64,
-    realloc_calls: u64,
-    bytes_allocated: u64,
-}
-
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+#[path = "support/allocation_counts.rs"]
+mod allocation_counts;
+#[cfg(all(feature = "bench-internals", feature = "test-utils"))]
+use allocation_counts::{
+    AllocationDelta, allocation_report_heading, assert_zeroed_allocation_is_counted,
 };
+#[cfg(feature = "bench-internals")]
+use allocation_counts::{AllocationSnapshot, allocation_count_print, allocation_count_report};
+
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group};
 use lattice_inference::forward::cpu::matmul_bt;
 #[cfg(feature = "bench-internals")]
 use lattice_inference::forward::cpu::{elementwise_mul, rms_norm, silu_inplace};
@@ -812,141 +746,6 @@ fn bench_q8_neon_forward(c: &mut Criterion) {
 // alloc_calls, realloc_calls, or bytes_allocated differ across runs.
 // ---------------------------------------------------------------------------
 
-// Builds the stderr heading for one allocation report. The suite is the caller's
-// Criterion group, so a report can never be filed under another bench's name; an
-// empty `label` collapses to `<suite>/<phase>` for benches whose only axis is the
-// phase.
-fn allocation_report_heading(suite: &str, label: &str, phase: &str) -> String {
-    if label.is_empty() {
-        format!("{suite}/{phase}")
-    } else {
-        format!("{suite}/{label}/{phase}")
-    }
-}
-
-// Asserts that a zeroing allocation is visible to `CountingAlloc`. `GlobalAlloc`'s
-// `alloc_zeroed` is not overridden above, so zeroed allocations are only counted
-// while its default implementation routes through `alloc`. Overriding it later to
-// recover the platform calloc path would stop counting a whole category, and every
-// total would drop -- which reads as an improvement. This runs on the bench's own
-// path rather than as a `#[test]`, because this target is declared `harness = false`
-// and libtest never runs here.
-fn assert_zeroed_allocation_is_counted() {
-    let before = AllocationSnapshot::capture();
-    let zeroed: Vec<u8> = vec![0; 4096];
-    black_box(&zeroed);
-    let delta = AllocationSnapshot::delta_since(&before);
-    assert!(
-        delta.alloc_calls > 0,
-        "zeroed allocation was not observed by CountingAlloc: a 4 KiB vec![0; _] moved \
-         alloc_calls by {} and bytes_allocated by {}; allocation totals in this bench \
-         are undercounting every calloc-shaped allocation",
-        delta.alloc_calls,
-        delta.bytes_allocated,
-    );
-}
-
-// Print allocation counts without asserting zero — use for "before" snapshots.
-#[allow(dead_code)]
-fn allocation_count_print(
-    suite: &str,
-    label: &str,
-    phase: &str,
-    tokens: usize,
-    run_fn: &mut impl FnMut() -> AllocationDelta,
-) {
-    assert_zeroed_allocation_is_counted();
-    let heading = allocation_report_heading(suite, label, phase);
-    let samples: Vec<AllocationDelta> = (0..3).map(|_| run_fn()).collect();
-    let s0 = samples[0];
-    for (i, &s) in samples.iter().enumerate().skip(1) {
-        if s != s0 {
-            panic!(
-                "allocation count is non-deterministic at run {i} for {heading}: \
-                 run0=({},{},{}) run{i}=({},{},{})",
-                s0.alloc_calls,
-                s0.realloc_calls,
-                s0.bytes_allocated,
-                s.alloc_calls,
-                s.realloc_calls,
-                s.bytes_allocated,
-            );
-        }
-    }
-    let n = tokens as f64;
-    eprintln!(
-        "\n{heading}\n\
-         tokens={tokens}\n\
-         alloc_calls_total={}\n\
-         realloc_calls_total={}\n\
-         bytes_allocated_total={}\n\
-         allocations_per_token={:.2}\n\
-         reallocations_per_token={:.2}\n\
-         bytes_allocated_per_token={:.0}",
-        s0.alloc_calls,
-        s0.realloc_calls,
-        s0.bytes_allocated,
-        s0.alloc_calls as f64 / n,
-        s0.realloc_calls as f64 / n,
-        s0.bytes_allocated as f64 / n,
-    );
-}
-
-#[allow(dead_code)]
-fn allocation_count_report(
-    suite: &str,
-    label: &str,
-    phase: &str,
-    tokens: usize,
-    run_fn: &mut impl FnMut() -> AllocationDelta,
-) {
-    assert_zeroed_allocation_is_counted();
-    let heading = allocation_report_heading(suite, label, phase);
-    let samples: Vec<AllocationDelta> = (0..3).map(|_| run_fn()).collect();
-
-    let s0 = samples[0];
-    for (i, &s) in samples.iter().enumerate().skip(1) {
-        if s != s0 {
-            panic!(
-                "allocation count is non-deterministic at run {i} for {heading}: \
-                 run0=({},{},{}) run{i}=({},{},{})",
-                s0.alloc_calls,
-                s0.realloc_calls,
-                s0.bytes_allocated,
-                s.alloc_calls,
-                s.realloc_calls,
-                s.bytes_allocated,
-            );
-        }
-    }
-
-    if s0.alloc_calls != 0 || s0.realloc_calls != 0 || s0.bytes_allocated != 0 {
-        panic!(
-            "allocation gate failed for {heading}: \
-             alloc_calls_total={} realloc_calls_total={} bytes_allocated_total={}",
-            s0.alloc_calls, s0.realloc_calls, s0.bytes_allocated,
-        );
-    }
-
-    let n = tokens as f64;
-    eprintln!(
-        "\n{heading}\n\
-         tokens={tokens}\n\
-         alloc_calls_total={}\n\
-         realloc_calls_total={}\n\
-         bytes_allocated_total={}\n\
-         allocations_per_token={:.2}\n\
-         reallocations_per_token={:.2}\n\
-         bytes_allocated_per_token={:.0}",
-        s0.alloc_calls,
-        s0.realloc_calls,
-        s0.bytes_allocated,
-        s0.alloc_calls as f64 / n,
-        s0.realloc_calls as f64 / n,
-        s0.bytes_allocated as f64 / n,
-    );
-}
-
 fn bench_q8_neon_forward_allocations(c: &mut Criterion) {
     #[cfg(feature = "bench-internals")]
     {
@@ -1063,12 +862,15 @@ fn bench_q8_neon_forward_allocations(c: &mut Criterion) {
 // the push, inside the worker that executes the request, so it measures execution
 // and not enqueueing.
 //
-// Isolation: counters are process-wide because the CPU forward runs matmul on
+// Isolation: counters are process-wide because the CPU forward can run matmul on
 // rayon threads whose allocations belong to the request. The request therefore
-// runs alone in this process: one dedicated worker thread executes the warm-up and
-// every repeat, the calling thread is parked in `join`, and a quiet-process probe
-// precedes every arm. Unrelated concurrent allocation is rejected by the stability
-// gate, and a control with a deliberate noise thread proves the gate does so.
+// runs alone in this process: the worker of the one-thread counted-sample executor
+// executes the warm-up and every repeat, the calling thread is parked in `install`,
+// and a quiet-process probe precedes every arm. On a one-thread pool `matmul_bt`
+// does not split (the x86_64 row and column splits need at least two threads) and
+// takes its serial kernel, so the counts describe single-threaded execution, not a
+// multi-threaded caller. Unrelated concurrent allocation is rejected by the
+// stability gate, and a control with a deliberate noise thread proves the gate does so.
 //
 // Run (the group only runs when selected by name):
 //   RUSTC_WRAPPER="" cargo bench -p lattice-inference \
@@ -1361,18 +1163,21 @@ mod qwen_cpu_driver_allocations {
         );
     }
 
-    /// One worker executes the warm-up and every repeat; the caller is parked in join.
+    /// The one-thread executor's worker runs the warm-up and every repeat; the caller is
+    /// parked in `install`. On the ambient pool the matmul splits spread work over several
+    /// workers, and which repeat a worker's first-use allocation lands in varies between
+    /// runs, so exact repeat equality refused healthy runs (issue #2008). With one thread
+    /// the splits are off and every `matmul_bt` takes its serial kernel, so each repeat
+    /// executes the same way and the counts describe single-threaded execution.
     fn measure_unchecked(spec: &ArmSpec<'_>) -> Vec<Sample> {
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .name("alloc-instrument-worker".into())
-                .spawn_scoped(scope, || {
-                    let _warm_up = run_once(spec);
-                    (0..REPEATS).map(|_| run_once(spec)).collect::<Vec<_>>()
-                })
-                .expect("spawning the measurement worker")
-                .join()
-                .expect("the measurement worker panicked")
+        super::allocation_counts::counted_sample_executor().install(|| {
+            assert_eq!(
+                rayon::current_num_threads(),
+                1,
+                "the measurement must run on the one-thread executor, not on the ambient pool"
+            );
+            let _warm_up = run_once(spec);
+            (0..REPEATS).map(|_| run_once(spec)).collect::<Vec<_>>()
         })
     }
 
@@ -3192,4 +2997,32 @@ criterion_group!(
         bench_forward_with_cache,
         bench_rope_apply_decode,
 );
-criterion_main!(perf_benches);
+const FORWARD_ALLOCATION_SMOKE_FILTER: &str =
+    "^generate_forward_with_cache/(allocating_current|scratch_dispatch)$";
+
+fn main() {
+    let forward_smoke = std::env::args().any(|arg| arg == "--test")
+        && std::env::args().any(|arg| arg == FORWARD_ALLOCATION_SMOKE_FILTER);
+    if forward_smoke {
+        #[cfg(not(feature = "bench-internals"))]
+        panic!("REFUSE: allocation smoke requires bench-internals");
+        #[cfg(feature = "bench-internals")]
+        {
+            // Unselected groups construct large fixtures before Criterion applies its filter.
+            let mut criterion = Criterion::default().configure_from_args();
+            bench_forward_with_cache(&mut criterion);
+            // Reading the pool size earlier would initialize Rayon before the measured warmup.
+            // The counted executor's size is reported from the pool object itself: every counted
+            // sample already asserts, on the thread that runs it, that this is the pool it is in.
+            eprintln!(
+                "ALLOCATION_SMOKE mode=generate_forward_with_cache rayon_threads={} \
+                 counted_executor_threads={}",
+                rayon::current_num_threads(),
+                allocation_counts::counted_sample_executor().current_num_threads(),
+            );
+        }
+    } else {
+        perf_benches();
+    }
+    Criterion::default().configure_from_args().final_summary();
+}

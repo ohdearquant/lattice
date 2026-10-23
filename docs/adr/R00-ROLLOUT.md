@@ -62,8 +62,9 @@ grammar masking and the override → grammar → bookkeeping → EOS → push/lo
 Do not skip the legacy sampling step when policy will force a token, or draw again when scoring it.
 
 Retain `grammar_budget_forced_close_fails_closed`: with reasoning budget one and grammar
-`root ::= "aa"`, the forced close is rejected and output remains `[1]`. Add a legal forced-close
-continuation with requested logprobs where the sampled candidate differs from the forced token;
+`root ::= "a"+`, the forced close is rejected after 32 deferred tokens and output remains 33 copies
+of `[1]`. Add a legal forced-close continuation with requested logprobs where the sampled candidate
+differs from the forced token;
 observe metadata for the accepted final ID from the same prediction and the next decode consuming
 that final ID. Mutating grammar advance, scoring or consumption to use the candidate must fail.
 Include stale-prediction and repeated-consumption refusals, first-token and terminal-no-next-decode

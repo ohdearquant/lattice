@@ -297,7 +297,7 @@ fn gpt2_raw_vocab_bytelevel_fallback_parity() {
                 input: "hello world",
                 expected: &[31373, 995],
             },
-            // Whitespace-run boundary (#330 finding 1). Real GPT-2's merge
+            // Whitespace-run boundary (#330). Real GPT-2's merge
             // table has no rule pairing the byte-mapped newline/tab char with
             // a following letter, so the wrong 2-piece fallback segmentation
             // ["hello", "\nworld"] happens to BPE-decompose to the same ids
@@ -318,7 +318,7 @@ fn gpt2_raw_vocab_bytelevel_fallback_parity() {
                 input: "hello  world",
                 expected: &[31373, 220, 995],
             },
-            // Contraction boundary (#330 finding 2): the fixed HF contraction
+            // Contraction boundary (#330): the fixed HF contraction
             // set is `'s 't 're 've 'm 'll 'd`. The prior fallback primed on
             // `'` and swallowed the whole trailing letter run, fusing "'st"
             // into one piece instead of splitting "'s" + "t". This DOES

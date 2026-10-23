@@ -163,8 +163,14 @@ fn construction_token_hits(source: &str) -> Vec<(usize, &'static str)> {
     hits
 }
 
+/// Source trees of the crates split out of this one, relative to this
+/// crate's manifest directory. Code that moved there left this crate's `src/`
+/// but still loads checkpoint data, so the contract scans them too.
+const SPLIT_CRATE_SOURCE_ROOTS: &[&str] = &["../inference-core/src", "../tokenizer/src"];
+
 /// The contract: outside [`TRUST_BOUNDARY_FILE`], no file under this crate's
-/// `src/` names a mmap construction API -- and, in the same invocation, the
+/// `src/` or a [`SPLIT_CRATE_SOURCE_ROOTS`] tree names a mmap construction
+/// API -- and, in the same invocation, the
 /// scan finds at least one such name *inside* that file. The second half is
 /// the must-MATCH arm: a scan that finds nothing exits the same way whether
 /// the crate is clean or the scan itself is broken (wrong root, wrong
@@ -173,12 +179,21 @@ fn construction_token_hits(source: &str) -> Vec<(usize, &'static str)> {
 #[test]
 fn only_the_mmap_trust_boundary_names_a_construction_api() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let src_root = manifest_dir.join("src");
+    let mut sources = rust_sources_under(&manifest_dir.join("src"));
+    for root in SPLIT_CRATE_SOURCE_ROOTS {
+        let split_sources = rust_sources_under(&manifest_dir.join(root));
+        assert!(
+            !split_sources.is_empty(),
+            "{root} holds no Rust sources: the split crate moved or the scan root is wrong, so \
+             this contract would silently stop covering it"
+        );
+        sources.extend(split_sources);
+    }
 
     let mut boundary_hits = 0usize;
     let mut violations: Vec<String> = Vec::new();
 
-    for path in rust_sources_under(&src_root) {
+    for path in sources {
         let relative = path
             .strip_prefix(manifest_dir)
             .expect("source under manifest directory")

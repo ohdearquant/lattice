@@ -1345,7 +1345,7 @@ impl MetalQwen35State {
             QuantFormat::Q8_0 => {
                 enc.set_compute_pipeline_state(&self.engine.pipelines.lm_head_block_topk_f16[slot]);
                 enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_offset);
-                enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
+                enc.set_buffer(1, Some(self.engine.embed_tokens.f16_buffer()), 0);
                 enc.set_buffer(2, Some(&self.session.activations.topk_scratch_a), 0);
                 enc.set_bytes(3, 4, &vocab_size as *const u32 as *const _);
             }

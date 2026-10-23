@@ -19,9 +19,9 @@ use crate::generation::{GenerateConfig, GenerateOutput};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serve::lora::{AdapterControlError, AdapterControlResult};
 use crate::serve::lora::{AdapterIndex, LoraSelection, ResidencyLimits};
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::serve::metal_worker::AdapterCommand;
 use crate::serve::prepare::PreparationHandle;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_worker::AdapterCommand;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 
@@ -38,11 +38,16 @@ pub(crate) trait ServingRuntime {
         cfg: &GenerateConfig,
         lora: &[LoraSelection],
         stream: bool,
+        explicitly_thinking: bool,
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure> {
         self.execute(
-            RuntimeInput::ChatMessages { messages, lora },
+            RuntimeInput::ChatMessages {
+                messages,
+                lora,
+                explicitly_thinking,
+            },
             cfg,
             stream,
             on_token,

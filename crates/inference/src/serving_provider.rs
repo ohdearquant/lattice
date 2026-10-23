@@ -1,18 +1,35 @@
 //! Directory-aware provider selection for serving entry points.
 
+use crate::error::InferenceError;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::forward::metal_qwen35::MetalQwen35State;
 use crate::model_format::ModelFormat;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::serve::metal_worker::WorkerMetadata;
+use crate::serve::lora::ResidencyLimits;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serve::prepare::PreparationHandle;
 use crate::serve::route::{RouteRefusal, ServedBackend, ServedRoute};
+use crate::serving_embeddings::{PooledEmbeddingHandle, TextEmbeddingHandle};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serving_factory::ServingFactory;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_runtime_contract::WorkerMetadata;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use crate::serving_worker::{AffineWorker, StartupError, WorkerClient, WorkerOwner};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 pub mod providers;
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub use providers::qwen::worker::{
+    DEFAULT_SERVE_MAX_CONTEXT, FALLBACK_MODEL_MAX_CONTEXT, ServeContextSource,
+    model_context_from_config, parse_max_context, resolve_serve_context,
+};
 
 /// A binary's serving route policy.
 #[doc(hidden)]
@@ -31,6 +48,23 @@ pub struct CheckpointEvidence {
     directory: PathBuf,
     format: ModelFormat,
     model_type: Option<String>,
+}
+
+/// Options used when opening a `lattice serve` route.
+#[doc(hidden)]
+pub struct LatticeOpenOptions {
+    /// Optional directory containing the Q4 tokenizer.
+    pub tokenizer_dir: Option<PathBuf>,
+    /// Maximum number of queued and in-flight worker requests.
+    pub max_pending: usize,
+    /// Maximum number of resident adapter identities.
+    pub max_resident_adapters: usize,
+    /// Maximum resident adapter tensor payload, in bytes.
+    pub max_resident_adapter_bytes: usize,
+    /// Whether to eagerly load available vision weights before worker startup.
+    pub preload_vision: bool,
+    /// Fixed context cap used by the `lattice` command.
+    pub context_window: usize,
 }
 
 impl CheckpointEvidence {
@@ -74,7 +108,7 @@ pub enum SelectionError {
         /// The provider names, in sorted order.
         claimants: Vec<&'static str>,
     },
-    /// The selected provider's legacy route projection refused this entry.
+    /// The selected provider refused this serving entry.
     Route {
         /// The inspected checkpoint directory.
         directory: PathBuf,
@@ -100,6 +134,136 @@ impl SelectionError {
     }
 }
 
+/// Why pooled embedding provider selection could not choose one provider.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingSelectionError {
+    /// More than one registered provider claimed the checkpoint.
+    Ambiguous {
+        /// Provider names in deterministic sorted order.
+        providers: Vec<&'static str>,
+    },
+}
+
+impl std::fmt::Display for EmbeddingSelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ambiguous { providers } => {
+                write!(
+                    formatter,
+                    "ambiguous pooled embedding providers: {}",
+                    providers.join(", ")
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EmbeddingSelectionError {}
+
+/// Opaque pooled embedding load plan selected from checkpoint evidence.
+#[doc(hidden)]
+pub struct PooledEmbeddingPlan {
+    inner: Box<dyn PooledEmbeddingLoadPlan>,
+}
+
+impl PooledEmbeddingPlan {
+    /// Loads the selected provider's pooled embedding service.
+    pub fn load(self) -> Result<PooledEmbeddingHandle, InferenceError> {
+        self.inner.load()
+    }
+}
+
+/// Opaque text embedding load plan selected from checkpoint evidence.
+#[doc(hidden)]
+pub struct TextEmbeddingPlan {
+    inner: Box<dyn TextEmbeddingLoadPlan>,
+}
+
+impl TextEmbeddingPlan {
+    /// Loads the selected provider's text embedding service.
+    pub fn load(self) -> Result<TextEmbeddingHandle, String> {
+        self.inner.load()
+    }
+}
+
+/// An implicit pooled embedding action selected alongside generation.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplicitPooledEmbeddingPlan {
+    /// Checkpoint directory to try after generation loading succeeds.
+    pub directory_to_try: Option<PathBuf>,
+    /// Startup line to emit when pooled embeddings are disabled.
+    pub disabled_line: Option<String>,
+}
+
+pub(crate) trait LatticeRoutePlan {
+    fn selection_marker(&self) -> String;
+    fn implicit_embeddings(&self, model: &str) -> ImplicitPooledEmbeddingPlan;
+    fn open(
+        self: Box<Self>,
+        options: LatticeOpenOptions,
+        generation_admission: Arc<Semaphore>,
+    ) -> Result<crate::serving_host::ServingHandle, String>;
+}
+
+pub(crate) trait RegisteredProvider: Sync {
+    fn generation(&self) -> Option<&dyn ServingProvider>;
+    fn pooled_embeddings(&self) -> Option<&dyn PooledEmbeddingProvider>;
+    fn text_embeddings(&self) -> Option<&dyn TextEmbeddingProvider>;
+}
+
+pub(crate) trait PooledEmbeddingProvider: Sync {
+    fn name(&self) -> &'static str;
+    fn claims(&self, evidence: &CheckpointEvidence) -> bool;
+    fn plan(&self, directory: PathBuf) -> Box<dyn PooledEmbeddingLoadPlan>;
+}
+
+pub(crate) trait PooledEmbeddingLoadPlan {
+    fn load(self: Box<Self>) -> Result<PooledEmbeddingHandle, InferenceError>;
+}
+
+pub(crate) trait TextEmbeddingProvider: Sync {
+    fn name(&self) -> &'static str;
+    fn claims(&self, evidence: &CheckpointEvidence) -> bool;
+    fn plan(
+        &self,
+        directory: PathBuf,
+        pooling_override: Option<String>,
+    ) -> Box<dyn TextEmbeddingLoadPlan>;
+}
+
+pub(crate) trait TextEmbeddingLoadPlan {
+    fn load(self: Box<Self>) -> Result<TextEmbeddingHandle, String>;
+}
+
+/// Plans a pooled embedding load from a checkpoint directory.
+#[doc(hidden)]
+pub fn plan_pooled_embeddings(
+    directory: &Path,
+) -> Result<PooledEmbeddingPlan, EmbeddingSelectionError> {
+    let evidence = inspect_checkpoint(directory);
+    let provider =
+        select_pooled_with_registry(&evidence, &providers::PROVIDERS, &providers::QWEN_PROVIDER)?;
+    Ok(PooledEmbeddingPlan {
+        inner: provider.plan(evidence.directory),
+    })
+}
+
+/// Plans a text embedding load from a checkpoint directory.
+#[doc(hidden)]
+pub fn plan_text_embeddings(
+    directory: &Path,
+    pooling_override: Option<String>,
+) -> Result<TextEmbeddingPlan, EmbeddingSelectionError> {
+    let evidence = inspect_checkpoint(directory);
+    let provider =
+        select_text_with_registry(&evidence, &providers::PROVIDERS, &providers::BERT_PROVIDER)?;
+    Ok(TextEmbeddingPlan {
+        inner: provider.plan(evidence.directory, pooling_override),
+    })
+}
+
 /// Presence of standalone flags that a provider may reject.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[doc(hidden)]
@@ -116,7 +280,7 @@ pub struct StandaloneOptionPresence {
     pub positive_reasoning_budget: bool,
 }
 
-/// Options needed to construct the standalone serving factory.
+/// Options used to prepare a standalone load plan.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[doc(hidden)]
 pub struct StandaloneLoadOptions {
@@ -124,9 +288,12 @@ pub struct StandaloneLoadOptions {
     pub tokenizer_path: PathBuf,
     /// Whether Qwen vision weights should be loaded before worker startup.
     pub preload_vision: bool,
+    /// `--max-context`: caps the served context window. `None` serves
+    /// the smaller of the model window and the default serving cap.
+    pub max_context: Option<usize>,
 }
 
-/// Binary-owned worker loader builder retained at the standalone call site.
+/// Compatibility loader builder for existing standalone factory callers.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[doc(hidden)]
 pub type StandaloneQwenLoader = Box<
@@ -142,20 +309,156 @@ pub type StandaloneQwenLoader = Box<
         + 'static,
 >;
 
-/// The provider selected for one checkpoint and its existing route projection.
+/// Startup text selected with the serving provider.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub struct StandaloneStartupDescription {
+    /// Route evidence printed before the loading line.
+    pub route_marker: Option<String>,
+    /// Format label used by the loading line.
+    pub loading_label: &'static str,
+}
+
+/// A provider's staged standalone worker load and post-ready continuation.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub struct StandaloneLoadPlan {
+    factory: ServingFactory,
+    post_ready: StandalonePostReady,
+    context_source: Option<ServeContextSource>,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+impl StandaloneLoadPlan {
+    pub(crate) fn new(factory: ServingFactory, post_ready: StandalonePostReady) -> Self {
+        Self {
+            factory,
+            post_ready,
+            context_source: None,
+        }
+    }
+
+    pub(crate) fn with_context_source(mut self, source: ServeContextSource) -> Self {
+        self.context_source = Some(source);
+        self
+    }
+
+    /// Open the worker and load the selected provider's model on its thread.
+    pub fn open(
+        self,
+        max_pending: usize,
+        residency_limits: ResidencyLimits,
+    ) -> Result<StartedStandalone, String> {
+        let (owner, jobs, metadata, preparation) = AffineWorker::spawn_with_vision(
+            self.factory,
+            max_pending,
+            residency_limits,
+        )
+        .map_err(|error| match error {
+            StartupError::Load(message) => message,
+            StartupError::ThreadExited => "worker thread exited during model load".to_owned(),
+            other => other.to_string(),
+        })?;
+        Ok(StartedStandalone {
+            owner,
+            jobs,
+            metadata,
+            preparation,
+            post_ready: self.post_ready,
+            context_source: self.context_source,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+type GrammarVocabularyLoad =
+    Box<dyn FnOnce() -> Result<std::sync::Arc<Vec<Vec<u8>>>, String> + Send + 'static>;
+
+/// One-shot work that follows the worker's ready line.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub struct StandalonePostReady {
+    finish: GrammarVocabularyLoad,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+impl StandalonePostReady {
+    pub(crate) fn new(
+        finish: impl FnOnce() -> Result<std::sync::Arc<Vec<Vec<u8>>>, String> + Send + 'static,
+    ) -> Self {
+        Self {
+            finish: Box::new(finish),
+        }
+    }
+
+    /// Complete provider work and return the grammar vocabulary.
+    pub fn finish(self) -> Result<std::sync::Arc<Vec<Vec<u8>>>, String> {
+        (self.finish)()
+    }
+}
+
+/// The standalone worker handles and post-ready continuation.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub struct StartedStandalone {
+    /// Owner retained for the server lifetime.
+    pub owner: WorkerOwner,
+    /// Client stored in the standalone application state.
+    pub jobs: WorkerClient,
+    /// Metadata from the loaded model.
+    pub metadata: WorkerMetadata,
+    /// Preparation data returned by the worker factory.
+    pub preparation: PreparationHandle,
+    /// Provider-owned work performed after the ready line.
+    pub post_ready: StandalonePostReady,
+    /// Where the served context window came from, when the provider chose
+    /// it. `None` means the model's own window.
+    pub context_source: Option<ServeContextSource>,
+}
+
+/// The provider selected for one checkpoint and its admitted serving entry.
 #[doc(hidden)]
 pub struct SelectedProvider<'a> {
     #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
     provider: &'a dyn ServingProvider,
     evidence: CheckpointEvidence,
     entry: ServingEntry,
-    legacy_route: Option<ServedRoute>,
+    lattice_plan: Option<Box<dyn LatticeRoutePlan>>,
 }
 
 impl SelectedProvider<'_> {
-    /// The route the entry has historically exposed, if the entry defers it.
+    /// The route exposed by the selected provider's historical interface.
     pub fn legacy_route(&self) -> Option<ServedRoute> {
-        self.legacy_route
+        self.provider
+            .legacy_route(&self.evidence, self.entry)
+            .ok()
+            .flatten()
+    }
+
+    /// Describes the selected provider's implicit pooled embedding action.
+    pub fn implicit_pooled_embeddings(&self, model: &str) -> ImplicitPooledEmbeddingPlan {
+        self.provider
+            .implicit_pooled_embeddings(&self.evidence, model)
+    }
+
+    /// Describes the selected provider's implicit pooled embedding action.
+    #[doc(hidden)]
+    pub fn implicit_embeddings(&self, model: &str) -> ImplicitPooledEmbeddingPlan {
+        self.lattice_plan
+            .as_ref()
+            .map(|plan| plan.implicit_embeddings(model))
+            .unwrap_or_else(|| {
+                self.provider
+                    .implicit_pooled_embeddings(&self.evidence, model)
+            })
+    }
+
+    /// Returns the startup marker for an admitted `lattice serve` route.
+    #[doc(hidden)]
+    pub fn lattice_selection_marker(&self) -> Option<String> {
+        self.lattice_plan
+            .as_ref()
+            .map(|plan| plan.selection_marker())
     }
 
     /// Load the selected provider's CPU route for `lattice serve`.
@@ -164,12 +467,30 @@ impl SelectedProvider<'_> {
             return Err("CPU loading requested for a non-lattice entry".to_owned());
         }
         if self
-            .legacy_route
+            .legacy_route()
             .is_none_or(|route| route.backend != ServedBackend::Cpu)
         {
             return Err("CPU loading requested for a non-CPU route".to_owned());
         }
         self.provider.load_lattice_cpu(&self.evidence)
+    }
+
+    /// Open the selected route for the `lattice serve` command.
+    #[doc(hidden)]
+    pub fn open_lattice(
+        self,
+        options: LatticeOpenOptions,
+        generation_admission: Arc<Semaphore>,
+    ) -> Result<crate::serving_host::ServingHandle, String> {
+        if self.entry != ServingEntry::Lattice {
+            return Err("lattice loading requested for a non-lattice entry".to_owned());
+        }
+        let Some(plan) = self.lattice_plan else {
+            return Err(crate::model_format::unloadable_format_message(
+                &self.evidence.directory,
+            ));
+        };
+        plan.open(options, generation_admission)
     }
 
     /// Validate standalone flag presence through the selected provider.
@@ -180,7 +501,28 @@ impl SelectedProvider<'_> {
         presence: &StandaloneOptionPresence,
     ) -> Result<(), String> {
         self.provider
-            .validate_standalone_options(entry, self.legacy_route, presence)
+            .validate_standalone_options(entry, self.legacy_route(), presence)
+    }
+
+    /// Describe the route before model loading starts.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub fn standalone_startup_description(&self) -> StandaloneStartupDescription {
+        self.provider
+            .standalone_startup_description(self.evidence.format, self.legacy_route())
+    }
+
+    /// Prepare the selected provider's staged standalone load plan.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub fn prepare_standalone_load(
+        self,
+        options: StandaloneLoadOptions,
+    ) -> Result<StandaloneLoadPlan, String> {
+        if self.entry != ServingEntry::Standalone {
+            return Err("standalone load plan requested for a non-standalone entry".to_owned());
+        }
+        let route = self.legacy_route();
+        self.provider
+            .prepare_standalone_load(self.evidence, route, options)
     }
 
     /// Build the standalone worker factory through the selected provider.
@@ -203,11 +545,30 @@ impl SelectedProvider<'_> {
 pub(crate) trait ServingProvider: Sync {
     fn name(&self) -> &'static str;
     fn claims(&self, evidence: &CheckpointEvidence) -> bool;
+    fn admit_lattice(
+        &self,
+        evidence: &CheckpointEvidence,
+    ) -> Result<Box<dyn LatticeRoutePlan>, RouteRefusal>;
     fn legacy_route(
         &self,
         evidence: &CheckpointEvidence,
         entry: ServingEntry,
-    ) -> Result<Option<ServedRoute>, RouteRefusal>;
+    ) -> Result<Option<ServedRoute>, RouteRefusal> {
+        let _ = (evidence, entry);
+        Ok(None)
+    }
+
+    fn implicit_pooled_embeddings(
+        &self,
+        evidence: &CheckpointEvidence,
+        model: &str,
+    ) -> ImplicitPooledEmbeddingPlan {
+        let _ = model;
+        ImplicitPooledEmbeddingPlan {
+            directory_to_try: Some(evidence.directory.clone()),
+            disabled_line: None,
+        }
+    }
 
     fn load_lattice_cpu(
         &self,
@@ -225,6 +586,21 @@ pub(crate) trait ServingProvider: Sync {
     ) -> Result<(), String>;
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn standalone_startup_description(
+        &self,
+        format: ModelFormat,
+        route: Option<ServedRoute>,
+    ) -> StandaloneStartupDescription;
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn prepare_standalone_load(
+        &self,
+        evidence: CheckpointEvidence,
+        route: Option<ServedRoute>,
+        options: StandaloneLoadOptions,
+    ) -> Result<StandaloneLoadPlan, String>;
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn standalone_factory(
         &self,
         evidence: CheckpointEvidence,
@@ -234,13 +610,11 @@ pub(crate) trait ServingProvider: Sync {
 }
 
 pub(crate) struct ProviderRegistry<'a> {
-    providers: &'a [&'a dyn ServingProvider],
-    legacy: &'a dyn ServingProvider,
+    providers: &'a [&'a dyn RegisteredProvider],
+    legacy_generation: &'a dyn ServingProvider,
 }
 
-static LEGACY_PROVIDER: &dyn ServingProvider = &providers::QWEN_PROVIDER;
-
-/// Select a provider and project the route for one serving entry.
+/// Select a provider and admit one serving entry.
 #[doc(hidden)]
 pub fn select(
     evidence: CheckpointEvidence,
@@ -248,7 +622,7 @@ pub fn select(
 ) -> Result<SelectedProvider<'static>, SelectionError> {
     let registry = ProviderRegistry {
         providers: &providers::PROVIDERS,
-        legacy: LEGACY_PROVIDER,
+        legacy_generation: &providers::QWEN_PROVIDER,
     };
     select_with_registry(evidence, entry, &registry)
 }
@@ -258,683 +632,107 @@ pub(crate) fn select_with_registry<'a>(
     entry: ServingEntry,
     registry: &ProviderRegistry<'a>,
 ) -> Result<SelectedProvider<'a>, SelectionError> {
-    let claimants = registry
-        .providers
-        .iter()
-        .copied()
-        .filter(|provider| provider.claims(&evidence))
-        .collect::<Vec<_>>();
-
-    if claimants.len() > 1 {
-        let mut names = claimants
+    let provider = match unique_claim(
+        registry
+            .providers
             .iter()
-            .map(|provider| provider.name())
-            .collect::<Vec<_>>();
-        names.sort_unstable();
-        return Err(SelectionError::Ambiguous {
-            directory: evidence.directory.clone(),
-            claimants: names,
-        });
-    }
-
-    let provider = if claimants.len() == 1 {
-        claimants[0]
-    } else {
-        registry.legacy
-    };
-    let legacy_route =
-        provider
-            .legacy_route(&evidence, entry)
-            .map_err(|refusal| SelectionError::Route {
+            .filter_map(|provider| provider.generation()),
+        |provider| provider.claims(&evidence),
+        ServingProvider::name,
+    ) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => registry.legacy_generation,
+        Err(claimants) => {
+            return Err(SelectionError::Ambiguous {
                 directory: evidence.directory.clone(),
-                refusal,
-            })?;
+                claimants,
+            });
+        }
+    };
+    let lattice_plan = match entry {
+        ServingEntry::Lattice => {
+            let plan =
+                provider
+                    .admit_lattice(&evidence)
+                    .map_err(|refusal| SelectionError::Route {
+                        directory: evidence.directory.clone(),
+                        refusal,
+                    })?;
+            Some(plan)
+        }
+        ServingEntry::Standalone => {
+            provider
+                .legacy_route(&evidence, entry)
+                .map_err(|refusal| SelectionError::Route {
+                    directory: evidence.directory.clone(),
+                    refusal,
+                })?;
+            None
+        }
+    };
 
     Ok(SelectedProvider {
         provider,
         evidence,
         entry,
-        legacy_route,
+        lattice_plan,
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model_format::ModelFamily;
-    use crate::serve::route::{select_route, select_standalone_route};
-    use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    const FORMATS: [FormatFixture; 5] = [
-        FormatFixture::SafetensorsFile,
-        FormatFixture::SafetensorsIndex,
-        FormatFixture::BothSafetensorsSentinels,
-        FormatFixture::Q4Only,
-        FormatFixture::Empty,
-    ];
-
-    /// One F32 tensor `w` of shape `[1]`: the smallest file format
-    /// detection reads as an unquantized safetensors checkpoint.
-    fn write_minimal_safetensors(path: &Path) {
-        let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
-        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-        bytes.extend_from_slice(header);
-        bytes.extend_from_slice(&[0u8; 4]);
-        fs::write(path, bytes).expect("write minimal safetensors");
+fn unique_claim<'a, T: ?Sized>(
+    providers: impl Iterator<Item = &'a T>,
+    claims: impl Fn(&T) -> bool,
+    name: impl Fn(&T) -> &'static str,
+) -> Result<Option<&'a T>, Vec<&'static str>> {
+    let claimants = providers
+        .filter(|provider| claims(provider))
+        .collect::<Vec<_>>();
+    if claimants.len() > 1 {
+        let mut names = claimants
+            .iter()
+            .map(|provider| name(provider))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        return Err(names);
     }
+    Ok(claimants.into_iter().next())
+}
 
-    #[derive(Debug, Clone, Copy)]
-    enum FormatFixture {
-        SafetensorsFile,
-        SafetensorsIndex,
-        BothSafetensorsSentinels,
-        Q4Only,
-        Empty,
-    }
-
-    impl FormatFixture {
-        fn expected(self) -> ModelFormat {
-            match self {
-                Self::SafetensorsFile | Self::SafetensorsIndex | Self::BothSafetensorsSentinels => {
-                    ModelFormat::Safetensors
-                }
-                Self::Q4Only => ModelFormat::Q4,
-                Self::Empty => ModelFormat::Unknown,
-            }
-        }
-
-        fn write(self, directory: &Path) {
-            match self {
-                Self::SafetensorsFile => {
-                    write_minimal_safetensors(&directory.join("model.safetensors"));
-                }
-                Self::SafetensorsIndex => {
-                    write_minimal_safetensors(&directory.join("model-00001-of-00001.safetensors"));
-                    fs::write(
-                        directory.join("model.safetensors.index.json"),
-                        br#"{"weight_map":{"w":"model-00001-of-00001.safetensors"}}"#,
-                    )
-                    .expect("write safetensors index");
-                }
-                Self::BothSafetensorsSentinels => {
-                    write_minimal_safetensors(&directory.join("model.safetensors"));
-                    fs::write(
-                        directory.join("model.safetensors.index.json"),
-                        br#"{"weight_map":{"w":"model.safetensors"}}"#,
-                    )
-                    .expect("write safetensors index");
-                    fs::write(directory.join("weights.q4"), b"q4").expect("write q4 sentinel");
-                }
-                Self::Q4Only => {
-                    fs::write(directory.join("weights.q4"), b"q4").expect("write q4 sentinel");
-                }
-                Self::Empty => {}
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    enum MetadataFixture {
-        Qwen,
-        QwenMoe,
-        GemmaUnsupportedProfile,
-        Missing,
-        Unreadable,
-        Malformed,
-        Oversized,
-        WrongType,
-        NestedOnly,
-    }
-
-    impl MetadataFixture {
-        fn expected_model_type(self) -> Option<&'static str> {
-            match self {
-                Self::Qwen => Some("qwen3_5"),
-                Self::QwenMoe => Some("qwen3_5_moe"),
-                Self::GemmaUnsupportedProfile => Some("gemma4"),
-                Self::WrongType => Some("bert"),
-                Self::Missing
-                | Self::Unreadable
-                | Self::Malformed
-                | Self::Oversized
-                | Self::NestedOnly => None,
-            }
-        }
-
-        fn expected_provider(self) -> &'static str {
-            match self {
-                Self::GemmaUnsupportedProfile => "gemma",
-                Self::Qwen | Self::QwenMoe => "qwen",
-                Self::Missing
-                | Self::Unreadable
-                | Self::Malformed
-                | Self::Oversized
-                | Self::WrongType
-                | Self::NestedOnly => "qwen",
-            }
-        }
-
-        fn write(self, directory: &Path) {
-            let path = directory.join("config.json");
-            match self {
-                Self::Qwen => {
-                    fs::write(&path, br#"{"model_type":"qwen3_5"}"#).expect("write qwen config")
-                }
-                Self::QwenMoe => fs::write(&path, br#"{"model_type":"qwen3_5_moe"}"#)
-                    .expect("write qwen moe config"),
-                Self::GemmaUnsupportedProfile => fs::write(
-                    &path,
-                    br#"{"model_type":"gemma4","architectures":["unsupported"]}"#,
-                )
-                .expect("write unsupported Gemma profile"),
-                Self::Missing => {}
-                Self::Unreadable => fs::create_dir(&path).expect("create non-file config path"),
-                Self::Malformed => fs::write(&path, b"{").expect("write malformed config"),
-                Self::Oversized => {
-                    let bytes =
-                        vec![b' '; crate::model::config_file::MAX_CONFIG_JSON_BYTES as usize + 1];
-                    fs::write(&path, bytes).expect("write oversized config");
-                }
-                Self::WrongType => {
-                    fs::write(&path, br#"{"model_type":"bert"}"#).expect("write other model type")
-                }
-                Self::NestedOnly => fs::write(&path, br#"{"text_config":{"model_type":"gemma4"}}"#)
-                    .expect("write nested-only model type"),
-            }
-        }
-    }
-
-    #[test]
-    fn format_and_top_level_model_type_matrix_selects_expected_provider() {
-        let metadata = [
-            MetadataFixture::Qwen,
-            MetadataFixture::QwenMoe,
-            MetadataFixture::GemmaUnsupportedProfile,
-            MetadataFixture::Missing,
-            MetadataFixture::Unreadable,
-            MetadataFixture::Malformed,
-            MetadataFixture::Oversized,
-            MetadataFixture::WrongType,
-            MetadataFixture::NestedOnly,
-        ];
-
-        for format_fixture in FORMATS {
-            for metadata_fixture in metadata {
-                let temp = tempfile::tempdir().expect("create checkpoint tempdir");
-                let directory = temp.path().join("checkpoint");
-                fs::create_dir(&directory).expect("create checkpoint directory");
-                format_fixture.write(&directory);
-                metadata_fixture.write(&directory);
-
-                let evidence = inspect_checkpoint(&directory);
-                assert_eq!(evidence.format(), format_fixture.expected());
-                assert_eq!(
-                    evidence.model_type.as_deref(),
-                    metadata_fixture.expected_model_type(),
-                    "metadata fixture {metadata_fixture:?}"
-                );
-                match select(evidence, ServingEntry::Standalone) {
-                    Ok(selected) => assert_eq!(
-                        selected.provider.name(),
-                        metadata_fixture.expected_provider(),
-                        "format fixture {format_fixture:?}, metadata fixture {metadata_fixture:?}"
-                    ),
-                    Err(SelectionError::Route {
-                        refusal: RouteRefusal::GemmaMetalUnsupported,
-                        ..
-                    }) => assert!(matches!(
-                        (format_fixture, metadata_fixture),
-                        (
-                            FormatFixture::Q4Only,
-                            MetadataFixture::GemmaUnsupportedProfile
-                        )
-                    )),
-                    Err(error) => panic!(
-                        "unexpected refusal for format fixture {format_fixture:?}, metadata fixture {metadata_fixture:?}: {error:?}"
-                    ),
-                }
-            }
-        }
-
-        let temp = tempfile::tempdir().expect("create missing checkpoint parent");
-        let missing = temp.path().join("missing");
-        let evidence = inspect_checkpoint(&missing);
-        assert_eq!(evidence.format(), ModelFormat::Unknown);
-        assert_eq!(evidence.model_type, None);
-        let selected = select(evidence, ServingEntry::Standalone)
-            .expect("missing directory preserves standalone no-route path");
-        assert_eq!(selected.provider.name(), "qwen");
-        assert_eq!(selected.legacy_route(), None);
-    }
-
-    #[test]
-    fn gemma_identity_is_selected_even_for_an_unsupported_or_malformed_profile() {
-        for config in [
-            br#"{"model_type":"gemma4","architectures":["unsupported"]}"#.as_slice(),
-            br#"{"model_type":"gemma4","text_config":{}}"#.as_slice(),
-        ] {
-            let temp = tempfile::tempdir().expect("create checkpoint tempdir");
-            write_minimal_safetensors(&temp.path().join("model.safetensors"));
-            fs::write(temp.path().join("config.json"), config).expect("write Gemma config");
-            let selected = select(inspect_checkpoint(temp.path()), ServingEntry::Lattice)
-                .expect("identity claim does not validate the Gemma profile");
-            assert_eq!(selected.provider.name(), "gemma");
-            assert_eq!(selected.legacy_route(), Some(ServedRoute::GEMMA4_CPU));
-        }
-    }
-
-    #[test]
-    fn provider_route_projections_match_the_existing_route_functions() {
-        let family_providers: [(&dyn ServingProvider, ModelFamily, &str); 2] = [
-            (&providers::QWEN_PROVIDER, ModelFamily::Qwen35, "qwen3_5"),
-            (&providers::GEMMA_PROVIDER, ModelFamily::Gemma4, "gemma4"),
-        ];
-
-        for (provider, family, model_type) in family_providers {
-            for format in [
-                ModelFormat::Safetensors,
-                ModelFormat::Q4,
-                ModelFormat::Unknown,
-            ] {
-                for entry in [ServingEntry::Lattice, ServingEntry::Standalone] {
-                    let evidence = CheckpointEvidence {
-                        directory: PathBuf::new(),
-                        format,
-                        model_type: Some(model_type.to_owned()),
-                    };
-                    let provider_list = [provider];
-                    let selected = select_with_registry(
-                        evidence,
-                        entry,
-                        &ProviderRegistry {
-                            providers: &provider_list,
-                            legacy: &providers::QWEN_PROVIDER,
-                        },
-                    );
-                    let actual =
-                        selected
-                            .map(|selection| selection.legacy_route())
-                            .map_err(|error| match error {
-                                SelectionError::Route { refusal, .. } => refusal,
-                                SelectionError::Ambiguous { .. } => {
-                                    panic!("one provider cannot produce an ambiguity")
-                                }
-                            });
-                    let expected = match entry {
-                        ServingEntry::Lattice => select_route(format, family).map(Some),
-                        ServingEntry::Standalone => match select_standalone_route(format, family) {
-                            Ok(route) => Ok(Some(route)),
-                            Err(RouteRefusal::UnrecognizedFormat) => Ok(None),
-                            Err(refusal) => Err(refusal),
-                        },
-                    };
-                    assert_eq!(actual, expected, "{family:?}, {format:?}, {entry:?}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn ambiguity_is_sorted_duplicate_sensitive_and_order_independent() {
-        let alpha = TestProvider::new("alpha", true, Ok(Some(ServedRoute::QWEN35_CPU)));
-        let zeta = TestProvider::new("zeta", true, Ok(Some(ServedRoute::GEMMA4_CPU)));
-        let forward = [&zeta as &dyn ServingProvider, &alpha];
-        let reverse = [&alpha as &dyn ServingProvider, &zeta];
-        let legacy = TestProvider::new("legacy", false, Ok(None));
-
-        let forward_error = select_with_registry(
-            empty_evidence(),
-            ServingEntry::Lattice,
-            &ProviderRegistry {
-                providers: &forward,
-                legacy: &legacy,
-            },
-        )
-        .err()
-        .expect("two providers must be ambiguous");
-        let reverse_error = select_with_registry(
-            empty_evidence(),
-            ServingEntry::Lattice,
-            &ProviderRegistry {
-                providers: &reverse,
-                legacy: &legacy,
-            },
-        )
-        .err()
-        .expect("reversing registration must remain ambiguous");
-        assert_eq!(forward_error, reverse_error);
-        assert_eq!(
-            forward_error,
-            SelectionError::Ambiguous {
-                directory: PathBuf::new(),
-                claimants: vec!["alpha", "zeta"]
-            }
-        );
-        assert_eq!(
-            forward_error.message(),
-            "ambiguous serving providers for '': alpha, zeta"
-        );
-        assert_eq!(alpha.route_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(zeta.route_calls.load(Ordering::SeqCst), 0);
-
-        let duplicated = [&alpha as &dyn ServingProvider, &alpha];
-        let duplicate_error = select_with_registry(
-            empty_evidence(),
-            ServingEntry::Lattice,
-            &ProviderRegistry {
-                providers: &duplicated,
-                legacy: &legacy,
-            },
-        )
-        .err()
-        .expect("the same provider listed twice is two claims");
-        assert_eq!(
-            duplicate_error,
-            SelectionError::Ambiguous {
-                directory: PathBuf::new(),
-                claimants: vec!["alpha", "alpha"]
-            }
-        );
-        assert_eq!(alpha.route_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn positive_claim_refusal_does_not_reach_the_legacy_provider() {
-        let claimant =
-            TestProvider::new("claimant", true, Err(RouteRefusal::GemmaMetalUnsupported));
-        let legacy = TestProvider::new("legacy", false, Ok(None));
-        let providers = [&claimant as &dyn ServingProvider, &legacy];
-        let error = select_with_registry(
-            empty_evidence(),
-            ServingEntry::Lattice,
-            &ProviderRegistry {
-                providers: &providers,
-                legacy: &legacy,
-            },
-        )
-        .err()
-        .expect("a claimed provider's route refusal is final");
-
-        assert!(matches!(
-            error,
-            SelectionError::Route {
-                refusal: RouteRefusal::GemmaMetalUnsupported,
-                ..
-            }
-        ));
-        assert_eq!(claimant.route_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(legacy.route_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn legacy_provider_route_is_reached_only_when_no_provider_claims() {
-        let nonclaimant = TestProvider::new("nonclaimant", false, Ok(None));
-        let legacy = TestProvider::new("legacy", false, Ok(Some(ServedRoute::QWEN35_CPU)));
-        let providers = [&nonclaimant as &dyn ServingProvider, &legacy];
-        let selected = select_with_registry(
-            empty_evidence(),
-            ServingEntry::Lattice,
-            &ProviderRegistry {
-                providers: &providers,
-                legacy: &legacy,
-            },
-        )
-        .expect("zero claims binds the registered legacy provider");
-
-        assert_eq!(selected.provider.name(), "legacy");
-        assert_eq!(nonclaimant.route_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(legacy.route_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn unknown_format_matches_the_legacy_route_behavior_on_each_entry() {
-        for config in [None, Some(br#"{"model_type":"gemma4"}"#.as_slice())] {
-            let temp = tempfile::tempdir().expect("create checkpoint tempdir");
-            if let Some(config) = config {
-                fs::write(temp.path().join("config.json"), config).expect("write model config");
-            }
-            let evidence = inspect_checkpoint(temp.path());
-            let lattice = select(evidence, ServingEntry::Lattice)
-                .err()
-                .expect("lattice still refuses unknown format");
-            assert!(matches!(
-                lattice,
-                SelectionError::Route {
-                    refusal: RouteRefusal::UnrecognizedFormat,
-                    ..
-                }
-            ));
-
-            let standalone = select(inspect_checkpoint(temp.path()), ServingEntry::Standalone)
-                .expect("standalone keeps its old loader error path");
-            assert_eq!(standalone.legacy_route(), None);
-        }
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    #[test]
-    fn gemma_standalone_refuses_present_options_in_legacy_order() {
-        let cases = [
-            (
-                StandaloneOptionPresence {
-                    preload_vision: true,
-                    tokenizer_dir: false,
-                    resident_count: false,
-                    resident_bytes: false,
-                    positive_reasoning_budget: false,
-                },
-                "--preload-vision",
-            ),
-            (
-                StandaloneOptionPresence {
-                    preload_vision: false,
-                    tokenizer_dir: true,
-                    resident_count: false,
-                    resident_bytes: false,
-                    positive_reasoning_budget: false,
-                },
-                "--tokenizer-dir",
-            ),
-            (
-                StandaloneOptionPresence {
-                    preload_vision: false,
-                    tokenizer_dir: false,
-                    resident_count: true,
-                    resident_bytes: false,
-                    positive_reasoning_budget: false,
-                },
-                "--max-resident-adapters",
-            ),
-            (
-                StandaloneOptionPresence {
-                    preload_vision: false,
-                    tokenizer_dir: false,
-                    resident_count: false,
-                    resident_bytes: true,
-                    positive_reasoning_budget: false,
-                },
-                "--max-resident-adapter-bytes",
-            ),
-            (
-                StandaloneOptionPresence {
-                    preload_vision: false,
-                    tokenizer_dir: false,
-                    resident_count: false,
-                    resident_bytes: false,
-                    positive_reasoning_budget: true,
-                },
-                "--reasoning-budget",
-            ),
-        ];
-
-        for (presence, flag) in cases {
-            let selected = select(
-                CheckpointEvidence {
-                    directory: PathBuf::new(),
-                    format: ModelFormat::Safetensors,
-                    model_type: Some("gemma4".to_owned()),
-                },
-                ServingEntry::Standalone,
-            )
-            .expect("Gemma safetensors selects its standalone provider");
-            assert_eq!(
-                selected.validate_standalone_options(ServingEntry::Standalone, &presence),
-                Err(format!(
-                    "unsupported_feature: {flag} is not supported for Gemma 4 checkpoints"
-                )),
-                "option {flag}"
-            );
-        }
-
-        let selected = select(
-            CheckpointEvidence {
-                directory: PathBuf::new(),
-                format: ModelFormat::Safetensors,
-                model_type: Some("gemma4".to_owned()),
-            },
-            ServingEntry::Standalone,
-        )
-        .expect("Gemma safetensors selects its standalone provider");
-        assert_eq!(
-            selected.validate_standalone_options(
-                ServingEntry::Standalone,
-                &StandaloneOptionPresence {
-                    preload_vision: true,
-                    tokenizer_dir: true,
-                    resident_count: true,
-                    resident_bytes: true,
-                    positive_reasoning_budget: true,
-                }
-            ),
-            Err(
-                "unsupported_feature: --preload-vision is not supported for Gemma 4 checkpoints"
-                    .to_owned()
-            )
-        );
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    #[test]
-    fn qwen_standalone_accepts_all_present_options() {
-        let selected = select(
-            CheckpointEvidence {
-                directory: PathBuf::new(),
-                format: ModelFormat::Safetensors,
-                model_type: Some("qwen3_5".to_owned()),
-            },
-            ServingEntry::Standalone,
-        )
-        .expect("Qwen safetensors selects its standalone provider");
-        assert_eq!(
-            selected.validate_standalone_options(
-                ServingEntry::Standalone,
-                &StandaloneOptionPresence {
-                    preload_vision: true,
-                    tokenizer_dir: true,
-                    resident_count: true,
-                    resident_bytes: true,
-                    positive_reasoning_budget: true,
-                }
-            ),
-            Ok(())
-        );
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    #[test]
-    fn unknown_gemma_standalone_skips_option_refusals() {
-        let selected = select(
-            CheckpointEvidence {
-                directory: PathBuf::new(),
-                format: ModelFormat::Unknown,
-                model_type: Some("gemma4".to_owned()),
-            },
-            ServingEntry::Standalone,
-        )
-        .expect("Unknown format defers standalone failure to its legacy loader path");
-        assert_eq!(selected.legacy_route(), None);
-        assert_eq!(
-            selected.validate_standalone_options(
-                ServingEntry::Standalone,
-                &StandaloneOptionPresence {
-                    preload_vision: true,
-                    tokenizer_dir: true,
-                    resident_count: true,
-                    resident_bytes: true,
-                    positive_reasoning_budget: true,
-                }
-            ),
-            Ok(())
-        );
-    }
-
-    fn empty_evidence() -> CheckpointEvidence {
-        CheckpointEvidence {
-            directory: PathBuf::new(),
-            format: ModelFormat::Safetensors,
-            model_type: None,
-        }
-    }
-
-    struct TestProvider {
-        name: &'static str,
-        claim: bool,
-        route: Result<Option<ServedRoute>, RouteRefusal>,
-        route_calls: AtomicUsize,
-    }
-
-    impl TestProvider {
-        fn new(
-            name: &'static str,
-            claim: bool,
-            route: Result<Option<ServedRoute>, RouteRefusal>,
-        ) -> Self {
-            Self {
-                name,
-                claim,
-                route,
-                route_calls: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl ServingProvider for TestProvider {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
-        fn claims(&self, _evidence: &CheckpointEvidence) -> bool {
-            self.claim
-        }
-
-        fn legacy_route(
-            &self,
-            _evidence: &CheckpointEvidence,
-            _entry: ServingEntry,
-        ) -> Result<Option<ServedRoute>, RouteRefusal> {
-            self.route_calls.fetch_add(1, Ordering::SeqCst);
-            self.route
-        }
-
-        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-        fn validate_standalone_options(
-            &self,
-            _entry: ServingEntry,
-            _route: Option<ServedRoute>,
-            _presence: &StandaloneOptionPresence,
-        ) -> Result<(), String> {
-            Ok(())
-        }
-
-        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-        fn standalone_factory(
-            &self,
-            _evidence: CheckpointEvidence,
-            _options: StandaloneLoadOptions,
-            _qwen_loader: StandaloneQwenLoader,
-        ) -> Result<ServingFactory, String> {
-            Err("test provider does not build a factory".to_owned())
-        }
+fn select_pooled_with_registry<'a>(
+    evidence: &CheckpointEvidence,
+    providers: &'a [&'a dyn RegisteredProvider],
+    legacy: &'a dyn PooledEmbeddingProvider,
+) -> Result<&'a dyn PooledEmbeddingProvider, EmbeddingSelectionError> {
+    match unique_claim(
+        providers
+            .iter()
+            .filter_map(|provider| provider.pooled_embeddings()),
+        |provider| provider.claims(evidence),
+        PooledEmbeddingProvider::name,
+    ) {
+        Ok(Some(provider)) => Ok(provider),
+        Ok(None) => Ok(legacy),
+        Err(providers) => Err(EmbeddingSelectionError::Ambiguous { providers }),
     }
 }
+
+fn select_text_with_registry<'a>(
+    evidence: &CheckpointEvidence,
+    providers: &'a [&'a dyn RegisteredProvider],
+    legacy: &'a dyn TextEmbeddingProvider,
+) -> Result<&'a dyn TextEmbeddingProvider, EmbeddingSelectionError> {
+    match unique_claim(
+        providers
+            .iter()
+            .filter_map(|provider| provider.text_embeddings()),
+        |provider| provider.claims(evidence),
+        TextEmbeddingProvider::name,
+    ) {
+        Ok(Some(provider)) => Ok(provider),
+        Ok(None) => Ok(legacy),
+        Err(providers) => Err(EmbeddingSelectionError::Ambiguous { providers }),
+    }
+}
+
+#[cfg(test)]
+mod tests;

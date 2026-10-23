@@ -34,7 +34,7 @@ set -u
 
 LIST_FILE=crates/inference/src/serve/lora.rs
 BIN_A=crates/inference/src/bin/lattice/serve.rs
-BIN_B=crates/inference/src/bin/lattice_serve.rs
+BIN_B=crates/inference/src/bin/lattice_serve/main.rs
 
 # Paths registered via `.route("/v1/lora...")` in a binary's source.
 extract_registered() {

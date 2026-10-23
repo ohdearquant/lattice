@@ -17,6 +17,11 @@ extend-exclude = [
     "target/**",
 ]
 
+[default]
+# Verbatim quotation in ADR-103's Direction section, kept as written. Matches only that phrase, so the
+# misspelling stays flagged everywhere else.
+extend-ignore-re = ["the aggragator interface for acceessing stuff"]
+
 [default.extend-words]
 # Domain vocabulary and established abbreviations, not misspellings:
 ot = "ot"       # optimal transport (crates/transport, ADR-035/036/038/039/055)
@@ -30,6 +35,7 @@ comput = "comput" # bibliographic abbreviation, "SIAM J. Sci. Comput."
 oll = "oll"     # ollama shell/plot variable abbreviation in bench scripts
 yhat = "yhat"   # statistics notation (predicted value)
 unparseable = "unparseable" # accepted alternate spelling (cf. Java ParseException)
+alse = "alse"   # a `false` fragment ("f" + "alse") in grammar-engine tokenizer vocab fixtures
 
 # Short local-variable and struct-field abbreviations the checker treats as
 # misspelled English words:
