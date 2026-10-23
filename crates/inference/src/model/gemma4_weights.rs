@@ -148,7 +148,7 @@ impl PerLayerEmbeddings {
         let row_bytes = self.row_len.checked_mul(2).ok_or_else(extent_error)?;
         let start = row.checked_mul(row_bytes).ok_or_else(extent_error)?;
         let end = start.checked_add(row_bytes).ok_or_else(extent_error)?;
-        let payload = self.file.bf16_payload(&self.tensor_name)?;
+        let payload = safetensors_bf16_payload(&self.file, &self.tensor_name)?;
         let bytes = payload.get(start..end).ok_or_else(|| {
             InferenceError::InvalidSafetensors(format!(
                 "tensor {} payload is shorter than its declared {} rows",
