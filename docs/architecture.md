@@ -15,6 +15,7 @@ lattice-transport   (standalone — optimal transport math, Sinkhorn-Knopp)
 lattice-tokenizer   ←── lattice-inference-core   (WordPiece, SentencePiece, BPE tokenizers)
 lattice-grammar     ←── lattice-inference-core   (JSON Schema, GBNF, constrained decoding)
 lattice-weights     ←── lattice-inference-core   (weight storage, model-directory format detection)
+lattice-metal-runtime ←── lattice-inference-core (shared Metal helpers, macOS + `metal-gpu`)
 lattice-quant       ←── lattice-inference-core
                     ←── lattice-weights         (Q4 manifests, Hadamard transforms, rotation absorption)
 lattice-inference   ←── lattice-inference-core
@@ -22,6 +23,7 @@ lattice-inference   ←── lattice-inference-core
                     ←── lattice-grammar
                     ←── lattice-weights
                     ←── lattice-quant
+                    ←── lattice-metal-runtime (optional, `metal-gpu` feature)
                     ←── lattice-fann (optional, `mixture` or `metal-gpu` feature)
                                      (transformer forward pass, weights)
        │
@@ -38,7 +40,8 @@ only on `inference-core` at runtime; grammar uses tokenizer in tests. `quant` de
 `inference-core` and `weights`. `inference` depends on all five unconditionally (plus
 `fann` under the optional `mixture` or `metal-gpu` features), re-exporting tokenizer,
 grammar, weight, model-format, quantization primitive and error items at their original
-paths. Consumer crates (`embed`, `tune`) compose them.
+paths. `metal-runtime` depends only on `inference-core` internally; the facade enables
+it under `metal-gpu`. Consumer crates (`embed`, `tune`) compose them.
 
 ## Design Philosophy
 
@@ -58,6 +61,13 @@ Async lives in `lattice-embed`'s service layer where I/O (model download, cache 
 justifies it.
 
 ## Crate Descriptions
+
+### lattice-metal-runtime
+
+Shared Metal buffer allocation and upload, argument encoding, shader compilation
+and compute pipeline construction. Its API exists only on macOS with the optional
+`metal-gpu` feature. The inference facade keeps this module private; its existing
+device test stays in inference to reuse the one shared GPU measurement lock.
 
 ### lattice-grammar
 

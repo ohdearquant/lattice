@@ -76,6 +76,7 @@ const RAW_HARNESS_ENTRYPOINTS: &[(&str, &str, CallSelector)] = &[
     ),
 ];
 const ADDITIONAL_GUARDED_ENTRYPOINTS: &[(&str, &str, CallSelector)] = &[
+    (".", "tests/metal_runtime_buffers.rs", DEVICE_SYSTEM_DEFAULT),
     (
         ".",
         "examples/bench_embed_quality.rs",

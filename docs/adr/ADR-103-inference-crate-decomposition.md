@@ -34,6 +34,29 @@ the facade re-exports. Changed:
    `profile_reachable_states`, and a test module gated `all(test, feature = "bench-internals")`, now run by its own
    Linux CI step). The removal rule still applies to gates on items that are not on the facade's public listing.
 
+## Amendment 3 (2026-10-24)
+
+The first case of D9 step 3 moves the shared Metal runtime module (`forward/metal_runtime.rs`) into its own crate.
+Recorded:
+
+1. D8.1: the crate is `lattice-metal-runtime`. It depends on `lattice-inference-core` for `InferenceError` and, on
+   macOS under its `metal-gpu` feature, on `metal`, `objc` and `bytemuck`; its whole library compiles only on macOS
+   with that feature. The facade depends on it only under its own `metal-gpu`, which forwards the feature. It publishes
+   in the second tier, beside `lattice-tokenizer`, `lattice-grammar` and `lattice-weights`.
+2. D4: the module's items take disposition 2 (Public). They are the crate's whole job, and the facade imports them
+   `pub(crate)`, so its public listing is unchanged. One item needed more than wider visibility. `scalar` copies the
+   bytes of its argument into a Metal argument table. While it was crate-private, every caller was in view; a public
+   safe function cannot rely on that. Its bound narrows from `Copy` to `bytemuck::NoUninit`, which excludes types with
+   padding or other uninitialized bytes, and a compile-time assertion limits the type to 1 to 4095 bytes, inside the
+   4 KB that Metal's `setBytes` accepts. This is the move's one signature change, and D6.6 admits it because
+   disposition 2 requires it. The two model parameter structs passed to `scalar` gain the derive.
+3. The GPU test lock stays in `lattice-inference` (`measurement::gpu_test_lock`). The measurement harness admits
+   `lattice-inference` targets only and the lock-coverage contract lists entry points inside `lattice-inference`, so
+   moving the lock would be a harness change, which D6.5 keeps out of an extraction. The module's device test
+   therefore moves to `lattice-inference`'s integration tests (`tests/metal_runtime_buffers.rs`), takes the same lock
+   there, and is listed as a guarded entry point in the lock-coverage contract. The new crate keeps the module's pure
+   unit test and has no device test of its own.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
