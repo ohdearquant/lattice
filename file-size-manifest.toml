@@ -9,10 +9,6 @@
 # are read as data rather than source. Paths are exact: no globs, and no
 # directory entries.
 
-[[ratchet]]
-path = "scripts/perf-bench-gate.py"
-ceiling = 3818
-
 [[data]]
 path = "Cargo.lock"
 
