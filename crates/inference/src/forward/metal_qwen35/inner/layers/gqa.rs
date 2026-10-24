@@ -18,11 +18,9 @@ impl MetalQwen35State {
         cfg: &Qwen35Config,
         prof: &mut StepProfile,
         profiling: bool,
-        with_mlp: bool,
         mrope_override: Option<(&Buffer, &Buffer)>,
     ) {
         let hidden = cfg.hidden_size;
-        // GQA: SINGLE command buffer — pre-norm + projections + KV copy + attention + MLP
         let (w_q_proj, w_k_proj, w_v_proj, w_o_proj, w_q_norm, w_k_norm) = {
             let MetalLayerAttnWeights::Full(full_w) = &self.engine.layer_weights[compact_idx].0
             else {
@@ -234,10 +232,6 @@ impl MetalQwen35State {
         );
         if let Some(t0) = gqa_oproj_t0 {
             prof.projection_us += t0.elapsed().as_micros();
-        }
-
-        if with_mlp {
-            self.encode_mlp_block(enc, compact_idx, layer_idx, position, cfg, prof, profiling);
         }
     }
 }

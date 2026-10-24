@@ -119,8 +119,8 @@ impl MetalQwen35State {
     /// Dispatches: fused residual-add-norm → gate_up_proj GEMV → LoRA(gate/up) →
     /// silu_mul → down_proj GEMV → LoRA(down) → residual-add-copy.
     ///
-    /// Pure extraction from `encode_gdn_layer` / `encode_gqa_layer`; the fused
-    /// path is byte-for-byte identical to inlining.
+    /// The caller completes the encoded norm before returning a fresh encoder
+    /// from `complete_norm`; only MoE layers invoke that boundary.
     ///
     /// # Preconditions
     /// - `self.session.activations.residual` holds the post-attention residual.
@@ -129,16 +129,17 @@ impl MetalQwen35State {
     ///
     /// # Postconditions
     /// - `self.session.activations.residual` and `.hidden` hold the post-FFN state.
-    pub(super) fn encode_mlp_block(
+    pub(super) fn encode_mlp_block<'a>(
         &mut self,
-        enc: &ComputeCommandEncoderRef,
+        mut enc: &'a ComputeCommandEncoderRef,
         compact_idx: usize,
         layer_idx: usize,
         position: usize,
         cfg: &Qwen35Config,
         prof: &mut StepProfile,
         profiling: bool,
-    ) {
+        complete_norm: impl FnOnce(&'a ComputeCommandEncoderRef) -> &'a ComputeCommandEncoderRef,
+    ) -> &'a ComputeCommandEncoderRef {
         let hidden = cfg.hidden_size;
         let inter = cfg.intermediate_size;
         let (_, common_w) = &self.engine.layer_weights[compact_idx];
@@ -153,6 +154,9 @@ impl MetalQwen35State {
             hidden as u32,
             cfg.rms_norm_eps,
         );
+        if matches!(&common_w.ffn, MetalFfnWeights::Moe(_)) {
+            enc = complete_norm(enc);
+        }
         // SAFETY: FFN weight buffers are live for the command buffer lifetime.
         match &common_w.ffn {
             MetalFfnWeights::Dense {
@@ -214,7 +218,8 @@ impl MetalQwen35State {
             }
             MetalFfnWeights::Moe(moe_bufs) => {
                 let moe_ptr = moe_bufs.as_ref() as *const MoeMetalBuffers;
-                // SAFETY: moe_bufs is owned by layer_weights which is live.
+                // SAFETY: layer_weights owns moe_bufs; complete_norm waited for
+                // this layer's norm before the CPU reads the shared hidden buffer.
                 unsafe {
                     self.encode_moe_ffn(enc, &*moe_ptr, cfg, layer_idx, position);
                 }
@@ -230,6 +235,7 @@ impl MetalQwen35State {
         if let Some(t0) = mlp_t0 {
             prof.mlp_us += t0.elapsed().as_micros();
         }
+        enc
     }
 
     /// Encode a MoE FFN step into an already-open compute command encoder.
@@ -240,7 +246,8 @@ impl MetalQwen35State {
     ///
     /// # Preconditions
     /// - `moe` is a live reference to a `MoeMetalBuffers` owned by `self.engine.layer_weights`.
-    /// - `self.session.activations.hidden` holds the post-RMSNorm hidden state ([hidden] f32).
+    /// - The current layer's post-attention fused residual-add-norm has completed
+    ///   on the GPU; `activations.hidden` contains its normalized [hidden] f32 state.
     /// - The encoder `enc` is open and NOT yet committed.
     ///
     /// # Postconditions
@@ -250,9 +257,10 @@ impl MetalQwen35State {
     /// # Safety
     /// Reads `moe.router_gate.contents()` and `moe.shared_expert_gate.contents()` as
     /// `*const f32` for CPU routing. Valid because both buffers use `StorageModeShared`
-    /// and no GPU work on those buffers is in flight (router runs before encoding starts).
-    /// Reads `self.session.activations.hidden.contents()` similarly (GPU idle at this point
-    /// — this is called before the encoder dispatches any hidden-state kernel).
+    /// and the immutable weights are not modified by GPU work. The caller
+    /// `encode_mlp_block` invokes its completion boundary after encoding the current
+    /// layer's norm, committing and waiting before this CPU read of the shared hidden
+    /// buffer. The replacement encoder has not queued another write to hidden.
     unsafe fn encode_moe_ffn(
         &self,
         enc: &ComputeCommandEncoderRef,
