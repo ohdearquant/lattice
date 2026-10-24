@@ -47,10 +47,9 @@ impl<'a> ConstructionTally<'a> {
         let recorded_position = package_path_key(exemption.package, exemption.recorded_position);
         if current_position != recorded_position {
             self.moved_exemptions.push(format!(
-                "{site}: recorded position `{}` no longer matches current position \
+                "{site}: recorded position `{recorded_position}` no longer matches current position \
                  `{current_position}`; confirm this exemption still describes the same work \
-                 (this is not a locking violation)",
-                recorded_position
+                 (this is not a locking violation)"
             ));
         }
         None
