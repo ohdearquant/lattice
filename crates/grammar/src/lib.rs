@@ -22,7 +22,7 @@
 //!
 //! ```rust,ignore
 //! use std::sync::Arc;
-//! use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
+//! use lattice_grammar::{GrammarEngine, GrammarSpec};
 //! use lattice_inference::model::GenerateConfig;
 //!
 //! let spec = GrammarSpec::json_schema_str(r#"{"type":"object","properties":{"name":{"type":"string"}}}"#)?;
@@ -73,3 +73,18 @@ pub mod vocab_partition;
 // Re-exports for the primary public API.
 pub use engine::{GrammarEngine, GrammarError};
 pub use spec::GrammarSpec;
+
+/// Engine glue used by the `lattice-inference` facade.
+///
+/// Not part of the supported grammar API. The facade calls these free
+/// functions by their full path; they are not re-exported by that facade.
+#[doc(hidden)]
+pub mod __internal {
+    use crate::engine::GrammarEngine;
+    use crate::pda::GrammarState;
+
+    #[inline]
+    pub fn is_complete_without_continuation(engine: &GrammarEngine, state: &GrammarState) -> bool {
+        engine.is_complete_without_continuation(state)
+    }
+}

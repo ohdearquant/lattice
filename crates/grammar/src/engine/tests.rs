@@ -458,7 +458,7 @@ fn optional_keys_sharing_a_prefix_are_reachable_through_mask_logits() {
 /// being built over a matcher that silently drops stacks.
 #[test]
 fn engine_construction_reports_the_live_stack_limit() {
-    let alternatives: Vec<String> = (0..=crate::grammar::pda::MAX_LIVE_STACKS)
+    let alternatives: Vec<String> = (0..=crate::pda::MAX_LIVE_STACKS)
         .map(|i| format!("\"a\" \"{i}\""))
         .collect();
     let spec = GrammarSpec::Gbnf(format!("root ::= {}\n", alternatives.join(" | ")));
@@ -479,7 +479,7 @@ fn engine_construction_reports_the_live_stack_limit() {
 /// whose continuations cannot be classified is not called terminal.
 #[test]
 fn runtime_paths_report_the_live_stack_limit() {
-    use crate::grammar::pda::{CompiledGrammar, MAX_LIVE_STACKS, Rule, Symbol};
+    use crate::pda::{CompiledGrammar, MAX_LIVE_STACKS, Rule, Symbol};
 
     // The root is nullable (its first alternative is empty), so the initial
     // state is accepting; every other alternative starts with "a".
@@ -539,7 +539,7 @@ fn unknown_state_fallback_is_sound() {
     // Vocab: token 0 = b"\"" (quote), token 1 = b"a".
     // At a deep mid-chain state the only valid next token is `a`; the
     // closing quote `"` is invalid there but IS valid at state 0.
-    use crate::grammar::pda::{CompiledGrammar, Rule, Symbol};
+    use crate::pda::{CompiledGrammar, Rule, Symbol};
 
     let mut chain = vec![Symbol::Terminal(b'"')];
     chain.extend(std::iter::repeat_n(Symbol::Terminal(b'a'), 300));
@@ -556,16 +556,13 @@ fn unknown_state_fallback_is_sound() {
     // Build engine then swap in the hand-built grammar + partition so the
     // test does not depend on json_schema const-compilation internals.
     let mut engine = GrammarEngine::new(&spec, vocab.clone()).unwrap();
-    let states = enumerate_grammar_states(
-        &grammar,
-        &vocab,
-        crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
-    )
-    .expect("fixture stays inside the stack limits");
+    let states =
+        enumerate_grammar_states(&grammar, &vocab, crate::vocab_partition::MAX_GRAMMAR_STATES)
+            .expect("fixture stays inside the stack limits");
     // Enumeration must have hit the cap, otherwise the test is vacuous.
     assert_eq!(
         states.len(),
-        crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
+        crate::vocab_partition::MAX_GRAMMAR_STATES,
         "grammar must exceed the state cap for this regression to bite"
     );
     engine.partition = VocabPartition::build(&grammar, states, &vocab);
@@ -976,12 +973,20 @@ fn trie_mask_byte_identical_to_oracle_real_vocab() {
         );
     }
 
-    let cfg = crate::model::qwen35_config::Qwen35Config::from_model_dir(tokenizer_dir)
-        .expect("config.json load");
-    let tokenizer = crate::tokenizer::BpeTokenizer::from_tokenizer_json(&tokenizer_path)
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("config.json read"))
+            .expect("config.json parse");
+    let vocab_size = config
+        .get("text_config")
+        .and_then(|text| text.get("vocab_size"))
+        .or_else(|| config.get("vocab_size"))
+        .and_then(serde_json::Value::as_u64)
+        .expect("config.json carries no vocab_size under text_config or at the top level");
+    let vocab_size = usize::try_from(vocab_size).expect("vocab_size fits usize");
+    let tokenizer = lattice_tokenizer::BpeTokenizer::from_tokenizer_json(&tokenizer_path)
         .expect("tokenizer.json load");
     let vocab = tokenizer
-        .vocab_bytes(cfg.vocab_size)
+        .vocab_bytes(vocab_size)
         .expect("vocab_bytes over real tokenizer");
     assert!(
         vocab.len() > 100_000,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::grammar::pda::{GrammarState, SimResult, simulate_token};
+use crate::pda::{GrammarState, SimResult, simulate_token};
 
 #[test]
 fn ref_target_annotations_exclude_structural_keys() {

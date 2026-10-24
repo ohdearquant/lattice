@@ -1,5 +1,5 @@
 use super::*;
-use crate::grammar::pda::StackFrame;
+use crate::pda::StackFrame;
 
 fn reference_enumeration(
     grammar: &CompiledGrammar,

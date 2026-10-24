@@ -24,8 +24,8 @@ esac
 
 # Publish order follows the internal dependency DAG (deps before dependents):
 #   fann, transport, inference-core   leaves, no internal deps
-#     -> tokenizer                    depends on inference-core
-#       -> inference                  depends on fann (via `mixture`), tokenizer
+#     -> tokenizer, grammar           depend on inference-core
+#       -> inference                  depends on fann (via `mixture`), inference-core, tokenizer, grammar
 #         -> embed                    depends on inference, transport
 #         -> tune                     depends on fann, inference
 # Each tier waits for crates.io indexing before the next tier resolves it.
@@ -36,7 +36,7 @@ esac
 # exceeds 10 MiB, and a rejection in tier 2 leaves tier 1 already published and
 # immutable. `cargo publish --dry-run` does not cover this: it can only validate
 # the leaf tier, because a crate whose internal path dependencies are not yet
-# live on the registry cannot be packaged at all. Measure all seven first.
+# live on the registry cannot be packaged at all. Measure all eight first.
 echo "--- Pre-publish: package size against the crates.io upload limit ---"
 "$(dirname "$0")/package-size-check.sh"
 
@@ -52,15 +52,21 @@ fi
 echo "Waiting for crates.io indexing..."
 sleep 30
 
-echo "--- Tier 2: tokenizer (depends on inference-core) ---"
+echo "--- Tier 2: tokenizer and grammar (depend on inference-core) ---"
 cargo publish -p lattice-tokenizer $FLAG
+# lattice-grammar's tests depend on the lattice-tokenizer release just uploaded.
+if [ -z "$FLAG" ]; then
+    echo "Waiting for crates.io indexing..."
+    sleep 30
+fi
+cargo publish -p lattice-grammar $FLAG
 
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."
     sleep 30
 fi
 
-echo "--- Tier 3: inference (depends on fann, inference-core, tokenizer) ---"
+echo "--- Tier 3: inference (depends on fann, inference-core, tokenizer, grammar) ---"
 cargo publish -p lattice-inference $FLAG
 
 if [ -z "$FLAG" ]; then
