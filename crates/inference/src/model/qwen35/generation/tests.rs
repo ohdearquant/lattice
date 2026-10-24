@@ -2574,4 +2574,217 @@ fn transition_leaves_an_unspent_reasoning_budget_inert() {
     assert_eq!(token_logprobs[1].token_id, sampled_id);
 }
 
+fn build_tiny_oov_thinking_model() -> Qwen35Model {
+    let mut model = build_tiny_zero_model();
+    assert_eq!(model.config.vocab_size, 97);
+    model.tokenizer = BpeTokenizer::from_vocab_and_merges(
+        std::collections::HashMap::from([
+            ("<unk>".to_string(), 0),
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+            ("d".to_string(), 4),
+            ("e".to_string(), 5),
+            (" ".to_string(), 6),
+            ("</think>".to_string(), 97),
+        ]),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(model.tokenizer.tokenize("a").real_length, 1);
+    model
+}
+
+type ColdPreflightResult = Result<(GenerateOutput, driver::DriverTrace), InferenceError>;
+
+fn cold_preflight_results(
+    model: &Qwen35Model,
+    prompt: &str,
+    cfg: &GenerateConfig,
+) -> [(&'static str, ColdPreflightResult); 2] {
+    [
+        ("nonstreaming", model.generate_with_trace(prompt, cfg)),
+        (
+            "streaming",
+            model.generate_streaming_with_trace(prompt, cfg, |_| true, || false, |_| {}),
+        ),
+    ]
+}
+
+#[test]
+fn cold_preflight_empty_prompt_precedes_zero_tokens_and_other_refusals() {
+    let model = super::super::test_support::tiny_zero_model_with_context(1);
+    let cfg = GenerateConfig {
+        max_new_tokens: 0,
+        reasoning_budget: Some(2),
+        enable_thinking: true,
+        ..Default::default()
+    };
+    assert_eq!(model.tokenizer.tokenize("").real_length, 0);
+    for (entry, result) in cold_preflight_results(&model, "", &cfg) {
+        assert!(
+            matches!(&result, Err(InferenceError::Inference(message)) if message == "empty prompt"),
+            "{entry}: empty input must win over zero tokens, context and missing marker: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn cold_preflight_zero_tokens_bypass_context_and_close_marker_resolution() {
+    let model = super::super::test_support::tiny_zero_model_with_context(1);
+    let cfg = GenerateConfig {
+        max_new_tokens: 0,
+        reasoning_budget: Some(2),
+        enable_thinking: true,
+        logprobs: Some(3),
+        ..Default::default()
+    };
+    assert_eq!(model.tokenizer.tokenize("ab").real_length, 2);
+    for (entry, result) in cold_preflight_results(&model, "ab", &cfg) {
+        assert!(
+            result.is_ok(),
+            "{entry}: zero tokens must return early: {result:?}"
+        );
+        let (output, trace) = result.unwrap();
+        assert!(output.text.is_empty(), "{entry}");
+        assert!(output.token_ids.is_empty(), "{entry}");
+        assert!(output.token_logprobs.is_empty(), "{entry}");
+        assert_eq!(output.prompt_tokens, 2, "{entry}");
+        assert_eq!(output.generated_tokens, 0, "{entry}");
+        assert!(!output.stopped, "{entry}");
+        assert_eq!(output.stop_reason, Some(StopReason::Length), "{entry}");
+        assert_eq!(trace, driver::DriverTrace::default(), "{entry}");
+    }
+}
+
+#[test]
+fn cold_preflight_context_refusal_precedes_missing_and_oov_close_markers() {
+    let cfg = GenerateConfig {
+        max_new_tokens: 1,
+        temperature: 0.0,
+        reasoning_budget: Some(1),
+        enable_thinking: true,
+        ..Default::default()
+    };
+    for oov_marker in [false, true] {
+        let mut model = super::super::test_support::tiny_zero_model_with_context(2);
+        if oov_marker {
+            model.tokenizer = build_tiny_oov_thinking_model().tokenizer;
+        }
+        assert_eq!(model.max_context(), 2);
+        assert_eq!(model.tokenizer.tokenize("a").real_length, 1);
+        for (entry, result) in cold_preflight_results(&model, "a", &cfg) {
+            assert!(
+                matches!(&result, Err(InferenceError::Inference(message))
+                    if message.contains("effective decode cap (3 tokens")
+                        && message.contains("model context window (2)")),
+                "{entry}, oov_marker={oov_marker}: context must win over the marker: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cold_preflight_context_uses_effective_reasoning_budget_at_exact_boundary() {
+    let model = super::super::test_support::tiny_zero_model_with_context(2);
+    let mut cfg = GenerateConfig {
+        max_new_tokens: 1,
+        temperature: 0.0,
+        reasoning_budget: Some(2),
+        enable_thinking: false,
+        stop_token_ids: vec![],
+        ..Default::default()
+    };
+    assert_eq!(model.tokenizer.tokenize("a").real_length, 1);
+    assert_eq!(cfg.effective_reasoning_budget(), None);
+    for (entry, result) in cold_preflight_results(&model, "a", &cfg) {
+        assert!(
+            result.is_ok(),
+            "{entry}: inactive raw budget must not consume context or require a marker: {result:?}"
+        );
+        let (output, trace) = result.unwrap();
+        assert_eq!(output.token_ids, vec![0], "{entry}");
+        assert_eq!(output.prompt_tokens, 1, "{entry}");
+        assert_eq!(output.generated_tokens, 1, "{entry}");
+        assert_eq!(output.stop_reason, Some(StopReason::Length), "{entry}");
+        assert_eq!(trace.opened, 1, "{entry}");
+    }
+    cfg.enable_thinking = true;
+    assert_eq!(cfg.effective_reasoning_budget(), Some(2));
+    for (entry, result) in cold_preflight_results(&model, "a", &cfg) {
+        assert!(
+            matches!(&result, Err(InferenceError::Inference(message))
+                if message.contains("effective decode cap (4 tokens")
+                    && message.contains("reasoning_budget=2")),
+            "{entry}: activating the same budget must overflow context first: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn cold_preflight_close_marker_requires_positive_budget_and_thinking() {
+    let model = build_tiny_zero_model();
+    for (reasoning_budget, enable_thinking) in [(None, true), (Some(0), true), (Some(1), false)] {
+        let cfg = GenerateConfig {
+            max_new_tokens: 1,
+            temperature: 0.0,
+            reasoning_budget,
+            enable_thinking,
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        for (entry, result) in cold_preflight_results(&model, "a", &cfg) {
+            assert!(
+                result.is_ok(),
+                "{entry}: inactive close predicate must admit a missing marker: {result:?}"
+            );
+            let (output, trace) = result.unwrap();
+            assert_eq!(output.prompt_tokens, 1, "{entry}");
+            assert!(output.generated_tokens > 0, "{entry}");
+            assert!(trace.opened > 0, "{entry}");
+        }
+    }
+}
+
+#[test]
+fn cold_preflight_missing_and_oov_close_markers_share_the_error_variant() {
+    let cfg = GenerateConfig {
+        max_new_tokens: 1,
+        temperature: 0.0,
+        reasoning_budget: Some(1),
+        enable_thinking: true,
+        stop_token_ids: vec![],
+        ..Default::default()
+    };
+    for oov_marker in [false, true] {
+        let model = if oov_marker {
+            build_tiny_oov_thinking_model()
+        } else {
+            build_tiny_zero_model()
+        };
+        let mut messages = Vec::new();
+        for (entry, result) in cold_preflight_results(&model, "a", &cfg) {
+            let expected = if oov_marker {
+                "vocab_size 97"
+            } else {
+                "no </think> token"
+            };
+            assert!(
+                matches!(&result, Err(InferenceError::InvalidInput(message))
+                    if message.contains("reasoning_budget") && message.contains(expected)),
+                "{entry}, oov_marker={oov_marker}: marker must refuse as InvalidInput: {result:?}"
+            );
+            messages.push(result.err().unwrap().to_string());
+        }
+        assert_eq!(messages[0], messages[1]);
+    }
+    for (entry, result) in cold_preflight_results(&build_tiny_thinking_model(), "a", &cfg) {
+        assert!(
+            result.is_ok(),
+            "{entry}: an in-range close marker must be admitted: {result:?}"
+        );
+        assert!(result.unwrap().1.opened > 0, "{entry}");
+    }
+}
+
 mod streaming;
