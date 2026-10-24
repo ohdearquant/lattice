@@ -63,6 +63,7 @@ const RAW_HARNESS_ENTRYPOINTS: &[(&str, CallSelector)] = &[
     ("examples/profile_metal_decode.rs", DEVICE_SYSTEM_DEFAULT),
 ];
 const ADDITIONAL_GUARDED_ENTRYPOINTS: &[(&str, CallSelector)] = &[
+    ("tests/metal_runtime_buffers.rs", DEVICE_SYSTEM_DEFAULT),
     (
         "examples/bench_embed_quality.rs",
         CallSelector::Path(&["run_bench"]),

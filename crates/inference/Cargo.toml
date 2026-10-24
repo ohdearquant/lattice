@@ -69,7 +69,7 @@ f16 = ["lattice-weights/f16"]
 # lattice-fann supplies the shared LoRA descriptor/blend-validation module
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
 # be present whenever this feature is — not just under `mixture`.
-metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu"]
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 bench-internals = ["lattice-grammar/bench-internals"]
 # Stock `gemm` for multi-row `matmul_bt` on Linux x86_64 (ADR-099 F1, step 1). Off by default.
@@ -142,6 +142,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
 lattice-grammar = { version = "0.15.0", path = "../grammar" }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+lattice-metal-runtime = { version = "0.15.0", path = "../metal-runtime", optional = true }
 lattice-quant = { version = "0.15.0", path = "../quant" }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
