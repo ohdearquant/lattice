@@ -767,6 +767,16 @@ prebuild_embed() {
   require_measured "$what" "$rc"
 }
 
+# The control arms run in a target directory the previous arm's revision has
+# just rebuilt, so without this the inference bench executable is re-linked
+# inside the sampled window. The first-arm builds double as presence checks;
+# the control arms already know the target is present.
+prebuild_inference() {
+  local what="$1" rc=0
+  cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run || rc=$?
+  require_measured "$what" "$rc"
+}
+
 # The GPU handoff builds into its own target directory, and `measure` builds
 # from inside the sampled window. Warm that exact build before the window
 # opens: same frozen-plan entry, same argv, cwd, environment and target
@@ -937,6 +947,9 @@ echo "--- Re-benching HEAD for reverse-order control ($HEAD_SHA) ---"
 HEAD_CONTROL_PHASE_RC=0
 (
   cd "$HEAD_DIR"
+  if [ -z "$handoff_broker" ]; then
+    prebuild_inference "head control lattice-inference:$BENCHES_INFERENCE build (--no-run)"
+  fi
   prebuild_embed "head control lattice-embed:$BENCHES_EMBED build (--no-run)"
   if [ -n "$handoff_broker" ]; then
     prebuild_handoff "head control lattice-inference:$BENCHES_INFERENCE prebuild" \
@@ -978,6 +991,9 @@ echo "--- Re-benching BASE for reverse-order control ($BASE_SHA) ---"
 BASE_CONTROL_PHASE_RC=0
 (
   cd "$WT"
+  if [ -z "$handoff_broker" ]; then
+    prebuild_inference "base control lattice-inference:$BENCHES_INFERENCE build (--no-run)"
+  fi
   prebuild_embed "base control lattice-embed:$BENCHES_EMBED build (--no-run)"
   if [ -n "$handoff_broker" ]; then
     prebuild_handoff "base control lattice-inference:$BENCHES_INFERENCE prebuild" \
