@@ -130,11 +130,13 @@ lattice/
       src/
         model/            — BertConfig, QwenConfig, cross_encoder
         tokenizer/        — WordPiece, SentencePiece, BPE
-        weights/          — f32, f16, Q8, Q4 weight formats
+        weights.rs        — re-exports lattice-weights; model and compute compatibility paths
         attention/        — standard, GQA, Flash, GDN
         forward/          — CPU (AVX2/NEON/tiled), Metal, WGPU
       benches/            — Criterion benchmarks
       examples/           — end-to-end bench_* programs
+    weights/              — weight storage and model-format detection
+      src/                — f32, f16, Q3, Q4 and Q8 storage; safetensors loading
     embed/                — public embedding service
       src/
         model.rs          — EmbeddingModel enum + ModelConfig

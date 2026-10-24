@@ -228,4 +228,6 @@ fn sigmoid(value: f32) -> f32 {
 }
 
 #[cfg(test)]
+mod bert_namespace_tests;
+#[cfg(test)]
 mod tests;
