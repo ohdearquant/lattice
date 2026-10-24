@@ -2783,6 +2783,47 @@ fn pipeline_production_collector_resolves_renamed_scanned_dependency() {
 }
 
 #[test]
+fn pipeline_production_collector_resolves_reexported_model_alias() {
+    let fixture = pipeline_package_fixture();
+    let inference = fixture.path().join("inference");
+    let serve = fixture.path().join("serve");
+    std::fs::write(
+        inference.join("src/lib.rs"),
+        "pub mod model; pub use model::ConcreteModel as PublicModel; pub mod pipeline { pub struct Allowed; }",
+    )
+    .expect("fixture library re-export");
+    std::fs::write(
+        serve.join("src/bin/frontend.rs"),
+        "use lattice_inference::PublicModel as Renamed; fn main() { let _ = Renamed; let _ = lattice_inference::pipeline::Allowed; }",
+    )
+    .expect("fixture re-export consumer");
+    let packages = scanned_packages_at(&inference, &[".", "../serve"]).expect("fixture packages");
+    let population = BoundaryPopulation {
+        origins: &[(".", "src/model")],
+        frontends: &[],
+        providers: &[],
+        known_positive: &[("../serve", "src/bin/frontend.rs")],
+    };
+    let report = collect_pipeline_boundary(&packages, &population).expect("fixture population");
+    assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
+    assert!(
+        report.crossings.iter().any(|crossing| {
+            crossing.relative_path == "../serve:src/bin/frontend.rs"
+                && crossing.resolved_path == ".:crate::model::ConcreteModel"
+        }),
+        "the consumer alias must follow the library re-export into the model origin: {:?}",
+        report.crossings
+    );
+    assert!(
+        !report
+            .crossings
+            .iter()
+            .any(|crossing| crossing.resolved_path.contains("Allowed")),
+        "the allowed pipeline neighbor must remain outside the model origin"
+    );
+}
+
+#[test]
 fn pipeline_baseline_preserves_package_qualified_keys() {
     let original = parse_baseline("src/bin/frontend.rs\tcrate::model::ConcreteModel\n");
     assert_eq!(
