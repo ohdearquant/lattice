@@ -9,11 +9,14 @@ use std::cell::Cell;
 
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
+    MTLCommandBufferStatus, MTLSize,
 };
 
 use crate::error::InferenceError;
-use crate::forward::metal_runtime::{ELEMENT_THREADS, bind, element_dispatch, scalar};
+use crate::forward::metal_runtime::{
+    self, BufferPolicy, ELEMENT_THREADS, UploadCopy, ZeroLengthPolicy, bind, element_dispatch,
+    scalar,
+};
 use crate::model::ernie45::{Ernie45Config, Ernie45LayerWeights, Ernie45Weights, MAX_SEQ_LEN};
 use crate::model::gemma4_ops::{gemma4_rope_cos_sin, gemma4_rope_inv_freq};
 
@@ -36,17 +39,7 @@ fn runtime(message: impl Into<String>) -> InferenceError {
 }
 
 fn elements(name: &str, rows: usize, width: usize) -> Result<usize, InferenceError> {
-    let count = rows
-        .checked_mul(width)
-        .ok_or_else(|| invalid(format!("{name} element count overflow")))?;
-    u32::try_from(count).map_err(|_| invalid(format!("{name} exceeds u32 indexing")))?;
-    let bytes = count
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| invalid(format!("{name} byte count overflow")))?;
-    if bytes > isize::MAX as usize {
-        return Err(invalid(format!("{name} exceeds host slice capacity")));
-    }
-    Ok(count)
+    metal_runtime::elements(name, rows, width, invalid)
 }
 
 /// Check all shader geometry and host capacities before acquiring a Metal device.
@@ -301,51 +294,18 @@ struct Activations {
     token_ids: Buffer,
 }
 
+const BUFFER_POLICY: BufferPolicy = BufferPolicy {
+    zero_length: ZeroLengthPolicy::Exact,
+    invalid,
+    runtime,
+};
+
 fn allocate(device: &Device, count: usize, label: &str) -> Result<Buffer, InferenceError> {
-    let count = elements(label, count, 1)?;
-    let bytes = (count * size_of::<f32>()) as u64;
-    if bytes > device.max_buffer_length() {
-        return Err(runtime(format!(
-            "{label} exceeds the device buffer capacity"
-        )));
-    }
-    let selector = objc::runtime::Sel::register("newBufferWithLength:options:");
-    // SAFETY: this is the Metal allocation selector with its documented NSUInteger
-    // length/options ABI and nullable object return. A raw pointer preserves nil
-    // until it can be checked, unlike metal-rs's non-null Buffer return type.
-    let raw: *mut metal::MTLBuffer = unsafe {
-        objc::Message::send_message(
-            &**device,
-            selector,
-            (bytes, MTLResourceOptions::StorageModeShared),
-        )
-    }
-    .map_err(|error| runtime(format!("{label} allocation message failed: {error}")))?;
-    if raw.is_null() {
-        return Err(runtime(format!("{label} allocation failed")));
-    }
-    // SAFETY: Metal returned a non-null owned (+1) MTLBuffer. Transferring that
-    // ownership exactly once to Buffer pairs it with metal-rs's release on drop.
-    let buffer = unsafe { <Buffer as metal::foreign_types::ForeignType>::from_ptr(raw) };
-    buffer.set_label(label);
-    if buffer.contents().is_null() || buffer.length() < bytes {
-        return Err(runtime(format!("{label} allocation is not CPU accessible")));
-    }
-    Ok(buffer)
+    metal_runtime::allocate(device, count, label, BUFFER_POLICY)
 }
 
 fn upload(device: &Device, values: &[f32], label: &str) -> Result<Buffer, InferenceError> {
-    let buffer = allocate(device, values.len(), label)?;
-    // SAFETY: allocate created a suitably aligned shared buffer for values.len() f32s.
-    // This new buffer has not been submitted to the GPU and cannot alias the input slice.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            values.as_ptr(),
-            buffer.contents().cast::<f32>(),
-            values.len(),
-        );
-    }
-    Ok(buffer)
+    metal_runtime::upload(device, values, label, BUFFER_POLICY, UploadCopy::Direct)
 }
 
 /// Metal f32 prefill and cached decode with persistent weights and scratch.
