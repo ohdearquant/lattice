@@ -44,22 +44,34 @@ impl<'a> ConstructionTally<'a> {
         self.classified.insert(site.clone());
         self.used_exemptions.insert(site.clone());
         let current_position = parsed.source_site_label(construction);
-        if current_position != exemption.recorded_position {
+        let recorded_position = package_path_key(exemption.package, exemption.recorded_position);
+        if current_position != recorded_position {
             self.moved_exemptions.push(format!(
                 "{site}: recorded position `{}` no longer matches current position \
                  `{current_position}`; confirm this exemption still describes the same work \
                  (this is not a locking violation)",
-                exemption.recorded_position
+                recorded_position
             ));
         }
         None
     }
 }
 
-#[test]
-fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exemptions = CONSTRUCTION_EXEMPTIONS
+pub(super) struct ConstructionInventory {
+    pub(super) discovered: BTreeSet<String>,
+    pub(super) classified: BTreeSet<String>,
+    pub(super) used_exemptions: BTreeSet<String>,
+    pub(super) expected_exemptions: BTreeSet<String>,
+    pub(super) moved_exemptions: Vec<String>,
+    pub(super) violations: Vec<String>,
+}
+
+pub(super) fn scan_constructions(
+    packages: &[ScannedPackage],
+    exemptions: &[ConstructionExemption],
+) -> ConstructionInventory {
+    let expected_exemption_count = exemptions.len();
+    let exemptions = exemptions
         .iter()
         .map(|exemption| {
             assert!(
@@ -67,12 +79,24 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
                 "construction exemption {} needs a justification",
                 exemption.site
             );
-            (exemption.site.to_string(), exemption)
+            measurement_lock_helpers::require_package(packages, exemption.package);
+            let (target, site) = exemption
+                .site
+                .split_once("=>")
+                .expect("construction exemption must name its target and source site");
+            (
+                format!(
+                    "{}=>{}",
+                    package_path_key(exemption.package, target),
+                    package_path_key(exemption.package, site)
+                ),
+                exemption,
+            )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(
         exemptions.len(),
-        CONSTRUCTION_EXEMPTIONS.len(),
+        expected_exemption_count,
         "construction exemptions must not contain duplicate sites"
     );
 
@@ -84,116 +108,133 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
         moved_exemptions: Vec::new(),
     };
     let mut violations = Vec::new();
-    for target in cargo_targets(manifest_dir, &["bench", "example", "bin", "test", "lib"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        let target_relative = target
-            .path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        let sources = measurement_lock_helpers::construction_scan_sources(manifest_dir, &target);
-        let caller_owned = BENCH_HARNESSES
-            .iter()
-            .find(|contract| contract.path == target_relative && !contract.calls.is_empty());
-        if let Some(contract) = caller_owned {
-            validate_bench_harness_sources(&sources, contract)
-                .unwrap_or_else(|reason| panic!("{}: {reason}", contract.path));
-        }
-        for source in &sources {
-            let site_prefix = format!("{}:{}:{}", target.kind, target.name, target_relative);
-            let mut ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for package in packages {
+        for target in package
+            .cargo_targets(&["bench", "example", "bin", "test", "lib"])
+            .unwrap_or_else(|reason| panic!("{reason}"))
+        {
+            let target_relative = package
+                .relative(&target.path)
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            let sources = measurement_lock_helpers::construction_scan_sources(package, &target);
+            let caller_owned = BENCH_HARNESSES.iter().find(|contract| {
+                contract.package == package.identity
+                    && contract.path == target_relative
+                    && !contract.calls.is_empty()
+            });
+            if let Some(contract) = caller_owned {
+                validate_bench_harness_sources(&sources, contract)
+                    .unwrap_or_else(|reason| panic!("{}: {reason}", contract.key()));
+            }
+            for source in &sources {
+                let site_prefix = package.key(&format!(
+                    "{}:{}:{}",
+                    target.kind, target.name, target_relative
+                ));
+                let mut ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
 
-            if target.kind == "lib" {
-                for function in source
-                    .parsed
-                    .test_functions()
-                    .unwrap_or_else(|reason| panic!("{reason}"))
-                {
-                    for (construction, selector) in source
+                if target.kind == "lib" {
+                    for function in source
                         .parsed
-                        .construction_sites(function.body.clone())
+                        .test_functions()
                         .unwrap_or_else(|reason| panic!("{reason}"))
                     {
-                        let Some(site) = tally.record(
-                            &source.parsed,
-                            &site_prefix,
-                            construction,
-                            selector,
-                            &mut ordinals,
-                        ) else {
-                            continue;
-                        };
-                        match source.parsed.validate_work_sites(
-                            &[construction],
-                            LOCAL_LOCK_SELECTOR,
-                            GuardRequirement::Function {
-                                closing_brace: function.body.end,
-                            },
-                        ) {
-                            Ok(()) => {
-                                tally.classified.insert(site);
+                        for (construction, selector) in source
+                            .parsed
+                            .construction_sites(function.body.clone())
+                            .unwrap_or_else(|reason| panic!("{reason}"))
+                        {
+                            let Some(site) = tally.record(
+                                &source.parsed,
+                                &site_prefix,
+                                construction,
+                                selector,
+                                &mut ordinals,
+                            ) else {
+                                continue;
+                            };
+                            match source.parsed.validate_work_sites(
+                                &[construction],
+                                LOCAL_LOCK_SELECTOR,
+                                GuardRequirement::Function {
+                                    closing_brace: function.body.end,
+                                },
+                            ) {
+                                Ok(()) => {
+                                    tally.classified.insert(site);
+                                }
+                                Err(reason) => violations.push(format!("{site}: {reason}")),
                             }
-                            Err(reason) => violations.push(format!("{site}: {reason}")),
                         }
                     }
+                    continue;
                 }
-                continue;
-            }
 
-            for (construction, selector) in source
-                .parsed
-                .construction_sites(0..source.parsed.tokens.len())
-                .unwrap_or_else(|reason| panic!("{reason}"))
-            {
-                let Some(site) = tally.record(
-                    &source.parsed,
-                    &site_prefix,
-                    construction,
-                    selector,
-                    &mut ordinals,
-                ) else {
-                    continue;
-                };
-                if caller_owned.is_some() {
-                    // The same gate verifies the exact construction inventory,
-                    // all caller edges, live owner guards, and registration.
-                    tally.classified.insert(site);
-                    continue;
-                }
-                match source.parsed.validate_work_sites(
-                    &[construction],
-                    SHARED_LOCK_SELECTOR,
-                    GuardRequirement::Lexical,
-                ) {
-                    Ok(()) => {
+                for (construction, selector) in source
+                    .parsed
+                    .construction_sites(0..source.parsed.tokens.len())
+                    .unwrap_or_else(|reason| panic!("{reason}"))
+                {
+                    let Some(site) = tally.record(
+                        &source.parsed,
+                        &site_prefix,
+                        construction,
+                        selector,
+                        &mut ordinals,
+                    ) else {
+                        continue;
+                    };
+                    if caller_owned.is_some() {
+                        // The same gate verifies the exact construction inventory,
+                        // all caller edges, live owner guards, and registration.
                         tally.classified.insert(site);
+                        continue;
                     }
-                    Err(reason) => violations.push(format!("{site}: {reason}")),
+                    match source.parsed.validate_work_sites(
+                        &[construction],
+                        SHARED_LOCK_SELECTOR,
+                        GuardRequirement::Lexical,
+                    ) {
+                        Ok(()) => {
+                            tally.classified.insert(site);
+                        }
+                        Err(reason) => violations.push(format!("{site}: {reason}")),
+                    }
                 }
             }
         }
     }
 
+    ConstructionInventory {
+        discovered: tally.discovered,
+        classified: tally.classified,
+        used_exemptions: tally.used_exemptions,
+        expected_exemptions: exemptions.keys().cloned().collect(),
+        moved_exemptions: tally.moved_exemptions,
+        violations,
+    }
+}
+
+#[test]
+fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
+    let inventory = scan_constructions(&scanned_packages(), CONSTRUCTION_EXEMPTIONS);
     assert!(
-        violations.is_empty(),
+        inventory.violations.is_empty(),
         "MetalQwen35State construction sites without a live shared-lock binding:\n{}",
-        violations.join("\n")
+        inventory.violations.join("\n")
     );
     assert!(
-        tally.moved_exemptions.is_empty(),
+        inventory.moved_exemptions.is_empty(),
         "construction exemptions recorded a position that no longer matches (not a locking \
          violation — update recorded_position once the move is confirmed intentional):\n{}",
-        tally.moved_exemptions.join("\n")
+        inventory.moved_exemptions.join("\n")
     );
 
-    let expected_exemptions = exemptions.keys().cloned().collect::<BTreeSet<_>>();
     assert_eq!(
-        tally.used_exemptions, expected_exemptions,
+        inventory.used_exemptions, inventory.expected_exemptions,
         "construction exemptions must identify current exact sites"
     );
-    assert_construction_inventory_classified(&tally.discovered, &tally.classified);
+    assert_construction_inventory_classified(&inventory.discovered, &inventory.classified);
 }
 
 #[test]

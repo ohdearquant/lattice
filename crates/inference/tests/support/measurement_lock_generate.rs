@@ -71,10 +71,10 @@ fn validate_generate_work(
         if sites.is_empty() {
             continue;
         }
-        if source.relative != contract.path {
+        if source.package != contract.package || source.relative != contract.path {
             return Err(format!(
                 "generate work moved to unreviewed source {}",
-                source.relative
+                source.key()
             ));
         }
         let syntax = syn::parse_file(&parsed.source).map_err(|reason| reason.to_string())?;
@@ -120,16 +120,20 @@ fn validate_generate_work(
 
 #[test]
 fn reviewed_metal_generate_targets_use_live_lock_bindings() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packages = scanned_packages();
     let already_owned = RAW_HARNESS_ENTRYPOINTS
         .iter()
         .chain(ADDITIONAL_GUARDED_ENTRYPOINTS)
-        .map(|(path, _)| *path)
-        .chain(TARGETS_WITH_STATE_DRIVEN_WORK.iter().copied())
+        .map(|(package, path, _)| package_path_key(package, path))
+        .chain(
+            TARGETS_WITH_STATE_DRIVEN_WORK
+                .iter()
+                .map(|(package, path)| package_path_key(package, path)),
+        )
         .collect::<BTreeSet<_>>();
     let expected = GENERATE_WORK_TARGETS
         .iter()
-        .map(|target| target.path)
+        .map(GenerateWorkTarget::key)
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected.len(),
@@ -140,30 +144,32 @@ fn reviewed_metal_generate_targets_use_live_lock_bindings() {
         expected.is_disjoint(&already_owned),
         "generate work target already has an owner"
     );
-    assert!(
-        expected
+    assert!(expected.iter().all(|path| {
+        TARGETS_WITH_RECOGNIZED_METAL_MARKERS
             .iter()
-            .all(|path| TARGETS_WITH_RECOGNIZED_METAL_MARKERS.contains(path))
-    );
+            .any(|(package, relative)| package_path_key(package, relative) == *path)
+    }));
     let mut actual = BTreeSet::new();
-    for path in cargo_target_roots(manifest_dir, &["example", "bin"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy();
-        let Some(contract) = GENERATE_WORK_TARGETS
-            .iter()
-            .find(|target| target.path == relative.as_ref())
-        else {
-            continue;
-        };
-        actual.insert(contract.path);
-        let sources = parsed_module_closure(manifest_dir, &path, false)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-        validate_generate_work(&sources, contract)
-            .unwrap_or_else(|reason| panic!("{}: {reason}", contract.path));
+    for package in &packages {
+        for path in package
+            .target_roots(&["example", "bin"])
+            .unwrap_or_else(|reason| panic!("{reason}"))
+        {
+            let relative = package
+                .relative(&path)
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            let Some(contract) = GENERATE_WORK_TARGETS
+                .iter()
+                .find(|target| target.package == package.identity && target.path == relative)
+            else {
+                continue;
+            };
+            actual.insert(contract.key());
+            let sources = parsed_package_module_closure(package, &path, false)
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            validate_generate_work(&sources, contract)
+                .unwrap_or_else(|reason| panic!("{}: {reason}", contract.key()));
+        }
     }
     assert_eq!(
         actual, expected,
@@ -172,6 +178,7 @@ fn reviewed_metal_generate_targets_use_live_lock_bindings() {
 }
 
 const GENERATE_WORK_FIXTURE: GenerateWorkTarget = GenerateWorkTarget {
+    package: ".",
     path: "examples/generate_fixture.rs",
     owner: "run",
     receiver: "metal",
@@ -192,6 +199,7 @@ fn run() {
 fn generate_work_fixture(source: &str) -> Result<(), String> {
     validate_generate_work(
         &[ParsedModuleSource {
+            package: GENERATE_WORK_FIXTURE.package.into(),
             relative: GENERATE_WORK_FIXTURE.path.into(),
             parsed: StructuredSource::parse(GENERATE_WORK_FIXTURE.path, source, false)?,
         }],
@@ -337,6 +345,7 @@ fn generate_wrapper_rejects_unreviewed_or_deferred_work() {
         assert!(error.contains(expected), "{label}: wrong failure: {error}");
     }
     let source = ParsedModuleSource {
+        package: GENERATE_WORK_FIXTURE.package.into(),
         relative: "examples/other.rs".into(),
         parsed: StructuredSource::parse("moved fixture", GENERATE_WORK_SOURCE, false).unwrap(),
     };
