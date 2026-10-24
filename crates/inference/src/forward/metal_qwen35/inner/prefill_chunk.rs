@@ -634,7 +634,7 @@ impl MetalQwen35State {
     /// `[chunks, heads, C, dim]` back to `[n_tokens, dim]` token order.
     ///
     /// SAFETY / correctness argument (verified against
-    /// `forward/shaders/qwen35.metal`): `sc.q`/`sc.k`/`sc.v`/`sc.beta_log_alpha`
+    /// `forward/shaders/qwen35_prefill.metal`): `sc.q`/`sc.k`/`sc.v`/`sc.beta_log_alpha`
     /// are written ONLY by `gdn_chunk_materialize_c32` and read (`device const`,
     /// never written) by `gdn_chunk_solve_c32` and
     /// `gdn_chunk_residual_output_c32`; `gdn_chunk_conv_buf_update_c32`,
@@ -649,7 +649,7 @@ impl MetalQwen35State {
     ///
     /// De-chunking: `dispatch_gdn_chunk_materialize_c32` writes row
     /// `((chunk*num_value_heads + head)*GDN_CHUNK_SIZE + j)*dim + d` for token
-    /// `chunk*GDN_CHUNK_SIZE + j` (see `qwen35.metal`'s `head_row` computation);
+    /// `chunk*GDN_CHUNK_SIZE + j` (see `qwen35_prefill.metal`'s `head_row` computation);
     /// only the LAST active chunk is short (materialize's `ci = min(chunk_size,
     /// n_tokens - chunk_base)` loop bound leaves the tail rows at their
     /// zero-initialized default). Reading exactly `rows_in_chunk * dim`
