@@ -2471,3 +2471,189 @@ kernel void moe_shared_gate_add(
     scratch_out[gid] = fma(gate_val, expert_out[gid], scratch_out[gid]);
 }
 
+
+// ===== MoE device route (ADR-053 D3') =====
+// Route buffer, one per MoE layer, 32-bit words with K = top_k:
+//   [0, K)    expert ids, rank order
+//   [K, 2K)   normalized routing weights (f32), rank order
+//   [2K, 5K)  element offsets per rank: gate, up, down
+//   [5K]      shared-expert gate scalar (f32)
+// The library is compiled with fast math, so non-finite logits are classified
+// from their bit patterns rather than with isnan/isinf.
+struct MoeRouteParams {
+    uint hidden;
+    uint num_experts;
+    uint top_k;
+    uint inter;
+};
+
+constant constexpr uint MOE_ROUTE_MAX_EXPERTS = 1024u;
+constant constexpr uint MOE_ROUTE_MAX_TOP_K = 16u;
+
+inline bool moe_route_is_nan(float v) {
+    return (as_type<uint>(v) & 0x7fffffffu) > 0x7f800000u;
+}
+
+inline bool moe_route_is_pos_inf(float v) {
+    return as_type<uint>(v) == 0x7f800000u;
+}
+
+inline bool moe_route_is_neg_inf(float v) {
+    return as_type<uint>(v) == 0xff800000u;
+}
+
+// Total order on (logit, id): every non-NaN logit ranks above every NaN,
+// larger logits rank higher, and equal logits (or two NaNs) go to the lower id.
+inline bool moe_route_ranks_above(float a, uint ia, float b, uint ib) {
+    const bool na = moe_route_is_nan(a);
+    const bool nb = moe_route_is_nan(b);
+    if (na != nb) { return nb; }
+    if (!na && a != b) { return a > b; }
+    return ia < ib;
+}
+
+// Router logits, ordered top-k, renormalized weights and element offsets.
+// Dispatch: threadgroups=(1,1,1), threads=(256,1,1). The host refuses to build
+// the device route when num_experts > MOE_ROUTE_MAX_EXPERTS, top_k is 0 or
+// above MOE_ROUTE_MAX_TOP_K or num_experts, or an offset would overflow u32.
+kernel void moe_router_topk(
+    device const float*       x       [[buffer(0)]],
+    device const float*       Wr      [[buffer(1)]],
+    device uint*              route   [[buffer(2)]],
+    constant MoeRouteParams&  p       [[buffer(3)]],
+    uint tid          [[thread_index_in_threadgroup]],
+    uint tg_size      [[threads_per_threadgroup]],
+    uint simd_lane    [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+    uint simd_width   [[threads_per_simdgroup]])
+{
+    threadgroup float logits[MOE_ROUTE_MAX_EXPERTS];
+    threadgroup uint ranked[MOE_ROUTE_MAX_TOP_K];
+
+    const uint n_sg = tg_size / simd_width;
+    for (uint e = simdgroup_id; e < p.num_experts; e += n_sg) {
+        device const float* row = Wr + (ulong)e * p.hidden;
+        float acc = 0.0f;
+        for (uint i = simd_lane; i < p.hidden; i += simd_width) {
+            acc = fma(x[i], row[i], acc);
+        }
+        acc = simdgroup_reduce_add_f32(acc, simd_lane, simd_width);
+        if (simd_lane == 0u) { logits[e] = acc; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint e = tid; e < p.num_experts; e += tg_size) {
+        const float le = logits[e];
+        uint rank = 0u;
+        for (uint j = 0u; j < p.num_experts; j++) {
+            if (j != e && moe_route_ranks_above(logits[j], j, le, e)) { rank++; }
+        }
+        if (rank < p.top_k) { ranked[rank] = e; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid != 0u) { return; }
+    const uint k_n = p.top_k;
+    // Softmax over all experts followed by renormalization over the selected
+    // ones equals a softmax over the selected logits alone.
+    uint n_pos_inf = 0u;
+    float m = -INFINITY;
+    bool any_finite = false;
+    for (uint k = 0u; k < k_n; k++) {
+        const float l = logits[ranked[k]];
+        if (moe_route_is_pos_inf(l)) {
+            n_pos_inf++;
+        } else if (!moe_route_is_nan(l) && !moe_route_is_neg_inf(l)) {
+            m = any_finite ? max(m, l) : l;
+            any_finite = true;
+        }
+    }
+    float w[MOE_ROUTE_MAX_TOP_K];
+    float sum = 0.0f;
+    for (uint k = 0u; k < k_n; k++) {
+        const float l = logits[ranked[k]];
+        float v;
+        if (n_pos_inf > 0u) {
+            v = moe_route_is_pos_inf(l) ? 1.0f : 0.0f;
+        } else if (any_finite) {
+            v = (moe_route_is_nan(l) || moe_route_is_neg_inf(l)) ? 0.0f : exp(l - m);
+        } else {
+            v = 1.0f;
+        }
+        w[k] = v;
+        sum += v;
+    }
+    device float* weights = (device float*)(route + k_n);
+    device uint* offsets = route + 2u * k_n;
+    const ulong expert_gate_up = 2ul * (ulong)p.inter * (ulong)p.hidden;
+    const ulong expert_down = (ulong)p.hidden * (ulong)p.inter;
+    for (uint k = 0u; k < k_n; k++) {
+        const uint e = ranked[k];
+        route[k] = e;
+        weights[k] = w[k] / sum;
+        const ulong gate = (ulong)e * expert_gate_up;
+        offsets[3u * k] = (uint)gate;
+        offsets[3u * k + 1u] = (uint)(gate + (ulong)p.inter * (ulong)p.hidden);
+        offsets[3u * k + 2u] = (uint)((ulong)e * expert_down);
+    }
+}
+
+// Shared-expert gate scalar: out[0] = sigmoid(dot(x, w)).
+// Dispatch: threadgroups=(1,1,1), threads=(256,1,1).
+kernel void moe_shared_gate_scalar(
+    device const float* x      [[buffer(0)]],
+    device const float* w      [[buffer(1)]],
+    device float*       out    [[buffer(2)]],
+    constant uint&      hidden [[buffer(3)]],
+    uint tid          [[thread_index_in_threadgroup]],
+    uint tg_size      [[threads_per_threadgroup]],
+    uint simd_lane    [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+    uint simd_width   [[threads_per_simdgroup]])
+{
+    threadgroup float sg_partials[32];
+    float acc = 0.0f;
+    for (uint i = tid; i < hidden; i += tg_size) {
+        acc = fma(x[i], w[i], acc);
+    }
+    acc = simdgroup_reduce_add_f32(acc, simd_lane, simd_width);
+    if (simd_lane == 0u) { sg_partials[simdgroup_id] = acc; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0u) { return; }
+    const uint n_sg = tg_size / simd_width;
+    float s = 0.0f;
+    for (uint i = 0u; i < n_sg; i++) { s += sg_partials[i]; }
+    out[0] = 1.0f / (1.0f + exp(-s));
+}
+
+// moe_expert_gemv with the expert's element offset read from the route buffer.
+// buffer(4) is bound at the byte offset of the rank's gate, up or down entry.
+kernel void moe_expert_gemv_routed(
+    device const float* x             [[buffer(0)]],
+    device const half*  W             [[buffer(1)]],
+    device float*       out           [[buffer(2)]],
+    constant GemmParams& p            [[buffer(3)]],
+    device const uint&   W_elem_off   [[buffer(4)]],
+    uint n            [[threadgroup_position_in_grid]],
+    uint tid          [[thread_index_in_threadgroup]],
+    uint simd_lane    [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+    uint simd_width   [[threads_per_simdgroup]])
+{
+    threadgroup float sg_partials[8]; // 256/32 simdgroups
+    gemv_decode_core<256>(x, W + W_elem_off, out, p, n, tid,
+                          simd_lane, simdgroup_id, simd_width, sg_partials);
+}
+
+// scratch_out[i] += scale * expert_out[i], with the scale read from the route
+// buffer (a rank's routing weight, or the shared-expert gate scalar).
+kernel void moe_scale_add_routed(
+    device float*       scratch_out   [[buffer(0)]],
+    device const float* expert_out    [[buffer(1)]],
+    device const float& scale         [[buffer(2)]],
+    constant uint&      hidden        [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden) return;
+    scratch_out[gid] = fma(scale, expert_out[gid], scratch_out[gid]);
+}

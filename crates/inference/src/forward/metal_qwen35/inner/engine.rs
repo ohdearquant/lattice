@@ -252,6 +252,62 @@ pub(super) fn build_rope_interleaved(
     (cos_data, sin_data)
 }
 
+/// Largest expert count and top-k the `moe_router_topk` kernel's threadgroup
+/// arrays hold (`MOE_ROUTE_MAX_EXPERTS` / `MOE_ROUTE_MAX_TOP_K` in `qwen35.metal`).
+pub(super) const MOE_ROUTE_MAX_EXPERTS: usize = 1024;
+pub(super) const MOE_ROUTE_MAX_TOP_K: usize = 16;
+
+/// The route buffer for ADR-053 D3' on Eager storage, or `None` when this
+/// layer's shape is outside what the device route supports.
+///
+/// The router kernel computes u32 element offsets from the ids it writes, and
+/// clamps nothing, so the route is refused here unless every expert's gate,
+/// up and down start offset fits u32 and every expert's extent ends inside its
+/// buffer (`gate_up_len` / `down_len` are element counts).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn moe_device_route_buffer(
+    device: &Device,
+    num_experts: usize,
+    top_k: usize,
+    inter: usize,
+    hidden: usize,
+    gate_up_len: usize,
+    down_len: usize,
+    label: &str,
+) -> Option<Buffer> {
+    if num_experts == 0
+        || num_experts > MOE_ROUTE_MAX_EXPERTS
+        || top_k == 0
+        || top_k > MOE_ROUTE_MAX_TOP_K
+        || top_k > num_experts
+    {
+        return None;
+    }
+    let expert_matrix = inter.checked_mul(hidden)?;
+    let gate_up_extent = expert_matrix.checked_mul(2)?;
+    let last = num_experts - 1;
+    let last_up_start = last
+        .checked_mul(gate_up_extent)?
+        .checked_add(expert_matrix)?;
+    let last_down_start = last.checked_mul(expert_matrix)?;
+    let gate_up_end = num_experts.checked_mul(gate_up_extent)?;
+    let down_end = num_experts.checked_mul(expert_matrix)?;
+    if u32::try_from(last_up_start).is_err()
+        || u32::try_from(last_down_start).is_err()
+        || gate_up_end > gate_up_len
+        || down_end > down_len
+    {
+        return None;
+    }
+    let words = 5 * top_k + 1;
+    let buf = device.new_buffer(
+        (words * std::mem::size_of::<u32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    buf.set_label(label);
+    Some(buf)
+}
+
 impl MetalQwen35Engine {
     /// Load immutable model resources from CPU weights. Does NOT allocate any session state.
     ///
@@ -430,6 +486,20 @@ impl MetalQwen35Engine {
                     let scratch_expert_out =
                         make_zero_buffer(&device, hid, &format!("L{i}.moe.scr_exp_out"));
                     let scratch_out = make_zero_buffer(&device, hid, &format!("L{i}.moe.scr_out"));
+                    let device_route = if crate::env_switch_enabled("LATTICE_MOE_HOST_ROUTER") {
+                        None
+                    } else {
+                        moe_device_route_buffer(
+                            &device,
+                            num_exp,
+                            top_k,
+                            inter,
+                            hid,
+                            m.experts.gate_up_proj.len(),
+                            m.experts.down_proj.len(),
+                            &format!("L{i}.moe.route"),
+                        )
+                    };
 
                     MetalFfnWeights::Moe(Box::new(MoeMetalBuffers {
                         routed: RoutedExpertStorage::Eager {
@@ -445,6 +515,7 @@ impl MetalQwen35Engine {
                         scratch_up,
                         scratch_expert_out,
                         scratch_out,
+                        device_route,
                         num_experts: num_exp,
                         inter,
                         shared_inter: s_inter,

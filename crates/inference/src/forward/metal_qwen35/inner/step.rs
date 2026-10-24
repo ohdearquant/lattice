@@ -2,8 +2,8 @@
 use super::MetalCrossTurnPrefixCache;
 use super::{
     GdnStateTrafficScope, GpuCandidate, MetalLayerAttnWeights, MetalQwen35State, MetalStepOutput,
-    QuantFormat, Qwen35Config, StepProfile, div_ceil, make_buffer, read_buffer,
-    resolve_block_local_k,
+    QuantFormat, Qwen35Config, StepProfile, div_ceil, make_buffer, publish_moe_device_routes,
+    read_buffer, resolve_block_local_k,
 };
 use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
 use std::sync::atomic::Ordering;
@@ -318,6 +318,8 @@ impl MetalQwen35State {
 
         let kv_dim = cfg.full_kv_dim();
 
+        let queue = self.engine.queue.clone();
+
         if decode_profiling {
             // Per-group command-buffer split path (LATTICE_DECODE_PROFILE=1).
             // Each layer gets its own command buffer committed and waited before the next.
@@ -334,9 +336,8 @@ impl MetalQwen35State {
                     &self.engine.layer_weights[compact_idx].0,
                     MetalLayerAttnWeights::Linear(_)
                 );
-                // SAFETY: same raw-pointer idiom as the fused path below.
-                // cmd is ref-counted by Metal and outlives the queue borrow.
-                // encode_* methods need &mut self but don't touch engine.queue.
+                // SAFETY: this dispatch's autorelease pool keeps the command buffer live.
+                // Encoding mutates session state without replacing engine.queue.
                 let layer_cmd = unsafe {
                     &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
                 };
@@ -347,12 +348,10 @@ impl MetalQwen35State {
                         layer_enc,
                         compact_idx,
                         linear_idx,
-                        position,
                         layer_i,
                         &cfg,
                         &mut prof,
                         profiling,
-                        false,
                     );
                     gdn_gpu_dispatches += gdn_dispatches_this_layer;
                     #[cfg(feature = "gdn-state-counters")]
@@ -375,37 +374,6 @@ impl MetalQwen35State {
                         layer_cmd.wait_until_completed();
                     }
                     prof.gpu_gdn_mixer_us += t_mixer.elapsed().as_micros();
-                    // MLP-only command buffer for this GDN layer.
-                    let mlp_cmd = unsafe {
-                        &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
-                    };
-                    let mlp_enc = mlp_cmd.new_compute_command_encoder();
-                    self.encode_mlp_block(
-                        mlp_enc,
-                        compact_idx,
-                        layer_i,
-                        position,
-                        &cfg,
-                        &mut prof,
-                        false,
-                    );
-                    mlp_enc.end_encoding();
-                    let t_mlp = std::time::Instant::now();
-                    {
-                        let _signpost_commit = crate::forward::signpost::interval_in(
-                            signpost_scope,
-                            crate::forward::signpost::Label::DecodeCbCommit,
-                        );
-                        mlp_cmd.commit();
-                    }
-                    {
-                        let _signpost_wait = crate::forward::signpost::interval_in(
-                            signpost_scope,
-                            crate::forward::signpost::Label::DecodeCbWait,
-                        );
-                        mlp_cmd.wait_until_completed();
-                    }
-                    prof.gpu_mlp_us += t_mlp.elapsed().as_micros();
                 } else {
                     // Attn-only (no MLP): measures pure GQA attention cost.
                     self.encode_gqa_layer(
@@ -418,7 +386,6 @@ impl MetalQwen35State {
                         &cfg,
                         &mut prof,
                         profiling,
-                        false,
                         mrope_override,
                     );
                     full_idx += 1;
@@ -439,38 +406,58 @@ impl MetalQwen35State {
                         layer_cmd.wait_until_completed();
                     }
                     prof.gpu_gqa_attn_us += t_attn.elapsed().as_micros();
-                    // MLP-only command buffer for this GQA layer.
-                    let mlp_cmd = unsafe {
-                        &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
-                    };
-                    let mlp_enc = mlp_cmd.new_compute_command_encoder();
-                    self.encode_mlp_block(
-                        mlp_enc,
-                        compact_idx,
-                        layer_i,
-                        position,
-                        &cfg,
-                        &mut prof,
-                        false,
-                    );
-                    mlp_enc.end_encoding();
-                    let t_mlp = std::time::Instant::now();
-                    {
-                        let _signpost_commit = crate::forward::signpost::interval_in(
-                            signpost_scope,
-                            crate::forward::signpost::Label::DecodeCbCommit,
-                        );
-                        mlp_cmd.commit();
-                    }
-                    {
-                        let _signpost_wait = crate::forward::signpost::interval_in(
-                            signpost_scope,
-                            crate::forward::signpost::Label::DecodeCbWait,
-                        );
-                        mlp_cmd.wait_until_completed();
-                    }
-                    prof.gpu_mlp_us += t_mlp.elapsed().as_micros();
                 }
+                let mut mlp_cmd = queue.new_command_buffer();
+                let mlp_enc = mlp_cmd.new_compute_command_encoder();
+                let mut norm_gpu_us = 0;
+                let mlp_enc = self.encode_mlp_block(
+                    mlp_enc,
+                    compact_idx,
+                    layer_i,
+                    position,
+                    &cfg,
+                    &mut prof,
+                    false,
+                    |enc| {
+                        enc.end_encoding();
+                        let t_norm = std::time::Instant::now();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            mlp_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            mlp_cmd.wait_until_completed();
+                        }
+                        norm_gpu_us += t_norm.elapsed().as_micros();
+                        let next_cmd = queue.new_command_buffer();
+                        mlp_cmd = next_cmd;
+                        next_cmd.new_compute_command_encoder()
+                    },
+                );
+                mlp_enc.end_encoding();
+                let t_mlp = std::time::Instant::now();
+                {
+                    let _signpost_commit = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeCbCommit,
+                    );
+                    mlp_cmd.commit();
+                }
+                {
+                    let _signpost_wait = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeCbWait,
+                    );
+                    mlp_cmd.wait_until_completed();
+                }
+                prof.gpu_mlp_us += norm_gpu_us + t_mlp.elapsed().as_micros();
                 // Keep legacy aggregates for backward compat with existing tooling.
                 prof.gpu_gdn_us = prof.gpu_gdn_mixer_us;
                 prof.gpu_gqa_us = prof.gpu_gqa_attn_us;
@@ -502,6 +489,8 @@ impl MetalQwen35State {
                 head_cmd.wait_until_completed();
             }
             prof.gpu_lm_head_us += t_gpu.elapsed().as_micros();
+            // SAFETY: every command buffer of this token has completed.
+            unsafe { publish_moe_device_routes() };
 
             let total_gpu_us = prof.gpu_gdn_mixer_us
                 + prof.gpu_gqa_attn_us
@@ -536,7 +525,7 @@ impl MetalQwen35State {
                 pct(prof.gpu_lm_head_us)
             );
             eprintln!(
-                "  NOTE: GPU time under serialized per-group command buffers (2 cmd bufs/layer + 1 for lm_head). Absolute throughput is lower than the fused path."
+                "  NOTE: GPU time under serialized per-group command buffers (2 buffers per dense layer, 3 per MoE layer, plus 1 for lm_head). Absolute throughput is lower than the fused path."
             );
 
             debug_assert_eq!(
@@ -641,14 +630,8 @@ impl MetalQwen35State {
             };
         }
 
-        // Fused single-command-buffer path (default, zero-cost when LATTICE_DECODE_PROFILE is off).
-        // Single command buffer for ALL 24 layers — no intermediate waits.
-        // Raw pointer breaks the borrow chain: cmd is ref-counted by Metal
-        // and outlives the queue borrow. The encode_* methods need &mut self
-        // (for session state) but don't touch engine.queue.
-        let cmd =
-            unsafe { &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef) };
-        let enc = cmd.new_compute_command_encoder();
+        let mut cmd = queue.new_command_buffer();
+        let mut enc = cmd.new_compute_command_encoder();
 
         for layer_i in 0..cfg.num_hidden_layers {
             if !cfg.is_layer_active(layer_i) {
@@ -665,12 +648,10 @@ impl MetalQwen35State {
                     enc,
                     compact_idx,
                     linear_idx,
-                    position,
                     layer_i,
                     &cfg,
                     &mut prof,
                     profiling,
-                    true,
                 );
                 gdn_gpu_dispatches += gdn_dispatches_this_layer;
                 #[cfg(feature = "gdn-state-counters")]
@@ -687,11 +668,39 @@ impl MetalQwen35State {
                     &cfg,
                     &mut prof,
                     profiling,
-                    true,
                     mrope_override,
                 );
                 full_idx += 1;
             }
+            enc = self.encode_mlp_block(
+                enc,
+                compact_idx,
+                layer_i,
+                position,
+                &cfg,
+                &mut prof,
+                profiling,
+                |enc| {
+                    enc.end_encoding();
+                    {
+                        let _signpost_commit = crate::forward::signpost::interval_in(
+                            signpost_scope,
+                            crate::forward::signpost::Label::DecodeCbCommit,
+                        );
+                        cmd.commit();
+                    }
+                    {
+                        let _signpost_wait = crate::forward::signpost::interval_in(
+                            signpost_scope,
+                            crate::forward::signpost::Label::DecodeCbWait,
+                        );
+                        cmd.wait_until_completed();
+                    }
+                    let next_cmd = queue.new_command_buffer();
+                    cmd = next_cmd;
+                    next_cmd.new_compute_command_encoder()
+                },
+            );
         } // end layer loop
 
         let topk_which = if run_head {
@@ -700,7 +709,6 @@ impl MetalQwen35State {
             None
         };
 
-        // Single submit for entire forward pass + optional top-k.
         enc.end_encoding();
         {
             let _signpost_commit = crate::forward::signpost::interval_in(
@@ -716,6 +724,8 @@ impl MetalQwen35State {
             );
             cmd.wait_until_completed();
         }
+        // SAFETY: every command buffer of this token has completed.
+        unsafe { publish_moe_device_routes() };
 
         // Diagnostic: dump post-final-norm hidden state magnitudes for
         // divergence analysis vs MLX. Set LATTICE_HIDDEN_DUMP=path to enable.
@@ -1405,11 +1415,9 @@ impl MetalQwen35State {
         let mut active_layer_idx = 0usize;
         let mut linear_idx = 0usize;
 
-        // Single command buffer for all GDN layers (GQA layers produce no encoder work).
-        // Raw pointer breaks the borrow chain; identical idiom to forward_step_inner.
-        let cmd =
-            unsafe { &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef) };
-        let enc = cmd.new_compute_command_encoder();
+        let queue = self.engine.queue.clone();
+        let mut cmd = queue.new_command_buffer();
+        let mut enc = cmd.new_compute_command_encoder();
 
         let mut prof = StepProfile::default();
         for layer_i in 0..cfg.num_hidden_layers {
@@ -1427,16 +1435,31 @@ impl MetalQwen35State {
                     enc,
                     compact_idx,
                     linear_idx,
-                    position,
                     layer_i,
                     &cfg,
                     &mut prof,
                     false,
-                    true,
                 );
                 #[cfg(feature = "gdn-state-counters")]
                 self.record_gdn_layer_access(GdnStateTrafficScope::Decode, 1);
                 linear_idx += 1;
+                enc = self.encode_mlp_block(
+                    enc,
+                    compact_idx,
+                    layer_i,
+                    position,
+                    &cfg,
+                    &mut prof,
+                    false,
+                    |enc| {
+                        enc.end_encoding();
+                        cmd.commit();
+                        cmd.wait_until_completed();
+                        let next_cmd = queue.new_command_buffer();
+                        cmd = next_cmd;
+                        next_cmd.new_compute_command_encoder()
+                    },
+                );
             }
             // GQA layers: residual stream passes through without modification.
         }
@@ -1447,6 +1470,8 @@ impl MetalQwen35State {
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
+        // SAFETY: every command buffer of this token has completed.
+        unsafe { publish_moe_device_routes() };
 
         // Read logits — do NOT increment kv_cache.seq_len.
         // SAFETY: GPU completed, buffer is StorageModeShared.

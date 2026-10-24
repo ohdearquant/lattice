@@ -9,6 +9,7 @@ mod layers;
 mod lm_head;
 mod lora;
 mod moe;
+mod moe_device_route;
 mod mtp_hidden_tap;
 mod mtp_verify;
 mod mtp_weight_load;
