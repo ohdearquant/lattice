@@ -39,8 +39,8 @@ impl ScannedPackage {
     }
 
     pub(crate) fn target_roots(&self, kinds: &[&str]) -> Result<Vec<PathBuf>, String> {
-        self.cargo_targets(kinds)
-            .map(|targets| targets.into_iter().map(|target| target.path).collect())
+        cargo_target_roots(&self.manifest_dir, kinds)
+            .map_err(|reason| format!("package {}: {reason}", self.identity))
     }
 
     pub(crate) fn relative(&self, path: &Path) -> Result<String, String> {
