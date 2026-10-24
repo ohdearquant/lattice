@@ -302,6 +302,7 @@ fn test_tokenize_batch_matches_per_text_tokenize_on_rayon_pools() {
     }
 }
 
+#[cfg(feature = "parallel")]
 #[test]
 fn test_tokenize_batch_chunks_stay_on_current_pool_threads() {
     let tokenizer = WordPieceTokenizer::from_str(&synthetic_spec_vocab()).unwrap();
