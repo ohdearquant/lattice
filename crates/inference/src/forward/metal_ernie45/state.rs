@@ -13,6 +13,7 @@ use metal::{
 };
 
 use crate::error::InferenceError;
+use crate::forward::metal_runtime::{ELEMENT_THREADS, bind, element_dispatch, scalar};
 use crate::model::ernie45::{Ernie45Config, Ernie45LayerWeights, Ernie45Weights, MAX_SEQ_LEN};
 use crate::model::gemma4_ops::{gemma4_rope_cos_sin, gemma4_rope_inv_freq};
 
@@ -23,7 +24,6 @@ const SHADERS: &str = concat!(
     include_str!("../shaders/ernie45_embed.metal"),
     include_str!("../shaders/ernie45_decode.metal")
 );
-const ELEMENT_THREADS: u64 = 256;
 const TILE_Q: u32 = 4;
 const SIMD_WIDTH: u32 = 32;
 
@@ -869,23 +869,4 @@ impl MetalErnie45State {
         #[cfg(all(test, feature = "f16"))]
         self.record(4);
     }
-}
-
-fn bind(enc: &ComputeCommandEncoderRef, index: u64, buffer: &Buffer) {
-    enc.set_buffer(index, Some(buffer), 0);
-}
-
-fn scalar<T: Copy>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
-    enc.set_bytes(
-        index,
-        size_of::<T>() as u64,
-        std::ptr::from_ref(value).cast(),
-    );
-}
-
-fn element_dispatch(enc: &ComputeCommandEncoderRef, count: u32) {
-    enc.dispatch_thread_groups(
-        MTLSize::new(u64::from(count).div_ceil(ELEMENT_THREADS), 1, 1),
-        MTLSize::new(ELEMENT_THREADS, 1, 1),
-    );
 }
