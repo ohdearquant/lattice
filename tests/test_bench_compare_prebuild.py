@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Regression tests for prebuilding benchmarks before an arm's sampler starts.
 
-These cases live apart from tests/test_bench_compare_measurement.py because that
-module is already above ADR-102's line cap and may only shrink. The script-level
-runner, admission fixtures, and stubs live in bench_compare_support so both
-suites use the same setup.
+These cases live apart from tests/test_bench_compare_measurement.py. The
+script-level runner, admission fixtures, and stubs live in bench_compare_support
+so both suites use the same setup.
 """
 import json
 import os
