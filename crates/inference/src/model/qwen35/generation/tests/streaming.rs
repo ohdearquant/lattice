@@ -1118,7 +1118,11 @@ fn cold_preflight_seed_and_temperature_match_between_generation_entries() {
     assert_ne!(expected_a, expected_b);
     assert!(expected_a.iter().any(|&id| id != 1));
     assert_eq!(model.tokenizer.tokenize("a").real_length, 1);
-    for (seed, expected) in [(seed_a, expected_a), (seed_b, expected_b), (seed_a, expected_a)] {
+    for (seed, expected) in [
+        (seed_a, expected_a),
+        (seed_b, expected_b),
+        (seed_a, expected_a),
+    ] {
         let cfg = GenerateConfig {
             max_new_tokens: 12,
             temperature: 0.75,
