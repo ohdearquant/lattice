@@ -7,7 +7,7 @@
 // context *= sigmoid(gate_z) before o_proj, and LoRA on q_proj spans the full
 // 2*q_dim. The Q half is normed+roped; the gate half is raw (no norm, no rope).
 
-use super::ops::{linear_vjp, lora_vjp, rope_backward};
+use super::ops::{Automatic, BackwardMath, rope_backward};
 use crate::attention::gated::{apply_sigmoid_gate, deinterleave_q_gate};
 use crate::forward::cpu::matmul_bt;
 
@@ -79,6 +79,28 @@ pub fn gqa_backward(
     lora_rank: usize,
     lora_scale: f32,
 ) -> AttnGrads {
+    gqa_backward_with::<Automatic>(
+        dy_out, cache, w_q, w_k, w_v, w_o, q_norm_w, k_norm_w, lora_a_q, lora_b_q, lora_a_v,
+        lora_b_v, lora_rank, lora_scale,
+    )
+}
+
+pub(crate) fn gqa_backward_with<M: BackwardMath>(
+    dy_out: &[f32],
+    cache: &AttnCache,
+    w_q: &[f32],
+    w_k: &[f32],
+    w_v: &[f32],
+    w_o: &[f32],
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+    lora_a_q: Option<&[f32]>,
+    lora_b_q: Option<&[f32]>,
+    lora_a_v: Option<&[f32]>,
+    lora_b_v: Option<&[f32]>,
+    lora_rank: usize,
+    lora_scale: f32,
+) -> AttnGrads {
     let AttnCache {
         x_input,
         q_raw,
@@ -129,7 +151,7 @@ pub fn gqa_backward(
     for t in 0..*seq_len {
         let dy_t = &dy_out[t * hidden..(t + 1) * hidden];
         // o_proj backward gives the gradient w.r.t. the GATED context.
-        let d_context_gated = linear_vjp(w_o, dy_t, q_dim, hidden);
+        let d_context_gated = M::linear_vjp(w_o, dy_t, q_dim, hidden);
         // Split the sigmoid gate: context_gated = context_ungated · sigmoid(gate_z).
         //   d_context_ungated = d_context_gated · sigmoid(gate_z)
         //   d_gate_z          = d_context_gated · context_ungated · sigmoid'(gate_z)
@@ -226,13 +248,13 @@ pub fn gqa_backward(
             d_q_and_gate[dst + head_dim..dst + 2 * head_dim]
                 .copy_from_slice(&d_gate_z[t * q_dim + qsrc..t * q_dim + qsrc + head_dim]);
         }
-        let dx_q = linear_vjp(w_q, &d_q_and_gate, hidden, 2 * q_dim);
+        let dx_q = M::linear_vjp(w_q, &d_q_and_gate, hidden, 2 * q_dim);
         for j in 0..hidden {
             dx_t[j] += dx_q[j];
         }
         if let (Some(la), Some(lb)) = (lora_a_q, lora_b_q) {
             let h_q_t = &h_q[t * lora_rank..(t + 1) * lora_rank];
-            let (gb, ga, dx_lora) = lora_vjp(
+            let (gb, ga, dx_lora) = M::lora_vjp(
                 &d_q_and_gate,
                 x_t,
                 h_q_t,
@@ -279,20 +301,20 @@ pub fn gqa_backward(
                     (1.0 + k_norm_w[j]) * dg[j] * inv_rms - k_head[j] * inv3_over_d * sum_xwg;
             }
         }
-        let dx_k = linear_vjp(w_k, &d_k_raw, hidden, kv_dim);
+        let dx_k = M::linear_vjp(w_k, &d_k_raw, hidden, kv_dim);
         for j in 0..hidden {
             dx_t[j] += dx_k[j];
         }
 
         // ---- V path ----
         let d_v_t = &d_v[t * kv_dim..(t + 1) * kv_dim];
-        let dx_v = linear_vjp(w_v, d_v_t, hidden, kv_dim);
+        let dx_v = M::linear_vjp(w_v, d_v_t, hidden, kv_dim);
         for j in 0..hidden {
             dx_t[j] += dx_v[j];
         }
         if let (Some(la), Some(lb)) = (lora_a_v, lora_b_v) {
             let h_v_t = &h_v[t * lora_rank..(t + 1) * lora_rank];
-            let (gb, ga, dx_lora) = lora_vjp(
+            let (gb, ga, dx_lora) = M::lora_vjp(
                 d_v_t, x_t, h_v_t, la, lb, lora_rank, hidden, kv_dim, lora_scale,
             );
             for k in 0..ga.len() {
@@ -623,6 +645,15 @@ mod tests {
     /// GQA gradcheck: analytic grad_A,B vs central FD for a 2-layer all-GQA tiny fixture.
     #[test]
     fn gqa_lora_gradcheck() {
+        run_gqa_lora_gradcheck(false);
+    }
+
+    #[test]
+    fn forced_gqa_independent_gradcheck() {
+        run_gqa_lora_gradcheck(true);
+    }
+
+    fn run_gqa_lora_gradcheck(forced: bool) {
         let seq_len = 3;
         let hidden = 8;
         let num_q_heads = 2;
@@ -748,6 +779,38 @@ mod tests {
             lora_scale,
         );
 
+        let grads = if forced {
+            use crate::backward::simd::{Backend, Operation, force_scalar};
+            let dispatch = force_scalar();
+            let (scalar, calls) = crate::forward::cpu::observe_matmul_calls(|| {
+                dispatch
+                    .gqa_backward(
+                        &dy,
+                        &cache,
+                        &w_q,
+                        &w_k,
+                        &w_v,
+                        &w_o,
+                        &q_norm_w,
+                        &k_norm_w,
+                        Some(&lora_a_q),
+                        Some(&lora_b_q),
+                        Some(&lora_a_v),
+                        Some(&lora_b_v),
+                        lora_rank,
+                        lora_scale,
+                    )
+                    .unwrap()
+            });
+            assert_eq!(calls, 0);
+            assert_eq!(
+                dispatch.verify_for(Operation::GqaBackward),
+                Ok(Backend::Scalar)
+            );
+            scalar
+        } else {
+            grads
+        };
         let fd_eps = 1e-3f32;
 
         // FD for grad_A_q
@@ -799,6 +862,9 @@ mod tests {
         }
 
         let rel_err = |a: &[f32], b: &[f32]| -> f64 {
+            assert_eq!(a.len(), b.len());
+            assert!(a.iter().chain(b).all(|v| v.is_finite()));
+            assert!(a.iter().any(|v| v.abs() > 1e-8));
             let diff_sq: f64 = a
                 .iter()
                 .zip(b.iter())
@@ -809,6 +875,44 @@ mod tests {
             (2.0 * diff_sq / norm_sq.max(1e-30)).sqrt()
         };
 
+        let mut fd_x = vec![0.0; x.len()];
+        for (index, derivative) in fd_x.iter_mut().enumerate() {
+            let loss = |delta: f32| -> f64 {
+                let mut input = x.clone();
+                input[index] += delta;
+                let (output, _) = gqa_forward_with_cache(
+                    &input,
+                    &w_q,
+                    &w_k,
+                    &w_v,
+                    &w_o,
+                    &q_norm_w,
+                    &k_norm_w,
+                    Some(&lora_a_q),
+                    Some(&lora_b_q),
+                    Some(&lora_a_v),
+                    Some(&lora_b_v),
+                    lora_rank,
+                    lora_scale,
+                    seq_len,
+                    hidden,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    rope_dim,
+                    &cos_table,
+                    &sin_table,
+                    eps_norm,
+                );
+                output
+                    .iter()
+                    .zip(&dy)
+                    .map(|(&y, &g)| f64::from(y) * f64::from(g))
+                    .sum()
+            };
+            *derivative = ((loss(fd_eps) - loss(-fd_eps)) / (2.0 * f64::from(fd_eps))) as f32;
+        }
+        assert!(rel_err(&grads.dx, &fd_x) < 1e-2);
         let err_aq = rel_err(&grads.grad_a_q, &fd_a_q);
         let err_av = rel_err(&grads.grad_a_v, &fd_a_v);
         let err_bq = rel_err(&grads.grad_b_q, &fd_b_q);

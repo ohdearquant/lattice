@@ -69,7 +69,7 @@
 //! eliminate catastrophic cancellation at eps = 1e-3.
 
 use crate::attention::gdn::{sigmoid, softplus};
-use crate::backward::ops::lora_vjp;
+use crate::backward::ops::{Automatic, BackwardMath};
 use crate::model::qwen35_config::Qwen35Config;
 
 /// Gradients of the GDN layer w.r.t. LoRA params for all 5 projections.
@@ -765,6 +765,14 @@ pub fn gdn_backward(
     saved: &GdnSaved,
     weights: &crate::attention::gdn::GatedDeltaNetWeights,
 ) -> GdnGrads {
+    gdn_backward_with::<Automatic>(grad_outputs, saved, weights)
+}
+
+pub(crate) fn gdn_backward_with<M: BackwardMath>(
+    grad_outputs: &[f32],
+    saved: &GdnSaved,
+    weights: &crate::attention::gdn::GatedDeltaNetWeights,
+) -> GdnGrads {
     let seq_len = saved.seq_len;
     let hidden = saved.hidden_size;
     let num_kh = saved.num_key_heads;
@@ -882,7 +890,7 @@ pub fn gdn_backward(
         if have_lora {
             let gated_buf_t = &saved.gated_buf[t * output_dim..(t + 1) * output_dim];
             let h_out_t = &saved.h_out[t * lora_rank..(t + 1) * lora_rank];
-            let (gb, ga, dx_lora) = lora_vjp(
+            let (gb, ga, dx_lora) = M::lora_vjp(
                 dy,
                 gated_buf_t,
                 h_out_t,
@@ -973,7 +981,7 @@ pub fn gdn_backward(
         // g = d_z_proj, x = x_t, h = h_z_t, d_in=hidden, d_out=output_dim
         if have_lora {
             let h_z_t = &saved.h_z[t * lora_rank..(t + 1) * lora_rank];
-            let (gb, ga, dx_lora) = lora_vjp(
+            let (gb, ga, dx_lora) = M::lora_vjp(
                 &d_z_proj,
                 x_t,
                 h_z_t,
@@ -1201,7 +1209,7 @@ pub fn gdn_backward(
         // g = d_alpha_vh (full [value_heads] vector), x = x_t, h_a_t, d_in=hidden, d_out=value_heads
         if have_lora {
             let h_b_t = &saved.h_b[t * lora_rank..(t + 1) * lora_rank];
-            let (gb, ga, dx_lora) = lora_vjp(
+            let (gb, ga, dx_lora) = M::lora_vjp(
                 &d_beta_raw_vh,
                 x_t,
                 h_b_t,
@@ -1223,7 +1231,7 @@ pub fn gdn_backward(
             }
 
             let h_a_t = &saved.h_a[t * lora_rank..(t + 1) * lora_rank];
-            let (gb, ga, dx_lora) = lora_vjp(
+            let (gb, ga, dx_lora) = M::lora_vjp(
                 &d_alpha_vh,
                 x_t,
                 h_a_t,
@@ -1322,7 +1330,7 @@ pub fn gdn_backward(
         if have_lora {
             let d_qkv_g = &d_qkv_proj_all[t * qkv_dim..(t + 1) * qkv_dim];
             let h_qkv_t = &saved.h_qkv[t * lora_rank..(t + 1) * lora_rank];
-            let (gb, ga, dx_lora) = lora_vjp(
+            let (gb, ga, dx_lora) = M::lora_vjp(
                 d_qkv_g,
                 x_t,
                 h_qkv_t,
@@ -1673,6 +1681,7 @@ mod tests {
         input_seed: u64,
         coeff_seed: u64,
         eps: f64,
+        forced: bool,
     ) -> (f32, usize, f32, f32) {
         let cfg = tiny_cfg(hidden, num_kh, num_vh, key_dim, value_dim, kernel_size);
         let weights = make_tiny_weights(
@@ -1731,7 +1740,11 @@ mod tests {
             0,
             0.0,
         );
-        let gdn_grads = gdn_backward(&coeffs, &saved, &weights);
+        let gdn_grads = if forced {
+            forced_gdn_checked(&coeffs, &saved, &weights)
+        } else {
+            gdn_backward(&coeffs, &saved, &weights)
+        };
         let analytic = gdn_grads.dx;
 
         // FD
@@ -1742,6 +1755,7 @@ mod tests {
         let mut worst = 0;
         let mut n_tested = 0usize;
         for i in 0..analytic.len() {
+            assert!(analytic[i].is_finite() && fd[i].is_finite());
             let abs_err = (analytic[i] - fd[i]).abs();
             // Skip indices where both are negligibly small.  With f32 forward
             // arithmetic and eps=1e-3, the FD oracle itself has ~1% relative
@@ -1782,6 +1796,7 @@ mod tests {
             1337, // input_seed
             999,  // coeff_seed
             1e-3, // eps
+            false,
         );
 
         assert!(
@@ -1800,6 +1815,7 @@ mod tests {
             2024, // input_seed
             777,  // coeff_seed
             1e-3, // eps
+            false,
         );
 
         assert!(
@@ -1908,6 +1924,7 @@ mod tests {
         b_a: &[f32],
         a_out: &[f32],
         b_out: &[f32],
+        forced: bool,
     ) -> GdnGrads {
         let hidden = cfg.hidden_size;
         let num_kh = cfg.linear_num_key_heads;
@@ -1952,7 +1969,11 @@ mod tests {
             lora_rank,
             lora_scale,
         );
-        gdn_backward(coeffs, &saved, weights)
+        if forced {
+            forced_gdn_checked(coeffs, &saved, weights)
+        } else {
+            gdn_backward(coeffs, &saved, weights)
+        }
     }
 
     /// Central-difference estimate of d(loss)/d(param[idx]) for a single entry.
@@ -2103,6 +2124,7 @@ mod tests {
         lora_seed: u64,
         coeff_seed: u64,
         eps: f32,
+        forced: bool,
     ) -> PerArrayCoverage {
         let cfg = tiny_cfg(hidden, num_kh, num_vh, key_dim, value_dim, kernel_size);
         let weights = make_tiny_weights(
@@ -2152,7 +2174,7 @@ mod tests {
         // Analytic weight grads via forward+backward.
         let grads = run_lora_forward_backward(
             &inputs, &weights, &cfg, seq_len, &coeffs, lora_rank, lora_scale, &a_qkv, &b_qkv, &a_z,
-            &b_z, &a_b, &b_b, &a_a, &b_a, &a_out, &b_out,
+            &b_z, &a_b, &b_b, &a_a, &b_a, &a_out, &b_out, forced,
         );
         // Collect (which_array, analytic_grad_slice, array_len) triples.
         let analytic_arrays: [(&[f32], usize); 10] = [
@@ -2184,6 +2206,7 @@ mod tests {
                     &inputs, &weights, &cfg, seq_len, &coeffs, lora_rank, lora_scale, &a_qkv,
                     &b_qkv, &a_z, &b_z, &a_b, &b_b, &a_a, &b_a, &a_out, &b_out, which, idx, eps,
                 );
+                assert!(analytic_v.is_finite() && fd_v.is_finite());
                 let mag = fd_v.abs().max(analytic_v.abs());
                 if mag >= 1e-4 {
                     arr_n_tested += 1;
@@ -2239,6 +2262,7 @@ mod tests {
             777,  // lora_seed
             999,  // coeff_seed
             1e-3, // eps
+            false,
         );
         for (name, (n, rel)) in LORA_ARRAY_NAMES.iter().zip(cov.per_array.iter()) {
             println!("  {name:<12}: n_tested={n}  max_rel={rel:.3e}");
@@ -2279,6 +2303,7 @@ mod tests {
             555,  // lora_seed
             111,  // coeff_seed
             1e-3, // eps
+            false,
         );
         for (name, (n, rel)) in LORA_ARRAY_NAMES.iter().zip(cov.per_array.iter()) {
             println!("  {name:<12}: n_tested={n}  max_rel={rel:.3e}");
@@ -2301,6 +2326,42 @@ mod tests {
             cov.overall_max_rel,
             cov.overall_n_tested
         );
+    }
+
+    fn forced_gdn_checked(
+        gradients: &[f32],
+        saved: &GdnSaved,
+        weights: &GatedDeltaNetWeights,
+    ) -> GdnGrads {
+        use crate::backward::simd::{Backend, Operation, force_scalar};
+        let dispatch = force_scalar();
+        let (result, calls) = crate::forward::cpu::observe_matmul_calls(|| {
+            dispatch.gdn_backward(gradients, saved, weights).unwrap()
+        });
+        assert_eq!(calls, 0);
+        assert_eq!(
+            dispatch.verify_for(Operation::GdnBackward),
+            Ok(Backend::Scalar)
+        );
+        result
+    }
+
+    #[test]
+    fn forced_gdn_independent_input_gradcheck() {
+        let (error, _, _, _) =
+            run_gradcheck_linear(32, 2, 4, 6, 6, 2, 4, 0.5, 99, 2024, 777, 1e-3, true);
+        assert!(error < 1e-2, "forced GDN input gradient error: {error}");
+    }
+
+    #[test]
+    fn forced_gdn_independent_ten_array_gradcheck() {
+        let coverage = run_lora_weight_gradcheck(
+            32, 2, 4, 8, 8, 3, 20, 2, 12.0, 99, 2024, 555, 111, 1e-3, true,
+        );
+        for (name, (count, error)) in LORA_ARRAY_NAMES.iter().zip(coverage.per_array) {
+            assert!(count > 0, "{name} has no independent gradient witness");
+            assert!(error < 1e-2, "{name} gradient error: {error}");
+        }
     }
 
     // ---------------------------------------------------------------------------
