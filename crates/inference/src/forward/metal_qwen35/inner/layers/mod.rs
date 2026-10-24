@@ -1,5 +1,8 @@
 mod gdn;
 mod gqa;
+mod moe_device_route;
+
+use moe_device_route::moe_device_route_applies;
 
 use super::*;
 
@@ -154,7 +157,14 @@ impl MetalQwen35State {
             hidden as u32,
             cfg.rms_norm_eps,
         );
-        if matches!(&common_w.ffn, MetalFfnWeights::Moe(_)) {
+        // ADR-053 D3': the device route reads the norm output on the GPU in
+        // encoder order, so only the synchronized CPU router needs the
+        // completion boundary.
+        let device_route = match &common_w.ffn {
+            MetalFfnWeights::Moe(moe) => moe_device_route_applies(moe),
+            MetalFfnWeights::Dense { .. } => false,
+        };
+        if matches!(&common_w.ffn, MetalFfnWeights::Moe(_)) && !device_route {
             enc = complete_norm(enc);
         }
         // SAFETY: FFN weight buffers are live for the command buffer lifetime.
@@ -216,6 +226,13 @@ impl MetalQwen35State {
                     "down_proj",
                 );
             }
+            MetalFfnWeights::Moe(moe_bufs) if device_route => {
+                let moe_ptr = moe_bufs.as_ref() as *const MoeMetalBuffers;
+                // SAFETY: layer_weights owns moe_bufs for the command buffer's lifetime.
+                unsafe {
+                    self.encode_moe_ffn_device(enc, &*moe_ptr, layer_idx, position);
+                }
+            }
             MetalFfnWeights::Moe(moe_bufs) => {
                 let moe_ptr = moe_bufs.as_ref() as *const MoeMetalBuffers;
                 // SAFETY: layer_weights owns moe_bufs; complete_norm waited for
@@ -274,6 +291,9 @@ impl MetalQwen35State {
         let shared_inter = moe.shared_inter;
         let num_experts = moe.num_experts;
         let top_k = moe.top_k;
+
+        #[cfg(test)]
+        MOE_ROUTER_RUNS_FOR_TEST.with(|c| c.set((c.get().0 + 1, c.get().1)));
 
         // ── Step 0: Zero the accumulator on GPU ───────────────────────────────
         let hidden_u32 = hidden as u32;

@@ -416,6 +416,9 @@ impl MetalQwen35State {
             scratch_up,
             scratch_expert_out,
             scratch_out,
+            // ADR-053 D3' covers Eager storage only: Cached admits experts on the
+            // host when they are selected, so it keeps the synchronized CPU router.
+            device_route: None,
             num_experts,
             inter,
             shared_inter,

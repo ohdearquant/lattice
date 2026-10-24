@@ -309,7 +309,62 @@ pub fn arm_moe_routing_trace() {
 /// Disarm the collector and return every record buffered since the last
 /// [`arm_moe_routing_trace`] call (empty if it was never armed).
 pub fn take_moe_routing_trace() -> Vec<MoeRoutingTraceRecord> {
+    MOE_DEVICE_ROUTE_PENDING.with(|c| c.borrow_mut().clear());
     MOE_ROUTING_TRACE.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
+thread_local! {
+    /// Device-route buffers (ADR-053 D3') the armed trace still has to publish,
+    /// as `(layer_idx, token_idx, top_k, route)` in encode order. The router
+    /// kernel writes them inside the token's command buffer, so they are read
+    /// only by [`publish_moe_device_routes`] after that buffer completes.
+    pub(super) static MOE_DEVICE_ROUTE_PENDING:
+        std::cell::RefCell<Vec<(usize, usize, usize, metal::Buffer)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Move every pending device route into the armed routing trace, with its
+/// original layer index, token position, rank order and normalized weights.
+///
+/// # Safety
+/// The command buffers that wrote the pending route buffers have completed.
+pub(super) unsafe fn publish_moe_device_routes() {
+    let pending = MOE_DEVICE_ROUTE_PENDING.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if pending.is_empty() {
+        return;
+    }
+    MOE_ROUTING_TRACE.with(|c| {
+        let mut armed = c.borrow_mut();
+        let Some(trace) = armed.as_mut() else {
+            return;
+        };
+        for (layer_idx, token_idx, top_k, route) in pending {
+            // SAFETY: the route buffer is StorageModeShared and holds at least
+            // `5 * top_k + 1` u32 words; its writer completed (caller contract).
+            let words =
+                unsafe { std::slice::from_raw_parts(route.contents() as *const u32, 2 * top_k) };
+            trace.push(MoeRoutingTraceRecord {
+                layer_idx,
+                token_idx,
+                selected_ids: words[..top_k].iter().map(|&id| id as usize).collect(),
+                gate_weights: words[top_k..].iter().map(|&w| f32::from_bits(w)).collect(),
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only router-run counters `(host, device)`: the synchronized CPU
+    /// router in `encode_moe_ffn` bumps the first, the device-route encoder the
+    /// second, once per MoE layer per token.
+    pub(super) static MOE_ROUTER_RUNS_FOR_TEST: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_moe_router_runs_for_test() -> (usize, usize) {
+    MOE_ROUTER_RUNS_FOR_TEST.with(|c| c.replace((0, 0)))
 }
 
 /// Write `records` as newline-delimited JSON, one [`MoeRoutingTraceRecord`]

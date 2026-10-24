@@ -2,8 +2,8 @@
 use super::MetalCrossTurnPrefixCache;
 use super::{
     GdnStateTrafficScope, GpuCandidate, MetalLayerAttnWeights, MetalQwen35State, MetalStepOutput,
-    QuantFormat, Qwen35Config, StepProfile, div_ceil, make_buffer, read_buffer,
-    resolve_block_local_k,
+    QuantFormat, Qwen35Config, StepProfile, div_ceil, make_buffer, publish_moe_device_routes,
+    read_buffer, resolve_block_local_k,
 };
 use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
 use std::sync::atomic::Ordering;
@@ -489,6 +489,8 @@ impl MetalQwen35State {
                 head_cmd.wait_until_completed();
             }
             prof.gpu_lm_head_us += t_gpu.elapsed().as_micros();
+            // SAFETY: every command buffer of this token has completed.
+            unsafe { publish_moe_device_routes() };
 
             let total_gpu_us = prof.gpu_gdn_mixer_us
                 + prof.gpu_gqa_attn_us
@@ -722,6 +724,8 @@ impl MetalQwen35State {
             );
             cmd.wait_until_completed();
         }
+        // SAFETY: every command buffer of this token has completed.
+        unsafe { publish_moe_device_routes() };
 
         // Diagnostic: dump post-final-norm hidden state magnitudes for
         // divergence analysis vs MLX. Set LATTICE_HIDDEN_DUMP=path to enable.
@@ -1466,6 +1470,8 @@ impl MetalQwen35State {
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
+        // SAFETY: every command buffer of this token has completed.
+        unsafe { publish_moe_device_routes() };
 
         // Read logits — do NOT increment kv_cache.seq_len.
         // SAFETY: GPU completed, buffer is StorageModeShared.
