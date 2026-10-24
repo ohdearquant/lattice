@@ -20,7 +20,7 @@ default = []
 metal-gpu = ["dep:metal", "dep:objc", "dep:bytemuck"]
 
 [dependencies]
-lattice-inference-core = { version = "0.14.0", path = "../inference-core" }
+lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.33", optional = true }
