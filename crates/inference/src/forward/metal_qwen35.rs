@@ -321,8 +321,9 @@ mod inner {
     use diagnostics::{
         FORCED_MOE_EXPERTS_FOR_TEST, MOE_PREFETCH_ORDERING_GATE_FOR_TEST,
         MOE_PREFETCH_PARALLEL_FOR_TEST, MOE_PREFETCH_STEP2_DONE_TX_FOR_TEST,
-        set_forced_moe_experts_for_test, set_moe_prefetch_ordering_gate_for_test,
-        set_moe_prefetch_parallel_for_test, set_moe_prefetch_step2_done_tx_for_test,
+        MOE_ROUTER_RUNS_FOR_TEST, set_forced_moe_experts_for_test,
+        set_moe_prefetch_ordering_gate_for_test, set_moe_prefetch_parallel_for_test,
+        set_moe_prefetch_step2_done_tx_for_test, take_moe_router_runs_for_test,
     };
     pub use diagnostics::{
         HiddenReadbackPathProofSnapshot, LayerImportanceScore, LayerPruningPlan,
@@ -330,7 +331,9 @@ mod inner {
         PathProofSnapshot, arm_moe_routing_trace, dump_moe_routing_trace_jsonl,
         take_moe_routing_trace,
     };
-    use diagnostics::{MOE_ROUTING_TRACE, StepProfile};
+    use diagnostics::{
+        MOE_DEVICE_ROUTE_PENDING, MOE_ROUTING_TRACE, StepProfile, publish_moe_device_routes,
+    };
     use gdn_state::{MetalGdnState, MetalGdnStatePrecision, active_gdn_layer_indices};
     // Chat message types + the shared ChatML renderer (#668) live at the file
     // top level (module-scope, above `mod inner`) so CPU-only builds can
@@ -528,6 +531,11 @@ mod inner {
         scratch_expert_out: Buffer,
         /// Accumulator: weighted sum of all expert outputs [hidden] f32.
         scratch_out: Buffer,
+        /// Device route buffer (ADR-053 D3'), `5 * top_k + 1` u32 words written by
+        /// `moe_router_topk` and `moe_shared_gate_scalar` (layout in `qwen35.metal`).
+        /// `Some` only for Eager storage whose shape the device route supports;
+        /// `None` keeps the synchronized CPU router.
+        device_route: Option<Buffer>,
         /// Model dimensions, cached to avoid recomputing at dispatch time.
         num_experts: usize,
         inter: usize,
@@ -670,6 +678,11 @@ mod inner {
         moe_scale_add: ComputePipelineState,
         moe_shared_gate_add: ComputePipelineState,
         moe_zero_buf: ComputePipelineState,
+        // ADR-053 D3': MoE device route kernels
+        moe_router_topk: ComputePipelineState,
+        moe_shared_gate_scalar: ComputePipelineState,
+        moe_expert_gemv_routed: ComputePipelineState,
+        moe_scale_add_routed: ComputePipelineState,
         // Win 1 batch prefill prep kernels (ADR-126A)
         scatter_q_gate_batch: ComputePipelineState,
         per_head_rms_norm_batch: ComputePipelineState,
