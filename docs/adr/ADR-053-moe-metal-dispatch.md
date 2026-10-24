@@ -54,8 +54,11 @@ router kernel, checked by tests:
   finite value; ties go to the lower expert id), so the kernel always writes K valid, distinct
   ids.
 - Offsets are computed on the device from those ids, in elements, in the same unit as the
-  existing expert GEMV parameters (u32 element offsets in `GemmParams`: gate half
-  `e·2·inter·hidden`, up half `+inter·hidden`, down `e·hidden·inter`). At route-buffer
+  existing expert GEMV (u32 element offsets, passed as the `moe_expert_gemv` kernel's own
+  `W_elem_offset` argument at buffer(4), `shaders/qwen35.metal` around line 2425, separate from
+  `GemmParams`, which carries only m, n, k, lda, ldb, ldc; the host computes them in
+  `metal_qwen35/inner/layers/mod.rs` around line 613: gate half `e·2·inter·hidden`, up half
+  `+inter·hidden`, down `e·hidden·inter`). At route-buffer
   construction the host checks that the largest offset plus one expert's extent fits both u32
   and the bound buffer's length, and refuses to build the device route otherwise. The kernel
   clamps nothing: an id outside the range is a kernel defect caught by the tests below, never a
@@ -134,6 +137,9 @@ The Metal forward path (`forward/metal_qwen35.rs`) handles the Qwen3.5-2B hybrid
 decode-mode GEMV kernels (`gemv_decode_core` with simdgroup reduction), tiled GEMM for prefill,
 and a GQA flash-attention kernel. **MoE layers are not yet handled** — the Metal path falls back
 to CPU for any `FeedForwardWeights::Moe` variant.
+
+> Amendment (2026-10-24): the shipped default route submits one command buffer per token, not
+> per layer; per-layer buffers exist only on the profiling path. See the amendment above.
 
 ### The dispatch cost problem
 
@@ -226,11 +232,20 @@ must know which experts are active before encoding any of their compute commands
 command buffer. Routing on CPU eliminates a GPU→CPU readback that would serialize the entire
 dispatch.
 
+_Superseded on the Eager decode route by D3′ (2026-10-24 amendment): routing moves to the device
+and the experts dispatch from a device-written route buffer, so no readback precedes encoding.
+D3 stays in force for Cached Q4 and the CPU fallback._
+
 **D4: Shared expert weight is pinned to a dedicated Metal buffer.**
 The shared expert always activates. Its weights (`gate_proj`, `up_proj`, `down_proj`) are
 allocated as a separate `MTLBuffer` at model-load time, distinct from the routed expert
 buffer. This allows the shared expert GEMV to be the first encoder in every command buffer,
 overlapping encode time with routing on CPU.
+
+_Holds in part after the 2026-10-24 amendment: the dedicated buffer stays, and the shared expert
+still runs independently of the route because it does not depend on the selected ids. The
+overlap with CPU routing no longer applies on the Eager decode route, where routing is on the
+device; the shared gate is computed before its scale is applied, as D3′ describes._
 
 ---
 
