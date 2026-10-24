@@ -94,18 +94,20 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ```
 fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
                                        |
-                     tokenizer (8K)   grammar   weights   ← depend on inference-core
+                     tokenizer (8K)   grammar   weights   metal-runtime   ← depend on inference-core
                                                  |
                                                quant     ← depends on inference-core + weights
     |                                  |
 inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant;
+                                                   optional metal-runtime under `metal-gpu`;
     |                                               optional dep on fann (`mixture` or `metal-gpu` feature)
 embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
 ```
 
 `inference-core` (the shared `InferenceError`), `tokenizer`, `grammar`, `weights` and
 `quant` were split out of `inference`; all five edges into them are unconditional.
-`quant` depends on `inference-core` and `weights`. `inference` re-exports the extracted
+`metal-runtime` depends on `inference-core` and is enabled by inference's opt-in
+`metal-gpu` feature. `quant` depends on `inference-core` and `weights`. `inference` re-exports the extracted
 public items at their original paths. Of the four edges among the
 other crates, three are feature-gated, and the gates do not all default the
 same way, so "depends on" in the diagram is not one relationship. `tune` depends on
@@ -123,6 +125,15 @@ the build you are looking at.
 | Module     | Purpose                  | Key Exports      |
 | ---------- | ------------------------ | ---------------- |
 | `error.rs` | Error type across crates | `InferenceError` |
+
+### lattice-metal-runtime — Shared Metal helpers
+
+| Module   | Purpose                                            | Key Exports                                                        |
+| -------- | -------------------------------------------------- | ------------------------------------------------------------------ |
+| `lib.rs` | Shared buffers, encoding and pipeline construction | `allocate`, `upload`, `scalar`, `compile_library`, `make_pipeline` |
+
+The API is enabled only on macOS with `metal-gpu`. GPU tests remain in inference
+and use its single measurement lock. Scalar arguments require `bytemuck::NoUninit`.
 
 ### lattice-tokenizer — Pure Rust tokenizers
 
@@ -301,7 +312,7 @@ GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Ru
 
 ### Bench-Compare Disposition
 
-Every PR that touches `crates/inference/`, `crates/inference-core/`, `crates/tokenizer/`, `crates/grammar/`, `crates/weights/`, `crates/quant/`,
+Every PR that touches `crates/inference/`, `crates/inference-core/`, `crates/metal-runtime/`, `crates/tokenizer/`, `crates/grammar/`, `crates/weights/`, `crates/quant/`,
 `crates/embed/`, or `crates/fann/` must include a bench-compare disposition in its description.
 By default, run `make bench-compare` and paste its A/B table into the PR body. If the result shows no change, state that as the disposition.
 `crates/fann/` is covered both because it feeds inference through the optional `mixture` feature
@@ -315,7 +326,7 @@ sufficient.
 
 ### E2E Parity Gate
 
-PRs touching `crates/inference/src/`, `crates/inference-core/src/`, `crates/tokenizer/src/`, `crates/grammar/src/`, `crates/weights/src/`, `crates/quant/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
+PRs touching `crates/inference/src/`, `crates/inference-core/src/`, `crates/metal-runtime/src/`, `crates/tokenizer/src/`, `crates/grammar/src/`, `crates/weights/src/`, `crates/quant/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
 
 The `perf-baselines` branch is still updated by `bench-update.yml` on merge to main for trend tracking.
 

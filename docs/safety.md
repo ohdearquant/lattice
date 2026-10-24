@@ -39,8 +39,9 @@ auditable location.
 
 **Metal FFI** — The Metal GPU backend calls into `metal-rs`, which itself uses `objc::msg_send!`.
 The library's own unsafe Metal code sends Objective-C messages directly and reads and writes
-shared-storage buffers through the raw pointer that `contents()` returns. All of it is under
-`crates/inference/src/forward/`: `metal.rs`, `metal_gemm.rs`, `metal_runtime.rs`, `moe_expert_cache.rs`,
+shared-storage buffers through the raw pointer that `contents()` returns. The shared runtime
+helpers live in `crates/metal-runtime/src/lib.rs`; the remaining code is under
+`crates/inference/src/forward/`: `metal.rs`, `metal_gemm.rs`, `moe_expert_cache.rs`,
 and the `metal_qwen35`, `metal_ernie45` and `metal_embeddinggemma2` modules. Elsewhere, library
 code uses `metal-rs` through safe calls only. Benchmarks under `crates/inference/benches/` also access
 buffers through raw pointers, and examples under `crates/inference/examples/` do both.
