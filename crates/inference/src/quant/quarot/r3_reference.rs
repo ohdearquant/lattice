@@ -24,7 +24,7 @@
 //! **R3 rotates the gated attention output (`context * sigmoid(gate_z)`),
 //! immediately before `o_proj`. `o_proj` absorbs the rotation's transpose on
 //! its INPUT side** — i.e. exactly [`crate::quant::quarot::plan::AbsorptionSide::InputSide`]
-//! applied to `o_proj`'s `q_dim` axis, matching `rotation.rs`'s documented
+//! applied to `o_proj`'s `q_dim` axis, matching `lattice_quant::quarot::rotation`'s documented
 //! `y = W · R^T · (R · x)` identity with `x` = the gated context. This is
 //! recorded in [`crate::quant::quarot::plan::OnlineRotationSpec::r3_full_attention`]
 //! as `side: AbsorptionSide::InputSide`.

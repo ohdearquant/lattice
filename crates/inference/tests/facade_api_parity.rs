@@ -967,3 +967,97 @@ mod weights_parity {
         );
     }
 }
+
+mod quant_parity {
+    use lattice_inference::quant as facade;
+    use lattice_quant as extracted;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn quant_types_are_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<facade::q4_manifest::ManifestFlavor>,
+            PhantomData::<extracted::q4_manifest::ManifestFlavor>,
+        );
+        same_type(
+            PhantomData::<facade::q4_manifest::Q4Manifest>,
+            PhantomData::<extracted::q4_manifest::Q4Manifest>,
+        );
+        same_type(
+            PhantomData::<facade::q4_manifest::Q4ManifestEntry>,
+            PhantomData::<extracted::q4_manifest::Q4ManifestEntry>,
+        );
+        same_type(
+            PhantomData::<facade::q4_manifest::Q4ManifestError>,
+            PhantomData::<extracted::q4_manifest::Q4ManifestError>,
+        );
+        same_type(
+            PhantomData::<facade::quarot::hadamard::BlockHadamard>,
+            PhantomData::<extracted::quarot::hadamard::BlockHadamard>,
+        );
+        same_type(
+            PhantomData::<facade::quarot::hadamard::RandomizedHadamard>,
+            PhantomData::<extracted::quarot::hadamard::RandomizedHadamard>,
+        );
+    }
+
+    #[test]
+    fn quant_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::q4_manifest::load_manifest,
+            extracted::q4_manifest::load_manifest,
+        );
+        same_function(
+            facade::q4_manifest::parse_manifest,
+            extracted::q4_manifest::parse_manifest,
+        );
+        same_function(
+            facade::q4_manifest::read_manifest_bytes_bounded,
+            extracted::q4_manifest::read_manifest_bytes_bounded,
+        );
+        same_function(
+            facade::quarot::hadamard::walsh_hadamard_f64_in_place,
+            extracted::quarot::hadamard::walsh_hadamard_f64_in_place,
+        );
+        same_function(
+            facade::quarot::hadamard::walsh_hadamard_in_place,
+            extracted::quarot::hadamard::walsh_hadamard_in_place,
+        );
+        same_function(
+            facade::quarot::hadamard::walsh_hadamard_orthonormal_f64_in_place,
+            extracted::quarot::hadamard::walsh_hadamard_orthonormal_f64_in_place,
+        );
+        same_function(
+            facade::quarot::hadamard::walsh_hadamard_orthonormal_in_place,
+            extracted::quarot::hadamard::walsh_hadamard_orthonormal_in_place,
+        );
+        same_function(
+            facade::quarot::rotation::absorb_input_rotation,
+            extracted::quarot::rotation::absorb_input_rotation,
+        );
+        same_function(
+            facade::quarot::rotation::absorb_input_rotation_f64,
+            extracted::quarot::rotation::absorb_input_rotation_f64,
+        );
+        same_function(
+            facade::quarot::rotation::absorb_output_rotation,
+            extracted::quarot::rotation::absorb_output_rotation,
+        );
+        same_function(
+            facade::quarot::rotation::absorb_output_rotation_f64,
+            extracted::quarot::rotation::absorb_output_rotation_f64,
+        );
+    }
+
+    #[test]
+    fn quant_constants_are_equal_at_both_paths() {
+        assert_eq!(
+            facade::q4_manifest::MAX_QUANTIZE_INDEX_LEN,
+            extracted::q4_manifest::MAX_QUANTIZE_INDEX_LEN
+        );
+    }
+}
