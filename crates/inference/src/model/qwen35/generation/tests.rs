@@ -706,8 +706,10 @@ fn check_reasoning_budget_not_set_allows_none() {
 // one of the seven CPU/Metal generation entry points now calls instead of
 // its own inline `if prompt_len == 0` copy. Pure-function unit tests
 // here; per-entry-point production-seam tests live alongside each real
-// call site (cpu_f16.rs, cpu_q8.rs, neon_forward.rs,
-// forward/metal_qwen35.rs) and `qwen35_model_generate_rejects_empty_prompt`
+// call site (cpu_f16.rs, cpu_q8.rs, neon_forward.rs, and for Metal
+// forward/metal_qwen35/inner/tests/stop_token_sweep.rs and
+// forward/metal_qwen35/inner/tests/grammar.rs) and
+// `qwen35_model_generate_rejects_empty_prompt`
 // below, which exercises this exact function through `Qwen35Model::generate`.
 // -----------------------------------------------------------------------
 
@@ -744,7 +746,7 @@ fn check_prompt_not_empty_allows_nonzero() {
 // `generate_streaming_with_prefix_cache_and_cancel`) now calls, instead of
 // the Metal-only bug of bounding `prompt_len` alone. Pure-function unit
 // tests here (no GPU/Metal device needed); per-entry-point production-seam
-// tests for the Metal call sites live in `forward/metal_qwen35.rs`.
+// tests for the Metal call sites live under `forward/metal_qwen35/inner/tests/`.
 // -----------------------------------------------------------------------
 
 /// A prompt that fits the window by itself, but whose decode budget pushes
