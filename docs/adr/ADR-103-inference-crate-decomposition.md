@@ -69,7 +69,7 @@ Measured at `main` b58ce287 with `wc -l` over the `.rs` files under each crate's
 | `lattice-fann`      |                                 13,516 |
 | `lattice-transport` |                                  5,723 |
 
-`lattice-inference` is about 84% of the workspace's library source. Its largest top-level modules are `forward`
+`lattice-inference` is about 84% of the workspace's source lines. Its largest top-level modules are `forward`
 (89,894 lines), `model` (57,355), `bin` (29,771), `weights` (22,509), `serve` (21,709), `attention` (16,348), `quant`
 (15,691), `grammar` (13,595), `vision` (11,033), `decoder` (9,282) and `tokenizer` (8,243). Every change to any of them
 recompiles the whole crate, review ownership is crate-wide, and a downstream user who needs one tokenizer compiles a
