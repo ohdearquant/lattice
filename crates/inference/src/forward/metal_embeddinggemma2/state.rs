@@ -503,7 +503,7 @@ fn read_f32(buffer: &Buffer, count: usize) -> Result<Vec<f32>, InferenceError> {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct AttentionParams {
     seq_len: u32,
     heads: u32,

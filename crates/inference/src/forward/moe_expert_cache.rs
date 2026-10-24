@@ -19,50 +19,43 @@
 //!
 //! ## GPU buffer lifetime invariant (read before touching eviction logic)
 //!
-//! `MetalQwen35State::forward_step_inner_impl`'s default (fused) decode path
-//! encodes **the entire forward pass for one token — every layer, including
-//! every routed-expert GEMV dispatch — into a single Metal command buffer**,
-//! then calls `cmd.commit(); cmd.wait_until_completed();` before
-//! `forward_step` returns. Decode is otherwise fully synchronous/serial (one
-//! token at a time, no prefetch/pipelining across tokens in Stage 1). Two
-//! consequences pin down exactly when a cache slot's Metal buffer may be
-//! safely overwritten:
+//! Decode remains synchronous across tokens. Before each MoE CPU router read,
+//! `MetalQwen35State::encode_mlp_block` commits and waits for that layer's
+//! post-attention residual-add-norm. The default path therefore splits a token
+//! across command buffers: routed-expert GEMVs enter a replacement buffer,
+//! which completes by the next MoE norm boundary or the final token wait.
+//! Profiling also waits after each group; GDN-only decoding uses the same
+//! norm-completion boundary. Dense layers introduce no additional wait.
 //!
-//! 1. **Across tokens**: by the time the NEXT token's `encode_moe_ffn` call
-//!    (and thus the next round of `ExpertSlotCache::resolve` calls) begins,
-//!    `wait_until_completed()` has already returned for the previous
-//!    token's command buffer — every GPU command that could reference any
-//!    slot has finished executing. So any slot may be evicted at a token
-//!    boundary, unconditionally.
-//! 2. **Within one token**: a slot must not be overwritten while a command
-//!    appended earlier in the *same, still-open* command buffer still reads
-//!    it. The write (a CPU `memcpy` into a `StorageModeShared` buffer's
-//!    `contents()`) and the read (a GPU dispatch encoded before the buffer
-//!    is committed) are not ordered by anything except which one the CPU
-//!    performs first — encoding a GEMV against a slot, then later in the
-//!    same token overwriting that slot before the buffer is submitted, would
-//!    make the already-encoded GEMV race the new dequant write once the GPU
-//!    actually executes it.
+//! A cache slot may be overwritten only after every earlier encoded GPU read
+//! of that slot has completed. Two cases govern reuse:
 //!
-//! Stage 1's chosen scheme is the "evict-only-after-token-boundary" option:
-//! `ExpertSlotCache::begin_token` clears a per-slot "touched this token"
-//! flag, `ExpertSlotCache::resolve` sets it on every slot it touches (hit
-//! or miss), and eviction (`ExpertSlotCache::pick_eviction_slot`) only
-//! ever selects an *untouched* slot. This is sufficient — not just
-//! plausible — because [`moe_expert_cache_num_slots`] is required to return
-//! `num_slots >= top_k` (validated at construction, see
-//! `ExpertSlotCache::new`), and a single token's routed-expert loop
-//! (`encode_moe_ffn` Step 3) never resolves more than `top_k` distinct
-//! experts. So there are always enough untouched slots left to satisfy every
-//! miss within one token, and no same-token slot ever needs to be evicted
-//! twice.
+//! 1. **Across tokens**: before the next token's `encode_moe_ffn` and cache
+//!    resolution begin, the previous token's final command buffer has completed.
+//!    All preceding buffers already completed at their norm or group boundaries,
+//!    so no earlier GPU read can reference a reused slot.
+//! 2. **Within one token**: encoding a GEMV does not complete its read. A slot
+//!    referenced by an open, unsubmitted buffer or an in-flight buffer must not
+//!    be overwritten by a CPU copy into its `StorageModeShared` contents. The
+//!    per-layer norm wait completes earlier work, but does not authorize reuse
+//!    of slots referenced by routed-expert GEMVs encoded after that wait.
 //!
-//! No fence, semaphore, or double-buffering is needed beyond this
-//! touched-this-token bookkeeping *because* decode never overlaps two
-//! tokens' GPU work (prefetching a future token's experts while the
-//! current token's command buffer is still in flight would need to
-//! revisit this invariant — out of scope; see the note below, which
-//! covers a narrower, already-safe form of prefetch).
+//! The cache keeps its conservative touched-this-token policy. For each
+//! (layer, gate_up|down) cache, `encode_moe_ffn` calls
+//! `ExpertSlotCache::begin_token` after the norm-completion boundary to clear
+//! the per-slot flags. `resolve` and `plan_prefetch` mark every selected slot
+//! touched; `pick_eviction_slot` selects only untouched slots. No additional
+//! reset or eviction is introduced between experts in that layer's loop.
+//!
+//! This is sufficient because [`moe_expert_cache_num_slots`] returns at least
+//! `top_k` slots (validated at construction), and one layer invocation resolves
+//! at most `top_k` distinct experts in each cache. Touched slots remain protected
+//! until that cache's next invocation, after its previous GPU reads completed.
+//!
+//! Cache eviction adds no fence, semaphore or double-buffering beyond the
+//! synchronous command-buffer waits and touched-slot bookkeeping above.
+//! Overlapping GPU work across tokens would require revisiting this invariant;
+//! the narrower within-token prefetch below does not overlap such GPU reads.
 //!
 //! ## Stage 2: within-token prefetch overlap
 //!

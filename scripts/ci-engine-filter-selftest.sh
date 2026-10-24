@@ -28,7 +28,7 @@ extract_re() {  # $1 = anchor substring unique to the wanted line
     | sed -E "s/^ *if grep -E '//; s/' <<<.*$//"
 }
 
-ENGINE_RE="$(extract_re 'crates/(inference|inference-core|tokenizer|grammar|weights|quant|embed)/')"
+ENGINE_RE="$(extract_re 'crates/(inference|inference-core|metal-runtime|tokenizer|grammar|weights|quant|embed)/')"
 TUNE_RE="$(extract_re 'crates/tune/')"
 
 # FAIL CLOSED ON EMPTY. An extraction that resolved nothing would make every
@@ -76,6 +76,12 @@ crates/inference/METAL_TRACE.md
 tests/fixtures/vision/README.md')"
 
 # ── positive controls: the gate must still fire on real engine surface ───────
+check "metal runtime source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/metal-runtime/src/lib.rs')"
+check "metal runtime manifest -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/metal-runtime/Cargo.toml')"
+check "metal runtime README alone -> engine" false \
+  "$(classify "$ENGINE_RE" <<<'crates/metal-runtime/README.md')"
 # Without these, deleting the whole regex would make this file pass.
 check "inference source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/inference/src/rope.rs')"
