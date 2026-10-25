@@ -23,7 +23,7 @@ handle the CPU path.
 
 Lattice is two things in one repo.
 
-**A Rust inference library.** Thirteen crates covering embeddings, generation,
+**A Rust inference library.** Fourteen crates covering embeddings, generation,
 quantization, LoRA fine-tuning, and optimal transport. Use `lattice-embed` as a
 library dependency, or run the `lattice` binary for interactive chat and an
 OpenAI-compatible HTTP server.
@@ -164,7 +164,8 @@ Three leaf crates (`fann`, `transport`, `inference-core`) have zero
 intra-workspace dependencies. `tokenizer`, `grammar` and `weights` each depend
 only on `inference-core` at runtime. `model-config` depends on `inference-core`
 and `weights`; `quant` depends on those two and on `model-config`, and `compute`
-on `inference-core` and `model-config`. `inference` depends on all seven
+on `inference-core`, `tokenizer`, `weights` and `model-config`. `inference`
+depends on all seven
 unconditionally and pulls in `fann` through the optional `mixture` or
 `metal-gpu` features. Each can be used on its own.
 
@@ -708,9 +709,9 @@ variable when the same requirement should apply to `make ci` or Git hooks.
 dependents:
 
 1. `fann`, `transport`, and `inference-core` (leaves).
-2. `tokenizer`, `grammar`, `weights`, `metal-runtime`, and `compute`.
+2. `tokenizer`, `grammar`, `weights`, and `metal-runtime`.
 3. `model-config`.
-4. `quant`.
+4. `quant` and `compute`.
 5. `inference`.
 6. `embed`, `tune` and `serve`.
 
