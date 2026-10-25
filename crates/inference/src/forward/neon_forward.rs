@@ -228,7 +228,7 @@ fn pack_full_attn_weights(
     // by the original, unwrapped head count.
     let q_dim = cfg.checked_full_q_dim()?;
     let kv_dim = cfg.checked_full_kv_dim()?;
-    let q_proj_rows = crate::model::qwen35_config::checked_double(q_dim, "full_q_dim")?; // Q + gate interleaved
+    let q_proj_rows = lattice_model_config::__internal::checked_double(q_dim, "full_q_dim")?; // Q + gate interleaved
 
     validate_cfg_len(
         w.q_norm.len(),

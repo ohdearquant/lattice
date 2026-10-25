@@ -136,7 +136,7 @@ fn nested_rope_theta_checkpoint_fixtures_stay_admitted() {
         (
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/qwen35_0_8b_config.json"
+                "/../inference/tests/fixtures/qwen35_0_8b_config.json"
             )),
             1024,
             24,
