@@ -6,8 +6,8 @@
 //! ([`lora_hook::LoraHook`]), the numerical diagnostics
 //! ([`metrics::OnlineSoftmaxEntropy`], [`pruning::BlockInfluence`]), option-letter scoring
 //! ([`option_scoring::OptionScores`]), shared attention row semantics
-//! ([`attention::softmax_row`]), and CPU forward kernels ([`forward::cpu`]); pooling and sampling
-//! move here in later releases.
+//! ([`attention::softmax_row`]), CPU forward kernels ([`forward::cpu`]), and BERT-family pooling
+//! ([`pool`]); sampling moves here in a later release.
 //!
 //! `lattice-inference` re-exports the supported items at their original paths, so
 //! `lattice_inference::rope::RopeTable` and `lattice_compute::rope::RopeTable` name the same type.
@@ -25,6 +25,7 @@ pub mod kv_cache;
 pub mod lora_hook;
 pub mod metrics;
 pub mod option_scoring;
+pub mod pool;
 pub mod pruning;
 pub mod rope;
 

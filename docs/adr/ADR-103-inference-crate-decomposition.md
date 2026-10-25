@@ -488,6 +488,31 @@ code sits below the facade. Recorded:
    A measured A/B of that target is required before merge. This amendment records the extraction and its validation
    obligation; it does not assert a measurement result or a structural waiver.
 
+## Amendment 15 (2026-10-25)
+
+BERT-family pooling joins `lattice-compute`, next to the SIMD detection it dispatches on. Recorded:
+
+1. **D8.1.** `BertPooling`, `default_bert_pooling_for_model_name`, `mean_pool`, `last_token_pool`, `cls_pool` and
+   `l2_normalize`, with their NEON and AVX2 paths, move from `lattice_inference::pool` into a new
+   `lattice_compute::pool` module, byte-identical. Its only crate-internal dependency is `simd_config`, already in
+   compute after Amendment 14, so compute gains no dependency and its publish tier is unchanged. The BERT, cross-encoder
+   and Qwen embedding models that call pooling stay in the facade.
+2. **D1.** `lattice_inference::pool` keeps named public re-exports of the six items, and the crate-root
+   `lattice_inference::BertPooling` stays the same type. Every existing caller keeps its path.
+3. **D4 and D5.** The six items were already public: no crate-private crossing, no `__internal` bridge, no feature or
+   target gate. Compute keeps an empty default feature set.
+4. **D6.1.** The twelve pooling tests move with the module, names unchanged. `facade_api_parity` adds `pool_parity`,
+   covering the type at both facade paths and the five functions.
+5. **Non-exhaustive match.** `BertPooling` is `#[non_exhaustive]`, so `BertModel::pool` in the facade now needs a
+   wildcard arm; it applies mean pooling, the type's default, and the two existing variants behave as before. Because
+   the wildcard would also accept a variant added later, compute adds
+   `every_pooling_variant_is_known_to_the_bert_model`, an exhaustive match that stops compiling when a variant is
+   added and names `BertModel::pool` as the second place to handle it.
+6. **D6.4.** The `mean_pool_l2_normalize` group of `inference_bench` runs `mean_pool` and `l2_normalize` directly, and
+   the crate boundary is a changed build input, so a measured A/B of that group is required before merge. This
+   amendment records the extraction and its validation obligation; it does not assert a measurement result or a
+   structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

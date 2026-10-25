@@ -1811,3 +1811,36 @@ mod cpu_forward_parity {
         same_function(facade::matmul_avx512, extracted::matmul_avx512);
     }
 }
+
+mod pool_parity {
+    use lattice_compute::pool as extracted;
+    use lattice_inference::pool as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn pool_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::BertPooling>,
+            PhantomData::<extracted::BertPooling>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::BertPooling>,
+            PhantomData::<extracted::BertPooling>,
+        );
+    }
+
+    #[test]
+    fn pool_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::default_bert_pooling_for_model_name,
+            extracted::default_bert_pooling_for_model_name,
+        );
+        same_function(facade::mean_pool, extracted::mean_pool);
+        same_function(facade::last_token_pool, extracted::last_token_pool);
+        same_function(facade::cls_pool, extracted::cls_pool);
+        same_function(facade::l2_normalize, extracted::l2_normalize);
+    }
+}

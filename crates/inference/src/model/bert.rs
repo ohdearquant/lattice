@@ -555,6 +555,12 @@ impl BertModel {
                 self.config.hidden_size,
             ),
             BertPooling::CLS => cls_pool(hidden_states, seq_len, self.config.hidden_size),
+            _ => mean_pool(
+                hidden_states,
+                attention_mask,
+                seq_len,
+                self.config.hidden_size,
+            ),
         }
     }
 
