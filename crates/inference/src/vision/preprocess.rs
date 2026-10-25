@@ -157,31 +157,32 @@ impl ImageTensor {
 ///
 /// # Errors
 ///
+/// Returns `VisionError::InvalidConfig` if `cfg.patch_size` is zero,
+/// `cfg.image_size` is not divisible by `cfg.patch_size`, or any std component
+/// is not positive. The configuration is checked before any decoding, with or
+/// without the `image` feature.
 /// Returns `VisionError::ImageDecode` if the bytes cannot be decoded or the
 /// `image` feature is disabled.
-/// Returns `VisionError::InvalidConfig` if `cfg.image_size` is not divisible
-/// by `cfg.patch_size`, or if any std component is zero.
 pub fn preprocess(image_bytes: &[u8], cfg: &PreprocessConfig) -> Result<ImageTensor, VisionError> {
-    #[cfg(feature = "image")]
-    {
-        // Validate config
-        if cfg.patch_size == 0 {
-            return Err(VisionError::InvalidConfig("patch_size must be > 0".into()));
-        }
-        if !cfg.image_size.is_multiple_of(cfg.patch_size) {
+    if cfg.patch_size == 0 {
+        return Err(VisionError::InvalidConfig("patch_size must be > 0".into()));
+    }
+    if !cfg.image_size.is_multiple_of(cfg.patch_size) {
+        return Err(VisionError::InvalidConfig(format!(
+            "image_size {} must be divisible by patch_size {}",
+            cfg.image_size, cfg.patch_size
+        )));
+    }
+    for (i, &s) in cfg.std.iter().enumerate() {
+        if s <= 0.0 {
             return Err(VisionError::InvalidConfig(format!(
-                "image_size {} must be divisible by patch_size {}",
-                cfg.image_size, cfg.patch_size
+                "std[{i}]={s} must be > 0"
             )));
         }
-        for (i, &s) in cfg.std.iter().enumerate() {
-            if s <= 0.0 {
-                return Err(VisionError::InvalidConfig(format!(
-                    "std[{i}]={s} must be > 0"
-                )));
-            }
-        }
+    }
 
+    #[cfg(feature = "image")]
+    {
         // Decode image
         let reader = ImageReader::new(Cursor::new(image_bytes))
             .with_guessed_format()
@@ -237,7 +238,7 @@ pub fn preprocess(image_bytes: &[u8], cfg: &PreprocessConfig) -> Result<ImageTen
     }
     #[cfg(not(feature = "image"))]
     {
-        let _ = (image_bytes, cfg);
+        let _ = image_bytes;
         Err(VisionError::ImageDecode(
             "image decoding is not compiled in; enable the `image` feature".into(),
         ))

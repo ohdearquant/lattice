@@ -24,6 +24,31 @@ fn image_decoders_require_image_feature() {
         Err(InferenceError::InvalidInput(message))
             if message == format!("EmbeddingGemma 2 image: {expected}")
     ));
+    let mut zero_patch = PreprocessConfig::qwen3_vl();
+    zero_patch.patch_size = 0;
+    assert!(matches!(
+        preprocess(bytes, &zero_patch),
+        Err(VisionError::InvalidConfig(_))
+    ));
+}
+
+#[test]
+fn preprocess_refuses_an_invalid_config_before_decoding() {
+    use crate::vision::preprocess::{PreprocessConfig, preprocess};
+
+    let not_an_image = b"not an image";
+    let mut zero_patch = PreprocessConfig::qwen3_vl();
+    zero_patch.patch_size = 0;
+    let mut indivisible = PreprocessConfig::qwen3_vl();
+    indivisible.image_size = indivisible.patch_size * 3 + 1;
+    let mut zero_std = PreprocessConfig::qwen3_vl();
+    zero_std.std[1] = 0.0;
+    for cfg in [zero_patch, indivisible, zero_std] {
+        assert!(matches!(
+            preprocess(not_an_image, &cfg),
+            Err(VisionError::InvalidConfig(_))
+        ));
+    }
 }
 
 fn tiny_cfg() -> VisionModelConfig {
