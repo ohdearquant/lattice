@@ -1241,12 +1241,11 @@ jobs:
       # either, for the same reason: no workflow's filter matched their
       # names.
       #
-      # `--lib inject` also matches `inject_quarot_seed_roundtrips_in_config_json`
-      # (QuaRot seed round trip), `injection_replaces_lookup_and_is_mutation_sensitive`
-      # (CPU f16 injection oracle), and
+      # `--lib inject` also matches `injection_replaces_lookup_and_is_mutation_sensitive`
+      # (CPU f16 injection oracle) and
       # `shared_server_runner_drops_router_after_injected_shutdown` (serve-shutdown
       # regression matching only incidentally on the `injected` substring), so
-      # the exact-count greps below are 9 in lattice-inference (6 `inject`-filter
+      # the exact-count greps below are 8 in lattice-inference (5 `inject`-filter
       # matches + 3 `emit_head`-filter matches) and 3 in lattice-serve (1
       # `inject`-filter match + 2 `vision_runtime_preload`-filter matches), not 4
       # -- update them in the same PR if the matched test surface changes. The source-reading guard
@@ -1273,7 +1272,7 @@ jobs:
             cat vision-mp2-inject-gate.log
             exit "$status"
           fi
-          grep -Eq '^test result: ok\. 9 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
+          grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
           if cargo test --release -p lattice-serve --features f16,metal-gpu \
             --lib \
             -- inject vision_runtime_preload \
