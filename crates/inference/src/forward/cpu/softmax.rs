@@ -172,9 +172,7 @@ unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m25
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn exp_neon_degree5(
-    x: std::arch::aarch64::float32x4_t,
-) -> std::arch::aarch64::float32x4_t {
+unsafe fn exp_neon_degree5(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;
 
     const LOG2E: f32 = std::f32::consts::LOG2_E;
@@ -457,7 +455,8 @@ macro_rules! softmax_avx2_kernel {
                         let vinv = _mm256_set1_ps(inv_sum);
                         for c in 0..chunks {
                             let off = c * 8;
-                            let v = _mm256_mul_ps(_mm256_loadu_ps(ptr.add(off) as *const f32), vinv);
+                            let v =
+                                _mm256_mul_ps(_mm256_loadu_ps(ptr.add(off) as *const f32), vinv);
                             _mm256_storeu_ps(ptr.add(off), v);
                         }
                         for i in (chunks * 8)..n {
