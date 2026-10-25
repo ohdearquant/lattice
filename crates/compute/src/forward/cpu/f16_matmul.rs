@@ -1,6 +1,6 @@
 //! Mixed-precision CPU matrix multiplication with packed F16 weights.
 
-use crate::weights::f16_weights::F16;
+use lattice_weights::f16_weights::F16;
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

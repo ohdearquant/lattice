@@ -594,6 +594,7 @@ flowchart TD
     Compute --> Core
     Compute --> ModelConfig
     Compute --> Tokenizer
+    Compute --> Weights
     Grammar --> Core
     Weights --> Core
     Quant --> Core

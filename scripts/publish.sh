@@ -26,7 +26,7 @@ esac
 #   fann, transport, inference-core   leaves, no internal deps
 #     -> tokenizer, grammar, weights, metal-runtime  depend on inference-core
 #       -> model-config               depends on inference-core, weights
-#         -> quant, compute           quant depends on inference-core, weights, model-config; compute on inference-core, model-config
+#         -> quant, compute           quant depends on inference-core, weights, model-config; compute on inference-core, tokenizer, weights, model-config
 #           -> inference              depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, model-config, compute, metal-runtime
 #             -> embed                depends on inference
 #             -> serve                depends on inference (exact version), fann, tokenizer, weights

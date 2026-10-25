@@ -2,7 +2,7 @@
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SimdConfig {
+pub struct SimdConfig {
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub avx2_enabled: bool,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
@@ -47,6 +47,6 @@ impl SimdConfig {
 
 static SIMD_CONFIG: OnceLock<SimdConfig> = OnceLock::new();
 
-pub(crate) fn simd_config() -> SimdConfig {
+pub fn simd_config() -> SimdConfig {
     *SIMD_CONFIG.get_or_init(SimdConfig::detect)
 }

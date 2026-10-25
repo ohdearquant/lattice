@@ -1740,3 +1740,74 @@ mod softmax_row_parity {
         same_function(facade::finalize_row, extracted::finalize_row);
     }
 }
+
+mod cpu_forward_parity {
+    use lattice_compute::forward::cpu as extracted;
+    use lattice_inference::forward as forward_root;
+    use lattice_inference::forward::cpu as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn cpu_bert_policy_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::BertCpuKernelPolicy>,
+            PhantomData::<extracted::BertCpuKernelPolicy>,
+        );
+        same_type(
+            PhantomData::<forward_root::BertCpuKernelPolicy>,
+            PhantomData::<extracted::BertCpuKernelPolicy>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::BertCpuKernelProfile>,
+            PhantomData::<extracted::BertCpuKernelProfile>,
+        );
+    }
+
+    #[test]
+    fn cpu_forward_functions_are_the_same_items_at_both_paths() {
+        same_function(facade::add_bias, extracted::add_bias);
+        same_function(facade::add_bias_gelu, extracted::add_bias_gelu);
+        same_function(facade::gelu, extracted::gelu);
+        same_function(facade::sgemm_bt_strided, extracted::sgemm_bt_strided);
+        same_function(facade::sgemm_nn_ab, extracted::sgemm_nn_ab);
+        same_function(facade::sgemm_nn_strided, extracted::sgemm_nn_strided);
+        same_function(facade::elementwise_mul, extracted::elementwise_mul);
+        same_function(facade::rms_norm, extracted::rms_norm);
+        same_function(facade::silu_inplace, extracted::silu_inplace);
+        same_function(facade::matmul, extracted::matmul);
+        same_function(facade::matmul_bt, extracted::matmul_bt);
+        same_function(facade::matmul_into, extracted::matmul_into);
+        same_function(facade::matmul_scalar, extracted::matmul_scalar);
+        same_function(facade::layer_norm, extracted::layer_norm);
+        same_function(
+            facade::residual_add_layer_norm,
+            extracted::residual_add_layer_norm,
+        );
+        same_function(facade::softmax_attention, extracted::softmax_attention);
+        same_function(forward_root::matmul_bt, extracted::matmul_bt);
+    }
+
+    #[test]
+    fn cpu_f16_matmul_is_the_same_item_at_both_paths() {
+        same_function(
+            lattice_inference::weights::f16_weights::matmul_bt_f16,
+            lattice_compute::forward::cpu::f16_matmul::matmul_bt_f16,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn cpu_neon_matmul_is_the_same_item_at_both_paths() {
+        same_function(facade::matmul_neon, extracted::matmul_neon);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpu_x86_matmul_is_the_same_item_at_both_paths() {
+        same_function(facade::matmul_avx2, extracted::matmul_avx2);
+        same_function(facade::matmul_avx512, extracted::matmul_avx512);
+    }
+}

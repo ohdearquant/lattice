@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Host-side compute for Lattice inference: rotary position embedding tables (including Gemma 4), KV caches, LoRA hooks, numerical diagnostics and option scoring"
+description = "Host-side compute for Lattice inference: rotary position embedding tables (including Gemma 4), KV caches, LoRA hooks, numerical diagnostics, option scoring, attention row semantics and CPU kernels"
 keywords = ["inference", "rope", "transformer", "llm", "cpu"]
 categories = ["science", "algorithms"]
 
@@ -15,14 +15,21 @@ all-features = true
 
 [features]
 default = []
+x86-gemm = ["dep:gemm"]
 
 [dependencies]
 half.workspace = true
+gemm = { version = "=0.18.2", optional = true }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 lattice-model-config = { version = "0.15.0", path = "../model-config" }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
+lattice-weights = { version = "0.15.0", path = "../weights" }
 indexmap.workspace = true
+rayon = { workspace = true }
 rustc-hash.workspace = true
+
+[dev-dependencies]
+approx = "0.5"
 
 [lints]
 workspace = true

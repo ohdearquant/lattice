@@ -110,7 +110,7 @@ fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
                                                  |
                                               model-config   ← depends on inference-core + weights
                                                  |
-                                               quant   compute   ← quant depends on inference-core + weights + model-config; compute on inference-core + tokenizer + model-config
+                                               quant   compute   ← quant depends on inference-core + weights + model-config; compute on inference-core + tokenizer + weights + model-config
     |                                  |
 inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + model-config + compute;
                                                    optional metal-runtime under `metal-gpu`;
@@ -125,7 +125,7 @@ all seven edges into them are unconditional. `metal-runtime` depends on
 `inference-core` and is enabled by inference's opt-in `metal-gpu` feature.
 `model-config` depends on `inference-core` and `weights`; `quant` depends on
 those two and on `model-config`, while `compute` depends on `inference-core`,
-`tokenizer` and `model-config`. `inference` re-exports the extracted public items at their
+`tokenizer`, `weights` and `model-config`. `inference` re-exports the extracted public items at their
 original paths. Of the four edges among the other crates, three are
 feature-gated, and the gates do not all default the same way, so "depends on" in
 the diagram is not one relationship. `tune` depends on `fann` unconditionally.
@@ -241,20 +241,25 @@ reasoning-budget helpers in `model::qwen35_config` stay in inference.
 
 ### lattice-compute — Host-side compute
 
-| Module                   | Purpose                                            | Key Exports                                      |
-| ------------------------ | -------------------------------------------------- | ------------------------------------------------ |
-| `rope.rs`                | Rotary position embedding sin/cos tables           | `RopeTable`                                      |
-| `kv_cache/flat.rs`       | Contiguous half-precision KV storage               | `FlatKVCache`, `FlatKVCacheConfig`               |
-| `kv_cache/paged.rs`      | Paged storage, allocation and eviction             | `PagePool`, `PagedKVCache`, `PagedKVCacheConfig` |
-| `kv_cache/prefix.rs`     | Shared prefix pages and cache                      | `AdapterId`, `PrefixPageCache`                   |
-| `kv_cache/cross_turn.rs` | Cross-turn prefix reuse planning                   | `CrossTurnPrefixEntry`, `plan_prefix_reuse`      |
-| `lora_hook.rs`           | LoRA projection geometry, hook and row application | `LoraHook`, `NoopLoraHook`, `apply_lora_rows`    |
+| Module                     | Purpose                                                        | Key Exports                                         |
+| -------------------------- | -------------------------------------------------------------- | --------------------------------------------------- |
+| `rope.rs`                  | Rotary position embedding sin/cos tables                       | `RopeTable`                                         |
+| `kv_cache/flat.rs`         | Contiguous half-precision KV storage                           | `FlatKVCache`, `FlatKVCacheConfig`                  |
+| `kv_cache/paged.rs`        | Paged storage, allocation and eviction                         | `PagePool`, `PagedKVCache`, `PagedKVCacheConfig`    |
+| `kv_cache/prefix.rs`       | Shared prefix pages and cache                                  | `AdapterId`, `PrefixPageCache`                      |
+| `kv_cache/cross_turn.rs`   | Cross-turn prefix reuse planning                               | `CrossTurnPrefixEntry`, `plan_prefix_reuse`         |
+| `lora_hook.rs`             | LoRA projection geometry, hook and row application             | `LoraHook`, `NoopLoraHook`, `apply_lora_rows`       |
+| `gemma_rope.rs`            | Gemma 4 text and vision RoPE tables                            | `gemma4_rope_cos_sin`, `vision_axial_rope_inv_freq` |
+| `metrics.rs`, `pruning.rs` | Numerical diagnostics and block-influence scores               | `OnlineSoftmaxEntropy`, `BlockInfluence`            |
+| `option_scoring.rs`        | Option-letter scoring over a logit row                         | `OptionScores`, `option_scores_from_logits`         |
+| `attention/softmax_row.rs` | Shared fail-closed softmax row contract                        | `row_max_and_any_nan`, `finalize_row`               |
+| `forward/cpu/`             | CPU forward kernels: matmul, GEMM, norms, activations, softmax | `matmul_bt`, `rms_norm`, `softmax_attention`        |
 
-Its internal runtime dependencies are `inference-core` for the shared error type
-and `model-config` for Qwen3.5 geometry in the LoRA hook contract. Flat and
+Its internal runtime dependencies are `inference-core` for the shared error type,
+`model-config` for Qwen3.5 geometry in the LoRA hook contract, `tokenizer` for
+option scoring and `weights` for the F16 storage type in the CPU F16 matmul. Flat and
 paged storage, prefix sharing and cross-turn planning are available under
-`kv_cache`; CPU kernels, attention, pooling and sampling move here in later
-changes. The inference facade retains the `lattice_inference::rope::RopeTable`,
+`kv_cache`; pooling and sampling move here in later changes. The inference facade retains the `lattice_inference::rope::RopeTable`,
 `lattice_inference::kv_cache::*` and `lattice_inference::lora_hook::*` public
 paths through named re-exports.
 

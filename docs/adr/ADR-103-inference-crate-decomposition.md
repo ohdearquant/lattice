@@ -452,6 +452,39 @@ depending on the inference facade. Recorded:
    changed build input, so a measured A/B of that target is required before merge. This amendment records the
    extraction and its validation obligation; it does not assert a measurement result or a structural waiver.
 
+## Amendment 14 (2026-10-25)
+
+The CPU forward kernels join `lattice-compute`, so the host-side matmul, GEMM, normalization, activation and softmax
+code sits below the facade. Recorded:
+
+1. **D8.1.** The `forward::cpu` kernels (activation, the architecture kernels, BERT kernel policy, BLAS-style GEMM,
+   elementwise, F16 matmul, GEMM validation, matmul, norm, SIMD detection, softmax and the tiled variants) move from
+   `lattice_inference::forward::cpu` into `lattice_compute::forward::cpu` with their tests. The Q8 matrix kernel and
+   its tests stay in the facade. Compute gains direct dependencies on `lattice-weights` (the F16 storage type used by
+   the F16 matmul) and `rayon`, and the optional `gemm` dependency moves from inference to compute. Weights already
+   publishes before compute, so compute's tier, the publish script and the publish-order test are unchanged.
+2. **D1.** `lattice_inference::forward::cpu` keeps named public re-exports of every function and type it exported
+   before, including the architecture-gated `matmul_neon` (aarch64) and `matmul_avx2`/`matmul_avx512` (x86_64).
+   `lattice_inference::forward` replaces its glob re-export of the CPU module with the same named list,
+   `lattice_inference::{BertCpuKernelPolicy, BertCpuKernelProfile}` keep their hidden crate-root paths, and
+   `lattice_inference::weights::f16_weights::matmul_bt_f16` keeps its path. The items are the same at every path.
+3. **D3.** The BERT policy documentation linked the BERT model that stays in the facade; that link becomes plain text.
+4. **D4.** `simd_config`, `SimdConfig`, `validate_gemm_nn`, `validate_gemm_bt` and `validate_ternary_matvec_args` were
+   crate-private and become public in `lattice_compute::forward::cpu`, because facade code that stays (attention, the
+   ternary kernel, the GPU GEMM paths, vision and backward) calls them. The facade imports the four functions with `pub(crate) use`, preserving their
+   facade visibility, and does not export `SimdConfig`. The `f16_matmul` module becomes public in compute so the
+   facade can keep the `matmul_bt_f16` path. No `__internal` bridge is added.
+5. **D5.** Compute keeps an empty default feature set and gains `x86-gemm = ["dep:gemm"]`; inference's `x86-gemm`
+   forwards to it, so every caller keeps the same feature name and the same off-by-default behaviour.
+6. **D6.1.** The moved source and test files carry 135 tests, names unchanged. Integration tests that use the kernels
+   through the facade (`bert_cpu_kernel_policy_api`, `x86_gemm_allocations` and others) stay in inference.
+   `facade_api_parity` adds `cpu_forward_parity`, covering the policy types, every re-exported function, the F16
+   kernel and the architecture-gated kernels.
+7. **D6.4.** `elementwise_cpu_bench` runs these kernels directly, and the workspace builds without link-time
+   optimization, so a facade caller now reaches them across a crate boundary where only `#[inline]` functions inline.
+   A measured A/B of that target is required before merge. This amendment records the extraction and its validation
+   obligation; it does not assert a measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

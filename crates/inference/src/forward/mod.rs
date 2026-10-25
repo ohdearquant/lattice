@@ -27,5 +27,16 @@ pub mod neon_forward;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod signpost;
 
-// Re-export from cpu for backward compat (was `layers`)
-pub use self::cpu::*;
+// Re-export the supported CPU names for backward compatibility (was `layers`).
+#[cfg(target_arch = "aarch64")]
+#[doc(no_inline)]
+pub use self::cpu::matmul_neon;
+#[doc(no_inline)]
+pub use self::cpu::{
+    BertCpuKernelPolicy, BertCpuKernelProfile, add_bias, add_bias_gelu, elementwise_mul, gelu,
+    layer_norm, matmul, matmul_bt, matmul_into, matmul_scalar, residual_add_layer_norm, rms_norm,
+    sgemm_bt_strided, sgemm_nn_ab, sgemm_nn_strided, silu_inplace, softmax_attention,
+};
+#[cfg(target_arch = "x86_64")]
+#[doc(no_inline)]
+pub use self::cpu::{matmul_avx2, matmul_avx512};
