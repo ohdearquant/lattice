@@ -409,6 +409,28 @@ so forward and evaluation code can use them without depending on the inference f
    declared bench target. This amendment records the extraction and its validation obligations; it does not assert a
    measurement result or a structural waiver.
 
+## Amendment 12 (2026-10-25)
+
+The Gemma 4 rotary embedding tables join `lattice-compute`, so the Gemma, EmbeddingGemma and ERNIE forward paths can
+build them without depending on the inference facade. Recorded:
+
+1. **D8.1.** `gemma4_rope_inv_freq`, `gemma4_rope_cos_sin` and `vision_axial_rope_inv_freq` move from
+   `lattice_inference::model::gemma4_ops` into a new `lattice_compute::gemma_rope` module. Their bodies use only the
+   standard library, so compute gains no dependency and its publish tier is unchanged. Applying the rotation
+   (`gemma4_apply_rope`, `vision_axial_rope_apply`) and the other Gemma 4 operations stay in the facade.
+2. **D1.** `lattice_inference::model::gemma4_ops` keeps named public re-exports of the three functions; they are the
+   same function items at both paths, and every existing caller keeps its path.
+3. **D3.** The one documentation link that pointed back into the facade (`gemma4_apply_rope`) becomes plain
+   qualified code text, so compute does not reference `lattice-inference`.
+4. **D4 and D5.** The three functions were already public and take no facade-owned type: no crate-private crossing,
+   no `__internal` bridge, no feature or target gate. Compute keeps an empty default feature set.
+5. **D6.1.** No test moves: the fifteen `gemma4_ops` tests, which check the tables against reference goldens, keep
+   running in `lattice-inference` through the re-exported paths. `facade_api_parity` adds
+   `gemma_rope_functions_are_the_same_items_at_both_paths`.
+6. **D6.4.** `bench_gemma4_driver_pair` reaches `gemma4_rope_cos_sin` on every decode step, and the crate boundary is
+   a changed build input, so a paired before/after of that target is required before merge. This amendment records
+   the extraction and its validation obligation; it does not assert a measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

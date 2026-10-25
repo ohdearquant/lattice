@@ -1702,3 +1702,23 @@ mod option_scoring_parity {
         assert_eq!(facade::LETTER_LABELS, extracted::LETTER_LABELS);
     }
 }
+
+mod gemma_rope_parity {
+    use lattice_compute::gemma_rope as extracted;
+    use lattice_inference::model::gemma4_ops as facade;
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn gemma_rope_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::gemma4_rope_inv_freq,
+            extracted::gemma4_rope_inv_freq,
+        );
+        same_function(facade::gemma4_rope_cos_sin, extracted::gemma4_rope_cos_sin);
+        same_function(
+            facade::vision_axial_rope_inv_freq,
+            extracted::vision_axial_rope_inv_freq,
+        );
+    }
+}

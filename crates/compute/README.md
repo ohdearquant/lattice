@@ -1,6 +1,7 @@
 # lattice-compute
 
-Host-side compute for Lattice inference: rotary position embedding (RoPE) tables,
+Host-side compute for Lattice inference: rotary position embedding (RoPE) tables
+(including the Gemma 4 text and vision inverse-frequency tables),
 flat/paged KV caches with prefix reuse, LoRA adapter hooks and row application, and
 the numerical diagnostics (metrics accumulators and block-influence pruning scores).
 It also holds option-letter scoring over a full-vocabulary logit row.

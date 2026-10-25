@@ -1,8 +1,9 @@
 //! Host-side compute for Lattice inference.
 //!
 //! This crate holds the computation that runs on the host for a decoder forward pass. It currently
-//! contains rotary position embedding tables ([`rope::RopeTable`]), flat/paged KV storage with prefix
-//! planning, LoRA adapter hooks ([`lora_hook::LoraHook`]), the numerical diagnostics
+//! contains rotary position embedding tables ([`rope::RopeTable`] and the Gemma 4 tables in
+//! [`gemma_rope`]), flat/paged KV storage with prefix planning, LoRA adapter hooks
+//! ([`lora_hook::LoraHook`]), the numerical diagnostics
 //! ([`metrics::OnlineSoftmaxEntropy`], [`pruning::BlockInfluence`]), and option-letter scoring
 //! ([`option_scoring::OptionScores`]); CPU kernels, attention, pooling and sampling move here in
 //! later releases.
@@ -12,6 +13,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+pub mod gemma_rope;
 pub mod kv_cache;
 pub mod lora_hook;
 pub mod metrics;
