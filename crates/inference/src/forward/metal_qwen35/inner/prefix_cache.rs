@@ -375,7 +375,9 @@ impl MetalQwen35State {
                 self.session.set_position(checkpoint_len);
                 Ok(Some(entry))
             }
-            PrefixReuseMode::FullRefill => {
+            // `PrefixReuseMode` is non-exhaustive in lattice-compute: FullRefill and any
+            // mode this build does not know reset and prefill the whole prompt.
+            _ => {
                 self.reset_state();
                 Ok(None)
             }
