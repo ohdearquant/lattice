@@ -88,6 +88,23 @@ moves the configuration parsers only. Recorded:
    that stay in `lattice-inference`, so they stay where they are, and the moved tests read them through a path relative
    to the workspace, as `lattice-embed`'s tests already read the first of them.
 
+## Amendment 6 (2026-10-25)
+
+The rest of the configuration surface that Amendment 5 left in the facade moves to `lattice-model-config`. QuaRot reads
+`QwenConfig` and the Qwen3.5 tensor-name functions as well as `Qwen35Config`, so they have to sit below the facade
+before the QuaRot modules can leave it. Recorded:
+
+1. **D8.1.** `QwenConfig` with its `impl` moves out of `model/qwen.rs` into the crate's `qwen_config` module, and
+   `qwen_layer_tensor_prefix` and `qwen_required_tensor_names` move out of `model/qwen35/loading.rs` into a
+   `qwen35_tensors` module. The facade re-exports them at `model::qwen::QwenConfig`, `model::QwenConfig`, the crate root
+   `QwenConfig` and `model::qwen35::{qwen_layer_tensor_prefix, qwen_required_tensor_names}`. The `config.json` parser for
+   `QwenConfig` stays in `model/qwen.rs` with the model loader that calls it, and so does `ModelInferenceConfig`, which
+   reads `inference_config.json` and derives cache revisions from the checkpoint's files.
+2. **D4.** No crate-private item crosses the boundary. Everything moved was already public.
+3. **D6.1.** The unit tests of the moved items stay in the facade and reach them through the re-exports, so no test is
+   renamed or moved. `facade_api_parity` adds a compile-time check that each re-exported function is the same function
+   item as its definition.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

@@ -1115,6 +1115,28 @@ mod model_config_parity {
             PhantomData::<facade::bitnet_config::BitNetConfig>,
             PhantomData::<extracted::bitnet_config::BitNetConfig>,
         );
+        same_type(
+            PhantomData::<facade::qwen::QwenConfig>,
+            PhantomData::<extracted::qwen_config::QwenConfig>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::QwenConfig>,
+            PhantomData::<extracted::qwen_config::QwenConfig>,
+        );
+    }
+
+    fn same_fn<F>(_: F, _: F) {}
+
+    #[test]
+    fn model_config_functions_are_the_same_function_at_both_paths() {
+        same_fn(
+            facade::qwen35::qwen_layer_tensor_prefix,
+            extracted::qwen35_tensors::qwen_layer_tensor_prefix,
+        );
+        same_fn(
+            facade::qwen35::qwen_required_tensor_names,
+            extracted::qwen35_tensors::qwen_required_tensor_names,
+        );
     }
 
     #[test]
