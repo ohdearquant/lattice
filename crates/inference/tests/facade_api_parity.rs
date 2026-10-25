@@ -1722,3 +1722,21 @@ mod gemma_rope_parity {
         );
     }
 }
+
+mod softmax_row_parity {
+    use lattice_compute::attention::softmax_row as extracted;
+    use lattice_inference::attention::softmax_row as facade;
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn softmax_row_functions_are_the_same_items_at_both_paths() {
+        same_function(facade::row_max_and_any_nan, extracted::row_max_and_any_nan);
+        same_function(
+            facade::row_fails_closed_pre_exp,
+            extracted::row_fails_closed_pre_exp,
+        );
+        same_function(facade::is_masked_neg_inf, extracted::is_masked_neg_inf);
+        same_function(facade::finalize_row, extracted::finalize_row);
+    }
+}

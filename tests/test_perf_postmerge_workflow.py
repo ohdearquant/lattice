@@ -18,6 +18,7 @@ _BENCH_IMPL = _ROOT / "scripts" / "lib" / "bench-compare-impl.sh"
 _BENCH_BINARY_INPUTS = {
     "crates/inference/src/forward/cpu/**",
     "crates/inference/src/attention/**",
+    "crates/compute/src/attention/**",
     "crates/inference/benches/elementwise_cpu_bench.rs",
     "crates/inference/Cargo.toml",
     "crates/embed/src/simd/**",

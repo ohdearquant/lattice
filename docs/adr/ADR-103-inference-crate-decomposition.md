@@ -431,6 +431,27 @@ build them without depending on the inference facade. Recorded:
    a changed build input, so a paired before/after of that target is required before merge. This amendment records
    the extraction and its validation obligation; it does not assert a measurement result or a structural waiver.
 
+## Amendment 13 (2026-10-25)
+
+The fail-closed softmax row contract joins `lattice-compute`, so the CPU kernels that move next can apply it without
+depending on the inference facade. Recorded:
+
+1. **D8.1.** `row_max_and_any_nan`, `row_fails_closed_pre_exp`, `is_masked_neg_inf` and `finalize_row` move from
+   `lattice_inference::attention::softmax_row` into a new `lattice_compute::attention::softmax_row` module. They use
+   only the standard library, so compute gains no dependency and its publish tier is unchanged. The attention kernels
+   that call them (GQA, decode, flash, differential, native sparse) stay in the facade.
+2. **D1.** `lattice_inference::attention::softmax_row` keeps named public re-exports of the four functions; they are
+   the same function items at both paths, and every existing caller keeps its path.
+3. **D3.** The module documentation linked the GQA and decode kernels that stay in the facade; those two links become
+   plain qualified code text, so compute does not reference `lattice-inference`.
+4. **D4 and D5.** The four functions were already public and keep their `#[inline]` attributes: no crate-private
+   crossing, no `__internal` bridge, no feature or target gate. Compute keeps an empty default feature set.
+5. **D6.1.** The module's twelve tests move with it, names unchanged. `facade_api_parity` adds
+   `softmax_row_functions_are_the_same_items_at_both_paths`.
+6. **D6.4.** `elementwise_cpu_bench` reaches the contract through `softmax_attention`, and the crate boundary is a
+   changed build input, so a measured A/B of that target is required before merge. This amendment records the
+   extraction and its validation obligation; it does not assert a measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

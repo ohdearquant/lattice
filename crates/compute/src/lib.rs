@@ -4,15 +4,16 @@
 //! contains rotary position embedding tables ([`rope::RopeTable`] and the Gemma 4 tables in
 //! [`gemma_rope`]), flat/paged KV storage with prefix planning, LoRA adapter hooks
 //! ([`lora_hook::LoraHook`]), the numerical diagnostics
-//! ([`metrics::OnlineSoftmaxEntropy`], [`pruning::BlockInfluence`]), and option-letter scoring
-//! ([`option_scoring::OptionScores`]); CPU kernels, attention, pooling and sampling move here in
-//! later releases.
+//! ([`metrics::OnlineSoftmaxEntropy`], [`pruning::BlockInfluence`]), option-letter scoring
+//! ([`option_scoring::OptionScores`]), and shared attention row semantics
+//! ([`attention::softmax_row`]); CPU kernels, pooling and sampling move here in later releases.
 //!
 //! `lattice-inference` re-exports the supported items at their original paths, so
 //! `lattice_inference::rope::RopeTable` and `lattice_compute::rope::RopeTable` name the same type.
 
 #![allow(clippy::needless_range_loop)]
 
+pub mod attention;
 pub mod gemma_rope;
 pub mod kv_cache;
 pub mod lora_hook;
