@@ -599,7 +599,8 @@ fn retired_closed_call_chains_stay_deleted() {
         "shared layer helpers must retain one common owner module"
     );
     count(&population, "gqa", "lora", 4);
-    count(&population, "gqa", "mlp", 1);
+    count(&population, "gqa", "mlp", 0);
+    count(&population, "injected", "mlp", 2);
     let block = body(&population, "gqa");
     let projections = calls(&block)
         .methods

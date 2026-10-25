@@ -16,6 +16,204 @@ use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::{Attribute, ItemFn, Meta, Token};
 
+#[allow(dead_code)]
+#[path = "workspace_metadata.rs"]
+mod workspace_metadata;
+
+pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &["."];
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScannedPackage {
+    pub(crate) identity: String,
+    pub(crate) manifest_dir: PathBuf,
+}
+
+impl ScannedPackage {
+    pub(crate) fn key(&self, relative: &str) -> String {
+        package_path_key(&self.identity, relative)
+    }
+
+    pub(crate) fn cargo_targets(&self, kinds: &[&str]) -> Result<Vec<CargoTargetRoot>, String> {
+        cargo_targets(&self.manifest_dir, kinds)
+            .map_err(|reason| format!("package {}: {reason}", self.identity))
+    }
+
+    pub(crate) fn target_roots(&self, kinds: &[&str]) -> Result<Vec<PathBuf>, String> {
+        cargo_target_roots(&self.manifest_dir, kinds)
+            .map_err(|reason| format!("package {}: {reason}", self.identity))
+    }
+
+    pub(crate) fn relative(&self, path: &Path) -> Result<String, String> {
+        let relative = path
+            .strip_prefix(&self.manifest_dir)
+            .map_err(|reason| format!("package {}: {}: {reason}", self.identity, path.display()))?;
+        relative.to_str().map(str::to_owned).ok_or_else(|| {
+            format!(
+                "package {}: source path is not UTF-8: {}",
+                self.identity,
+                path.display()
+            )
+        })
+    }
+}
+
+pub(crate) fn package_path_key(package: &str, relative: &str) -> String {
+    format!("{package}:{relative}")
+}
+
+fn relative_package_dir(base: &Path, root: &Path) -> Result<String, String> {
+    let base = base.components().collect::<Vec<_>>();
+    let root = root.components().collect::<Vec<_>>();
+    let shared = base.iter().zip(&root).take_while(|(a, b)| a == b).count();
+    if shared == 0 {
+        return Err("package directories must share a filesystem root".into());
+    }
+    let mut relative = PathBuf::new();
+    for _ in shared..base.len() {
+        relative.push("..");
+    }
+    for component in &root[shared..] {
+        relative.push(component.as_os_str());
+    }
+    Ok(if relative.as_os_str().is_empty() {
+        ".".into()
+    } else {
+        relative
+            .to_str()
+            .ok_or("package directory is not UTF-8")?
+            .replace('\\', "/")
+    })
+}
+
+pub(crate) fn scanned_packages_at(
+    inference_dir: &Path,
+    identities: &[&str],
+) -> Result<Vec<ScannedPackage>, String> {
+    let base = std::fs::canonicalize(inference_dir)
+        .map_err(|reason| format!("could not resolve inference manifest directory: {reason}"))?;
+    if identities.is_empty() {
+        return Err("scanned package list is empty".into());
+    }
+    let mut packages = Vec::new();
+    let mut seen = BTreeSet::new();
+    for identity in identities {
+        if identity.is_empty()
+            || identity.contains([':', '\\'])
+            || Path::new(identity).is_absolute()
+        {
+            return Err(format!("invalid scanned package identity: {identity:?}"));
+        }
+        let manifest =
+            std::fs::canonicalize(base.join(identity).join("Cargo.toml")).map_err(|reason| {
+                format!("package {identity}: could not resolve Cargo.toml: {reason}")
+            })?;
+        if !manifest.is_file() {
+            return Err(format!("package {identity}: Cargo.toml is not a file"));
+        }
+        let manifest_dir = manifest.parent().ok_or("package manifest has no parent")?;
+        if relative_package_dir(&base, manifest_dir)? != *identity {
+            return Err(format!("noncanonical scanned package identity: {identity}"));
+        }
+        if !seen.insert(manifest_dir.to_path_buf()) {
+            return Err(format!("duplicate scanned package identity: {identity}"));
+        }
+        packages.push(ScannedPackage {
+            identity: (*identity).to_owned(),
+            manifest_dir: manifest_dir.to_path_buf(),
+        });
+    }
+    Ok(packages)
+}
+
+pub(crate) fn scanned_packages() -> Vec<ScannedPackage> {
+    scanned_packages_at(Path::new(env!("CARGO_MANIFEST_DIR")), SCANNED_PACKAGE_DIRS)
+        .unwrap_or_else(|reason| panic!("{reason}"))
+}
+
+pub(crate) fn validate_scanned_package_membership(
+    inference_dir: &Path,
+    identities: &[&str],
+    metadata: &serde_json::Value,
+) -> Result<(), String> {
+    let packages = scanned_packages_at(inference_dir, identities)?;
+    let base = std::fs::canonicalize(inference_dir).map_err(|reason| reason.to_string())?;
+    let workspace = workspace_metadata::workspace_packages(metadata)?;
+    let mut expected = BTreeSet::from([".".to_owned()]);
+    let mut manifests = BTreeSet::new();
+    for (name, package) in workspace {
+        let manifest = package["manifest_path"]
+            .as_str()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| format!("workspace package {name} has no manifest path"))?;
+        let manifest = std::fs::canonicalize(manifest)
+            .map_err(|reason| format!("workspace package {name}: {reason}"))?;
+        if !manifest.is_file()
+            || manifest.file_name().is_none_or(|name| name != "Cargo.toml")
+            || !manifests.insert(manifest.clone())
+        {
+            return Err(format!(
+                "workspace package {name} has an invalid or duplicate manifest"
+            ));
+        }
+        let directory = manifest
+            .parent()
+            .ok_or("workspace manifest has no parent")?;
+        let identity = relative_package_dir(&base, directory)?;
+        if (name == "lattice-inference") != (identity == ".") {
+            return Err("inference package identity does not match the inference directory".into());
+        }
+        let dependencies = package["dependencies"]
+            .as_array()
+            .ok_or_else(|| format!("workspace package {name} has no dependency array"))?;
+        for dependency in dependencies {
+            let dependency_name = dependency["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    format!("workspace package {name} has a malformed dependency name")
+                })?;
+            let features = dependency["features"].as_array().ok_or_else(|| {
+                format!("workspace package {name} has a malformed dependency feature list")
+            })?;
+            let mut seen_features = BTreeSet::new();
+            for feature in features {
+                let feature = feature
+                    .as_str()
+                    .filter(|feature| !feature.is_empty())
+                    .ok_or_else(|| {
+                        format!("workspace package {name} has a malformed dependency feature")
+                    })?;
+                if !seen_features.insert(feature) {
+                    return Err(format!(
+                        "workspace package {name} has duplicate dependency features"
+                    ));
+                }
+            }
+            if dependency_name == "lattice-inference" && seen_features.contains("serving-support") {
+                expected.insert(identity.clone());
+            }
+        }
+    }
+    let actual = packages
+        .into_iter()
+        .map(|package| package.identity)
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!(
+            "scanned package membership mismatch: expected {expected:?}, found {actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_current_scanned_package_membership() -> Result<(), String> {
+    validate_scanned_package_membership(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        SCANNED_PACKAGE_DIRS,
+        workspace_metadata::read_workspace_metadata(),
+    )
+}
+
 pub(crate) const CHECKED_CARGO_TARGET_KINDS: &[&str] = &["bench", "bin", "example", "lib", "test"];
 pub(crate) fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_path_buf()];

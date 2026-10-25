@@ -8,7 +8,8 @@
 //!     (`NAME=0` would then enable the feature) unless the name is on
 //!     `PRESENCE_ALLOWLIST` with a reason. Switches go through `crate::env_switch_enabled`.
 //! (b) The set of `LATTICE_*` names that non-test source under `crates/*/src/` names
-//!     equals the set of rows in `crates/inference/CONFIG.md`'s variable table.
+//!     equals the union of the inference and optional serve `CONFIG.md` tables.
+//!     A name must occur in exactly one row across both tables.
 //!
 //! "Non-test" means: reachable from a crate root with `cfg(test)` false, and not inside an
 //! item carrying `#[test]` or a `cfg` that holds only when `test` does. Variables named
@@ -571,24 +572,62 @@ fn scan_population() -> &'static Population {
 }
 
 fn config_rows() -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("CONFIG.md");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|reason| panic!("read {}: {reason}", path.display()));
+    let inference = Path::new(env!("CARGO_MANIFEST_DIR"));
+    config_rows_at(
+        &inference.join("CONFIG.md"),
+        &inference.join("../serve/CONFIG.md"),
+    )
+    .unwrap_or_else(|reason| panic!("{reason}"))
+}
+
+fn config_rows_at(inference: &Path, serve: &Path) -> Result<Vec<String>, String> {
+    let mut paths = vec![inference];
+    if serve
+        .try_exists()
+        .map_err(|reason| format!("inspect {}: {reason}", serve.display()))?
+    {
+        paths.push(serve);
+    }
     let mut rows = Vec::new();
-    for line in text.lines() {
-        let Some(rest) = line.trim_start().strip_prefix('|') else {
-            continue;
-        };
-        let first = rest.split('|').next().unwrap_or("").trim();
-        if let Some(name) = first
-            .strip_prefix('`')
-            .and_then(|inner| inner.strip_suffix('`'))
-            && is_lattice_name(name)
-        {
-            rows.push(name.to_string());
+    let mut owners = BTreeMap::new();
+    for path in paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|reason| format!("read {}: {reason}", path.display()))?;
+        for line in text.lines() {
+            let Some(rest) = line.trim_start().strip_prefix('|') else {
+                continue;
+            };
+            let first = rest.split('|').next().unwrap_or("").trim();
+            if let Some(name) = first
+                .strip_prefix('`')
+                .and_then(|inner| inner.strip_suffix('`'))
+                && is_lattice_name(name)
+            {
+                if let Some(previous) = owners.insert(name.to_string(), path) {
+                    return Err(format!(
+                        "{name} is listed twice in CONFIG.md tables: {} and {}",
+                        previous.display(),
+                        path.display()
+                    ));
+                }
+                rows.push(name.to_string());
+            }
         }
     }
-    rows
+    Ok(rows)
+}
+
+fn config_table_agrees(source: &BTreeSet<String>, rows: &BTreeSet<String>) -> Result<(), String> {
+    let missing: Vec<&String> = source.difference(rows).collect();
+    let stale: Vec<&String> = rows.difference(source).collect();
+    if missing.is_empty() && stale.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "inference/serve CONFIG.md tables and the non-test source disagree.\n  read by source but no row: {missing:?}\n  \
+             row but read by no non-test source: {stale:?}"
+        ))
+    }
 }
 
 fn names_of(hits: &[Hit]) -> BTreeSet<String> {
@@ -717,11 +756,122 @@ fn config_table_lists_exactly_the_variables_the_source_reads() {
         "CONFIG.md has a variable listed twice"
     );
 
-    let missing: Vec<&String> = source.difference(&row_set).collect();
-    let stale: Vec<&String> = row_set.difference(&source).collect();
+    config_table_agrees(&source, &row_set).unwrap_or_else(|reason| panic!("{reason}"));
+}
+
+#[test]
+fn config_rows_union_accepts_optional_serve_table() {
+    let fixture = tempfile::tempdir().expect("config table fixture");
+    let inference = fixture.path().join("inference/CONFIG.md");
+    let serve = fixture.path().join("serve/CONFIG.md");
+    std::fs::create_dir_all(inference.parent().expect("inference parent"))
+        .expect("fixture inference");
+    std::fs::write(&inference, "| `LATTICE_INFERENCE_ONLY` | value |\n").expect("inference table");
+    assert_eq!(
+        config_rows_at(&inference, &serve).expect("optional serve"),
+        vec!["LATTICE_INFERENCE_ONLY"]
+    );
+    std::fs::create_dir_all(serve.parent().expect("serve parent")).expect("fixture serve");
+    std::fs::write(&serve, "| `LATTICE_SERVE_ONLY` | value |\n").expect("serve table");
+    assert_eq!(
+        config_rows_at(&inference, &serve).expect("union"),
+        vec!["LATTICE_INFERENCE_ONLY", "LATTICE_SERVE_ONLY"]
+    );
+    std::fs::write(&serve, [0xff]).expect("invalid UTF-8 table");
     assert!(
-        missing.is_empty() && stale.is_empty(),
-        "crates/inference/CONFIG.md and the non-test source disagree.\n  read by source but no row: {missing:?}\n  \
-         row but read by no non-test source: {stale:?}"
+        config_rows_at(&inference, &serve).is_err(),
+        "an unreadable table is not absent"
+    );
+    std::fs::remove_file(&serve).expect("remove fixture table");
+    std::fs::create_dir(&serve).expect("directory in place of table");
+    assert!(
+        config_rows_at(&inference, &serve).is_err(),
+        "a table directory is not absent"
+    );
+}
+
+#[test]
+fn config_rows_union_rejects_duplicate_names_across_tables() {
+    let fixture = tempfile::tempdir().expect("config table fixture");
+    let inference = fixture.path().join("inference/CONFIG.md");
+    let serve = fixture.path().join("serve/CONFIG.md");
+    for path in [&inference, &serve] {
+        std::fs::create_dir_all(path.parent().expect("table parent"))
+            .expect("fixture table directory");
+        std::fs::write(path, "| `LATTICE_DUPLICATE` | value |\n").expect("duplicate table");
+    }
+    let reason = config_rows_at(&inference, &serve).expect_err("cross-table duplicate must fail");
+    assert!(
+        reason.contains("LATTICE_DUPLICATE") && reason.contains("listed twice"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("inference/CONFIG.md") && reason.contains("serve/CONFIG.md"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn config_rows_union_rejects_duplicate_names_within_one_table() {
+    let fixture = tempfile::tempdir().expect("config table fixture");
+    let inference = fixture.path().join("CONFIG.md");
+    std::fs::write(
+        &inference,
+        "| `LATTICE_DUPLICATE` | value |\n| `LATTICE_DUPLICATE` | value |\n",
+    )
+    .expect("duplicate table");
+    assert!(
+        config_rows_at(&inference, &fixture.path().join("absent/CONFIG.md"))
+            .expect_err("same-table duplicate must fail")
+            .contains("listed twice")
+    );
+}
+
+#[test]
+fn config_table_rejects_missing_variable_read_only_in_other_crate() {
+    let fixture = tempfile::tempdir().expect("other-crate variable fixture");
+    let source_path = fixture.path().join("embed/src/lib.rs");
+    std::fs::create_dir_all(source_path.parent().expect("source parent"))
+        .expect("fixture source directory");
+    std::fs::write(
+        &source_path,
+        "pub fn read() { let _ = std::env::var(\"LATTICE_OTHER_CRATE_ONLY\"); }",
+    )
+    .expect("other-crate source");
+    let tree = syn::parse_file(&std::fs::read_to_string(source_path).expect("fixture source"))
+        .expect("fixture syntax");
+    let consts = BTreeMap::new();
+    let mut scanner = Scanner {
+        consts: &consts,
+        krate: "embed",
+        file: "src/lib.rs",
+        scope: Vec::new(),
+        hits: Vec::new(),
+    };
+    scanner.visit_file(&tree);
+    assert!(
+        scanner
+            .hits
+            .iter()
+            .any(|hit| hit.name == "LATTICE_OTHER_CRATE_ONLY"
+                && hit.krate == "embed"
+                && hit.kind == Kind::Value)
+    );
+    let names = names_of(&scanner.hits);
+    let reason = config_table_agrees(&names, &BTreeSet::new())
+        .expect_err("other-crate variable needs a row");
+    assert!(
+        reason.contains("read by source but no row: [\"LATTICE_OTHER_CRATE_ONLY\"]"),
+        "{reason}"
+    );
+    assert!(
+        config_table_agrees(&names, &names).is_ok(),
+        "the documented negative twin must be accepted"
+    );
+    let reason = config_table_agrees(&BTreeSet::new(), &names)
+        .expect_err("an unread table name must remain stale");
+    assert!(
+        reason.contains("row but read by no non-test source: [\"LATTICE_OTHER_CRATE_ONLY\"]"),
+        "{reason}"
     );
 }

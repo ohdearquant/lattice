@@ -65,7 +65,7 @@ impl EmbeddingTable {
                 unsafe {
                     let src = (embedding.buffer.contents() as *const u16).add(id * cols);
                     for (i, value) in dst.iter_mut().enumerate() {
-                        *value = crate::weights::half_bits::f16_bits_to_f32(*src.add(i));
+                        *value = lattice_weights::half_bits::f16_bits_to_f32(*src.add(i));
                     }
                 }
             }

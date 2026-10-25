@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Regression tests for prebuilding benchmarks before an arm's sampler starts.
 
-These cases live apart from tests/test_bench_compare_measurement.py because that
-module is already above ADR-102's line cap and may only shrink. The script-level
-runner, admission fixtures, and stubs live in bench_compare_support so both
-suites use the same setup.
+These cases live apart from tests/test_bench_compare_measurement.py. The
+script-level runner, admission fixtures, and stubs live in bench_compare_support
+so both suites use the same setup.
 """
 import json
 import os
@@ -329,6 +328,52 @@ class PrebuildOrdering(support.GpuBenchmarkAdmissionSupport, unittest.TestCase):
         self.assertEqual(
             [record[2] for record in runs], ["running"] * 4,
             f"an embed measurement ran outside a sampled window: {runs}",
+        )
+
+    def test_inference_bench_is_built_before_each_arms_sampler_starts(self):
+        """The control arms build the inference bench before their samplers too.
+
+        head2 and base2 run in a target directory the other revision has just
+        rebuilt, so a control arm without its own build re-links the inference
+        bench inside the sampled window.
+
+        Mutation-sensitive: remove the --no-run call from either control arm
+        and the four-build assertion fails with three builds.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            state_file = Path(temporary) / "cargo-sampler-state.tsv"
+            result = _run(
+                [],
+                stub_cargo=RECORDING_STALE_CHANGE_CARGO,
+                extra_env={"STUB_SAMPLER_STATE_FILE": str(state_file)},
+            )
+            records = [
+                tuple(line.split("\t"))
+                for line in state_file.read_text().splitlines()
+            ]
+        self.assertEqual(
+            result.returncode, 0,
+            f"inference prebuild fixture failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        inference = [record for record in records if record[0] == "lattice-inference"]
+        builds = [record for record in inference if record[1] == "build"]
+        runs = [record for record in inference if record[1] == "run"]
+        self.assertEqual(
+            len(builds), 4,
+            f"expected one inference build per arm, got {builds}\nrecords: {records}",
+        )
+        self.assertEqual(
+            [record[2] for record in builds], ["not-running"] * 4,
+            f"an inference build ran inside a sampled window: {builds}",
+        )
+        self.assertEqual(
+            len(runs), 4,
+            f"expected one inference measurement per arm, got {runs}\nrecords: {records}",
+        )
+        self.assertEqual(
+            [record[2] for record in runs], ["running"] * 4,
+            f"an inference measurement ran outside a sampled window: {runs}",
         )
 
     def _run_handoff(self, temporary, *, fail_first_build=False,

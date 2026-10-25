@@ -51,11 +51,25 @@ pub mod vision;
 /// and [`forward`].
 pub mod weights;
 
+/// Negative-scale Q4 fixture shared by every Q4 consumer's sign test.
+///
+/// Every block has a negative scale, so a consumer that drops the sign, clamps the
+/// scale at zero or otherwise reads the scale's sign computes different weights. Each
+/// consumer test runs the fixture, the same blocks with `|scale|`, and the same blocks
+/// with a zero scale: the first must match the f64 reference, and the other two, which
+/// are exactly what a sign-dropping or zero-clamping consumer would compute on the
+/// fixture, must miss it by more than ten times the tolerance.
+#[cfg(test)]
+mod signed_scale_fixture;
+
 // Standalone modules
 /// Continuous batching and scheduler support for multi-sequence inference. See [`kv_cache`]
 /// and [`model`].
 pub mod batch;
-pub(crate) mod bounded_read;
+#[cfg(test)]
+mod bounded_config;
+#[cfg(test)]
+mod bounded_read;
 /// Registered held-out evidence for router candidate admission.
 #[cfg(feature = "router-learning")]
 pub mod router_admission;
@@ -254,6 +268,7 @@ pub use crate::generation::TokenLogprob;
 pub use crate::generation::TopLogprob;
 /// Grammar-constrained decoding engine, reachable from the root because
 /// [`GenerateConfig::grammar`] carries one. See [`grammar`].
+#[doc(no_inline)]
 pub use crate::grammar::GrammarEngine;
 /// BERT encoder configuration. See [`BertModel`] and [`model`].
 pub use crate::model::BertConfig;

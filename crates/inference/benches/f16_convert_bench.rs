@@ -4,15 +4,16 @@
 //! Measures at N=1024 (the Qwen3.5-0.8B hidden size):
 //! - `scalar`: the crate's production scalar decoder
 //!   (`lattice_inference::weights::bench_support::f16_bits_to_f32`, which
-//!   `weights/mod.rs` re-exports behind `bench-internals` from the single
-//!   always-compiled `weights::half_bits` module every load/quant call site
+//!   `weights.rs` re-exports behind `bench-internals` from the single
+//!   always-compiled `lattice_weights::half_bits` module every load/quant call site
 //!   delegates to — lattice#799). This bench previously carried its own
 //!   copied decoder rather than exercising that migrated path, so its
 //!   numbers said nothing about the consolidation. Requires `--features bench-internals`.
 //!
 //! A NEON fast path (`vcvt_f32_f16`, 4 lanes/instruction) was removed in #568: it
 //! required the nightly-only `stdarch_neon_f16` feature and broke stable-toolchain
-//! builds. `convert_f16_row` in `metal_qwen35.rs` is scalar-only for the same reason.
+//! builds. `convert_f16_row` in `forward/metal_qwen35/inner/buffers.rs` is scalar-only for
+//! the same reason.
 //!
 //! Run: `cargo bench -p lattice-inference --bench f16_convert_bench --features bench-internals`
 //!

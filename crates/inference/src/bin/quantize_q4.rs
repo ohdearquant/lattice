@@ -20,8 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-#[path = "../weights/f16_encode.rs"]
-mod f16_encode;
+use lattice_weights::f16_encode;
 
 // ---------------------------------------------------------------------------
 // Tensor classification: should_quantize

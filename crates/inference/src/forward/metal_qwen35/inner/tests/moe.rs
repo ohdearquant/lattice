@@ -326,7 +326,7 @@ fn from_q4_dir_loads_and_generates_on_synthetic_moe_checkpoint() {
     // rather than the pre-#682 global `e * ...` offsets into one giant
     // resident buffer.
     {
-        use crate::weights::q4_weights::q4_f16_to_f32;
+        use lattice_weights::q4_weights::q4_f16_to_f32;
         let (_, common) = &state.engine.layer_weights[0];
         let MetalFfnWeights::Moe(moe) = &common.ffn else {
             panic!("layer 0 must build MetalFfnWeights::Moe for an is_moe() config");
@@ -2267,4 +2267,411 @@ fn from_q4_dir_rejects_transposed_moe_routed_expert_header() {
         err.contains("shape"),
         "error must name the shape mismatch so it's diagnosable, got: {err}"
     );
+}
+
+#[test]
+fn moe_routing_matches_completed_current_layer_norm() {
+    use lattice_weights::q4_weights::{
+        dequantize_q4_to_f32, load_f16_tensor_file, load_q4_file, q4_f32_to_f16,
+    };
+
+    let mut cfg = synthetic_moe_test_config();
+    cfg.num_hidden_layers = 2;
+    cfg.layer_types = vec![LayerType::FullAttention; 2];
+    cfg.layer_mask = vec![true; 2];
+    let hidden = cfg.hidden_size;
+    let experts = cfg.num_experts.expect("fixture experts");
+    let tmp = tempfile::tempdir().expect("fixture directory");
+    let dir = tmp.path();
+    write_synthetic_moe_checkpoint(dir, &cfg, |_| 0.0, |_| 0.0, |_| 0.0);
+    let original_files: Vec<_> = std::fs::read_dir(dir)
+        .expect("fixture entries")
+        .map(|entry| entry.expect("fixture entry").path())
+        .collect();
+    for path in original_files {
+        let name = path
+            .file_name()
+            .expect("fixture filename")
+            .to_str()
+            .expect("UTF-8 fixture");
+        if name.starts_with("model_language_model_layers_0_") {
+            std::fs::copy(&path, dir.join(name.replacen("layers_0_", "layers_1_", 1)))
+                .expect("copy second layer fixture");
+        }
+    }
+    write_tiny_q4_fixture_per_row(
+        dir,
+        "model.language_model.embed_tokens.weight",
+        cfg.vocab_size,
+        hidden,
+        |row| [1.0, 2.0, 0.5][row % 3],
+    );
+    for layer in 0..2 {
+        let prefix = format!("model.language_model.layers.{layer}");
+        for (projection, rows, cols) in [
+            ("self_attn.q_proj.weight", 2 * cfg.full_q_dim(), hidden),
+            ("self_attn.k_proj.weight", cfg.full_kv_dim(), hidden),
+            ("self_attn.v_proj.weight", cfg.full_kv_dim(), hidden),
+            ("self_attn.o_proj.weight", hidden, cfg.full_q_dim()),
+            (
+                "mlp.shared_expert.gate_proj.weight",
+                cfg.shared_expert_intermediate_size(),
+                hidden,
+            ),
+            (
+                "mlp.shared_expert.up_proj.weight",
+                cfg.shared_expert_intermediate_size(),
+                hidden,
+            ),
+            (
+                "mlp.shared_expert.down_proj.weight",
+                hidden,
+                cfg.shared_expert_intermediate_size(),
+            ),
+        ] {
+            write_tiny_q4_fixture_per_row(
+                dir,
+                &format!("{prefix}.{projection}"),
+                rows,
+                cols,
+                |_| 0.0,
+            );
+        }
+        write_tiny_q4_fixture_per_row(
+            dir,
+            &format!("{prefix}.mlp.gate.weight"),
+            experts,
+            hidden,
+            |expert| [1.0, -1.0, 0.0, 0.0][expert],
+        );
+    }
+    let norm_path = mtp_tensor_path(
+        dir,
+        "model.language_model.layers.1.post_attention_layernorm.weight",
+        "f16",
+    );
+    let mut norm_bytes = std::fs::read(&norm_path).expect("layer-one norm");
+    let payload_start = norm_bytes.len() - hidden * 2;
+    for value in norm_bytes[payload_start..].chunks_exact_mut(2) {
+        value.copy_from_slice(&q4_f32_to_f16(-2.0).to_le_bytes());
+    }
+    std::fs::write(&norm_path, norm_bytes).expect("write shifted negative norm");
+
+    let read_q4 = |name: &str| {
+        let tensor = load_q4_file(&mtp_tensor_path(dir, name, "q4")).expect("decode fixture Q4");
+        dequantize_q4_to_f32(&tensor)
+    };
+    let embeddings = read_q4("model.language_model.embed_tokens.weight");
+    assert_eq!(embeddings.len(), cfg.vocab_size * hidden);
+    let mut expected = Vec::new();
+    for token in [0usize, 1, 2] {
+        let stale = &embeddings[token * hidden..(token + 1) * hidden];
+        assert!(stale.iter().all(|value| *value == stale[0] && *value > 0.0));
+        let inverse_rms = (stale.iter().map(|value| value * value).sum::<f32>() / hidden as f32
+            + cfg.rms_norm_eps)
+            .sqrt()
+            .recip();
+        for layer in 0..2 {
+            let prefix = format!("model.language_model.layers.{layer}");
+            for projection in [
+                "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.o_proj.weight",
+                "mlp.experts.gate_up_proj",
+                "mlp.experts.down_proj",
+                "mlp.shared_expert.gate_proj.weight",
+                "mlp.shared_expert.up_proj.weight",
+                "mlp.shared_expert.down_proj.weight",
+            ] {
+                let values = read_q4(&format!("{prefix}.{projection}"));
+                assert!(
+                    !values.is_empty() && values.iter().all(|value| *value == 0.0),
+                    "fixture output isolation: {prefix}.{projection}"
+                );
+            }
+            let (gamma, shape) = load_f16_tensor_file(&mtp_tensor_path(
+                dir,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                "f16",
+            ))
+            .expect("decode fixture norm");
+            assert_eq!(shape, vec![hidden]);
+            assert!(
+                gamma
+                    .iter()
+                    .all(|value| *value == if layer == 0 { 1.0 } else { -2.0 })
+            );
+            let current: Vec<_> = stale
+                .iter()
+                .zip(gamma)
+                .map(|(value, gamma)| value * inverse_rms * (1.0 + gamma))
+                .collect();
+            let router = read_q4(&format!("{prefix}.mlp.gate.weight"));
+            assert_eq!(router.len(), experts * hidden);
+            let select = |input: &[f32]| {
+                let logits: Vec<f32> = router
+                    .chunks_exact(hidden)
+                    .map(|row| {
+                        row.iter()
+                            .zip(input)
+                            .map(|(weight, value)| weight * value)
+                            .sum()
+                    })
+                    .collect();
+                assert!(logits.iter().all(|value| value.is_finite()));
+                let mut winner = 0;
+                for expert in 1..experts {
+                    if logits[expert] > logits[winner] {
+                        winner = expert;
+                    }
+                }
+                assert!(
+                    logits
+                        .iter()
+                        .enumerate()
+                        .all(|(expert, value)| expert == winner || logits[winner] > *value)
+                );
+                winner
+            };
+            let stale_choice = select(stale);
+            let current_choice = select(&current);
+            assert_eq!(stale_choice, 0);
+            assert_eq!(current_choice, layer);
+            if layer == 1 {
+                assert_ne!(
+                    stale_choice, current_choice,
+                    "fixture must distinguish stale and current hidden"
+                );
+            }
+            expected.push(current_choice);
+        }
+    }
+
+    let _gpu = gpu_test_lock();
+    let _device =
+        Device::system_default().expect("MoE routing freshness witness requires a Metal device");
+    assert!(
+        !crate::env_switch_enabled("LATTICE_DECODE_PROFILE"),
+        "test requires default decode path"
+    );
+    assert!(
+        FORCED_MOE_EXPERTS_FOR_TEST.with(|forced| forced.borrow().is_none()),
+        "test requires real routing"
+    );
+    struct RoutingTraceGuard;
+    impl Drop for RoutingTraceGuard {
+        fn drop(&mut self) {
+            let _ = take_moe_routing_trace();
+        }
+    }
+    let _trace_guard = RoutingTraceGuard;
+    let _ = take_moe_routing_trace();
+    let mut state = MetalQwen35State::from_q4_dir(dir, std::path::Path::new("/dev/null"), &cfg, 16)
+        .expect("load two-layer routing fixture");
+    assert_eq!(state.engine.layer_weights.len(), 2);
+    arm_moe_routing_trace();
+    for (position, token) in [0u32, 1, 2].into_iter().enumerate() {
+        let logits = state.forward_step(token, position);
+        assert_eq!(logits.len(), cfg.vocab_size);
+        assert!(logits.iter().all(|value| value.is_finite()));
+    }
+    let trace = take_moe_routing_trace();
+    assert_eq!(trace.len(), 6, "both layers must route every token");
+    for (index, record) in trace.iter().enumerate() {
+        assert_eq!((record.layer_idx, record.token_idx), (index % 2, index / 2));
+        assert_eq!(record.selected_ids.len(), 1);
+        assert!(record.selected_ids[0] < experts);
+        assert_eq!(record.gate_weights, vec![1.0]);
+        assert_eq!(
+            record.selected_ids,
+            vec![expected[index]],
+            "routing must use current-layer normalized hidden at layer {} position {}",
+            record.layer_idx,
+            record.token_idx
+        );
+    }
+}
+
+#[test]
+fn moe_shared_expert_gate_matches_completed_current_layer_norm() {
+    use lattice_weights::q4_weights::{
+        dequantize_q4_to_f32, load_f16_tensor_file, load_q4_file, q4_f16_to_f32, q4_f32_to_f16,
+    };
+
+    let mut cfg = synthetic_moe_test_config();
+    cfg.shared_expert_intermediate_size = Some(32);
+    let hidden = cfg.hidden_size;
+    let shared_inter = cfg.shared_expert_intermediate_size();
+    let tmp = tempfile::tempdir().expect("fixture directory");
+    let dir = tmp.path();
+    write_synthetic_moe_checkpoint(dir, &cfg, |_| 0.0, |_| 0.0, |_| 0.0);
+    write_tiny_q4_fixture_per_row(
+        dir,
+        "model.language_model.embed_tokens.weight",
+        cfg.vocab_size,
+        hidden,
+        |row| [1.0, 2.0, 0.5][row % 3],
+    );
+    let prefix = "model.language_model.layers.0";
+    for (projection, rows, cols, value) in [
+        ("self_attn.q_proj.weight", 2 * cfg.full_q_dim(), hidden, 0.0),
+        ("self_attn.k_proj.weight", cfg.full_kv_dim(), hidden, 0.0),
+        ("self_attn.v_proj.weight", cfg.full_kv_dim(), hidden, 0.0),
+        ("self_attn.o_proj.weight", hidden, cfg.full_q_dim(), 0.0),
+        (
+            "mlp.shared_expert.gate_proj.weight",
+            shared_inter,
+            hidden,
+            1.0 / hidden as f32,
+        ),
+        (
+            "mlp.shared_expert.up_proj.weight",
+            shared_inter,
+            hidden,
+            1.0 / hidden as f32,
+        ),
+        (
+            "mlp.shared_expert.down_proj.weight",
+            hidden,
+            shared_inter,
+            1.0 / shared_inter as f32,
+        ),
+        (
+            "mlp.shared_expert_gate.weight",
+            1,
+            hidden,
+            1.0 / hidden as f32,
+        ),
+    ] {
+        write_tiny_q4_fixture_per_row(dir, &format!("{prefix}.{projection}"), rows, cols, |_| {
+            value
+        });
+    }
+    let norm_name = format!("{prefix}.post_attention_layernorm.weight");
+    let norm_path = mtp_tensor_path(dir, &norm_name, "f16");
+    let mut norm_bytes = std::fs::read(&norm_path).expect("fixture norm");
+    let payload_start = norm_bytes.len() - hidden * 2;
+    for value in norm_bytes[payload_start..].chunks_exact_mut(2) {
+        value.copy_from_slice(&q4_f32_to_f16(-2.0).to_le_bytes());
+    }
+    std::fs::write(&norm_path, norm_bytes).expect("write negative shifted norm");
+
+    let read_q4 = |name: &str| {
+        let tensor = load_q4_file(&mtp_tensor_path(dir, name, "q4")).expect("read fixture Q4");
+        dequantize_q4_to_f32(&tensor)
+    };
+    let read_shared = |projection: &str| {
+        read_q4(&format!("{prefix}.mlp.shared_expert.{projection}.weight"))
+            .into_iter()
+            .map(|value| q4_f16_to_f32(q4_f32_to_f16(value)))
+            .collect::<Vec<_>>()
+    };
+    let embeddings = read_q4("model.language_model.embed_tokens.weight");
+    let gate = read_shared("gate_proj");
+    let up = read_shared("up_proj");
+    let down = read_shared("down_proj");
+    let shared_gate = read_q4(&format!("{prefix}.mlp.shared_expert_gate.weight"));
+    let (gamma, shape) = load_f16_tensor_file(&norm_path).expect("read fixture norm");
+    assert_eq!(shape, vec![hidden]);
+    assert!(gamma.iter().all(|value| *value == -2.0));
+    assert_eq!(embeddings.len(), cfg.vocab_size * hidden);
+    assert_eq!(gate.len(), shared_inter * hidden);
+    assert_eq!(up.len(), shared_inter * hidden);
+    assert_eq!(down.len(), hidden * shared_inter);
+    assert_eq!(shared_gate.len(), hidden);
+    for projection in [
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+    ] {
+        let values = read_q4(&format!("{prefix}.{projection}"));
+        assert!(!values.is_empty() && values.iter().all(|value| *value == 0.0));
+    }
+    assert!(
+        gate.iter()
+            .chain(&up)
+            .chain(&down)
+            .all(|value| *value > 0.0)
+    );
+    assert!(shared_gate.iter().all(|value| *value > 0.0));
+    let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f32>();
+    let project = |weights: &[f32], input: &[f32]| {
+        weights
+            .chunks_exact(input.len())
+            .map(|row| dot(row, input))
+            .collect::<Vec<_>>()
+    };
+    let sigmoid = |value: f32| 1.0 / (1.0 + (-value).exp());
+    let mut expected = Vec::new();
+    for token in 0..3 {
+        let stale = &embeddings[token * hidden..(token + 1) * hidden];
+        assert!(stale.iter().all(|value| *value == stale[0] && *value > 0.0));
+        let inverse_rms = (dot(stale, stale) / hidden as f32 + cfg.rms_norm_eps)
+            .sqrt()
+            .recip();
+        let current: Vec<_> = stale
+            .iter()
+            .zip(&gamma)
+            .map(|(value, gamma)| value * inverse_rms * (1.0 + gamma))
+            .collect();
+        let fresh_sigmoid = sigmoid(dot(&current, &shared_gate));
+        let stale_sigmoid = sigmoid(dot(stale, &shared_gate));
+        assert!(stale_sigmoid - fresh_sigmoid > 0.35);
+        let projected_gate = project(&gate, &current);
+        let projected_up = project(&up, &current);
+        let activated: Vec<_> = projected_gate
+            .iter()
+            .zip(projected_up)
+            .map(|(gate, up)| gate * sigmoid(*gate) * up)
+            .collect();
+        let shared_output = project(&down, &activated);
+        assert_eq!(shared_output.len(), hidden);
+        assert!(
+            shared_output.iter().all(|value| {
+                value.is_finite() && value * (stale_sigmoid - fresh_sigmoid) > 0.09
+            })
+        );
+        expected.push((shared_output, fresh_sigmoid, stale_sigmoid));
+    }
+
+    let _gpu = gpu_test_lock();
+    let _device = Device::system_default().expect("shared gate witness requires a Metal device");
+    assert!(
+        !crate::env_switch_enabled("LATTICE_DECODE_PROFILE"),
+        "test requires default decode path"
+    );
+    assert!(
+        FORCED_MOE_EXPERTS_FOR_TEST.with(|forced| forced.borrow().is_none()),
+        "test requires real routing"
+    );
+    let mut state = MetalQwen35State::from_q4_dir(dir, std::path::Path::new("/dev/null"), &cfg, 16)
+        .expect("load shared gate fixture");
+    assert_eq!(state.engine.layer_weights.len(), 1);
+    assert!(matches!(
+        &state.engine.layer_weights[0].1.ffn,
+        MetalFfnWeights::Moe(_)
+    ));
+    for (position, (shared_output, fresh_sigmoid, stale_sigmoid)) in expected.iter().enumerate() {
+        let logits = state.forward_step(position as u32, position);
+        assert_eq!(logits.len(), cfg.vocab_size);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        // SAFETY: forward_step completed all GPU work; ffn_out is a live Shared
+        // [hidden] f32 buffer, retained separately from the final normalized hidden.
+        let actual = unsafe { read_buffer(&state.session.activations.ffn_out, hidden) };
+        assert_eq!(actual.len(), hidden);
+        for (row, (actual, shared_output)) in actual.iter().zip(shared_output).enumerate() {
+            let fresh = shared_output * fresh_sigmoid;
+            let stale = shared_output * stale_sigmoid;
+            assert!(
+                actual.is_finite() && (*actual - fresh).abs() < 1e-3,
+                "shared expert must use current-layer normalized gate at position {position} \
+                 row {row}: actual={actual}, fresh={fresh}, stale={stale}"
+            );
+            assert!((*actual - stale).abs() > 0.08);
+        }
+    }
 }

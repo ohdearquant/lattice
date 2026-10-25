@@ -287,7 +287,7 @@ fn candidate_pre_gate_value_only(fx: &Fixture) -> Vec<f32> {
 /// `o_proj` absorbs the matching rotation on its input side. Expected to
 /// match dense output exactly (a pure post-nonlinearity linear
 /// reparameterization, structurally identical to the already-proven
-/// `rotation.rs` input-side absorption identity — the orientation
+/// `lattice_quant::quarot::rotation` input-side absorption identity — the orientation
 /// (post-gate, input-side on `o_proj`) is what this identity requires;
 /// the AXIS must independently match QuaRot's cross-head factor, which
 /// is what `r3_axis_discriminates_cross_head_from_intra_head` below

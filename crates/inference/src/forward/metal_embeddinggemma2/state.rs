@@ -4,11 +4,15 @@
 //! the oracle for every kernel here.
 
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLGPUFamily, MTLResourceOptions, MTLSize,
+    Buffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device,
+    MTLCommandBufferStatus, MTLGPUFamily, MTLSize,
 };
 
 use crate::error::InferenceError;
+use crate::forward::metal_runtime::{
+    self, BufferPolicy, ELEMENT_THREADS, UploadCopy, ZeroLengthPolicy, bind, element_dispatch,
+    scalar,
+};
 use crate::model::embeddinggemma2::{EmbeddingGemma2Model, LayerWeights, Weights};
 use crate::model::embeddinggemma2_config::{EmbeddingGemma2Config, EmbeddingGemma2LayerKind};
 use crate::model::gemma4_ops::{gemma4_rope_cos_sin, gemma4_rope_inv_freq};
@@ -30,7 +34,6 @@ const ATTENTION_SHADER: &str = include_str!("../shaders/embeddinggemma2_attentio
 const VISION_SHADER: &str = include_str!("../shaders/embeddinggemma2_vision.metal");
 const GEMM_SG_SHADER: &str = include_str!("../shaders/gemm_f32_sg.metal");
 const ATTENTION_SG_SHADER: &str = include_str!("../shaders/attention_sg_hd64.metal");
-const ELEMENT_THREADS: u64 = 256;
 const ATTENTION_ROWS: u64 = 8;
 /// Threads of the simdgroup-matrix kernels: four simdgroups.
 const MATRIX_THREADS: u64 = 128;
@@ -54,17 +57,7 @@ fn runtime(message: impl Into<String>) -> InferenceError {
 }
 
 fn elements(name: &str, rows: usize, width: usize) -> Result<usize, InferenceError> {
-    let count = rows
-        .checked_mul(width)
-        .ok_or_else(|| invalid(format!("{name} element count overflow")))?;
-    u32::try_from(count).map_err(|_| invalid(format!("{name} exceeds u32 indexing")))?;
-    let bytes = count
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| invalid(format!("{name} byte count overflow")))?;
-    if bytes > isize::MAX as usize {
-        return Err(invalid(format!("{name} exceeds host slice capacity")));
-    }
-    Ok(count)
+    metal_runtime::elements(name, rows, width, invalid)
 }
 
 /// The distinct attention head widths the device pipelines must cover.
@@ -432,43 +425,24 @@ fn gpu_span(
     (end - start).max(0.0)
 }
 
+const BUFFER_POLICY: BufferPolicy = BufferPolicy {
+    zero_length: ZeroLengthPolicy::MinimumF32,
+    invalid,
+    runtime,
+};
+
 fn allocate(device: &Device, count: usize, label: &str) -> Result<Buffer, InferenceError> {
-    let count = elements(label, count, 1)?;
-    let bytes = (count * size_of::<f32>()) as u64;
-    if bytes > device.max_buffer_length() {
-        return Err(runtime(format!(
-            "{label} exceeds the device buffer capacity"
-        )));
-    }
-    let selector = objc::runtime::Sel::register("newBufferWithLength:options:");
-    // SAFETY: this is the Metal allocation selector with its documented NSUInteger
-    // length/options ABI and nullable object return. A raw pointer preserves nil
-    // until it can be checked, unlike metal-rs's non-null Buffer return type.
-    let raw: *mut metal::MTLBuffer = unsafe {
-        objc::Message::send_message(
-            &**device,
-            selector,
-            (bytes.max(4), MTLResourceOptions::StorageModeShared),
-        )
-    }
-    .map_err(|error| runtime(format!("{label} allocation message failed: {error}")))?;
-    if raw.is_null() {
-        return Err(runtime(format!("{label} allocation failed")));
-    }
-    // SAFETY: Metal returned a non-null owned (+1) MTLBuffer. Transferring that
-    // ownership exactly once to Buffer pairs it with metal-rs's release on drop.
-    let buffer = unsafe { <Buffer as metal::foreign_types::ForeignType>::from_ptr(raw) };
-    buffer.set_label(label);
-    if buffer.contents().is_null() || buffer.length() < bytes {
-        return Err(runtime(format!("{label} allocation is not CPU accessible")));
-    }
-    Ok(buffer)
+    metal_runtime::allocate(device, count, label, BUFFER_POLICY)
 }
 
 fn upload(device: &Device, values: &[f32], label: &str) -> Result<Buffer, InferenceError> {
-    let buffer = allocate(device, values.len(), label)?;
-    write_f32(&buffer, values)?;
-    Ok(buffer)
+    metal_runtime::upload(
+        device,
+        values,
+        label,
+        BUFFER_POLICY,
+        UploadCopy::Checked(write_f32),
+    )
 }
 
 /// A read-only `f32` view over the first `count` elements of a shared buffer, without a copy.
@@ -524,31 +498,12 @@ fn read_f32(buffer: &Buffer, count: usize) -> Result<Vec<f32>, InferenceError> {
     Ok(unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), count) }.to_vec())
 }
 
-fn bind(enc: &ComputeCommandEncoderRef, index: u64, buffer: &Buffer) {
-    enc.set_buffer(index, Some(buffer), 0);
-}
-
-fn scalar<T: Copy>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
-    enc.set_bytes(
-        index,
-        size_of::<T>() as u64,
-        std::ptr::from_ref(value).cast(),
-    );
-}
-
-fn element_dispatch(enc: &ComputeCommandEncoderRef, count: u32) {
-    enc.dispatch_thread_groups(
-        MTLSize::new(u64::from(count).div_ceil(ELEMENT_THREADS), 1, 1),
-        MTLSize::new(ELEMENT_THREADS, 1, 1),
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Pipelines
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct AttentionParams {
     seq_len: u32,
     heads: u32,
@@ -599,31 +554,9 @@ impl Pipelines {
         source.push_str(VISION_SHADER);
         source.push_str(GEMM_SG_SHADER);
         source.push_str(ATTENTION_SG_SHADER);
-        let options = CompileOptions::new();
-        options.set_fast_math_enabled(false);
-        let library = device
-            .new_library_with_source(&source, &options)
-            .map_err(|error| runtime(format!("shader compilation failed: {error}")))?;
+        let library = metal_runtime::compile_library(device, &source, runtime)?;
         let make = |name: &str, threads: u64| -> Result<ComputePipelineState, InferenceError> {
-            let function = library
-                .get_function(name, None)
-                .map_err(|error| runtime(format!("missing {name} kernel: {error}")))?;
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(|error| runtime(format!("{name} pipeline failed: {error}")))?;
-            if pipeline.max_total_threads_per_threadgroup() < threads {
-                return Err(runtime(format!(
-                    "{name} needs {threads} threads per group, pipeline permits {}",
-                    pipeline.max_total_threads_per_threadgroup()
-                )));
-            }
-            if pipeline.static_threadgroup_memory_length() > device.max_threadgroup_memory_length()
-            {
-                return Err(runtime(format!(
-                    "{name} exceeds threadgroup memory capacity"
-                )));
-            }
-            Ok(pipeline)
+            metal_runtime::make_pipeline(device, &library, name, threads, runtime)
         };
         let attention_threads = ATTENTION_ROWS * SIMD_WIDTH;
         let limits = device.max_threads_per_threadgroup();

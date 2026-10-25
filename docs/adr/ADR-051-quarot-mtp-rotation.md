@@ -258,7 +258,7 @@ variant absorbs. Therefore:
 H_d · H_d · x = x    [exact, no separate R^T needed]
 ```
 
-The code convention (see `quant::quarot::hadamard.rs:120-127`) defines `R = H · diag(s)` where
+The code convention (see `crates/quant/src/quarot/hadamard.rs`) defines `R = H · diag(s)` where
 `s_i ∈ {+1,-1}` are the random sign flips from the seed. `apply()` performs sign flip then WHT.
 Therefore `R^T = diag(s) · H` (since `diag(s)^T = diag(s)` and `H^T = H`), and `apply_inverse()`
 performs WHT then sign flip.
@@ -364,6 +364,6 @@ not change the dtype or buffer layout; no GPU kernel changes are required for Ph
 - ADR-044: QuaRot rotated quantization (rotation absorption, RMSNorm fusion, forward-equivalence gate)
 - ADR-006: Speculative decoding (MtpVerifier, `mtp_forward_one`, cache rollback)
 - `src/forward/metal_qwen35.rs:5015` — `mtp_forward_one` Phase 1 (CPU) and Phase 2 (GPU) structure
-- `src/quant/quarot/hadamard.rs` — `walsh_hadamard_orthonormal_in_place` (f32, self-inverse)
+- `crates/quant/src/quarot/hadamard.rs` — `walsh_hadamard_orthonormal_in_place` (f32, self-inverse)
 - `src/quant/quarot/plan.rs` — `RotationPlan`, `RandomizedHadamard`
 - Ashkboos et al., _QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs_, NeurIPS 2024, arxiv:2404.00456

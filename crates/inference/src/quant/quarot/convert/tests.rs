@@ -3,7 +3,7 @@ use crate::model::qwen35_config::{LayerType, compute_layer_types};
 use crate::quant::quarot::lm_head::{
     QWEN35_EMBED_TOKENS_NAME, QWEN35_FINAL_NORM_NAME, QWEN35_LM_HEAD_NAME,
 };
-use crate::weights::q4_weights::q4_f32_to_f16;
+use lattice_weights::q4_weights::q4_f32_to_f16;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -1343,7 +1343,7 @@ fn tiny_config_json_with_mtp(cfg: &Qwen35Config) -> String {
 /// scaled down to the tiny test config's `hidden_size=8`) into `path`.
 ///
 /// Shapes are derived from the loader expectations in
-/// `metal_qwen35.rs:load_mtp_q4_weights`:
+/// `load_mtp_q4_weights` (`forward/metal_qwen35/inner/weights.rs`):
 ///   - fc.weight:              [hidden, 2*hidden]   → fc projects concat(embed, hidden)
 ///   - q_proj.weight:          [num_heads*head_dim*4, hidden]  — use 4*hidden rows
 ///   - k_proj.weight:          [num_kv_heads*head_dim, hidden] — use hidden rows

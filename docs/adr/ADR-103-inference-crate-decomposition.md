@@ -23,6 +23,40 @@ that did not match the repository. Changed:
    Context counting method, the Context statement that `bytes_to_unicode` is public (its facade re-export is
    `cfg(test)` only), and the compile-scope consequence.
 
+## Amendment 2 (2026-10-22)
+
+The grammar extraction (lattice-grammar) met a case D5 did not cover: a consumer-feature gate on a public item that
+the facade re-exports. Changed:
+
+1. D5: such a gate is kept, as a feature of the new crate with the same name and meaning, forwarded by the facade's
+   feature of that name. Removing it would compile the item unconditionally and add it to the facade's default public
+   listing, which breaks D6.2's identical listing. First case: lattice-grammar `bench-internals` (`BfsDedupProfile`,
+   `profile_reachable_states`, and a test module gated `all(test, feature = "bench-internals")`, now run by its own
+   Linux CI step). The removal rule still applies to gates on items that are not on the facade's public listing.
+
+## Amendment 3 (2026-10-24)
+
+The first case of D9 step 3 moves the shared Metal runtime module (`forward/metal_runtime.rs`) into its own crate.
+Recorded:
+
+1. D8.1: the crate is `lattice-metal-runtime`. It depends on `lattice-inference-core` for `InferenceError` and, on
+   macOS under its `metal-gpu` feature, on `metal`, `objc` and `bytemuck`; its whole library compiles only on macOS
+   with that feature. The facade depends on it only under its own `metal-gpu`, which forwards the feature. It publishes
+   in the second tier, beside `lattice-tokenizer`, `lattice-grammar` and `lattice-weights`.
+2. D4: the module's items take disposition 2 (Public). They are the crate's whole job, and the facade imports them
+   `pub(crate)`, so its public listing is unchanged. One item needed more than wider visibility. `scalar` copies the
+   bytes of its argument into a Metal argument table. While it was crate-private, every caller was in view; a public
+   safe function cannot rely on that. Its bound narrows from `Copy` to `bytemuck::NoUninit`, which excludes types with
+   padding or other uninitialized bytes, and a compile-time assertion limits the type to 1 to 4095 bytes, inside the
+   4 KB that Metal's `setBytes` accepts. This is the move's one signature change, and D6.6 admits it because
+   disposition 2 requires it. The two model parameter structs passed to `scalar` gain the derive.
+3. The GPU test lock stays in `lattice-inference` (`measurement::gpu_test_lock`). The measurement harness admits
+   `lattice-inference` targets only and the lock-coverage contract lists entry points inside `lattice-inference`, so
+   moving the lock would be a harness change, which D6.5 keeps out of an extraction. The module's device test
+   therefore moves to `lattice-inference`'s integration tests (`tests/metal_runtime_buffers.rs`), takes the same lock
+   there, and is listed as a guarded entry point in the lock-coverage contract. The new crate keeps the module's pure
+   unit test and has no device test of its own.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
@@ -58,7 +92,7 @@ Measured at `main` b58ce287 with `wc -l` over the `.rs` files under each crate's
 | `lattice-fann`      |                                 13,516 |
 | `lattice-transport` |                                  5,723 |
 
-`lattice-inference` is about 84% of the workspace's library source. Its largest top-level modules are `forward`
+`lattice-inference` is about 84% of the workspace's source lines. Its largest top-level modules are `forward`
 (89,894 lines), `model` (57,355), `bin` (29,771), `weights` (22,509), `serve` (21,709), `attention` (16,348), `quant`
 (15,691), `grammar` (13,595), `vision` (11,033), `decoder` (9,282) and `tokenizer` (8,243). Every change to any of them
 recompiles the whole crate, review ownership is crate-wide, and a downstream user who needs one tokenizer compiles a
@@ -182,6 +216,13 @@ three tokenizer items listed under Context) is removed in the move, and the item
 a gate would require the new crate to declare consumer features it does not use, only so the facade can forward them.
 Where the gate also has a `cfg(test)` alternative, it cannot be kept at all: `cfg(test)` is false in a dependency when
 the facade's tests run, so a kept gate would break the CPU test suites that call these items today.
+
+A consumer-feature gate on a public item that the facade re-exports is kept, as a feature of the new crate with the
+same name and meaning, forwarded by the facade's feature of that name (Amendment 2). Removing it would compile the item
+unconditionally and add it to the facade's default public listing, which breaks D6.2's identical listing. First case:
+lattice-grammar `bench-internals`. The removal rule above still applies to gates on items that are not on the facade's
+public listing.
+
 New crates add no default features of their own; the facade's defaults are unchanged.
 
 ### D6. Acceptance of every extraction change
@@ -219,8 +260,10 @@ New crates add no default features of their own; the facade's defaults are uncha
 5. **CI reach.** Workflow path filters that select work by source path (for example the end-to-end parity gate,
    which watches `crates/inference/src/**` and `crates/embed/src/**`) are extended to the new crate's paths in the same
    change, so moved code keeps triggering the gates it triggered before. The same holds for checked-in lists that
-   name the crate a measurement target lives in: GPU-handoff admission reads the bench targets declared in
-   `crates/inference/Cargo.toml`, `scripts/lib/bench_admission.py` keeps required-feature tables that must name the
+   name the crate a measurement target lives in: GPU-handoff admission reads the `targets` and `bins` arrays in
+   `[package.metadata.gpu-bench-handoff]` in `crates/inference/Cargo.toml` and its `[[bench]]` and `[[bin]]` declarations.
+   For a binary without a `[[bin]]` table, when `autobins` is not false it reads
+   `crates/inference/src/bin/<name>.rs`. `scripts/lib/bench_admission.py` keeps required-feature tables that must name the
    same sets (admission refuses a revision where they differ), and `scripts/bench-measurements.toml` classifies
    binaries by path. A change that moves a bench target or a binary out of `crates/inference` updates all three in
    the same change. The measurement harness admits targets of `lattice-inference` only, so moving a GPU-driving
@@ -251,10 +294,9 @@ narrower crate in their own changes. A CI check over `cargo metadata` fails if a
    Because a dry run also passes when someone else already owns the name, that release re-checks on crates.io,
    immediately before the first upload, that each new name is still unowned or owned by the account that publishes
    the existing lattice crates. The check reads `https://crates.io/api/v1/crates/<name>` and its `owners` endpoint
-   with an identifying `User-Agent`, in the same pass as a control read of a crate that is known to exist, as the
-   registry check in `CLAUDE.md` (Publishing) does. Only a 404 for the name, with the control read succeeding, counts
-   as unowned. A refused, unreadable or timed-out answer, a failed control read, or an owner other than that account
-   stops the release before anything is uploaded.
+   with an identifying `User-Agent`, in the same pass as a control read of a crate that is known to exist. Only a
+   404 for the name, with the control read succeeding, counts as unowned. A refused, unreadable or timed-out answer,
+   a failed control read, or an owner other than that account stops the release before anything is uploaded.
 4. A new crate joins the semver job's package list in the first change after its first release, when a baseline
    exists. From then on the extracted crate is checked directly, which is where its API is now defined.
 

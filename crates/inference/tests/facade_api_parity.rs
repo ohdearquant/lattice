@@ -399,3 +399,665 @@ fn functions_and_constants_are_the_same_items_at_both_paths() {
         GEMMA4_AUDIO_HOP_LENGTH_SAMPLES
     );
 }
+
+mod grammar_parity {
+    use lattice_grammar as extracted;
+    use lattice_inference::grammar as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn grammar_types_are_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<facade::engine::MaskProfile>,
+            PhantomData::<extracted::engine::MaskProfile>,
+        );
+        same_type(
+            PhantomData::<facade::engine::BuildProfile>,
+            PhantomData::<extracted::engine::BuildProfile>,
+        );
+        same_type(
+            PhantomData::<facade::engine::GrammarError>,
+            PhantomData::<extracted::engine::GrammarError>,
+        );
+        same_type(
+            PhantomData::<facade::engine::GrammarEngine>,
+            PhantomData::<extracted::engine::GrammarEngine>,
+        );
+        same_type(
+            PhantomData::<facade::gbnf::GbnfError>,
+            PhantomData::<extracted::gbnf::GbnfError>,
+        );
+        same_type(
+            PhantomData::<facade::json_schema::SchemaError>,
+            PhantomData::<extracted::json_schema::SchemaError>,
+        );
+        same_type(
+            PhantomData::<facade::pda::Alt>,
+            PhantomData::<extracted::pda::Alt>,
+        );
+        same_type(
+            PhantomData::<facade::pda::Symbol>,
+            PhantomData::<extracted::pda::Symbol>,
+        );
+        same_type(
+            PhantomData::<facade::pda::Rule>,
+            PhantomData::<extracted::pda::Rule>,
+        );
+        same_type(
+            PhantomData::<facade::pda::CompiledGrammar>,
+            PhantomData::<extracted::pda::CompiledGrammar>,
+        );
+        same_type(
+            PhantomData::<facade::pda::StackFrame>,
+            PhantomData::<extracted::pda::StackFrame>,
+        );
+        same_type(
+            PhantomData::<facade::pda::GrammarState>,
+            PhantomData::<extracted::pda::GrammarState>,
+        );
+        same_type(
+            PhantomData::<facade::pda::StackLimitError>,
+            PhantomData::<extracted::pda::StackLimitError>,
+        );
+        same_type(
+            PhantomData::<facade::pda::StepResult>,
+            PhantomData::<extracted::pda::StepResult>,
+        );
+        same_type(
+            PhantomData::<facade::pda::SimResult>,
+            PhantomData::<extracted::pda::SimResult>,
+        );
+        same_type(
+            PhantomData::<facade::pda::BuilderError>,
+            PhantomData::<extracted::pda::BuilderError>,
+        );
+        same_type(
+            PhantomData::<facade::pda::GrammarBuilder>,
+            PhantomData::<extracted::pda::GrammarBuilder>,
+        );
+        same_type(
+            PhantomData::<facade::spec::GrammarSpec>,
+            PhantomData::<extracted::spec::GrammarSpec>,
+        );
+        same_type(
+            PhantomData::<facade::trie::ByteTrie>,
+            PhantomData::<extracted::trie::ByteTrie>,
+        );
+        same_type(
+            PhantomData::<facade::vocab_partition::VocabPartition>,
+            PhantomData::<extracted::vocab_partition::VocabPartition>,
+        );
+        same_type(
+            PhantomData::<facade::GrammarEngine>,
+            PhantomData::<extracted::GrammarEngine>,
+        );
+        same_type(
+            PhantomData::<facade::GrammarError>,
+            PhantomData::<extracted::GrammarError>,
+        );
+        same_type(
+            PhantomData::<facade::GrammarSpec>,
+            PhantomData::<extracted::GrammarSpec>,
+        );
+    }
+
+    #[test]
+    fn grammar_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::engine::enable_mask_profiling,
+            extracted::engine::enable_mask_profiling,
+        );
+        same_function(
+            facade::engine::take_mask_profile,
+            extracted::engine::take_mask_profile,
+        );
+        same_function(
+            facade::engine::context_recheck_simulated,
+            extracted::engine::context_recheck_simulated,
+        );
+        same_function(
+            facade::engine::context_recheck_candidates,
+            extracted::engine::context_recheck_candidates,
+        );
+        same_function(
+            facade::engine::last_build_profile,
+            extracted::engine::last_build_profile,
+        );
+        same_function(
+            facade::engine::probe_reachable_states,
+            extracted::engine::probe_reachable_states,
+        );
+        same_function(facade::gbnf::parse_gbnf, extracted::gbnf::parse_gbnf);
+        same_function(
+            facade::json_schema::compile_json_schema,
+            extracted::json_schema::compile_json_schema,
+        );
+        same_function(
+            facade::json_schema::compile,
+            extracted::json_schema::compile,
+        );
+        same_function(facade::pda::advance_byte, extracted::pda::advance_byte);
+        same_function(facade::pda::simulate_token, extracted::pda::simulate_token);
+    }
+
+    #[test]
+    fn grammar_constants_are_equal_at_both_paths() {
+        assert_eq!(facade::pda::UNCHOSEN_ALT, extracted::pda::UNCHOSEN_ALT);
+        assert_eq!(
+            facade::vocab_partition::MAX_GRAMMAR_STATES,
+            extracted::vocab_partition::MAX_GRAMMAR_STATES
+        );
+    }
+
+    #[test]
+    fn grammar_error_conversions_and_thread_safety_are_preserved() {
+        fn send_sync<T: Send + Sync>() {}
+        fn error<T: std::error::Error + Send + Sync + 'static>() {}
+        fn from<T: From<U>, U>() {}
+
+        send_sync::<facade::GrammarEngine>();
+        send_sync::<facade::GrammarSpec>();
+        send_sync::<facade::pda::CompiledGrammar>();
+        send_sync::<facade::pda::GrammarState>();
+        send_sync::<facade::trie::ByteTrie>();
+        send_sync::<facade::vocab_partition::VocabPartition>();
+        error::<facade::GrammarError>();
+        error::<facade::gbnf::GbnfError>();
+        error::<facade::json_schema::SchemaError>();
+        error::<facade::pda::BuilderError>();
+        error::<facade::pda::StackLimitError>();
+        from::<facade::GrammarError, extracted::gbnf::GbnfError>();
+        from::<facade::GrammarError, extracted::json_schema::SchemaError>();
+        from::<facade::GrammarError, extracted::pda::BuilderError>();
+        from::<facade::GrammarError, extracted::pda::StackLimitError>();
+        from::<facade::gbnf::GbnfError, extracted::pda::BuilderError>();
+        from::<facade::json_schema::SchemaError, extracted::pda::BuilderError>();
+        from::<lattice_inference::InferenceError, extracted::GrammarError>();
+        from::<lattice_inference_core::InferenceError, facade::GrammarError>();
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn grammar_profiling_items_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::engine::BfsDedupProfile>,
+            PhantomData::<extracted::engine::BfsDedupProfile>,
+        );
+        same_function(
+            facade::engine::profile_reachable_states,
+            extracted::engine::profile_reachable_states,
+        );
+    }
+}
+
+mod weights_parity {
+    use lattice_inference::weights as facade;
+    use lattice_weights as extracted;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn weights_types_are_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<facade::f16_weights::F16>,
+            PhantomData::<extracted::f16_weights::F16>,
+        );
+        same_type(
+            PhantomData::<facade::f16_weights::F16AttentionWeights>,
+            PhantomData::<extracted::f16_weights::F16AttentionWeights>,
+        );
+        same_type(
+            PhantomData::<facade::f16_weights::F16CommonLayerWeights>,
+            PhantomData::<extracted::f16_weights::F16CommonLayerWeights>,
+        );
+        same_type(
+            PhantomData::<facade::f16_weights::F16FeedForwardWeights>,
+            PhantomData::<extracted::f16_weights::F16FeedForwardWeights>,
+        );
+        same_type(
+            PhantomData::<facade::f16_weights::F16FullAttentionLayerWeights>,
+            PhantomData::<extracted::f16_weights::F16FullAttentionLayerWeights>,
+        );
+        same_type(
+            PhantomData::<facade::f16_weights::F16GatedDeltaNetWeights>,
+            PhantomData::<extracted::f16_weights::F16GatedDeltaNetWeights>,
+        );
+        same_type(
+            PhantomData::<facade::f16_weights::F16ModelWeights>,
+            PhantomData::<extracted::f16_weights::F16ModelWeights>,
+        );
+        same_type(
+            PhantomData::<facade::f16_weights::F16MoeLayerWeights>,
+            PhantomData::<extracted::f16_weights::F16MoeLayerWeights>,
+        );
+        same_type(
+            PhantomData::<facade::f16_weights::F16MoeRouter>,
+            PhantomData::<extracted::f16_weights::F16MoeRouter>,
+        );
+        same_type(
+            PhantomData::<facade::f16_weights::F16RoutedExperts>,
+            PhantomData::<extracted::f16_weights::F16RoutedExperts>,
+        );
+        same_type(
+            PhantomData::<facade::f16_weights::F16SharedExpert>,
+            PhantomData::<extracted::f16_weights::F16SharedExpert>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::BertWeights<'static>>,
+            PhantomData::<extracted::f32_weights::BertWeights<'static>>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::CrossEncoderWeights>,
+            PhantomData::<extracted::f32_weights::CrossEncoderWeights>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::QwenLayerWeights<'static>>,
+            PhantomData::<extracted::f32_weights::QwenLayerWeights<'static>>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::QwenWeights<'static>>,
+            PhantomData::<extracted::f32_weights::QwenWeights<'static>>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::SafetensorsFile>,
+            PhantomData::<extracted::f32_weights::SafetensorsFile>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::SafetensorsIndex>,
+            PhantomData::<extracted::f32_weights::SafetensorsIndex>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::ShardedQwenBacking>,
+            PhantomData::<extracted::f32_weights::ShardedQwenBacking>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::ShardedSafetensors>,
+            PhantomData::<extracted::f32_weights::ShardedSafetensors>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::Tensor>,
+            PhantomData::<extracted::f32_weights::Tensor>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::Tensor1D<'static>>,
+            PhantomData::<extracted::f32_weights::Tensor1D<'static>>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::Tensor2D<'static>>,
+            PhantomData::<extracted::f32_weights::Tensor2D<'static>>,
+        );
+        same_type(
+            PhantomData::<facade::f32_weights::TransformerLayerWeights<'static>>,
+            PhantomData::<extracted::f32_weights::TransformerLayerWeights<'static>>,
+        );
+        same_type(
+            PhantomData::<facade::q3_weights::Q3Block>,
+            PhantomData::<extracted::q3_weights::Q3Block>,
+        );
+        same_type(
+            PhantomData::<facade::q3_weights::Q3FileHeader>,
+            PhantomData::<extracted::q3_weights::Q3FileHeader>,
+        );
+        same_type(
+            PhantomData::<facade::q3_weights::Q3Tensor>,
+            PhantomData::<extracted::q3_weights::Q3Tensor>,
+        );
+        same_type(
+            PhantomData::<facade::q4_weights::F16LoadError>,
+            PhantomData::<extracted::q4_weights::F16LoadError>,
+        );
+        same_type(
+            PhantomData::<facade::q4_weights::Q4Block>,
+            PhantomData::<extracted::q4_weights::Q4Block>,
+        );
+        same_type(
+            PhantomData::<facade::q4_weights::Q4FileHeader>,
+            PhantomData::<extracted::q4_weights::Q4FileHeader>,
+        );
+        same_type(
+            PhantomData::<facade::q4_weights::Q4Tensor>,
+            PhantomData::<extracted::q4_weights::Q4Tensor>,
+        );
+        same_type(
+            PhantomData::<facade::q8_weights::Q8Matrix>,
+            PhantomData::<extracted::q8_weights::Q8Matrix>,
+        );
+        same_type(
+            PhantomData::<facade::SafetensorsFile>,
+            PhantomData::<extracted::SafetensorsFile>,
+        );
+        same_type(
+            PhantomData::<facade::SafetensorsIndex>,
+            PhantomData::<extracted::SafetensorsIndex>,
+        );
+        same_type(
+            PhantomData::<facade::Tensor>,
+            PhantomData::<extracted::Tensor>,
+        );
+        same_type(
+            PhantomData::<facade::CrossEncoderWeights>,
+            PhantomData::<extracted::CrossEncoderWeights>,
+        );
+        same_type(
+            PhantomData::<facade::ShardedSafetensors>,
+            PhantomData::<extracted::ShardedSafetensors>,
+        );
+        same_type(
+            PhantomData::<facade::Tensor1D<'static>>,
+            PhantomData::<extracted::Tensor1D<'static>>,
+        );
+    }
+
+    #[test]
+    fn weights_tensor_source_is_the_same_trait_at_both_paths() {
+        fn facade_bound<T: facade::f32_weights::TensorSource + ?Sized>() {}
+        fn extracted_bound<T: extracted::f32_weights::TensorSource + ?Sized>() {}
+        fn extracted_implies_facade<T: extracted::f32_weights::TensorSource + ?Sized>() {
+            facade_bound::<T>();
+        }
+        fn facade_implies_extracted<T: facade::f32_weights::TensorSource + ?Sized>() {
+            extracted_bound::<T>();
+        }
+        extracted_implies_facade::<extracted::SafetensorsFile>();
+        facade_implies_extracted::<facade::SafetensorsFile>();
+    }
+
+    #[test]
+    fn weights_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::f16_weights::f16_to_f32_slice,
+            extracted::f16_weights::f16_to_f32_slice,
+        );
+        same_function(
+            facade::f16_weights::f32_to_f16_slice,
+            extracted::f16_weights::f32_to_f16_slice,
+        );
+        same_function(
+            facade::f32_weights::contained_shard_path,
+            extracted::f32_weights::contained_shard_path,
+        );
+        same_function(
+            facade::f32_weights::load_sharded,
+            extracted::f32_weights::load_sharded,
+        );
+        same_function(
+            facade::f32_weights::parse_index,
+            extracted::f32_weights::parse_index,
+        );
+        same_function(
+            facade::f32_weights::resolve_shard,
+            extracted::f32_weights::resolve_shard,
+        );
+        same_function(
+            facade::q3_weights::dequantize_q3_to_f32,
+            extracted::q3_weights::dequantize_q3_to_f32,
+        );
+        same_function(
+            facade::q3_weights::dequantize_row_q3_0,
+            extracted::q3_weights::dequantize_row_q3_0,
+        );
+        same_function(
+            facade::q3_weights::gemm_q3_reference,
+            extracted::q3_weights::gemm_q3_reference,
+        );
+        same_function(
+            facade::q3_weights::gemv_q3_reference,
+            extracted::q3_weights::gemv_q3_reference,
+        );
+        same_function(
+            facade::q3_weights::load_q3_file,
+            extracted::q3_weights::load_q3_file,
+        );
+        same_function(
+            facade::q3_weights::quantize_bf16_to_q3,
+            extracted::q3_weights::quantize_bf16_to_q3,
+        );
+        same_function(
+            facade::q3_weights::quantize_f32_to_q3,
+            extracted::q3_weights::quantize_f32_to_q3,
+        );
+        same_function(
+            facade::q3_weights::quantize_f32_to_q3_mode,
+            extracted::q3_weights::quantize_f32_to_q3_mode,
+        );
+        same_function(
+            facade::q3_weights::quantize_row_q3_0,
+            extracted::q3_weights::quantize_row_q3_0,
+        );
+        same_function(
+            facade::q3_weights::quantize_tensor_q3_0,
+            extracted::q3_weights::quantize_tensor_q3_0,
+        );
+        same_function(
+            facade::q3_weights::read_q3_header::<std::fs::File>,
+            extracted::q3_weights::read_q3_header::<std::fs::File>,
+        );
+        same_function(
+            facade::q3_weights::save_q3_file,
+            extracted::q3_weights::save_q3_file,
+        );
+        same_function(
+            facade::q3_weights::validate_q3_mlp_role,
+            extracted::q3_weights::validate_q3_mlp_role,
+        );
+        same_function(
+            facade::q4_weights::dequantize_q4_to_f32,
+            extracted::q4_weights::dequantize_q4_to_f32,
+        );
+        same_function(
+            facade::q4_weights::dequantize_row_q4_0,
+            extracted::q4_weights::dequantize_row_q4_0,
+        );
+        same_function(
+            facade::q4_weights::load_f16_tensor_file,
+            extracted::q4_weights::load_f16_tensor_file,
+        );
+        same_function(
+            facade::q4_weights::load_f16_tensor_file_expecting,
+            extracted::q4_weights::load_f16_tensor_file_expecting,
+        );
+        same_function(
+            facade::q4_weights::load_q4_file,
+            extracted::q4_weights::load_q4_file,
+        );
+        same_function(
+            facade::q4_weights::quantize_bf16_to_q4,
+            extracted::q4_weights::quantize_bf16_to_q4,
+        );
+        same_function(
+            facade::q4_weights::quantize_f32_to_q4,
+            extracted::q4_weights::quantize_f32_to_q4,
+        );
+        same_function(
+            facade::q4_weights::quantize_f64_to_q4,
+            extracted::q4_weights::quantize_f64_to_q4,
+        );
+        same_function(
+            facade::q4_weights::quantize_f64_to_q4_mode,
+            extracted::q4_weights::quantize_f64_to_q4_mode,
+        );
+        same_function(
+            facade::q4_weights::quantize_row_q4_0,
+            extracted::q4_weights::quantize_row_q4_0,
+        );
+        same_function(
+            facade::q4_weights::quantize_tensor_q4_0,
+            extracted::q4_weights::quantize_tensor_q4_0,
+        );
+        same_function(
+            facade::q4_weights::read_q4_header::<std::fs::File>,
+            extracted::q4_weights::read_q4_header::<std::fs::File>,
+        );
+        same_function(
+            facade::q4_weights::save_q4_file,
+            extracted::q4_weights::save_q4_file,
+        );
+        same_function(
+            facade::q4_weights::stream_quantize_shard,
+            extracted::q4_weights::stream_quantize_shard,
+        );
+        same_function(
+            facade::q8_weights::quantize_matrix,
+            extracted::q8_weights::quantize_matrix,
+        );
+        same_function(facade::load_sharded, extracted::load_sharded);
+        same_function(facade::parse_index, extracted::parse_index);
+        same_function(
+            facade::contained_shard_path,
+            extracted::contained_shard_path,
+        );
+        same_function(facade::resolve_shard, extracted::resolve_shard);
+    }
+
+    #[test]
+    fn weights_constants_are_equal_at_both_paths() {
+        assert_eq!(
+            facade::q3_weights::Q3_BLOCK_BYTES,
+            extracted::q3_weights::Q3_BLOCK_BYTES
+        );
+        assert_eq!(
+            facade::q4_weights::Q4_BLOCK_BYTES,
+            extracted::q4_weights::Q4_BLOCK_BYTES
+        );
+    }
+
+    #[test]
+    fn model_format_items_are_the_same_at_both_paths() {
+        use lattice_inference::model_format as facade_format;
+        use lattice_weights::model_format as extracted_format;
+
+        let _: fn(facade_format::FormatDetection) -> extracted_format::FormatDetection =
+            |value| value;
+        let _: fn(extracted_format::FormatDetection) -> facade_format::FormatDetection =
+            |value| value;
+        let _: fn(facade_format::ModelFamily) -> extracted_format::ModelFamily = |value| value;
+        let _: fn(extracted_format::ModelFamily) -> facade_format::ModelFamily = |value| value;
+        let _: fn(facade_format::ModelFormat) -> extracted_format::ModelFormat = |value| value;
+        let _: fn(extracted_format::ModelFormat) -> facade_format::ModelFormat = |value| value;
+        same_function(
+            facade_format::detect_family,
+            extracted_format::detect_family,
+        );
+        same_function(
+            facade_format::detect_format,
+            extracted_format::detect_format,
+        );
+        same_function(
+            facade_format::inspect_format,
+            extracted_format::inspect_format,
+        );
+        same_function(
+            facade_format::metal_gpu_required_message,
+            extracted_format::metal_gpu_required_message,
+        );
+        same_function(
+            facade_format::unloadable_format_message,
+            extracted_format::unloadable_format_message,
+        );
+        same_function(
+            facade_format::unrecognized_format_message,
+            extracted_format::unrecognized_format_message,
+        );
+    }
+}
+
+mod quant_parity {
+    use lattice_inference::quant as facade;
+    use lattice_quant as extracted;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn quant_types_are_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<facade::q4_manifest::ManifestFlavor>,
+            PhantomData::<extracted::q4_manifest::ManifestFlavor>,
+        );
+        same_type(
+            PhantomData::<facade::q4_manifest::Q4Manifest>,
+            PhantomData::<extracted::q4_manifest::Q4Manifest>,
+        );
+        same_type(
+            PhantomData::<facade::q4_manifest::Q4ManifestEntry>,
+            PhantomData::<extracted::q4_manifest::Q4ManifestEntry>,
+        );
+        same_type(
+            PhantomData::<facade::q4_manifest::Q4ManifestError>,
+            PhantomData::<extracted::q4_manifest::Q4ManifestError>,
+        );
+        same_type(
+            PhantomData::<facade::quarot::hadamard::BlockHadamard>,
+            PhantomData::<extracted::quarot::hadamard::BlockHadamard>,
+        );
+        same_type(
+            PhantomData::<facade::quarot::hadamard::RandomizedHadamard>,
+            PhantomData::<extracted::quarot::hadamard::RandomizedHadamard>,
+        );
+    }
+
+    #[test]
+    fn quant_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::q4_manifest::load_manifest,
+            extracted::q4_manifest::load_manifest,
+        );
+        same_function(
+            facade::q4_manifest::parse_manifest,
+            extracted::q4_manifest::parse_manifest,
+        );
+        same_function(
+            facade::q4_manifest::read_manifest_bytes_bounded,
+            extracted::q4_manifest::read_manifest_bytes_bounded,
+        );
+        same_function(
+            facade::quarot::hadamard::walsh_hadamard_f64_in_place,
+            extracted::quarot::hadamard::walsh_hadamard_f64_in_place,
+        );
+        same_function(
+            facade::quarot::hadamard::walsh_hadamard_in_place,
+            extracted::quarot::hadamard::walsh_hadamard_in_place,
+        );
+        same_function(
+            facade::quarot::hadamard::walsh_hadamard_orthonormal_f64_in_place,
+            extracted::quarot::hadamard::walsh_hadamard_orthonormal_f64_in_place,
+        );
+        same_function(
+            facade::quarot::hadamard::walsh_hadamard_orthonormal_in_place,
+            extracted::quarot::hadamard::walsh_hadamard_orthonormal_in_place,
+        );
+        same_function(
+            facade::quarot::rotation::absorb_input_rotation,
+            extracted::quarot::rotation::absorb_input_rotation,
+        );
+        same_function(
+            facade::quarot::rotation::absorb_input_rotation_f64,
+            extracted::quarot::rotation::absorb_input_rotation_f64,
+        );
+        same_function(
+            facade::quarot::rotation::absorb_output_rotation,
+            extracted::quarot::rotation::absorb_output_rotation,
+        );
+        same_function(
+            facade::quarot::rotation::absorb_output_rotation_f64,
+            extracted::quarot::rotation::absorb_output_rotation_f64,
+        );
+    }
+
+    #[test]
+    fn quant_constants_are_equal_at_both_paths() {
+        assert_eq!(
+            facade::q4_manifest::MAX_QUANTIZE_INDEX_LEN,
+            extracted::q4_manifest::MAX_QUANTIZE_INDEX_LEN
+        );
+    }
+}

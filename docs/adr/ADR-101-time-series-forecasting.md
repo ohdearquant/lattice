@@ -21,7 +21,7 @@ sequence.
 | -- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | L1 | No forecasting code and no FFT anywhere in the workspace.                                                                                                                                      | `git grep -i -n "fn .*fft\|rustfft\|realfft" -- crates` returns nothing |
 | L2 | A delta-rule recurrence exists, but bound to the Qwen3.5 GatedDeltaNet layer: its step reads `Qwen35Config` and that layer's fused weight layout (`in_proj_qkv`, `in_proj_z`, gating `alpha`). | `attention/gdn.rs` `gated_delta_net_step`                               |
-| L3 | f32 safetensors loading with exact shape reads, a CPU `matmul_bt` / `matmul_into` dispatch (Accelerate on macOS, SIMD elsewhere) and an in-place `layer_norm`.                                 | `weights/f32_weights.rs`, `forward/cpu/{matmul,norm}.rs`                |
+| L3 | f32 safetensors loading with exact shape reads, a CPU `matmul_bt` / `matmul_into` dispatch (Accelerate on macOS, SIMD elsewhere) and an in-place `layer_norm`.                                 | `crates/weights/src/f32_weights.rs`, `forward/cpu/{matmul,norm}.rs`     |
 | L4 | `serde_json` is already a dependency of lattice-inference.                                                                                                                                     | `crates/inference/Cargo.toml`                                           |
 
 ### The model landscape (GIFT-Eval, recomputed from the public per-configuration results)

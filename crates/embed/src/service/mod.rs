@@ -210,7 +210,10 @@ impl EmbeddingsWithReport {
 }
 
 enum ValidatedTextBatchInner<'a> {
+    // Only native services construct these; the public delegation hook retains their readers.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     Contiguous(&'a [String]),
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     Borrowed(&'a [&'a str]),
 }
 
@@ -224,6 +227,7 @@ pub struct ValidatedTextBatch<'a> {
 }
 
 impl<'a> ValidatedTextBatch<'a> {
+    #[cfg(feature = "native")]
     pub(in crate::service) fn new(texts: &'a [String]) -> Result<Self> {
         validate_texts(texts)?;
         Ok(Self {
@@ -231,6 +235,7 @@ impl<'a> ValidatedTextBatch<'a> {
         })
     }
 
+    #[cfg(feature = "native")]
     pub(in crate::service) fn borrowed_subset<'b>(
         &'b self,
         texts: &'b [&'b str],
@@ -261,6 +266,7 @@ impl<'a> ValidatedTextBatch<'a> {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(in crate::service) fn borrowed(&self) -> Option<&'a [&'a str]> {
         match self.inner {
             ValidatedTextBatchInner::Contiguous(_) => None,
