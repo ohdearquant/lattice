@@ -38,7 +38,8 @@ pub mod forward;
 /// safetensors load path and forward-pass dispatch; see [`weights`], [`tokenizer`], and [`forward`].
 pub mod model;
 /// Canonical model-directory format detector (`ModelFormat`/`detect_format`) shared by
-/// the `lattice`, `lattice_serve`, and `chat_metal` binaries (ADR-080 amendment, #829).
+/// the `chat_metal` binary and the `lattice` and `lattice_serve` binaries of `lattice-serve`
+/// (ADR-080 amendment, #829).
 /// **Unstable, internal-binaries-only** -- see the module's own doc comment.
 pub mod model_format;
 /// Tokenizer implementations (`WordPiece`, `SentencePiece`, byte-level BPE) behind the
@@ -120,7 +121,7 @@ pub mod kv_cache;
 /// Metal engine takes out. Every item in it is Metal-only, so the module itself is
 /// gated rather than left as an empty shell on other builds; it also reaches
 /// `lattice-fann` for the shared effective-scale helper, and that dependency exists
-/// only under `metal-gpu` (or `mixture`). See [`lora_hook`] and [`serve`].
+/// only under `metal-gpu` (or `mixture`). See [`lora_hook`]; `lattice-serve` is its serving caller.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub mod lora_file;
 /// LoRA adapter hook called from inference forward paths. See [`model`] and [`forward`].
@@ -164,48 +165,11 @@ pub mod qwen35_checkpoint_fixture;
 pub mod rope;
 /// Sampling configuration and token selection helpers. See [`model`] and [`speculative`].
 pub mod sampling;
-/// Shared HTTP serving contract (error envelope, `finish_reason`, `max_tokens`
-/// zero-rejection, `/v1/models` body) consumed by both the `lattice` unified
-/// server and the `lattice_serve` daemon binaries (ADR-080 cluster C2).
-/// Requires the `serve` feature (axum/tokio/futures).
-#[cfg(feature = "serve")]
-pub mod serve;
-/// CPU serving runtimes for `lattice serve`: Gemma 4 E2B text and the traced
-/// Qwen3.5 CPU entries. Not a stable API.
-#[cfg(feature = "serve")]
+/// Unsupported, version-coupled interface for `lattice-serve` (ADR-103
+/// Amendment 4); not public API.
+#[cfg(feature = "serving-support")]
 #[doc(hidden)]
-pub mod serving_cpu;
-/// Shared request-local execution host for CPU-backed `lattice serve` routes.
-/// Not a stable API.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_cpu_host;
-/// Pooled embedding service interfaces used by serving entry points.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_embeddings;
-/// Builds the serving worker's runtime and request preparation for a loaded
-/// model. Not a stable API.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_factory;
-/// Shared request facade for the HTTP serving binaries. Not a stable API.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_host;
-#[cfg(feature = "serve")]
-mod serving_preparation;
-/// Selects serving providers from bounded checkpoint metadata.
-/// Requires the `serve` feature.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_provider;
-#[cfg(feature = "serve")]
-pub(crate) mod serving_runtime_contract;
-/// Dedicated-thread host for thread-affine serving runtimes. Not a stable API.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_worker;
+pub mod serving_support;
 /// N-gram prompt lookup speculative decoding. See [`sampling`] and [`model`].
 pub mod speculative;
 /// Generation stop reason taxonomy; see [`StopReason`] and [`model`].

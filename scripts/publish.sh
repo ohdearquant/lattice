@@ -28,6 +28,7 @@ esac
 #       -> quant                      depends on inference-core, weights
 #         -> inference                depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, metal-runtime
 #           -> embed                  depends on inference
+#           -> serve                  depends on inference (exact version), fann, tokenizer, weights
 #           -> tune                   depends on fann, inference
 # Each tier waits for crates.io indexing before the next tier resolves it.
 # (--dry-run validates only the leaf tier: cargo cannot dry-run a crate whose
@@ -88,5 +89,6 @@ fi
 echo "--- Tier 5: dependent crates (depend on inference) ---"
 cargo publish -p lattice-embed $FLAG
 cargo publish -p lattice-tune $FLAG
+cargo publish -p lattice-serve $FLAG
 
 echo "=== Done ==="

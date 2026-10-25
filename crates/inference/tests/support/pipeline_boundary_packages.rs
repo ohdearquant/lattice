@@ -22,12 +22,15 @@ const PROVIDER_FILES: &[&str] = &[
 
 pub(super) const PRODUCTION_POPULATION: BoundaryPopulation<'_> = BoundaryPopulation {
     origins: &[(".", "src/model"), (".", "src/forward/metal_*")],
-    frontends: &[(".", "src/serve/mod.rs"), (".", "src/serving_worker.rs")],
-    providers: &[(".", "src/serving_provider/providers", PROVIDER_FILES)],
+    frontends: &[
+        ("../serve", "src/serve/mod.rs"),
+        ("../serve", "src/serving_worker.rs"),
+    ],
+    providers: &[("../serve", "src/serving_provider/providers", PROVIDER_FILES)],
     known_positive: &[
-        (".", "src/serve/mod.rs"),
-        (".", "src/serving_worker.rs"),
-        (".", "src/bin/lattice_serve/main.rs"),
+        ("../serve", "src/serve/mod.rs"),
+        ("../serve", "src/serving_worker.rs"),
+        ("../serve", "src/bin/lattice_serve/main.rs"),
     ],
 };
 

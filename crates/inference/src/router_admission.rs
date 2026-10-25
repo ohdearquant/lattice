@@ -10,12 +10,12 @@ mod reference;
 mod statistics;
 
 #[cfg(all(
-    feature = "serve",
+    feature = "serving-support",
     feature = "f16",
     target_os = "macos",
     feature = "metal-gpu"
 ))]
-pub use reference::{ReferenceAdapter, score_metal_reference};
+pub use reference::{ReferenceAdapter, ReferenceEmbedder, score_metal_reference};
 pub use reference::{
     ReferenceBounds, ReferenceError, ReferenceEvidence, ReferenceExample, ReferencePayloadSummary,
     reference_content_hash,
@@ -611,5 +611,5 @@ fn same_named_values(left: &[(String, f32)], right: &[(String, f32)]) -> bool {
         })
 }
 
-#[cfg(all(test, feature = "serve"))]
+#[cfg(all(test, feature = "serving-support"))]
 mod tests;

@@ -208,19 +208,21 @@ forwarded through `lattice-embed`.
 
 Three ways to get `lattice`, in order of convenience:
 
-**1. `cargo install` (from [crates.io](https://crates.io/crates/lattice-inference)):**
+**1. `cargo install` (from [crates.io](https://crates.io/crates/lattice-serve)):**
 
 ```bash
 # CPU build (Linux/macOS). BF16/F16 safetensors load in every feature set;
 # the f16 feature adds F8_E4M3/F8_E5M2 tensor loading and no dependencies.
-cargo install lattice-inference --bin lattice --features f16
+cargo install lattice-serve --bin lattice --features f16
 
 # With Metal GPU (macOS only)
-cargo install lattice-inference --bin lattice --features f16,metal-gpu
+cargo install lattice-serve --bin lattice --features f16,metal-gpu
 ```
 
 This installs `lattice` to `~/.cargo/bin/lattice`. Requires Rust 1.93+
 (`rustup update` if `cargo install` complains about the `rust-version`).
+Releases before 0.16 shipped the CLI in `lattice-inference`
+(`cargo install lattice-inference --bin lattice`).
 
 **2. Prebuilt release binaries:**
 
@@ -256,7 +258,7 @@ cd lattice
 
 # CLI binary (chat + serve). BF16/F16 safetensors load in every feature
 # set; the f16 feature adds F8_E4M3/F8_E5M2 tensor loading and no dependencies.
-cargo build --release -p lattice-inference --bin lattice --features f16
+cargo build --release -p lattice-serve --bin lattice --features f16
 
 # Interactive chat
 ./target/release/lattice chat --model ~/.lattice/models/qwen3.5-0.8b
@@ -276,7 +278,7 @@ exit status. Omit the flag for the interactive loop.
 With Metal GPU (macOS only):
 
 ```bash
-cargo build --release -p lattice-inference --bin lattice --features metal-gpu,f16
+cargo build --release -p lattice-serve --bin lattice --features metal-gpu,f16
 ```
 
 ### Get a model

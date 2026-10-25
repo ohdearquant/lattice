@@ -321,7 +321,7 @@ the Q4/Metal path; `model.safetensors`/`.index.json` selects the CPU/safetensors
 
 `--tokenizer-dir` is required for a Q4 directory in both cases (Q4 output never includes
 `tokenizer.json`) and should point at the original safetensors directory. Both commands require
-the `metal-gpu` feature at build time (`cargo build --release -p lattice-inference --bin lattice
+the `metal-gpu` feature at build time (`cargo build --release -p lattice-serve --bin lattice
 --features metal-gpu,f16`); without it, a Q4 model directory is rejected with a clear
 "requires the metal-gpu feature" error rather than attempting a CPU fallback (Q4 inference in this
 codebase is Metal-only).
