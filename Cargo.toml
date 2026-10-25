@@ -14,6 +14,7 @@ members = [
     "crates/quant",
     "crates/model-config",
     "crates/serve",
+    "crates/compute",
 ]
 
 [workspace.package]

@@ -1,0 +1,20 @@
+[package]
+name = "lattice-compute"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-side compute for Lattice inference: rotary position embedding tables, with CPU kernels, attention, pooling, KV caches and sampling to follow"
+keywords = ["inference", "rope", "transformer", "llm", "cpu"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+
+[lints]
+workspace = true

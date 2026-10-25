@@ -1407,3 +1407,25 @@ mod model_config_parity {
         );
     }
 }
+
+mod compute_parity {
+    use lattice_compute as extracted;
+    use lattice_inference::rope as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    fn half_dim_of(table: &extracted::rope::RopeTable) -> usize {
+        table.half_dim()
+    }
+
+    #[test]
+    fn rope_table_is_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<facade::RopeTable>,
+            PhantomData::<extracted::rope::RopeTable>,
+        );
+        let table = facade::RopeTable::new(8, 4, 10_000.0);
+        assert_eq!(half_dim_of(&table), 4);
+    }
+}

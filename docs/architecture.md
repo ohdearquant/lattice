@@ -8,6 +8,7 @@ optimal transport — are written in Rust with hand-written SIMD kernels.
 
 ```
 lattice-inference-core  (standalone — shared InferenceError)
+lattice-compute     (standalone — host-side compute: RoPE tables)
 lattice-fann        (standalone — fast tiny neural nets, <5ms inference)
 lattice-transport   (standalone — optimal transport math, Sinkhorn-Knopp)
        │
@@ -27,6 +28,7 @@ lattice-inference   ←── lattice-inference-core
                     ←── lattice-weights
                     ←── lattice-quant
                     ←── lattice-model-config
+                    ←── lattice-compute
                     ←── lattice-metal-runtime (optional, `metal-gpu` feature)
                     ←── lattice-fann (optional, `mixture` or `metal-gpu` feature)
                                      (transformer forward pass, weights)
@@ -38,12 +40,12 @@ lattice-tune    ←── lattice-fann
                                         (training, LoRA, knowledge distillation)
 ```
 
-The three leaf crates (`inference-core`, `fann`, `transport`) have zero intra-workspace
+The four leaf crates (`inference-core`, `compute`, `fann`, `transport`) have zero intra-workspace
 dependencies and can be used standalone. `tokenizer`, `grammar` and `weights` each depend
 only on `inference-core` at runtime; grammar uses tokenizer in tests. `model-config`
-depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`. `inference` depends on all six unconditionally (plus
+depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`. `inference` depends on all seven unconditionally (plus
 `fann` under the optional `mixture` or `metal-gpu` features), re-exporting tokenizer,
-grammar, weight, model-format, quantization primitive, model configuration and error items at their original
+grammar, weight, model-format, quantization primitive, model configuration, compute and error items at their original
 paths. `metal-runtime` depends only on `inference-core` internally; the facade enables
 it under `metal-gpu`. Consumer crates (`embed`, `tune`) compose them.
 
@@ -110,6 +112,13 @@ parser reads through the bounded config reader from weights. The facade retains 
 `lattice_inference::model::{qwen35_config, gemma4_config, embeddinggemma2_config,
 bitnet_config}` paths. The deprecated generation aliases and the reasoning-budget helpers
 stay in `lattice_inference::model::qwen35_config`.
+
+### lattice-compute
+
+Host-side compute for the forward passes. It currently holds the rotary position
+embedding tables (`RopeTable`) and has no internal dependencies; the CPU kernels,
+attention, pooling, KV caches and sampling move here in later changes. The facade retains
+the `lattice_inference::rope::RopeTable` path.
 
 ### lattice-inference
 
@@ -202,6 +211,7 @@ lattice-inference        ← transformer forward pass
     │   lattice-weights: f32, f16, Q3, Q4, Q8 storage and model-format detection
     │   lattice-quant: Q4 manifests, Hadamard transforms and rotation absorption
     │   lattice-model-config: validated model configurations
+    │   lattice-compute: RoPE tables
     ▼
 CPU backends             Metal (macOS)    WGPU (cross-platform GPU)
 AVX2 / NEON kernels      Metal MSL kernels WGSL compute shaders

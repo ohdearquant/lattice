@@ -92,7 +92,7 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ## Crate Structure
 
 ```
-fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
+fann (7.7K)   transport (5.4K)   inference-core   compute   ← leaf, zero internal deps
                                        |
                      tokenizer (8K)   grammar   weights   metal-runtime   ← depend on inference-core
                                                  |
@@ -100,7 +100,7 @@ fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
                                                  |
                                                quant   ← depends on inference-core + weights + model-config
     |                                  |
-inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + model-config;
+inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + model-config + compute;
                                                    optional metal-runtime under `metal-gpu`;
     |                                               optional dep on fann (`mixture` or `metal-gpu` feature)
 embed (12K)   tune (20K)   serve               ← embed uses inference; tune uses fann + inference;
@@ -108,7 +108,7 @@ embed (12K)   tune (20K)   serve               ← embed uses inference; tune us
 ```
 
 `inference-core` (the shared `InferenceError`), `tokenizer`, `grammar`, `weights`,
-`quant` and `model-config` were split out of `inference`; all six edges into them are unconditional.
+`quant`, `model-config` and `compute` were split out of `inference`; all seven edges into them are unconditional.
 `metal-runtime` depends on `inference-core` and is enabled by inference's opt-in
 `metal-gpu` feature. `model-config` depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`. `inference` re-exports the extracted
 public items at their original paths. Of the four edges among the
@@ -218,6 +218,16 @@ Its internal runtime dependencies are `inference-core` and `weights`; every pars
 existing `model::qwen35_config`, `model::gemma4_config`, `model::embeddinggemma2_config` and
 `model::bitnet_config` paths; the deprecated generation aliases and the reasoning-budget
 helpers in `model::qwen35_config` stay in inference.
+
+### lattice-compute — Host-side compute
+
+| Module    | Purpose                                  | Key Exports |
+| --------- | ---------------------------------------- | ----------- |
+| `rope.rs` | Rotary position embedding sin/cos tables | `RopeTable` |
+
+It has no internal dependencies. The CPU kernels, attention, pooling, KV caches and
+sampling move here in later changes. The inference facade retains the
+`lattice_inference::rope::RopeTable` path.
 
 ### lattice-inference — Transformer kernel
 
@@ -354,7 +364,7 @@ GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Ru
 ### Bench-Compare Disposition
 
 Every PR that touches `crates/inference/`, `crates/inference-core/`, `crates/metal-runtime/`, `crates/tokenizer/`, `crates/grammar/`, `crates/weights/`, `crates/quant/`,
-`crates/model-config/`, `crates/embed/`, or `crates/fann/` must include a bench-compare disposition in its description.
+`crates/model-config/`, `crates/compute/`, `crates/embed/`, or `crates/fann/` must include a bench-compare disposition in its description.
 By default, run `make bench-compare` and paste its A/B table into the PR body. If the result shows no change, state that as the disposition.
 `crates/fann/` is covered both because it feeds inference through the optional `mixture` feature
 and because it declares its own measurement target (the `router_online` example).
@@ -367,7 +377,7 @@ sufficient.
 
 ### E2E Parity Gate
 
-PRs touching `crates/inference/src/`, `crates/inference-core/src/`, `crates/metal-runtime/src/`, `crates/tokenizer/src/`, `crates/grammar/src/`, `crates/weights/src/`, `crates/quant/src/`, `crates/model-config/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
+PRs touching `crates/inference/src/`, `crates/inference-core/src/`, `crates/metal-runtime/src/`, `crates/tokenizer/src/`, `crates/grammar/src/`, `crates/weights/src/`, `crates/quant/src/`, `crates/model-config/src/`, `crates/compute/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
 
 The `perf-baselines` branch is still updated by `bench-update.yml` on merge to main for trend tracking.
 

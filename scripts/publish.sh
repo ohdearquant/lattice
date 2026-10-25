@@ -23,11 +23,11 @@ case "${1:-}" in
 esac
 
 # Publish order follows the internal dependency DAG (deps before dependents):
-#   fann, transport, inference-core   leaves, no internal deps
+#   fann, transport, inference-core, compute   leaves, no internal deps
 #     -> tokenizer, grammar, weights, metal-runtime  depend on inference-core
 #       -> model-config               depends on inference-core, weights
 #         -> quant                    depends on inference-core, weights, model-config
-#           -> inference              depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, model-config, metal-runtime
+#           -> inference              depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, model-config, compute, metal-runtime
 #             -> embed                depends on inference
 #             -> serve                depends on inference (exact version), fann, tokenizer, weights
 #             -> tune                 depends on fann, inference
@@ -47,6 +47,7 @@ echo "--- Tier 1: leaf crates (no internal deps) ---"
 cargo publish -p lattice-fann $FLAG
 cargo publish -p lattice-transport $FLAG
 cargo publish -p lattice-inference-core $FLAG
+cargo publish -p lattice-compute $FLAG
 
 if [ -n "$FLAG" ]; then
     echo "=== Dry run stops after the leaf tier: later tiers need this release's leaf crates live on crates.io ==="
