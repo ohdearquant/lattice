@@ -17,6 +17,8 @@ all-features = true
 default = []
 
 [dependencies]
+half.workspace = true
+lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 indexmap.workspace = true
 rustc-hash.workspace = true
 
