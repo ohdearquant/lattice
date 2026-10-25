@@ -181,7 +181,13 @@ def non_measurement_surfaces() -> set[str]:
     return {surface["path"] for surface in data["non_measurement_surface"]}
 
 
-def discovered_declared_rust_inventory_paths() -> set[str]:
+# Packages whose examples and binaries the grammar covers. lattice-serve is
+# listed before it exists so the extraction moves paths and classifications
+# without also changing what discovery can see.
+INVENTORY_APPLICATION_PACKAGES = ("crates/inference", "crates/serve")
+
+
+def discovered_declared_rust_inventory_paths(repo: Path = REPO) -> set[str]:
     """Every Rust path the manifest's grammar must classify.
 
     Broadened from a bench*-prefix filename match (issue #1273): every
@@ -197,23 +203,18 @@ def discovered_declared_rust_inventory_paths() -> set[str]:
     modules go both unclassified and unseen by this fail-closed discovery.
     """
     paths = {
-        str(path.relative_to(REPO))
-        for path in (REPO / "crates").glob("*/benches/*.rs")
+        str(path.relative_to(repo))
+        for path in (repo / "crates").glob("*/benches/*.rs")
     }
-    paths.update(
-        str(path.relative_to(REPO))
-        for path in (REPO / "crates/inference/examples").glob("*.rs")
-    )
-    paths.update(
-        str(path.relative_to(REPO))
-        for path in (REPO / "crates/inference/src/bin").glob("*.rs")
-    )
-    paths.update(
-        str(path.relative_to(REPO))
-        for path in (REPO / "crates/inference/src/bin").glob("*/*.rs")
-    )
+    for package in INVENTORY_APPLICATION_PACKAGES:
+        for pattern in ("examples/*.rs", "src/bin/*.rs", "src/bin/*/*.rs"):
+            paths.update(
+                str(path.relative_to(repo))
+                for path in (repo / package).glob(pattern)
+            )
     paths.add("README.md")
-    paths.add("crates/fann/examples/router_online.rs")
+    if (repo / "crates/fann/examples/router_online.rs").is_file():
+        paths.add("crates/fann/examples/router_online.rs")
     return paths
 
 
@@ -919,7 +920,8 @@ class InventoryContract(unittest.TestCase):
         self.assertEqual(
             contract["rust_inventory_grammar"],
             "crates/*/benches/*.rs; crates/inference/examples/*.rs; "
-            "crates/inference/src/bin/*.rs; README.md; "
+            "crates/inference/src/bin/*.rs; crates/serve/examples/*.rs; "
+            "crates/serve/src/bin/*.rs; README.md; "
             "crates/fann/examples/router_online.rs",
         )
         self.assertEqual(
@@ -957,6 +959,35 @@ class InventoryContract(unittest.TestCase):
         self.assertTrue(excluded.isdisjoint(non_measurement_paths))
         self.assertEqual(
             excluded | non_measurement_paths, discovered_declared_rust_inventory_paths()
+        )
+
+    def test_inventory_discovers_every_application_package_and_no_other(self):
+        """An unclassified serve example or binary is discovered, so the
+        equality above fails closed; other crates' examples stay outside."""
+
+        fixture_repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for relative in (
+            "crates/inference/examples/kept.rs",
+            "crates/serve/examples/unclassified.rs",
+            "crates/serve/src/bin/server.rs",
+            "crates/serve/src/bin/split/main.rs",
+            "crates/serve/benches/timed.rs",
+            "crates/embed/examples/outside.rs",
+            "crates/embed/src/bin/outside.rs",
+        ):
+            path = fixture_repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fn main() {}\n")
+        self.assertEqual(
+            discovered_declared_rust_inventory_paths(fixture_repo),
+            {
+                "README.md",
+                "crates/inference/examples/kept.rs",
+                "crates/serve/benches/timed.rs",
+                "crates/serve/examples/unclassified.rs",
+                "crates/serve/src/bin/server.rs",
+                "crates/serve/src/bin/split/main.rs",
+            },
         )
 
     def test_phase_event_binary_is_classified_as_measurement(self):
