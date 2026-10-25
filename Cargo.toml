@@ -58,6 +58,8 @@ sha2 = "0.10"
 rusqlite = { version = "0.35", features = ["bundled"] }
 
 # Types
+indexmap = "2"
+rustc-hash = "2"
 uuid = { version = "1.0", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 

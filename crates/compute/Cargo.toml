@@ -16,5 +16,9 @@ all-features = true
 [features]
 default = []
 
+[dependencies]
+indexmap.workspace = true
+rustc-hash.workspace = true
+
 [lints]
 workspace = true

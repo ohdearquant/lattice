@@ -224,9 +224,12 @@ helpers in `model::qwen35_config` stay in inference.
 | Module    | Purpose                                  | Key Exports |
 | --------- | ---------------------------------------- | ----------- |
 | `rope.rs` | Rotary position embedding sin/cos tables | `RopeTable` |
+| `kv_cache/prefix.rs` | Shared prefix pages and cache | `AdapterId`, `PrefixPageCache` |
+| `kv_cache/cross_turn.rs` | Cross-turn prefix reuse planning | `CrossTurnPrefixEntry`, `plan_prefix_reuse` |
 
-It has no internal dependencies. The CPU kernels, attention, pooling, KV caches and
-sampling move here in later changes. The inference facade retains the
+It has no internal dependencies. Prefix sharing and cross-turn planning are available
+under `kv_cache`; flat and paged storage, CPU kernels, attention, pooling and sampling
+move here in later changes. The inference facade retains the
 `lattice_inference::rope::RopeTable` path.
 
 ### lattice-inference — Transformer kernel

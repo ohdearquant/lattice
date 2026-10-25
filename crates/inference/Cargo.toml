@@ -94,8 +94,8 @@ test-utils = []
 [dependencies]
 half.workspace = true
 memmap2 = "0.9"
-indexmap = "2"
-rustc-hash = "2"
+indexmap.workspace = true
+rustc-hash.workspace = true
 rayon = { workspace = true }
 gemm = { version = "=0.18.2", optional = true }
 serde.workspace = true
