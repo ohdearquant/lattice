@@ -251,6 +251,7 @@ pub use crate::model::QwenConfig;
 /// [`Tokenizer`], and [`weights`].
 pub use crate::model::QwenModel;
 /// BERT pooling strategy selector (mean or CLS). See [`pool`] and [`BertModel`].
+#[doc(no_inline)]
 pub use crate::pool::BertPooling;
 /// Reason a generation request stopped (e.g. EOS, max tokens). See [`stop_reason`] and
 /// [`model`].

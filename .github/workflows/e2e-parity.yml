@@ -478,7 +478,7 @@ jobs:
   # vector against the committed release baseline.
   #
   # Runs on ubuntu-24.04-arm (aarch64) to exercise the NEON normalise path that
-  # the native BERT pooling in crates/inference/src/pool.rs (via
+  # the native BERT pooling in crates/compute/src/pool.rs (via
   # crates/inference/src/model/bert.rs) dispatches on aarch64, the same ISA
   # path that production lattice deployments use. Relocated from
   # macos-latest (also aarch64) to cut the shared macOS-runner queue tax;
