@@ -45,13 +45,15 @@ bins = [
 ]
 
 [features]
-default = ["std", "download"]
+default = ["std", "download", "image"]
 # Unsupported, version-coupled interface for `lattice-serve` (ADR-103
 # Amendment 4): the hidden `serving_support` module and the router items it
 # needs. Off by default; `lattice-serve` depends on this crate with an exact
 # version and enables it. Not part of the public API.
 serving-support = []
 std = []
+# Encoded PNG/JPEG input; raw image tensors remain available without decoding.
+image = ["dep:image"]
 f16 = ["lattice-weights/f16"]
 # lattice-fann supplies the shared LoRA descriptor/blend-validation module
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
@@ -112,7 +114,7 @@ pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
 lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
 lattice-grammar = { version = "0.15.0", path = "../grammar" }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }

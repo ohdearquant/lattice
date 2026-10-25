@@ -144,7 +144,7 @@ region.
   actual completed-token counts. A successful cargo exit with SKIP output is not measurement.
 - `bench_decode_ab` is a manifest-declared plain binary reaching `chat_completion`. Its internal
   output-budget comparison is not itself a source-ref comparison; invoke identically at base/head.
-- The complete inventory includes targets such as fann's `router_online`; do not assume the default
+- The complete inventory includes targets such as fann's `router_online` example; do not assume the default
   inference/embed Criterion runner can drive every declared target.
 
 ### Why the default workspace gate does not cover the extraction rows

@@ -213,6 +213,8 @@ def discovered_declared_rust_inventory_paths(repo: Path = REPO) -> set[str]:
                 for path in (repo / package).glob(pattern)
             )
     paths.add("README.md")
+    if (repo / "crates/fann/examples/router_online.rs").is_file():
+        paths.add("crates/fann/examples/router_online.rs")
     return paths
 
 
@@ -919,7 +921,8 @@ class InventoryContract(unittest.TestCase):
             contract["rust_inventory_grammar"],
             "crates/*/benches/*.rs; crates/inference/examples/*.rs; "
             "crates/inference/src/bin/*.rs; crates/serve/examples/*.rs; "
-            "crates/serve/src/bin/*.rs; README.md",
+            "crates/serve/src/bin/*.rs; README.md; "
+            "crates/fann/examples/router_online.rs",
         )
         self.assertEqual(
             contract["rust_inventory_limitation"],

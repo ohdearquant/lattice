@@ -332,7 +332,7 @@ Every PR that touches `crates/inference/`, `crates/inference-core/`, `crates/met
 `crates/embed/`, or `crates/fann/` must include a bench-compare disposition in its description.
 By default, run `make bench-compare` and paste its A/B table into the PR body. If the result shows no change, state that as the disposition.
 `crates/fann/` is covered both because it feeds inference through the optional `mixture` feature
-and because it declares its own bench target (`router_online`).
+and because it declares its own measurement target (the `router_online` example).
 
 The waiver predicate is reachability, not compilation, and the canonical statement of the rule —
 including the all-declared-target search requirement, the FANN `router_online` example, and the
