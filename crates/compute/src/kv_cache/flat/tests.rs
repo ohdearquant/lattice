@@ -724,17 +724,22 @@ fn sdpa_decode(
     }
 }
 
-/// Top-1 token choice for the f16-vs-f32 KV-cache logits oracle below.
+/// Independent first-wins reference for the f16-vs-f32 KV-cache logits oracle.
 ///
-/// Delegates to the shared first-wins `crate::speculative::argmax` so
-/// the oracle's tie-break matches the engine's documented greedy
-/// contract (lowest index wins on an exact tie — see
-/// `forward::metal_qwen35`, `sampling`, and `torch.argmax`, all
-/// first-wins per #280). `Iterator::max_by` resolves ties to the *last*
-/// index instead, which let the oracle silently score a different top-1
-/// token than production would pick on an exact tie (#861).
+/// Strict comparisons skip NaNs and retain the lowest index on ties, matching
+/// the greedy contract without depending on the generation implementation.
 fn oracle_top1(logits: &[f32]) -> usize {
-    crate::speculative::argmax(logits)
+    logits
+        .iter()
+        .enumerate()
+        .fold((0, f32::NEG_INFINITY), |best, (index, &value)| {
+            if value > best.1 {
+                (index, value)
+            } else {
+                best
+            }
+        })
+        .0
 }
 
 /// The mandatory tensor oracle: compare f32-KV reference vs f16-KV-via-FlatKVCache.

@@ -1,6 +1,7 @@
 //! KV cache storage and prefix reuse for autoregressive decoding.
 
 pub mod cross_turn;
+pub mod flat;
 pub mod prefix;
 
 pub use cross_turn::{
@@ -11,3 +12,4 @@ pub use cross_turn::{
 pub use prefix::{
     AdapterId, PrefixEntry, PrefixKey, PrefixPageCache, PrefixPageCacheConfig, SharedPageRef,
 };
+pub use flat::{FlatKVCache, FlatKVCacheConfig};

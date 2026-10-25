@@ -1498,4 +1498,16 @@ mod compute_parity {
             extracted::kv_cache::cross_turn::checkpoint_survives_save,
         );
     }
+
+    #[test]
+    fn flat_cache_types_are_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::FlatKVCache>,
+            PhantomData::<extracted::kv_cache::flat::FlatKVCache>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::FlatKVCacheConfig>,
+            PhantomData::<extracted::kv_cache::flat::FlatKVCacheConfig>,
+        );
+    }
 }
