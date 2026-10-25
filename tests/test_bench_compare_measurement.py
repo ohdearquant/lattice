@@ -991,6 +991,38 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             self.assertEqual(captured[0].schema, gate.PROVENANCE_SCHEMA_V2)
             self.assertNotIn("cargo_target_protection", captured[0].fields)
 
+    def test_each_arm_builds_in_its_own_target_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "shared-target"
+            log = Path(temporary) / "targets.txt"
+            recording_cargo = STALE_CHANGE_CARGO.replace(
+                "#!/usr/bin/env bash\n",
+                "#!/usr/bin/env bash\n"
+                'if [ "${1:-}" != "--version" ]; then\n'
+                '  printf \'%s|%s|%s\\n\' "$PWD" "${CARGO_TARGET_DIR:-}" '
+                '"${CARGO_BUILD_TARGET_DIR:-}" >> "$STUB_TARGET_LOG"\n'
+                "fi\n",
+                1,
+            )
+            result = _run(
+                [],
+                stub_cargo=recording_cargo,
+                extra_env={"CARGO_TARGET_DIR": str(root), "STUB_TARGET_LOG": str(log)},
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            records = [line.split("|") for line in log.read_text().splitlines()]
+            by_arm = {"base": set(), "head": set()}
+            for cwd, target, build_target in records:
+                arm = "base" if cwd.endswith("/.cache/bench-compare-base") else "head"
+                self.assertTrue(
+                    cwd.endswith(f"/.cache/bench-compare-{arm}"), f"unexpected cwd {cwd}")
+                self.assertEqual(build_target, "", f"CARGO_BUILD_TARGET_DIR leaked into {cwd}")
+                by_arm[arm].add(target)
+            self.assertEqual(by_arm["base"], {str(root / "bench-compare-base")})
+            self.assertEqual(by_arm["head"], {str(root / "bench-compare-head")})
+            for arm in ("base", "head"):
+                self.assertTrue((root / f"bench-compare-{arm}" / ".metadata_never_index").is_file())
+
     def test_report_only_mode_uses_balanced_order(self):
         """Report-only evidence uses the same balanced ABBA measurement."""
         with tempfile.TemporaryDirectory() as temporary:
