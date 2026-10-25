@@ -42,4 +42,4 @@ pub use matmul::matmul_bt_scalar;
 #[cfg(test)]
 pub use norm::layer_norm_scalar;
 #[cfg(test)]
-pub use softmax::{fast_exp, softmax_attention_scalar};
+pub use softmax::softmax_attention_scalar;
