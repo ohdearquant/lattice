@@ -535,14 +535,14 @@ Measured performance on normalized vectors (internal benchmarks, subject to hard
 
 ### lattice-inference
 
-| Feature     | Default | Description                                                             |
-| ----------- | ------- | ----------------------------------------------------------------------- |
-| `f16`       | no      | Half-precision weights                                                  |
-| `metal-gpu` | no      | Metal compute backend                                                   |
-| `wgpu-gpu`  | no      | WGPU cross-platform GPU backend                                         |
-| `download`  | yes     | HuggingFace weight download with checksum verification                  |
-| `image`     | yes     | PNG/JPEG decoding; also enabled by `lattice-serve`                      |
-| `backfill`  | no      | Re-embedding coordinator (requires `rusqlite`)                          |
+| Feature     | Default | Description                                            |
+| ----------- | ------- | ------------------------------------------------------ |
+| `f16`       | no      | Half-precision weights                                 |
+| `metal-gpu` | no      | Metal compute backend                                  |
+| `wgpu-gpu`  | no      | WGPU cross-platform GPU backend                        |
+| `download`  | yes     | HuggingFace weight download with checksum verification |
+| `image`     | yes     | PNG/JPEG decoding; also enabled by `lattice-serve`     |
+| `backfill`  | no      | Re-embedding coordinator (requires `rusqlite`)         |
 
 ---
 
