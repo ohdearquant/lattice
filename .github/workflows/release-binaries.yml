@@ -128,7 +128,7 @@ jobs:
           shared-key: release-binaries-${{ matrix.target }}
 
       - name: Build lattice CLI (release)
-        run: cargo build --release -p lattice-inference --bin lattice --features ${{ matrix.features }}
+        run: cargo build --release -p lattice-serve --bin lattice --features ${{ matrix.features }}
 
       - name: Package tarball and checksum
         id: package

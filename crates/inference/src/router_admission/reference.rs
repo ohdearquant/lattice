@@ -133,7 +133,7 @@ fn policy_hash(source: &RefitSource) -> Result<String, ReferenceError> {
 }
 
 impl ReferenceEvidence {
-    #[cfg(all(test, feature = "serve"))]
+    #[cfg(all(test, feature = "serving-support"))]
     pub(super) fn fixture(
         source: &RefitSource,
         candidate: &RefitCandidate,
@@ -223,7 +223,7 @@ impl ReferenceEvidence {
 #[cfg(any(
     test,
     all(
-        feature = "serve",
+        feature = "serving-support",
         feature = "f16",
         target_os = "macos",
         feature = "metal-gpu"
@@ -364,7 +364,7 @@ mod scoring {
     }
 
     #[cfg(all(
-        feature = "serve",
+        feature = "serving-support",
         feature = "f16",
         target_os = "macos",
         feature = "metal-gpu"
@@ -375,11 +375,32 @@ mod scoring {
             ChatMessage, LoraLayerData, MetalQwen35State, blend_lora_layer_data,
             format_chat_template,
         };
-        use crate::serve::embeddings::{EmbeddingModel, QWEN35_F16_DECODER_LOADER};
-        use crate::serve::routing::{EmbedderIdentity, PromptSource, trained_pooling};
         use crate::tokenizer::{Tokenizer, bpe::BpeTokenizer};
         use lattice_fann::lora::LoraDescriptor;
         use std::collections::HashSet;
+
+        /// The routing embedder the scorer drives, bound to the identity the
+        /// source was registered with. Implemented by the serving application;
+        /// part of the unsupported `serving-support` interface.
+        #[doc(hidden)]
+        pub trait ReferenceEmbedder {
+            /// A pooling parsed from the registered representation.
+            type Pooling;
+            /// Operator-supplied embedder identity.
+            fn identity(&self) -> &str;
+            /// Loader format marker of the embedding model.
+            fn loader_format(&self) -> &str;
+            /// Prompt source serving embeds for routing.
+            fn prompt_source(&self) -> &str;
+            /// Embedding width.
+            fn dimensions(&self) -> usize;
+            /// Context bound of the embedder input.
+            fn max_context(&self) -> usize;
+            /// Parse a registered pooling name, refusing one the embedder does not serve.
+            fn parse_pooling(&self, name: &str) -> Result<Self::Pooling, String>;
+            /// Embed one text under a parsed pooling.
+            fn embed(&self, text: &str, pooling: &Self::Pooling) -> Result<Vec<f32>, String>;
+        }
 
         /// Exact resident payload and descriptor, in trained adapter-column order.
         pub struct ReferenceAdapter<'a> {
@@ -647,7 +668,7 @@ mod scoring {
         /// they are not cryptographic attestations of checkpoint bytes. Every payload
         /// bit is hashed. The state is reset and unloaded on success or any fallible
         /// scoring exit. An already loaded adapter is refused without mutation.
-        pub fn score_metal_reference(
+        pub fn score_metal_reference<E: ReferenceEmbedder>(
             source: &RefitSource,
             candidate: &RefitCandidate,
             contract: &AdmissionContract,
@@ -655,8 +676,7 @@ mod scoring {
             bounds: ReferenceBounds,
             state: &mut MetalQwen35State,
             tokenizer: &BpeTokenizer,
-            embedder: &EmbeddingModel,
-            embedder_identity: &EmbedderIdentity,
+            embedder: &E,
             adapters: &[ReferenceAdapter<'_>],
             base_model_identity: &str,
         ) -> Result<ReferenceEvidence, ReferenceError> {
@@ -701,16 +721,16 @@ mod scoring {
             )?;
             let reference_hash = reference_content_hash(examples)?;
             let repr = source.representation();
-            if repr.embedding_model != embedder_identity.as_str()
-                || repr.loader_format != QWEN35_F16_DECODER_LOADER
-                || repr.prompt_source != PromptSource::SERVED.as_str()
+            if repr.embedding_model != embedder.identity()
+                || repr.loader_format != embedder.loader_format()
+                || repr.prompt_source != embedder.prompt_source()
                 || repr.input_width != embedder.dimensions() as u64
             {
                 return Err(invalid(
                     "embedder representation differs from registered serving representation",
                 ));
             }
-            let pooling = trained_pooling(&repr.pooling).map_err(|e| invalid(e.message()))?;
+            let pooling = embedder.parse_pooling(&repr.pooling).map_err(invalid)?;
             let payload_summary = payloads(state, source, adapters)?;
             let payload_hash = serialized_hash(
                 b"lattice-router-reference-payload-set-v1\0",
@@ -767,8 +787,8 @@ mod scoring {
                     .ok_or(ReferenceError::Count("reference tokens"))?;
                 check_bounds(bounds, examples.len(), work_tokens)?;
                 let embedding = embedder
-                    .embed_text(&example.user_prompt, pooling)
-                    .map_err(|e| ReferenceError::Model(e.to_string()))?;
+                    .embed(&example.user_prompt, &pooling)
+                    .map_err(ReferenceError::Model)?;
                 if embedding.len() != embedder.dimensions()
                     || embedding.iter().any(|x| !x.is_finite())
                 {
@@ -1260,9 +1280,9 @@ mod scoring {
 }
 
 #[cfg(all(
-    feature = "serve",
+    feature = "serving-support",
     feature = "f16",
     target_os = "macos",
     feature = "metal-gpu"
 ))]
-pub use scoring::metal::{ReferenceAdapter, score_metal_reference};
+pub use scoring::metal::{ReferenceAdapter, ReferenceEmbedder, score_metal_reference};

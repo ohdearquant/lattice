@@ -168,7 +168,7 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|inference-core|metal-runtime|tokenizer|grammar|weights|quant|model-config|embed)/(src/|Cargo\.toml$)|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^\.github/actions/rust-setup/|^crates/inference/tests/fixtures/e2e_parity_reference_v1/|^tests/test_e2e_parity_reference\.py$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^crates/inference/tests/vision_serve_e2e_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|inference-core|metal-runtime|serve|tokenizer|grammar|weights|quant|model-config|embed)/(src/|Cargo\.toml$)|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^\.github/actions/rust-setup/|^crates/inference/tests/fixtures/e2e_parity_reference_v1/|^tests/test_e2e_parity_reference\.py$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^crates/serve/tests/vision_serve_e2e_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -1197,7 +1197,7 @@ jobs:
           # Hosted runners' bf16 model load has measured close to the 120 s test default.
           LATTICE_VISION_SERVE_HEALTH_TIMEOUT_SECS: '300'
         run: |
-          if cargo test --release -p lattice-inference --features f16,metal-gpu \
+          if cargo test --release -p lattice-serve --features f16,metal-gpu \
             --test vision_serve_e2e_test \
             serve_chat_completions_reaches_vision_forward_path \
             -- --exact --nocapture > vision-serve-metal-gate.log 2>&1
@@ -1236,7 +1236,7 @@ jobs:
       # `emit_head` filter term, plus the checkpoint-free
       # `vision_runtime_preload_is_noop_when_unsupported` and
       # `vision_runtime_preload_failure_falls_back_to_lazy_pending_state`
-      # (crates/inference/src/serve/metal_worker.rs) via the
+      # (crates/serve/src/serve/metal_worker.rs) via the
       # `vision_runtime_preload` filter term — none of these five ran in CI
       # either, for the same reason: no workflow's filter matched their
       # names.
@@ -1245,10 +1245,10 @@ jobs:
       # (CPU f16 injection oracle) and
       # `shared_server_runner_drops_router_after_injected_shutdown` (serve-shutdown
       # regression matching only incidentally on the `injected` substring), so
-      # the exact-count grep below is 11 (6 `inject`-filter matches + 3
-      # `emit_head`-filter matches + 2 `vision_runtime_preload`-filter
-      # matches), not 4 -- update it in the same PR if the matched test
-      # surface changes. The source-reading guard
+      # the exact-count greps below are 8 in lattice-inference (5 `inject`-filter
+      # matches + 3 `emit_head`-filter matches) and 3 in lattice-serve (1
+      # `inject`-filter match + 2 `vision_runtime_preload`-filter matches), not 4
+      # -- update them in the same PR if the matched test surface changes. The source-reading guard
       # `injected_embedding_never_falls_back_to_token_lookup` runs on every host from
       # `tests/metal_qwen35_source_contract.rs` and is no longer in this count. libtest ORs multiple filter arguments together, so
       # one step covers all three groups, but the filters MUST be passed to
@@ -1263,7 +1263,7 @@ jobs:
         run: |
           if cargo test --release -p lattice-inference --features f16,metal-gpu \
             --lib \
-            -- inject emit_head vision_runtime_preload \
+            -- inject emit_head \
             --nocapture --test-threads=1 > vision-mp2-inject-gate.log 2>&1
           then
             cat vision-mp2-inject-gate.log
@@ -1272,7 +1272,19 @@ jobs:
             cat vision-mp2-inject-gate.log
             exit "$status"
           fi
-          grep -Eq '^test result: ok\. 11 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
+          grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
+          if cargo test --release -p lattice-serve --features f16,metal-gpu \
+            --lib \
+            -- inject vision_runtime_preload \
+            --nocapture --test-threads=1 > vision-mp2-serve-inject-gate.log 2>&1
+          then
+            cat vision-mp2-serve-inject-gate.log
+          else
+            status=$?
+            cat vision-mp2-serve-inject-gate.log
+            exit "$status"
+          fi
+          grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-serve-inject-gate.log
 
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —

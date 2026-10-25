@@ -1,6 +1,6 @@
 use super::*;
+use crate::router_refit::test_router::LiveRouter;
 use crate::router_state::{RouterArtifact, RouterLineage, RouterProvenance};
-use crate::serve::routing::ServingRouter;
 use lattice_fann::{Activation, Layer};
 
 fn artifact() -> RouterArtifact {
@@ -43,10 +43,7 @@ fn artifact() -> RouterArtifact {
 }
 
 fn source() -> RefitSource {
-    ServingRouter::new(artifact(), true)
-        .unwrap()
-        .refit_source()
-        .unwrap()
+    LiveRouter::new(artifact()).refit_source().unwrap()
 }
 
 fn training() -> RlooConfig {
@@ -379,12 +376,7 @@ fn source_requires_enabled_recorded_exploration_and_exact_live_gate() {
     if let RouterProvenance::Recorded(recorded) = &mut art.provenance {
         recorded.policy.exploration_scale = None;
     }
-    assert!(
-        ServingRouter::new(art, true)
-            .unwrap()
-            .refit_source()
-            .is_err()
-    );
+    assert!(LiveRouter::new(art).refit_source().is_err());
 
     let art = artifact();
     let mut changed = source().router;
@@ -400,33 +392,18 @@ fn source_requires_enabled_recorded_exploration_and_exact_live_gate() {
 fn source_refuses_duplicate_columns_nonfinite_parameters_and_unusable_narrowing() {
     let mut art = artifact();
     art.adapter_names[1] = art.adapter_names[0].clone();
-    assert!(
-        ServingRouter::new(art, true)
-            .unwrap()
-            .refit_source()
-            .is_err()
-    );
+    assert!(LiveRouter::new(art).refit_source().is_err());
     let mut art = artifact();
     let mut gate = Network::from_bytes(&art.gate_bytes).unwrap();
     gate.layer_mut(0).unwrap().weights_mut()[0] = f32::NAN;
     art.gate_bytes = gate.to_bytes();
-    assert!(
-        ServingRouter::new(art, true)
-            .unwrap()
-            .refit_source()
-            .is_err()
-    );
+    assert!(LiveRouter::new(art).refit_source().is_err());
     for scale in [f64::MAX, 1e30] {
         let mut art = artifact();
         if let RouterProvenance::Recorded(recorded) = &mut art.provenance {
             recorded.policy.exploration_scale = Some(scale);
         }
-        assert!(
-            ServingRouter::new(art, true)
-                .unwrap()
-                .refit_source()
-                .is_err()
-        );
+        assert!(LiveRouter::new(art).refit_source().is_err());
     }
 }
 
@@ -625,7 +602,7 @@ fn candidate_outputs_come_from_candidate_bytes_and_the_existing_floor_policy() {
     if let RouterProvenance::Recorded(recorded) = &mut art.provenance {
         recorded.policy.epsilon = 0.6;
     }
-    let live = ServingRouter::new(art, true).unwrap();
+    let live = LiveRouter::new(art);
     let source = live.refit_source().unwrap();
     let store = pair(&source, 2);
     let before_epoch = live.policy_epoch();
@@ -677,10 +654,7 @@ fn a_floor_that_drops_every_adapter_remains_a_valid_policy_output() {
     if let RouterProvenance::Recorded(recorded) = &mut art.provenance {
         recorded.policy.epsilon = 1.0;
     }
-    let source = ServingRouter::new(art, true)
-        .unwrap()
-        .refit_source()
-        .unwrap();
+    let source = LiveRouter::new(art).refit_source().unwrap();
     let store = pair(&source, 2);
     let result = candidate(builder(2, 2).build_candidate(&source, &store).unwrap());
     assert!(
@@ -697,10 +671,7 @@ fn a_failed_candidate_evaluation_does_not_consume_ids_or_commit_trainer_history(
     art.gate_bytes = Network::new(vec![Layer::zeros(2, 3, Activation::Linear).unwrap()])
         .unwrap()
         .to_bytes();
-    let source = ServingRouter::new(art, true)
-        .unwrap()
-        .refit_source()
-        .unwrap();
+    let source = LiveRouter::new(art).refit_source().unwrap();
     let mut store = EpisodeStore::new(2);
     record(
         &mut store,
@@ -735,10 +706,7 @@ fn a_failed_training_update_does_not_consume_ids_or_commit_trainer_history() {
     if let RouterProvenance::Recorded(recorded) = &mut art.provenance {
         recorded.policy.exploration_scale = Some(f64::from(5e18_f32));
     }
-    let bad_source = ServingRouter::new(art, true)
-        .unwrap()
-        .refit_source()
-        .unwrap();
+    let bad_source = LiveRouter::new(art).refit_source().unwrap();
     let mut store = EpisodeStore::new(2);
     record(
         &mut store,

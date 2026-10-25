@@ -48,7 +48,7 @@ These modules contain submodules (directories with their own `mod.rs`).
 
 ### Feature-gated modules
 
-The `image` feature enables PNG/JPEG decoding and is enabled by default and by `serve`.
+The `image` feature enables PNG/JPEG decoding and is enabled by default and by `lattice-serve`.
 Without it, image decoding APIs remain available but return an error naming the required feature.
 
 | Module     | Feature flag     | Responsibility                                                                                                                     |

@@ -45,26 +45,12 @@ bins = [
 ]
 
 [features]
-default = ["std", "download", "serve", "image"]
-# HTTP serving stack (axum/tokio/futures) for the `lattice` CLI's serve
-# command and the standalone `lattice_serve` binary. On by default so a plain
-# `cargo install lattice-inference` keeps shipping the `lattice` CLI
-# unchanged, and existing `--features f16,metal-gpu` install/package profiles
-# keep including `lattice_serve` without needing an extra flag. Library
-# consumers building with `default-features = false` no longer pull an HTTP
-# server into their dependency tree (the lib itself never uses it).
-serve = [
-    "image",
-    "dep:axum",
-    "dep:tokio",
-    "dep:futures",
-    "dep:mime",
-    "dep:http-body-util",
-    "dep:hyper",
-    "dep:clap",
-    "dep:hyper-util",
-    "dep:tower",
-]
+default = ["std", "download", "image"]
+# Unsupported, version-coupled interface for `lattice-serve` (ADR-103
+# Amendment 4): the hidden `serving_support` module and the router items it
+# needs. Off by default; `lattice-serve` depends on this crate with an exact
+# version and enables it. Not part of the public API.
+serving-support = []
 std = []
 # Encoded PNG/JPEG input; raw image tensors remain available without decoding.
 image = ["dep:image"]
@@ -117,19 +103,6 @@ serde_json.workspace = true
 base64.workspace = true
 thiserror.workspace = true
 tracing = { workspace = true, features = ["default"] }
-clap = { workspace = true, optional = true }
-axum = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
-mime = { workspace = true, optional = true }
-# Distinguishes a request-body length-limit rejection (`LengthLimitError`)
-# from any other body-buffering failure in the `serve` HTTP handlers.
-# Already an axum 0.8 transitive dependency at the same version; this makes
-# it a direct dependency so production handler code can downcast against it.
-http-body-util = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-tower = { workspace = true, features = ["util"], optional = true }
 # `ureq` (the `download` feature's HTTP client) is declared in the non-wasm
 # `[target]` table below, not here -- see the rationale there.
 sha2.workspace = true
@@ -158,11 +131,6 @@ lattice-weights = { version = "0.15.0", path = "../weights" }
 libc = "0.2"
 
 [[bin]]
-name = "lattice"
-path = "src/bin/lattice/main.rs"
-required-features = ["serve"]
-
-[[bin]]
 name = "backfill_qwen3"
 path = "src/bin/backfill_qwen3.rs"
 required-features = ["backfill"]
@@ -179,60 +147,6 @@ path = "src/bin/moe_admission_sim.rs"
 name = "chat_metal"
 path = "src/bin/chat_metal.rs"
 required-features = ["f16", "metal-gpu"]
-
-[[bin]]
-name = "lattice_serve"
-path = "src/bin/lattice_serve/main.rs"
-required-features = ["f16", "metal-gpu", "serve"]
-
-[[test]]
-name = "vision_serve_e2e_test"
-required-features = ["download", "f16", "metal-gpu", "serve"]
-
-[[test]]
-name = "serve_lora_e2e_test"
-required-features = ["download", "f16", "metal-gpu", "serve"]
-
-# ADR-090 R09: spawns the standalone `lattice_serve` binary, which is built only
-# under these features.
-[[test]]
-name = "serve_standalone_route"
-required-features = ["f16", "metal-gpu", "serve"]
-
-[[test]]
-name = "serve_startup_golden"
-required-features = ["f16", "metal-gpu", "serve"]
-
-# Request, prompt and answer layer for the system-one wire format (no model, no
-# route); runs under the default `serve` feature. Its checkpoint-tokenizer tests
-# skip with a printed reason when `LATTICE_DECIDER_DIR` is unset, and
-# `LATTICE_DECIDER_GATE_ENFORCE=1` turns that skip into a failure.
-[[test]]
-name = "systemone_decider_0_8b"
-required-features = ["serve"]
-
-# The serving checkpoint targets stay out of `cargo test`'s default target set
-# and run only when selected with `--test <name>`. Set
-# `LATTICE_SERVE_CHARACTERIZATION_GATE_ENFORCE=1` to fail when a checkpoint is
-# missing. The path variables are `LATTICE_SERVE_STANDALONE_QWEN_DIR`,
-# `LATTICE_SERVE_STANDALONE_GEMMA_DIR`, and
-# `LATTICE_SERVE_CHARACTERIZATION_QWEN_Q4_DIR`. Their default checkpoint names
-# are `qwen3.5-0.8b`, `gemma-4-e2b-it`, and `qwen3.5-0.8b-q4`, respectively.
-[[test]]
-name = "serve_request_refusals"
-test = false
-required-features = ["f16", "metal-gpu", "serve"]
-
-[[test]]
-name = "serve_worker_live"
-test = false
-required-features = ["f16", "metal-gpu", "serve"]
-
-# These targets load real checkpoints, which take minutes each on the CPU.
-[[test]]
-name = "serve_cpu_isolation"
-test = false
-required-features = ["serve"]
 
 # ADR-090 R03. Excluded from `cargo test`'s default target set on purpose: this
 # gate enforces by default (a missing checkpoint or a missing `f16` feature is a
@@ -333,19 +247,6 @@ required-features = ["f16", "metal-gpu"]
 name = "bench_decode_streaming"
 required-features = ["f16", "metal-gpu"]
 
-# The Metal routes additionally need f16, metal-gpu and bench-internals;
-# without them those routes print SKIP and exit non-zero.
-[[example]]
-name = "bench_serve_prepare"
-required-features = ["serve"]
-
-# HTTP-level serving measurement: spawns the built `lattice` binary. `test = true`
-# runs its model-free refusal controls under a plain `cargo test`.
-[[example]]
-name = "bench_serve_http"
-required-features = ["serve", "download"]
-test = true
-
 [[example]]
 name = "bench_gpu"
 required-features = ["f16", "wgpu-gpu"]
@@ -423,7 +324,6 @@ ureq = { version = "3", optional = true }
 
 [dev-dependencies]
 lattice-weights = { version = "0.15.0", path = "../weights", features = ["test-utils"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 proc-macro2.workspace = true

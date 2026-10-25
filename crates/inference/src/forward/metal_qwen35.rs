@@ -910,7 +910,12 @@ mod inner {
         pub stopped: bool,
     }
 
-    #[cfg(all(test, feature = "router-learning", feature = "serve", feature = "f16"))]
+    #[cfg(all(
+        test,
+        feature = "router-learning",
+        feature = "serving-support",
+        feature = "f16"
+    ))]
     pub(crate) fn reference_scoring_fixture() -> (Qwen35Config, ModelWeights) {
         tests::option_scoring_fixture()
     }
@@ -1633,10 +1638,19 @@ pub use inner::{
     target_os = "macos",
     feature = "metal-gpu",
     feature = "router-learning",
-    feature = "serve",
+    feature = "serving-support",
     feature = "f16"
 ))]
 pub(crate) use inner::reference_scoring_fixture;
+
+/// Named by `crate::serving_support`'s prefix-cache wrapper; the type stays
+/// unnameable outside the crate, as before.
+#[cfg(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "serving-support"
+))]
+pub(crate) use inner::CachedGenerateOutput;
 
 /// The ordinary-generation route planner and samplers, shared with
 /// `crate::decoder::qwen_metal` so the decoder session selects exactly as

@@ -103,7 +103,8 @@ fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
 inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + model-config;
                                                    optional metal-runtime under `metal-gpu`;
     |                                               optional dep on fann (`mixture` or `metal-gpu` feature)
-embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
+embed (12K)   tune (20K)   serve               ← embed uses inference; tune uses fann + inference;
+                                                 serve (application) uses inference (`serving-support`) + tokenizer + weights
 ```
 
 `inference-core` (the shared `InferenceError`), `tokenizer`, `grammar`, `weights`,
@@ -121,6 +122,11 @@ default set. A default `cargo build -p lattice-tune` therefore does not compile
 `lattice-inference` at all — six targets pull it in through `required-features` and
 that is the whole of its reach. Check the manifest before assuming an edge is live in
 the build you are looking at.
+
+`serve` (`lattice-serve`) is an application crate, not a library layer: it holds the
+OpenAI-compatible HTTP server and the `lattice` and `lattice_serve` binaries. It reaches
+inference through the doc-hidden `serving-support` module, which it enables with an exact
+version requirement, so the two crates release together. Nothing depends on `serve`.
 
 ### lattice-inference-core — Shared base types
 
@@ -260,6 +266,16 @@ helpers in `model::qwen35_config` stay in inference.
 | `train/`    | Training loop           | `TrainingLoop`, `TrainingConfig`, `EarlyStopping`, `JitAdapter` |
 | `data/`     | Dataset pipeline        | `Dataset`, `TrainingExample`, `DatasetConfig`                   |
 | `registry/` | Model registry          | `ModelRegistry`, `RegisteredModel`, `ShadowSession`             |
+
+### lattice-serve — HTTP serving and the CLI
+
+| Module              | Purpose                                  | Key Exports                   |
+| ------------------- | ---------------------------------------- | ----------------------------- |
+| `serve/`            | HTTP server, routes, LoRA and routing    | `serve::route`, `serve::lora` |
+| `serving_provider`  | Per-family request preparation           | provider registry             |
+| `serving_worker`    | Model worker threads behind the server   | worker handles                |
+| `bin/lattice`       | `lattice` CLI (chat, serve, doctor, ...) | binary                        |
+| `bin/lattice_serve` | Standalone serving daemon                | binary (`f16`, `metal-gpu`)   |
 
 ### lattice-transport — Optimal transport
 
