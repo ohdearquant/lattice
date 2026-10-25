@@ -105,6 +105,31 @@ before the QuaRot modules can leave it. Recorded:
    renamed or moved. `facade_api_parity` adds a compile-time check that each re-exported function is the same function
    item as its definition.
 
+## Amendment 7 (2026-10-25)
+
+With the configurations below the facade (Amendments 5 and 6), the QuaRot conversion joins the primitives already in
+`lattice-quant`. This completes D9 step 2 for quantization. Recorded:
+
+1. **D8.1.** `quant::quarot::{convert, forward_equivalence, io, lm_head, lora, pipeline, plan, rmsnorm_fusion}` move to
+   `lattice-quant` under `quarot::`, with their tests, and so does the test-only `r3_reference` module. The crate gains
+   two normal dependencies: `lattice-model-config`, for the Qwen3.5 configuration, `QwenConfig` and the tensor-name
+   functions, and `memmap2`, because the source-tensor reader holds a memory map. Maps are still constructed only in
+   `lattice_weights::mmap_trust`; holding one is allowed, and the trust-boundary contract already scans this crate.
+   `lattice-quant` now depends on `lattice-model-config`, so the publish order puts `lattice-model-config` in its own
+   tier before `lattice-quant`, which changes Amendment 5's "third tier beside `lattice-quant`".
+2. **D1.** The facade keeps every path. Each moved module becomes a facade module of named re-exports, and
+   `quant::quarot` keeps its root re-exports of `io::{ArtifactVersion, OnlineArtifactDescriptor, QuarotTensorReader,
+   SourceDType}` and `plan::{OnlineRotationSpec, OnlineTransformSite, RotationId}`.
+3. **D4.** One crate-private item crosses the boundary: `convert::read_quarot_seed_from_index`, read by the Metal
+   weight loader and its tests. It is not part of any public API, so its definition stays crate-private and
+   `__internal::read_quarot_seed_from_index` forwards to it; the facade imports it `pub(crate)` at its old path under
+   its caller's gate, `all(target_os = "macos", feature = "metal-gpu")`. The definition was gated on
+   `any(test, feature = "metal-gpu")` for the conversion tests that also called it; those tests moved with it and
+   `lattice-quant` has no `metal-gpu` feature, so the gate on the definition goes. Every other crate-private item of the
+   moved modules is used only inside them.
+4. **D6.1.** The moved unit tests keep their names under the new crate's paths. `facade_api_parity` adds same-item
+   checks for every moved public type, function and constant, and for the root re-exports.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

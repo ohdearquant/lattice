@@ -1712,8 +1712,10 @@ name = "lattice-quant"
 version = "0.15.0"
 dependencies = [
  "lattice-inference-core",
+ "lattice-model-config",
  "lattice-weights",
  "libc",
+ "memmap2",
  "serde",
  "serde_json",
  "tempfile",

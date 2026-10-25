@@ -96,7 +96,9 @@ fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
                                        |
                      tokenizer (8K)   grammar   weights   metal-runtime   ← depend on inference-core
                                                  |
-                                               quant   model-config   ← depend on inference-core + weights
+                                              model-config   ← depends on inference-core + weights
+                                                 |
+                                               quant   ← depends on inference-core + weights + model-config
     |                                  |
 inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + model-config;
                                                    optional metal-runtime under `metal-gpu`;
@@ -107,7 +109,7 @@ embed (12K)   tune (20K)                          ← embed uses inference; tune
 `inference-core` (the shared `InferenceError`), `tokenizer`, `grammar`, `weights`,
 `quant` and `model-config` were split out of `inference`; all six edges into them are unconditional.
 `metal-runtime` depends on `inference-core` and is enabled by inference's opt-in
-`metal-gpu` feature. `quant` and `model-config` each depend on `inference-core` and `weights`. `inference` re-exports the extracted
+`metal-gpu` feature. `model-config` depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`. `inference` re-exports the extracted
 public items at their original paths. Of the four edges among the
 other crates, three are feature-gated, and the gates do not all default the
 same way, so "depends on" in the diagram is not one relationship. `tune` depends on
@@ -175,18 +177,26 @@ The `bench-internals` feature exposes profiling probes and is forwarded by the f
 Its only internal runtime dependency is `inference-core`. The inference facade retains
 its existing `weights` and `model_format` paths.
 
-### lattice-quant — Quantization primitives
+### lattice-quant — Quantization
 
-| Module               | Purpose                               | Key Exports                                       |
-| -------------------- | ------------------------------------- | ------------------------------------------------- |
-| `q4_manifest.rs`     | Bounded Q4 checkpoint manifest reads  | `Q4Manifest`, `Q4ManifestError`, `load_manifest`  |
-| `quarot/hadamard.rs` | Walsh-Hadamard transforms             | `RandomizedHadamard`, `BlockHadamard`             |
-| `quarot/rotation.rs` | Absorb rotations into weight matrices | `absorb_input_rotation`, `absorb_output_rotation` |
+| Module                          | Purpose                                    | Key Exports                                        |
+| ------------------------------- | ------------------------------------------ | -------------------------------------------------- |
+| `q4_manifest.rs`                | Bounded Q4 checkpoint manifest reads       | `Q4Manifest`, `Q4ManifestError`, `load_manifest`   |
+| `quarot/hadamard.rs`            | Walsh-Hadamard transforms                  | `RandomizedHadamard`, `BlockHadamard`              |
+| `quarot/rotation.rs`            | Absorb rotations into weight matrices      | `absorb_input_rotation`, `absorb_output_rotation`  |
+| `quarot/plan.rs`                | Rotation plan for a Qwen3.5 checkpoint     | `RotationPlan`, `OnlineRotationSpec`, `RotationId` |
+| `quarot/convert.rs`             | Offline QuaRot conversion                  | `convert_quarot_qwen35`                            |
+| `quarot/io.rs`                  | Source-tensor reader, artifact descriptor  | `QuarotTensorReader`, `OnlineArtifactDescriptor`   |
+| `quarot/rmsnorm_fusion.rs`      | Fold RMSNorm gains into adjacent weights   | RMSNorm fusion functions                           |
+| `quarot/lm_head.rs`             | Untie and materialize the LM head          | `materialize_lm_head_for_qwen35`                   |
+| `quarot/lora.rs`                | Rotate a LoRA adapter for a QuaRot model   | `rotate_adapter_for_quarot`                        |
+| `quarot/pipeline.rs`            | Load, fuse and rotate source tensors       | `load_tensors_f64`, `absorb_rotations`             |
+| `quarot/forward_equivalence.rs` | Pre-quantization forward-equivalence check | `assert_forward_equivalence_qwen35`                |
 
-Its internal runtime dependencies are `inference-core` and `weights`; the manifest
-reader uses the bounded file reader from `weights`. The inference facade retains the
-existing `quant::q4_manifest`, `quant::quarot::hadamard` and `quant::quarot::rotation`
-paths. Conversion orchestration and the remaining QuaRot modules stay in inference.
+Its internal runtime dependencies are `inference-core`, `weights` and `model-config`; the
+manifest reader uses the bounded file reader from `weights`, and the conversion reads the
+Qwen3.5 configuration and tensor names from `model-config`. The inference facade retains
+every `quant::q4_manifest` and `quant::quarot::*` path.
 
 ### lattice-model-config — Model configurations
 

@@ -20,8 +20,10 @@ lattice-tokenizer, lattice-grammar, lattice-weights, lattice-metal-runtime
                                 (depend on lattice-inference-core)
         │
         ▼  (wait for crates.io indexing)
-lattice-quant, lattice-model-config
-                                (depend on lattice-inference-core and lattice-weights)
+lattice-model-config            (depends on lattice-inference-core and lattice-weights)
+        │
+        ▼  (wait for crates.io indexing)
+lattice-quant                   (depends on lattice-inference-core, lattice-weights and lattice-model-config)
         │
         ▼  (wait for crates.io indexing)
 lattice-inference               (depends on lattice-inference-core, lattice-tokenizer, lattice-grammar,
@@ -122,8 +124,11 @@ cargo publish -p lattice-metal-runtime
 
 sleep 30   # wait for crates.io indexing
 
-cargo publish -p lattice-quant
 cargo publish -p lattice-model-config
+
+sleep 30   # wait for crates.io indexing
+
+cargo publish -p lattice-quant
 
 sleep 30   # wait for crates.io indexing
 

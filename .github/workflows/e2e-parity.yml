@@ -728,7 +728,7 @@ jobs:
         run: ./scripts/wasm-simd128-parity.sh
 
   # Composed rotated(QuaRot)+Q4 forward-path gate (issue #320). The converter's
-  # own f64 forward-equivalence check (quant/quarot/forward_equivalence.rs) gates
+  # own f64 forward-equivalence check (crates/quant/src/quarot/forward_equivalence.rs) gates
   # the rotation-fusion math PRE-quantization; nothing previously exercised the
   # runtime consumer of a QuaRot+Q4 artifact — MetalQwen35State::from_q4_dir
   # followed by greedy decode. This workflow regenerates an EPHEMERAL QuaRot+Q4
@@ -748,7 +748,7 @@ jobs:
   # value used by every non-CI invocation and by the canonical regen script
   # (scripts/gen_quarot_q4_composed_golden.py, which never passes --tolerance
   # either). assert_forward_equivalence_qwen35
-  # (crates/inference/src/quant/quarot/forward_equivalence.rs) gates the
+  # (crates/quant/src/quarot/forward_equivalence.rs) gates the
   # chain probe AND the per-tensor matrix-equivalence check against ONE
   # shared threshold — there is no CLI flag to loosen one without loosening
   # the other. An earlier revision of this job passed `--tolerance 16` to

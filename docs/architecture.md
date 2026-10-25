@@ -16,10 +16,11 @@ lattice-tokenizer   ←── lattice-inference-core   (WordPiece, SentencePiece
 lattice-grammar     ←── lattice-inference-core   (JSON Schema, GBNF, constrained decoding)
 lattice-weights     ←── lattice-inference-core   (weight storage, model-directory format detection)
 lattice-metal-runtime ←── lattice-inference-core (shared Metal helpers, macOS + `metal-gpu`)
-lattice-quant       ←── lattice-inference-core
-                    ←── lattice-weights         (Q4 manifests, Hadamard transforms, rotation absorption)
 lattice-model-config ←── lattice-inference-core
                     ←── lattice-weights         (Qwen3.5, Gemma 4, EmbeddingGemma 2, BitNet configs)
+lattice-quant       ←── lattice-inference-core
+                    ←── lattice-weights
+                    ←── lattice-model-config    (Q4 manifests, Hadamard rotations, QuaRot conversion)
 lattice-inference   ←── lattice-inference-core
                     ←── lattice-tokenizer
                     ←── lattice-grammar
@@ -39,8 +40,8 @@ lattice-tune    ←── lattice-fann
 
 The three leaf crates (`inference-core`, `fann`, `transport`) have zero intra-workspace
 dependencies and can be used standalone. `tokenizer`, `grammar` and `weights` each depend
-only on `inference-core` at runtime; grammar uses tokenizer in tests. `quant` and
-`model-config` each depend on `inference-core` and `weights`. `inference` depends on all six unconditionally (plus
+only on `inference-core` at runtime; grammar uses tokenizer in tests. `model-config`
+depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`. `inference` depends on all six unconditionally (plus
 `fann` under the optional `mixture` or `metal-gpu` features), re-exporting tokenizer,
 grammar, weight, model-format, quantization primitive, model configuration and error items at their original
 paths. `metal-runtime` depends only on `inference-core` internally; the facade enables
@@ -91,12 +92,14 @@ paths. Model loading and forward execution remain in `lattice-inference`.
 ### lattice-quant
 
 Bounded Q4 checkpoint manifest reading, Walsh-Hadamard transforms, seeded randomized
-and block Hadamard rotations, and input/output rotation absorption for weight matrices.
-Its internal runtime dependencies are `lattice-inference-core` and `lattice-weights`;
-the Q4 manifest reader uses the bounded file reader from weights. The facade retains
-`lattice_inference::quant::q4_manifest`, `lattice_inference::quant::quarot::hadamard`
-and `lattice_inference::quant::quarot::rotation`. Conversion orchestration, planning and
-the remaining QuaRot modules remain in `lattice-inference`.
+and block Hadamard rotations, input/output rotation absorption for weight matrices, and
+the offline QuaRot conversion of Qwen3.5 checkpoints: the rotation plan, RMSNorm fusion,
+LM-head and LoRA handling, the source-tensor reader and the online-rotation artifact
+descriptor, and the equivalence checks. Its internal runtime dependencies are
+`lattice-inference-core`, `lattice-weights` and `lattice-model-config`; the Q4 manifest
+reader uses the bounded file reader from weights, and the conversion takes the Qwen3.5
+configuration and tensor names from model-config. The facade retains every `lattice_inference::quant::q4_manifest` and
+`lattice_inference::quant::quarot::*` path.
 
 ### lattice-model-config
 
