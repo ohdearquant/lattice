@@ -221,13 +221,13 @@ helpers in `model::qwen35_config` stay in inference.
 
 ### lattice-compute — Host-side compute
 
-| Module    | Purpose                                  | Key Exports |
-| --------- | ---------------------------------------- | ----------- |
-| `rope.rs` | Rotary position embedding sin/cos tables | `RopeTable` |
-| `kv_cache/flat.rs` | Contiguous half-precision KV storage | `FlatKVCache`, `FlatKVCacheConfig` |
-| `kv_cache/paged.rs` | Paged storage, allocation and eviction | `PagePool`, `PagedKVCache`, `PagedKVCacheConfig` |
-| `kv_cache/prefix.rs` | Shared prefix pages and cache | `AdapterId`, `PrefixPageCache` |
-| `kv_cache/cross_turn.rs` | Cross-turn prefix reuse planning | `CrossTurnPrefixEntry`, `plan_prefix_reuse` |
+| Module                   | Purpose                                  | Key Exports                                      |
+| ------------------------ | ---------------------------------------- | ------------------------------------------------ |
+| `rope.rs`                | Rotary position embedding sin/cos tables | `RopeTable`                                      |
+| `kv_cache/flat.rs`       | Contiguous half-precision KV storage     | `FlatKVCache`, `FlatKVCacheConfig`               |
+| `kv_cache/paged.rs`      | Paged storage, allocation and eviction   | `PagePool`, `PagedKVCache`, `PagedKVCacheConfig` |
+| `kv_cache/prefix.rs`     | Shared prefix pages and cache            | `AdapterId`, `PrefixPageCache`                   |
+| `kv_cache/cross_turn.rs` | Cross-turn prefix reuse planning         | `CrossTurnPrefixEntry`, `plan_prefix_reuse`      |
 
 Its internal runtime dependency is `inference-core` for the shared error type. Flat and
 paged storage, prefix sharing and cross-turn planning are available under `kv_cache`;
