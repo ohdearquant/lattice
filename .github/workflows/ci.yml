@@ -1622,12 +1622,12 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
-      - name: inference - real route marker rejects a bypassing adapter
+      - name: serve - real route marker rejects a bypassing adapter
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/shared-route-rejects-bypass.log"
-          if cargo test -p lattice-inference --features test-utils --lib \
+          if cargo test -p lattice-serve --features test-utils --lib \
             'serving_cpu::tests::supported_route_marker_rejects_a_test_bypassing_adapter' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1637,13 +1637,13 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
-      - name: inference - Qwen Metal text marker reads its driver trace (macOS only)
+      - name: serve - Qwen Metal text marker reads its driver trace (macOS only)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/qwen-metal-text-route-marker.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'model::serving_runtime::qwen_metal::tests::text_requests_report_the_prefix_cache_driver_trace' \
+          if cargo test -p lattice-serve --features f16,metal-gpu --lib \
+            'serving_runtime::qwen_metal::tests::text_requests_report_the_prefix_cache_driver_trace' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
@@ -1652,13 +1652,13 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
-      - name: inference - Qwen Metal vision marker declares its bypass (macOS only)
+      - name: serve - Qwen Metal vision marker declares its bypass (macOS only)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/qwen-metal-vision-route-marker.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
-            'model::serving_runtime::qwen_metal::tests::vision_requests_report_a_bypassed_route' \
+          if cargo test -p lattice-serve --features f16,metal-gpu --lib \
+            'serving_runtime::qwen_metal::tests::vision_requests_report_a_bypassed_route' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else
