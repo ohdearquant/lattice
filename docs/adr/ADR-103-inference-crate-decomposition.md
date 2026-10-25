@@ -350,6 +350,32 @@ the implementation and its unit tests move together. Recorded:
 6. **D6.4.** The added dependencies and changed build inputs require measured A/B acceptance. This amendment records
    the extraction and its validation obligations; it does not assert a measurement result or a structural waiver.
 
+## Amendment 10 (2026-10-25)
+
+The LoRA hook contract and its row application helper join `lattice-compute`, so shared forward computation can use
+them without depending on the inference facade. Recorded:
+
+1. **D8.1.** `lora_hook` and its tests move into `lattice-compute`. The crate gains a normal dependency on
+   `lattice-model-config` for `Qwen35Config`, alongside its existing core dependency. Compute therefore moves from
+   publish tier 2 to tier 4, after model-config and beside quant; the script publishes quant then compute within that
+   tier. This order adds no compute-to-quant dependency. The publish-order test and dependency diagrams follow it.
+2. **D1.** `lattice_inference::lora_hook` keeps named public re-exports of `LoraHook`, `NoopLoraHook`,
+   `LoraProjectionShape`, `GDN_LORA_MODULES`, `GDN_LORA_MODULES_SERVABLE`, `gdn_lora_module_is_servable` and
+   `qwen35_projection_shape`. The types and trait are the same items at both paths.
+3. **D4.2.** The formerly crate-private free function `apply_lora_rows` becomes the documented public
+   `lattice_compute::lora_hook::apply_lora_rows`: applying an adapter to flattened token rows is a coherent compute
+   operation. The facade imports it with `pub(crate) use`, preserving its private facade visibility. No new
+   `__internal` bridge is added. The helper's row geometry, activity check and row order stay unchanged.
+4. **D5.** Compute keeps an empty default feature set. `lora_hook` and the model-config dependency are unconditional;
+   the move adds no caller feature or target gate.
+5. **D6.1.** `lora_hook/tests.rs` moves unchanged with all nine test names. The facade adds the unit test
+   `row_helper_is_the_same_function_item`. `facade_api_parity` adds
+   `lora_types_and_trait_are_the_same_at_both_paths`, `lora_functions_are_the_same_items_at_both_paths` and
+   `lora_constants_are_equal_at_both_paths`, covering type and trait identity, function-item identity and constant
+   equality without exposing the row helper publicly through the facade.
+6. **D6.4.** The added dependency and changed build inputs require measured A/B acceptance. This amendment records
+   the extraction and its validation obligations; it does not assert a measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
