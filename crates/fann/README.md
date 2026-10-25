@@ -271,9 +271,9 @@ Average inference time <5ms for networks up to 128->256->128->64->10.
 | 128->256->64->10 | 50K        | ~500us         |
 | 784->128->64->10 | 109K       | ~1ms           |
 
-No committed benchmark target currently produces these numbers (`crates/fann/benches/` has only
-`router_online.rs`, which measures online-learning convergence, not raw forward-pass latency) —
-treat this table as illustrative rather than reproducible until a forward-pass bench lands.
+No committed benchmark target currently produces these numbers
+(`crates/fann/examples/router_online.rs` measures online-learning convergence, not raw forward-pass
+latency) — treat this table as illustrative rather than reproducible until a forward-pass bench lands.
 
 ## GPU Acceleration
 
