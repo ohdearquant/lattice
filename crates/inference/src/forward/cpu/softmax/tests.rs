@@ -354,7 +354,7 @@ mod avx2 {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn assert_special_rows(arm: &str, run: impl Fn(&mut [f32], usize, usize)) {
     for &len in &ACCURACY_LENS {
         for lane in [0, len / 2, len - 1] {
@@ -397,4 +397,47 @@ fn avx2_fma_matches_f64_reference() {
     };
     assert_matches_f64_reference("avx2-fma", run);
     assert_special_rows("avx2-fma", run);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx2_degree5_matches_f64_reference() {
+    if !simd_config().avx2_enabled {
+        return;
+    }
+    eprintln!("softmax avx2 degree5: exercising SIMD body");
+    let run = |x: &mut [f32], seq_len, num_heads| {
+        // SAFETY: AVX2 was detected above.
+        unsafe { softmax_attention_avx2(x, seq_len, num_heads) };
+    };
+    assert_matches_f64_reference("avx2-degree5", run);
+    assert_special_rows("avx2-degree5", run);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx2_fma_degree5_matches_f64_reference() {
+    let config = simd_config();
+    if !config.avx2_enabled || !config.fma_enabled {
+        return;
+    }
+    eprintln!("softmax avx2-fma degree5: exercising SIMD body");
+    let run = |x: &mut [f32], seq_len, num_heads| {
+        // SAFETY: both AVX2 and FMA were detected above.
+        unsafe { softmax_attention_avx2_fma(x, seq_len, num_heads) };
+    };
+    assert_matches_f64_reference("avx2-fma-degree5", run);
+    assert_special_rows("avx2-fma-degree5", run);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_degree5_matches_f64_reference() {
+    eprintln!("softmax neon degree5: exercising SIMD body");
+    let run = |x: &mut [f32], seq_len, num_heads| {
+        // SAFETY: NEON is guaranteed on aarch64.
+        unsafe { softmax_attention_neon(x, seq_len, num_heads) };
+    };
+    assert_matches_f64_reference("neon-degree5", run);
+    assert_special_rows("neon-degree5", run);
 }
