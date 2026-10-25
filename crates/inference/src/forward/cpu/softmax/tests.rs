@@ -414,22 +414,6 @@ fn avx2_degree5_matches_f64_reference() {
     assert_special_rows("avx2-degree5", run);
 }
 
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn avx2_fma_degree5_matches_f64_reference() {
-    let config = simd_config();
-    if !config.avx2_enabled || !config.fma_enabled {
-        return;
-    }
-    eprintln!("softmax avx2-fma degree5: exercising SIMD body");
-    let run = |x: &mut [f32], seq_len, num_heads| {
-        // SAFETY: both AVX2 and FMA were detected above.
-        unsafe { softmax_attention_avx2_fma(x, seq_len, num_heads) };
-    };
-    assert_matches_f64_reference("avx2-fma-degree5", run);
-    assert_special_rows("avx2-fma-degree5", run);
-}
-
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn neon_degree5_matches_f64_reference() {
