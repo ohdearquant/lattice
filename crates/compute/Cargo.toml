@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Host-side compute for Lattice inference: rotary position embedding tables and KV caches"
+description = "Host-side compute for Lattice inference: rotary position embedding tables, KV caches and LoRA hooks"
 keywords = ["inference", "rope", "transformer", "llm", "cpu"]
 categories = ["science", "algorithms"]
 
@@ -19,6 +19,7 @@ default = []
 [dependencies]
 half.workspace = true
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+lattice-model-config = { version = "0.15.0", path = "../model-config" }
 indexmap.workspace = true
 rustc-hash.workspace = true
 

@@ -24,9 +24,9 @@ esac
 
 # Publish order follows the internal dependency DAG (deps before dependents):
 #   fann, transport, inference-core   leaves, no internal deps
-#     -> tokenizer, grammar, weights, metal-runtime, compute  depend on inference-core
+#     -> tokenizer, grammar, weights, metal-runtime  depend on inference-core
 #       -> model-config               depends on inference-core, weights
-#         -> quant                    depends on inference-core, weights, model-config
+#         -> quant, compute           quant depends on inference-core, weights, model-config; compute on inference-core, model-config
 #           -> inference              depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, model-config, compute, metal-runtime
 #             -> embed                depends on inference
 #             -> serve                depends on inference (exact version), fann, tokenizer, weights
@@ -55,7 +55,7 @@ fi
 echo "Waiting for crates.io indexing..."
 sleep 30
 
-echo "--- Tier 2: tokenizer, grammar, weights, metal-runtime and compute (depend on inference-core) ---"
+echo "--- Tier 2: tokenizer, grammar, weights and metal-runtime (depend on inference-core) ---"
 cargo publish -p lattice-tokenizer $FLAG
 # lattice-grammar's tests depend on the lattice-tokenizer release just uploaded.
 if [ -z "$FLAG" ]; then
@@ -65,7 +65,6 @@ fi
 cargo publish -p lattice-grammar $FLAG
 cargo publish -p lattice-weights $FLAG
 cargo publish -p lattice-metal-runtime $FLAG
-cargo publish -p lattice-compute $FLAG
 
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."
@@ -80,8 +79,9 @@ if [ -z "$FLAG" ]; then
     sleep 30
 fi
 
-echo "--- Tier 4: quant (depends on inference-core, weights, model-config) ---"
+echo "--- Tier 4: quant and compute (depend on model-config) ---"
 cargo publish -p lattice-quant $FLAG
+cargo publish -p lattice-compute $FLAG
 
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."

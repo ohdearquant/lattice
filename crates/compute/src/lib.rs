@@ -1,8 +1,9 @@
 //! Host-side compute for Lattice inference.
 //!
 //! This crate holds the computation that runs on the host for a decoder forward pass. It currently
-//! contains rotary position embedding tables ([`rope::RopeTable`]) and flat/paged KV storage with prefix planning; the
-//! CPU kernels, attention, pooling and sampling move here in later releases.
+//! contains rotary position embedding tables ([`rope::RopeTable`]), flat/paged KV storage with prefix
+//! planning and LoRA adapter hooks ([`lora_hook::LoraHook`]); CPU kernels, attention, pooling and
+//! sampling move here in later releases.
 //!
 //! `lattice-inference` re-exports the supported items at their original paths, so
 //! `lattice_inference::rope::RopeTable` and `lattice_compute::rope::RopeTable` name the same type.
@@ -10,6 +11,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod kv_cache;
+pub mod lora_hook;
 pub mod rope;
 
 /// Cache glue used by the `lattice-inference` facade.

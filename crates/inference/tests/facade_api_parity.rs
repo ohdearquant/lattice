@@ -1539,3 +1539,53 @@ mod compute_parity {
         );
     }
 }
+
+mod lora_hook_parity {
+    use lattice_compute::lora_hook as extracted;
+    use lattice_inference::lora_hook as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T: ?Sized>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+    fn send_sync<T: Send + Sync + ?Sized>() {}
+
+    #[test]
+    fn lora_types_and_trait_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::NoopLoraHook>,
+            PhantomData::<extracted::NoopLoraHook>,
+        );
+        same_type(
+            PhantomData::<facade::LoraProjectionShape>,
+            PhantomData::<extracted::LoraProjectionShape>,
+        );
+        same_type(
+            PhantomData::<dyn facade::LoraHook>,
+            PhantomData::<dyn extracted::LoraHook>,
+        );
+        let _: extracted::NoopLoraHook = facade::NoopLoraHook;
+        send_sync::<dyn facade::LoraHook>();
+        send_sync::<facade::NoopLoraHook>();
+    }
+
+    #[test]
+    fn lora_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::gdn_lora_module_is_servable,
+            extracted::gdn_lora_module_is_servable,
+        );
+        same_function(
+            facade::qwen35_projection_shape,
+            extracted::qwen35_projection_shape,
+        );
+    }
+
+    #[test]
+    fn lora_constants_are_equal_at_both_paths() {
+        assert_eq!(facade::GDN_LORA_MODULES, extracted::GDN_LORA_MODULES);
+        assert_eq!(
+            facade::GDN_LORA_MODULES_SERVABLE,
+            extracted::GDN_LORA_MODULES_SERVABLE
+        );
+    }
+}
