@@ -76,12 +76,24 @@ impl EmbeddingGemma2Rgb8Image {
     ///
     /// Declared pixel count is limited before decoding, with no per-side cap. Decoder
     /// allocations have an additional best-effort limit. Higher bit depths are rejected.
+    /// Returns [`InferenceError::InvalidInput`] when the `image` feature is disabled.
     pub fn from_encoded(image_bytes: &[u8]) -> Result<Self, InferenceError> {
-        let image = crate::vision::preprocess::decode_image_bounded(image_bytes)
-            .map_err(|error| invalid_image(format!("encoded image decode failed: {error}")))?;
-        Self::from_decoded(image)
+        #[cfg(feature = "image")]
+        {
+            let image = crate::vision::preprocess::decode_image_bounded(image_bytes)
+                .map_err(|error| invalid_image(format!("encoded image decode failed: {error}")))?;
+            Self::from_decoded(image)
+        }
+        #[cfg(not(feature = "image"))]
+        {
+            let _ = image_bytes;
+            Err(invalid_image(
+                "image decoding is not compiled in; enable the `image` feature",
+            ))
+        }
     }
 
+    #[cfg(feature = "image")]
     fn from_decoded(image: image::DynamicImage) -> Result<Self, InferenceError> {
         let width = usize::try_from(image.width()).map_err(|_| {
             invalid_image("decoded image width exceeds the supported integer range")

@@ -290,13 +290,53 @@ impl BertModel {
         config_json: &str,
         tokenizer_json: &str,
     ) -> Result<Self, InferenceError> {
+        Self::from_bytes_capped(weights_bytes, config_json, tokenizer_json, None)
+    }
+
+    /// **Unstable**: [`from_bytes`](Self::from_bytes) with the input length cap
+    /// chosen by the caller instead of derived from `config.json`; signature may
+    /// change as the from-bytes loading API matures.
+    ///
+    /// `max_tokens` counts the tokenizer's special tokens. A longer input is
+    /// truncated to `max_tokens` with its closing separator kept, so a caller
+    /// can reproduce another runtime's truncation length exactly. The cap never
+    /// exceeds the position-embedding table or the 2048-token limit `from_bytes`
+    /// applies; a larger value is lowered to them, and
+    /// [`tokenizer().max_seq_len()`](Self::tokenizer) reports the cap in force.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::InvalidInput`] when `max_tokens` is below 2, which
+    /// leaves no room for the opening and closing special tokens, and otherwise
+    /// the same errors as [`from_bytes`](Self::from_bytes).
+    pub fn from_bytes_with_max_tokens(
+        weights_bytes: Vec<u8>,
+        config_json: &str,
+        tokenizer_json: &str,
+        max_tokens: usize,
+    ) -> Result<Self, InferenceError> {
+        if max_tokens < 2 {
+            return Err(InferenceError::InvalidInput(format!(
+                "max_tokens must be at least 2 (the opening and closing special tokens), got {max_tokens}"
+            )));
+        }
+        Self::from_bytes_capped(weights_bytes, config_json, tokenizer_json, Some(max_tokens))
+    }
+
+    fn from_bytes_capped(
+        weights_bytes: Vec<u8>,
+        config_json: &str,
+        tokenizer_json: &str,
+        max_tokens: Option<usize>,
+    ) -> Result<Self, InferenceError> {
         let safetensors = Box::new(SafetensorsFile::from_bytes(weights_bytes)?);
         let config = BertConfig::from_json_str(config_json)?;
         // The tokenizer's own sequence-length cap has no `tokenizer_config.json`
         // to read here (see `tokenizer_from_json_str`'s doc comment), so derive
         // it from the config we already have, mirroring `infer_model_max_seq_len`'s
         // 2048 embedding-workload cap.
-        let max_seq_len = config.max_position_embeddings.min(2048);
+        let config_cap = config.max_position_embeddings.min(2048);
+        let max_seq_len = max_tokens.map_or(config_cap, |cap| cap.min(config_cap));
         let tokenizer = crate::tokenizer::tokenizer_from_json_str(tokenizer_json, max_seq_len)?;
 
         Self::assemble(config, tokenizer, safetensors)

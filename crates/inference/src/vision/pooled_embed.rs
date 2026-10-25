@@ -275,5 +275,5 @@ fn pool_from_pre_merger_hidden_states(
     embed_image_f16(weights, cfg, &request, pooling)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "image"))]
 mod tests;
