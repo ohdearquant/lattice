@@ -1580,6 +1580,7 @@ dependencies = [
  "half",
  "indexmap",
  "lattice-inference-core",
+ "lattice-model-config",
  "rustc-hash 2.1.3",
 ]
 
