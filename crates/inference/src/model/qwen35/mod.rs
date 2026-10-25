@@ -119,4 +119,7 @@ pub use generation::RawGenEvent;
 /// e.g., the QuaRot offline converter (ADR-044 step 3c) iterating
 /// rotation rules against an actual safetensors file. Originally
 /// `#[cfg(test)]`-only; promoted in step 3b.
-pub use loading::{qwen_layer_tensor_prefix, qwen_required_tensor_names};
+#[doc(inline)]
+pub use lattice_model_config::qwen35_tensors::{
+    qwen_layer_tensor_prefix, qwen_required_tensor_names,
+};

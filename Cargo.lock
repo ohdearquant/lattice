@@ -1645,6 +1645,7 @@ dependencies = [
  "lattice-grammar",
  "lattice-inference-core",
  "lattice-metal-runtime",
+ "lattice-model-config",
  "lattice-quant",
  "lattice-tokenizer",
  "lattice-weights",
@@ -1687,12 +1688,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "lattice-quant"
+name = "lattice-model-config"
 version = "0.15.0"
 dependencies = [
  "lattice-inference-core",
  "lattice-weights",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "lattice-quant"
+version = "0.15.0"
+dependencies = [
+ "lattice-inference-core",
+ "lattice-model-config",
+ "lattice-weights",
  "libc",
+ "memmap2",
  "serde",
  "serde_json",
  "tempfile",

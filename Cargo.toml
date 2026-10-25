@@ -12,6 +12,7 @@ members = [
     "crates/transport",
     "crates/weights",
     "crates/quant",
+    "crates/model-config",
     "crates/serve",
 ]
 

@@ -10,12 +10,14 @@
 //! represent the HF reference at the time of generation.
 //!
 //! **Tolerances** (constants at top of file — adjust here if needed):
-//! - BGE, E5, MiniLM (full f32 inference): cosine ≥ 0.9990, max-abs-diff ≤ 5e-3
+//! - BGE, E5, MiniLM (full f32 inference): cosine ≥ 0.99999, max-abs-diff ≤ 5e-3
 //! - Qwen3 (may have bf16 in path): cosine ≥ 0.9950, max-abs-diff ≤ 5e-3
 //!
 //! Note: max-abs-diff is observed at 1.8–3.5e-3 on current hardware (f32 → f64
 //! cast noise). The threshold is set at 5e-3 to provide headroom without masking
-//! regressions; the cosine guard (≥ 0.9990) is the primary quality signal.
+//! regressions; the cosine guard (≥ 0.99999) is the primary quality signal. An
+//! approximate exp in the attention softmax costs about 1e-4 in cosine, which this
+//! bound rejects.
 //!
 //! **How to regenerate fixtures** (run once, then commit the output):
 //!   ```bash
@@ -34,7 +36,7 @@
 // ---------------------------------------------------------------------------
 
 /// Minimum cosine similarity for BGE and E5 (full f32 inference paths).
-const COS_SIM_MIN_F32: f64 = 0.9990;
+const COS_SIM_MIN_F32: f64 = 0.99999;
 
 /// Minimum cosine similarity for Qwen3 (bf16 in forward pass).
 const COS_SIM_MIN_QWEN: f64 = 0.9950;

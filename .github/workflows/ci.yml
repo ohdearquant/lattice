@@ -1287,11 +1287,11 @@ jobs:
       # matches many tests, so pinning an exact number there would make this
       # step a sibling of every q4 test anyone adds later; non-zero is the
       # property that actually matters and the only one that stays true.
-      - name: inference — QuaRot rotated+Q4 composed forward gate
+      - name: quant — QuaRot rotated+Q4 composed forward gate
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/quarot-rotated-q4-forward-test.log"
-          if ! cargo test -p lattice-inference --lib quarot_rotated_q4_forward_matches_f64_reference -- --nocapture >"$log" 2>&1; then
+          if ! cargo test -p lattice-quant --lib quarot_rotated_q4_forward_matches_f64_reference -- --nocapture >"$log" 2>&1; then
             cat "$log"
             exit 1
           fi

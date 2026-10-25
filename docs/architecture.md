@@ -16,13 +16,17 @@ lattice-tokenizer   ←── lattice-inference-core   (WordPiece, SentencePiece
 lattice-grammar     ←── lattice-inference-core   (JSON Schema, GBNF, constrained decoding)
 lattice-weights     ←── lattice-inference-core   (weight storage, model-directory format detection)
 lattice-metal-runtime ←── lattice-inference-core (shared Metal helpers, macOS + `metal-gpu`)
+lattice-model-config ←── lattice-inference-core
+                    ←── lattice-weights         (Qwen3.5, Gemma 4, EmbeddingGemma 2, BitNet configs)
 lattice-quant       ←── lattice-inference-core
-                    ←── lattice-weights         (Q4 manifests, Hadamard transforms, rotation absorption)
+                    ←── lattice-weights
+                    ←── lattice-model-config    (Q4 manifests, Hadamard rotations, QuaRot conversion)
 lattice-inference   ←── lattice-inference-core
                     ←── lattice-tokenizer
                     ←── lattice-grammar
                     ←── lattice-weights
                     ←── lattice-quant
+                    ←── lattice-model-config
                     ←── lattice-metal-runtime (optional, `metal-gpu` feature)
                     ←── lattice-fann (optional, `mixture` or `metal-gpu` feature)
                                      (transformer forward pass, weights)
@@ -36,10 +40,10 @@ lattice-tune    ←── lattice-fann
 
 The three leaf crates (`inference-core`, `fann`, `transport`) have zero intra-workspace
 dependencies and can be used standalone. `tokenizer`, `grammar` and `weights` each depend
-only on `inference-core` at runtime; grammar uses tokenizer in tests. `quant` depends on
-`inference-core` and `weights`. `inference` depends on all five unconditionally (plus
+only on `inference-core` at runtime; grammar uses tokenizer in tests. `model-config`
+depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`. `inference` depends on all six unconditionally (plus
 `fann` under the optional `mixture` or `metal-gpu` features), re-exporting tokenizer,
-grammar, weight, model-format, quantization primitive and error items at their original
+grammar, weight, model-format, quantization primitive, model configuration and error items at their original
 paths. `metal-runtime` depends only on `inference-core` internally; the facade enables
 it under `metal-gpu`. Consumer crates (`embed`, `tune`) compose them.
 
@@ -88,12 +92,24 @@ paths. Model loading and forward execution remain in `lattice-inference`.
 ### lattice-quant
 
 Bounded Q4 checkpoint manifest reading, Walsh-Hadamard transforms, seeded randomized
-and block Hadamard rotations, and input/output rotation absorption for weight matrices.
-Its internal runtime dependencies are `lattice-inference-core` and `lattice-weights`;
-the Q4 manifest reader uses the bounded file reader from weights. The facade retains
-`lattice_inference::quant::q4_manifest`, `lattice_inference::quant::quarot::hadamard`
-and `lattice_inference::quant::quarot::rotation`. Conversion orchestration, planning and
-the remaining QuaRot modules remain in `lattice-inference`.
+and block Hadamard rotations, input/output rotation absorption for weight matrices, and
+the offline QuaRot conversion of Qwen3.5 checkpoints: the rotation plan, RMSNorm fusion,
+LM-head and LoRA handling, the source-tensor reader and the online-rotation artifact
+descriptor, and the equivalence checks. Its internal runtime dependencies are
+`lattice-inference-core`, `lattice-weights` and `lattice-model-config`; the Q4 manifest
+reader uses the bounded file reader from weights, and the conversion takes the Qwen3.5
+configuration and tensor names from model-config. The facade retains every `lattice_inference::quant::q4_manifest` and
+`lattice_inference::quant::quarot::*` path.
+
+### lattice-model-config
+
+Parsed and validated `config.json` for the Qwen3.5 and 3.6 hybrid models, Gemma 4,
+EmbeddingGemma 2 and BitNet b1.58, with the validation bounds those parsers enforce. Its
+internal runtime dependencies are `lattice-inference-core` and `lattice-weights`; every
+parser reads through the bounded config reader from weights. The facade retains the
+`lattice_inference::model::{qwen35_config, gemma4_config, embeddinggemma2_config,
+bitnet_config}` paths. The deprecated generation aliases and the reasoning-budget helpers
+stay in `lattice_inference::model::qwen35_config`.
 
 ### lattice-inference
 
@@ -185,6 +201,7 @@ lattice-inference        ← transformer forward pass
     │   Qwen3 decoder path (BPE, GQA, RoPE, SwiGLU, last-token pooling)
     │   lattice-weights: f32, f16, Q3, Q4, Q8 storage and model-format detection
     │   lattice-quant: Q4 manifests, Hadamard transforms and rotation absorption
+    │   lattice-model-config: validated model configurations
     ▼
 CPU backends             Metal (macOS)    WGPU (cross-platform GPU)
 AVX2 / NEON kernels      Metal MSL kernels WGSL compute shaders

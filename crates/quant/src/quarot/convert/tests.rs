@@ -1,8 +1,8 @@
 use super::*;
-use crate::model::qwen35_config::{LayerType, compute_layer_types};
-use crate::quant::quarot::lm_head::{
+use crate::quarot::lm_head::{
     QWEN35_EMBED_TOKENS_NAME, QWEN35_FINAL_NORM_NAME, QWEN35_LM_HEAD_NAME,
 };
+use lattice_model_config::qwen35_config::{LayerType, compute_layer_types};
 use lattice_weights::q4_weights::q4_f32_to_f16;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -1728,7 +1728,7 @@ fn convert_quarot_qwen35_emits_mtp_files_for_quarot() {
 /// used by the tiny test config.
 #[test]
 fn quarot_mtp_counter_rotation_roundtrip() {
-    use crate::quant::quarot::hadamard::RandomizedHadamard;
+    use crate::quarot::hadamard::RandomizedHadamard;
 
     let hidden = 8usize; // tiny_cfg hidden_size
     let seed: u64 = 0xDEAD_C0DE;
@@ -2080,7 +2080,7 @@ fn read_quarot_seed_from_index_rejects_oversized_file() {
     // One byte over the cap; write sparsely via set_len to avoid
     // actually allocating/writing 16 MiB+1 in the test.
     let f = fs::File::create(&path).unwrap();
-    f.set_len(crate::quant::q4_manifest::MAX_QUANTIZE_INDEX_LEN + 1)
+    f.set_len(crate::q4_manifest::MAX_QUANTIZE_INDEX_LEN + 1)
         .unwrap();
     drop(f);
     let err = read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b())
@@ -2099,19 +2099,18 @@ fn read_quarot_seed_from_index_rejects_oversized_file() {
 #[test]
 fn quantize_index_online_field_round_trips_through_json() {
     let cfg = Qwen35Config::qwen35_0_8b();
-    let r3 =
-        crate::quant::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+    let r3 = crate::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
     let names: Vec<String> = (0..cfg.num_hidden_layers)
         .filter(|&i| cfg.is_full_attention(i))
         .map(|i| {
             format!(
                 "{}.self_attn.o_proj.weight",
-                crate::model::qwen35::qwen_layer_tensor_prefix(i)
+                lattice_model_config::qwen35_tensors::qwen_layer_tensor_prefix(i)
             )
         })
         .collect();
     let descriptor = OnlineArtifactDescriptor {
-        version: crate::quant::quarot::io::ArtifactVersion::V1Online,
+        version: crate::quarot::io::ArtifactVersion::V1Online,
         online_rotations: vec![r3],
         asymmetric_tensor_names: names,
     };
@@ -2119,7 +2118,7 @@ fn quantize_index_online_field_round_trips_through_json() {
         quarot_seed: Some(7),
         tensors: vec![],
         online: Some(descriptor.clone()),
-        artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+        artifact_version: Some(crate::quarot::io::ArtifactVersion::V1Online),
         promotion: PromotionRecord::default(),
     };
     let json = serde_json::to_string(&index).unwrap();
@@ -2128,7 +2127,7 @@ fn quantize_index_online_field_round_trips_through_json() {
     assert_eq!(round_tripped.online, Some(descriptor));
     assert_eq!(
         round_tripped.artifact_version,
-        Some(crate::quant::quarot::io::ArtifactVersion::V1Online)
+        Some(crate::quarot::io::ArtifactVersion::V1Online)
     );
 }
 
@@ -2140,19 +2139,18 @@ fn quantize_index_online_field_round_trips_through_json() {
 #[test]
 fn quantize_index_v1_online_manifest_is_rejected_at_load_not_silently_accepted() {
     let cfg = Qwen35Config::qwen35_0_8b();
-    let r3 =
-        crate::quant::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+    let r3 = crate::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
     let names: Vec<String> = (0..cfg.num_hidden_layers)
         .filter(|&i| cfg.is_full_attention(i))
         .map(|i| {
             format!(
                 "{}.self_attn.o_proj.weight",
-                crate::model::qwen35::qwen_layer_tensor_prefix(i)
+                lattice_model_config::qwen35_tensors::qwen_layer_tensor_prefix(i)
             )
         })
         .collect();
     let descriptor = OnlineArtifactDescriptor {
-        version: crate::quant::quarot::io::ArtifactVersion::V1Online,
+        version: crate::quarot::io::ArtifactVersion::V1Online,
         online_rotations: vec![r3],
         asymmetric_tensor_names: names,
     };
@@ -2160,7 +2158,7 @@ fn quantize_index_v1_online_manifest_is_rejected_at_load_not_silently_accepted()
         quarot_seed: Some(7),
         tensors: vec![],
         online: Some(descriptor),
-        artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+        artifact_version: Some(crate::quarot::io::ArtifactVersion::V1Online),
         promotion: PromotionRecord::default(),
     };
     let json = serde_json::to_string(&index).unwrap();
@@ -2204,10 +2202,9 @@ fn quantize_index_with_invalid_online_descriptor_is_rejected_at_load() {
     // other V1Online manifest, not a `validate`-specific message; the
     // manifest is still rejected either way.
     let cfg = Qwen35Config::qwen35_0_8b();
-    let r3 =
-        crate::quant::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+    let r3 = crate::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
     let invalid_descriptor = OnlineArtifactDescriptor {
-        version: crate::quant::quarot::io::ArtifactVersion::V1Online,
+        version: crate::quarot::io::ArtifactVersion::V1Online,
         online_rotations: vec![r3],
         asymmetric_tensor_names: vec![],
     };
@@ -2215,7 +2212,7 @@ fn quantize_index_with_invalid_online_descriptor_is_rejected_at_load() {
         quarot_seed: Some(7),
         tensors: vec![],
         online: Some(invalid_descriptor),
-        artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+        artifact_version: Some(crate::quarot::io::ArtifactVersion::V1Online),
         promotion: PromotionRecord::default(),
     };
     let json = serde_json::to_string(&index).unwrap();
@@ -2249,15 +2246,15 @@ fn quantize_index_v1_online_large_layer_scope_is_rejected_without_running_valida
     // if `validate` ran, it would fail loudly with THIS spec's own
     // complaint, not the generic V1-unsupported refusal.
     let adversarial_layers: Vec<usize> = (0..cfg.num_hidden_layers * 4).collect();
-    let r3 = crate::quant::quarot::plan::OnlineRotationSpec {
-        id: crate::quant::quarot::plan::RotationId::AttentionOutputR3,
-        side: crate::quant::quarot::plan::AbsorptionSide::InputSide,
+    let r3 = crate::quarot::plan::OnlineRotationSpec {
+        id: crate::quarot::plan::RotationId::AttentionOutputR3,
+        side: crate::quarot::plan::AbsorptionSide::InputSide,
         seed: 42,
         block_size: 8,
         layer_scope: Some(adversarial_layers),
     };
     let descriptor = OnlineArtifactDescriptor {
-        version: crate::quant::quarot::io::ArtifactVersion::V1Online,
+        version: crate::quarot::io::ArtifactVersion::V1Online,
         online_rotations: vec![r3],
         asymmetric_tensor_names: vec![],
     };
@@ -2265,7 +2262,7 @@ fn quantize_index_v1_online_large_layer_scope_is_rejected_without_running_valida
         quarot_seed: Some(7),
         tensors: vec![],
         online: Some(descriptor),
-        artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+        artifact_version: Some(crate::quarot::io::ArtifactVersion::V1Online),
         promotion: PromotionRecord::default(),
     };
     let json = serde_json::to_string(&index).unwrap();

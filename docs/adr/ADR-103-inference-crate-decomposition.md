@@ -222,6 +222,79 @@ The work lands as two pull requests in order: the harness preparation of item 4,
       its listed additions; and the bench measurement disposition covers
       the changed build inputs (the manifest and feature changes are build inputs, so no structural waiver applies).
 
+## Amendment 5 (2026-10-25)
+
+The model configurations move below the facade, so that code which needs a model's configuration and nothing else no
+longer has to live in `lattice-inference`. The QuaRot conversion modules, for example, read `Qwen35Config` and cannot
+join `lattice-quant` while that type is defined in the facade. This is the first per-model step of D9 step 3, and it
+moves the configuration parsers only. Recorded:
+
+1. **D8.1.** The crate is `lattice-model-config`. It holds the four configuration modules `qwen35_config`,
+   `gemma4_config`, `embeddinggemma2_config` and `bitnet_config`, with their unit tests. It depends on
+   `lattice-inference-core` for `InferenceError` and on `lattice-weights` for the bounded `config.json` reader, and it
+   publishes in the third tier beside `lattice-quant`. The model code, the loaders, `QwenConfig` (defined inside
+   `model/qwen.rs` with the Qwen3 embedding model) and the Qwen3.5 tensor-name functions stay in the facade for later
+   changes.
+2. **D4.** Crate-private items used from outside the moving modules:
+   - Public: `qwen35_config::{MAX_VISION_TENSOR_BYTES, compute_layer_types}`, `gemma4_config::resolve_stop_token_ids`,
+     and `embeddinggemma2_config::{ImagePartsConfig, image_parts_config}` with the three fields of `ImagePartsConfig`.
+     Each is part of parsing or validating a configuration. The facade imports them `pub(crate)` at their old paths, so
+     its public listing is unchanged.
+   - Internal: `qwen35_config::checked_double`, which reports an overflow as a Qwen configuration error. Its definition
+     stays crate-private, and `__internal::checked_double` forwards to it for the two facade callers.
+   - Every other crate-private item of the four modules is used only inside them and stays crate-private.
+3. **D6.6.** Not everything in `model::qwen35_config` is configuration. The four deprecated aliases of the generation
+   types (`GenerateConfig`, `GenerateOutput`, `TokenLogprob`, `TopLogprob`) name types that stay in the facade, and the
+   reasoning-budget helpers `REASONING_CLOSE_GRACE_TOKENS`, `force_close_think` and `decode_cap` are generation code.
+   They stay in the facade's `model::qwen35_config` module, unchanged and at the same paths, together with their 15
+   unit tests, which keep their names. The rest of the module's tests move with it.
+4. **Fixtures.** `tests/fixtures/qwen36_config.json` is read only by the moved tests and moves to
+   `crates/model-config/tests/fixtures/`. `qwen35_0_8b_config.json` and `gemma4/e2b_config.json` are also read by tests
+   that stay in `lattice-inference`, so they stay where they are, and the moved tests read them through a path relative
+   to the workspace, as `lattice-embed`'s tests already read the first of them.
+
+## Amendment 6 (2026-10-25)
+
+The rest of the configuration surface that Amendment 5 left in the facade moves to `lattice-model-config`. QuaRot reads
+`QwenConfig` and the Qwen3.5 tensor-name functions as well as `Qwen35Config`, so they have to sit below the facade
+before the QuaRot modules can leave it. Recorded:
+
+1. **D8.1.** `QwenConfig` with its `impl` moves out of `model/qwen.rs` into the crate's `qwen_config` module, and
+   `qwen_layer_tensor_prefix` and `qwen_required_tensor_names` move out of `model/qwen35/loading.rs` into a
+   `qwen35_tensors` module. The facade re-exports them at `model::qwen::QwenConfig`, `model::QwenConfig`, the crate root
+   `QwenConfig` and `model::qwen35::{qwen_layer_tensor_prefix, qwen_required_tensor_names}`. The `config.json` parser for
+   `QwenConfig` stays in `model/qwen.rs` with the model loader that calls it, and so does `ModelInferenceConfig`, which
+   reads `inference_config.json` and derives cache revisions from the checkpoint's files.
+2. **D4.** No crate-private item crosses the boundary. Everything moved was already public.
+3. **D6.1.** The unit tests of the moved items stay in the facade and reach them through the re-exports, so no test is
+   renamed or moved. `facade_api_parity` adds a compile-time check that each re-exported function is the same function
+   item as its definition.
+
+## Amendment 7 (2026-10-25)
+
+With the configurations below the facade (Amendments 5 and 6), the QuaRot conversion joins the primitives already in
+`lattice-quant`. This completes D9 step 2 for quantization. Recorded:
+
+1. **D8.1.** `quant::quarot::{convert, forward_equivalence, io, lm_head, lora, pipeline, plan, rmsnorm_fusion}` move to
+   `lattice-quant` under `quarot::`, with their tests, and so does the test-only `r3_reference` module. The crate gains
+   two normal dependencies: `lattice-model-config`, for the Qwen3.5 configuration, `QwenConfig` and the tensor-name
+   functions, and `memmap2`, because the source-tensor reader holds a memory map. Maps are still constructed only in
+   `lattice_weights::mmap_trust`; holding one is allowed, and the trust-boundary contract already scans this crate.
+   `lattice-quant` now depends on `lattice-model-config`, so the publish order puts `lattice-model-config` in its own
+   tier before `lattice-quant`, which changes Amendment 5's "third tier beside `lattice-quant`".
+2. **D1.** The facade keeps every path. Each moved module becomes a facade module of named re-exports, and
+   `quant::quarot` keeps its root re-exports of `io::{ArtifactVersion, OnlineArtifactDescriptor, QuarotTensorReader,
+   SourceDType}` and `plan::{OnlineRotationSpec, OnlineTransformSite, RotationId}`.
+3. **D4.** One crate-private item crosses the boundary: `convert::read_quarot_seed_from_index`, read by the Metal
+   weight loader and its tests. It is not part of any public API, so its definition stays crate-private and
+   `__internal::read_quarot_seed_from_index` forwards to it; the facade imports it `pub(crate)` at its old path under
+   its caller's gate, `all(target_os = "macos", feature = "metal-gpu")`. The definition was gated on
+   `any(test, feature = "metal-gpu")` for the conversion tests that also called it; those tests moved with it and
+   `lattice-quant` has no `metal-gpu` feature, so the gate on the definition goes. Every other crate-private item of the
+   moved modules is used only inside them.
+4. **D6.1.** The moved unit tests keep their names under the new crate's paths. `facade_api_parity` adds same-item
+   checks for every moved public type, function and constant, and for the root re-exports.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

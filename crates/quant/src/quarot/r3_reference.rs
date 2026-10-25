@@ -16,17 +16,17 @@
 //! For one full-attention Qwen3.5-0.8B layer's attention-axis shape (GQA:
 //! `num_attention_heads=8`, `num_key_value_heads=2`, `head_dim=256`, so
 //! `q_dim=2048`, `kv_dim=512`, groups=4 — read from
-//! [`crate::model::qwen35_config::Qwen35Config::qwen35_0_8b`]; the test
+//! [`lattice_model_config::qwen35_config::Qwen35Config::qwen35_0_8b`]; the test
 //! fixture's `HIDDEN` constant is intentionally smaller than the real
 //! `hidden_size=1024` — see that constant's doc for why), the winning
 //! orientation is:
 //!
 //! **R3 rotates the gated attention output (`context * sigmoid(gate_z)`),
 //! immediately before `o_proj`. `o_proj` absorbs the rotation's transpose on
-//! its INPUT side** — i.e. exactly [`crate::quant::quarot::plan::AbsorptionSide::InputSide`]
+//! its INPUT side** — i.e. exactly [`crate::quarot::plan::AbsorptionSide::InputSide`]
 //! applied to `o_proj`'s `q_dim` axis, matching `lattice_quant::quarot::rotation`'s documented
 //! `y = W · R^T · (R · x)` identity with `x` = the gated context. This is
-//! recorded in [`crate::quant::quarot::plan::OnlineRotationSpec::r3_full_attention`]
+//! recorded in [`crate::quarot::plan::OnlineRotationSpec::r3_full_attention`]
 //! as `side: AbsorptionSide::InputSide`.
 //!
 //! ## The rotation is cross-head, not intra-head
