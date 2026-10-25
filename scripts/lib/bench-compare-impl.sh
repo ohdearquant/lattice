@@ -530,6 +530,30 @@ if [ -d "$WT" ]; then
 fi
 git -C "$REPO" worktree add --detach --end-of-options "$WT" "$BASE_FULL_SHA" 2>&1 | tail -1
 
+# --- One Cargo target directory per arm ---
+# A caller's CARGO_TARGET_DIR (or CARGO_BUILD_TARGET_DIR, or a build.target-dir in
+# a user Cargo config) would otherwise be shared by both worktrees. Cargo names a
+# workspace member's artifacts without the checkout's absolute path, so both arms
+# write the same bench executable name, and a re-bench of the older checkout finds
+# the newer arm's executable fresh and runs it without compiling. The reverse-order
+# base arm then times head code, which reads as order bias. Each arm gets its own
+# directory: under the caller's root when one is set, else its worktree's target.
+ARM_TARGET_ROOT="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-}}"
+use_arm_target() {
+  local arm="$1" worktree="$2" dir
+  if [ -n "$ARM_TARGET_ROOT" ]; then
+    dir="$ARM_TARGET_ROOT/bench-compare-$arm"
+  else
+    dir="$worktree/target"
+  fi
+  if ! mkdir -p "$dir" || ! "$REPO/scripts/lib/ensure-noindex-marker.sh" "$dir"; then
+    echo "ERROR: cannot prepare the $arm arm's target directory $dir; refusing to measure" >&2
+    exit 2
+  fi
+  export CARGO_TARGET_DIR="$dir"
+  unset CARGO_BUILD_TARGET_DIR
+}
+
 command_version() {
   local directory="$1"; shift
   local output
@@ -767,10 +791,10 @@ prebuild_embed() {
   require_measured "$what" "$rc"
 }
 
-# The control arms run in a target directory the previous arm's revision has
-# just rebuilt, so without this the inference bench executable is re-linked
-# inside the sampled window. The first-arm builds double as presence checks;
-# the control arms already know the target is present.
+# Warm the inference bench executable before the sampled window, so any
+# re-link happens outside it. Each arm re-enters its own target directory
+# (see use_arm_target). The first-arm builds double as presence checks; the
+# control arms already know the target is present.
 prebuild_inference() {
   local what="$1" rc=0
   cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run || rc=$?
@@ -807,6 +831,7 @@ echo "--- Building + benching BASE ($BASE_SHA) ---"
 BASE_PHASE_RC=0
 (
   cd "$WT"
+  use_arm_target base "$WT"
   # Only bench what exists — some benches may not exist on older refs. That
   # tolerance is right for a human comparing against an old ref and wrong for
   # the enforcing lane, where "absent" and "failed to compile" arrive on the
@@ -904,6 +929,7 @@ prepare_target_root \
 HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
+  use_arm_target head "$HEAD_DIR"
   HEAD_INFERENCE_PRESENT=0
   if [ -n "$handoff_broker" ] || cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
     HEAD_INFERENCE_PRESENT=1
@@ -947,6 +973,7 @@ echo "--- Re-benching HEAD for reverse-order control ($HEAD_SHA) ---"
 HEAD_CONTROL_PHASE_RC=0
 (
   cd "$HEAD_DIR"
+  use_arm_target head "$HEAD_DIR"
   if [ -z "$handoff_broker" ]; then
     prebuild_inference "head control lattice-inference:$BENCHES_INFERENCE build (--no-run)"
   fi
@@ -991,6 +1018,7 @@ echo "--- Re-benching BASE for reverse-order control ($BASE_SHA) ---"
 BASE_CONTROL_PHASE_RC=0
 (
   cd "$WT"
+  use_arm_target base "$WT"
   if [ -z "$handoff_broker" ]; then
     prebuild_inference "base control lattice-inference:$BENCHES_INFERENCE build (--no-run)"
   fi
