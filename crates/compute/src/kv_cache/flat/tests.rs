@@ -667,6 +667,7 @@ fn rand_f32(state: &mut u32, lo: f32, hi: f32) -> f32 {
 /// output: [num_heads * head_dim]
 ///
 /// Groups = num_heads / num_kv_heads; each KV head is shared across `groups` Q heads.
+#[allow(clippy::too_many_arguments)]
 fn sdpa_decode(
     output: &mut [f32],
     q: &[f32],

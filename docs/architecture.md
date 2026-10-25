@@ -116,10 +116,10 @@ stay in `lattice_inference::model::qwen35_config`.
 ### lattice-compute
 
 Host-side compute for the forward passes. It currently holds the rotary position
-embedding tables (`RopeTable`), flat KV storage and prefix sharing/cross-turn reuse
-planning. Its internal runtime dependency is `lattice-inference-core` for the shared
-error type; paged storage, CPU kernels, attention, pooling and sampling move here
-in later changes. The facade retains
+embedding tables (`RopeTable`), flat/paged KV storage and prefix sharing/cross-turn
+reuse planning. Its internal runtime dependency is `lattice-inference-core` for the
+shared error type; CPU kernels, attention, pooling and sampling move here in later
+changes. The facade retains
 the `lattice_inference::rope::RopeTable` path.
 
 ### lattice-inference
