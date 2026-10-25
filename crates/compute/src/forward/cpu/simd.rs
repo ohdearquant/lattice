@@ -1,7 +1,13 @@
 //! Runtime SIMD configuration and accessor.
 use std::sync::OnceLock;
 
+/// CPU SIMD features detected at runtime, used to pick a kernel path.
+///
+/// Each field reports one instruction set. Fields for another architecture are always `false`. New fields may be
+/// added as more instruction sets are detected, so the struct is `#[non_exhaustive]`: read it through
+/// [`simd_config`] or [`SimdConfig::detect`] rather than building one.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SimdConfig {
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub avx2_enabled: bool,
@@ -14,6 +20,7 @@ pub struct SimdConfig {
 }
 
 impl SimdConfig {
+    /// Detects the SIMD features of the running CPU. On aarch64 NEON is part of the baseline and always reported.
     pub fn detect() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
@@ -47,6 +54,7 @@ impl SimdConfig {
 
 static SIMD_CONFIG: OnceLock<SimdConfig> = OnceLock::new();
 
+/// Returns the SIMD features of the running CPU, detected once per process and cached.
 pub fn simd_config() -> SimdConfig {
     *SIMD_CONFIG.get_or_init(SimdConfig::detect)
 }

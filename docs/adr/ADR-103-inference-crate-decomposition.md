@@ -473,7 +473,10 @@ code sits below the facade. Recorded:
    crate-private and become public in `lattice_compute::forward::cpu`, because facade code that stays (attention, the
    ternary kernel, the GPU GEMM paths, vision and backward) calls them. The facade imports the four functions with `pub(crate) use`, preserving their
    facade visibility, and does not export `SimdConfig`. The `f16_matmul` module becomes public in compute so the
-   facade can keep the `matmul_bt_f16` path. No `__internal` bridge is added.
+   facade can keep the `matmul_bt_f16` path. No `__internal` bridge is added. Each of the five is documented as a
+   public item of compute, and `SimdConfig` is `#[non_exhaustive]`, so detecting a further instruction set adds a field
+   without a breaking change. `validate_gemm_strided_shape`, the sixth crate-private item of these modules, has no
+   caller outside them and stays crate-private.
 5. **D5.** Compute keeps an empty default feature set and gains `x86-gemm = ["dep:gemm"]`; inference's `x86-gemm`
    forwards to it, so every caller keeps the same feature name and the same off-by-default behaviour.
 6. **D6.1.** The moved source and test files carry 135 tests, names unchanged. Integration tests that use the kernels
