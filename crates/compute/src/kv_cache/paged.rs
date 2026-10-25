@@ -1092,7 +1092,7 @@ impl PagedKVCache {
     }
 
     #[allow(clippy::too_many_arguments)]
-fn copy_token_between_page_layouts(
+    fn copy_token_between_page_layouts(
         src_page: &[f32],
         src_page_size: usize,
         src_offset: usize,
