@@ -68,7 +68,7 @@ class PublishScriptArgs(unittest.TestCase):
         proc, calls = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 10, calls)
+        self.assertEqual(len(publishes), 11, calls)
         self.assertFalse(any("--dry-run" in c for c in publishes), publishes)
         self.assertEqual(
             [c for c in calls if c.startswith(("cargo ", "sleep "))],
@@ -81,6 +81,7 @@ class PublishScriptArgs(unittest.TestCase):
                 "sleep 30",
                 "cargo publish -p lattice-grammar",
                 "cargo publish -p lattice-weights",
+                "cargo publish -p lattice-metal-runtime",
                 "sleep 30",
                 "cargo publish -p lattice-quant",
                 "sleep 30",

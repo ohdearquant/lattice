@@ -40,7 +40,7 @@ parking_lot = { workspace = true }
 thiserror = { workspace = true }
 
 # Logging
-tracing = "0.1"
+tracing = { workspace = true }
 
 # Embedding generation, pure Rust. Unconditional (applies to every target):
 # after trimming to `default-features = false, features = ["std", "f16"]` the
