@@ -649,8 +649,8 @@ impl BatchWorker {
 
 /// Extension trait to expose `floats_per_page` calculation to `BatchWorker`.
 ///
-/// `PagedKVCacheConfig::floats_per_page` is `pub(crate)` in paged.rs; this
-/// trait provides the equivalent calculation for the worker.
+/// Checked geometry stays with the cache owner so worker budgeting and
+/// allocation use the same overflow checks.
 pub trait PagedKVCacheConfigExt {
     fn floats_per_page_pub(&self) -> usize;
     fn try_floats_per_page_pub(&self) -> Result<usize, InferenceError>;
@@ -662,7 +662,7 @@ impl PagedKVCacheConfigExt for crate::kv_cache::PagedKVCacheConfig {
     }
 
     fn try_floats_per_page_pub(&self) -> Result<usize, InferenceError> {
-        self.try_floats_per_page()
+        lattice_compute::__internal::paged_cache_try_floats_per_page(self)
     }
 }
 

@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Host-side compute for Lattice inference: rotary position embedding tables, with CPU kernels, attention, pooling, KV caches and sampling to follow"
+description = "Host-side compute for Lattice inference: rotary position embedding tables and KV caches"
 keywords = ["inference", "rope", "transformer", "llm", "cpu"]
 categories = ["science", "algorithms"]
 

@@ -1510,4 +1510,32 @@ mod compute_parity {
             PhantomData::<extracted::kv_cache::flat::FlatKVCacheConfig>,
         );
     }
+
+    #[test]
+    fn paged_cache_types_are_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::CacheType>,
+            PhantomData::<extracted::kv_cache::paged::CacheType>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::EvictionPolicy>,
+            PhantomData::<extracted::kv_cache::paged::EvictionPolicy>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PagePool>,
+            PhantomData::<extracted::kv_cache::paged::PagePool>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PageTable>,
+            PhantomData::<extracted::kv_cache::paged::PageTable>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PagedKVCache>,
+            PhantomData::<extracted::kv_cache::paged::PagedKVCache>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PagedKVCacheConfig>,
+            PhantomData::<extracted::kv_cache::paged::PagedKVCacheConfig>,
+        );
+    }
 }
