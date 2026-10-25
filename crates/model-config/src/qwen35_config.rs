@@ -1473,7 +1473,7 @@ impl Qwen35Config {
     }
 
     /// Parse HF config.json text into a `Qwen35Config`. Stable signature kept for existing
-    /// callers (e.g. `quant/quarot/convert.rs`); runs the identical validation
+    /// callers (e.g. `crates/quant/src/quarot/convert.rs`); runs the identical validation
     /// as [`Self::from_config_json_str_validated`], just unwrapping the newtype.
     pub fn from_config_json_str(json: &str) -> Result<Self, InferenceError> {
         Self::from_config_json_str_validated(json).map(ValidatedQwen35Config::into_inner)

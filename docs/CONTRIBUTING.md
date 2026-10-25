@@ -137,8 +137,8 @@ lattice/
       examples/           — end-to-end bench_* programs
     weights/              — weight storage and model-format detection
       src/                — f32, f16, Q3, Q4 and Q8 storage; safetensors loading
-    quant/                — quantization primitives; depends on inference-core and weights
-      src/                — Q4 manifests, Hadamard transforms and rotation absorption
+    quant/                — quantization; depends on inference-core, weights and model-config
+      src/                — Q4 manifests, Hadamard rotations and the QuaRot conversion
     model-config/         — model configurations; depends on inference-core and weights
       src/                — Qwen3.5, Gemma 4, EmbeddingGemma 2 and BitNet config parsing
     metal-runtime/        — shared Metal helpers; depends on inference-core

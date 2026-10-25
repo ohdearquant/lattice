@@ -1,5 +1,5 @@
-use crate::quant::quarot::hadamard::{BlockHadamard, RandomizedHadamard, derive_block_seed};
-use crate::quant::quarot::plan::{AbsorptionSide, OnlineRotationSpec};
+use crate::quarot::hadamard::{BlockHadamard, RandomizedHadamard, derive_block_seed};
+use crate::quarot::plan::{AbsorptionSide, OnlineRotationSpec};
 
 // HIDDEN is deliberately NOT the real Qwen3.5-0.8B hidden_size (1024).
 // This module's contract is about the ATTENTION-axis question (does the
@@ -421,7 +421,7 @@ fn r3_orientation_enumeration_finds_exactly_one_reparameterization() {
 
     // The artifact schema's recorded orientation must agree with the
     // enumeration result.
-    let cfg = crate::model::qwen35_config::Qwen35Config::qwen35_0_8b();
+    let cfg = lattice_model_config::qwen35_config::Qwen35Config::qwen35_0_8b();
     let spec = OnlineRotationSpec::r3_full_attention(&cfg, 1, NUM_Q_HEADS).unwrap();
     assert_eq!(
         spec.side,
@@ -443,8 +443,7 @@ fn cross_head_matrix(num_heads: usize, head_dim: usize) -> Vec<Vec<f32>> {
         e[j] = 1.0;
         for d in 0..head_dim {
             let mut channel: Vec<f32> = (0..num_heads).map(|h| e[h * head_dim + d]).collect();
-            crate::quant::quarot::hadamard::walsh_hadamard_orthonormal_in_place(&mut channel)
-                .unwrap();
+            crate::quarot::hadamard::walsh_hadamard_orthonormal_in_place(&mut channel).unwrap();
             for (h, &v) in channel.iter().enumerate() {
                 e[h * head_dim + d] = v;
             }
@@ -468,7 +467,7 @@ fn intra_head_matrix(num_heads: usize, head_dim: usize) -> Vec<Vec<f32>> {
         e[j] = 1.0;
         for h in 0..num_heads {
             let slice = &mut e[h * head_dim..(h + 1) * head_dim];
-            crate::quant::quarot::hadamard::walsh_hadamard_orthonormal_in_place(slice).unwrap();
+            crate::quarot::hadamard::walsh_hadamard_orthonormal_in_place(slice).unwrap();
         }
         for (i, &v) in e.iter().enumerate() {
             matrix[i][j] = v;

@@ -23,7 +23,7 @@
 //! Shape normalization, by contrast, is **not** fully unified: `doctor`'s
 //! tensor inventory ([`parse_manifest`] / [`load_manifest`], via
 //! [`Q4ManifestEntry`]) and QuaRot rotation-seed loading
-//! (`quant::quarot::convert::read_quarot_seed_from_index`) have genuinely
+//! (`quarot::convert::read_quarot_seed_from_index`) have genuinely
 //! different acceptance contracts. `doctor` only inventories tensors and
 //! has always tolerated a minimal `{name, file}` entry (ignoring extra or
 //! missing `quantized`/`shape`/`numel`); the seed loader has always
@@ -142,7 +142,7 @@ pub struct Q4Manifest {
     /// QuaRot's residual-stream Hadamard rotation seed (ADR-051), read
     /// tolerantly here for inventory purposes only. `doctor` doesn't act on
     /// this field; the authoritative, strict seed read is
-    /// `quant::quarot::convert::read_quarot_seed_from_index`.
+    /// `quarot::convert::read_quarot_seed_from_index`.
     pub quarot_seed: Option<u64>,
     pub tensors: Vec<Q4ManifestEntry>,
 }

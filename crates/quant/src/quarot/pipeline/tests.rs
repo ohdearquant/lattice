@@ -1,7 +1,7 @@
 use super::*;
-use crate::model::qwen35_config::Qwen35Config;
-use crate::quant::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use crate::weights::q4_weights::{dequantize_q4_to_f32, quantize_f64_to_q4};
+use crate::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
+use lattice_model_config::qwen35_config::Qwen35Config;
+use lattice_weights::q4_weights::{dequantize_q4_to_f32, quantize_f64_to_q4};
 use lattice_weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
 
 fn synthetic_f64(n: usize, seed: u64) -> Vec<f64> {
@@ -332,7 +332,7 @@ fn qwen35_fusion_plan_targets_resolve_within_required_tensor_set() {
     // between the fusion plan and the loader's required-name helper.
     let cfg = Qwen35Config::qwen35_0_8b();
     let required: std::collections::HashSet<String> =
-        crate::model::qwen35::qwen_required_tensor_names(&cfg)
+        lattice_model_config::qwen35_tensors::qwen_required_tensor_names(&cfg)
             .into_iter()
             .collect();
     let plan = qwen35_per_layer_fusion_plan(&cfg).unwrap();
@@ -364,9 +364,9 @@ fn qwen35_fusion_plan_targets_resolve_within_required_tensor_set() {
 fn quarot_rotated_q4_forward_matches_f64_reference() {
     use std::collections::HashMap;
 
-    use crate::quant::quarot::hadamard::RandomizedHadamard;
-    use crate::quant::quarot::pipeline::{TensorEntry, absorb_rotations};
-    use crate::quant::quarot::plan::RotationPlan;
+    use crate::quarot::hadamard::RandomizedHadamard;
+    use crate::quarot::pipeline::{TensorEntry, absorb_rotations};
+    use crate::quarot::plan::RotationPlan;
 
     const HIDDEN: usize = 32;
     const Q_ROWS: usize = 2; // q_proj input-side [2, 32]

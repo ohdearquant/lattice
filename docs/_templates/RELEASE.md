@@ -52,7 +52,7 @@ Run `scripts/package-size-check.sh` for all twelve crates before publishing.
 git tag -a v{VERSION} -m "v{VERSION}"
 git push origin v{VERSION}
 
-# 6. Publish to crates.io (leaves → tokenizer, grammar, weights, metal-runtime → quant, model-config → inference → embed, tune, with indexing waits)
+# 6. Publish to crates.io (leaves → tokenizer, grammar, weights, metal-runtime → model-config → quant → inference → embed, tune, with indexing waits)
 make publish
 
 # 7. Create the tagged GitHub release as a draft

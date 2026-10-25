@@ -228,7 +228,7 @@ fn final_norm_fusion_target_norm_name_matches_loader() {
     // Round-trip: the final_norm name we emit must match what the loader
     // actually requests for this config.
     let cfg = tied_qwen35_test_cfg();
-    let required = crate::model::qwen35::qwen_required_tensor_names(&cfg);
+    let required = lattice_model_config::qwen35_tensors::qwen_required_tensor_names(&cfg);
     let tgt = qwen35_final_norm_fusion_target();
     assert!(
         required.contains(&tgt.norm_tensor),
@@ -259,9 +259,9 @@ fn untie_word_embeddings_is_idempotent_on_untied() {
 /// not be byte-identical (they were before fusion + absorption ran).
 #[test]
 fn materialized_lm_head_diverges_from_embed_tokens_after_pipeline() {
-    use crate::quant::quarot::hadamard::RandomizedHadamard;
-    use crate::quant::quarot::pipeline::{absorb_rotations, fuse_rmsnorms};
-    use crate::quant::quarot::plan::RotationPlan;
+    use crate::quarot::hadamard::RandomizedHadamard;
+    use crate::quarot::pipeline::{absorb_rotations, fuse_rmsnorms};
+    use crate::quarot::plan::RotationPlan;
 
     let cfg = tied_qwen35_test_cfg();
     let vocab = cfg.vocab_size;
@@ -309,7 +309,10 @@ fn materialized_lm_head_diverges_from_embed_tokens_after_pipeline() {
 /// make a reload see `tie_word_embeddings=false`.
 #[test]
 fn output_config_flip_updates_all_hf_tie_flags_and_reparses_untied() {
-    let fixture_json = include_str!("../../../../tests/fixtures/qwen35_0_8b_config.json");
+    let fixture_json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../inference/tests/fixtures/qwen35_0_8b_config.json"
+    ));
 
     let original: serde_json::Value = serde_json::from_str(fixture_json).unwrap();
     assert_eq!(original["tie_word_embeddings"].as_bool(), Some(true));

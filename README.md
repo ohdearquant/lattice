@@ -145,7 +145,7 @@ regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
 
 Three leaf crates (`fann`, `transport`, `inference-core`) have zero intra-workspace
 dependencies. `tokenizer`, `grammar` and `weights` each depend only on `inference-core`
-at runtime. `quant` and `model-config` each depend on `inference-core` and `weights`. `inference` depends on
+at runtime. `model-config` depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`. `inference` depends on
 all six unconditionally and pulls in `fann` through
 the optional `mixture` or `metal-gpu` features. Each can be used on its own.
 
@@ -563,6 +563,7 @@ flowchart TD
     Weights --> Core
     Quant --> Core
     Quant --> Weights
+    Quant --> ModelConfig
     ModelConfig --> Core
     ModelConfig --> Weights
     Inference -.->|mixture or metal-gpu| Fann[lattice-fann]
@@ -664,9 +665,10 @@ variable when the same requirement should apply to `make ci` or Git hooks.
 
 1. `fann`, `transport`, and `inference-core` (leaves).
 2. `tokenizer`, `grammar`, `weights`, and `metal-runtime`.
-3. `quant` and `model-config`.
-4. `inference`.
-5. `embed` and `tune`.
+3. `model-config`.
+4. `quant`.
+5. `inference`.
+6. `embed` and `tune`.
 
 The script waits 30 seconds between tiers for registry indexing. Its dry-run mode
 checks package sizes for all twelve crates, then runs `cargo publish --dry-run` for

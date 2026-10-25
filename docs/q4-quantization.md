@@ -196,7 +196,7 @@ There is no partial/corrupt output state to clean up.
 Note the different tensor counts (188 quantized + 148 kept = 336) versus plain `quantize_q4`'s
 271 + 217 = 488 on the same source directory. The two exclusions behind that gap are different
 kinds of things, and it's worth being precise about which is which
-(`crates/inference/src/quant/quarot/convert.rs`):
+(`crates/quant/src/quarot/convert.rs`):
 
 - **Vision tower — excluded, never read.** Qwen3.5-0.8B's checkpoint on disk is multimodal (it
   ships a `vision_config`); QuaRot's converter never reads or rewrites those tensors on either the

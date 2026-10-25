@@ -547,7 +547,7 @@ fn r3_accepts_block_size_grouping_non_power_of_two_head_count() {
     // 24 heads into 3 independently-rotated cross-head blocks — the
     // documented BlockHadamard fallback, not a randomized-orthogonal
     // matrix, for a non-power-of-two head count.
-    let cfg = crate::model::qwen35_config::Qwen35Config::qwen36_27b();
+    let cfg = lattice_model_config::qwen35_config::Qwen35Config::qwen36_27b();
     assert_eq!(cfg.num_attention_heads, 24);
     let spec = OnlineRotationSpec::r3_full_attention(&cfg, 1, 8).unwrap();
     assert_eq!(spec.block_size, 8);

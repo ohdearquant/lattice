@@ -118,9 +118,9 @@ the `train-backward` feature in `backward/`.
 
 **Quantization.** Q4 and Q8 weight structs are in `crates/weights/src/q4_weights.rs` and
 `crates/weights/src/q8_weights.rs`. QuaRot Hadamard transforms and rotation absorption live
-in `crates/quant/src/quarot/hadamard.rs` and `crates/quant/src/quarot/rotation.rs`. Conversion
-orchestration remains in `crates/inference/src/quant/quarot/convert.rs` and `pipeline.rs`.
-The inference facade retains the existing primitive module paths. Wiring QuaRot into the
+in `crates/quant/src/quarot/hadamard.rs` and `crates/quant/src/quarot/rotation.rs`, and the
+conversion orchestration in `crates/quant/src/quarot/convert.rs` and `pipeline.rs`.
+The inference facade retains the existing `quant::quarot` module paths. Wiring QuaRot into the
 Q4 load path is tracked in ADR-044.
 
 ---
