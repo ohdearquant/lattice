@@ -510,6 +510,30 @@ BERT-family pooling joins `lattice-compute`, next to the SIMD detection it dispa
    amendment records the extraction and its validation obligation; it does not assert a measurement result or a
    structural waiver.
 
+## Amendment 16 (2026-10-25)
+
+Three command-line tools move from the facade into the application crate. Recorded:
+
+1. **D7, application crate.** `quantize_q4`, `quantize_quarot` and `moe_admission_sim` move from
+   `crates/inference/src/bin/` to `crates/serve/src/bin/`, byte-identical. They call only the facade's public API, so
+   no item changes visibility and there is no D4 crossing. `lattice-serve` already depends on `lattice-inference` and
+   `lattice-weights` under Amendment 4 item 1; it gains no dependency, no feature and no lockfile change. The
+   facade's library source is unchanged. Its manifest loses the two explicit `[[bin]]` tables, and `lattice-serve`
+   declares all three binaries explicitly. None of the three has a feature-conditional path. Under the application
+   crate's default features they link the facade with `std`, `download` and `image`, the facade's own defaults, plus
+   `serving-support`.
+2. **D6.1, tests and fixtures.** `quantize_q4_reader_refactor` and its two golden fixtures move to
+   `crates/serve/tests/`, test names and fixture bytes unchanged; the fixtures load relative to the test file.
+3. **D6.5, CI and tooling reach.** Every invocation that named the binaries on the facade now names `lattice-serve`: the
+   parity workflow's Q4 and QuaRot build steps, the CI contract test anchors for those steps, the app build and
+   packaging scripts, and the tool documentation. The Metal lock contract and the measurement inventory list the three
+   files at their new paths; all three stay classified as non-measurement surfaces.
+4. **D6.4.** None of the three binaries is a bench target, and no declared bench or measurement target of the facade
+   reaches their code. The facade's library source, dependencies, features, profiles, bench tables and lockfile are
+   identical between base and head; the only manifest change removes `[[bin]]` tables, which Cargo does not build for
+   a bench target. This is a structural disposition: the move is unmeasured, and a later change to the tools'
+   behaviour takes its own measurement where a target reaches it.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

@@ -27,7 +27,7 @@ layout is what `MetalQwen35State::from_q4_dir` (the Metal loader used by `lattic
 ## Step 1: plain Q4_0 with `quantize_q4`
 
 ```bash
-cargo build --release -p lattice-inference --bin quantize_q4
+cargo build --release -p lattice-serve --bin quantize_q4
 ./target/release/quantize_q4 \
   --model-dir ~/.lattice/models/qwen3.5-0.8b \
   --output-dir ~/.lattice/models/qwen3.5-0.8b-q4
@@ -153,7 +153,7 @@ the seed used, not rely on an implicit default. It accepts decimal or `0x`-prefi
 optional `_` separators exactly like a Rust integer literal (`0xCAFE_BABE_DEAD_BEEF`).
 
 ```bash
-cargo build --release -p lattice-inference --bin quantize_quarot
+cargo build --release -p lattice-serve --bin quantize_quarot
 ./target/release/quantize_quarot \
   --model-dir ~/.lattice/models/qwen3.5-0.8b \
   --output-dir ~/.lattice/models/qwen3.5-0.8b-q4-quarot \

@@ -212,15 +212,15 @@ path = "crates/inference/src/bin/dump_quarot_q4_golden.rs"
 reason = "Golden/correctness dump utility, not a timed benchmark."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/moe_admission_sim.rs"
+path = "crates/serve/src/bin/moe_admission_sim.rs"
 reason = "Admission simulation utility, not a Metal measurement harness."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/quantize_q4.rs"
+path = "crates/serve/src/bin/quantize_q4.rs"
 reason = "Weight-conversion tool; any elapsed-time logging is progress reporting, not a benchmark."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/quantize_quarot.rs"
+path = "crates/serve/src/bin/quantize_quarot.rs"
 reason = "Weight-conversion tool; any elapsed-time logging is progress reporting, not a benchmark."
 
 [[non_measurement_surface]]

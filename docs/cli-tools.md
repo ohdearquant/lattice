@@ -1,6 +1,6 @@
 # CLI Tool Walkthroughs
 
-Several binaries in `lattice-inference` ship with no walkthrough beyond `--help` (or, for the
+Several binaries in `lattice-inference` and `lattice-serve` ship with no walkthrough beyond `--help` (or, for the
 ones with no `--help` at all, beyond reading the source). This document works through
 `quantize_q4`, `chat_metal`'s full flag surface, `ppl_metal`, and `bench_lora_mixture`: what each
 one is for, what it needs on disk, and a verified command sequence with real output.
@@ -75,13 +75,13 @@ the cost of an extra preprocessing step; see `docs/q4-quantization.md`).
 
 - A local safetensors checkpoint directory (`model.safetensors` or a sharded
   `model.safetensors.index.json`).
-- Build with no special features: `cargo build --release -p lattice-inference --bin quantize_q4`.
+- Build with no special features: `cargo build --release -p lattice-serve --bin quantize_q4`.
 - An output directory: always a scratch location, never overwrite a model directory in place.
 
 ### Verified command sequence
 
 ```bash
-cargo build --release -p lattice-inference --bin quantize_q4
+cargo build --release -p lattice-serve --bin quantize_q4
 ```
 
 No arguments prints usage and exits 1 (there is no `--help` flag, but any missing/unknown

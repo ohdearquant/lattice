@@ -501,9 +501,9 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     (".", "src/bin/bench_gemma4_driver_pair.rs"),
     (".", "src/bin/gramtime_profile.rs"),
     ("../serve", "src/bin/lattice_serve/main.rs"),
-    (".", "src/bin/moe_admission_sim.rs"),
-    (".", "src/bin/quantize_q4.rs"),
-    (".", "src/bin/quantize_quarot.rs"),
+    ("../serve", "src/bin/moe_admission_sim.rs"),
+    ("../serve", "src/bin/quantize_q4.rs"),
+    ("../serve", "src/bin/quantize_quarot.rs"),
     (".", "src/bin/qwen35_debug.rs"),
     (".", "src/bin/qwen35_generate.rs"),
 ];
