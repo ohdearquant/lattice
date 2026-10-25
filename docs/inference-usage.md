@@ -90,7 +90,7 @@ helper is a private implementation detail of `model::qwen35` and is not part of 
 
 ## Feature Flags
 
-- `image` — enabled by default and by `serve`; enables PNG/JPEG decoding. Without it,
+- `image` — enabled by default and by `lattice-serve`; enables PNG/JPEG decoding. Without it,
   image decoding APIs remain available but return an error naming the required feature.
 
 - `f16` — required to build the `bench_embedding` example target and to use f16 weight storage.

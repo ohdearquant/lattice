@@ -20,7 +20,7 @@ use syn::{Attribute, ItemFn, Meta, Token};
 #[path = "workspace_metadata.rs"]
 mod workspace_metadata;
 
-pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &["."];
+pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &[".", "../serve"];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScannedPackage {

@@ -398,7 +398,7 @@ impl AdapterRouter {
         replay.route_explored(&[0.0], available, available.len(), Some(exploration))
     }
 
-    #[cfg(all(feature = "router-learning", feature = "serve"))]
+    #[cfg(all(feature = "router-learning", feature = "serving-support"))]
     pub(crate) fn gate_bytes(&self) -> Vec<u8> {
         self.gate.to_bytes()
     }

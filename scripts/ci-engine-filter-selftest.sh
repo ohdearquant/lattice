@@ -28,7 +28,7 @@ extract_re() {  # $1 = anchor substring unique to the wanted line
     | sed -E "s/^ *if grep -E '//; s/' <<<.*$//"
 }
 
-ENGINE_RE="$(extract_re 'crates/(inference|inference-core|metal-runtime|tokenizer|grammar|weights|quant|model-config|embed)/')"
+ENGINE_RE="$(extract_re 'crates/(inference|inference-core|metal-runtime|serve|tokenizer|grammar|weights|quant|model-config|embed)/')"
 TUNE_RE="$(extract_re 'crates/tune/')"
 
 # FAIL CLOSED ON EMPTY. An extraction that resolved nothing would make every
@@ -87,6 +87,12 @@ check "inference source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/inference/src/rope.rs')"
 check "inference core source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/inference-core/src/error.rs')"
+check "serve source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/serve/src/serve/route.rs')"
+check "serve manifest -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/serve/Cargo.toml')"
+check "serve vision HTTP test -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/serve/tests/vision_serve_e2e_test.rs')"
 check "tokenizer source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/tokenizer/src/bpe.rs')"
 check "grammar source -> engine" true \

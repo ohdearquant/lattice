@@ -1312,9 +1312,11 @@ pub(crate) fn tiny_nonzero_model() -> Gemma4Model {
 /// single-layer zero-weight model, whose embedding tables grow with the
 /// vocabulary. A test that feeds it prompts rendered and tokenized with the
 /// committed tokenizer needs a vocabulary at least as large as that
-/// tokenizer's.
-#[cfg(test)]
-pub(crate) fn tiny_zero_model_with_vocab(vocab_size: usize) -> Gemma4Model {
+/// tokenizer's. Exported under `test-utils` for `lattice-serve`'s tests; not
+/// part of the supported API.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn tiny_zero_model_with_vocab(vocab_size: usize) -> Gemma4Model {
     use super::gemma4_config::Gemma4LayerType;
     use super::gemma4_weights::{Gemma4LayerWeights, per_layer_embeddings_from_bits};
 

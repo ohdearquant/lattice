@@ -29,6 +29,7 @@ esac
 #         -> quant                    depends on inference-core, weights, model-config
 #           -> inference              depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, model-config, metal-runtime
 #             -> embed                depends on inference
+#             -> serve                depends on inference (exact version), fann, tokenizer, weights
 #             -> tune                 depends on fann, inference
 # Each tier waits for crates.io indexing before the next tier resolves it.
 # (--dry-run validates only the leaf tier: cargo cannot dry-run a crate whose
@@ -38,7 +39,7 @@ esac
 # exceeds 10 MiB, and a rejection in tier 2 leaves tier 1 already published and
 # immutable. `cargo publish --dry-run` does not cover this: it can only validate
 # the leaf tier, because a crate whose internal path dependencies are not yet
-# live on the registry cannot be packaged at all. Measure all twelve first.
+# live on the registry cannot be packaged at all. Measure all thirteen first.
 echo "--- Pre-publish: package size against the crates.io upload limit ---"
 "$(dirname "$0")/package-size-check.sh"
 
@@ -97,5 +98,6 @@ fi
 echo "--- Tier 6: dependent crates (depend on inference) ---"
 cargo publish -p lattice-embed $FLAG
 cargo publish -p lattice-tune $FLAG
+cargo publish -p lattice-serve $FLAG
 
 echo "=== Done ==="

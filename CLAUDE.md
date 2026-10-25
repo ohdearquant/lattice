@@ -272,7 +272,7 @@ Publish order follows the internal dependency DAG (deps before dependents): fann
 1. Bump workspace + path-dep versions to the next patch
 2. Update release notes file (rename if needed); add a "Note on v<broken>" section explaining the yank
 3. Tag + GH release + `make publish`
-4. `for c in lattice-inference lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-model-config lattice-fann lattice-transport lattice-embed lattice-tune; do cargo yank --version <broken> "$c"; done`
+4. `for c in lattice-inference lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-model-config lattice-fann lattice-transport lattice-embed lattice-tune lattice-serve; do cargo yank --version <broken> "$c"; done`
 5. Verify against the registry. crates.io rejects API requests that do not identify the caller, returning HTTP 403 with a JSON error object rather than crate data, so the request needs a `User-Agent` and the check needs to distinguish an error object from an absent version — a bare `curl` fails in a way that reads like "this version was never published".
 
    ```bash
@@ -281,7 +281,7 @@ Publish order follows the internal dependency DAG (deps before dependents): fann
    # line at all proves the registry accepted the request shape. The subshell keeps the abort
    # from closing an interactive terminal.
    (
-   for c in serde lattice-inference lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-model-config lattice-fann lattice-transport lattice-embed lattice-tune; do
+   for c in serde lattice-inference lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-model-config lattice-fann lattice-transport lattice-embed lattice-tune lattice-serve; do
      curl -s -H "User-Agent: $UA" "https://crates.io/api/v1/crates/$c" | python3 -c "
    import sys, json
    d = json.load(sys.stdin)

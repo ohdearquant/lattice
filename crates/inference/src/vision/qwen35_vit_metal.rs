@@ -37,9 +37,17 @@ use crate::model::qwen35_config::VisionModelConfig;
 
 pub(crate) struct Qwen35VitMetalOutput {
     pub(crate) hidden_states: Vec<f32>,
-    #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal-gpu",
+        any(test, feature = "serving-support")
+    ))]
     pub(crate) metal_dispatches: usize,
-    #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal-gpu",
+        any(test, feature = "serving-support")
+    ))]
     pub(crate) gemm_calls: usize,
 }
 
@@ -467,9 +475,9 @@ mod gpu {
         }
         Ok(Some(Qwen35VitMetalOutput {
             hidden_states,
-            #[cfg(feature = "serve")]
+            #[cfg(any(test, feature = "serving-support"))]
             metal_dispatches: dispatch_stats.metal_dispatches,
-            #[cfg(feature = "serve")]
+            #[cfg(any(test, feature = "serving-support"))]
             gemm_calls: dispatch_stats.gemm_calls,
         }))
     }

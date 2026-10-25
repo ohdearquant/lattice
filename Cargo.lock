@@ -1634,17 +1634,11 @@ name = "lattice-inference"
 version = "0.15.0"
 dependencies = [
  "approx",
- "axum",
  "base64 0.22.1",
  "bytemuck",
- "clap",
  "criterion",
- "futures",
  "gemm",
  "half",
- "http-body-util",
- "hyper",
- "hyper-util",
  "image",
  "indexmap",
  "lattice-fann",
@@ -1658,7 +1652,6 @@ dependencies = [
  "libc",
  "memmap2",
  "metal 0.33.0",
- "mime",
  "naga 24.0.0",
  "objc",
  "ort",
@@ -1675,8 +1668,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokenizers",
- "tokio",
- "tower",
  "tracing",
  "ureq",
  "wgpu 24.0.5",
@@ -1719,6 +1710,38 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "lattice-serve"
+version = "0.15.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "image",
+ "indexmap",
+ "lattice-fann",
+ "lattice-inference",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "metal 0.33.0",
+ "mime",
+ "proptest",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tower",
+ "tracing",
+ "ureq",
 ]
 
 [[package]]

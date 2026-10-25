@@ -402,7 +402,7 @@ pub(crate) enum FinishDisposition {
 /// `is_cancelled` takes `&self`, which is forced by D1's `cancel: &dyn Cancellation`
 /// shape, so the impl can only cover `Fn() -> bool`. An `FnMut` closure that mutates
 /// captured state is not `Fn` and does not adapt. Worse for the serving path specifically:
-/// `crates/inference/src/bin/lattice/serve.rs` threads cancellation as an erased
+/// `crates/serve/src/bin/lattice/serve.rs` threads cancellation as an erased
 /// `&mut dyn FnMut() -> bool`, and `&mut dyn FnMut()` implements neither `Fn` nor this
 /// trait. Today's concrete closure there (`move || *cancel_rx.borrow()`) only reads its
 /// capture and so is `Fn`, but the type it travels under is not, which is what a future

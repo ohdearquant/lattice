@@ -43,7 +43,7 @@ make publish-dry
 `lattice-transport`, `lattice-inference-core`). The nine dependent crates, including
 `lattice-tokenizer`, `lattice-grammar`, `lattice-weights`, `lattice-metal-runtime`, `lattice-quant` and `lattice-model-config`, need their dependencies
 published first.
-Run `scripts/package-size-check.sh` for all twelve crates before publishing.
+Run `scripts/package-size-check.sh` for all thirteen crates before publishing.
 
 ## Publish
 
@@ -71,7 +71,7 @@ state and every remote asset before retrying.
 
 ## Post-release
 
-- [ ] Verify on crates.io: all twelve crates show v{VERSION}
+- [ ] Verify on crates.io: all thirteen crates show v{VERSION}
 - [ ] Smoke test: `cargo add lattice-inference@{VERSION}` in a fresh project
 - [ ] Update getting-started.md if API changed
 - [ ] Close relevant milestone/issues
@@ -90,7 +90,7 @@ gh release create v{NEW_VERSION} --draft --title "v{NEW_VERSION}" --notes-file d
 gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f tag=v{NEW_VERSION}
 
 # Only after the replacement is live and the asset workflow succeeds:
-for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-model-config lattice-inference lattice-embed lattice-tune; do
+for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-model-config lattice-inference lattice-embed lattice-tune lattice-serve; do
   cargo yank --version {VERSION} "$c"
 done
 ```
