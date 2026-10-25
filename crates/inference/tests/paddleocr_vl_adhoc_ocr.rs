@@ -25,7 +25,7 @@
 //! Release only, for the same reason the e2e gate is: this is a ~0.9B decoder
 //! running on CPU, and prefill over a full-page image is minutes, not seconds.
 
-#![cfg(feature = "f16")]
+#![cfg(all(feature = "f16", feature = "image"))]
 
 use std::path::PathBuf;
 
