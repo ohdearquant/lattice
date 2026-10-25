@@ -92,9 +92,9 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ## Crate Structure
 
 ```
-fann (7.7K)   transport (5.4K)   inference-core   compute   ← leaf, zero internal deps
+fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
                                        |
-                     tokenizer (8K)   grammar   weights   metal-runtime   ← depend on inference-core
+                     tokenizer (8K)   grammar   weights   metal-runtime   compute   ← depend on inference-core
                                                  |
                                               model-config   ← depends on inference-core + weights
                                                  |

@@ -725,22 +725,20 @@ fn sdpa_decode(
     }
 }
 
-/// Independent first-wins reference for the f16-vs-f32 KV-cache logits oracle.
+/// Top-1 reference mirroring `lattice_inference::speculative::argmax`.
 ///
-/// Strict comparisons skip NaNs and retain the lowest index on ties, matching
-/// the greedy contract without depending on the generation implementation.
+/// The two bodies must change together. Keeping this reference local avoids a
+/// cache-test dependency on generation. Strict `>` preserves first-index ties.
 fn oracle_top1(logits: &[f32]) -> usize {
-    logits
-        .iter()
-        .enumerate()
-        .fold((0, f32::NEG_INFINITY), |best, (index, &value)| {
-            if value > best.1 {
-                (index, value)
-            } else {
-                best
-            }
-        })
-        .0
+    let mut best_idx = 0;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    best_idx
 }
 
 /// The mandatory tensor oracle: compare f32-KV reference vs f16-KV-via-FlatKVCache.

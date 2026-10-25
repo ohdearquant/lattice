@@ -68,7 +68,7 @@ class PublishScriptArgs(unittest.TestCase):
         proc, calls = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 13, calls)
+        self.assertEqual(len(publishes), 14, calls)
         self.assertFalse(any("--dry-run" in c for c in publishes), publishes)
         self.assertEqual(
             [c for c in calls if c.startswith(("cargo ", "sleep "))],
@@ -76,13 +76,13 @@ class PublishScriptArgs(unittest.TestCase):
                 "cargo publish -p lattice-fann",
                 "cargo publish -p lattice-transport",
                 "cargo publish -p lattice-inference-core",
-                "cargo publish -p lattice-compute",
                 "sleep 30",
                 "cargo publish -p lattice-tokenizer",
                 "sleep 30",
                 "cargo publish -p lattice-grammar",
                 "cargo publish -p lattice-weights",
                 "cargo publish -p lattice-metal-runtime",
+                "cargo publish -p lattice-compute",
                 "sleep 30",
                 "cargo publish -p lattice-model-config",
                 "sleep 30",
@@ -100,7 +100,7 @@ class PublishScriptArgs(unittest.TestCase):
         proc, calls = self._run("--dry-run")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 4, calls)
+        self.assertEqual(len(publishes), 3, calls)
         self.assertTrue(all(c.endswith(" --dry-run") for c in publishes), publishes)
         self.assertEqual(
             publishes,
@@ -108,7 +108,6 @@ class PublishScriptArgs(unittest.TestCase):
                 "cargo publish -p lattice-fann --dry-run",
                 "cargo publish -p lattice-transport --dry-run",
                 "cargo publish -p lattice-inference-core --dry-run",
-                "cargo publish -p lattice-compute --dry-run",
             ],
         )
         self.assertFalse(any(c.startswith("sleep ") for c in calls), calls)
