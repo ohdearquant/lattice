@@ -1,10 +1,12 @@
 //! Model configurations for Lattice inference: the parsed and validated `config.json` of the Qwen3.5
 //! hybrid models, Gemma 4, EmbeddingGemma 2 and BitNet b1.58, with the validation bounds those
-//! parsers enforce.
+//! parsers enforce, the Qwen3 embedding model configuration, and the Qwen3.5 checkpoint tensor
+//! names a configuration implies.
 //!
 //! `lattice-inference` re-exports the supported items at their original
 //! `lattice_inference::model::{qwen35_config, gemma4_config, embeddinggemma2_config, bitnet_config}`
-//! paths.
+//! paths, `QwenConfig` at `lattice_inference::model::qwen::QwenConfig`, and the tensor-name functions
+//! at `lattice_inference::model::qwen35`.
 
 mod error {
     pub use lattice_inference_core::InferenceError;
@@ -14,6 +16,8 @@ pub mod bitnet_config;
 pub mod embeddinggemma2_config;
 pub mod gemma4_config;
 pub mod qwen35_config;
+pub mod qwen35_tensors;
+pub mod qwen_config;
 
 /// Configuration glue used by the `lattice-inference` facade.
 ///

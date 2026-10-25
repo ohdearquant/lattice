@@ -94,7 +94,7 @@ fn qwen35_plan_misses_rmsnorm_and_scalar_weights() {
 
 /// Required-rule list that step 3b's converter MUST find in any Qwen3.5
 /// hybrid SafeTensors file. Suffixes match the loader's expectations at
-/// `crates/inference/src/model/qwen35/loading.rs:16, 33`.
+/// `qwen_required_tensor_names` (`crates/model-config/src/qwen35_tensors.rs`).
 fn qwen35_required_residual_tensor_suffixes() -> &'static [&'static str] {
     &[
         "self_attn.q_proj.weight",
