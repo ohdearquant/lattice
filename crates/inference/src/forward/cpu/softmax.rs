@@ -1,4 +1,4 @@
-//! Softmax attention helpers and fast exponential approximation.
+//! Softmax over attention scores, with NEON and AVX2 fast paths.
 // ===================================================================
 // Softmax over attention scores — with SIMD fast path
 // ===================================================================
@@ -29,9 +29,13 @@ pub fn softmax_attention(x: &mut [f32], seq_len: usize, num_heads: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if config.avx2_enabled {
-            // SAFETY: The runtime feature check guarantees AVX2 support.
+            // SAFETY: AVX2 is checked above; the FMA arm has its own runtime check.
             unsafe {
-                softmax_attention_avx2(x, seq_len, num_heads);
+                if config.fma_enabled {
+                    softmax_attention_avx2_fma(x, seq_len, num_heads);
+                } else {
+                    softmax_attention_avx2(x, seq_len, num_heads);
+                }
                 return;
             }
         }
@@ -61,13 +65,14 @@ pub fn softmax_attention_scalar(x: &mut [f32], seq_len: usize, num_heads: usize)
             }
             let mut sum = 0.0f32;
             for val in row.iter_mut() {
-                // `fast_exp` clamps its input to a finite floor, so a masked
+                // The SIMD arms' exp clamps its input to a finite floor, so a masked
                 // `-inf` lane would otherwise round-trip into a small nonzero
-                // weight (#740) instead of exact zero. Guard it explicitly.
+                // weight (#740) instead of exact zero. Guard it explicitly here too
+                // so every arm agrees on masked lanes.
                 *val = if is_masked_neg_inf(*val) {
                     0.0
                 } else {
-                    fast_exp(*val - max_val)
+                    (*val - max_val).exp()
                 };
                 sum += *val;
             }
@@ -76,48 +81,126 @@ pub fn softmax_attention_scalar(x: &mut [f32], seq_len: usize, num_heads: usize)
     }
 }
 
-/// Fast exp approximation using the integer bit trick.
-/// Based on Schraudolph's method: exp(x) ~ 2^(x/ln2) via float bit manipulation.
-/// Accuracy: ~5-6% relative error. Systematic bias cancels in softmax normalization.
-#[inline]
-pub fn fast_exp(x: f32) -> f32 {
-    // Clamp to prevent overflow/underflow in the integer conversion.
-    let x = x.clamp(-87.0, 88.0);
-    // 2^23 / ln(2) = 12102203.16..., bias = 127 * 2^23 = 1065353216
-    let val = (12_102_203.0f32 * x + 1_065_353_216.0f32) as i32;
-    f32::from_bits(val as u32)
-}
-
-/// NEON fast exp approximation for 4 lanes using the Schraudolph bit trick.
-/// exp(x) ~ reinterpret_float(int(x * 2^23/ln2 + 127*2^23))
-/// Intentionally kept instead of the more accurate polynomial exp from elementwise — the
-/// Schraudolph systematic bias cancels in softmax normalization, and it's ~3x faster.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-unsafe fn neon_exp_f32(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
-    use std::arch::aarch64::*;
-    let x = vmaxq_f32(x, vdupq_n_f32(-87.0));
-    let x = vminq_f32(x, vdupq_n_f32(88.0));
-    let t = vfmaq_f32(vdupq_n_f32(1_065_353_216.0), x, vdupq_n_f32(12_102_203.0));
-    vreinterpretq_f32_s32(vcvtq_s32_f32(t))
-}
-
-/// AVX2 fast exp approximation for 8 lanes using the Schraudolph bit trick.
+/// AVX2 degree-5 Taylor exp after reduction to `|r| <= ln(2)/2`.
+///
+/// Coefficients are `1/k!`, for `k = 0..=5`. The real-arithmetic relative
+/// remainder is below `sqrt(2) * (ln(2)/2)^6 / 720 < 3.404e-6`.
+/// The clamped binary32 implementation still requires numerical validation.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn fast_exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+unsafe fn exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
-    // Clamp to [-87, 88]
-    let x = _mm256_max_ps(x, _mm256_set1_ps(-87.0));
-    let x = _mm256_min_ps(x, _mm256_set1_ps(88.0));
-    // t = x * (2^23 / ln2) + 127 * 2^23
-    let scale = _mm256_set1_ps(12_102_203.0);
-    let bias = _mm256_set1_ps(1_065_353_216.0);
-    let t = _mm256_add_ps(_mm256_mul_ps(x, scale), bias);
-    // Convert to int then reinterpret as float
-    _mm256_castsi256_ps(_mm256_cvtps_epi32(t))
+
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
+    const LN2_HI: f32 = 0.693_145_75_f32;
+    const LN2_LO: f32 = 1.428_606_8e-6_f32;
+
+    let x = _mm256_max_ps(
+        _mm256_min_ps(x, _mm256_set1_ps(88.0)),
+        _mm256_set1_ps(-87.33),
+    );
+
+    // Round x*log2(e) to the nearest integer with the 1.5 * 2^23 magic number.
+    let magic = _mm256_set1_ps(12_582_912.0);
+    let biased = _mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(LOG2E)), magic);
+    let n = _mm256_sub_ps(biased, magic);
+    let n_int = _mm256_cvtps_epi32(n);
+
+    let r = _mm256_sub_ps(
+        _mm256_sub_ps(x, _mm256_mul_ps(n, _mm256_set1_ps(LN2_HI))),
+        _mm256_mul_ps(n, _mm256_set1_ps(LN2_LO)),
+    );
+
+    let p = _mm256_set1_ps(1.0 / 120.0);
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.0 / 24.0));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.0 / 6.0));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(0.5));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.0));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.0));
+
+    let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+        n_int,
+        _mm256_set1_epi32(127),
+    )));
+    _mm256_mul_ps(p, pow2n)
+}
+
+// Keep range selection identical to the AVX2-only arm; fuse reduction and Horner.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
+    const LN2_HI: f32 = 0.693_145_75_f32;
+    const LN2_LO: f32 = 1.428_606_8e-6_f32;
+
+    let x = _mm256_max_ps(
+        _mm256_min_ps(x, _mm256_set1_ps(88.0)),
+        _mm256_set1_ps(-87.33),
+    );
+
+    // Round x*log2(e) to the nearest integer with the 1.5 * 2^23 magic number.
+    let magic = _mm256_set1_ps(12_582_912.0);
+    let biased = _mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(LOG2E)), magic);
+    let n = _mm256_sub_ps(biased, magic);
+    let n_int = _mm256_cvtps_epi32(n);
+
+    let r = _mm256_fnmadd_ps(
+        n,
+        _mm256_set1_ps(LN2_LO),
+        _mm256_fnmadd_ps(n, _mm256_set1_ps(LN2_HI), x),
+    );
+
+    let p = _mm256_set1_ps(1.0 / 120.0);
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0 / 24.0));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0 / 6.0));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0));
+
+    let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+        n_int,
+        _mm256_set1_epi32(127),
+    )));
+    _mm256_mul_ps(p, pow2n)
+}
+
+// Keep this softmax polynomial separate from silu's unchanged degree-six helper.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn exp_neon_degree5(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
+    const LN2_HI: f32 = 0.693_145_75_f32;
+    const LN2_LO: f32 = 1.428_606_8e-6_f32;
+
+    let x = vmaxq_f32(vminq_f32(x, vdupq_n_f32(88.0)), vdupq_n_f32(-87.33));
+
+    // Range reduction: x = n*ln(2) + r, |r| <= ln(2)/2
+    // Round to nearest via magic-number trick (avoids unstable intrinsics)
+    let magic = vdupq_n_f32(12_582_912.0); // 1.5 * 2^23
+    let biased = vaddq_f32(vmulq_f32(x, vdupq_n_f32(LOG2E)), magic);
+    let n = vsubq_f32(biased, magic);
+    let n_int = vcvtq_s32_f32(n);
+
+    let r = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(LN2_HI)), n, vdupq_n_f32(LN2_LO));
+
+    // Degree five uses the same 1/k! coefficients as the AVX2 softmax arms.
+    let p = vdupq_n_f32(1.0 / 120.0);
+    let p = vfmaq_f32(vdupq_n_f32(1.0 / 24.0), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(1.0 / 6.0), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(0.5), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(1.0), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(1.0), p, r);
+
+    // Reconstruct: exp(x) = 2^n * exp(r)
+    let pow2n = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(n_int, vdupq_n_s32(127))));
+    vmulq_f32(p, pow2n)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -187,9 +270,9 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
                 continue;
             }
 
-            // --- Step 2: Subtract max + fast exp + accumulate sum ---
+            // --- Step 2: Subtract max + exp + accumulate sum ---
             // A structurally-masked `-inf` lane must produce exact `0.0`, not the
-            // small nonzero value `neon_exp`'s finite-floor clamp would otherwise
+            // small nonzero value `exp_neon_degree5`'s finite-floor clamp would otherwise
             // produce (#740); `vceqq_f32(v, neg_inf)` + `vbslq_f32` blends that lane
             // to exact zero without a scalar fallback.
             let vmax_val = vdupq_n_f32(max_val);
@@ -208,22 +291,22 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
                 let e0 = vbslq_f32(
                     vceqq_f32(raw0, neg_inf),
                     zero,
-                    neon_exp_f32(vsubq_f32(raw0, vmax_val)),
+                    exp_neon_degree5(vsubq_f32(raw0, vmax_val)),
                 );
                 let e1 = vbslq_f32(
                     vceqq_f32(raw1, neg_inf),
                     zero,
-                    neon_exp_f32(vsubq_f32(raw1, vmax_val)),
+                    exp_neon_degree5(vsubq_f32(raw1, vmax_val)),
                 );
                 let e2 = vbslq_f32(
                     vceqq_f32(raw2, neg_inf),
                     zero,
-                    neon_exp_f32(vsubq_f32(raw2, vmax_val)),
+                    exp_neon_degree5(vsubq_f32(raw2, vmax_val)),
                 );
                 let e3 = vbslq_f32(
                     vceqq_f32(raw3, neg_inf),
                     zero,
-                    neon_exp_f32(vsubq_f32(raw3, vmax_val)),
+                    exp_neon_degree5(vsubq_f32(raw3, vmax_val)),
                 );
                 vst1q_f32(ptr.add(base), e0);
                 vst1q_f32(ptr.add(base + 4), e1);
@@ -240,7 +323,7 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
                 let e = if raw == f32::NEG_INFINITY {
                     0.0
                 } else {
-                    fast_exp(raw - max_val)
+                    (raw - max_val).exp()
                 };
                 *ptr.add(i) = e;
                 sum += e;
@@ -276,9 +359,16 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
     }
 }
 
+/// AVX2 softmax rows, generic over the vector `exp`. Always inlined into the
+/// `#[target_feature]` wrappers below, so it is compiled with each wrapper's features.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn softmax_attention_avx2(x: &mut [f32], seq_len: usize, num_heads: usize) {
+#[inline(always)]
+unsafe fn softmax_attention_avx2_rows(
+    x: &mut [f32],
+    seq_len: usize,
+    num_heads: usize,
+    exp: impl Fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256,
+) {
     use std::arch::x86_64::*;
 
     for h in 0..num_heads {
@@ -335,9 +425,9 @@ unsafe fn softmax_attention_avx2(x: &mut [f32], seq_len: usize, num_heads: usize
                 continue;
             }
 
-            // --- Step 2: Subtract max + fast exp + accumulate sum (all SIMD) ---
+            // --- Step 2: Subtract max + exp + accumulate sum (all SIMD) ---
             // A structurally-masked `-inf` lane must produce exact `0.0`, not the
-            // small nonzero value `fast_exp_avx2`'s finite-floor clamp would
+            // small nonzero value `exp_avx2`'s finite-floor clamp would
             // otherwise produce (#740); blend that lane to exact zero via the
             // NaN-free-style ordered-equal compare against `-inf`.
             let vmax_val = _mm256_set1_ps(max_val);
@@ -347,7 +437,7 @@ unsafe fn softmax_attention_avx2(x: &mut [f32], seq_len: usize, num_heads: usize
                 let off = c * 8;
                 let raw = _mm256_loadu_ps(ptr.add(off) as *const f32);
                 let is_masked = _mm256_cmp_ps(raw, neg_inf, _CMP_EQ_OQ);
-                let e_full = fast_exp_avx2(_mm256_sub_ps(raw, vmax_val));
+                let e_full = exp(_mm256_sub_ps(raw, vmax_val));
                 let e = _mm256_andnot_ps(is_masked, e_full);
                 _mm256_storeu_ps(ptr.add(off), e);
                 vsum = _mm256_add_ps(vsum, e);
@@ -358,7 +448,7 @@ unsafe fn softmax_attention_avx2(x: &mut [f32], seq_len: usize, num_heads: usize
                 let e = if raw == f32::NEG_INFINITY {
                     0.0
                 } else {
-                    fast_exp(raw - max_val)
+                    (raw - max_val).exp()
                 };
                 *ptr.add(i) = e;
                 sum += e;
@@ -379,6 +469,18 @@ unsafe fn softmax_attention_avx2(x: &mut [f32], seq_len: usize, num_heads: usize
             }
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn softmax_attention_avx2(x: &mut [f32], seq_len: usize, num_heads: usize) {
+    softmax_attention_avx2_rows(x, seq_len, num_heads, |v| exp_avx2(v));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softmax_attention_avx2_fma(x: &mut [f32], seq_len: usize, num_heads: usize) {
+    softmax_attention_avx2_rows(x, seq_len, num_heads, |v| exp_avx2_fma(v));
 }
 
 #[cfg(test)]

@@ -355,22 +355,6 @@ fn test_softmax_finite_valid_row_masked_weight_is_exact_zero() {
 }
 
 #[test]
-fn test_fast_exp_accuracy() {
-    // Verify fast_exp matches std exp within acceptable tolerance for softmax.
-    // Schraudolph's method has ~5-6% relative error which is fine because
-    // softmax normalizes by the sum, so systematic bias cancels out.
-    for &x in &[-10.0f32, -5.0, -1.0, 0.0, 1.0, 5.0, 10.0] {
-        let expected = x.exp();
-        let actual = fast_exp(x);
-        let rel_err = ((actual - expected) / expected).abs();
-        assert!(
-            rel_err < 0.08,
-            "fast_exp({x}) = {actual}, expected {expected}, rel_err = {rel_err}"
-        );
-    }
-}
-
-#[test]
 fn test_add_bias_gelu_matches_separate_ops() {
     // Verify fused add_bias_gelu produces the same result as add_bias + gelu.
     let dim = 1536; // intermediate_size for BGE-small

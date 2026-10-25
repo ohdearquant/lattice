@@ -15,6 +15,71 @@ fn single_row_matrix(row: &[f32]) -> (Vec<f32>, usize) {
     (x, seq_len)
 }
 
+/// Row lengths covering an empty SIMD body, exact multiples of the 8- and
+/// 16-wide chunks, and chunk-plus-tail shapes.
+const ACCURACY_LENS: [usize; 9] = [1, 3, 8, 9, 15, 16, 17, 33, 128];
+
+/// Relative tolerance against the f64 reference. The polynomial exp is within
+/// ~15 ULP and f32 summation over 128 terms adds at most ~8e-6, while the
+/// Schraudolph bit-trick exp is off by up to ~6%.
+const ACCURACY_RTOL: f64 = 2e-5;
+
+/// A `[seq_len, seq_len]` single-head matrix of deterministic scores in
+/// roughly [-12, 12], so each row spans many powers of two after the max is
+/// subtracted.
+fn accuracy_matrix(seq_len: usize) -> Vec<f32> {
+    (0..seq_len * seq_len)
+        .map(|i| {
+            let t = i as f32;
+            12.0 * (t * 0.618_034).sin() * (t * 0.137).cos()
+        })
+        .collect()
+}
+
+fn softmax_f64_reference(row: &[f32]) -> Vec<f64> {
+    let max = row
+        .iter()
+        .fold(f64::NEG_INFINITY, |m, &v| m.max(f64::from(v)));
+    let exps: Vec<f64> = row.iter().map(|&v| (f64::from(v) - max).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    exps.iter().map(|e| e / sum).collect()
+}
+
+/// Every output weight of `run` must match the f64 softmax within
+/// `ACCURACY_RTOL` relative error, on every row of every shape.
+fn assert_matches_f64_reference(arm: &str, run: impl Fn(&mut [f32], usize, usize)) {
+    for &seq_len in &ACCURACY_LENS {
+        let input = accuracy_matrix(seq_len);
+        let mut out = input.clone();
+        run(&mut out, seq_len, 1);
+        for r in 0..seq_len {
+            let row = &input[r * seq_len..(r + 1) * seq_len];
+            let reference = softmax_f64_reference(row);
+            for (k, (&got, &want)) in out[r * seq_len..(r + 1) * seq_len]
+                .iter()
+                .zip(reference.iter())
+                .enumerate()
+            {
+                let rel = (f64::from(got) - want).abs() / want;
+                assert!(
+                    rel <= ACCURACY_RTOL,
+                    "{arm}: seq_len={seq_len} row={r} key={k}: got {got}, f64 reference {want}, relative error {rel:.3e}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn scalar_matches_f64_reference() {
+    assert_matches_f64_reference("scalar", softmax_attention_scalar);
+}
+
+#[test]
+fn dispatched_matches_f64_reference() {
+    assert_matches_f64_reference("dispatched", softmax_attention);
+}
+
 /// A single NaN score anywhere in the row must zero the WHOLE row, not just
 /// that lane (#740). RED before the fix: the row max fold silently dropped
 /// the NaN operand, so only the NaN's own output lane stayed corrupted while
@@ -172,6 +237,11 @@ mod neon {
         );
     }
 
+    #[test]
+    fn neon_matches_f64_reference() {
+        assert_matches_f64_reference("neon", run_neon);
+    }
+
     /// NEON must agree with the scalar reference on well-formed (all
     /// finite) rows, matching the scalar/NEON parity the file's own
     /// comments already document.
@@ -260,6 +330,16 @@ mod avx2 {
     }
 
     #[test]
+    fn avx2_matches_f64_reference() {
+        if !simd_config().avx2_enabled {
+            return;
+        }
+        assert_matches_f64_reference("avx2", |x, seq_len, num_heads| {
+            run_avx2(x, seq_len, num_heads);
+        });
+    }
+
+    #[test]
     fn avx2_matches_scalar_on_finite_row() {
         let row: Vec<f32> = (0..20).map(|i| (i as f32 * 0.37).sin()).collect();
         let (mut x_scalar, seq_len) = single_row_matrix(&row);
@@ -272,4 +352,76 @@ mod avx2 {
             assert!((a - b).abs() < 1e-4, "scalar={a} avx2={b}");
         }
     }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn assert_special_rows(arm: &str, run: impl Fn(&mut [f32], usize, usize)) {
+    for &len in &ACCURACY_LENS {
+        for lane in [0, len / 2, len - 1] {
+            for value in [f32::NAN, f32::INFINITY] {
+                let mut row = vec![0.5f32; len];
+                row[lane] = value;
+                let (mut matrix, _) = single_row_matrix(&row);
+                run(&mut matrix, len, 1);
+                assert!(
+                    matrix[..len].iter().all(|&v| v == 0.0),
+                    "{arm}: len={len} lane={lane} value={value}"
+                );
+            }
+        }
+        let (mut masked, _) = single_row_matrix(&vec![f32::NEG_INFINITY; len]);
+        run(&mut masked, len, 1);
+        assert!(masked[..len].iter().all(|&v| v == 0.0), "{arm}: len={len}");
+        if len > 1 {
+            let mut row = vec![0.5f32; len];
+            row[0] = f32::NEG_INFINITY;
+            let (mut matrix, _) = single_row_matrix(&row);
+            run(&mut matrix, len, 1);
+            assert_eq!(matrix[0], 0.0, "{arm}: len={len}");
+            assert!(matrix[1..len].iter().all(|v| v.is_finite() && *v > 0.0));
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx2_fma_matches_f64_reference() {
+    let config = simd_config();
+    if !config.avx2_enabled || !config.fma_enabled {
+        return;
+    }
+    eprintln!("softmax avx2-fma: exercising SIMD body");
+    let run = |x: &mut [f32], seq_len, num_heads| {
+        // SAFETY: both AVX2 and FMA were detected above.
+        unsafe { softmax_attention_avx2_fma(x, seq_len, num_heads) };
+    };
+    assert_matches_f64_reference("avx2-fma", run);
+    assert_special_rows("avx2-fma", run);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx2_degree5_matches_f64_reference() {
+    if !simd_config().avx2_enabled {
+        return;
+    }
+    eprintln!("softmax avx2 degree5: exercising SIMD body");
+    let run = |x: &mut [f32], seq_len, num_heads| {
+        // SAFETY: AVX2 was detected above.
+        unsafe { softmax_attention_avx2(x, seq_len, num_heads) };
+    };
+    assert_matches_f64_reference("avx2-degree5", run);
+    assert_special_rows("avx2-degree5", run);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_degree5_matches_f64_reference() {
+    eprintln!("softmax neon degree5: exercising SIMD body");
+    let run = |x: &mut [f32], seq_len, num_heads| {
+        // SAFETY: NEON is guaranteed on aarch64.
+        unsafe { softmax_attention_neon(x, seq_len, num_heads) };
+    };
+    assert_matches_f64_reference("neon-degree5", run);
+    assert_special_rows("neon-degree5", run);
 }
