@@ -14,20 +14,26 @@
 //! These are the standard ImageNet statistics used by the Qwen VL family.
 //! See `Qwen/Qwen3-VL-7B-Instruct` processor_config.json.
 
+#[cfg(feature = "image")]
 use image::{DynamicImage, ImageReader, RgbImage};
+#[cfg(feature = "image")]
 use std::io::Cursor;
 
 use super::VisionError;
 
+#[cfg(feature = "image")]
 #[derive(Clone, Copy)]
 struct DecodeLimits {
     pixels: u64,
     allocation_bytes: u64,
 }
 
+#[cfg(feature = "image")]
 const EG2_MAX_DECODED_PIXELS: u64 = 8192 * 8192;
+#[cfg(feature = "image")]
 const EG2_MAX_DECODE_ALLOCATION_BYTES: u64 = 512 * 1024 * 1024;
 
+#[cfg(feature = "image")]
 const IMAGE_DECODE_LIMITS: DecodeLimits = DecodeLimits {
     pixels: EG2_MAX_DECODED_PIXELS,
     allocation_bytes: EG2_MAX_DECODE_ALLOCATION_BYTES,
@@ -37,10 +43,12 @@ const IMAGE_DECODE_LIMITS: DecodeLimits = DecodeLimits {
 ///
 /// Pixel count is checked before pixel decoding, with no per-side cap. The image crate's
 /// decoder allocation limit is additionally applied, but is a best-effort limit.
+#[cfg(feature = "image")]
 pub(crate) fn decode_image_bounded(image_bytes: &[u8]) -> Result<DynamicImage, VisionError> {
     decode_image_with_limits(image_bytes, IMAGE_DECODE_LIMITS)
 }
 
+#[cfg(feature = "image")]
 fn decode_image_with_limits(
     image_bytes: &[u8],
     budget: DecodeLimits,
@@ -149,11 +157,13 @@ impl ImageTensor {
 ///
 /// # Errors
 ///
-/// Returns `VisionError::ImageDecode` if the bytes cannot be decoded.
-/// Returns `VisionError::InvalidConfig` if `cfg.image_size` is not divisible
-/// by `cfg.patch_size`, or if any std component is zero.
+/// Returns `VisionError::InvalidConfig` if `cfg.patch_size` is zero,
+/// `cfg.image_size` is not divisible by `cfg.patch_size`, or any std component
+/// is not positive. The configuration is checked before any decoding, with or
+/// without the `image` feature.
+/// Returns `VisionError::ImageDecode` if the bytes cannot be decoded or the
+/// `image` feature is disabled.
 pub fn preprocess(image_bytes: &[u8], cfg: &PreprocessConfig) -> Result<ImageTensor, VisionError> {
-    // Validate config
     if cfg.patch_size == 0 {
         return Err(VisionError::InvalidConfig("patch_size must be > 0".into()));
     }
@@ -171,59 +181,69 @@ pub fn preprocess(image_bytes: &[u8], cfg: &PreprocessConfig) -> Result<ImageTen
         }
     }
 
-    // Decode image
-    let reader = ImageReader::new(Cursor::new(image_bytes))
-        .with_guessed_format()
-        .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
-    let img: DynamicImage = reader
-        .decode()
-        .map_err(|e| VisionError::ImageDecode(format!("decode failed: {e}")))?;
+    #[cfg(feature = "image")]
+    {
+        // Decode image
+        let reader = ImageReader::new(Cursor::new(image_bytes))
+            .with_guessed_format()
+            .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
+        let img: DynamicImage = reader
+            .decode()
+            .map_err(|e| VisionError::ImageDecode(format!("decode failed: {e}")))?;
 
-    // Resize to image_size × image_size (bilinear)
-    let size = cfg.image_size;
-    let resized: RgbImage = img
-        .resize_exact(size, size, image::imageops::FilterType::Triangle)
-        .into_rgb8();
+        // Resize to image_size × image_size (bilinear)
+        let size = cfg.image_size;
+        let resized: RgbImage = img
+            .resize_exact(size, size, image::imageops::FilterType::Triangle)
+            .into_rgb8();
 
-    // Extract patches
-    let patch_size = cfg.patch_size as usize;
-    let image_size = cfg.image_size as usize;
-    let patches_per_side = image_size / patch_size;
-    let n_patches = patches_per_side * patches_per_side;
-    let patch_len = patch_size * patch_size * 3;
+        // Extract patches
+        let patch_size = cfg.patch_size as usize;
+        let image_size = cfg.image_size as usize;
+        let patches_per_side = image_size / patch_size;
+        let n_patches = patches_per_side * patches_per_side;
+        let patch_len = patch_size * patch_size * 3;
 
-    let mut patches = vec![0.0f32; n_patches * patch_len];
+        let mut patches = vec![0.0f32; n_patches * patch_len];
 
-    for py in 0..patches_per_side {
-        for px in 0..patches_per_side {
-            let patch_idx = py * patches_per_side + px;
-            let patch_slice = &mut patches[patch_idx * patch_len..(patch_idx + 1) * patch_len];
+        for py in 0..patches_per_side {
+            for px in 0..patches_per_side {
+                let patch_idx = py * patches_per_side + px;
+                let patch_slice = &mut patches[patch_idx * patch_len..(patch_idx + 1) * patch_len];
 
-            let pixel_start_y = py * patch_size;
-            let pixel_start_x = px * patch_size;
+                let pixel_start_y = py * patch_size;
+                let pixel_start_x = px * patch_size;
 
-            let mut out_idx = 0usize;
-            for dy in 0..patch_size {
-                for dx in 0..patch_size {
-                    let px_coord = (pixel_start_x + dx) as u32;
-                    let py_coord = (pixel_start_y + dy) as u32;
-                    let pixel = resized.get_pixel(px_coord, py_coord);
-                    for c in 0..3usize {
-                        let raw = pixel[c] as f32 / 255.0;
-                        patch_slice[out_idx] = (raw - cfg.mean[c]) / cfg.std[c];
-                        out_idx += 1;
+                let mut out_idx = 0usize;
+                for dy in 0..patch_size {
+                    for dx in 0..patch_size {
+                        let px_coord = (pixel_start_x + dx) as u32;
+                        let py_coord = (pixel_start_y + dy) as u32;
+                        let pixel = resized.get_pixel(px_coord, py_coord);
+                        for c in 0..3usize {
+                            let raw = pixel[c] as f32 / 255.0;
+                            patch_slice[out_idx] = (raw - cfg.mean[c]) / cfg.std[c];
+                            out_idx += 1;
+                        }
                     }
                 }
             }
         }
-    }
 
-    Ok(ImageTensor {
-        patches,
-        n_patches,
-        patch_hw: patch_size,
-    })
+        Ok(ImageTensor {
+            patches,
+            n_patches,
+            patch_hw: patch_size,
+        })
+    }
+    #[cfg(not(feature = "image"))]
+    {
+        let _ = image_bytes;
+        Err(VisionError::ImageDecode(
+            "image decoding is not compiled in; enable the `image` feature".into(),
+        ))
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "image"))]
 mod tests;
