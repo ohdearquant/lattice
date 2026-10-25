@@ -243,7 +243,9 @@ unsafe fn rms_norm_neon(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn neon_exp_f32(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+pub(super) unsafe fn neon_exp_f32(
+    x: std::arch::aarch64::float32x4_t,
+) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;
 
     const LOG2E: f32 = std::f32::consts::LOG2_E;

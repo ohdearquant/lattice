@@ -15,6 +15,71 @@ fn single_row_matrix(row: &[f32]) -> (Vec<f32>, usize) {
     (x, seq_len)
 }
 
+/// Row lengths covering an empty SIMD body, exact multiples of the 8- and
+/// 16-wide chunks, and chunk-plus-tail shapes.
+const ACCURACY_LENS: [usize; 9] = [1, 3, 8, 9, 15, 16, 17, 33, 128];
+
+/// Relative tolerance against the f64 reference. The polynomial exp is within
+/// ~15 ULP and f32 summation over 128 terms adds at most ~8e-6, while the
+/// Schraudolph bit-trick exp is off by up to ~6%.
+const ACCURACY_RTOL: f64 = 2e-5;
+
+/// A `[seq_len, seq_len]` single-head matrix of deterministic scores in
+/// roughly [-12, 12], so each row spans many powers of two after the max is
+/// subtracted.
+fn accuracy_matrix(seq_len: usize) -> Vec<f32> {
+    (0..seq_len * seq_len)
+        .map(|i| {
+            let t = i as f32;
+            12.0 * (t * 0.618_034).sin() * (t * 0.137).cos()
+        })
+        .collect()
+}
+
+fn softmax_f64_reference(row: &[f32]) -> Vec<f64> {
+    let max = row
+        .iter()
+        .fold(f64::NEG_INFINITY, |m, &v| m.max(f64::from(v)));
+    let exps: Vec<f64> = row.iter().map(|&v| (f64::from(v) - max).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    exps.iter().map(|e| e / sum).collect()
+}
+
+/// Every output weight of `run` must match the f64 softmax within
+/// `ACCURACY_RTOL` relative error, on every row of every shape.
+fn assert_matches_f64_reference(arm: &str, run: impl Fn(&mut [f32], usize, usize)) {
+    for &seq_len in &ACCURACY_LENS {
+        let input = accuracy_matrix(seq_len);
+        let mut out = input.clone();
+        run(&mut out, seq_len, 1);
+        for r in 0..seq_len {
+            let row = &input[r * seq_len..(r + 1) * seq_len];
+            let reference = softmax_f64_reference(row);
+            for (k, (&got, &want)) in out[r * seq_len..(r + 1) * seq_len]
+                .iter()
+                .zip(reference.iter())
+                .enumerate()
+            {
+                let rel = (f64::from(got) - want).abs() / want;
+                assert!(
+                    rel <= ACCURACY_RTOL,
+                    "{arm}: seq_len={seq_len} row={r} key={k}: got {got}, f64 reference {want}, relative error {rel:.3e}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn scalar_matches_f64_reference() {
+    assert_matches_f64_reference("scalar", softmax_attention_scalar);
+}
+
+#[test]
+fn dispatched_matches_f64_reference() {
+    assert_matches_f64_reference("dispatched", softmax_attention);
+}
+
 /// A single NaN score anywhere in the row must zero the WHOLE row, not just
 /// that lane (#740). RED before the fix: the row max fold silently dropped
 /// the NaN operand, so only the NaN's own output lane stayed corrupted while
@@ -172,6 +237,11 @@ mod neon {
         );
     }
 
+    #[test]
+    fn neon_matches_f64_reference() {
+        assert_matches_f64_reference("neon", run_neon);
+    }
+
     /// NEON must agree with the scalar reference on well-formed (all
     /// finite) rows, matching the scalar/NEON parity the file's own
     /// comments already document.
@@ -257,6 +327,16 @@ mod avx2 {
             return;
         }
         assert_eq!(x[4], 0.0, "masked lane must be exact zero, got {}", x[4]);
+    }
+
+    #[test]
+    fn avx2_matches_f64_reference() {
+        if !simd_config().avx2_enabled {
+            return;
+        }
+        assert_matches_f64_reference("avx2", |x, seq_len, num_heads| {
+            run_avx2(x, seq_len, num_heads);
+        });
     }
 
     #[test]
