@@ -57,6 +57,37 @@ Recorded:
    there, and is listed as a guarded entry point in the lock-coverage contract. The new crate keeps the module's pure
    unit test and has no device test of its own.
 
+## Amendment 5 (2026-10-25)
+
+The model configurations move below the facade, so that code which needs a model's configuration and nothing else no
+longer has to live in `lattice-inference`. The QuaRot conversion modules, for example, read `Qwen35Config` and cannot
+join `lattice-quant` while that type is defined in the facade. This is the first per-model step of D9 step 3, and it
+moves the configuration parsers only. Recorded:
+
+1. **D8.1.** The crate is `lattice-model-config`. It holds the four configuration modules `qwen35_config`,
+   `gemma4_config`, `embeddinggemma2_config` and `bitnet_config`, with their unit tests. It depends on
+   `lattice-inference-core` for `InferenceError` and on `lattice-weights` for the bounded `config.json` reader, and it
+   publishes in the third tier beside `lattice-quant`. The model code, the loaders, `QwenConfig` (defined inside
+   `model/qwen.rs` with the Qwen3 embedding model) and the Qwen3.5 tensor-name functions stay in the facade for later
+   changes.
+2. **D4.** Crate-private items used from outside the moving modules:
+   - Public: `qwen35_config::{MAX_VISION_TENSOR_BYTES, compute_layer_types}`, `gemma4_config::resolve_stop_token_ids`,
+     and `embeddinggemma2_config::{ImagePartsConfig, image_parts_config}` with the three fields of `ImagePartsConfig`.
+     Each is part of parsing or validating a configuration. The facade imports them `pub(crate)` at their old paths, so
+     its public listing is unchanged.
+   - Internal: `qwen35_config::checked_double`, which reports an overflow as a Qwen configuration error. Its definition
+     stays crate-private, and `__internal::checked_double` forwards to it for the two facade callers.
+   - Every other crate-private item of the four modules is used only inside them and stays crate-private.
+3. **D6.6.** Not everything in `model::qwen35_config` is configuration. The four deprecated aliases of the generation
+   types (`GenerateConfig`, `GenerateOutput`, `TokenLogprob`, `TopLogprob`) name types that stay in the facade, and the
+   reasoning-budget helpers `REASONING_CLOSE_GRACE_TOKENS`, `force_close_think` and `decode_cap` are generation code.
+   They stay in the facade's `model::qwen35_config` module, unchanged and at the same paths, together with their 15
+   unit tests, which keep their names. The rest of the module's tests move with it.
+4. **Fixtures.** `tests/fixtures/qwen36_config.json` is read only by the moved tests and moves to
+   `crates/model-config/tests/fixtures/`. `qwen35_0_8b_config.json` and `gemma4/e2b_config.json` are also read by tests
+   that stay in `lattice-inference`, so they stay where they are, and the moved tests read them through a path relative
+   to the workspace, as `lattice-embed`'s tests already read the first of them.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

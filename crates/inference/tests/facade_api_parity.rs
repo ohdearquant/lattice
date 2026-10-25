@@ -1061,3 +1061,91 @@ mod quant_parity {
         );
     }
 }
+
+mod model_config_parity {
+    use lattice_inference::model as facade;
+    use lattice_model_config as extracted;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    #[test]
+    fn model_config_types_are_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<facade::qwen35_config::LayerType>,
+            PhantomData::<extracted::qwen35_config::LayerType>,
+        );
+        same_type(
+            PhantomData::<facade::qwen35_config::Qwen35Config>,
+            PhantomData::<extracted::qwen35_config::Qwen35Config>,
+        );
+        same_type(
+            PhantomData::<facade::qwen35_config::RopeParams>,
+            PhantomData::<extracted::qwen35_config::RopeParams>,
+        );
+        same_type(
+            PhantomData::<facade::qwen35_config::ValidatedQwen35Config>,
+            PhantomData::<extracted::qwen35_config::ValidatedQwen35Config>,
+        );
+        same_type(
+            PhantomData::<facade::qwen35_config::VisionModelConfig>,
+            PhantomData::<extracted::qwen35_config::VisionModelConfig>,
+        );
+        same_type(
+            PhantomData::<facade::gemma4_config::Gemma4Config>,
+            PhantomData::<extracted::gemma4_config::Gemma4Config>,
+        );
+        same_type(
+            PhantomData::<facade::gemma4_config::Gemma4LayerType>,
+            PhantomData::<extracted::gemma4_config::Gemma4LayerType>,
+        );
+        same_type(
+            PhantomData::<facade::embeddinggemma2_config::EmbeddingGemma2Config>,
+            PhantomData::<extracted::embeddinggemma2_config::EmbeddingGemma2Config>,
+        );
+        same_type(
+            PhantomData::<facade::embeddinggemma2_config::EmbeddingGemma2LayerKind>,
+            PhantomData::<extracted::embeddinggemma2_config::EmbeddingGemma2LayerKind>,
+        );
+        same_type(
+            PhantomData::<facade::embeddinggemma2_config::EmbeddingGemma2LayerShape>,
+            PhantomData::<extracted::embeddinggemma2_config::EmbeddingGemma2LayerShape>,
+        );
+        same_type(
+            PhantomData::<facade::bitnet_config::BitNetConfig>,
+            PhantomData::<extracted::bitnet_config::BitNetConfig>,
+        );
+    }
+
+    #[test]
+    fn model_config_constants_are_equal_at_both_paths() {
+        assert_eq!(
+            facade::qwen35_config::MAX_HIDDEN_LAYERS,
+            extracted::qwen35_config::MAX_HIDDEN_LAYERS
+        );
+        assert_eq!(
+            facade::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID,
+            extracted::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID
+        );
+        assert_eq!(
+            facade::qwen35_config::QWEN3_NEWLINE_TOKEN_ID,
+            extracted::qwen35_config::QWEN3_NEWLINE_TOKEN_ID
+        );
+        assert_eq!(
+            facade::qwen35_config::QWEN3_NO_THINK_PREFIX,
+            extracted::qwen35_config::QWEN3_NO_THINK_PREFIX
+        );
+        assert_eq!(
+            facade::qwen35_config::QWEN3_THINK_CLOSE_TOKEN_ID,
+            extracted::qwen35_config::QWEN3_THINK_CLOSE_TOKEN_ID
+        );
+        assert_eq!(
+            facade::qwen35_config::QWEN3_THINK_OPEN_TOKEN_ID,
+            extracted::qwen35_config::QWEN3_THINK_OPEN_TOKEN_ID
+        );
+        assert_eq!(
+            facade::gemma4_config::GEMMA4_EXPECTED_DTYPE,
+            extracted::gemma4_config::GEMMA4_EXPECTED_DTYPE
+        );
+    }
+}

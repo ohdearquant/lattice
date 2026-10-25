@@ -25,8 +25,8 @@ esac
 # Publish order follows the internal dependency DAG (deps before dependents):
 #   fann, transport, inference-core   leaves, no internal deps
 #     -> tokenizer, grammar, weights, metal-runtime  depend on inference-core
-#       -> quant                      depends on inference-core, weights
-#         -> inference                depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, metal-runtime
+#       -> quant, model-config        depend on inference-core, weights
+#         -> inference                depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, model-config, metal-runtime
 #           -> embed                  depends on inference
 #           -> tune                   depends on fann, inference
 # Each tier waits for crates.io indexing before the next tier resolves it.
@@ -37,7 +37,7 @@ esac
 # exceeds 10 MiB, and a rejection in tier 2 leaves tier 1 already published and
 # immutable. `cargo publish --dry-run` does not cover this: it can only validate
 # the leaf tier, because a crate whose internal path dependencies are not yet
-# live on the registry cannot be packaged at all. Measure all eleven first.
+# live on the registry cannot be packaged at all. Measure all twelve first.
 echo "--- Pre-publish: package size against the crates.io upload limit ---"
 "$(dirname "$0")/package-size-check.sh"
 
@@ -69,15 +69,16 @@ if [ -z "$FLAG" ]; then
     sleep 30
 fi
 
-echo "--- Tier 3: quant (depends on inference-core, weights) ---"
+echo "--- Tier 3: quant and model-config (depend on inference-core, weights) ---"
 cargo publish -p lattice-quant $FLAG
+cargo publish -p lattice-model-config $FLAG
 
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."
     sleep 30
 fi
 
-echo "--- Tier 4: inference (depends on fann, inference-core, tokenizer, grammar, weights, quant, metal-runtime) ---"
+echo "--- Tier 4: inference (depends on fann, inference-core, tokenizer, grammar, weights, quant, model-config, metal-runtime) ---"
 cargo publish -p lattice-inference $FLAG
 
 if [ -z "$FLAG" ]; then

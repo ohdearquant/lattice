@@ -143,6 +143,7 @@ lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
 lattice-grammar = { version = "0.15.0", path = "../grammar" }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 lattice-metal-runtime = { version = "0.15.0", path = "../metal-runtime", optional = true }
+lattice-model-config = { version = "0.15.0", path = "../model-config" }
 lattice-quant = { version = "0.15.0", path = "../quant" }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
