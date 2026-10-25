@@ -39,11 +39,11 @@ make ci  # fmt + clippy + doc lint + test + release build
 make publish-dry
 ```
 
-`make publish-dry` validates only the four leaf crates (`lattice-fann`,
-`lattice-transport`, `lattice-inference-core`, `lattice-compute`). The nine dependent crates, including
-`lattice-tokenizer`, `lattice-grammar`, `lattice-weights`, `lattice-metal-runtime`, `lattice-quant` and `lattice-model-config`, need their dependencies
+`make publish-dry` validates only the three leaf crates (`lattice-fann`,
+`lattice-transport`, `lattice-inference-core`). The ten dependent crates, including
+`lattice-tokenizer`, `lattice-grammar`, `lattice-weights`, `lattice-metal-runtime`, `lattice-compute`, `lattice-quant` and `lattice-model-config`, need their dependencies
 published first.
-Run `scripts/package-size-check.sh` for all thirteen crates before publishing.
+Run `scripts/package-size-check.sh` for all fourteen crates before publishing.
 
 ## Publish
 
@@ -71,7 +71,7 @@ state and every remote asset before retrying.
 
 ## Post-release
 
-- [ ] Verify on crates.io: all thirteen crates show v{VERSION}
+- [ ] Verify on crates.io: all fourteen crates show v{VERSION}
 - [ ] Smoke test: `cargo add lattice-inference@{VERSION}` in a fresh project
 - [ ] Update getting-started.md if API changed
 - [ ] Close relevant milestone/issues

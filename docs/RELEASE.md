@@ -13,10 +13,10 @@ Publish order follows the internal dependency DAG, leaf crates first:
 
 ```
 lattice-fann, lattice-transport,  (leaf crates, no internal deps)
-lattice-inference-core, lattice-compute
+lattice-inference-core
         │
         ▼  (wait for crates.io indexing)
-lattice-tokenizer, lattice-grammar, lattice-weights, lattice-metal-runtime
+lattice-tokenizer, lattice-grammar, lattice-weights, lattice-metal-runtime, lattice-compute
                                 (depend on lattice-inference-core)
         │
         ▼  (wait for crates.io indexing)
@@ -58,14 +58,14 @@ make ci  # fmt + clippy + doc lint + test + release build
 # 4. Dry-run publish (catches missing fields, version conflicts)
 make publish-dry
 
-# 5. Package size against the crates.io upload limit, all thirteen crates
+# 5. Package size against the crates.io upload limit, all fourteen crates
 scripts/package-size-check.sh
 ```
 
 `make publish-dry` only validates the leaf tier (`lattice-fann`, `lattice-transport`,
-`lattice-inference-core`, `lattice-compute`) — Cargo cannot dry-run a crate whose internal path dependencies are not
+`lattice-inference-core`) — Cargo cannot dry-run a crate whose internal path dependencies are not
 yet live on the registry, so `lattice-tokenizer`, `lattice-grammar`, `lattice-weights`,
-`lattice-metal-runtime`, `lattice-quant`, `lattice-model-config`, `lattice-inference`, `lattice-embed`, `lattice-tune`, and `lattice-serve` are not covered by the dry run.
+`lattice-metal-runtime`, `lattice-compute`, `lattice-quant`, `lattice-model-config`, `lattice-inference`, `lattice-embed`, `lattice-tune`, and `lattice-serve` are not covered by the dry run.
 
 ### Package size
 
@@ -73,7 +73,7 @@ That same gap hides the registry's upload limit until publish time, which is the
 to find it: crates.io rejects an archive over 10 MiB (10,485,760 bytes), and a rejection in
 the second tier leaves the first tier already published and immutable.
 
-`scripts/package-size-check.sh` covers all thirteen crates and needs no registry access. It
+`scripts/package-size-check.sh` covers all fourteen crates and needs no registry access. It
 brackets each archive from `cargo package --list`, which builds nothing and names exactly the
 files that would ship, gzipped at level 6 — cargo's default, and the level to use here,
 because level 9 shaves enough off the estimate to flatter a crate that is close to the limit.
@@ -112,7 +112,6 @@ make publish
 cargo publish -p lattice-fann
 cargo publish -p lattice-transport
 cargo publish -p lattice-inference-core
-cargo publish -p lattice-compute
 
 sleep 30   # wait for crates.io indexing
 
@@ -123,6 +122,7 @@ sleep 30   # lattice-grammar's tests depend on lattice-tokenizer
 cargo publish -p lattice-grammar
 cargo publish -p lattice-weights
 cargo publish -p lattice-metal-runtime
+cargo publish -p lattice-compute
 
 sleep 30   # wait for crates.io indexing
 
@@ -160,7 +160,7 @@ state and every remote asset before retrying.
 
 ## Post-release
 
-- [ ] Verify on crates.io: all thirteen crates (`lattice-fann`, `lattice-transport`,
+- [ ] Verify on crates.io: all fourteen crates (`lattice-fann`, `lattice-transport`,
       `lattice-inference-core`, `lattice-tokenizer`, `lattice-grammar`, `lattice-weights`,
       `lattice-metal-runtime`, `lattice-quant`, `lattice-model-config`, `lattice-compute`, `lattice-inference`, `lattice-embed`, `lattice-tune`, `lattice-serve`) show `v{VERSION}`.
 - [ ] Smoke test: `cargo add lattice-inference@{VERSION}` in a fresh project.
