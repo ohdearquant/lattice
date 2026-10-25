@@ -1581,6 +1581,7 @@ dependencies = [
  "indexmap",
  "lattice-inference-core",
  "lattice-model-config",
+ "lattice-tokenizer",
  "rustc-hash 2.1.3",
 ]
 

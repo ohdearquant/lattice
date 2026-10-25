@@ -1,5 +1,5 @@
 use super::*;
-use crate::tokenizer::{BpeTokenizer, TokenizedInput};
+use lattice_tokenizer::{BpeTokenizer, TokenizedInput};
 use std::collections::HashMap;
 
 /// A row with distinct, mixed-sign values so that a wrong index changes the result.

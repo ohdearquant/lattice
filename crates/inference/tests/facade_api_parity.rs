@@ -1589,3 +1589,116 @@ mod lora_hook_parity {
         );
     }
 }
+
+mod metrics_pruning_parity {
+    use lattice_compute as extracted;
+    use lattice_inference::{metrics as facade_metrics, pruning as facade_pruning};
+    use std::marker::PhantomData;
+
+    fn same_type<T: ?Sized>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn metrics_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade_metrics::MetricsMode>,
+            PhantomData::<extracted::metrics::MetricsMode>,
+        );
+        same_type(
+            PhantomData::<facade_metrics::LayerMetrics>,
+            PhantomData::<extracted::metrics::LayerMetrics>,
+        );
+        same_type(
+            PhantomData::<facade_metrics::ForwardMetrics>,
+            PhantomData::<extracted::metrics::ForwardMetrics>,
+        );
+        same_type(
+            PhantomData::<facade_metrics::OnlineSoftmaxEntropy>,
+            PhantomData::<extracted::metrics::OnlineSoftmaxEntropy>,
+        );
+        let _: extracted::metrics::OnlineSoftmaxEntropy =
+            facade_metrics::OnlineSoftmaxEntropy::new();
+    }
+
+    #[test]
+    fn metrics_functions_are_the_same_items_at_both_paths() {
+        same_function(facade_metrics::l2_norm, extracted::metrics::l2_norm);
+    }
+
+    #[test]
+    fn pruning_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade_pruning::BlockInfluence>,
+            PhantomData::<extracted::pruning::BlockInfluence>,
+        );
+        same_type(
+            PhantomData::<facade_pruning::BlockInfluenceAccumulator>,
+            PhantomData::<extracted::pruning::BlockInfluenceAccumulator>,
+        );
+    }
+
+    #[test]
+    fn pruning_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade_pruning::cosine_similarity,
+            extracted::pruning::cosine_similarity,
+        );
+        same_function(
+            facade_pruning::score_from_hidden_states,
+            extracted::pruning::score_from_hidden_states,
+        );
+        same_function(
+            facade_pruning::pruning_rank,
+            extracted::pruning::pruning_rank,
+        );
+    }
+
+    #[test]
+    fn metrics_mode_variants_resolve_through_the_facade() {
+        let mode = facade_metrics::MetricsMode::default();
+        assert!(matches!(mode, facade_metrics::MetricsMode::Off));
+        let _ = facade_metrics::MetricsMode::HeavyDiagnostics;
+    }
+}
+
+mod option_scoring_parity {
+    use lattice_compute::option_scoring as extracted;
+    use lattice_inference::option_scoring as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T: ?Sized>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn option_scoring_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::OptionScores>,
+            PhantomData::<extracted::OptionScores>,
+        );
+        same_type(
+            PhantomData::<facade::DecisionLabelTable>,
+            PhantomData::<extracted::DecisionLabelTable>,
+        );
+    }
+
+    #[test]
+    fn option_scoring_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::option_scores_from_logits,
+            extracted::option_scores_from_logits,
+        );
+        same_function(
+            facade::resolve_option_letters,
+            extracted::resolve_option_letters,
+        );
+        same_function(
+            facade::resolve_decision_labels,
+            extracted::resolve_decision_labels,
+        );
+    }
+
+    #[test]
+    fn letter_labels_constant_is_equal_at_both_paths() {
+        assert_eq!(facade::LETTER_LABELS, extracted::LETTER_LABELS);
+    }
+}

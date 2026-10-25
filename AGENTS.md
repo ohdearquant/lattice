@@ -110,7 +110,7 @@ fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
                                                  |
                                               model-config   ← depends on inference-core + weights
                                                  |
-                                               quant   compute   ← quant depends on inference-core + weights + model-config; compute on inference-core + model-config
+                                               quant   compute   ← quant depends on inference-core + weights + model-config; compute on inference-core + tokenizer + model-config
     |                                  |
 inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + model-config + compute;
                                                    optional metal-runtime under `metal-gpu`;
@@ -124,8 +124,8 @@ embed (12K)   tune (20K)   serve               ← embed uses inference; tune us
 all seven edges into them are unconditional. `metal-runtime` depends on
 `inference-core` and is enabled by inference's opt-in `metal-gpu` feature.
 `model-config` depends on `inference-core` and `weights`; `quant` depends on
-those two and on `model-config`, while `compute` depends on `inference-core` and
-`model-config`. `inference` re-exports the extracted public items at their
+those two and on `model-config`, while `compute` depends on `inference-core`,
+`tokenizer` and `model-config`. `inference` re-exports the extracted public items at their
 original paths. Of the four edges among the other crates, three are
 feature-gated, and the gates do not all default the same way, so "depends on" in
 the diagram is not one relationship. `tune` depends on `fann` unconditionally.

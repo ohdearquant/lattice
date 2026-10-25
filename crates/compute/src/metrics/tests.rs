@@ -171,7 +171,10 @@ fn test_entropy_try_update_rejects_non_finite_logits() {
         let err = acc
             .try_update(logit)
             .expect_err("non-finite logit must fail");
-        assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+        assert!(matches!(
+            err,
+            lattice_inference_core::InferenceError::InvalidInput(_)
+        ));
         assert_eq!(acc.count(), 0);
         assert_eq!(acc.entropy_nats(), 0.0);
     }

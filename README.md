@@ -593,6 +593,7 @@ flowchart TD
     Inference --> Compute[lattice-compute]
     Compute --> Core
     Compute --> ModelConfig
+    Compute --> Tokenizer
     Grammar --> Core
     Weights --> Core
     Quant --> Core

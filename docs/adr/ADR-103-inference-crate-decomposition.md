@@ -376,6 +376,39 @@ them without depending on the inference facade. Recorded:
 6. **D6.4.** The added dependency and changed build inputs require measured A/B acceptance. This amendment records
    the extraction and its validation obligations; it does not assert a measurement result or a structural waiver.
 
+## Amendment 11 (2026-10-25)
+
+The numerical diagnostics (`metrics`, `pruning`) and option-letter scoring (`option_scoring`) join `lattice-compute`,
+so forward and evaluation code can use them without depending on the inference facade. Recorded:
+
+1. **D8.1.** `metrics`, `pruning` and `option_scoring` move into `lattice-compute` with their tests. `metrics` and
+   `pruning` reach only the core crate. `option_scoring` names the `Tokenizer` trait, so compute gains a normal
+   dependency on `lattice-tokenizer`. The tokenizer publishes in tier 2, before compute's tier 4, so compute's tier,
+   the publish script and the publish-order test are unchanged.
+2. **D1.** `lattice_inference::metrics` keeps named public re-exports of `MetricsMode`, `LayerMetrics`,
+   `ForwardMetrics`, `OnlineSoftmaxEntropy` and `l2_norm`; `lattice_inference::pruning` of `cosine_similarity`,
+   `BlockInfluence`, `BlockInfluenceAccumulator`, `score_from_hidden_states` and `pruning_rank`;
+   `lattice_inference::option_scoring` of `OptionScores`, `option_scores_from_logits`, `resolve_option_letters`,
+   `resolve_decision_labels`, `LETTER_LABELS` and `DecisionLabelTable`. The items are the same at both paths.
+   `MetricsMode` keeps its `#[non_exhaustive]` annotation; no match on it exists outside compute.
+3. **D4.2.** The formerly crate-private free function `check_letter_ids` becomes the documented public
+   `lattice_compute::option_scoring::check_letter_ids`: validating letter ids against a vocabulary is part of option
+   scoring. The facade imports it with `pub(crate) use`, preserving its private facade visibility, and its callers in
+   the CPU and Metal scorers keep their crate path. No new `__internal` bridge is added. `metrics` and `pruning` have
+   no crate-private items.
+4. **D5.** Compute keeps an empty default feature set. The three modules and the tokenizer dependency are
+   unconditional; the move adds no caller feature or target gate.
+5. **D6.1.** `metrics/tests.rs` (28 tests), `pruning/tests.rs` (25) and `option_scoring/tests.rs` (20) move with all
+   names unchanged; only the error and tokenizer import paths change. `facade_api_parity` adds
+   `metrics_types_are_the_same_at_both_paths`, `metrics_functions_are_the_same_items_at_both_paths`,
+   `pruning_types_are_the_same_at_both_paths`, `pruning_functions_are_the_same_items_at_both_paths`,
+   `metrics_mode_variants_resolve_through_the_facade`, `option_scoring_types_are_the_same_at_both_paths`,
+   `option_scoring_functions_are_the_same_items_at_both_paths` and `letter_labels_constant_is_equal_at_both_paths`.
+6. **D6.4.** The added dependency and changed build inputs require measured A/B acceptance. `metrics_bench` and
+   `pruning_bench` stay in `lattice-inference` and reach the moved code through the facade; option scoring has no
+   declared bench target. This amendment records the extraction and its validation obligations; it does not assert a
+   measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
