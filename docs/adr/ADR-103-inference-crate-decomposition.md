@@ -323,6 +323,33 @@ filled by small moves, each its own change, and the first move is the rotary pos
    alternative of a separate crate for host primitives is reconsidered when a consumer needs only those primitives and
    the measured cost of the rest of the crate's dependencies is significant to it.
 
+## Amendment 9 (2026-10-25)
+
+KV storage and prefix reuse join `lattice-compute`, following the RoPE tables. The facade keeps its existing paths;
+the implementation and its unit tests move together. Recorded:
+
+1. **D8.1.** `kv_cache::{cross_turn, flat, paged, prefix}` move into `lattice-compute`. The crate gains normal
+   dependencies on `lattice-inference-core`, `half`, `indexmap` and `rustc-hash`. It therefore moves from publish tier 1
+   to tier 2, after `lattice-inference-core`, beside tokenizer, grammar, weights and the Metal runtime. The publish script
+   and its dependency-order test record that order.
+2. **D1.** The facade's four `kv_cache` modules become named re-exports, preserving their 20 public types and three
+   public functions, including the existing `kv_cache` root re-exports. Callers keep the same types at both paths.
+3. **D4.3.** One crate-private crossing needs a bridge:
+   `lattice_compute::__internal::paged_cache_try_floats_per_page`. It delegates to
+   `PagedKVCacheConfig::try_floats_per_page`, which stays crate-private in compute. The facade's existing
+   `batch::worker::PagedKVCacheConfigExt::try_floats_per_page_pub` calls the bridge. Widening the inherent method would
+   widen the re-exported type's facade API, so the checked geometry stays with its owner behind the hidden bridge;
+   the facade does not re-export the bridge. `try_kv_dim` has no cross-crate caller and stays crate-private.
+4. **D5.** Compute keeps an empty default feature set; these modules and dependencies are unconditional. The move
+   adds no caller feature or target gate.
+5. **D6.1.** The four test modules move with 20, 41, 30 and six test functions respectively, retaining all 97 names.
+   The flat-cache tests use a local first-index-wins `oracle_top1` instead of reaching upward into speculative
+   generation; the other three test files are unchanged. `facade_api_parity` adds
+   `prefix_cache_types_are_the_same_type_at_both_paths`, `prefix_cache_functions_are_the_same_items_at_both_paths`,
+   `flat_cache_types_are_the_same_type_at_both_paths` and `paged_cache_types_are_the_same_type_at_both_paths`.
+6. **D6.4.** The added dependencies and changed build inputs require measured A/B acceptance. This amendment records
+   the extraction and its validation obligations; it does not assert a measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
