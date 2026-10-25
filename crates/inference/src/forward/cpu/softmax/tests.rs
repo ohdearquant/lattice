@@ -353,3 +353,48 @@ mod avx2 {
         }
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+fn assert_special_rows(arm: &str, run: impl Fn(&mut [f32], usize, usize)) {
+    for &len in &ACCURACY_LENS {
+        for lane in [0, len / 2, len - 1] {
+            for value in [f32::NAN, f32::INFINITY] {
+                let mut row = vec![0.5f32; len];
+                row[lane] = value;
+                let (mut matrix, _) = single_row_matrix(&row);
+                run(&mut matrix, len, 1);
+                assert!(
+                    matrix[..len].iter().all(|&v| v == 0.0),
+                    "{arm}: len={len} lane={lane} value={value}"
+                );
+            }
+        }
+        let (mut masked, _) = single_row_matrix(&vec![f32::NEG_INFINITY; len]);
+        run(&mut masked, len, 1);
+        assert!(masked[..len].iter().all(|&v| v == 0.0), "{arm}: len={len}");
+        if len > 1 {
+            let mut row = vec![0.5f32; len];
+            row[0] = f32::NEG_INFINITY;
+            let (mut matrix, _) = single_row_matrix(&row);
+            run(&mut matrix, len, 1);
+            assert_eq!(matrix[0], 0.0, "{arm}: len={len}");
+            assert!(matrix[1..len].iter().all(|v| v.is_finite() && *v > 0.0));
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx2_fma_matches_f64_reference() {
+    let config = simd_config();
+    if !config.avx2_enabled || !config.fma_enabled {
+        return;
+    }
+    eprintln!("softmax avx2-fma: exercising SIMD body");
+    let run = |x: &mut [f32], seq_len, num_heads| {
+        // SAFETY: both AVX2 and FMA were detected above.
+        unsafe { softmax_attention_avx2_fma(x, seq_len, num_heads) };
+    };
+    assert_matches_f64_reference("avx2-fma", run);
+    assert_special_rows("avx2-fma", run);
+}

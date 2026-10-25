@@ -31,9 +31,13 @@ pub fn softmax_attention(x: &mut [f32], seq_len: usize, num_heads: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if config.avx2_enabled {
-            // SAFETY: The runtime feature check guarantees AVX2 support.
+            // SAFETY: AVX2 is checked above; the FMA arm has its own runtime check.
             unsafe {
-                softmax_attention_avx2(x, seq_len, num_heads);
+                if config.fma_enabled {
+                    softmax_attention_avx2_fma(x, seq_len, num_heads);
+                } else {
+                    softmax_attention_avx2(x, seq_len, num_heads);
+                }
                 return;
             }
         }
@@ -120,6 +124,49 @@ unsafe fn exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(0.5));
     let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.0));
     let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.0));
+
+    let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+        n_int,
+        _mm256_set1_epi32(127),
+    )));
+    _mm256_mul_ps(p, pow2n)
+}
+
+// Keep range selection identical to the AVX2-only arm; fuse reduction and Horner.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
+    const LN2_HI: f32 = 0.693_145_75_f32;
+    const LN2_LO: f32 = 1.428_606_8e-6_f32;
+
+    let x = _mm256_max_ps(
+        _mm256_min_ps(x, _mm256_set1_ps(88.0)),
+        _mm256_set1_ps(-87.33),
+    );
+
+    // Round x*log2(e) to the nearest integer with the 1.5 * 2^23 magic number.
+    let magic = _mm256_set1_ps(12_582_912.0);
+    let biased = _mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(LOG2E)), magic);
+    let n = _mm256_sub_ps(biased, magic);
+    let n_int = _mm256_cvtps_epi32(n);
+
+    let r = _mm256_fnmadd_ps(
+        n,
+        _mm256_set1_ps(LN2_LO),
+        _mm256_fnmadd_ps(n, _mm256_set1_ps(LN2_HI), x),
+    );
+
+    let p = _mm256_set1_ps(1.0 / 720.0);
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0 / 120.0));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0 / 24.0));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0 / 6.0));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0));
 
     let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
         n_int,
@@ -285,109 +332,118 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn softmax_attention_avx2(x: &mut [f32], seq_len: usize, num_heads: usize) {
-    use std::arch::x86_64::*;
+macro_rules! softmax_avx2_kernel {
+    ($name:ident, $features:literal, $exp:ident) => {
+        #[target_feature(enable = $features)]
+        unsafe fn $name(x: &mut [f32], seq_len: usize, num_heads: usize) {
+            use std::arch::x86_64::*;
 
-    for h in 0..num_heads {
-        for s in 0..seq_len {
-            let start = (h * seq_len + s) * seq_len;
-            let row = &mut x[start..start + seq_len];
-            let ptr = row.as_mut_ptr();
-            let n = row.len();
-            let chunks = n / 8;
+            for h in 0..num_heads {
+                for s in 0..seq_len {
+                    let start = (h * seq_len + s) * seq_len;
+                    let row = &mut x[start..start + seq_len];
+                    let ptr = row.as_mut_ptr();
+                    let n = row.len();
+                    let chunks = n / 8;
 
-            // --- Step 1: Find row max using SIMD, plus an explicit NaN scan ---
-            // `_mm256_max_ps` (MAXPS) drops a lone NaN operand like `f32::max`, so a
-            // NaN score would otherwise survive undetected as a single bad lane
-            // (ADR-080 C1 / #740) instead of failing the whole row closed.
-            // `_mm256_cmp_ps(v, v, _CMP_EQ_OQ)` is all-ones for every non-NaN lane
-            // (ordered-equal comparisons are false for NaN), so ANDing that mask
-            // across chunks gives an explicit any-NaN flag.
-            let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
-            let mut nan_free = _mm256_set1_ps(f32::from_bits(u32::MAX));
-            for c in 0..chunks {
-                // SAFETY: c * 8 + 7 < chunks * 8 <= n, within row bounds.
-                let v = _mm256_loadu_ps(ptr.add(c * 8) as *const f32);
-                vmax = _mm256_max_ps(vmax, v);
-                nan_free = _mm256_and_ps(nan_free, _mm256_cmp_ps(v, v, _CMP_EQ_OQ));
-            }
-            // Horizontal max reduction
-            let hi128 = _mm256_extractf128_ps(vmax, 1);
-            let lo128 = _mm256_castps256_ps128(vmax);
-            let max128 = _mm_max_ps(lo128, hi128);
-            let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
-            let max32 = _mm_max_ps(max64, _mm_movehdup_ps(max64));
-            let mut max_val = _mm_cvtss_f32(max32);
-            // Horizontal AND reduction of the NaN-free mask (as integers).
-            let nan_free_i = _mm256_castps_si256(nan_free);
-            let hi128_i = _mm256_extractf128_si256(nan_free_i, 1);
-            let lo128_i = _mm256_castsi256_si128(nan_free_i);
-            let and128 = _mm_and_si128(lo128_i, hi128_i);
-            let and64 = _mm_and_si128(and128, _mm_srli_si128(and128, 8));
-            let and32 = _mm_and_si128(and64, _mm_srli_si128(and64, 4));
-            let mut any_nan = (_mm_cvtsi128_si32(and32) as u32) != u32::MAX;
-            for i in (chunks * 8)..n {
-                let v = *ptr.add(i);
-                if v.is_nan() {
-                    any_nan = true;
-                } else {
-                    max_val = max_val.max(v);
-                }
-            }
+                    // --- Step 1: Find row max using SIMD, plus an explicit NaN scan ---
+                    // `_mm256_max_ps` (MAXPS) drops a lone NaN operand like `f32::max`, so a
+                    // NaN score would otherwise survive undetected as a single bad lane
+                    // (ADR-080 C1 / #740) instead of failing the whole row closed.
+                    // `_mm256_cmp_ps(v, v, _CMP_EQ_OQ)` is all-ones for every non-NaN lane
+                    // (ordered-equal comparisons are false for NaN), so ANDing that mask
+                    // across chunks gives an explicit any-NaN flag.
+                    let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
+                    let mut nan_free = _mm256_set1_ps(f32::from_bits(u32::MAX));
+                    for c in 0..chunks {
+                        // SAFETY: c * 8 + 7 < chunks * 8 <= n, within row bounds.
+                        let v = _mm256_loadu_ps(ptr.add(c * 8) as *const f32);
+                        vmax = _mm256_max_ps(vmax, v);
+                        nan_free = _mm256_and_ps(nan_free, _mm256_cmp_ps(v, v, _CMP_EQ_OQ));
+                    }
+                    // Horizontal max reduction
+                    let hi128 = _mm256_extractf128_ps(vmax, 1);
+                    let lo128 = _mm256_castps256_ps128(vmax);
+                    let max128 = _mm_max_ps(lo128, hi128);
+                    let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+                    let max32 = _mm_max_ps(max64, _mm_movehdup_ps(max64));
+                    let mut max_val = _mm_cvtss_f32(max32);
+                    // Horizontal AND reduction of the NaN-free mask (as integers).
+                    let nan_free_i = _mm256_castps_si256(nan_free);
+                    let hi128_i = _mm256_extractf128_si256(nan_free_i, 1);
+                    let lo128_i = _mm256_castsi256_si128(nan_free_i);
+                    let and128 = _mm_and_si128(lo128_i, hi128_i);
+                    let and64 = _mm_and_si128(and128, _mm_srli_si128(and128, 8));
+                    let and32 = _mm_and_si128(and64, _mm_srli_si128(and64, 4));
+                    let mut any_nan = (_mm_cvtsi128_si32(and32) as u32) != u32::MAX;
+                    for i in (chunks * 8)..n {
+                        let v = *ptr.add(i);
+                        if v.is_nan() {
+                            any_nan = true;
+                        } else {
+                            max_val = max_val.max(v);
+                        }
+                    }
 
-            // All-masked row (max stayed -inf), a `+inf` max, or any NaN score: zero
-            // it and skip, matching the scalar reference (ADR-080 C1 contract).
-            if any_nan || !max_val.is_finite() {
-                row.fill(0.0);
-                continue;
-            }
+                    // All-masked row (max stayed -inf), a `+inf` max, or any NaN score: zero
+                    // it and skip, matching the scalar reference (ADR-080 C1 contract).
+                    if any_nan || !max_val.is_finite() {
+                        row.fill(0.0);
+                        continue;
+                    }
 
-            // --- Step 2: Subtract max + exp + accumulate sum (all SIMD) ---
-            // A structurally-masked `-inf` lane must produce exact `0.0`, not the
-            // small nonzero value `exp_avx2`'s finite-floor clamp would
-            // otherwise produce (#740); blend that lane to exact zero via the
-            // NaN-free-style ordered-equal compare against `-inf`.
-            let vmax_val = _mm256_set1_ps(max_val);
-            let neg_inf = _mm256_set1_ps(f32::NEG_INFINITY);
-            let mut vsum = _mm256_setzero_ps();
-            for c in 0..chunks {
-                let off = c * 8;
-                let raw = _mm256_loadu_ps(ptr.add(off) as *const f32);
-                let is_masked = _mm256_cmp_ps(raw, neg_inf, _CMP_EQ_OQ);
-                let e_full = exp_avx2(_mm256_sub_ps(raw, vmax_val));
-                let e = _mm256_andnot_ps(is_masked, e_full);
-                _mm256_storeu_ps(ptr.add(off), e);
-                vsum = _mm256_add_ps(vsum, e);
-            }
-            let mut sum = hsum_m256(vsum);
-            for i in (chunks * 8)..n {
-                let raw = *ptr.add(i);
-                let e = if raw == f32::NEG_INFINITY {
-                    0.0
-                } else {
-                    (raw - max_val).exp()
-                };
-                *ptr.add(i) = e;
-                sum += e;
-            }
+                    // --- Step 2: Subtract max + exp + accumulate sum (all SIMD) ---
+                    // A structurally-masked `-inf` lane must produce exact `0.0`, not the
+                    // small nonzero value `exp_avx2`'s finite-floor clamp would
+                    // otherwise produce (#740); blend that lane to exact zero via the
+                    // NaN-free-style ordered-equal compare against `-inf`.
+                    let vmax_val = _mm256_set1_ps(max_val);
+                    let neg_inf = _mm256_set1_ps(f32::NEG_INFINITY);
+                    let mut vsum = _mm256_setzero_ps();
+                    for c in 0..chunks {
+                        let off = c * 8;
+                        let raw = _mm256_loadu_ps(ptr.add(off) as *const f32);
+                        let is_masked = _mm256_cmp_ps(raw, neg_inf, _CMP_EQ_OQ);
+                        let e_full = $exp(_mm256_sub_ps(raw, vmax_val));
+                        let e = _mm256_andnot_ps(is_masked, e_full);
+                        _mm256_storeu_ps(ptr.add(off), e);
+                        vsum = _mm256_add_ps(vsum, e);
+                    }
+                    let mut sum = hsum_m256(vsum);
+                    for i in (chunks * 8)..n {
+                        let raw = *ptr.add(i);
+                        let e = if raw == f32::NEG_INFINITY {
+                            0.0
+                        } else {
+                            (raw - max_val).exp()
+                        };
+                        *ptr.add(i) = e;
+                        sum += e;
+                    }
 
-            // --- Step 3: Divide by sum using SIMD ---
-            if sum.is_finite() && sum > 0.0 {
-                let inv_sum = 1.0 / sum;
-                let vinv = _mm256_set1_ps(inv_sum);
-                for c in 0..chunks {
-                    let off = c * 8;
-                    let v = _mm256_mul_ps(_mm256_loadu_ps(ptr.add(off) as *const f32), vinv);
-                    _mm256_storeu_ps(ptr.add(off), v);
-                }
-                for i in (chunks * 8)..n {
-                    *ptr.add(i) *= inv_sum;
+                    // --- Step 3: Divide by sum using SIMD ---
+                    if sum.is_finite() && sum > 0.0 {
+                        let inv_sum = 1.0 / sum;
+                        let vinv = _mm256_set1_ps(inv_sum);
+                        for c in 0..chunks {
+                            let off = c * 8;
+                            let v = _mm256_mul_ps(_mm256_loadu_ps(ptr.add(off) as *const f32), vinv);
+                            _mm256_storeu_ps(ptr.add(off), v);
+                        }
+                        for i in (chunks * 8)..n {
+                            *ptr.add(i) *= inv_sum;
+                        }
+                    }
                 }
             }
         }
-    }
+    };
 }
+
+#[cfg(target_arch = "x86_64")]
+softmax_avx2_kernel!(softmax_attention_avx2, "avx2", exp_avx2);
+#[cfg(target_arch = "x86_64")]
+softmax_avx2_kernel!(softmax_attention_avx2_fma, "avx2,fma", exp_avx2_fma);
 
 #[cfg(test)]
 mod tests;
