@@ -20,6 +20,8 @@ mod measurement_lock_construction;
 mod measurement_lock_generate;
 #[path = "support/measurement_lock_helpers.rs"]
 mod measurement_lock_helpers;
+#[path = "support/measurement_lock_packages.rs"]
+mod measurement_lock_packages;
 
 #[derive(Clone, Copy)]
 enum CallSelector {
@@ -42,33 +44,46 @@ const RAW_GPU_SELECTORS: &[CallSelector] = &[
     NEW_COMMAND_BUFFER_UNRETAINED,
 ];
 const SHARED_LOCK_CALL: &str = "lattice_inference::measurement::gpu_test_lock()";
-const RAW_HARNESS_ENTRYPOINTS: &[(&str, CallSelector)] = &[
+const RAW_HARNESS_ENTRYPOINTS: &[(&str, &str, CallSelector)] = &[
     (
+        ".",
         "benches/decode_attn_bench.rs",
         CallSelector::Path(&["bench_flash_decode"]),
     ),
     (
+        ".",
         "benches/topk_readback.rs",
         CallSelector::Path(&["bench_topk_parity"]),
     ),
-    ("examples/bench_concurrent.rs", CallSelector::Path(&["run"])),
-    ("examples/bench_dispatch.rs", DEVICE_SYSTEM_DEFAULT),
-    ("examples/bench_dispatch2.rs", DEVICE_SYSTEM_DEFAULT),
     (
+        ".",
+        "examples/bench_concurrent.rs",
+        CallSelector::Path(&["run"]),
+    ),
+    (".", "examples/bench_dispatch.rs", DEVICE_SYSTEM_DEFAULT),
+    (".", "examples/bench_dispatch2.rs", DEVICE_SYSTEM_DEFAULT),
+    (
+        ".",
         "examples/bench_gemm_shapes.rs",
         CallSelector::Path(&["run"]),
     ),
-    ("examples/bench_mps_gemm.rs", DEVICE_SYSTEM_DEFAULT),
-    ("examples/bench_simdgroup.rs", DEVICE_SYSTEM_DEFAULT),
-    ("examples/profile_metal_decode.rs", DEVICE_SYSTEM_DEFAULT),
-];
-const ADDITIONAL_GUARDED_ENTRYPOINTS: &[(&str, CallSelector)] = &[
-    ("tests/metal_runtime_buffers.rs", DEVICE_SYSTEM_DEFAULT),
+    (".", "examples/bench_mps_gemm.rs", DEVICE_SYSTEM_DEFAULT),
+    (".", "examples/bench_simdgroup.rs", DEVICE_SYSTEM_DEFAULT),
     (
+        ".",
+        "examples/profile_metal_decode.rs",
+        DEVICE_SYSTEM_DEFAULT,
+    ),
+];
+const ADDITIONAL_GUARDED_ENTRYPOINTS: &[(&str, &str, CallSelector)] = &[
+    (".", "tests/metal_runtime_buffers.rs", DEVICE_SYSTEM_DEFAULT),
+    (
+        ".",
         "examples/bench_embed_quality.rs",
         CallSelector::Path(&["run_bench"]),
     ),
     (
+        ".",
         "examples/bench_metal.rs",
         CallSelector::Path(&["MetalForwardPass", "new"]),
     ),
@@ -103,19 +118,19 @@ const STATE_WORK_SELECTORS: &[CallSelector] = &[
 /// `QwenModel` `encode*` family) or through a library helper reached across
 /// a module boundary, and are out of scope for this lexical, single-file
 /// call-site check (named as a residual gap, not silently swept in).
-const TARGETS_WITH_STATE_DRIVEN_WORK: &[&str] = &[
-    "examples/bench_gdn_decode.rs",
-    "examples/bench_gdn_prefill_ab.rs",
-    "examples/bench_gdn_state.rs",
-    "examples/bench_metal_forward_allocation.rs",
-    "examples/bench_pruning.rs",
-    "examples/bench_q4_prefill.rs",
-    "examples/bench_q8_prefill.rs",
-    "examples/bench_quality.rs",
-    "examples/decode_profile.rs",
-    "examples/profile_metal.rs",
-    "examples/rss_autorelease_probe.rs",
-    "src/bin/bench_logit_dump.rs",
+const TARGETS_WITH_STATE_DRIVEN_WORK: &[(&str, &str)] = &[
+    (".", "examples/bench_gdn_decode.rs"),
+    (".", "examples/bench_gdn_prefill_ab.rs"),
+    (".", "examples/bench_gdn_state.rs"),
+    (".", "examples/bench_metal_forward_allocation.rs"),
+    (".", "examples/bench_pruning.rs"),
+    (".", "examples/bench_q4_prefill.rs"),
+    (".", "examples/bench_q8_prefill.rs"),
+    (".", "examples/bench_quality.rs"),
+    (".", "examples/decode_profile.rs"),
+    (".", "examples/profile_metal.rs"),
+    (".", "examples/rss_autorelease_probe.rs"),
+    (".", "src/bin/bench_logit_dump.rs"),
 ];
 /// A same-file helper-mediated exception within `TARGETS_WITH_STATE_DRIVEN_WORK`,
 /// the `STATE_WORK_SELECTORS` analogue of `ADDITIONAL_GUARDED_ENTRYPOINTS`
@@ -131,34 +146,45 @@ const TARGETS_WITH_STATE_DRIVEN_WORK: &[&str] = &[
 /// own guard and keeps going through the ordinary path below; only the
 /// `run_one`-mediated call sites are rerouted to validate the entrypoint
 /// (`run_one(...)`) instead of the low-level method inside it.
-const STATE_WORK_HELPER_ENTRYPOINTS: &[(&str, CallSelector)] = &[(
+const STATE_WORK_HELPER_ENTRYPOINTS: &[(&str, &str, CallSelector)] = &[(
+    ".",
     "examples/bench_gdn_prefill_ab.rs",
     CallSelector::Path(&["run_one"]),
 )];
 
 struct GenerateWorkTarget {
+    package: &'static str,
     path: &'static str,
     owner: &'static str,
     receiver: &'static str,
     calls: usize,
 }
 
+impl GenerateWorkTarget {
+    fn key(&self) -> String {
+        package_path_key(self.package, self.path)
+    }
+}
+
 // Only these reviewed synchronous receivers are covered; other generate methods,
 // mixed CPU/Metal targets, and cross-module wrapper calls need separate contracts.
 const GENERATE_WORK_TARGETS: &[GenerateWorkTarget] = &[
     GenerateWorkTarget {
+        package: ".",
         path: "examples/bench_persistent_state.rs",
         owner: "run",
         receiver: "state",
         calls: 2,
     },
     GenerateWorkTarget {
+        package: ".",
         path: "src/bin/bench_decode_slopefit.rs",
         owner: "run",
         receiver: "metal",
         calls: 2,
     },
     GenerateWorkTarget {
+        package: ".",
         path: "src/bin/dump_quarot_q4_golden.rs",
         owner: "run",
         receiver: "metal",
@@ -173,10 +199,17 @@ struct BenchHarnessCall {
 }
 
 struct BenchHarness {
+    package: &'static str,
     path: &'static str,
     registered: &'static [&'static str],
     calls: &'static [BenchHarnessCall],
     constructions: &'static [(&'static str, CallSelector)],
+}
+
+impl BenchHarness {
+    fn key(&self) -> String {
+        package_path_key(self.package, self.path)
+    }
 }
 
 // These are finite, reviewed caller chains, not Rust name resolution. The
@@ -184,6 +217,7 @@ struct BenchHarness {
 // these names rather than silently losing the ownership proof.
 const BENCH_HARNESSES: &[BenchHarness] = &[
     BenchHarness {
+        package: ".",
         path: "benches/metal_decode_bench.rs",
         registered: &["bench_locked_metal_decode"],
         calls: &[
@@ -225,6 +259,7 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         ],
     },
     BenchHarness {
+        package: ".",
         path: "benches/cross_turn_prefix_cache_bench.rs",
         registered: &["bench_locked_cross_turn_prefix_cache"],
         calls: &[
@@ -245,6 +280,7 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         )],
     },
     BenchHarness {
+        package: ".",
         path: "benches/lm_head_bench.rs",
         registered: &["bench_locked_lm_head"],
         calls: &[
@@ -276,6 +312,7 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         ],
     },
     BenchHarness {
+        package: ".",
         path: "benches/mtp_decode.rs",
         registered: &["bench_locked_mtp_decode"],
         calls: &[
@@ -302,6 +339,7 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         ],
     },
     BenchHarness {
+        package: ".",
         path: "benches/decode_attn_bench.rs",
         registered: &["bench_locked_metal_decode"],
         calls: &[
@@ -319,6 +357,7 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         constructions: &[],
     },
     BenchHarness {
+        package: ".",
         path: "benches/topk_readback.rs",
         registered: &["bench_locked_topk_readback"],
         calls: &[
@@ -381,109 +420,154 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         constructions: &[],
     },
 ];
-const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
-    "benches/cross_turn_prefix_cache_bench.rs",
-    "benches/decode_attn_bench.rs",
-    "benches/lm_head_bench.rs",
-    "benches/metal_decode_bench.rs",
-    "benches/mtp_decode.rs",
-    "benches/topk_readback.rs",
-    "examples/bench_concurrent.rs",
-    "examples/bench_decode_streaming.rs",
-    "examples/bench_dispatch.rs",
-    "examples/bench_dispatch2.rs",
-    "examples/bench_embed_quality.rs",
-    "examples/bench_embedding.rs",
-    "examples/bench_gdn_decode.rs",
-    "examples/bench_gdn_prefill_ab.rs",
-    "examples/bench_gdn_state.rs",
-    "examples/bench_gemm_shapes.rs",
-    "examples/bench_gpu.rs",
-    "examples/bench_metal.rs",
-    "examples/bench_metal_forward_allocation.rs",
-    "examples/bench_mps_gemm.rs",
-    "examples/bench_persistent_state.rs",
-    "examples/bench_profile.rs",
-    "examples/bench_pruning.rs",
-    "examples/bench_q4_prefill.rs",
-    "examples/bench_q8_prefill.rs",
-    "examples/bench_quality.rs",
-    "examples/bench_serve_prepare.rs",
-    "examples/bench_simdgroup.rs",
-    "examples/bench_stability.rs",
-    "examples/bench_suite.rs",
-    "examples/decode_profile.rs",
-    "examples/dump_embeddinggemma2.rs",
-    "examples/dump_embeddinggemma2_vision.rs",
-    "examples/layer_sweep.rs",
-    "examples/profile_metal.rs",
-    "examples/profile_metal_decode.rs",
-    "examples/rss_autorelease_probe.rs",
-    "src/bin/backfill_qwen3.rs",
-    "src/bin/bench_decode_ab.rs",
-    "src/bin/bench_decode_slopefit.rs",
-    "src/bin/bench_gdn_prefill_ab.rs",
-    "src/bin/bench_logit_dump.rs",
-    "src/bin/bench_lora_mixture.rs",
-    "src/bin/bench_vision_prefill_ab.rs",
-    "src/bin/chat_metal.rs",
-    "src/bin/dump_quarot_q4_golden.rs",
-    "src/bin/eval_perplexity.rs",
-    "src/bin/gramperf_profile.rs",
-    "src/bin/lattice/main.rs",
-    "src/bin/ppl_metal.rs",
+const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
+    (".", "benches/cross_turn_prefix_cache_bench.rs"),
+    (".", "benches/decode_attn_bench.rs"),
+    (".", "benches/lm_head_bench.rs"),
+    (".", "benches/metal_decode_bench.rs"),
+    (".", "benches/mtp_decode.rs"),
+    (".", "benches/topk_readback.rs"),
+    (".", "examples/bench_concurrent.rs"),
+    (".", "examples/bench_decode_streaming.rs"),
+    (".", "examples/bench_dispatch.rs"),
+    (".", "examples/bench_dispatch2.rs"),
+    (".", "examples/bench_embed_quality.rs"),
+    (".", "examples/bench_embedding.rs"),
+    (".", "examples/bench_gdn_decode.rs"),
+    (".", "examples/bench_gdn_prefill_ab.rs"),
+    (".", "examples/bench_gdn_state.rs"),
+    (".", "examples/bench_gemm_shapes.rs"),
+    (".", "examples/bench_gpu.rs"),
+    (".", "examples/bench_metal.rs"),
+    (".", "examples/bench_metal_forward_allocation.rs"),
+    (".", "examples/bench_mps_gemm.rs"),
+    (".", "examples/bench_persistent_state.rs"),
+    (".", "examples/bench_profile.rs"),
+    (".", "examples/bench_pruning.rs"),
+    (".", "examples/bench_q4_prefill.rs"),
+    (".", "examples/bench_q8_prefill.rs"),
+    (".", "examples/bench_quality.rs"),
+    (".", "examples/bench_serve_prepare.rs"),
+    (".", "examples/bench_simdgroup.rs"),
+    (".", "examples/bench_stability.rs"),
+    (".", "examples/bench_suite.rs"),
+    (".", "examples/decode_profile.rs"),
+    (".", "examples/dump_embeddinggemma2.rs"),
+    (".", "examples/dump_embeddinggemma2_vision.rs"),
+    (".", "examples/layer_sweep.rs"),
+    (".", "examples/profile_metal.rs"),
+    (".", "examples/profile_metal_decode.rs"),
+    (".", "examples/rss_autorelease_probe.rs"),
+    (".", "src/bin/backfill_qwen3.rs"),
+    (".", "src/bin/bench_decode_ab.rs"),
+    (".", "src/bin/bench_decode_slopefit.rs"),
+    (".", "src/bin/bench_gdn_prefill_ab.rs"),
+    (".", "src/bin/bench_logit_dump.rs"),
+    (".", "src/bin/bench_lora_mixture.rs"),
+    (".", "src/bin/bench_vision_prefill_ab.rs"),
+    (".", "src/bin/chat_metal.rs"),
+    (".", "src/bin/dump_quarot_q4_golden.rs"),
+    (".", "src/bin/eval_perplexity.rs"),
+    (".", "src/bin/gramperf_profile.rs"),
+    (".", "src/bin/lattice/main.rs"),
+    (".", "src/bin/ppl_metal.rs"),
 ];
-const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
-    "benches/attention_dispatch_bench.rs",
-    "benches/attn_opt_bench.rs",
-    "benches/backward_stage0.rs",
-    "benches/differential_attention_bench.rs",
-    "benches/e2e_bench.rs",
-    "benches/elementwise_bench.rs",
-    "benches/elementwise_cpu_bench.rs",
-    "benches/f16_convert_bench.rs",
-    "benches/gated_attention_bench.rs",
-    "benches/grammar_mask_bench.rs",
-    "benches/inference_bench.rs",
-    "benches/inference_perf.rs",
-    "benches/kv_cache_f16_bench.rs",
-    "benches/kv_cache_layout_bench.rs",
-    "benches/metrics_bench.rs",
-    "benches/native_sparse_attention_bench.rs",
-    "benches/pruning_bench.rs",
-    "benches/quarot_hadamard_bench.rs",
-    "benches/tokenizer_bench.rs",
-    "examples/bench_gdn.rs",
-    "examples/bench_serve_http.rs",
-    "examples/diff_attn_layer23.rs",
-    "examples/diff_gdn_layer.rs",
-    "examples/ernie45_trace_dump.rs",
-    "examples/load_cross_encoder.rs",
-    "src/bin/bench_gemma4_driver_pair.rs",
-    "src/bin/gramtime_profile.rs",
-    "src/bin/lattice_serve/main.rs",
-    "src/bin/moe_admission_sim.rs",
-    "src/bin/quantize_q4.rs",
-    "src/bin/quantize_quarot.rs",
-    "src/bin/qwen35_debug.rs",
-    "src/bin/qwen35_generate.rs",
+const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
+    (".", "benches/attention_dispatch_bench.rs"),
+    (".", "benches/attn_opt_bench.rs"),
+    (".", "benches/backward_stage0.rs"),
+    (".", "benches/differential_attention_bench.rs"),
+    (".", "benches/e2e_bench.rs"),
+    (".", "benches/elementwise_bench.rs"),
+    (".", "benches/elementwise_cpu_bench.rs"),
+    (".", "benches/f16_convert_bench.rs"),
+    (".", "benches/gated_attention_bench.rs"),
+    (".", "benches/grammar_mask_bench.rs"),
+    (".", "benches/inference_bench.rs"),
+    (".", "benches/inference_perf.rs"),
+    (".", "benches/kv_cache_f16_bench.rs"),
+    (".", "benches/kv_cache_layout_bench.rs"),
+    (".", "benches/metrics_bench.rs"),
+    (".", "benches/native_sparse_attention_bench.rs"),
+    (".", "benches/pruning_bench.rs"),
+    (".", "benches/quarot_hadamard_bench.rs"),
+    (".", "benches/tokenizer_bench.rs"),
+    (".", "examples/bench_gdn.rs"),
+    (".", "examples/bench_serve_http.rs"),
+    (".", "examples/diff_attn_layer23.rs"),
+    (".", "examples/diff_gdn_layer.rs"),
+    (".", "examples/ernie45_trace_dump.rs"),
+    (".", "examples/load_cross_encoder.rs"),
+    (".", "src/bin/bench_gemma4_driver_pair.rs"),
+    (".", "src/bin/gramtime_profile.rs"),
+    (".", "src/bin/lattice_serve/main.rs"),
+    (".", "src/bin/moe_admission_sim.rs"),
+    (".", "src/bin/quantize_q4.rs"),
+    (".", "src/bin/quantize_quarot.rs"),
+    (".", "src/bin/qwen35_debug.rs"),
+    (".", "src/bin/qwen35_generate.rs"),
 ];
-const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
-    "src/forward/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
-    "src/forward/metal_qwen35/inner/tests.rs::test_gemv_decode_numerical",
-    "src/forward/metal_qwen35/inner/tests/decode_attention.rs::test_gpu_argmax_parity_k1",
-    "src/forward/metal_qwen35/inner/tests/gdn_chunked_scan.rs::decode_attention_reference_fails_closed_on_nan_q",
-    "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
-    "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries",
-    "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_differential_fails_closed_on_nan_scale",
-    "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
-    "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::lora_gemv_kernel_matches_cpu_reference",
-    "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::load_adapter_and_dispatch_lora_if_active",
-    "src/forward/metal_qwen35/inner/tests/lora.rs::lora_rows_dispatch_matches_cpu_reference_across_rows_ranks_and_strides",
-    "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference",
-    "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
-    "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::gemv_q4_decode_honours_negative_scales",
-    "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::lm_head_block_topk_q4_honours_negative_scales",
+const IN_CRATE_COMMAND_BUFFER_TESTS: &[(&str, &str)] = &[
+    (
+        ".",
+        "src/forward/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests.rs::test_gemv_decode_numerical",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/decode_attention.rs::test_gpu_argmax_parity_k1",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/gdn_chunked_scan.rs::decode_attention_reference_fails_closed_on_nan_q",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_differential_fails_closed_on_nan_scale",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::lora_gemv_kernel_matches_cpu_reference",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::load_adapter_and_dispatch_lora_if_active",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/lora.rs::lora_rows_dispatch_matches_cpu_reference_across_rows_ranks_and_strides",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::gemv_q4_decode_honours_negative_scales",
+    ),
+    (
+        ".",
+        "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::lm_head_block_topk_q4_honours_negative_scales",
+    ),
 ];
 const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
     CallSelector::Path(&["MetalEmbeddingGemma2State", "new"]),
@@ -506,6 +590,7 @@ const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
 /// site's current position no longer matches it, the site has moved and is
 /// worth a human look, even though its stable key still matches.
 struct ConstructionExemption {
+    package: &'static str,
     site: &'static str,
     recorded_position: &'static str,
     reason: &'static str,
@@ -513,61 +598,73 @@ struct ConstructionExemption {
 
 const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     ConstructionExemption {
+        package: ".",
         site: "example:bench_concurrent:examples/bench_concurrent.rs=>examples/bench_concurrent.rs::run::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "examples/bench_concurrent.rs:444:27",
         reason: "run state1 construction is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "example:bench_concurrent:examples/bench_concurrent.rs=>examples/bench_concurrent.rs::run::MetalQwen35State::from_q4_dir()#2",
         recorded_position: "examples/bench_concurrent.rs:474:27",
         reason: "run state2 construction is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "example:bench_embed_quality:examples/bench_embed_quality.rs=>examples/bench_embed_quality.rs::run_bench::QwenModel::from_directory()#1",
         recorded_position: "examples/bench_embed_quality.rs:136:52",
         reason: "run_bench QwenModel::from_directory is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::new()#1",
         recorded_position: "examples/bench_serve_prepare.rs:688:47",
         reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
     },
     ConstructionExemption {
+        package: ".",
         site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "examples/bench_serve_prepare.rs:698:47",
         reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
     },
     ConstructionExemption {
+        package: ".",
         site: "bin:backfill_qwen3:src/bin/backfill_qwen3.rs=>src/bin/backfill_qwen3.rs::main::QwenModel::from_directory()#1",
         recorded_position: "src/bin/backfill_qwen3.rs:37:28",
         reason: "one-time DB embedding migration over an unbounded row count belongs to a long-running batch process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/bin/chat_metal.rs:474:39",
         reason: "run Q4 initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::new()#1",
         recorded_position: "src/bin/chat_metal.rs:499:39",
         reason: "run safetensors initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/chat.rs::MetalChatBackend::load::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/bin/lattice/chat.rs:53:81",
         reason: "MetalChatBackend::load belongs to an interactive or one-shot product process outside the measurement-harness contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "bin:lattice:src/bin/lattice/main.rs=>src/serving_provider/providers/qwen/lattice_worker.rs::open::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/serving_provider/providers/qwen/lattice_worker.rs:64:47",
         reason: "the Qwen lattice worker initializes a long-running server worker outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/serving_provider/providers/qwen/worker.rs:116:43",
         reason: "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::new()#1",
         recorded_position: "src/serving_provider/providers/qwen/worker.rs:135:43",
         reason: "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
@@ -1034,8 +1131,29 @@ fn classify_test_attributes(attributes: &[Attribute]) -> TestRegistration {
 }
 
 struct ParsedModuleSource {
+    package: String,
     relative: String,
     parsed: StructuredSource,
+}
+
+impl ParsedModuleSource {
+    fn key(&self) -> String {
+        package_path_key(&self.package, &self.relative)
+    }
+}
+
+fn parsed_package_module_closure(
+    package: &ScannedPackage,
+    root: &Path,
+    test_cfg: bool,
+) -> Result<Vec<ParsedModuleSource>, String> {
+    let mut sources = parsed_module_closure(&package.manifest_dir, root, test_cfg)
+        .map_err(|reason| format!("package {}: {reason}", package.identity))?;
+    for source in &mut sources {
+        source.package = package.identity.clone();
+        source.parsed.context = source.key();
+    }
+    Ok(sources)
 }
 
 fn parsed_module_closure(
@@ -1057,7 +1175,11 @@ fn parsed_module_closure(
                 .into_owned();
             let parsed =
                 StructuredSource::parse_module_source(manifest_dir, &module, &source, test_cfg)?;
-            Ok(ParsedModuleSource { relative, parsed })
+            Ok(ParsedModuleSource {
+                package: ".".into(),
+                relative,
+                parsed,
+            })
         })
         .collect()
 }
@@ -2669,7 +2791,10 @@ fn validate_bench_harness_sources(
     sources: &[ParsedModuleSource],
     contract: &BenchHarness,
 ) -> Result<(), String> {
-    if sources.len() != 1 || sources[0].relative != contract.path {
+    if sources.len() != 1
+        || sources[0].package != contract.package
+        || sources[0].relative != contract.path
+    {
         return Err(
             "reviewed state harness module closure changed; classify its new source paths".into(),
         );
@@ -2690,47 +2815,50 @@ fn validate_bench_harness_inventory(
 
 #[test]
 fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packages = scanned_packages();
     let mut discovered = BTreeSet::new();
     let mut violations = Vec::new();
-    for root in cargo_target_roots(manifest_dir, &["lib", "test"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        for source in parsed_module_closure(manifest_dir, &root, true)
+    for package in &packages {
+        for root in package
+            .target_roots(&["lib", "test"])
             .unwrap_or_else(|reason| panic!("{reason}"))
         {
-            let relative = source.relative;
-            let parsed = source.parsed;
-            let functions = parsed
-                .test_functions()
-                .unwrap_or_else(|reason| panic!("{reason}"));
-            for selector in COMMAND_BUFFER_SELECTORS {
-                parsed
-                    .reject_selector_in_macros(*selector)
+            for source in parsed_package_module_closure(package, &root, true)
+                .unwrap_or_else(|reason| panic!("{reason}"))
+            {
+                let relative = source.key();
+                let parsed = source.parsed;
+                let functions = parsed
+                    .test_functions()
                     .unwrap_or_else(|reason| panic!("{reason}"));
-            }
-            for function in functions {
-                let mut command_buffers = Vec::new();
                 for selector in COMMAND_BUFFER_SELECTORS {
-                    command_buffers.extend(
-                        parsed
-                            .call_sites(function.body.clone(), *selector, true)
-                            .unwrap_or_else(|reason| panic!("{reason}")),
-                    );
+                    parsed
+                        .reject_selector_in_macros(*selector)
+                        .unwrap_or_else(|reason| panic!("{reason}"));
                 }
-                if command_buffers.is_empty() {
-                    continue;
-                }
-                let site = format!("{relative}::{}", function.name);
-                discovered.insert(site.clone());
-                if let Err(reason) = parsed.validate_work_sites(
-                    &command_buffers,
-                    LOCAL_LOCK_SELECTOR,
-                    GuardRequirement::Function {
-                        closing_brace: function.body.end,
-                    },
-                ) {
-                    violations.push(format!("{site}: {reason}"));
+                for function in functions {
+                    let mut command_buffers = Vec::new();
+                    for selector in COMMAND_BUFFER_SELECTORS {
+                        command_buffers.extend(
+                            parsed
+                                .call_sites(function.body.clone(), *selector, true)
+                                .unwrap_or_else(|reason| panic!("{reason}")),
+                        );
+                    }
+                    if command_buffers.is_empty() {
+                        continue;
+                    }
+                    let site = format!("{relative}::{}", function.name);
+                    discovered.insert(site.clone());
+                    if let Err(reason) = parsed.validate_work_sites(
+                        &command_buffers,
+                        LOCAL_LOCK_SELECTOR,
+                        GuardRequirement::Function {
+                            closing_brace: function.body.end,
+                        },
+                    ) {
+                        violations.push(format!("{site}: {reason}"));
+                    }
                 }
             }
         }
@@ -2738,7 +2866,7 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
 
     let reviewed = IN_CRATE_COMMAND_BUFFER_TESTS
         .iter()
-        .map(|site| (*site).to_string())
+        .map(|(package, site)| package_path_key(package, site))
         .collect::<BTreeSet<_>>();
     assert_eq!(
         discovered, reviewed,
@@ -2753,28 +2881,31 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
 
 #[test]
 fn rust_targets_have_one_gpu_lock_definition_and_path() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packages = scanned_packages();
     let definition = ["fn gpu", "_test_lock"].concat();
     let lock_path = ["/tmp/lion-metal", "-gpu-test.lock"].concat();
     let mut definitions = BTreeSet::new();
     let mut paths = BTreeSet::new();
 
-    for path in rust_sources_under(manifest_dir) {
-        let source = std::fs::read_to_string(&path).expect("read Rust source");
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        if source.contains(&definition) {
-            definitions.insert(relative.clone());
-        }
-        if source.contains(&lock_path) {
-            paths.insert(relative);
+    for package in &packages {
+        for path in rust_sources_under(&package.manifest_dir) {
+            let relative = package.key(
+                &package
+                    .relative(&path)
+                    .unwrap_or_else(|reason| panic!("{reason}")),
+            );
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|reason| panic!("{relative}: {reason}"));
+            if source.contains(&definition) {
+                definitions.insert(relative.clone());
+            }
+            if source.contains(&lock_path) {
+                paths.insert(relative);
+            }
         }
     }
 
-    let only_shared_module = BTreeSet::from(["src/measurement.rs".to_string()]);
+    let only_shared_module = BTreeSet::from([package_path_key(".", "src/measurement.rs")]);
     assert_eq!(
         definitions, only_shared_module,
         "GPU lock behavior must have exactly one Rust definition"
@@ -2787,29 +2918,34 @@ fn rust_targets_have_one_gpu_lock_definition_and_path() {
 
 #[test]
 fn prior_lock_owners_and_existing_bench_use_the_shared_module() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packages = scanned_packages();
     let callers = [
         (
+            ".",
             "src/forward/metal.rs",
             "use crate::measurement::gpu_test_lock;",
         ),
         (
+            ".",
             "src/forward/metal_qwen35/inner/tests.rs",
             "use crate::measurement::gpu_test_lock;",
         ),
         (
+            ".",
             "tests/vision_s3b_vit_metal_gate_test.rs",
             "use lattice_inference::measurement::gpu_test_lock;",
         ),
-        ("src/bin/bench_gdn_prefill_ab.rs", SHARED_LOCK_CALL),
+        (".", "src/bin/bench_gdn_prefill_ab.rs", SHARED_LOCK_CALL),
     ];
 
-    for (relative, shared_reference) in callers {
-        let source =
-            std::fs::read_to_string(manifest_dir.join(relative)).expect("read migrated caller");
+    for (owner, relative, shared_reference) in callers {
+        let package = measurement_lock_helpers::require_package(&packages, owner);
+        let key = package.key(relative);
+        let source = std::fs::read_to_string(package.manifest_dir.join(relative))
+            .unwrap_or_else(|reason| panic!("{key}: {reason}"));
         assert!(
             source.contains(shared_reference),
-            "{relative} no longer references the one shared GPU lock"
+            "{key} no longer references the one shared GPU lock"
         );
     }
 }
