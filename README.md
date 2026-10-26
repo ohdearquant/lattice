@@ -718,8 +718,9 @@ dependents:
 2. `tokenizer`, `grammar`, `weights`, `metal-runtime`, and `model-io`.
 3. `arch`.
 4. `quant` and `compute`.
-5. `inference`.
-6. `embed`, `tune` and `serve`.
+5. The model-family crates under [`crates/models/`](crates/models).
+6. `inference`.
+7. `embed`, `tune` and `serve`.
 
 The script waits 30 seconds between tiers for registry indexing. Its dry-run
 mode checks package sizes for the workspace crates, then runs
