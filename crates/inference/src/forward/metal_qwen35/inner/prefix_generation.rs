@@ -292,7 +292,9 @@ impl MetalQwen35State {
             PrefixReuseMode::ExactAppend | PrefixReuseMode::ReplayFromCheckpoint { .. } => {
                 self.restore_cross_turn_prefix(slot_id, &plan)?
             }
-            PrefixReuseMode::FullRefill => {
+            // FullRefill, and any mode this build does not know (the enum is
+            // non-exhaustive in lattice-compute), resets and prefills.
+            _ => {
                 self.reset_state();
                 None
             }

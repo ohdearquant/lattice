@@ -1,0 +1,26 @@
+[package]
+name = "lattice-compute"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-side compute for Lattice inference: rotary position embedding tables and KV caches"
+keywords = ["inference", "rope", "transformer", "llm", "cpu"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+
+[dependencies]
+half.workspace = true
+lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+indexmap.workspace = true
+rustc-hash.workspace = true
+
+[lints]
+workspace = true

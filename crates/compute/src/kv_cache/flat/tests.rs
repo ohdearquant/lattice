@@ -667,6 +667,7 @@ fn rand_f32(state: &mut u32, lo: f32, hi: f32) -> f32 {
 /// output: [num_heads * head_dim]
 ///
 /// Groups = num_heads / num_kv_heads; each KV head is shared across `groups` Q heads.
+#[allow(clippy::too_many_arguments)]
 fn sdpa_decode(
     output: &mut [f32],
     q: &[f32],
@@ -724,17 +725,20 @@ fn sdpa_decode(
     }
 }
 
-/// Top-1 token choice for the f16-vs-f32 KV-cache logits oracle below.
+/// Top-1 reference mirroring `lattice_inference::speculative::argmax`.
 ///
-/// Delegates to the shared first-wins `crate::speculative::argmax` so
-/// the oracle's tie-break matches the engine's documented greedy
-/// contract (lowest index wins on an exact tie — see
-/// `forward::metal_qwen35`, `sampling`, and `torch.argmax`, all
-/// first-wins per #280). `Iterator::max_by` resolves ties to the *last*
-/// index instead, which let the oracle silently score a different top-1
-/// token than production would pick on an exact tie (#861).
+/// The two bodies must change together. Keeping this reference local avoids a
+/// cache-test dependency on generation. Strict `>` preserves first-index ties.
 fn oracle_top1(logits: &[f32]) -> usize {
-    crate::speculative::argmax(logits)
+    let mut best_idx = 0;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    best_idx
 }
 
 /// The mandatory tensor oracle: compare f32-KV reference vs f16-KV-via-FlatKVCache.

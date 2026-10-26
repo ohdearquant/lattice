@@ -295,6 +295,61 @@ With the configurations below the facade (Amendments 5 and 6), the QuaRot conver
 4. **D6.1.** The moved unit tests keep their names under the new crate's paths. `facade_api_parity` adds same-item
    checks for every moved public type, function and constant, and for the root re-exports.
 
+## Amendment 8 (2026-10-25)
+
+The host-side computation of the decoder forward pass gets its own crate, `lattice-compute`, so that the CPU kernels,
+attention, pooling, KV caches and sampling can leave the facade without each one becoming a crate of its own. It is
+filled by small moves, each its own change, and the first move is the rotary position embedding tables. Recorded:
+
+1. **D9.** Step 3 widens from "the shared Metal runtime and per-model definitions" to the shared compute, host and
+   Metal, and per-model definitions. Host compute is shared by every model's forward pass in the same way the Metal
+   runtime is. The ADR-102 condition on step 3 concerns the Metal files and does not apply to host modules that are
+   already under the 3000-line cap; `rope.rs` is 86 lines. Step 4 (serving and the binaries, lattice#2227) is not
+   blocked by this widening: the first move lands after it.
+2. **D8.1.** The crate is `lattice-compute`. Its first content, `rope`, has no dependencies, internal or external, so the
+   crate is a leaf and publishes in the first tier beside `lattice-fann`, `lattice-transport` and
+   `lattice-inference-core`. `lattice-inference` gains it as a normal dependency. Later moves that add dependencies
+   re-derive its tier in their own change. The name was checked free on crates.io in the same pass as a control read of
+   a crate known to exist; D8.3's re-check before the first upload still applies.
+3. **D1.** The facade keeps `lattice_inference::rope::RopeTable`, as a named re-export of `lattice_compute::rope::RopeTable`.
+4. **D4.** No crate-private item crosses the boundary. `rope.rs` imports nothing from the rest of `lattice-inference`,
+   and every item it defines was already public.
+5. **D6.1.** `rope/tests.rs` moves unchanged with its five tests, which keep their names under the new crate's path.
+   `facade_api_parity` adds a check that the facade's `RopeTable` and the extracted one are the same type.
+6. **D6.4.** The RoPE tables are timed by `inference_perf`'s decode RoPE group under `bench-internals`, and the change
+   adds a crate and a dependency, so it carries a measured A/B and does not claim the structural waiver.
+7. **Later moves.** Each later move into lattice-compute is its own PR with its own measured A/B, or a structural
+   waiver that names why no default bench target reaches it, and records its D4 and D6 listings in its own amendment. The
+   alternative of a separate crate for host primitives is reconsidered when a consumer needs only those primitives and
+   the measured cost of the rest of the crate's dependencies is significant to it.
+
+## Amendment 9 (2026-10-25)
+
+KV storage and prefix reuse join `lattice-compute`, following the RoPE tables. The facade keeps its existing paths;
+the implementation and its unit tests move together. Recorded:
+
+1. **D8.1.** `kv_cache::{cross_turn, flat, paged, prefix}` move into `lattice-compute`. The crate gains normal
+   dependencies on `lattice-inference-core`, `half`, `indexmap` and `rustc-hash`. It therefore moves from publish tier 1
+   to tier 2, after `lattice-inference-core`, beside tokenizer, grammar, weights and the Metal runtime. The publish script
+   and its dependency-order test record that order.
+2. **D1.** The facade's four `kv_cache` modules become named re-exports, preserving their 20 public types and three
+   public functions, including the existing `kv_cache` root re-exports. Callers keep the same types at both paths.
+3. **D4.3.** One crate-private crossing needs a bridge:
+   `lattice_compute::__internal::paged_cache_try_floats_per_page`. It delegates to
+   `PagedKVCacheConfig::try_floats_per_page`, which stays crate-private in compute. The facade's existing
+   `batch::worker::PagedKVCacheConfigExt::try_floats_per_page_pub` calls the bridge. Widening the inherent method would
+   widen the re-exported type's facade API, so the checked geometry stays with its owner behind the hidden bridge;
+   the facade does not re-export the bridge. `try_kv_dim` has no cross-crate caller and stays crate-private.
+4. **D5.** Compute keeps an empty default feature set; these modules and dependencies are unconditional. The move
+   adds no caller feature or target gate.
+5. **D6.1.** The four test modules move with 20, 41, 30 and six test functions respectively, retaining all 97 names.
+   The flat-cache tests use a local first-index-wins `oracle_top1` instead of reaching upward into speculative
+   generation; the other three test files are unchanged. `facade_api_parity` adds
+   `prefix_cache_types_are_the_same_type_at_both_paths`, `prefix_cache_functions_are_the_same_items_at_both_paths`,
+   `flat_cache_types_are_the_same_type_at_both_paths` and `paged_cache_types_are_the_same_type_at_both_paths`.
+6. **D6.4.** The added dependencies and changed build inputs require measured A/B acceptance. This amendment records
+   the extraction and its validation obligations; it does not assert a measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

@@ -226,6 +226,7 @@ fn only_the_mmap_trust_boundary_names_a_construction_api() {
         "lattice-weights",
         "lattice-quant",
         "lattice-model-config",
+        "lattice-compute",
     ] {
         assert!(
             scanned.iter().any(|name| name == required),

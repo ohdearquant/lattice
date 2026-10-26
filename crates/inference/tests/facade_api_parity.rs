@@ -1407,3 +1407,135 @@ mod model_config_parity {
         );
     }
 }
+
+mod compute_parity {
+    use lattice_compute as extracted;
+    use lattice_inference::rope as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    fn half_dim_of(table: &extracted::rope::RopeTable) -> usize {
+        table.half_dim()
+    }
+
+    #[test]
+    fn rope_table_is_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<facade::RopeTable>,
+            PhantomData::<extracted::rope::RopeTable>,
+        );
+        let table = facade::RopeTable::new(8, 4, 10_000.0);
+        assert_eq!(half_dim_of(&table), 4);
+    }
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn prefix_cache_types_are_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::AdapterId>,
+            PhantomData::<extracted::kv_cache::prefix::AdapterId>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PrefixKey>,
+            PhantomData::<extracted::kv_cache::prefix::PrefixKey>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::SharedPageRef>,
+            PhantomData::<extracted::kv_cache::prefix::SharedPageRef>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PrefixPageCacheConfig>,
+            PhantomData::<extracted::kv_cache::prefix::PrefixPageCacheConfig>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PrefixEntry>,
+            PhantomData::<extracted::kv_cache::prefix::PrefixEntry>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PrefixPageCache>,
+            PhantomData::<extracted::kv_cache::prefix::PrefixPageCache>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::CrossTurnSlotId>,
+            PhantomData::<extracted::kv_cache::cross_turn::CrossTurnSlotId>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::CrossTurnPrefixMetadata>,
+            PhantomData::<extracted::kv_cache::cross_turn::CrossTurnPrefixMetadata>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::KvPrefixHandle>,
+            PhantomData::<extracted::kv_cache::cross_turn::KvPrefixHandle>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::CrossTurnPrefixEntry>,
+            PhantomData::<extracted::kv_cache::cross_turn::CrossTurnPrefixEntry>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PrefixReuseMode>,
+            PhantomData::<extracted::kv_cache::cross_turn::PrefixReuseMode>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PrefixRestorePlan>,
+            PhantomData::<extracted::kv_cache::cross_turn::PrefixRestorePlan>,
+        );
+    }
+
+    #[test]
+    fn prefix_cache_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            lattice_inference::kv_cache::longest_common_token_prefix,
+            extracted::kv_cache::cross_turn::longest_common_token_prefix,
+        );
+        same_function(
+            lattice_inference::kv_cache::plan_prefix_reuse,
+            extracted::kv_cache::cross_turn::plan_prefix_reuse,
+        );
+        same_function(
+            lattice_inference::kv_cache::checkpoint_survives_save,
+            extracted::kv_cache::cross_turn::checkpoint_survives_save,
+        );
+    }
+
+    #[test]
+    fn flat_cache_types_are_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::FlatKVCache>,
+            PhantomData::<extracted::kv_cache::flat::FlatKVCache>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::FlatKVCacheConfig>,
+            PhantomData::<extracted::kv_cache::flat::FlatKVCacheConfig>,
+        );
+    }
+
+    #[test]
+    fn paged_cache_types_are_the_same_type_at_both_paths() {
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::CacheType>,
+            PhantomData::<extracted::kv_cache::paged::CacheType>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::EvictionPolicy>,
+            PhantomData::<extracted::kv_cache::paged::EvictionPolicy>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PagePool>,
+            PhantomData::<extracted::kv_cache::paged::PagePool>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PageTable>,
+            PhantomData::<extracted::kv_cache::paged::PageTable>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PagedKVCache>,
+            PhantomData::<extracted::kv_cache::paged::PagedKVCache>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::kv_cache::PagedKVCacheConfig>,
+            PhantomData::<extracted::kv_cache::paged::PagedKVCacheConfig>,
+        );
+    }
+}
