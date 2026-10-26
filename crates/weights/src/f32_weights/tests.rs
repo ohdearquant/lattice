@@ -2179,3 +2179,302 @@ fn load_sharded_rejects_hostile_index_with_traversal_entry() {
         "load_sharded must reject a `../` traversal entry in the index manifest"
     );
 }
+
+fn neutral_read_source(tensors: &[(&str, &[usize], &[f32])]) -> SafetensorsFile {
+    let mut header = serde_json::Map::new();
+    header.insert(
+        "__metadata__".to_string(),
+        serde_json::json!({"purpose": "neutral view fixture"}),
+    );
+    let mut payload = Vec::new();
+    for &(name, shape, values) in tensors {
+        let start = payload.len();
+        for value in values {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        header.insert(
+            name.to_string(),
+            serde_json::json!({
+                "dtype": "F32", "shape": shape,
+                "data_offsets": [start, payload.len()],
+            }),
+        );
+    }
+    let mut header = serde_json::to_vec(&header).unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&payload);
+    SafetensorsFile::from_bytes(bytes).unwrap()
+}
+
+fn assert_neutral_shape_error(
+    error: InferenceError,
+    tensor_name: &str,
+    expected_shape: &[usize],
+    actual_shape: &[usize],
+) {
+    let InferenceError::ShapeMismatch {
+        name,
+        expected,
+        actual,
+    } = error
+    else {
+        panic!("expected ShapeMismatch, got {error:?}");
+    };
+    assert_eq!(name.as_str(), tensor_name);
+    assert_eq!(expected.as_slice(), expected_shape);
+    assert_eq!(actual.as_slice(), actual_shape);
+}
+
+fn assert_neutral_missing_error(error: InferenceError, tensor_name: &str) {
+    let InferenceError::MissingTensor(name) = error else {
+        panic!("expected MissingTensor, got {error:?}");
+    };
+    assert_eq!(name.as_str(), tensor_name);
+}
+
+#[test]
+fn tensor_names_iter_lends_the_complete_tensor_name_set() {
+    let source = neutral_read_source(&[
+        ("z.scale", &[1], &[1.0]),
+        ("a.matrix", &[1, 2], &[2.0, 3.0]),
+        ("middle.value", &[1], &[4.0]),
+    ]);
+    let names: Vec<&str> = source.tensor_names_iter().collect();
+    assert_eq!(names.len(), 3);
+    let actual: std::collections::BTreeSet<_> = names.iter().copied().collect();
+    assert_eq!(
+        actual,
+        std::collections::BTreeSet::from(["z.scale", "a.matrix", "middle.value"])
+    );
+    assert_eq!(
+        names,
+        source
+            .tensors
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    for name in names {
+        let (stored, _) = source.tensors.get_key_value(name).unwrap();
+        assert_eq!(name.as_ptr(), stored.as_ptr());
+    }
+}
+
+#[test]
+fn tensor_names_iter_is_empty_for_a_metadata_only_file() {
+    let source = neutral_read_source(&[]);
+    assert_eq!(source.tensor_names_iter().next(), None);
+}
+
+#[test]
+fn view_1d_borrows_f32_data_and_preserves_length() {
+    let source = neutral_read_source(&[("scale", &[3], &[1.25, -2.5, 3.75])]);
+    let (original, _) = source.get_f32_tensor("scale").unwrap();
+    let view = source.view_1d("scale", 3).unwrap();
+    assert_eq!(view.data, &[1.25, -2.5, 3.75]);
+    assert_eq!(view.len, 3);
+    assert_eq!(view.data.as_ptr(), original.as_ptr());
+}
+
+#[test]
+fn view_2d_borrows_non_square_f32_data_and_preserves_dimensions() {
+    let source = neutral_read_source(&[("matrix", &[2, 3], &[2.0, -4.0, 8.0, 16.0, -32.0, 64.0])]);
+    let (original, _) = source.get_f32_tensor("matrix").unwrap();
+    let view = source.view_2d("matrix", 2, 3).unwrap();
+    assert_eq!(view.data, &[2.0, -4.0, 8.0, 16.0, -32.0, 64.0]);
+    assert_eq!((view.rows, view.cols), (2, 3));
+    assert_eq!(view.data.as_ptr(), original.as_ptr());
+}
+
+#[test]
+fn view_methods_refuse_wrong_ranks_and_each_wrong_dimension() {
+    let source = neutral_read_source(&[
+        ("vector", &[3], &[1.0, 2.0, 3.0]),
+        ("matrix", &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        ("scalar", &[], &[9.0]),
+    ]);
+    assert_neutral_shape_error(
+        source.view_1d("vector", 2).unwrap_err(),
+        "vector",
+        &[2],
+        &[3],
+    );
+    assert_neutral_shape_error(
+        source.view_1d("matrix", 6).unwrap_err(),
+        "matrix",
+        &[6],
+        &[2, 3],
+    );
+    assert_neutral_shape_error(
+        source.view_1d("scalar", 1).unwrap_err(),
+        "scalar",
+        &[1],
+        &[],
+    );
+    assert_neutral_shape_error(
+        source.view_2d("vector", 1, 3).unwrap_err(),
+        "vector",
+        &[1, 3],
+        &[3],
+    );
+    for (rows, cols) in [(3, 2), (4, 3), (2, 4)] {
+        assert_neutral_shape_error(
+            source.view_2d("matrix", rows, cols).unwrap_err(),
+            "matrix",
+            &[rows, cols],
+            &[2, 3],
+        );
+    }
+    assert_neutral_shape_error(
+        source.view_2d("scalar", 1, 1).unwrap_err(),
+        "scalar",
+        &[1, 1],
+        &[],
+    );
+}
+
+#[test]
+fn view_methods_preserve_missing_tensor_errors_including_zero_requests() {
+    let source = neutral_read_source(&[("present", &[1], &[1.0])]);
+    for len in [0, 3] {
+        assert_neutral_missing_error(
+            source.view_1d("missing.vector", len).unwrap_err(),
+            "missing.vector",
+        );
+    }
+    for (rows, cols) in [(0, 0), (2, 3)] {
+        assert_neutral_missing_error(
+            source.view_2d("missing.matrix", rows, cols).unwrap_err(),
+            "missing.matrix",
+        );
+    }
+}
+
+#[test]
+fn view_methods_propagate_dtype_errors_before_shape_checks() {
+    let path = temp_path("lattice_view_dtype_order");
+    write_raw_tensor(&path, "counts", "I64", &[2], &8i64.to_le_bytes().repeat(2));
+    let source = SafetensorsFile::open(&path).unwrap();
+    let original = source.get_f32_tensor("counts").unwrap_err();
+    assert!(matches!(&original, InferenceError::InvalidSafetensors(_)));
+    let original_message = original.to_string();
+    for error in [
+        source.view_1d("counts", 3).unwrap_err(),
+        source.view_2d("counts", 1, 2).unwrap_err(),
+    ] {
+        assert!(matches!(&error, InferenceError::InvalidSafetensors(_)));
+        assert_eq!(error.to_string(), original_message);
+    }
+}
+
+#[test]
+fn view_methods_preserve_zero_dimension_views_and_exact_shapes() {
+    let source = neutral_read_source(&[("empty", &[0], &[])]);
+    for view in [
+        source.view_1d("empty", 0).unwrap(),
+        source.tensor1d("empty", 0).unwrap(),
+    ] {
+        assert!(view.data.is_empty());
+        assert_eq!(view.len, 0);
+    }
+    assert_neutral_shape_error(source.view_1d("empty", 1).unwrap_err(), "empty", &[1], &[0]);
+    for (rows, cols) in [(0, 3), (4, 0)] {
+        let source = neutral_read_source(&[("empty", &[rows, cols], &[])]);
+        for view in [
+            source.view_2d("empty", rows, cols).unwrap(),
+            source.tensor2d("empty", rows, cols).unwrap(),
+        ] {
+            assert!(view.data.is_empty());
+            assert_eq!((view.rows, view.cols), (rows, cols));
+        }
+    }
+    let source = neutral_read_source(&[("empty", &[0, 3], &[])]);
+    assert_neutral_shape_error(
+        source.view_2d("empty", 0, 4).unwrap_err(),
+        "empty",
+        &[0, 4],
+        &[0, 3],
+    );
+}
+
+#[test]
+fn private_rank_helpers_preserve_literal_values_and_errors() {
+    let source = neutral_read_source(&[
+        ("vector", &[3], &[1.0, 2.0, 3.0]),
+        ("matrix", &[2, 3], &[4.0, 5.0, 6.0, 7.0, 8.0, 9.0]),
+    ]);
+    for view in [
+        source.tensor1d("vector", 3).unwrap(),
+        source.view_1d("vector", 3).unwrap(),
+    ] {
+        assert_eq!(view.data, &[1.0, 2.0, 3.0]);
+        assert_eq!(view.len, 3);
+    }
+    for view in [
+        source.tensor2d("matrix", 2, 3).unwrap(),
+        source.view_2d("matrix", 2, 3).unwrap(),
+    ] {
+        assert_eq!(view.data, &[4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        assert_eq!((view.rows, view.cols), (2, 3));
+    }
+    assert_neutral_shape_error(
+        source.tensor1d("vector", 4).unwrap_err(),
+        "vector",
+        &[4],
+        &[3],
+    );
+    assert_neutral_shape_error(
+        source.tensor2d("matrix", 3, 2).unwrap_err(),
+        "matrix",
+        &[3, 2],
+        &[2, 3],
+    );
+    assert_neutral_missing_error(source.tensor1d("absent", 3).unwrap_err(), "absent");
+    assert_neutral_missing_error(source.tensor2d("absent", 2, 3).unwrap_err(), "absent");
+    let optional_vector = source.tensor1d_optional("absent", 3).unwrap();
+    assert!(optional_vector.data.is_empty());
+    assert_eq!(optional_vector.len, 0);
+    let optional_matrix = source.tensor2d_optional("absent", 2, 3).unwrap();
+    assert!(optional_matrix.data.is_empty());
+    assert_eq!((optional_matrix.rows, optional_matrix.cols), (0, 0));
+}
+
+#[test]
+fn neutral_view_methods_resolve_through_lower_root_and_module_paths() {
+    let source: crate::SafetensorsFile = neutral_read_source(&[
+        ("vector", &[2], &[1.0, 2.0]),
+        ("matrix", &[2, 3], &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+    ]);
+    let root_vector: crate::Tensor1D<'_> =
+        crate::SafetensorsFile::view_1d(&source, "vector", 2).unwrap();
+    let module_vector: crate::f32_weights::Tensor1D<'_> =
+        crate::f32_weights::SafetensorsFile::view_1d(&source, "vector", 2).unwrap();
+    for view in [root_vector, module_vector] {
+        assert_eq!(view.data, &[1.0, 2.0]);
+        assert_eq!(view.len, 2);
+    }
+    let root_matrix: crate::Tensor2D<'_> =
+        crate::SafetensorsFile::view_2d(&source, "matrix", 2, 3).unwrap();
+    let module_matrix: crate::f32_weights::Tensor2D<'_> =
+        crate::f32_weights::SafetensorsFile::view_2d(&source, "matrix", 2, 3).unwrap();
+    for view in [root_matrix, module_matrix] {
+        assert_eq!(view.data, &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!((view.rows, view.cols), (2, 3));
+    }
+    let expected = std::collections::BTreeSet::from(["vector", "matrix"]);
+    assert_eq!(
+        crate::SafetensorsFile::tensor_names_iter(&source)
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
+    assert_eq!(
+        crate::f32_weights::SafetensorsFile::tensor_names_iter(&source)
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
+}
