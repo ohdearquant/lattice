@@ -21,6 +21,7 @@
 
 pub mod attention;
 pub mod forward;
+pub mod gemma_ops;
 pub mod gemma_rope;
 pub mod kv_cache;
 pub mod lora_hook;

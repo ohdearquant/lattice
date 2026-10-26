@@ -98,70 +98,8 @@ use merger::{MlpMerger, MlpMergerWeights};
 use preprocess::PreprocessConfig;
 use vit::{ViT, VisionWeights};
 
-/// Errors produced by the vision encoder pipeline.
-///
-/// Marked `#[non_exhaustive]` so that distinguishing a new failure mode is a
-/// minor change rather than a major one. Adding `DimensionsExceeded` was a
-/// breaking change only because this enum was exhaustive; that cost is paid
-/// once here.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum VisionError {
-    /// Raw image bytes could not be decoded (unsupported format, corrupt data).
-    ImageDecode(String),
-    /// A weight or activation tensor had unexpected dimensions.
-    ShapeMismatch {
-        expected: usize,
-        actual: usize,
-        context: String,
-    },
-    /// A configuration value is invalid (zero dimension, indivisible sizes, etc.).
-    InvalidConfig(String),
-    /// The decoded image's declared pixel dimensions, pre-merge patch grid,
-    /// or resulting preprocessed buffer exceed a serving-side budget --
-    /// distinct from [`Self::ImageDecode`] (the image itself is well-formed,
-    /// just larger than this server will process) and from
-    /// [`Self::InvalidConfig`] (a checkpoint/config problem, not a
-    /// per-request one). Callers map this to a client-safe, retriable
-    /// rejection rather than the generic image-decode error.
-    DimensionsExceeded(String),
-    /// I/O error during weight loading.
-    Io(std::io::Error),
-}
-
-impl std::fmt::Display for VisionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ImageDecode(msg) => write!(f, "Vision image decode error: {msg}"),
-            Self::ShapeMismatch {
-                expected,
-                actual,
-                context,
-            } => write!(
-                f,
-                "Vision shape mismatch ({context}): expected {expected}, got {actual}"
-            ),
-            Self::InvalidConfig(msg) => write!(f, "Vision invalid config: {msg}"),
-            Self::DimensionsExceeded(msg) => write!(f, "Vision dimensions exceeded: {msg}"),
-            Self::Io(e) => write!(f, "Vision I/O error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for VisionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for VisionError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
+#[doc(inline)]
+pub use lattice_model_io::image::VisionError;
 
 // ---------------------------------------------------------------------------
 // VisionOutput

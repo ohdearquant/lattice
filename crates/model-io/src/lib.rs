@@ -13,6 +13,8 @@ use lattice_inference_core::InferenceError;
 
 /// Model-file ensure/download flow, canonical model names and checksum verification.
 pub mod download;
+/// Bounded image decoding and shared vision errors.
+pub mod image;
 
 /// Checkpoint-directory resolver for checkpoint-gated tests in the model crates.
 /// Not part of the supported API.

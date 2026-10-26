@@ -3,7 +3,9 @@ use super::*;
 #[cfg(not(feature = "image"))]
 #[test]
 fn image_decoders_require_image_feature() {
+    #[cfg(feature = "embeddinggemma2")]
     use crate::error::InferenceError;
+    #[cfg(feature = "embeddinggemma2")]
     use crate::model::embeddinggemma2_image::EmbeddingGemma2Rgb8Image;
     use crate::vision::preprocess::{PreprocessConfig, preprocess};
 
@@ -19,6 +21,7 @@ fn image_decoders_require_image_feature() {
     for error in errors {
         assert!(matches!(error, VisionError::ImageDecode(message) if message == expected));
     }
+    #[cfg(feature = "embeddinggemma2")]
     assert!(matches!(
         EmbeddingGemma2Rgb8Image::from_encoded(bytes),
         Err(InferenceError::InvalidInput(message))

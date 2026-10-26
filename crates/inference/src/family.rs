@@ -3,8 +3,8 @@
 //!
 //! **Unstable**: [`QWEN35`](crate::family::QWEN35) offers a Qwen3.5 decoder on the CPU through
 //! [`Qwen35CpuDecoder`](crate::family::Qwen35CpuDecoder); [`BERT`](crate::family::BERT) and
-//! [`EMBEDDING_GEMMA2`](crate::family::EMBEDDING_GEMMA2) offer the CPU encoders of
-//! [`crate::encoder`]. [`registry`](crate::family::registry) builds a table of all three. The
+//! `EMBEDDING_GEMMA2` (when `embeddinggemma2` is enabled) offer the CPU encoders of
+//! [`crate::encoder`]. [`registry`](crate::family::registry) builds their available descriptors. The
 //! Qwen3 embedding model has no descriptor yet: its loader chooses the Metal backend itself, so a
 //! [`LoadRequest`](crate::family::LoadRequest) cannot fix its backend.
 
@@ -16,11 +16,10 @@ pub use lattice_arch::family::{
 
 use crate::decoder::DecoderSession;
 use crate::decoder::qwen_cpu::QwenCpuSession;
-use crate::encoder::{BertEncoder, EmbeddingGemma2Encoder, Encoder};
+use crate::encoder::{BertEncoder, Encoder};
 use crate::error::InferenceError;
 use crate::generation::GenerateConfig;
 use crate::model::BertModel;
-use crate::model::embeddinggemma2::EmbeddingGemma2Model;
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{
     check_context_budget, check_prompt_ids_in_vocab, check_prompt_not_empty,
@@ -218,14 +217,6 @@ fn load_bert(request: &LoadRequest) -> Result<Arc<dyn Encoder>, InferenceError> 
     Ok(Arc::new(BertEncoder::new(Arc::new(model))?))
 }
 
-fn load_embeddinggemma2(request: &LoadRequest) -> Result<Arc<dyn Encoder>, InferenceError> {
-    let model = EmbeddingGemma2Model::from_model_dir(request.model_dir())?;
-    Ok(Arc::new(EmbeddingGemma2Encoder::new(
-        Arc::new(model),
-        None,
-    )?))
-}
-
 /// Qwen3.5 text generation on the CPU: `model_type` `qwen3_5`, `qwen3_5_moe` or `qwen3_5_text`.
 pub static QWEN35: FamilyDescriptor = FamilyDescriptor::decoder(
     "qwen35",
@@ -236,19 +227,23 @@ pub static QWEN35: FamilyDescriptor = FamilyDescriptor::decoder(
 /// BERT-family text embeddings on the CPU: `model_type` `bert`.
 pub static BERT: FamilyDescriptor = FamilyDescriptor::encoder("bert", &["bert"], load_bert);
 
-/// EmbeddingGemma 2 text embeddings on the CPU at the native width. Resolved by family name: it
-/// claims no `model_type`.
-pub static EMBEDDING_GEMMA2: FamilyDescriptor =
-    FamilyDescriptor::encoder("embeddinggemma2", &[], load_embeddinggemma2);
+#[cfg(feature = "embeddinggemma2")]
+#[doc(inline)]
+pub use lattice_model_embeddinggemma2::family::EMBEDDING_GEMMA2;
 
-/// A registry of [`QWEN35`], [`BERT`] and [`EMBEDDING_GEMMA2`].
+/// A registry of [`QWEN35`], [`BERT`] and the enabled embedding families.
 ///
 /// # Errors
 ///
-/// None in practice: the three descriptors share no name and no claim. The `Result` is
+/// None in practice: the available descriptors share no name and no claim. The `Result` is
 /// [`Registry::new`]'s.
 pub fn registry() -> Result<Registry, RegistryError> {
-    Registry::new(&[&QWEN35, &BERT, &EMBEDDING_GEMMA2])
+    Registry::new(&[
+        &QWEN35,
+        &BERT,
+        #[cfg(feature = "embeddinggemma2")]
+        &EMBEDDING_GEMMA2,
+    ])
 }
 
 #[cfg(test)]

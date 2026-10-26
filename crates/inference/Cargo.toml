@@ -45,7 +45,8 @@ bins = [
 ]
 
 [features]
-default = ["std", "download", "image"]
+default = ["std", "download", "image", "embeddinggemma2"]
+embeddinggemma2 = ["dep:lattice-model-embeddinggemma2"]
 # Unsupported, version-coupled interface for `lattice-serve` (ADR-103
 # Amendment 4): the hidden `serving_support` module and the router items it
 # needs. Off by default; `lattice-serve` depends on this crate with an exact
@@ -53,12 +54,12 @@ default = ["std", "download", "image"]
 serving-support = []
 std = []
 # Encoded PNG/JPEG input; raw image tensors remain available without decoding.
-image = ["dep:image"]
+image = ["dep:image", "lattice-model-io/image", "lattice-model-embeddinggemma2?/image"]
 f16 = ["lattice-weights/f16"]
 # lattice-fann supplies the shared LoRA descriptor/blend-validation module
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
 # be present whenever this feature is — not just under `mixture`.
-metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu", "lattice-model-embeddinggemma2?/metal-gpu"]
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 bench-internals = ["lattice-compute/bench-internals", "lattice-grammar/bench-internals"]
 # Stock `gemm` for multi-row `matmul_bt` on Linux x86_64 (ADR-099 F1, step 1). Off by default.
@@ -104,14 +105,14 @@ thiserror.workspace = true
 tracing = { workspace = true, features = ["default"] }
 sha2.workspace = true
 rusqlite = { workspace = true, optional = true }
-metal = { version = "0.33", optional = true }
-objc = { version = "0.2", optional = true }
+metal = { workspace = true, optional = true }
+objc = { workspace = true, optional = true }
 wgpu = { version = "24", optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
-image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+image = { workspace = true, optional = true }
 lattice-compute = { version = "0.15.0", path = "../compute" }
 lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
 lattice-grammar = { version = "0.15.0", path = "../grammar" }
@@ -119,6 +120,7 @@ lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 lattice-metal-runtime = { version = "0.15.0", path = "../metal-runtime", optional = true }
 lattice-arch = { version = "0.15.0", path = "../arch" }
 lattice-model-io = { version = "0.15.0", path = "../model-io", default-features = false }
+lattice-model-embeddinggemma2 = { workspace = true, optional = true }
 lattice-quant = { version = "0.15.0", path = "../quant" }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
@@ -292,7 +294,7 @@ required-features = ["f16", "metal-gpu"]
 
 [[example]]
 name = "bench_gemm_shapes"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "embeddinggemma2"]
 
 [[example]]
 name = "decode_profile"
@@ -428,3 +430,11 @@ required-features = ["metal-gpu", "f16"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "dump_embeddinggemma2"
+required-features = ["embeddinggemma2"]
+
+[[example]]
+name = "dump_embeddinggemma2_vision"
+required-features = ["embeddinggemma2"]

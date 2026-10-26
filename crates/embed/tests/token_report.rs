@@ -17,7 +17,7 @@
 #![cfg(feature = "native")]
 
 use lattice_embed::{EmbeddingModel, EmbeddingRole, EmbeddingService, NativeEmbeddingService};
-use lattice_inference::model::embeddinggemma2::EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS;
+use lattice_model_embeddinggemma2::model::EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS;
 use lattice_tokenizer::{GemmaBpeTokenizer, Tokenizer, load_tokenizer};
 use std::path::PathBuf;
 

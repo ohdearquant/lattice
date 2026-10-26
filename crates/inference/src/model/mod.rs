@@ -3,11 +3,12 @@ pub mod bert;
 pub mod bitnet_config;
 pub(crate) use lattice_weights::bounded_config as config_file;
 pub mod cross_encoder;
+#[cfg(feature = "embeddinggemma2")]
 pub mod embeddinggemma2;
 pub mod embeddinggemma2_config;
 /// RGB image input and internal patch preparation for EmbeddingGemma 2.
+#[cfg(feature = "embeddinggemma2")]
 pub mod embeddinggemma2_image;
-pub(crate) mod embeddinggemma2_vision;
 pub mod ernie45;
 pub mod gemma4_cache;
 pub mod gemma4_config;
@@ -24,6 +25,7 @@ pub mod qwen35_config;
 // Re-export everything from bert (was top-level `model` module)
 pub use self::bert::*;
 pub use self::cross_encoder::CrossEncoderModel;
+#[cfg(feature = "embeddinggemma2")]
 pub use self::embeddinggemma2::EmbeddingGemma2Model;
 // Re-export key types from other model modules
 pub use self::gemma4_model::Gemma4Model;
