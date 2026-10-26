@@ -46,9 +46,9 @@ use memmap2::Mmap;
 use serde_json::Value;
 
 use crate::error::InferenceError;
-use crate::quarot::plan::{OnlineRotationSpec, OnlineTransformSite};
-use lattice_arch::qwen35_config::Qwen35Config;
-use lattice_arch::qwen35_tensors::qwen_layer_tensor_prefix;
+use crate::quarot::plan::{
+    OnlineRotationSpec, OnlineTransformSite, RotationTarget, qwen35_rotation_dimensions,
+};
 use lattice_weights::ingress::DecodedTensorValidator;
 use lattice_weights::safetensors_layout::{
     safetensors_dtype_name, safetensors_layout_entry, validate_safetensors_layout,
@@ -359,7 +359,7 @@ impl Backing {
 /// `crate::quarot::convert::QuantizeIndex` carries an optional
 /// `online: Option<OnlineArtifactDescriptor>` field, and
 /// `read_quarot_seed_from_index` validates it (via
-/// [`OnlineArtifactDescriptor::validate`]) whenever it is present. A
+/// [`OnlineArtifactDescriptor::validate_target`]) whenever it is present. A
 /// *structurally valid* `V1Online` descriptor is rejected there too (not
 /// merely validated-then-discarded), because no forward path executes R3/R4
 /// online rotations at runtime yet — see that function's doc comment for the
@@ -372,7 +372,7 @@ impl Backing {
 /// online rotation touches to explicitly declare asymmetric mode.
 ///
 /// **Hard rule (design doc §E.1(a)):** a `V0Residual` artifact must never be
-/// interpreted as online-capable. [`OnlineArtifactDescriptor::validate`]
+/// interpreted as online-capable. [`OnlineArtifactDescriptor::validate_target`]
 /// enforces this by refusing a `V0Residual` descriptor that carries any
 /// [`OnlineRotationSpec`] — that combination cannot occur from a real v0
 /// artifact and is evidence of a corrupted or hand-edited index.
@@ -391,7 +391,7 @@ pub enum ArtifactVersion {
 /// `convert.rs` owns the wire-format struct (`QuantizeIndex`) while
 /// validation semantics live here; `QuantizeIndex`
 /// embeds this type directly (`online: Option<OnlineArtifactDescriptor>`)
-/// and `read_quarot_seed_from_index` calls [`Self::validate`] on it when
+/// and `read_quarot_seed_from_index` calls [`Self::validate_target`] on it when
 /// present — this is no longer schema-only, it is consulted at load time
 /// (and a valid `V1Online` descriptor causes the load to be rejected
 /// outright, since no forward path executes its recipe yet).
@@ -400,7 +400,7 @@ pub struct OnlineArtifactDescriptor {
     pub version: ArtifactVersion,
     /// v1 contract: at most one spec per online transform site (per
     /// [`super::plan::RotationId::online_transform_site`]) — a second spec
-    /// targeting the same site is rejected by [`Self::validate`] rather
+    /// targeting the same site is rejected by [`Self::validate_target`] rather
     /// than left for a future runtime to disambiguate.
     pub online_rotations: Vec<OnlineRotationSpec>,
     /// Names of every Q4 tensor that is affected by an online rotation
@@ -413,7 +413,7 @@ pub struct OnlineArtifactDescriptor {
 impl OnlineArtifactDescriptor {
     /// Upper bound on each caller-supplied vector (`online_rotations` and
     /// `asymmetric_tensor_names`). A descriptor is publicly deserializable, so
-    /// [`Self::validate`] caps both vectors before any per-entry work: a real
+    /// [`Self::validate_target`] caps both vectors before any per-entry work: a real
     /// recipe declares a handful of rotations and at most a few tensors per
     /// layer, so this ceiling sits far above any legitimate artifact while
     /// keeping validation cost strictly bounded regardless of input.
@@ -421,8 +421,8 @@ impl OnlineArtifactDescriptor {
 
     /// Derive the exact set of per-layer tensor names this descriptor's
     /// online rotations counter-rotate, from the recipe (`online_rotations`)
-    /// and `cfg` alone. This is the SINGLE internal representation of "what
-    /// this artifact affects" — [`Self::validate`] requires
+    /// and `target` alone. This is the SINGLE internal representation of "what
+    /// this artifact affects" — [`Self::validate_target`] requires
     /// `asymmetric_tensor_names` to equal this set exactly. This collapses
     /// the prior three-representation contract — recipe-derived suffixes,
     /// declared `asymmetric_tensor_names`, and a caller-supplied affected
@@ -434,7 +434,7 @@ impl OnlineArtifactDescriptor {
     /// which spec/layer a missing or unexpected name belongs to.
     fn derive_expected_tensor_names(
         &self,
-        cfg: &Qwen35Config,
+        target: &RotationTarget,
     ) -> Vec<(super::plan::RotationId, usize, String)> {
         let mut expected = Vec::new();
         for spec in &self.online_rotations {
@@ -444,13 +444,13 @@ impl OnlineArtifactDescriptor {
             let suffix = site.weight_tensor_suffix();
             let layers: Vec<usize> = match &spec.layer_scope {
                 Some(layers) => layers.clone(),
-                None => (0..cfg.num_hidden_layers).collect(),
+                None => (0..target.num_hidden_layers()).collect(),
             };
             for idx in layers {
                 expected.push((
                     spec.id,
                     idx,
-                    format!("{}.{suffix}", qwen_layer_tensor_prefix(idx)),
+                    format!("{}.{suffix}", target.layer_tensor_prefix(idx)),
                 ));
             }
         }
@@ -461,7 +461,7 @@ impl OnlineArtifactDescriptor {
     /// exactly match this descriptor's derived affected-tensor set (see
     /// [`Self::derive_expected_tensor_names`]). Narrow entry point for a
     /// future converter that wants to verify what it actually transformed
-    /// against the recipe — the core [`Self::validate`] path does not take
+    /// against the recipe — the core [`Self::validate_target`] path does not take
     /// this input and does not call this method.
     ///
     /// `pub(crate)`, not `pub`: no caller (in-crate or cross-crate) exists
@@ -472,10 +472,10 @@ impl OnlineArtifactDescriptor {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn verify_affected(
         &self,
-        cfg: &Qwen35Config,
+        target: &RotationTarget,
         transformed_tensor_names: &[&str],
     ) -> Result<(), InferenceError> {
-        let expected = self.derive_expected_tensor_names(cfg);
+        let expected = self.derive_expected_tensor_names(target);
         for (id, idx, name) in &expected {
             if !transformed_tensor_names.contains(&name.as_str()) {
                 return Err(InferenceError::Inference(format!(
@@ -500,7 +500,7 @@ impl OnlineArtifactDescriptor {
 
     /// Validate internal consistency, including that `asymmetric_tensor_names`
     /// equals exactly the tensor set this descriptor's online rotations
-    /// derive from `spec` + `cfg` (see `Self::derive_expected_tensor_names`).
+    /// derive from `spec` + `target` (see `Self::derive_expected_tensor_names`).
     ///
     /// Refuses (does not warn-and-continue) on:
     /// - `V0Residual` carrying any online rotation metadata — a v0 artifact
@@ -510,20 +510,20 @@ impl OnlineArtifactDescriptor {
     ///   with no R3/R4 recipe is a contradiction, not a valid degenerate
     ///   case (use `V0Residual` for that).
     /// - `V1Online` with any rotation spec that fails its own internal
-    ///   invariants (see [`OnlineRotationSpec::validate`]) — e.g. wrong
+    ///   invariants (see [`OnlineRotationSpec::validate_target`]) — e.g. wrong
     ///   `side`, non-power-of-two `block_size`, or a `layer_scope` that
     ///   contradicts its `RotationId`'s contract. Every `OnlineRotationSpec`
     ///   field is publicly constructible, so a directly-built malformed spec
     ///   (bypassing the `r3_full_attention`/`r4_dense_mlp` constructors)
     ///   must be caught here rather than passing descriptor validation
-    ///   silently. `cfg` is threaded
-    ///   through to each spec as `Some(cfg)` so the config-aware
+    ///   silently. `target` is threaded
+    ///   through to each spec as `Some(target)` so the target-aware
     ///   divisibility/full-attention checks always run for `V1Online` (see
-    ///   below: `cfg` is mandatory at the descriptor level for that
-    ///   variant). Passing `cfg: None` to *this* method is valid only for
+    ///   below: `target` is mandatory at the descriptor level for that
+    ///   variant). Passing `target: None` to *this* method is valid only for
     ///   an empty `V0Residual` descriptor: `V1Online` unconditionally
-    ///   rejects `cfg: None` below, and `V0Residual` never carries a spec to
-    ///   thread `cfg` into in the first place.
+    ///   rejects `target: None` below, and `V0Residual` never carries a spec to
+    ///   thread `target` into in the first place.
     /// - `V1Online` with more than one spec in `online_rotations` targeting
     ///   the same [`OnlineTransformSite`] (e.g. two `AttentionOutputR3`
     ///   entries with different seeds) — the v1 recipe format allows at
@@ -536,7 +536,7 @@ impl OnlineArtifactDescriptor {
     ///   tensor, so an empty declaration list cannot be satisfied.
     /// - `V1Online` with any `asymmetric_tensor_names` entry that is not in
     ///   the exact set `Self::derive_expected_tensor_names` derives from
-    ///   this descriptor's `online_rotations` + `cfg` — an unrelated or
+    ///   this descriptor's `online_rotations` + `target` — an unrelated or
     ///   out-of-scope declaration (e.g. `"unrelated"`, or a real tensor name
     ///   from a layer outside the recipe's scope) must not satisfy the
     ///   fail-closed requirement just by resembling a real tensor.
@@ -550,26 +550,39 @@ impl OnlineArtifactDescriptor {
     ///   representation of the affected-tensor contract (it collapses the
     ///   prior recipe-suffix / declaration / caller-supplied-slice triple
     ///   representation down to this one) and must equal
-    ///   `Self::derive_expected_tensor_names(cfg)` exactly — no missing
+    ///   `Self::derive_expected_tensor_names(target)` exactly — no missing
     ///   entries, no extras. A future converter that wants to
     ///   cross-check what it actually transformed against this contract
     ///   should use `Self::verify_affected`, which `validate` itself does
     ///   not call.
-    /// - `V1Online` called with `cfg: None`: a `None`-scoped (R4)
+    /// - `V1Online` called with `target: None`: a `None`-scoped (R4)
     ///   rotation's full layer set is
     ///   unknowable without a config, so a config-free call previously
     ///   *skipped* per-layer completeness checking for R4 instead of
     ///   refusing — letting a caller silently select weaker semantics by
-    ///   omitting `cfg`. `cfg` is now mandatory for `V1Online`; this method
+    ///   omitting `target`. `target` is now mandatory for `V1Online`; this method
     ///   refuses immediately rather than downgrading to a partial check.
     ///   `V0Residual` never claims per-layer completeness, so it stays
-    ///   `cfg`-free.
+    ///   `target`-free.
     /// - `V0Residual` with any nonempty `asymmetric_tensor_names`: the V0
     ///   contract is symmetric-only Q4
     ///   with no R3/R4 metadata, so a V0 descriptor carrying asymmetric
     ///   declarations is evidence of a corrupted or hand-edited index, same
     ///   as a V0 descriptor carrying online rotations.
-    pub fn validate(&self, cfg: Option<&Qwen35Config>) -> Result<(), InferenceError> {
+    pub fn validate_target(&self, target: Option<&RotationTarget>) -> Result<(), InferenceError> {
+        self.validate_with_layout(
+            target,
+            |spec, target| spec.validate_target(Some(target)),
+            |target| self.derive_expected_tensor_names(target),
+        )
+    }
+
+    fn validate_with_layout<T>(
+        &self,
+        target: Option<&T>,
+        validate_spec: impl Fn(&OnlineRotationSpec, &T) -> Result<(), InferenceError>,
+        expected_tensor_names: impl FnOnce(&T) -> Vec<(super::plan::RotationId, usize, String)>,
+    ) -> Result<(), InferenceError> {
         if self.online_rotations.len() > Self::MAX_VALIDATED_ENTRIES {
             return Err(InferenceError::Inference(format!(
                 "OnlineArtifactDescriptor: online_rotations declares {} entries, \
@@ -608,7 +621,7 @@ impl OnlineArtifactDescriptor {
                 }
             }
             ArtifactVersion::V1Online => {
-                let cfg = cfg.ok_or_else(|| {
+                let target = target.ok_or_else(|| {
                     InferenceError::Inference(
                         "OnlineArtifactDescriptor: V1 online validation requires \
                          model config — a config-free call cannot prove per-layer \
@@ -628,7 +641,7 @@ impl OnlineArtifactDescriptor {
                     ));
                 }
                 for spec in &self.online_rotations {
-                    spec.validate(Some(cfg))?;
+                    validate_spec(spec, target)?;
                 }
                 // Canonical-form contract (v1): at most one spec per online
                 // transform site. Two specs targeting the same runtime site
@@ -678,7 +691,7 @@ impl OnlineArtifactDescriptor {
                 // recipe requires but the descriptor doesn't declare), then
                 // extra-direction (declared names the recipe doesn't recognize,
                 // matched against the full derived name, not only a suffix).
-                let expected = self.derive_expected_tensor_names(cfg);
+                let expected = expected_tensor_names(target);
                 let mut declared_set: HashSet<&str> =
                     HashSet::with_capacity(self.asymmetric_tensor_names.len());
                 for declared in &self.asymmetric_tensor_names {
@@ -719,6 +732,22 @@ impl OnlineArtifactDescriptor {
             }
         }
         Ok(())
+    }
+
+    /// Validate the descriptor against a Qwen3.5 configuration.
+    #[deprecated(
+        since = "0.15.0",
+        note = "use validate_target with qwen35_rotation_target"
+    )]
+    pub fn validate(
+        &self,
+        cfg: Option<&lattice_arch::qwen35_config::Qwen35Config>,
+    ) -> Result<(), InferenceError> {
+        self.validate_with_layout(
+            cfg,
+            |spec, cfg| spec.validate_qwen35_layout(cfg),
+            |cfg| self.derive_expected_tensor_names(&qwen35_rotation_dimensions(cfg)),
+        )
     }
 }
 
@@ -1049,3 +1078,6 @@ fn decode_bytes_to_f64(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod target_tests;

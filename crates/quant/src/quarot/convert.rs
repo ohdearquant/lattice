@@ -44,7 +44,7 @@ use crate::quarot::lm_head::{
     untie_word_embeddings_in_config_json,
 };
 use crate::quarot::pipeline::{TensorEntry, absorb_rotations, fuse_rmsnorms, load_tensors_f64};
-use crate::quarot::plan::RotationPlan;
+use crate::quarot::plan::RotationTarget;
 use crate::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
 use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
@@ -300,8 +300,8 @@ struct QuantizeIndex {
 /// verification against the real qwen3.5-0.8b-q4 checkpoint).
 ///
 /// When the object form carries an `online` [`OnlineArtifactDescriptor`]
-/// whose version is `V0Residual`, it is validated against `cfg`
-/// (`OnlineArtifactDescriptor::validate`) before this function returns — a
+/// whose version is `V0Residual`, it is validated against `target`
+/// (`OnlineArtifactDescriptor::validate_target`) before this function returns — a
 /// manifest carrying a present-but-invalid online descriptor is rejected at
 /// load time, the same fail-closed treatment as a malformed `tensors`
 /// entry. A manifest with no `online` field (every V0 manifest, and any
@@ -332,7 +332,8 @@ struct QuantizeIndex {
 /// as an incomplete/corrupted V1 artifact, never silently downgraded to V0.
 pub(crate) fn read_quarot_seed_from_index(
     q4_dir: &Path,
-    cfg: &Qwen35Config,
+    target: &RotationTarget,
+    legacy_seed: Option<u64>,
 ) -> Result<Option<u64>, String> {
     let path = q4_dir.join("quantize_index.json");
     let Some(bytes) = crate::q4_manifest::read_manifest_bytes_bounded(&path)? else {
@@ -377,7 +378,7 @@ pub(crate) fn read_quarot_seed_from_index(
             path.display()
         ));
     }
-    if index.quarot_seed.is_none() && cfg.quarot_rotation_seed.is_none() {
+    if index.quarot_seed.is_none() && legacy_seed.is_none() {
         // Object form means `convert_quarot_qwen35` wrote this manifest, and
         // that converter rotates unconditionally and stamps the seed into both
         // channels it owns (`quarot_seed` here, `quarot_rotation_seed` in the
@@ -418,7 +419,7 @@ pub(crate) fn read_quarot_seed_from_index(
                 path.display()
             ));
         }
-        online.validate(Some(cfg)).map_err(|e| {
+        online.validate_target(Some(target)).map_err(|e| {
             format!(
                 "{}: invalid online-artifact descriptor: {e}",
                 path.display()
@@ -851,7 +852,7 @@ pub fn convert_quarot_qwen35(
 
     let mut fusion_plan = qwen35_per_layer_fusion_plan(&cfg)?;
     fusion_plan.push(qwen35_final_norm_fusion_target());
-    let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let rotation_plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
 
     fuse_rmsnorms(&mut working_set, &fusion_plan)?;
     absorb_rotations(&mut working_set, &rotation_plan, &rotation)?;
@@ -1147,3 +1148,6 @@ fn write_f16_file(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod target_tests;

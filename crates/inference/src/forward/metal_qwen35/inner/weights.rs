@@ -1272,8 +1272,13 @@ impl MetalQwen35State {
         // is *also* rejected here (this is the only load path into
         // `MetalQwen35State`, Metal being the only forward implementation) — see
         // `read_quarot_seed_from_index`'s doc comment.
-        let index_seed = crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir, cfg)
-            .map_err(|e| format!("from_q4_dir: {e}"))?;
+        let rotation_target = crate::quant::quarot::plan::qwen35_rotation_target(cfg);
+        let index_seed = crate::quant::quarot::convert::read_quarot_seed_from_index(
+            q4_dir,
+            &rotation_target,
+            cfg.quarot_rotation_seed,
+        )
+        .map_err(|e| format!("from_q4_dir: {e}"))?;
         let quarot_seed_opt = index_seed.or(cfg.quarot_rotation_seed);
         let is_quarot = quarot_seed_opt.is_some();
 

@@ -280,9 +280,8 @@ fn load_lora_adapter_none_seed_resolves_to_base_seed_not_no_rotation() {
     let mut direct = [layer()];
     {
         use crate::quant::quarot::lora::{LoraLayerMut, rotate_adapter_for_quarot};
-        use crate::quant::quarot::plan::RotationPlan;
 
-        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+        let plan = crate::quant::quarot::plan::qwen35_residual_stream_linear_layers();
         let lora_muts: Vec<LoraLayerMut<'_>> = direct
             .iter_mut()
             .map(|l| LoraLayerMut {

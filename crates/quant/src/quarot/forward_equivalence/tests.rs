@@ -201,7 +201,10 @@ fn full_pipeline_plans(
 ) {
     let mut fusion = qwen35_per_layer_fusion_plan(cfg).unwrap();
     fusion.push(qwen35_final_norm_fusion_target());
-    (fusion, RotationPlan::qwen35_residual_stream_linear_layers())
+    (
+        fusion,
+        crate::quarot::plan::qwen35_residual_stream_linear_layers(),
+    )
 }
 
 /// Sanity: the tiny test config really has one GDN + one GQA layer.
@@ -433,7 +436,7 @@ fn forward_equivalence_refuses_when_final_norm_fusion_skipped() {
     let rotation = RandomizedHadamard::new(0xBADC0DE, cfg.hidden_size).unwrap();
     absorb_rotations(
         &mut rotated,
-        &RotationPlan::qwen35_residual_stream_linear_layers(),
+        &crate::quarot::plan::qwen35_residual_stream_linear_layers(),
         &rotation,
     )
     .unwrap();
@@ -577,7 +580,7 @@ fn forward_equivalence_refuses_when_per_layer_fusion_skipped() {
     let rotation = RandomizedHadamard::new(0xABCDEF, cfg.hidden_size).unwrap();
     absorb_rotations(
         &mut rotated,
-        &RotationPlan::qwen35_residual_stream_linear_layers(),
+        &crate::quarot::plan::qwen35_residual_stream_linear_layers(),
         &rotation,
     )
     .unwrap();
@@ -815,7 +818,7 @@ fn refuse_error_message_includes_max_abs_and_tolerance() {
     let rotation = RandomizedHadamard::new(0x1234_5678, cfg.hidden_size).unwrap();
     absorb_rotations(
         &mut rotated,
-        &RotationPlan::qwen35_residual_stream_linear_layers(),
+        &crate::quarot::plan::qwen35_residual_stream_linear_layers(),
         &rotation,
     )
     .unwrap();

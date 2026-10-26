@@ -1190,6 +1190,42 @@ mod quant_parity {
     }
 
     #[test]
+    fn neutral_rotation_targets_resolve_at_facade_paths() {
+        same_type(
+            PhantomData::<facade::quarot::plan::RotationTarget>,
+            PhantomData::<extracted::quarot::plan::RotationTarget>,
+        );
+        same_function(
+            facade::quarot::plan::RotationTarget::new,
+            extracted::quarot::plan::RotationTarget::new,
+        );
+        same_function(
+            facade::quarot::plan::qwen35_rotation_target,
+            extracted::quarot::plan::qwen35_rotation_target,
+        );
+        same_function(
+            facade::quarot::plan::qwen35_residual_stream_linear_layers,
+            extracted::quarot::plan::qwen35_residual_stream_linear_layers,
+        );
+        same_function(
+            facade::quarot::plan::OnlineRotationSpec::attention_output_r3,
+            extracted::quarot::plan::OnlineRotationSpec::attention_output_r3,
+        );
+        same_function(
+            facade::quarot::plan::OnlineRotationSpec::mlp_down_r4,
+            extracted::quarot::plan::OnlineRotationSpec::mlp_down_r4,
+        );
+        same_function(
+            facade::quarot::plan::OnlineRotationSpec::validate_target,
+            extracted::quarot::plan::OnlineRotationSpec::validate_target,
+        );
+        same_function(
+            facade::quarot::io::OnlineArtifactDescriptor::validate_target,
+            extracted::quarot::io::OnlineArtifactDescriptor::validate_target,
+        );
+    }
+
+    #[test]
     fn quarot_conversion_functions_are_the_same_items_at_both_paths() {
         same_function(
             facade::quarot::convert::convert_quarot_qwen35,

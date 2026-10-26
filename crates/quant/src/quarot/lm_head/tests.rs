@@ -261,7 +261,6 @@ fn untie_word_embeddings_is_idempotent_on_untied() {
 fn materialized_lm_head_diverges_from_embed_tokens_after_pipeline() {
     use crate::quarot::hadamard::RandomizedHadamard;
     use crate::quarot::pipeline::{absorb_rotations, fuse_rmsnorms};
-    use crate::quarot::plan::RotationPlan;
 
     let cfg = tied_qwen35_test_cfg();
     let vocab = cfg.vocab_size;
@@ -291,7 +290,7 @@ fn materialized_lm_head_diverges_from_embed_tokens_after_pipeline() {
     fuse_rmsnorms(&mut tensors, std::slice::from_ref(&final_norm_target)).unwrap();
 
     let rotation = RandomizedHadamard::new(0xCAFE_BABE, hidden).unwrap();
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     absorb_rotations(&mut tensors, &plan, &rotation).unwrap();
 
     // Post-pipeline: lm_head must differ from embed_tokens because the
