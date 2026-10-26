@@ -2,7 +2,7 @@
 //!
 //! Assembles the already-merged stages: config/loader preflight (#996),
 //! text math kernels with per-op HF goldens (#999, [`lattice_compute::gemma_ops`]),
-//! and the donor-slot shared-KV cache (#1002, [`super::gemma4_cache`]).
+//! and the donor-slot shared-KV cache (#1002, [`crate::gemma4_cache`]).
 //! Bounded batched prompt prefill and single-token decode (`forward_step`).
 //! Short prompts retain the sequential path. This is CPU-only, f32 throughout, no
 //! Metal wiring (ADR-082's stage ladder gates Metal on CPU parity landing
