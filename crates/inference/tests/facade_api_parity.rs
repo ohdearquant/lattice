@@ -1539,3 +1539,275 @@ mod compute_parity {
         );
     }
 }
+
+mod lora_hook_parity {
+    use lattice_compute::lora_hook as extracted;
+    use lattice_inference::lora_hook as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T: ?Sized>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+    fn send_sync<T: Send + Sync + ?Sized>() {}
+
+    #[test]
+    fn lora_types_and_trait_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::NoopLoraHook>,
+            PhantomData::<extracted::NoopLoraHook>,
+        );
+        same_type(
+            PhantomData::<facade::LoraProjectionShape>,
+            PhantomData::<extracted::LoraProjectionShape>,
+        );
+        same_type(
+            PhantomData::<dyn facade::LoraHook>,
+            PhantomData::<dyn extracted::LoraHook>,
+        );
+        let _: extracted::NoopLoraHook = facade::NoopLoraHook;
+        send_sync::<dyn facade::LoraHook>();
+        send_sync::<facade::NoopLoraHook>();
+    }
+
+    #[test]
+    fn lora_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::gdn_lora_module_is_servable,
+            extracted::gdn_lora_module_is_servable,
+        );
+        same_function(
+            facade::qwen35_projection_shape,
+            extracted::qwen35_projection_shape,
+        );
+    }
+
+    #[test]
+    fn lora_constants_are_equal_at_both_paths() {
+        assert_eq!(facade::GDN_LORA_MODULES, extracted::GDN_LORA_MODULES);
+        assert_eq!(
+            facade::GDN_LORA_MODULES_SERVABLE,
+            extracted::GDN_LORA_MODULES_SERVABLE
+        );
+    }
+}
+
+mod metrics_pruning_parity {
+    use lattice_compute as extracted;
+    use lattice_inference::{metrics as facade_metrics, pruning as facade_pruning};
+    use std::marker::PhantomData;
+
+    fn same_type<T: ?Sized>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn metrics_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade_metrics::MetricsMode>,
+            PhantomData::<extracted::metrics::MetricsMode>,
+        );
+        same_type(
+            PhantomData::<facade_metrics::LayerMetrics>,
+            PhantomData::<extracted::metrics::LayerMetrics>,
+        );
+        same_type(
+            PhantomData::<facade_metrics::ForwardMetrics>,
+            PhantomData::<extracted::metrics::ForwardMetrics>,
+        );
+        same_type(
+            PhantomData::<facade_metrics::OnlineSoftmaxEntropy>,
+            PhantomData::<extracted::metrics::OnlineSoftmaxEntropy>,
+        );
+        let _: extracted::metrics::OnlineSoftmaxEntropy =
+            facade_metrics::OnlineSoftmaxEntropy::new();
+    }
+
+    #[test]
+    fn metrics_functions_are_the_same_items_at_both_paths() {
+        same_function(facade_metrics::l2_norm, extracted::metrics::l2_norm);
+    }
+
+    #[test]
+    fn pruning_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade_pruning::BlockInfluence>,
+            PhantomData::<extracted::pruning::BlockInfluence>,
+        );
+        same_type(
+            PhantomData::<facade_pruning::BlockInfluenceAccumulator>,
+            PhantomData::<extracted::pruning::BlockInfluenceAccumulator>,
+        );
+    }
+
+    #[test]
+    fn pruning_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade_pruning::cosine_similarity,
+            extracted::pruning::cosine_similarity,
+        );
+        same_function(
+            facade_pruning::score_from_hidden_states,
+            extracted::pruning::score_from_hidden_states,
+        );
+        same_function(
+            facade_pruning::pruning_rank,
+            extracted::pruning::pruning_rank,
+        );
+    }
+
+    #[test]
+    fn metrics_mode_variants_resolve_through_the_facade() {
+        let mode = facade_metrics::MetricsMode::default();
+        assert!(matches!(mode, facade_metrics::MetricsMode::Off));
+        let _ = facade_metrics::MetricsMode::HeavyDiagnostics;
+    }
+}
+
+mod option_scoring_parity {
+    use lattice_compute::option_scoring as extracted;
+    use lattice_inference::option_scoring as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T: ?Sized>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn option_scoring_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::OptionScores>,
+            PhantomData::<extracted::OptionScores>,
+        );
+        same_type(
+            PhantomData::<facade::DecisionLabelTable>,
+            PhantomData::<extracted::DecisionLabelTable>,
+        );
+    }
+
+    #[test]
+    fn option_scoring_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::option_scores_from_logits,
+            extracted::option_scores_from_logits,
+        );
+        same_function(
+            facade::resolve_option_letters,
+            extracted::resolve_option_letters,
+        );
+        same_function(
+            facade::resolve_decision_labels,
+            extracted::resolve_decision_labels,
+        );
+    }
+
+    #[test]
+    fn letter_labels_constant_is_equal_at_both_paths() {
+        assert_eq!(facade::LETTER_LABELS, extracted::LETTER_LABELS);
+    }
+}
+
+mod gemma_rope_parity {
+    use lattice_compute::gemma_rope as extracted;
+    use lattice_inference::model::gemma4_ops as facade;
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn gemma_rope_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::gemma4_rope_inv_freq,
+            extracted::gemma4_rope_inv_freq,
+        );
+        same_function(facade::gemma4_rope_cos_sin, extracted::gemma4_rope_cos_sin);
+        same_function(
+            facade::vision_axial_rope_inv_freq,
+            extracted::vision_axial_rope_inv_freq,
+        );
+    }
+}
+
+mod softmax_row_parity {
+    use lattice_compute::attention::softmax_row as extracted;
+    use lattice_inference::attention::softmax_row as facade;
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn softmax_row_functions_are_the_same_items_at_both_paths() {
+        same_function(facade::row_max_and_any_nan, extracted::row_max_and_any_nan);
+        same_function(
+            facade::row_fails_closed_pre_exp,
+            extracted::row_fails_closed_pre_exp,
+        );
+        same_function(facade::is_masked_neg_inf, extracted::is_masked_neg_inf);
+        same_function(facade::finalize_row, extracted::finalize_row);
+    }
+}
+
+mod cpu_forward_parity {
+    use lattice_compute::forward::cpu as extracted;
+    use lattice_inference::forward as forward_root;
+    use lattice_inference::forward::cpu as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn cpu_bert_policy_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::BertCpuKernelPolicy>,
+            PhantomData::<extracted::BertCpuKernelPolicy>,
+        );
+        same_type(
+            PhantomData::<forward_root::BertCpuKernelPolicy>,
+            PhantomData::<extracted::BertCpuKernelPolicy>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::BertCpuKernelProfile>,
+            PhantomData::<extracted::BertCpuKernelProfile>,
+        );
+    }
+
+    #[test]
+    fn cpu_forward_functions_are_the_same_items_at_both_paths() {
+        same_function(facade::add_bias, extracted::add_bias);
+        same_function(facade::add_bias_gelu, extracted::add_bias_gelu);
+        same_function(facade::gelu, extracted::gelu);
+        same_function(facade::sgemm_bt_strided, extracted::sgemm_bt_strided);
+        same_function(facade::sgemm_nn_ab, extracted::sgemm_nn_ab);
+        same_function(facade::sgemm_nn_strided, extracted::sgemm_nn_strided);
+        same_function(facade::elementwise_mul, extracted::elementwise_mul);
+        same_function(facade::rms_norm, extracted::rms_norm);
+        same_function(facade::silu_inplace, extracted::silu_inplace);
+        same_function(facade::matmul, extracted::matmul);
+        same_function(facade::matmul_bt, extracted::matmul_bt);
+        same_function(facade::matmul_into, extracted::matmul_into);
+        same_function(facade::matmul_scalar, extracted::matmul_scalar);
+        same_function(facade::layer_norm, extracted::layer_norm);
+        same_function(
+            facade::residual_add_layer_norm,
+            extracted::residual_add_layer_norm,
+        );
+        same_function(facade::softmax_attention, extracted::softmax_attention);
+        same_function(forward_root::matmul_bt, extracted::matmul_bt);
+    }
+
+    #[test]
+    fn cpu_f16_matmul_is_the_same_item_at_both_paths() {
+        same_function(
+            lattice_inference::weights::f16_weights::matmul_bt_f16,
+            lattice_compute::forward::cpu::f16_matmul::matmul_bt_f16,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn cpu_neon_matmul_is_the_same_item_at_both_paths() {
+        same_function(facade::matmul_neon, extracted::matmul_neon);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpu_x86_matmul_is_the_same_item_at_both_paths() {
+        same_function(facade::matmul_avx2, extracted::matmul_avx2);
+        same_function(facade::matmul_avx512, extracted::matmul_avx512);
+    }
+}

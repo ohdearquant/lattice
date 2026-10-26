@@ -94,7 +94,7 @@ cargo fmt --all --check && cargo clippy --workspace -- -D warnings
 SIMD kernels live in:
 
 - `crates/embed/src/simd/` — distance ops (cosine, dot product, euclidean, normalize, binary, quantized)
-- `crates/inference/src/forward/cpu/` — matmul, activation, norm, softmax, tiled variants
+- `crates/compute/src/forward/cpu/` — matmul, activation, norm, softmax, tiled variants
 - `crates/inference/src/forward/neon.rs` — NEON-specific paths
 - `crates/inference/src/forward/metal.rs` — Metal GPU dispatch
 

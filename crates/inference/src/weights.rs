@@ -4,8 +4,9 @@
 //! re-exports are named rather than globbed so the facade never widens the supported API.
 
 pub mod f16_weights {
-    pub use crate::forward::cpu::f16_matmul::matmul_bt_f16;
     pub use crate::model::qwen35::f16_loading::load_f16_weights;
+    #[doc(inline)]
+    pub use lattice_compute::forward::cpu::f16_matmul::matmul_bt_f16;
     #[doc(inline)]
     pub use lattice_weights::f16_weights::{
         F16, F16AttentionWeights, F16CommonLayerWeights, F16FeedForwardWeights,

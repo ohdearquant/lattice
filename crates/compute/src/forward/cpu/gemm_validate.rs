@@ -24,7 +24,7 @@
 ///
 /// `op` is a short static label included in panic messages to identify the failing call site.
 #[inline]
-pub(crate) fn validate_gemm_nn(
+pub fn validate_gemm_nn(
     a_len: usize,
     b_len: usize,
     c_len: usize,
@@ -43,7 +43,7 @@ pub(crate) fn validate_gemm_nn(
 
 /// Validate arguments for `C = A @ B^T` (row-major, `A: [m, k]`, `B: [n, k]`, `C: [m, n]`).
 #[inline]
-pub(crate) fn validate_gemm_bt(
+pub fn validate_gemm_bt(
     a_len: usize,
     b_len: usize,
     c_len: usize,
@@ -103,7 +103,7 @@ pub(crate) fn validate_gemm_strided_shape(
 /// longer than that minimum is accepted — only rows/elements within the required footprint
 /// are ever read (see `validate_ternary_matvec_args_accepts_oversized` below).
 #[inline]
-pub(crate) fn validate_ternary_matvec_args(
+pub fn validate_ternary_matvec_args(
     x_q_len: usize,
     alphas_len: usize,
     packed_w_len: usize,

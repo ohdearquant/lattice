@@ -5,7 +5,7 @@ use super::simd::{SimdConfig, simd_config};
 /// Frozen CPU capability facts captured for a future pinned BERT execution policy.
 ///
 /// This value is metadata only. Possessing it does not prove that a
-/// [`crate::model::BertModel`] was loaded or executed with pinned kernels. No model constructor
+/// BERT model was loaded or executed with pinned kernels. No model constructor
 /// accepts this profile yet.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

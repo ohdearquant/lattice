@@ -350,6 +350,144 @@ the implementation and its unit tests move together. Recorded:
 6. **D6.4.** The added dependencies and changed build inputs require measured A/B acceptance. This amendment records
    the extraction and its validation obligations; it does not assert a measurement result or a structural waiver.
 
+## Amendment 10 (2026-10-25)
+
+The LoRA hook contract and its row application helper join `lattice-compute`, so shared forward computation can use
+them without depending on the inference facade. Recorded:
+
+1. **D8.1.** `lora_hook` and its tests move into `lattice-compute`. The crate gains a normal dependency on
+   `lattice-model-config` for `Qwen35Config`, alongside its existing core dependency. Compute therefore moves from
+   publish tier 2 to tier 4, after model-config and beside quant; the script publishes quant then compute within that
+   tier. This order adds no compute-to-quant dependency. The publish-order test and dependency diagrams follow it.
+2. **D1.** `lattice_inference::lora_hook` keeps named public re-exports of `LoraHook`, `NoopLoraHook`,
+   `LoraProjectionShape`, `GDN_LORA_MODULES`, `GDN_LORA_MODULES_SERVABLE`, `gdn_lora_module_is_servable` and
+   `qwen35_projection_shape`. The types and trait are the same items at both paths.
+3. **D4.2.** The formerly crate-private free function `apply_lora_rows` becomes the documented public
+   `lattice_compute::lora_hook::apply_lora_rows`: applying an adapter to flattened token rows is a coherent compute
+   operation. The facade imports it with `pub(crate) use`, preserving its private facade visibility. No new
+   `__internal` bridge is added. The helper's row geometry, activity check and row order stay unchanged.
+4. **D5.** Compute keeps an empty default feature set. `lora_hook` and the model-config dependency are unconditional;
+   the move adds no caller feature or target gate.
+5. **D6.1.** `lora_hook/tests.rs` moves unchanged with all nine test names. The facade adds the unit test
+   `row_helper_is_the_same_function_item`. `facade_api_parity` adds
+   `lora_types_and_trait_are_the_same_at_both_paths`, `lora_functions_are_the_same_items_at_both_paths` and
+   `lora_constants_are_equal_at_both_paths`, covering type and trait identity, function-item identity and constant
+   equality without exposing the row helper publicly through the facade.
+6. **D6.4.** The added dependency and changed build inputs require measured A/B acceptance. This amendment records
+   the extraction and its validation obligations; it does not assert a measurement result or a structural waiver.
+
+## Amendment 11 (2026-10-25)
+
+The numerical diagnostics (`metrics`, `pruning`) and option-letter scoring (`option_scoring`) join `lattice-compute`,
+so forward and evaluation code can use them without depending on the inference facade. Recorded:
+
+1. **D8.1.** `metrics`, `pruning` and `option_scoring` move into `lattice-compute` with their tests. `metrics` and
+   `pruning` reach only the core crate. `option_scoring` names the `Tokenizer` trait, so compute gains a normal
+   dependency on `lattice-tokenizer`. The tokenizer publishes in tier 2, before compute's tier 4, so compute's tier,
+   the publish script and the publish-order test are unchanged.
+2. **D1.** `lattice_inference::metrics` keeps named public re-exports of `MetricsMode`, `LayerMetrics`,
+   `ForwardMetrics`, `OnlineSoftmaxEntropy` and `l2_norm`; `lattice_inference::pruning` of `cosine_similarity`,
+   `BlockInfluence`, `BlockInfluenceAccumulator`, `score_from_hidden_states` and `pruning_rank`;
+   `lattice_inference::option_scoring` of `OptionScores`, `option_scores_from_logits`, `resolve_option_letters`,
+   `resolve_decision_labels`, `LETTER_LABELS` and `DecisionLabelTable`. The items are the same at both paths.
+   `MetricsMode` keeps its `#[non_exhaustive]` annotation; no match on it exists outside compute.
+3. **D4.2.** The formerly crate-private free function `check_letter_ids` becomes the documented public
+   `lattice_compute::option_scoring::check_letter_ids`: validating letter ids against a vocabulary is part of option
+   scoring. The facade imports it with `pub(crate) use`, preserving its private facade visibility, and its callers in
+   the CPU and Metal scorers keep their crate path. No new `__internal` bridge is added. `metrics` and `pruning` have
+   no crate-private items.
+4. **D5.** Compute keeps an empty default feature set. The three modules and the tokenizer dependency are
+   unconditional; the move adds no caller feature or target gate.
+5. **D6.1.** `metrics/tests.rs` (28 tests), `pruning/tests.rs` (25) and `option_scoring/tests.rs` (20) move with all
+   names unchanged; only the error and tokenizer import paths change. `facade_api_parity` adds
+   `metrics_types_are_the_same_at_both_paths`, `metrics_functions_are_the_same_items_at_both_paths`,
+   `pruning_types_are_the_same_at_both_paths`, `pruning_functions_are_the_same_items_at_both_paths`,
+   `metrics_mode_variants_resolve_through_the_facade`, `option_scoring_types_are_the_same_at_both_paths`,
+   `option_scoring_functions_are_the_same_items_at_both_paths` and `letter_labels_constant_is_equal_at_both_paths`.
+6. **D6.4.** The added dependency and changed build inputs require measured A/B acceptance. `metrics_bench` and
+   `pruning_bench` stay in `lattice-inference` and reach the moved code through the facade; option scoring has no
+   declared bench target. This amendment records the extraction and its validation obligations; it does not assert a
+   measurement result or a structural waiver.
+
+## Amendment 12 (2026-10-25)
+
+The Gemma 4 rotary embedding tables join `lattice-compute`, so the Gemma, EmbeddingGemma and ERNIE forward paths can
+build them without depending on the inference facade. Recorded:
+
+1. **D8.1.** `gemma4_rope_inv_freq`, `gemma4_rope_cos_sin` and `vision_axial_rope_inv_freq` move from
+   `lattice_inference::model::gemma4_ops` into a new `lattice_compute::gemma_rope` module. Their bodies use only the
+   standard library, so compute gains no dependency and its publish tier is unchanged. Applying the rotation
+   (`gemma4_apply_rope`, `vision_axial_rope_apply`) and the other Gemma 4 operations stay in the facade.
+2. **D1.** `lattice_inference::model::gemma4_ops` keeps named public re-exports of the three functions; they are the
+   same function items at both paths, and every existing caller keeps its path.
+3. **D3.** The one documentation link that pointed back into the facade (`gemma4_apply_rope`) becomes plain
+   qualified code text, so compute does not reference `lattice-inference`.
+4. **D4 and D5.** The three functions were already public and take no facade-owned type: no crate-private crossing,
+   no `__internal` bridge, no feature or target gate. Compute keeps an empty default feature set.
+5. **D6.1.** No test moves: the fifteen `gemma4_ops` tests, which check the tables against reference goldens, keep
+   running in `lattice-inference` through the re-exported paths. `facade_api_parity` adds
+   `gemma_rope_functions_are_the_same_items_at_both_paths`.
+6. **D6.4.** `bench_gemma4_driver_pair` reaches `gemma4_rope_cos_sin` on every decode step, and the crate boundary is
+   a changed build input, so a paired before/after of that target is required before merge. This amendment records
+   the extraction and its validation obligation; it does not assert a measurement result or a structural waiver.
+
+## Amendment 13 (2026-10-25)
+
+The fail-closed softmax row contract joins `lattice-compute`, so the CPU kernels that move next can apply it without
+depending on the inference facade. Recorded:
+
+1. **D8.1.** `row_max_and_any_nan`, `row_fails_closed_pre_exp`, `is_masked_neg_inf` and `finalize_row` move from
+   `lattice_inference::attention::softmax_row` into a new `lattice_compute::attention::softmax_row` module. They use
+   only the standard library, so compute gains no dependency and its publish tier is unchanged. The attention kernels
+   that call them (GQA, decode, flash, differential, native sparse) stay in the facade.
+2. **D1.** `lattice_inference::attention::softmax_row` keeps named public re-exports of the four functions; they are
+   the same function items at both paths, and every existing caller keeps its path.
+3. **D3.** The module documentation linked the GQA and decode kernels that stay in the facade; those two links become
+   plain qualified code text, so compute does not reference `lattice-inference`.
+4. **D4 and D5.** The four functions were already public and keep their `#[inline]` attributes: no crate-private
+   crossing, no `__internal` bridge, no feature or target gate. Compute keeps an empty default feature set.
+5. **D6.1.** The module's twelve tests move with it, names unchanged. `facade_api_parity` adds
+   `softmax_row_functions_are_the_same_items_at_both_paths`.
+6. **D6.4.** `elementwise_cpu_bench` reaches the contract through `softmax_attention`, and the crate boundary is a
+   changed build input, so a measured A/B of that target is required before merge. This amendment records the
+   extraction and its validation obligation; it does not assert a measurement result or a structural waiver.
+
+## Amendment 14 (2026-10-25)
+
+The CPU forward kernels join `lattice-compute`, so the host-side matmul, GEMM, normalization, activation and softmax
+code sits below the facade. Recorded:
+
+1. **D8.1.** The `forward::cpu` kernels (activation, the architecture kernels, BERT kernel policy, BLAS-style GEMM,
+   elementwise, F16 matmul, GEMM validation, matmul, norm, SIMD detection, softmax and the tiled variants) move from
+   `lattice_inference::forward::cpu` into `lattice_compute::forward::cpu` with their tests. The Q8 matrix kernel and
+   its tests stay in the facade. Compute gains direct dependencies on `lattice-weights` (the F16 storage type used by
+   the F16 matmul) and `rayon`, and the optional `gemm` dependency moves from inference to compute. Weights already
+   publishes before compute, so compute's tier, the publish script and the publish-order test are unchanged.
+2. **D1.** `lattice_inference::forward::cpu` keeps named public re-exports of every function and type it exported
+   before, including the architecture-gated `matmul_neon` (aarch64) and `matmul_avx2`/`matmul_avx512` (x86_64).
+   `lattice_inference::forward` replaces its glob re-export of the CPU module with the same named list,
+   `lattice_inference::{BertCpuKernelPolicy, BertCpuKernelProfile}` keep their hidden crate-root paths, and
+   `lattice_inference::weights::f16_weights::matmul_bt_f16` keeps its path. The items are the same at every path.
+3. **D3.** The BERT policy documentation linked the BERT model that stays in the facade; that link becomes plain text.
+4. **D4.** `simd_config`, `SimdConfig`, `validate_gemm_nn`, `validate_gemm_bt` and `validate_ternary_matvec_args` were
+   crate-private and become public in `lattice_compute::forward::cpu`, because facade code that stays (attention, the
+   ternary kernel, the GPU GEMM paths, vision and backward) calls them. The facade imports the four functions with `pub(crate) use`, preserving their
+   facade visibility, and does not export `SimdConfig`. The `f16_matmul` module becomes public in compute so the
+   facade can keep the `matmul_bt_f16` path. No `__internal` bridge is added. Each of the five is documented as a
+   public item of compute, and `SimdConfig` is `#[non_exhaustive]`, so detecting a further instruction set adds a field
+   without a breaking change. `validate_gemm_strided_shape`, the sixth crate-private item of these modules, has no
+   caller outside them and stays crate-private.
+5. **D5.** Compute keeps an empty default feature set and gains `x86-gemm = ["dep:gemm"]`; inference's `x86-gemm`
+   forwards to it, so every caller keeps the same feature name and the same off-by-default behaviour.
+6. **D6.1.** The moved source and test files carry 135 tests, names unchanged. Integration tests that use the kernels
+   through the facade (`bert_cpu_kernel_policy_api`, `x86_gemm_allocations` and others) stay in inference.
+   `facade_api_parity` adds `cpu_forward_parity`, covering the policy types, every re-exported function, the F16
+   kernel and the architecture-gated kernels.
+7. **D6.4.** `elementwise_cpu_bench` runs these kernels directly, and the workspace builds without link-time
+   optimization, so a facade caller now reaches them across a crate boundary where only `#[inline]` functions inline.
+   A measured A/B of that target is required before merge. This amendment records the extraction and its validation
+   obligation; it does not assert a measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
