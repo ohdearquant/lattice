@@ -12,11 +12,15 @@ workspace = true
 
 [features]
 default = []
+paddleocr-vl = ["dep:lattice-arch", "dep:lattice-tokenizer"]
+image = []
 f16 = ["lattice-weights/f16"]
 metal-gpu = ["dep:metal", "dep:objc", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu"]
 x86-gemm = ["lattice-compute/x86-gemm"]
 
 [dependencies]
+lattice-arch = { workspace = true, optional = true }
+lattice-tokenizer = { workspace = true, optional = true }
 lattice-compute.workspace = true
 lattice-inference-core.workspace = true
 lattice-weights.workspace = true
@@ -28,3 +32,32 @@ metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
 lattice-metal-runtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+image.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[[test]]
+name = "paddleocr_vl_adhoc_ocr"
+required-features = ["paddleocr-vl"]
+
+[[test]]
+name = "paddleocr_vl_decoder_goldens_test"
+required-features = ["paddleocr-vl"]
+
+[[test]]
+name = "paddleocr_vl_e2e_goldens_test"
+required-features = ["paddleocr-vl"]
+
+[[test]]
+name = "paddleocr_vl_preprocess_goldens_test"
+required-features = ["paddleocr-vl"]
+
+[[test]]
+name = "paddleocr_vl_tokenizer_goldens_test"
+required-features = ["paddleocr-vl"]
+
+[[test]]
+name = "paddleocr_vl_vision_goldens_test"
+required-features = ["paddleocr-vl"]

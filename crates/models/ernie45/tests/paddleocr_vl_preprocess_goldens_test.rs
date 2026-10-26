@@ -1,6 +1,6 @@
 //! Bit-exact goldens for the PaddleOCR-VL image preprocessing pipeline.
 //!
-//! Holds `lattice_inference::vision::paddleocr_preprocess` against the
+//! Holds `lattice_model_ernie45::vision::paddleocr_preprocess` against the
 //! committed fixture `fixtures/paddleocr_vl/preprocess/preprocess_goldens.json`,
 //! produced with PIL 12.3.0 on a synthetic HWC uint8 image. No model
 //! checkpoint and no feature flag are required; the test runs under default
@@ -10,11 +10,12 @@
 //! `pixel[y][x][c] = (x*7 + y*13 + c*101 + (x*y) % 29 + (x/3)*(c+1)) % 256`
 //! with integer division.
 
-use lattice_inference::vision::paddleocr_preprocess::{
+use lattice_model_ernie45::vision::paddleocr_preprocess::{
     PaddleOcrImageProcessorConfig, preprocess_rgb8, resize_bicubic_rgb8, smart_resize,
 };
 use sha2::{Digest, Sha256};
-const FIXTURE: &str = "tests/fixtures/paddleocr_vl/preprocess/preprocess_goldens.json";
+const FIXTURE: &str =
+    "../../inference/tests/fixtures/paddleocr_vl/preprocess/preprocess_goldens.json";
 
 fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);

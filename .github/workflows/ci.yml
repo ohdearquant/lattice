@@ -276,6 +276,11 @@ jobs:
       # calls out by name. This step is the call site.
       - name: inference — ADR-092 pipeline boundary contract
         run: cargo test --locked -p lattice-inference --test pipeline_boundary_contract -- --nocapture
+      - name: ERNIE4.5 — PaddleOCR-VL tests
+        run: cargo test --locked -p lattice-model-ernie45 --all-targets --features f16,image,paddleocr-vl
+      - name: ERNIE4.5 — Metal and PaddleOCR-VL tests
+        if: matrix.os == 'macos-latest'
+        run: cargo test --locked -p lattice-model-ernie45 --lib --features f16,image,metal-gpu,paddleocr-vl
       # Bench compilation, folded in from the former standalone `bench-compile`
       # job. It only ever ran on macOS (metal-gpu), so it maps onto this matrix
       # leg exactly. Folding it here costs one fewer macOS runner slot per PR
