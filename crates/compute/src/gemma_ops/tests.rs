@@ -392,3 +392,63 @@ fn apply_rope_bit_identical_to_two_pass_reference() {
         );
     }
 }
+
+#[test]
+fn scaled_embedding_matches_hf_golden() {
+    let fx = load_json("scaled_embedding.json");
+    let tol = tolerance("scaled_embedding");
+    let hidden = fx["hidden"].as_u64().unwrap() as usize;
+    let ids = flatten_u32(&fx["input_ids"]);
+    let embed_weight = load_bin(&fx, "embed_weight");
+    let expected = load_bin(&fx, "output");
+    let expected_scale = fx["embed_scale"].as_f64().unwrap() as f32;
+    assert!(
+        ((hidden as f32).sqrt() - expected_scale).abs() < 1e-6,
+        "fixture embed_scale must be sqrt(hidden_size)"
+    );
+
+    let mut out = vec![0f32; ids.len() * hidden];
+    gemma4_scaled_embedding(&ids, &embed_weight, hidden, &mut out);
+
+    let diff = max_abs_diff(&out, &expected);
+    assert!(
+        diff <= tol,
+        "scaled_embedding max-abs-diff {diff} exceeds tolerance {tol}"
+    );
+}
+
+#[test]
+fn logit_softcap_matches_hf_golden() {
+    let fx = load_json("logit_softcap.json");
+    let tol = tolerance("logit_softcap");
+    let cap = fx["cap"].as_f64().unwrap() as f32;
+    let mut logits = load_bin(&fx, "input");
+    let expected = load_bin(&fx, "output");
+
+    gemma4_logit_softcap(&mut logits, cap);
+
+    let diff = max_abs_diff(&logits, &expected);
+    assert!(
+        diff <= tol,
+        "logit_softcap max-abs-diff {diff} exceeds tolerance {tol}"
+    );
+}
+
+#[test]
+fn mutation_disabled_softcap_fails_golden() {
+    // Fail-closed negative test: leaving logits uncapped (identity) must
+    // diverge from the capped golden beyond tolerance. The fixture's
+    // logits deliberately span well past +/-cap so saturation is
+    // material, not a rounding-noise-sized difference.
+    let fx = load_json("logit_softcap.json");
+    let floor = mutation_separation_floor("logit_softcap");
+    let logits = load_bin(&fx, "input");
+    let expected = load_bin(&fx, "output");
+
+    let diff = max_abs_diff(&logits, &expected);
+    assert!(
+        diff >= floor,
+        "uncapped logits must diverge from the softcapped golden by at least the \
+             predeclared mutation-separation floor (diff {diff}, floor {floor})"
+    );
+}

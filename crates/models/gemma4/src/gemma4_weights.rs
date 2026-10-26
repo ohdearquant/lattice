@@ -6,13 +6,13 @@
 //! tensors exist but are tolerate-and-skipped at load time
 //! (`gemma4_loading`) and never wired into the forward pass; the forward
 //! pass instead resolves those layers' K/V through
-//! [`crate::model::gemma4_cache::Gemma4KvCache`]'s donor-slot indirection.
+//! [`crate::gemma4_cache::Gemma4KvCache`]'s donor-slot indirection.
 
-use crate::error::InferenceError;
-use crate::weights::SafetensorsFile;
+use lattice_inference_core::InferenceError;
 use lattice_weights::__internal::safetensors_bf16_payload;
 #[cfg(test)]
 use lattice_weights::__internal::safetensors_cached_f32_tensor_count;
+use lattice_weights::SafetensorsFile;
 use lattice_weights::half_bits::bf16_bits_to_f32;
 
 /// Per-layer Gemma 4 weights.
@@ -33,7 +33,7 @@ pub(crate) struct Gemma4LayerWeights {
 
     /// `None` on KV-shared layers (ADR-082 Amendment 1): those layers have
     /// no `k_proj`/`v_proj`/`k_norm` weights loaded, and read their donor's
-    /// K/V via [`crate::model::gemma4_cache::Gemma4KvCache`] instead.
+    /// K/V via [`crate::gemma4_cache::Gemma4KvCache`] instead.
     pub(crate) k_proj: Option<Vec<f32>>, // [kv_dim, hidden]
     pub(crate) v_proj: Option<Vec<f32>>, // [kv_dim, hidden]
     pub(crate) k_norm: Option<Vec<f32>>, // [head_w]

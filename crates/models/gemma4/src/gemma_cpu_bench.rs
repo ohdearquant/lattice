@@ -24,7 +24,7 @@
 //! or a substitute for checkpoint parity tests.
 
 use super::*;
-use crate::GenerateConfig;
+use lattice_arch::generation::GenerateConfig;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -119,7 +119,7 @@ fn corpus() -> (Corpus, String) {
         );
     }
     let golden: Golden = serde_json::from_str(include_str!(
-        "../../tests/fixtures/gemma4/stage5/e2e_golden.json"
+        "../tests/fixtures/gemma4/generation_tokens.json"
     ))
     .expect("committed Gemma golden JSON");
     assert!(golden.input_ids.len() > 1);

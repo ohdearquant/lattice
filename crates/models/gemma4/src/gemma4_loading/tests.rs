@@ -1,6 +1,6 @@
-use super::super::gemma4_config::Gemma4LayerType;
 use super::super::gemma4_weights::synthetic_safetensors_bytes;
 use super::*;
+use lattice_arch::gemma4_config::Gemma4LayerType;
 use lattice_weights::__internal::safetensors_cached_f32_tensor_count;
 use std::collections::HashMap;
 

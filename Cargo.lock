@@ -1685,6 +1685,7 @@ dependencies = [
  "lattice-metal-runtime",
  "lattice-model-bert",
  "lattice-model-embeddinggemma2",
+ "lattice-model-gemma4",
  "lattice-model-io",
  "lattice-model-qwen3",
  "lattice-quant",
@@ -1764,6 +1765,22 @@ dependencies = [
  "lattice-weights",
  "metal 0.33.0",
  "objc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "lattice-model-gemma4"
+version = "0.15.0"
+dependencies = [
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-grammar",
+ "lattice-inference-core",
+ "lattice-tokenizer",
+ "lattice-weights",
  "serde",
  "serde_json",
  "sha2",

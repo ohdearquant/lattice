@@ -1,9 +1,7 @@
 use super::*;
-use crate::model::gemma4_config::Gemma4LayerType;
-use crate::model::gemma4_ops::gemma4_rope_inv_freq;
-use crate::model::gemma4_weights::{
-    Gemma4LayerWeights, Gemma4Weights, per_layer_embeddings_from_bits,
-};
+use crate::gemma4_weights::{Gemma4LayerWeights, Gemma4Weights, per_layer_embeddings_from_bits};
+use lattice_arch::gemma4_config::Gemma4LayerType;
+use lattice_compute::gemma_ops::gemma4_rope_inv_freq;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::mem::size_of;
@@ -168,7 +166,7 @@ fn alias_map(cache: &Gemma4KvCache) {
 fn cache_close(
     actual: &Gemma4KvCache,
     expected: &Gemma4KvCache,
-    cfg: &crate::model::gemma4_config::Gemma4Config,
+    cfg: &lattice_arch::gemma4_config::Gemma4Config,
     abs: f32,
     rel: f32,
     global_rel: f32,

@@ -12,13 +12,14 @@ pub mod embeddinggemma2_config;
 #[cfg(feature = "embeddinggemma2")]
 pub mod embeddinggemma2_image;
 pub mod ernie45;
+#[cfg(feature = "gemma4")]
 pub mod gemma4_cache;
 pub mod gemma4_config;
-mod gemma4_loading;
+#[cfg(feature = "gemma4")]
 pub mod gemma4_model;
 pub mod gemma4_ops;
+#[cfg(feature = "gemma4")]
 pub mod gemma4_preflight;
-mod gemma4_weights;
 pub mod paddleocr_vl;
 pub mod qwen;
 pub mod qwen35;
@@ -32,6 +33,7 @@ pub use self::cross_encoder::CrossEncoderModel;
 #[cfg(feature = "embeddinggemma2")]
 pub use self::embeddinggemma2::EmbeddingGemma2Model;
 // Re-export key types from other model modules
+#[cfg(feature = "gemma4")]
 pub use self::gemma4_model::Gemma4Model;
 pub use self::qwen::QwenConfig;
 #[cfg(feature = "qwen3")]

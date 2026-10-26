@@ -2476,6 +2476,16 @@ fn vision_errors_keep_the_same_identity() {
 
 #[test]
 fn gemma_kernels_keep_both_named_paths() {
+    type ScaledEmbedding = fn(&[u32], &[f32], usize, &mut [f32]);
+    type LogitSoftcap = fn(&mut [f32], f32);
+    let _: (ScaledEmbedding, ScaledEmbedding) = (
+        lattice_inference::model::gemma4_ops::gemma4_scaled_embedding,
+        lattice_compute::gemma_ops::gemma4_scaled_embedding,
+    );
+    let _: (LogitSoftcap, LogitSoftcap) = (
+        lattice_inference::model::gemma4_ops::gemma4_logit_softcap,
+        lattice_compute::gemma_ops::gemma4_logit_softcap,
+    );
     type RmsNorm = fn(&mut [f32], &[f32], usize, f32);
     type Gelu = fn(&mut [f32]);
     type Geglu =
@@ -2507,4 +2517,36 @@ fn gemma_kernels_keep_both_named_paths() {
         lattice_inference::model::gemma4_ops::vision_axial_rope_apply,
         lattice_compute::gemma_ops::vision_axial_rope_apply,
     );
+}
+
+#[cfg(feature = "gemma4")]
+#[test]
+fn model_cache_and_preflight_paths_name_family_items() {
+    use lattice_inference::model as facade;
+    use lattice_model_gemma4 as family;
+    use std::marker::PhantomData;
+    let _: PhantomData<family::Gemma4Model> = PhantomData::<facade::Gemma4Model>;
+    let _: PhantomData<family::Gemma4Model> = PhantomData::<facade::gemma4_model::Gemma4Model>;
+    let _: PhantomData<family::gemma4_cache::Gemma4KvCache> =
+        PhantomData::<facade::gemma4_cache::Gemma4KvCache>;
+    let _: PhantomData<family::gemma4_preflight::TensorInfo> =
+        PhantomData::<facade::gemma4_preflight::TensorInfo>;
+    let _: PhantomData<family::gemma4_preflight::TensorInventory> =
+        PhantomData::<facade::gemma4_preflight::TensorInventory>;
+    let _: PhantomData<family::gemma4_preflight::PreflightReport> =
+        PhantomData::<facade::gemma4_preflight::PreflightReport>;
+    let _: fn(
+        &std::path::Path,
+    ) -> Result<family::Gemma4Model, lattice_inference_core::InferenceError> =
+        facade::Gemma4Model::from_safetensors;
+    type Check = fn(
+        &lattice_arch::gemma4_config::Gemma4Config,
+        &std::collections::HashMap<String, family::gemma4_preflight::TensorInfo>,
+    ) -> Result<
+        family::gemma4_preflight::PreflightReport,
+        lattice_inference_core::InferenceError,
+    >;
+    let old: Check = facade::gemma4_preflight::preflight_check;
+    let new: Check = family::gemma4_preflight::preflight_check;
+    assert!(std::ptr::fn_addr_eq(old, new));
 }

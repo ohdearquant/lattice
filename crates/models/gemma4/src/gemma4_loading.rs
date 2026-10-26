@@ -4,17 +4,17 @@
 //! 1): KV-shared layers' `k_proj`/`v_proj`/`k_norm` checkpoint tensors are
 //! never read here -- [`Gemma4LayerWeights`] carries `None` for those fields
 //! on shared layers, and the forward pass resolves shared K/V through
-//! [`crate::model::gemma4_cache::Gemma4KvCache`] instead. This module does
-//! not call [`crate::model::gemma4_preflight::preflight_check`] directly (that
+//! [`crate::gemma4_cache::Gemma4KvCache`] instead. This module does
+//! not call [`crate::gemma4_preflight::preflight_check`] directly (that
 //! needs a full tensor-name/shape/dtype inventory, which a `TensorSource`
 //! does not expose in bulk); it re-derives the same per-tensor shape
 //! expectations directly against `cfg` and fails closed exactly like
 //! `qwen35::loading::load_weights`.
 
-use super::gemma4_config::{GEMMA4_EXPECTED_DTYPE, Gemma4Config};
 use super::gemma4_weights::{Gemma4LayerWeights, Gemma4Weights, PerLayerEmbeddings};
-use crate::error::InferenceError;
-use crate::weights::{SafetensorsFile, TensorSource};
+use lattice_arch::gemma4_config::{GEMMA4_EXPECTED_DTYPE, Gemma4Config};
+use lattice_inference_core::InferenceError;
+use lattice_weights::{SafetensorsFile, TensorSource};
 
 const LM_PREFIX: &str = "model.language_model.";
 
