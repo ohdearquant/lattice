@@ -1,4 +1,5 @@
 use super::*;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::decoder::standalone_cpu::parity;
 use crate::model::qwen35_config::LayerType;
 use crate::stop_reason::StopReason;
@@ -524,7 +525,7 @@ fn test_forward_step_q8_neon_zero_weights_produces_zero_logits() {
     let num_linear = test_cfg.num_linear_attention_layers();
     let num_full = test_cfg.num_full_attention_layers();
     let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-        .map(|_| GatedDeltaNetState::new(&test_cfg))
+        .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&test_cfg)))
         .collect();
     let mut kv_cache = KvCache::new(num_full);
     let mut scratch = ForwardScratch::new();
@@ -581,7 +582,7 @@ fn test_gdn_step_q8_neon_zero_weights_produces_zero_output() {
         norm_weight: vec![0.0; cfg.linear_value_head_dim],
     };
 
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let mut state = GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg));
     let input = vec![0.0f32; hidden];
     let mut output = vec![0.0f32; hidden];
     let mut gdn_scratch = GatedDeltaNetFusedScratch::default();
@@ -1017,7 +1018,7 @@ fn test_forward_step_q8_neon_into_migration_preserves_nonzero_logits() {
 
     let run_two_steps = || -> Vec<f32> {
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-            .map(|_| GatedDeltaNetState::new(&cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
             .collect();
         let mut kv_cache = KvCache::new(num_full);
         let mut scratch = ForwardScratch::new();
@@ -1995,7 +1996,7 @@ fn test_gdn_step_q8_neon_decay_gate_overflow_fails_closed() {
     weights.dt_bias[0] = -200.0;
     assert_eq!(softplus(weights.dt_bias[0]), 0.0);
 
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let mut state = GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg));
     let input = vec![0.05f32; hidden];
     let mut output = vec![0.0f32; hidden];
     let mut gdn_scratch = GatedDeltaNetFusedScratch::default();

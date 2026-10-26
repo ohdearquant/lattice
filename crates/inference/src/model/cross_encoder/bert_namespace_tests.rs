@@ -2,6 +2,7 @@ use super::CrossEncoderModel;
 use crate::attention::AttentionBuffers;
 use crate::error::InferenceError;
 use crate::forward::cpu::matmul_bt;
+use crate::model::bert::weight_loading::{load_classifier_weights, load_weights};
 use crate::weights::SafetensorsFile;
 
 use lattice_weights::test_fixtures::bert_namespace as fixture;
@@ -46,7 +47,7 @@ fn evaluate(tensors: &[Tensor]) -> Vec<(Vec<u32>, u32, u32)> {
     let dir = model_directory(tensors);
     let model = CrossEncoderModel::from_directory(dir.path()).unwrap();
     let file = SafetensorsFile::open(&dir.path().join("model.safetensors")).unwrap();
-    let classifier = file.load_cross_encoder_weights(HIDDEN).unwrap();
+    let classifier = load_classifier_weights(&file, HIDDEN).unwrap();
     PAIRS
         .iter()
         .map(|&(query, document)| {
@@ -105,7 +106,7 @@ fn bert_namespace_absent_pooler_preserves_direct_cls_scores() {
     for prefix in ["bert.", "custom.encoder."] {
         let tensors = checkpoint(prefix, false);
         let file = SafetensorsFile::from_bytes(safetensors_bytes(&tensors)).unwrap();
-        let weights = file.load_bert_weights(LAYERS, HIDDEN).unwrap();
+        let weights = load_weights(&file, LAYERS, HIDDEN).unwrap();
         assert!(weights.pooler_weight.data.is_empty());
         assert!(weights.pooler_bias.data.is_empty());
         assert_eq!(flat, evaluate(&tensors), "{prefix}");
@@ -133,7 +134,7 @@ fn bert_namespace_classifier_stays_top_level_even_with_a_namespaced_shadow() {
             Tensor::new(&format!("{prefix}classifier.bias"), &[1], vec![12.0]),
         ]);
         let file = SafetensorsFile::from_bytes(safetensors_bytes(&tensors)).unwrap();
-        let classifier = file.load_cross_encoder_weights(HIDDEN).unwrap();
+        let classifier = load_classifier_weights(&file, HIDDEN).unwrap();
         assert_eq!(
             bits(&classifier.classifier_weight),
             bits(&[0.43, -0.71, 0.29, 0.58])

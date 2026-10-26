@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::attention::AttentionBuffers;
 use crate::error::InferenceError;
 use crate::forward::cpu::matmul_bt;
-use crate::lora_hook::LoraHook;
+use crate::lora_hook::{BertLoraGeometry, LoraHook};
 use crate::model::bert::BertModel;
 use crate::pool::cls_pool;
 use crate::weights::{CrossEncoderWeights, SafetensorsFile};
@@ -56,7 +56,10 @@ impl CrossEncoderModel {
         }
 
         let safetensors = SafetensorsFile::open(&dir.join("model.safetensors"))?;
-        let classifier = safetensors.load_cross_encoder_weights(bert.config().hidden_size)?;
+        let classifier = crate::model::bert::weight_loading::load_classifier_weights(
+            &safetensors,
+            bert.config().hidden_size,
+        )?;
 
         Ok(Self { bert, classifier })
     }
@@ -114,7 +117,7 @@ impl CrossEncoderModel {
     /// Score a single (query, document) pair with a LoRA hook applied during the forward pass.
     ///
     /// Geometry validation is *delegated* to the hook: this method calls
-    /// [`LoraHook::validate_against_bert`] with the model's BERT dimensions
+    /// the legacy validator, then [`LoraHook::validate_geometry`], with the model's BERT dimensions
     /// before the forward pass runs, and maps any `Err` to
     /// [`InferenceError::InvalidInput`]. The trait's default implementation
     /// of that method returns `Ok(())` — it trusts the caller — so an
@@ -203,11 +206,19 @@ impl CrossEncoderModel {
     /// dimensions and costs nothing measurable against a BERT forward pass.
     fn validate_hook(&self, lora: &dyn LoraHook) -> Result<(), InferenceError> {
         let config = self.bert.config();
+        // Keep checks from hooks that only override the legacy validator through 0.15.0.
+        #[allow(deprecated)]
         lora.validate_against_bert(
             config.num_hidden_layers,
             config.hidden_size,
             config.intermediate_size,
         )
+        .map_err(InferenceError::InvalidInput)?;
+        lora.validate_geometry(&BertLoraGeometry::new(
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.intermediate_size,
+        ))
         .map_err(InferenceError::InvalidInput)
     }
 

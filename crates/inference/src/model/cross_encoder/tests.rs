@@ -152,3 +152,85 @@ fn score_batch_empty_documents_returns_empty_vec() {
 
     assert!(scores.is_empty());
 }
+
+struct RejectingGeometryHook {
+    reject_old: bool,
+    calls: std::sync::Mutex<Vec<&'static str>>,
+}
+
+impl LoraHook for RejectingGeometryHook {
+    fn apply(&self, _layer: usize, _module: &str, _input: &[f32], _output: &mut [f32]) {
+        panic!("validation must reject before hooked scoring starts");
+    }
+    // Keep the legacy and neutral checks independently observable.
+    #[allow(deprecated)]
+    fn validate_against_bert(
+        &self,
+        _layers: usize,
+        _hidden: usize,
+        _intermediate: usize,
+    ) -> Result<(), String> {
+        self.calls.lock().unwrap().push("old");
+        if self.reject_old {
+            Err("legacy rejection".to_string())
+        } else {
+            Ok(())
+        }
+    }
+    fn validate_geometry(
+        &self,
+        _geometry: &dyn crate::lora_hook::LoraTargetGeometry,
+    ) -> Result<(), String> {
+        self.calls.lock().unwrap().push("new");
+        if self.reject_old {
+            Ok(())
+        } else {
+            Err("neutral rejection".to_string())
+        }
+    }
+}
+
+fn assert_hook_rejected_before_scoring(reject_old: bool) {
+    let directory = checkpoint();
+    let model = CrossEncoderModel::from_directory(directory.path()).unwrap();
+    let baseline = model.score("query", "document");
+    let hook = RejectingGeometryHook {
+        reject_old,
+        calls: std::sync::Mutex::new(Vec::new()),
+    };
+    for request in 0..3 {
+        let result = match request {
+            0 => model
+                .score_with_hook("query", "document", &hook)
+                .map(|_| ()),
+            1 => model.score_batch_with_hook("query", &[], &hook).map(|_| ()),
+            _ => model
+                .score_batch_with_hook("query", &["document"], &hook)
+                .map(|_| ()),
+        };
+        assert!(matches!(result, Err(InferenceError::InvalidInput(_))));
+        let calls = std::mem::take(&mut *hook.calls.lock().unwrap());
+        assert_eq!(
+            calls,
+            if reject_old {
+                vec!["old"]
+            } else {
+                vec!["old", "new"]
+            }
+        );
+        assert_eq!(
+            model.score("query", "document").to_bits(),
+            baseline.to_bits()
+        );
+    }
+}
+
+#[test]
+fn hooked_scoring_rejects_neutral_geometry_after_legacy_acceptance() {
+    assert_hook_rejected_before_scoring(false);
+}
+
+#[test]
+fn hooked_scoring_preserves_legacy_rejection_before_neutral_validation() {
+    assert_hook_rejected_before_scoring(true);
+}

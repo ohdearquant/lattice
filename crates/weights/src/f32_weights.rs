@@ -324,6 +324,93 @@ impl SafetensorsFile {
         self.tensors.keys().map(String::as_str).collect()
     }
 
+    /// **Unstable**: iterate over tensor names borrowed from this file.
+    ///
+    /// Names have unspecified iteration order. This iterator borrows the file
+    /// without collecting a name list and does not include safetensors metadata.
+    pub fn tensor_names_iter(&self) -> impl Iterator<Item = &str> + '_ {
+        self.tensors.keys().map(String::as_str)
+    }
+
+    /// **Unstable**: borrow a rank-one f32 tensor with exactly the requested length.
+    ///
+    /// The data borrows this file. Errors from [`Self::get_f32_tensor`] are
+    /// returned before checking that the shape is `[len]`; a different rank or
+    /// length returns [`InferenceError::ShapeMismatch`].
+    ///
+    /// The view borrows its source:
+    ///
+    /// ```rust,no_run
+    /// use lattice_weights::{SafetensorsFile, Tensor1D};
+    ///
+    /// fn borrowed(source: &SafetensorsFile) -> Tensor1D<'_> {
+    ///     source.view_1d("weight", 1).unwrap()
+    /// }
+    /// ```
+    ///
+    /// The view cannot outlive its source:
+    ///
+    /// ```compile_fail
+    /// use lattice_weights::{SafetensorsFile, Tensor1D};
+    ///
+    /// fn detached(source: SafetensorsFile) -> Tensor1D<'static> {
+    ///     source.view_1d("weight", 1).unwrap()
+    /// }
+    /// ```
+    pub fn view_1d(&self, name: &str, len: usize) -> Result<Tensor1D<'_>, InferenceError> {
+        let (data, shape) = self.get_f32_tensor(name)?;
+        if shape != [len] {
+            return Err(InferenceError::ShapeMismatch {
+                name: name.to_string(),
+                expected: vec![len],
+                actual: shape.to_vec(),
+            });
+        }
+        Ok(Tensor1D { data, len })
+    }
+
+    /// **Unstable**: borrow a rank-two f32 tensor with exactly the requested shape.
+    ///
+    /// The data borrows this file. Errors from [`Self::get_f32_tensor`] are
+    /// returned before checking that the shape is `[rows, cols]`; a different
+    /// rank or either mismatched dimension returns [`InferenceError::ShapeMismatch`].
+    ///
+    /// The view borrows its source:
+    ///
+    /// ```rust,no_run
+    /// use lattice_weights::{SafetensorsFile, Tensor2D};
+    ///
+    /// fn borrowed(source: &SafetensorsFile) -> Tensor2D<'_> {
+    ///     source.view_2d("weight", 1, 1).unwrap()
+    /// }
+    /// ```
+    ///
+    /// The view cannot outlive its source:
+    ///
+    /// ```compile_fail
+    /// use lattice_weights::{SafetensorsFile, Tensor2D};
+    ///
+    /// fn detached(source: SafetensorsFile) -> Tensor2D<'static> {
+    ///     source.view_2d("weight", 1, 1).unwrap()
+    /// }
+    /// ```
+    pub fn view_2d(
+        &self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Tensor2D<'_>, InferenceError> {
+        let (data, shape) = self.get_f32_tensor(name)?;
+        if shape != [rows, cols] {
+            return Err(InferenceError::ShapeMismatch {
+                name: name.to_string(),
+                expected: vec![rows, cols],
+                actual: shape.to_vec(),
+            });
+        }
+        Ok(Tensor2D { data, rows, cols })
+    }
+
     /// **Unstable**: check whether a named tensor exists; method may be merged into tensor_shape.
     ///
     /// Whether the file contains a tensor.
@@ -781,15 +868,7 @@ impl SafetensorsFile {
     }
 
     fn tensor1d(&self, name: &str, len: usize) -> Result<Tensor1D<'_>, InferenceError> {
-        let (data, shape) = self.get_f32_tensor(name)?;
-        if shape != [len] {
-            return Err(InferenceError::ShapeMismatch {
-                name: name.to_string(),
-                expected: vec![len],
-                actual: shape.to_vec(),
-            });
-        }
-        Ok(Tensor1D { data, len })
+        self.view_1d(name, len)
     }
 
     fn tensor2d(
@@ -798,15 +877,7 @@ impl SafetensorsFile {
         rows: usize,
         cols: usize,
     ) -> Result<Tensor2D<'_>, InferenceError> {
-        let (data, shape) = self.get_f32_tensor(name)?;
-        if shape != [rows, cols] {
-            return Err(InferenceError::ShapeMismatch {
-                name: name.to_string(),
-                expected: vec![rows, cols],
-                actual: shape.to_vec(),
-            });
-        }
-        Ok(Tensor2D { data, rows, cols })
+        self.view_2d(name, rows, cols)
     }
 
     fn tensor1d_optional(&self, name: &str, len: usize) -> Result<Tensor1D<'_>, InferenceError> {
@@ -905,9 +976,6 @@ impl<'a> BertTensorReader<'a> {
         self.file.tensor2d_optional(&self.name(name), rows, cols)
     }
 }
-
-#[cfg(test)]
-mod bert_namespace_tests;
 
 /// **Unstable**: per-layer Qwen3 decoder weights; field set may change with model variants.
 ///

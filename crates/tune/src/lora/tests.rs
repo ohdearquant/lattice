@@ -551,7 +551,7 @@ mod validate_against_tests {
     use super::*;
     use lattice_inference::model::qwen35_config::Qwen35Config;
 
-    fn make_adapter_for_layer(
+    pub(super) fn make_adapter_for_layer(
         layer_idx: usize,
         module: &str,
         d_in: usize,
@@ -760,6 +760,8 @@ mod validate_against_tests {
     /// delegates to the inherent method instead of defaulting to the
     /// trait's no-op `Ok(())`, for both a mismatched and a matching
     /// adapter.
+    // Preserve the legacy trait override contract through 0.15.0.
+    #[allow(deprecated)]
     #[test]
     fn test_lora_hook_trait_validate_against_delegates_to_inherent_method() {
         use lattice_inference::lora_hook::LoraHook;
@@ -844,7 +846,7 @@ mod validate_against_bert_tests {
     const HIDDEN_SIZE: usize = 384;
     const INTERMEDIATE_SIZE: usize = 1536;
 
-    fn make_bert_adapter(module: &str, d_in: usize, d_out: usize) -> LoraAdapter {
+    pub(super) fn make_bert_adapter(module: &str, d_in: usize, d_out: usize) -> LoraAdapter {
         let rank = 4;
         let mut layers = HashMap::new();
         layers.insert(
@@ -937,6 +939,8 @@ mod validate_against_bert_tests {
         }
     }
 
+    // Preserve the legacy trait override contract through 0.15.0.
+    #[allow(deprecated)]
     #[test]
     fn test_lora_hook_trait_validate_against_bert_delegates_to_inherent_method() {
         use lattice_inference::lora_hook::LoraHook;
@@ -1245,5 +1249,117 @@ mod validate_against_bert_tests {
             !adapter.has_adapter(0, "query"),
             "an empty placeholder layer must not report as active"
         );
+    }
+}
+
+#[cfg(feature = "inference-hook")]
+mod validate_geometry_tests {
+    use super::*;
+    use lattice_inference::lora_hook::{BertLoraGeometry, LoraHook, Qwen35LoraGeometry};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
+
+    #[test]
+    fn neutral_qwen_validation_matches_legacy_cases_through_trait_object() {
+        let config = Qwen35Config::qwen35_0_8b();
+        let geometry = Qwen35LoraGeometry::new(&config);
+        for (layer, module, d_in, d_out, expected) in [
+            (3, "q_proj", 1024, 4096, true),
+            (999, "q_proj", 1024, 4096, false),
+            (3, "query", 1024, 4096, false),
+            (3, "q_proj", 1025, 4096, false),
+            (3, "q_proj", 1024, 4097, false),
+            (0, "q_proj", 1024, 4096, false),
+            (0, "gate_proj", 1024, 3584, true),
+            (0, "in_proj_a", 1024, 16, true),
+        ] {
+            let adapter =
+                super::validate_against_tests::make_adapter_for_layer(layer, module, d_in, d_out);
+            assert_eq!(
+                adapter.validate_against(&config).is_ok(),
+                expected,
+                "legacy {layer}/{module}"
+            );
+            assert_eq!(
+                adapter.validate_geometry(&geometry).is_ok(),
+                expected,
+                "neutral {layer}/{module}"
+            );
+            let hook: &dyn LoraHook = &adapter;
+            assert_eq!(
+                hook.validate_geometry(&geometry).is_ok(),
+                expected,
+                "trait {layer}/{module}"
+            );
+        }
+    }
+
+    #[test]
+    fn neutral_bert_validation_matches_legacy_cases_through_trait_object() {
+        let geometry = BertLoraGeometry::new(12, 384, 1536);
+        for (module, d_in, d_out, expected) in [
+            ("query", 384, 384, true),
+            ("key", 384, 384, true),
+            ("value", 384, 384, true),
+            ("attn_output", 384, 384, true),
+            ("ffn_intermediate", 384, 1536, true),
+            ("ffn_output", 1536, 384, true),
+            ("query", 385, 384, false),
+            ("query", 384, 385, false),
+            ("q_proj", 384, 384, false),
+        ] {
+            let adapter =
+                super::validate_against_bert_tests::make_bert_adapter(module, d_in, d_out);
+            assert_eq!(
+                adapter.validate_against_bert(12, 384, 1536).is_ok(),
+                expected,
+                "legacy {module}"
+            );
+            assert_eq!(
+                adapter.validate_geometry(&geometry).is_ok(),
+                expected,
+                "neutral {module}"
+            );
+            let hook: &dyn LoraHook = &adapter;
+            assert_eq!(
+                hook.validate_geometry(&geometry).is_ok(),
+                expected,
+                "trait {module}"
+            );
+        }
+        let adapter = super::validate_against_bert_tests::make_bert_adapter("query", 384, 384);
+        let empty = BertLoraGeometry::new(0, 384, 1536);
+        assert!(adapter.validate_against_bert(0, 384, 1536).is_err());
+        assert!(adapter.validate_geometry(&empty).is_err());
+        let hook: &dyn LoraHook = &adapter;
+        assert!(hook.validate_geometry(&empty).is_err());
+    }
+
+    #[test]
+    fn neutral_geometry_accepts_over_complete_rank() {
+        let rank = 5;
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["ffn_output".to_string()],
+                dtype: "f32".to_string(),
+            },
+            HashMap::from([(
+                (0, "ffn_output".to_string()),
+                LoraLayer {
+                    a: vec![0.0; rank * 7],
+                    b: vec![0.0; 3 * rank],
+                    d_in: 7,
+                    d_out: 3,
+                    rank,
+                },
+            )]),
+        )
+        .unwrap();
+        let geometry = BertLoraGeometry::new(1, 3, 7);
+        assert!(adapter.validate_against_bert(1, 3, 7).is_ok());
+        assert!(adapter.validate_geometry(&geometry).is_ok());
+        let hook: &dyn LoraHook = &adapter;
+        assert!(hook.validate_geometry(&geometry).is_ok());
     }
 }

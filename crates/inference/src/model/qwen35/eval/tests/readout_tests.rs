@@ -1,6 +1,7 @@
 //! Numerical and input-validation tests for requested prefill readouts.
 
 use super::*;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 
 fn readout_value_bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
@@ -484,7 +485,7 @@ fn readout_refuses_256_distinct_valid_rows_before_forward() {
 fn readout_forward_embedding_trap_is_live() {
     let model = readout_refusal_model();
     let mut gdn_states: Vec<GatedDeltaNetState> = (0..model.config.num_linear_attention_layers())
-        .map(|_| GatedDeltaNetState::new(&model.config))
+        .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&model.config)))
         .collect();
     let mut kv_cache = KvCache::new(model.config.num_full_attention_layers());
     let mut scratch = ForwardScratch::new();
@@ -563,11 +564,11 @@ fn readout_hidden_sibling_matches_original_post_norm_at_every_position() {
     let h = model.config.hidden_size;
     let mut original_states: Vec<GatedDeltaNetState> =
         (0..model.config.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(&model.config))
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&model.config)))
             .collect();
     let mut hidden_states: Vec<GatedDeltaNetState> =
         (0..model.config.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(&model.config))
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&model.config)))
             .collect();
     let mut original_kv = KvCache::new(model.config.num_full_attention_layers());
     let mut hidden_kv = KvCache::new(model.config.num_full_attention_layers());
@@ -605,7 +606,7 @@ fn readout_hidden_sibling_does_not_access_untied_head() {
     let model = build_model(test_config(), 0x0A71_0C01);
     let h = model.config.hidden_size;
     let mut states: Vec<GatedDeltaNetState> = (0..model.config.num_linear_attention_layers())
-        .map(|_| GatedDeltaNetState::new(&model.config))
+        .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&model.config)))
         .collect();
     let mut cache = KvCache::new(model.config.num_full_attention_layers());
     let mut scratch = ForwardScratch::new();
@@ -615,19 +616,25 @@ fn readout_hidden_sibling_does_not_access_untied_head() {
     let mut head_trap_model = build_model(test_config(), 0x0A71_0C01);
     head_trap_model.config.tie_word_embeddings = false;
     head_trap_model.weights.lm_head = Some(Vec::new());
-    let mut states: Vec<GatedDeltaNetState> =
-        (0..head_trap_model.config.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(&head_trap_model.config))
-            .collect();
+    let mut states: Vec<GatedDeltaNetState> = (0..head_trap_model
+        .config
+        .num_linear_attention_layers())
+        .map(|_| {
+            GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&head_trap_model.config))
+        })
+        .collect();
     let mut cache = KvCache::new(head_trap_model.config.num_full_attention_layers());
     let mut scratch = ForwardScratch::new();
     head_trap_model.forward_hidden_step(11, 0, &mut states, &mut cache, &mut scratch);
     readout_assert_exact(&scratch.hidden[..h], &expected, "hidden-only ignores head");
 
-    let mut states: Vec<GatedDeltaNetState> =
-        (0..head_trap_model.config.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(&head_trap_model.config))
-            .collect();
+    let mut states: Vec<GatedDeltaNetState> = (0..head_trap_model
+        .config
+        .num_linear_attention_layers())
+        .map(|_| {
+            GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&head_trap_model.config))
+        })
+        .collect();
     let mut cache = KvCache::new(head_trap_model.config.num_full_attention_layers());
     let mut scratch = ForwardScratch::new();
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

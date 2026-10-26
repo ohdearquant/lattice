@@ -246,7 +246,9 @@ fn bench_gdn() -> Vec<Metric> {
 
     // Warmup + reference
     let ref_us = {
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(
+            &qwen35_gdn_geometry(&cfg).expect("preset geometry is valid"),
+        );
         let mut scratch = GatedDeltaNetScratch::default();
         let mut output = vec![0.0f32; hidden];
         for _ in 0..10 {
@@ -276,7 +278,9 @@ fn bench_gdn() -> Vec<Metric> {
 
     // Warmup + fused
     let fused_us = {
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(
+            &qwen35_gdn_geometry(&cfg).expect("preset geometry is valid"),
+        );
         let mut scratch = GatedDeltaNetFusedScratch::default();
         let mut output = vec![0.0f32; hidden];
         for _ in 0..10 {

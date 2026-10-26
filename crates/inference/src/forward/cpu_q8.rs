@@ -795,6 +795,7 @@ mod scratch_bench;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::gdn::require_qwen35_gdn_geometry;
     use crate::decoder::standalone_cpu::parity;
     use crate::weights::q8_weights::matmul_bt_q8;
 
@@ -1075,7 +1076,7 @@ mod tests {
             out_proj: make_zero_q8(hidden, output_dim),
         };
 
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg));
         let mut scratch = GatedDeltaNetFusedScratch::default();
         let input = vec![0.0f32; hidden];
         let mut output = vec![0.0f32; hidden];
@@ -1295,7 +1296,7 @@ mod tests {
             out_proj: make_zero_q8(hidden, output_dim),
         };
 
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg));
         let mut scratch = GatedDeltaNetFusedScratch::default();
         let input = vec![0.0f32; hidden];
         let mut output = vec![0.0f32; hidden];
@@ -2572,7 +2573,7 @@ mod tests {
 
         let decode_two_steps = |scratch: &mut ForwardScratch| -> Vec<f32> {
             let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-                .map(|_| GatedDeltaNetState::new(&cfg))
+                .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
                 .collect();
             let mut kv_cache = KvCache::new(num_full);
 
