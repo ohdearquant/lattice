@@ -1601,6 +1601,7 @@ dependencies = [
  "proptest",
  "rayon",
  "rustc-hash 2.1.3",
+ "serde_json",
 ]
 
 [[package]]
@@ -1616,6 +1617,7 @@ dependencies = [
  "lattice-compute",
  "lattice-inference",
  "lattice-inference-core",
+ "lattice-model-embeddinggemma2",
  "lattice-tokenizer",
  "lattice-transport",
  "lattice-weights",
@@ -1681,6 +1683,7 @@ dependencies = [
  "lattice-grammar",
  "lattice-inference-core",
  "lattice-metal-runtime",
+ "lattice-model-embeddinggemma2",
  "lattice-model-io",
  "lattice-quant",
  "lattice-tokenizer",
@@ -1727,9 +1730,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-model-embeddinggemma2"
+version = "0.15.0"
+dependencies = [
+ "bytemuck",
+ "image",
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-inference-core",
+ "lattice-metal-runtime",
+ "lattice-model-io",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "metal 0.33.0",
+ "objc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "lattice-model-io"
 version = "0.15.0"
 dependencies = [
+ "image",
  "lattice-inference-core",
  "libc",
  "sha2",

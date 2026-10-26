@@ -16,6 +16,7 @@ members = [
     "crates/serve",
     "crates/compute",
     "crates/model-io",
+    "crates/models/embeddinggemma2",
 ]
 
 [workspace.package]
@@ -106,6 +107,19 @@ naga = { version = "24.0", features = ["wgsl-in"] }
 # pin one workspace-wide version instead of each re-pinning locally.
 http-body-util = "0.1"
 tower = "0.5"
+
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+metal = "0.33"
+objc = "0.2"
+
+lattice-arch = { version = "0.15.0", path = "crates/arch" }
+lattice-compute = { version = "0.15.0", path = "crates/compute" }
+lattice-inference-core = { version = "0.15.0", path = "crates/inference-core" }
+lattice-metal-runtime = { version = "0.15.0", path = "crates/metal-runtime" }
+lattice-model-io = { version = "0.15.0", path = "crates/model-io", default-features = false }
+lattice-tokenizer = { version = "0.15.0", path = "crates/tokenizer" }
+lattice-weights = { version = "0.15.0", path = "crates/weights" }
+lattice-model-embeddinggemma2 = { version = "0.15.0", path = "crates/models/embeddinggemma2" }
 
 [workspace.lints.clippy]
 # Correctness

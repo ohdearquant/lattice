@@ -27,8 +27,9 @@ esac
 #     -> tokenizer, grammar, weights, metal-runtime, model-io  depend on inference-core
 #       -> arch                       depends on inference-core, grammar, weights
 #         -> quant, compute           quant depends on inference-core, weights, arch; compute on inference-core, tokenizer, weights, arch
-#           -> inference              depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime
-#             -> embed                depends on inference
+#           -> embeddinggemma2        depends on arch, compute, inference-core, tokenizer, weights, model-io and optional metal-runtime
+#             -> inference            depends on embeddinggemma2 and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime
+#               -> embed              depends on inference and embeddinggemma2
 #             -> serve                depends on inference (exact version), fann, tokenizer, weights
 #             -> tune                 depends on fann, inference
 # Each tier waits for crates.io indexing before the next tier resolves it.
@@ -39,7 +40,7 @@ esac
 # exceeds 10 MiB, and a rejection in tier 2 leaves tier 1 already published and
 # immutable. `cargo publish --dry-run` does not cover this: it can only validate
 # the leaf tier, because a crate whose internal path dependencies are not yet
-# live on the registry cannot be packaged at all. Measure all fifteen first.
+# live on the registry cannot be packaged at all. Measure every publishable workspace member first.
 echo "--- Pre-publish: package size against the crates.io upload limit ---"
 "$(dirname "$0")/package-size-check.sh"
 
@@ -89,7 +90,15 @@ if [ -z "$FLAG" ]; then
     sleep 30
 fi
 
-echo "--- Tier 5: inference (depends on fann, inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime) ---"
+echo "--- Tier 5: model family (depends on arch, compute and lower crates) ---"
+cargo publish -p lattice-model-embeddinggemma2 $FLAG
+
+if [ -z "$FLAG" ]; then
+    echo "Waiting for crates.io indexing..."
+    sleep 30
+fi
+
+echo "--- Tier 6: inference (depends on the model family and lower crates) ---"
 cargo publish -p lattice-inference $FLAG
 
 if [ -z "$FLAG" ]; then
@@ -97,7 +106,7 @@ if [ -z "$FLAG" ]; then
     sleep 30
 fi
 
-echo "--- Tier 6: dependent crates (depend on inference) ---"
+echo "--- Tier 7: dependent crates (depend on inference) ---"
 cargo publish -p lattice-embed $FLAG
 cargo publish -p lattice-tune $FLAG
 cargo publish -p lattice-serve $FLAG

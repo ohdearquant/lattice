@@ -28,6 +28,7 @@ mod decode_budget;
 pub mod decoder;
 pub mod embeddinggemma2_config;
 pub mod encoder;
+mod encoder_support;
 pub mod family;
 pub mod gemma4_config;
 pub mod generation;
@@ -45,6 +46,11 @@ mod stop_strings;
 #[doc(hidden)]
 pub mod __internal {
     use lattice_inference_core::InferenceError;
+
+    /// Numeric validation shared by encoder adapters.
+    pub mod encoder {
+        pub use crate::encoder_support::{output_dimension, pair, usage};
+    }
 
     pub use crate::decode_budget::decode_cap;
     pub use crate::generation::{

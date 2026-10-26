@@ -12,55 +12,16 @@ pub use lattice_arch::encoder::{
 };
 
 use crate::error::InferenceError;
-use crate::model::embeddinggemma2::EmbeddingGemma2Model;
 use crate::model::{BertModel, QwenModel};
 use crate::pool::BertPooling;
 use crate::tokenizer::EmbeddingTokenCounts;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-fn output_dimension(width: usize, model: &str) -> Result<NonZeroUsize, InferenceError> {
-    NonZeroUsize::new(width)
-        .ok_or_else(|| InferenceError::InvalidInput(format!("{model} has output dimension 0")))
-}
+use lattice_arch::__internal::encoder::{output_dimension, pair};
 
 fn usage(counts: EmbeddingTokenCounts) -> Result<TokenUsage, InferenceError> {
-    TokenUsage::new(counts.before_truncation, counts.embedded).ok_or_else(|| {
-        InferenceError::Inference(format!(
-            "token counts report {} embedded tokens of {}",
-            counts.embedded, counts.before_truncation
-        ))
-    })
-}
-
-/// Pairs each vector with its input's counts, refusing the whole call when the model returned a
-/// different number of vectors or a vector of another length.
-fn pair(
-    vectors: Vec<Vec<f32>>,
-    usages: Vec<TokenUsage>,
-    dimension: NonZeroUsize,
-) -> Result<Vec<EncodedText>, InferenceError> {
-    if vectors.len() != usages.len() {
-        return Err(InferenceError::Inference(format!(
-            "the model returned {} vectors for {} inputs",
-            vectors.len(),
-            usages.len()
-        )));
-    }
-    vectors
-        .into_iter()
-        .zip(usages)
-        .map(|(vector, usage)| {
-            if vector.len() == dimension.get() {
-                Ok(EncodedText::new(vector, usage))
-            } else {
-                Err(InferenceError::Inference(format!(
-                    "the model returned a vector of length {} for output dimension {dimension}",
-                    vector.len()
-                )))
-            }
-        })
-        .collect()
+    lattice_arch::__internal::encoder::usage(counts.before_truncation, counts.embedded)
 }
 
 /// A BERT-family model behind [`Encoder`]: mean or first-token pooling as the model is set, L2
@@ -181,63 +142,6 @@ impl Encoder for QwenEncoder {
     }
 }
 
-/// An EmbeddingGemma 2 model behind [`Encoder`]: mean pooling, L2 normalized, truncated to the
-/// chosen output dimension and normalized again, one tokenization per input whose ids are the
-/// ones embedded.
-pub struct EmbeddingGemma2Encoder {
-    model: Arc<EmbeddingGemma2Model>,
-    capabilities: EncoderCapabilities,
-    identity: EncoderIdentity,
-}
-
-impl EmbeddingGemma2Encoder {
-    /// Wraps a loaded model, embedding at `output_dim` leading dimensions, or at the model's
-    /// native width when `None`.
-    ///
-    /// # Errors
-    ///
-    /// [`InferenceError::InvalidInput`] when `output_dim` is 0 or above the native width.
-    pub fn new(
-        model: Arc<EmbeddingGemma2Model>,
-        output_dim: Option<usize>,
-    ) -> Result<Self, InferenceError> {
-        let width = output_dim.unwrap_or_else(|| model.dimensions());
-        model.check_widths(&[width])?;
-        let dimension = output_dimension(width, "the EmbeddingGemma 2 model")?;
-        Ok(Self {
-            capabilities: EncoderCapabilities::text(model.max_tokens().and_then(NonZeroUsize::new)),
-            identity: EncoderIdentity::new(Pooling::Mean, Normalization::L2, dimension)
-                .with_variant("cpu f32"),
-            model,
-        })
-    }
-}
-
-impl Encoder for EmbeddingGemma2Encoder {
-    fn capabilities(&self) -> &EncoderCapabilities {
-        &self.capabilities
-    }
-
-    fn output_dimension(&self) -> NonZeroUsize {
-        self.identity.output_dimension()
-    }
-
-    fn identity(&self) -> &EncoderIdentity {
-        &self.identity
-    }
-
-    fn encode_texts(&self, prepared: &[&str]) -> Result<Vec<EncodedText>, InferenceError> {
-        let dimension = self.output_dimension();
-        let mut vectors = Vec::with_capacity(prepared.len());
-        let mut usages = Vec::with_capacity(prepared.len());
-        for text in prepared {
-            let (ids, counts) = self.model.tokenize_with_counts(text)?;
-            usages.push(usage(counts)?);
-            vectors.push(self.model.encode_ids(&ids, Some(dimension.get()))?);
-        }
-        pair(vectors, usages, dimension)
-    }
-}
-
-#[cfg(test)]
-mod tests;
+#[cfg(feature = "embeddinggemma2")]
+#[doc(inline)]
+pub use lattice_model_embeddinggemma2::encoder::EmbeddingGemma2Encoder;

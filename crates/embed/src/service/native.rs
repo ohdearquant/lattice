@@ -10,8 +10,8 @@ use super::{
 use crate::error::{EmbedError, Result};
 use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
-use lattice_inference::model::embeddinggemma2::EmbeddingGemma2Model;
 use lattice_inference::{BertModel, QwenModel};
+use lattice_model_embeddinggemma2::model::EmbeddingGemma2Model;
 use lattice_tokenizer::EmbeddingTokenCounts;
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};

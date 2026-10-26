@@ -1,0 +1,40 @@
+[package]
+name = "lattice-model-embeddinggemma2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "EmbeddingGemma 2 text and image encoders with optional Metal execution"
+keywords = ["embeddings", "gemma", "inference", "metal"]
+categories = ["science", "algorithms"]
+
+[features]
+default = []
+image = ["dep:image", "lattice-model-io/image"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu"]
+
+[dependencies]
+lattice-arch.workspace = true
+lattice-compute.workspace = true
+lattice-inference-core.workspace = true
+lattice-model-io.workspace = true
+lattice-tokenizer.workspace = true
+lattice-weights.workspace = true
+image = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { workspace = true, optional = true }
+objc = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+lattice-metal-runtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

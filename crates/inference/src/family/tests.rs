@@ -351,6 +351,7 @@ fn the_registry_resolves_each_family_by_kind() {
         name(ResolveKey::ModelType("bert"), ModelKind::Encoder),
         Ok("bert")
     );
+    #[cfg(feature = "embeddinggemma2")]
     assert_eq!(
         name(ResolveKey::Family("embeddinggemma2"), ModelKind::Encoder),
         Ok("embeddinggemma2")
@@ -380,6 +381,17 @@ fn the_registry_resolves_each_family_by_kind() {
     );
     assert!(
         BERT.load_encoder(&LoadRequest::new("/nonexistent"))
+            .is_err()
+    );
+}
+
+#[cfg(not(feature = "embeddinggemma2"))]
+#[test]
+fn registry_omits_disabled_embeddinggemma2() {
+    assert!(
+        registry()
+            .unwrap()
+            .resolve(ResolveKey::Family("embeddinggemma2"), ModelKind::Encoder)
             .is_err()
     );
 }
