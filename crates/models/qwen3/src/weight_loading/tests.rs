@@ -575,3 +575,27 @@ fn every_adjacent_read_keeps_its_recipe_precedence() {
         }
     }
 }
+#[test]
+#[allow(deprecated)]
+fn rank_zero_embedding_is_a_shape_error_in_every_loader() {
+    let mut entries = tensors();
+    let embed = entries
+        .iter_mut()
+        .find(|tensor| tensor.name == "embed_tokens.weight")
+        .unwrap();
+    embed.shape = vec![];
+    embed.values = vec![1.0];
+    let checkpoint = Checkpoint::new(&entries);
+    let source = checkpoint.single();
+    let mut sharded = checkpoint.sharded();
+    for error in [
+        borrowed(&source).unwrap_err(),
+        source.load_qwen_weights(2, 2, 3, 1, 1, 3).unwrap_err(),
+        owned(&mut sharded).unwrap_err(),
+        sharded
+            .load_qwen_weights_owned(2, 2, 3, 1, 1, 3)
+            .unwrap_err(),
+    ] {
+        assert_shape(error, "embed_tokens.weight", &[0, 2], &[]);
+    }
+}

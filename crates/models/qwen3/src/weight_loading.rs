@@ -42,7 +42,10 @@ pub fn load_weights(
     if embed_shape.len() != 2 || embed_shape[1] != hidden_size {
         return Err(InferenceError::ShapeMismatch {
             name: "embed_tokens.weight".into(),
-            expected: vec![embed_shape[0], hidden_size],
+            expected: vec![
+                embed_shape.first().copied().unwrap_or_default(),
+                hidden_size,
+            ],
             actual: embed_shape.to_vec(),
         });
     }
@@ -339,7 +342,10 @@ pub fn load_owned_weights(
     if embed_shape.len() != 2 || embed_shape[1] != hidden_size {
         return Err(InferenceError::ShapeMismatch {
             name: "embed_tokens.weight".into(),
-            expected: vec![embed_shape[0], hidden_size],
+            expected: vec![
+                embed_shape.first().copied().unwrap_or_default(),
+                hidden_size,
+            ],
             actual: embed_shape,
         });
     }

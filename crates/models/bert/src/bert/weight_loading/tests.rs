@@ -668,3 +668,24 @@ fn bert_zero_dimension_requests_preserve_legacy_preflight_and_errors() {
         assert_missing(error, "bert.encoder.layer.0.intermediate.dense.weight");
     }
 }
+
+#[test]
+fn bert_rank_zero_shape_guards_return_shape_errors() {
+    for name in [
+        "embeddings.word_embeddings.weight",
+        "embeddings.position_embeddings.weight",
+        "embeddings.token_type_embeddings.weight",
+        "encoder.layer.0.intermediate.dense.weight",
+    ] {
+        let mut tensors = fixture::checkpoint("", false);
+        let tensor = tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == name)
+            .unwrap();
+        *tensor = fixture::Tensor::new(name, &[], vec![1.0]);
+        let source = source_from(&tensors);
+        for error in bert_errors(&source) {
+            assert_shape(error, name, &[0, fixture::HIDDEN], &[]);
+        }
+    }
+}
