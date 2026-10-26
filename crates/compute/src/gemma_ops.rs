@@ -283,6 +283,13 @@ pub fn vision_axial_rope_apply(
 /// `modeling_gemma4.py:1601-1602` and applied after being cast to the
 /// embedding weight's dtype -- computed and applied here in f32 throughout,
 /// matching this stage's f32 reference).
+///
+/// For nonzero `hidden`, every ID must index a row of `embed_weight`.
+///
+/// # Panics
+///
+/// Panics if the output length is not `ids.len() * hidden`, the weights do not
+/// contain whole hidden-sized rows, or an ID is out of range for nonzero `hidden`.
 pub fn gemma4_scaled_embedding(ids: &[u32], embed_weight: &[f32], hidden: usize, out: &mut [f32]) {
     assert_eq!(
         out.len(),
@@ -293,8 +300,15 @@ pub fn gemma4_scaled_embedding(ids: &[u32], embed_weight: &[f32], hidden: usize,
         embed_weight.len().is_multiple_of(hidden),
         "embed_weight must be a whole number of hidden-sized rows"
     );
+    let rows = embed_weight.len().checked_div(hidden);
     let scale = (hidden as f32).sqrt();
     for (t, &id) in ids.iter().enumerate() {
+        if let Some(rows) = rows {
+            assert!(
+                (id as usize) < rows,
+                "embedding id {id} at row {t} must be less than {rows} embedding rows"
+            );
+        }
         let row_start = id as usize * hidden;
         let row = &embed_weight[row_start..row_start + hidden];
         let out_row = &mut out[t * hidden..(t + 1) * hidden];

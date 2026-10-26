@@ -418,6 +418,16 @@ fn scaled_embedding_matches_hf_golden() {
 }
 
 #[test]
+#[should_panic(expected = "embedding id 2 at row 1 must be less than 2 embedding rows")]
+fn scaled_embedding_rejects_id_equal_to_embedding_rows() {
+    let ids = [0, 2];
+    let embed_weight = [0.0f32; 4];
+    let mut out = [0.0f32; 4];
+
+    gemma4_scaled_embedding(&ids, &embed_weight, 2, &mut out);
+}
+
+#[test]
 fn logit_softcap_matches_hf_golden() {
     let fx = load_json("logit_softcap.json");
     let tol = tolerance("logit_softcap");
