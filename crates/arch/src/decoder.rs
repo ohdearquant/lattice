@@ -18,12 +18,19 @@
 //! order, a prediction id that is stale, consumed or minted by another session's ledger, and any
 //! call after `finish`, before they change the session's state.
 //!
+//! **Loaded owners.** [`DecoderModel`] is a loaded model that opens sessions: each
+//! [`DecoderModel::session`] borrows the owner and one [`SessionRequest`] for the session's
+//! lifetime, and the driver reads its prompt, configuration and token policy from that same
+//! request. A loaded owner is local to the worker that loaded it; a consumer moves the loader and
+//! its [`crate::family::LoadRequest`] across threads, never the owner or a session.
+//!
 //! The speculative extension (the typed draft-verification protocol the Qwen Metal routes use)
 //! stays internal and is not part of this module.
 
 use crate::error::InferenceError;
 use crate::generation::{GenerateConfig, TopLogprob};
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The autoregressive driver (ADR-090 row C): one loop over `&mut dyn DecoderSession`
@@ -647,6 +654,140 @@ pub trait DecoderSession {
 
     /// Ends the request and its live prediction, if any. See [`FinishDisposition`].
     fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError>;
+}
+
+// ---------------------------------------------------------------------------
+// SessionRequest / DecoderModel
+// ---------------------------------------------------------------------------
+
+/// One admitted generation request: the prompt token ids, the generation configuration and the
+/// token policy of the model family, owned so that the session and the driver read the same
+/// values.
+///
+/// The token policy is the end-of-sequence id and, when a reasoning budget is enforced, the id of
+/// the token that closes a reasoning block together with the table of tokens that end a line
+/// (indexed by token id). [`driver::run`] takes them as `eos_token_id`, `think_close_id` and
+/// `reasoning_newline_boundary`. A [`DecoderModel`] refuses a request whose policy disagrees with
+/// the loaded model.
+#[derive(Clone)]
+pub struct SessionRequest {
+    prompt_ids: Vec<u32>,
+    config: GenerateConfig,
+    eos_token_id: u32,
+    think_close_id: Option<u32>,
+    reasoning_newline_boundary: Option<Arc<[bool]>>,
+}
+
+impl SessionRequest {
+    /// A request for `prompt_ids` under `config`, ending at `eos_token_id`, with no reasoning
+    /// close token.
+    pub fn new(prompt_ids: Vec<u32>, config: GenerateConfig, eos_token_id: u32) -> Self {
+        Self {
+            prompt_ids,
+            config,
+            eos_token_id,
+            think_close_id: None,
+            reasoning_newline_boundary: None,
+        }
+    }
+
+    /// Sets the token that closes a reasoning block and the table of line-ending tokens, both
+    /// needed to enforce `config.reasoning_budget`.
+    pub fn with_reasoning_close(
+        mut self,
+        think_close_id: u32,
+        newline_boundary: Arc<[bool]>,
+    ) -> Self {
+        self.think_close_id = Some(think_close_id);
+        self.reasoning_newline_boundary = Some(newline_boundary);
+        self
+    }
+
+    /// The prompt token ids.
+    pub fn prompt_ids(&self) -> &[u32] {
+        &self.prompt_ids
+    }
+
+    /// The generation configuration.
+    pub fn config(&self) -> &GenerateConfig {
+        &self.config
+    }
+
+    /// The end-of-sequence token id.
+    pub const fn eos_token_id(&self) -> u32 {
+        self.eos_token_id
+    }
+
+    /// The token that closes a reasoning block, if set.
+    pub const fn think_close_id(&self) -> Option<u32> {
+        self.think_close_id
+    }
+
+    /// Whether each token id ends a line, if a reasoning close token is set.
+    pub fn reasoning_newline_boundary(&self) -> Option<&Arc<[bool]>> {
+        self.reasoning_newline_boundary.as_ref()
+    }
+}
+
+/// Turns a loaded model's token ids into text.
+///
+/// Read-only over the model's tokenizer: it decodes and streams, and has no way to change the
+/// tokenizer or reach the model that handed it out. A consumer holds it beside a session, which
+/// borrows the model mutably, so that borrow stays the only one.
+pub trait TextDecoder: Send + Sync {
+    /// The text of `ids`. Bytes that do not form valid UTF-8 are replaced with U+FFFD.
+    fn decode(&self, ids: &[u32]) -> String;
+
+    /// A new incremental decoder for one generated sequence.
+    fn stream(&self) -> Box<dyn TextStream + '_>;
+}
+
+/// Incremental decoding of one generated sequence, token by token.
+pub trait TextStream {
+    /// Appends to `out` the text that `id` completes. Bytes of a character that a later token
+    /// may complete are held back. This is the shape [`driver::run_into`] takes for its
+    /// `decode_delta`, which clears the buffer before each call.
+    fn push_into(&mut self, id: u32, out: &mut String);
+
+    /// The bytes still held back at the end of the sequence, with invalid UTF-8 replaced by
+    /// U+FFFD; empty when none are held.
+    fn finish(&mut self) -> String;
+}
+
+/// A loaded decoder model that opens [`DecoderSession`]s.
+///
+/// No `Send` or `Sync` requirement: an owner may hold thread-bound backend state, and is loaded,
+/// used and dropped on one worker. A session borrows the owner mutably for its whole life, so an
+/// owner runs one session at a time.
+pub trait DecoderModel {
+    /// Tokenizes `prompt` and resolves the model's token policy for `config` into a request
+    /// that [`DecoderModel::session`] accepts.
+    ///
+    /// The request is owned and borrows nothing from `self`: a caller admits with `&self`,
+    /// keeps the request, and then passes it to `session`, which borrows the owner mutably.
+    ///
+    /// When `config.max_new_tokens` is 0 nothing will be generated, so neither the context
+    /// budget nor the reasoning close token is checked, and the request carries no close token.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::Inference`] when `prompt` tokenizes to no tokens, and when the prompt's
+    /// token count plus the decode cap of `config` exceeds the loaded model's context window.
+    /// [`InferenceError::InvalidInput`] when `config` enforces a reasoning budget and the model
+    /// has no usable token that closes a reasoning block.
+    fn admit(&self, prompt: &str, config: GenerateConfig)
+    -> Result<SessionRequest, InferenceError>;
+
+    /// The decoder of this model's token ids, shared with the model.
+    fn text(&self) -> Arc<dyn TextDecoder>;
+
+    /// Opens a session for `request`. Refuses, before allocating session state, a request the
+    /// loaded model cannot serve: an empty prompt, a token id outside the vocabulary, a token
+    /// policy that differs from the model's, or a prompt and decode budget past its context.
+    fn session<'m>(
+        &'m mut self,
+        request: &'m SessionRequest,
+    ) -> Result<Box<dyn DecoderSession + 'm>, InferenceError>;
 }
 
 #[cfg(test)]
