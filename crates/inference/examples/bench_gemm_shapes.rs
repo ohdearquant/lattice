@@ -415,10 +415,10 @@ fn build_q4_tiled_pipeline(device: &metal::Device) -> Result<metal::ComputePipel
 /// for the other kernels they define.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn matmul_source() -> String {
-    concat!(
-        include_str!("../src/forward/shaders/rms_reduce.metal"),
-        include_str!("../src/forward/shaders/flash_attention.metal"),
-        include_str!("../src/forward/shaders/ernie45_rope.metal"),
+    lattice_metal_runtime::concat_msl!(
+        lattice_metal_runtime::msl::RMS_REDUCE,
+        lattice_metal_runtime::msl::FLASH_ATTENTION,
+        lattice_metal_runtime::msl::ERNIE45_ROPE,
         include_str!("../src/forward/shaders/embeddinggemma2.metal"),
     )
     .replace("__FA_HEAD_DIM__", "128")
