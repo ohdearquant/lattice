@@ -1742,7 +1742,7 @@ dependencies = [
  "lattice-model-io",
  "lattice-tokenizer",
  "lattice-weights",
- "metal",
+ "metal 0.33.0",
  "objc",
  "serde",
  "serde_json",

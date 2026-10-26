@@ -60,6 +60,14 @@ fn load_bin(fx: &serde_json::Value, key: &str) -> Vec<f32> {
         .collect()
 }
 
+fn flatten_u32(v: &serde_json::Value) -> Vec<u32> {
+    match v {
+        serde_json::Value::Array(items) => items.iter().flat_map(flatten_u32).collect(),
+        serde_json::Value::Number(n) => vec![n.as_u64().expect("integer fixture value") as u32],
+        other => panic!("expected number or array in fixture, got {other:?}"),
+    }
+}
+
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "compared slices must have equal length");
     a.iter()

@@ -2398,69 +2398,72 @@ mod model_io_parity {
 }
 
 #[cfg(feature = "embeddinggemma2")]
-#[test]
-fn embeddinggemma2_items_keep_the_same_identity() {
-    macro_rules! same_type {
-        ($facade:ty, $family:ty) => {
-            let _: fn($facade) -> $family = |value| value;
-            let _: fn($family) -> $facade = |value| value;
-        };
+mod embeddinggemma2_parity {
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    #[test]
+    fn embeddinggemma2_items_keep_the_same_identity() {
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2Task>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2Task>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2Part>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2Part>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2PartCounts>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2PartCounts>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2PartsEncoding>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2PartsEncoding>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2ImageStages>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2ImageStages>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2Model>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2Model>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::EmbeddingGemma2Model>,
+            PhantomData::<lattice_model_embeddinggemma2::EmbeddingGemma2Model>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2_image::EmbeddingGemma2Rgb8Image>,
+            PhantomData::<lattice_model_embeddinggemma2::image::EmbeddingGemma2Rgb8Image>,
+        );
+        same_type(
+            PhantomData::<
+                lattice_inference::forward::metal_embeddinggemma2::MetalEmbeddingGemma2State,
+            >,
+            PhantomData::<lattice_model_embeddinggemma2::metal::MetalEmbeddingGemma2State>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::forward::metal_embeddinggemma2::VisionTimings>,
+            PhantomData::<lattice_model_embeddinggemma2::metal::VisionTimings>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::encoder::EmbeddingGemma2Encoder>,
+            PhantomData::<lattice_model_embeddinggemma2::encoder::EmbeddingGemma2Encoder>,
+        );
+        let _: fn(&str, &str) -> String =
+            lattice_inference::model::embeddinggemma2::format_titled_document;
+        let _: fn(&str, &str) -> String =
+            lattice_model_embeddinggemma2::model::format_titled_document;
+        assert_eq!(
+            lattice_inference::model::embeddinggemma2::EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS,
+            lattice_model_embeddinggemma2::model::EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS
+        );
+        assert!(std::ptr::eq(
+            &lattice_inference::family::EMBEDDING_GEMMA2,
+            &lattice_model_embeddinggemma2::family::EMBEDDING_GEMMA2
+        ));
     }
-    same_type!(
-        lattice_inference::model::embeddinggemma2::EmbeddingGemma2Task,
-        lattice_model_embeddinggemma2::model::EmbeddingGemma2Task
-    );
-    same_type!(
-        lattice_inference::model::embeddinggemma2::EmbeddingGemma2Part,
-        lattice_model_embeddinggemma2::model::EmbeddingGemma2Part
-    );
-    same_type!(
-        lattice_inference::model::embeddinggemma2::EmbeddingGemma2PartCounts,
-        lattice_model_embeddinggemma2::model::EmbeddingGemma2PartCounts
-    );
-    same_type!(
-        lattice_inference::model::embeddinggemma2::EmbeddingGemma2PartsEncoding,
-        lattice_model_embeddinggemma2::model::EmbeddingGemma2PartsEncoding
-    );
-    same_type!(
-        lattice_inference::model::embeddinggemma2::EmbeddingGemma2ImageStages,
-        lattice_model_embeddinggemma2::model::EmbeddingGemma2ImageStages
-    );
-    same_type!(
-        lattice_inference::model::embeddinggemma2::EmbeddingGemma2Model,
-        lattice_model_embeddinggemma2::model::EmbeddingGemma2Model
-    );
-    same_type!(
-        lattice_inference::model::EmbeddingGemma2Model,
-        lattice_model_embeddinggemma2::EmbeddingGemma2Model
-    );
-    same_type!(
-        lattice_inference::model::embeddinggemma2_image::EmbeddingGemma2Rgb8Image,
-        lattice_model_embeddinggemma2::image::EmbeddingGemma2Rgb8Image
-    );
-    same_type!(
-        lattice_inference::forward::metal_embeddinggemma2::MetalEmbeddingGemma2State,
-        lattice_model_embeddinggemma2::metal::MetalEmbeddingGemma2State
-    );
-    same_type!(
-        lattice_inference::forward::metal_embeddinggemma2::VisionTimings,
-        lattice_model_embeddinggemma2::metal::VisionTimings
-    );
-    same_type!(
-        lattice_inference::encoder::EmbeddingGemma2Encoder,
-        lattice_model_embeddinggemma2::encoder::EmbeddingGemma2Encoder
-    );
-    let _: fn(&str, &str) -> String =
-        lattice_inference::model::embeddinggemma2::format_titled_document;
-    let _: fn(&str, &str) -> String = lattice_model_embeddinggemma2::model::format_titled_document;
-    assert_eq!(
-        lattice_inference::model::embeddinggemma2::EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS,
-        lattice_model_embeddinggemma2::model::EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS
-    );
-    assert!(std::ptr::eq(
-        &lattice_inference::family::EMBEDDING_GEMMA2,
-        &lattice_model_embeddinggemma2::family::EMBEDDING_GEMMA2
-    ));
 }
 
 #[test]

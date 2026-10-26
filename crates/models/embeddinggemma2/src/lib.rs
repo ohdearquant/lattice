@@ -1,5 +1,9 @@
 //! EmbeddingGemma 2 text and image encoders with optional Metal execution.
 
+// The code moved here from `lattice-inference` keeps that crate's lint policy: kernel and
+// constructor signatures take many scalar dimensions, and index loops address several arrays.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 pub mod config;
 pub mod encoder;
 pub mod family;

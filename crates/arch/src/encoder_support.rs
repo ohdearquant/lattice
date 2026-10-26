@@ -14,8 +14,7 @@ pub fn output_dimension(width: usize, model: &str) -> Result<NonZeroUsize, Infer
 pub fn usage(before_truncation: usize, embedded: usize) -> Result<TokenUsage, InferenceError> {
     TokenUsage::new(before_truncation, embedded).ok_or_else(|| {
         InferenceError::Inference(format!(
-            "token counts report {} embedded tokens of {}",
-            embedded, before_truncation
+            "token counts report {embedded} embedded tokens of {before_truncation}"
         ))
     })
 }
