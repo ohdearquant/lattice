@@ -15,7 +15,7 @@ all-features = true
 
 [dependencies]
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
-lattice-model-config = { version = "0.15.0", path = "../model-config" }
+lattice-arch = { version = "0.15.0", path = "../arch" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
 memmap2 = "0.9"
 serde = { workspace = true }

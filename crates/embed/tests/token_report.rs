@@ -18,7 +18,7 @@
 
 use lattice_embed::{EmbeddingModel, EmbeddingRole, EmbeddingService, NativeEmbeddingService};
 use lattice_inference::model::embeddinggemma2::EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS;
-use lattice_inference::{GemmaBpeTokenizer, Tokenizer, load_tokenizer};
+use lattice_tokenizer::{GemmaBpeTokenizer, Tokenizer, load_tokenizer};
 use std::path::PathBuf;
 
 const QWEN_EOS_TOKEN_ID: u32 = 151_643;

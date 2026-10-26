@@ -107,31 +107,25 @@ pub(crate) enum MetalEntryProfile {
 /// The direct entry refuses `reasoning_budget` and `logprobs` before
 /// tokenization-dependent work (`GenerationEntryContract::MetalDirect`) and
 /// wires grammar masking and a stop-string matcher itself.
-const DIRECT_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
-    grammar: true,
-    logprobs: false,
-    stop_strings: true,
-    reasoning_budget: false,
-};
+const DIRECT_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::none()
+    .with_grammar(true)
+    .with_stop_strings(true);
 
 /// The streaming entry refuses none of the four controls
 /// (`GenerationEntryContract::MetalStreaming`) and wires all of them.
-const STREAMING_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
-    grammar: true,
-    logprobs: true,
-    stop_strings: true,
-    reasoning_budget: true,
-};
+const STREAMING_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::none()
+    .with_grammar(true)
+    .with_logprobs(true)
+    .with_stop_strings(true)
+    .with_reasoning_budget(true);
 
 /// The prefix-cache entry refuses `logprobs` and `enable_mtp`
 /// (`GenerationEntryContract::MetalPrefixCacheStreaming`) and wires grammar
 /// masking, stop strings and the reasoning budget like the streaming entry.
-const PREFIX_CACHE_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
-    grammar: true,
-    logprobs: false,
-    stop_strings: true,
-    reasoning_budget: true,
-};
+const PREFIX_CACHE_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::none()
+    .with_grammar(true)
+    .with_stop_strings(true)
+    .with_reasoning_budget(true);
 
 /// Readback route for every forward pass of one request. See the module doc
 /// comment.
@@ -396,7 +390,7 @@ impl<'state> QwenMetalSession<'state> {
             suffix_start,
             rng_state: plan.rng_state,
             temperature: gen_cfg.temperature,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new()?,
             readback: Readback::Empty,
             prefill_token_pending: false,
             route_engaged,
@@ -456,10 +450,7 @@ impl DecoderSession for QwenMetalSession<'_> {
             ReadbackMode::Dense | ReadbackMode::GreedyArgmax => Readback::Dense(logits),
         };
         self.prefill_token_pending = true;
-        Ok(StepStamp {
-            evaluated_len: self.state.session.position(),
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.state.session.position(), None))
     }
 
     /// Consumes `accepted.prediction`, then runs one decode forward pass at
@@ -501,10 +492,7 @@ impl DecoderSession for QwenMetalSession<'_> {
             ),
         };
 
-        Ok(StepStamp {
-            evaluated_len: self.state.session.position(),
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.state.session.position(), None))
     }
 
     /// Samples the next candidate from the current readback and opens a
@@ -572,11 +560,11 @@ impl DecoderSession for QwenMetalSession<'_> {
             }
             Readback::Argmax(id) => *id,
         };
-        let prediction = self.ledger.open();
-        Ok(SelectOutcome::Candidate(SelectionCandidate {
+        let prediction = self.ledger.open()?;
+        Ok(SelectOutcome::Candidate(SelectionCandidate::new(
             candidate_id,
             prediction,
-        }))
+        )))
     }
 
     /// Scores `final_token` against the live prediction's dense logits, after
@@ -590,6 +578,11 @@ impl DecoderSession for QwenMetalSession<'_> {
         final_token: u32,
         request: &MetadataRequest,
     ) -> Result<TokenMetadata, InferenceError> {
+        let Some(top_n) = request.top_logprobs else {
+            return Err(InferenceError::InvalidInput(
+                "metadata capture is disabled in this request".into(),
+            ));
+        };
         if !self.ledger.is_live(prediction) {
             return Err(PredictionError::Stale.into());
         }
@@ -599,18 +592,14 @@ impl DecoderSession for QwenMetalSession<'_> {
                 self.mode
             )));
         };
-        let (final_logprob, top) = compute_step_logprobs(
-            logits,
-            final_token,
-            self.temperature,
-            request.top_logprobs.unwrap_or(0),
-        );
-        Ok(TokenMetadata {
+        let (final_logprob, top) =
+            compute_step_logprobs(logits, final_token, self.temperature, top_n);
+        Ok(TokenMetadata::new(
             prediction,
-            final_token_id: final_token,
+            final_token,
             final_logprob,
             top,
-        })
+        ))
     }
 
     /// Tears down the compact route and ends the live prediction, whatever
@@ -1159,30 +1148,24 @@ mod tests {
     fn capabilities_mirror_each_entry_profiles_refusals() {
         assert_eq!(
             DIRECT_CAPABILITIES,
-            ExecutionCapabilities {
-                grammar: true,
-                logprobs: false,
-                stop_strings: true,
-                reasoning_budget: false,
-            }
+            ExecutionCapabilities::none()
+                .with_grammar(true)
+                .with_stop_strings(true)
         );
         assert_eq!(
             STREAMING_CAPABILITIES,
-            ExecutionCapabilities {
-                grammar: true,
-                logprobs: true,
-                stop_strings: true,
-                reasoning_budget: true,
-            }
+            ExecutionCapabilities::none()
+                .with_grammar(true)
+                .with_logprobs(true)
+                .with_stop_strings(true)
+                .with_reasoning_budget(true)
         );
         assert_eq!(
             PREFIX_CACHE_CAPABILITIES,
-            ExecutionCapabilities {
-                grammar: true,
-                logprobs: false,
-                stop_strings: true,
-                reasoning_budget: true,
-            }
+            ExecutionCapabilities::none()
+                .with_grammar(true)
+                .with_stop_strings(true)
+                .with_reasoning_budget(true)
         );
     }
 
@@ -1202,23 +1185,21 @@ mod tests {
     };
 
     fn greedy() -> GenerateConfig {
-        GenerateConfig {
-            temperature: 0.0,
-            top_k: 1,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
-        }
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config
     }
 
     fn sampled_block_topk() -> GenerateConfig {
-        GenerateConfig {
-            temperature: 0.8,
-            top_k: 40,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
-        }
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.8;
+        config.top_k = 40;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config
     }
 
     fn mode_for(
@@ -1273,14 +1254,16 @@ mod tests {
         );
 
         // Grammar and logprobs turn the compact route off in the planner.
-        let grammar = GenerateConfig {
-            grammar: Some(a_grammar()),
-            ..greedy()
+        let grammar = {
+            let mut config = greedy();
+            config.grammar = Some(a_grammar());
+            config
         };
         assert_eq!(mode_for(Direct, &grammar, COMPACT_ENV), ReadbackMode::Dense);
-        let logprobs = GenerateConfig {
-            logprobs: Some(2),
-            ..greedy()
+        let logprobs = {
+            let mut config = greedy();
+            config.logprobs = Some(2);
+            config
         };
         assert_eq!(
             mode_for(Streaming, &logprobs, COMPACT_ENV),
@@ -1294,13 +1277,15 @@ mod tests {
             route: GpuTopkRoute::BlockArgmax,
             top_k: 1,
         };
-        let grammar = GenerateConfig {
-            grammar: Some(a_grammar()),
-            ..greedy()
+        let grammar = {
+            let mut config = greedy();
+            config.grammar = Some(a_grammar());
+            config
         };
-        let logprobs = GenerateConfig {
-            logprobs: Some(1),
-            ..greedy()
+        let logprobs = {
+            let mut config = greedy();
+            config.logprobs = Some(1);
+            config
         };
         for (gen_cfg, mode) in [
             (&grammar, compact),
@@ -1442,17 +1427,14 @@ mod tests {
     }
 
     fn request<'a>(gen_cfg: &'a GenerateConfig, history: &'a [u32]) -> SelectionRequest<'a> {
-        SelectionRequest {
-            config: gen_cfg,
-            history,
-            grammar_mask: None,
-        }
+        SelectionRequest::new(gen_cfg, history)
     }
 
     fn candidate(outcome: SelectOutcome) -> SelectionCandidate {
         match outcome {
             SelectOutcome::Candidate(candidate) => candidate,
             SelectOutcome::GrammarExhausted => panic!("no grammar is set"),
+            _ => unreachable!("a select outcome this test does not model"),
         }
     }
 
@@ -1547,9 +1529,18 @@ mod tests {
         let first = candidate(s.select(&request(&gen_cfg, &history)).expect("select"));
         assert_eq!(first.candidate_id, 5);
         assert!(s.ledger.is_live(first.prediction));
-        let meta = MetadataRequest {
-            top_logprobs: Some(1),
-        };
+        let meta = MetadataRequest::with_top_logprobs(1);
+        // A disabled request is refused and leaves the prediction live.
+        let disabled = s.metadata(
+            first.prediction,
+            first.candidate_id,
+            &MetadataRequest::disabled(),
+        );
+        assert!(
+            matches!(&disabled, Err(InferenceError::InvalidInput(msg)) if msg.contains("disabled")),
+            "{disabled:?}"
+        );
+        assert!(s.ledger.is_live(first.prediction));
         // Control: the live prediction scores.
         s.metadata(first.prediction, first.candidate_id, &meta)
             .expect("metadata of the live prediction");
@@ -1564,10 +1555,7 @@ mod tests {
         ));
 
         // A stale id is refused by decode before any forward pass runs.
-        let stale = AcceptedToken {
-            final_id: first.candidate_id,
-            prediction: first.prediction,
-        };
+        let stale = AcceptedToken::new(first.candidate_id, first.prediction);
         let before = s.state.session.position();
         let refused = s.decode(&stale, &|| false);
         assert!(
@@ -1599,11 +1587,7 @@ mod tests {
         let mut s = session(&mut state, &gen_cfg, MetalEntryProfile::Direct, DENSE_ENV);
         assert_eq!(s.mode(), ReadbackMode::GreedyArgmax);
         let mask = |_: &mut [f32]| -> Result<(), InferenceError> { Ok(()) };
-        let masked = SelectionRequest {
-            config: &gen_cfg,
-            history: &history,
-            grammar_mask: Some(&mask),
-        };
+        let masked = SelectionRequest::new(&gen_cfg, &history).with_grammar_mask(&mask);
 
         s.readback = Readback::Argmax(4);
         assert!(matches!(
@@ -1628,9 +1612,10 @@ mod tests {
         let mut state =
             MetalQwen35State::new(&weights, &cfg, TINY_CACHE).expect("tiny Metal state");
         // The direct entry's own logprobs refusal, before any mutation.
-        let logprobs = GenerateConfig {
-            logprobs: Some(1),
-            ..greedy()
+        let logprobs = {
+            let mut config = greedy();
+            config.logprobs = Some(1);
+            config
         };
         let refused = QwenMetalSession::with_route_environment(
             &mut state,
@@ -1774,9 +1759,10 @@ mod tests {
         let prefix = [1u32, 2, 3];
         let mut state = state_restored_to(&weights, &cfg, &prefix);
 
-        let logprobs = GenerateConfig {
-            logprobs: Some(1),
-            ..greedy()
+        let logprobs = {
+            let mut config = greedy();
+            config.logprobs = Some(1);
+            config
         };
         let refused = QwenMetalSession::over_restored_state(
             &mut state,
@@ -1849,13 +1835,7 @@ mod tests {
 
             let full = s.state.max_context();
             s.state.session.set_position(full);
-            let failed = s.decode(
-                &AcceptedToken {
-                    final_id: c.candidate_id,
-                    prediction: c.prediction,
-                },
-                &|| false,
-            );
+            let failed = s.decode(&AcceptedToken::new(c.candidate_id, c.prediction), &|| false);
             assert!(
                 matches!(&failed, Err(InferenceError::Inference(msg)) if msg.contains("KV cache is full")),
                 "{failed:?}"
@@ -2030,10 +2010,7 @@ mod tests {
         }
 
         fn prefill(&mut self, _cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
-            Ok(StepStamp {
-                evaluated_len: 1,
-                prediction: None,
-            })
+            Ok(StepStamp::new(1, None))
         }
 
         fn decode(
@@ -2042,10 +2019,7 @@ mod tests {
             _cancel: &dyn Cancellation,
         ) -> Result<StepStamp, InferenceError> {
             self.ledger.consume(accepted.prediction)?;
-            Ok(StepStamp {
-                evaluated_len: 2,
-                prediction: None,
-            })
+            Ok(StepStamp::new(2, None))
         }
 
         fn select(
@@ -2061,10 +2035,10 @@ mod tests {
                     return Ok(SelectOutcome::GrammarExhausted);
                 }
             }
-            Ok(SelectOutcome::Candidate(SelectionCandidate {
+            Ok(SelectOutcome::Candidate(SelectionCandidate::new(
                 candidate_id,
-                prediction: self.ledger.open(),
-            }))
+                self.ledger.open()?,
+            )))
         }
 
         fn metadata(
@@ -2089,7 +2063,7 @@ mod tests {
     ) -> (Result<GenerateOutput, InferenceError>, Vec<(String, u32)>) {
         let mut session = ScriptedSession {
             caps: STREAMING_CAPABILITIES,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new().expect("a fresh ledger identity"),
             script,
             selects: 0,
         };
@@ -2116,9 +2090,10 @@ mod tests {
     /// placeholder id the driver hands the flush.
     #[test]
     fn streaming_tail_flush_reports_the_last_emitted_token_id() {
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 2,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 2;
+            config
         };
         let (output, calls) = stream_script(vec![0, 1], &gen_cfg);
         let output = output.expect("an unconstrained scripted stream runs to its cap");
@@ -2140,12 +2115,13 @@ mod tests {
     /// completes no stop string.
     #[test]
     fn streaming_grammar_rejection_reports_not_stopped() {
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 4,
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.enable_thinking = true;
+            config.reasoning_budget = Some(1);
+            config.grammar = Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b"));
+            config
         };
         let (output, calls) = stream_script(vec![3], &gen_cfg);
         let output = output.expect("a grammar rejection is not an error");
@@ -2170,13 +2146,14 @@ mod tests {
     /// and the matched text never reaches `on_token`.
     #[test]
     fn streaming_grammar_rejection_then_flushed_stop_string_reports_eos() {
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 4,
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
-            stop_strings: vec!["\n\u{fffd}".to_string()],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.enable_thinking = true;
+            config.reasoning_budget = Some(1);
+            config.grammar = Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b"));
+            config.stop_strings = vec!["\n\u{fffd}".to_string()];
+            config
         };
         let (output, calls) = stream_script(vec![3], &gen_cfg);
         let output = output.expect("a grammar rejection is not an error");
@@ -2192,10 +2169,11 @@ mod tests {
     /// decode-step message (control: the step-0 message is not applied to it).
     #[test]
     fn streaming_grammar_block_messages_distinguish_step_zero() {
-        let blocked_at_start = GenerateConfig {
-            max_new_tokens: 4,
-            grammar: Some(scripted_grammar("root ::= \"b\"\n", b"a")),
-            ..Default::default()
+        let blocked_at_start = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.grammar = Some(scripted_grammar("root ::= \"b\"\n", b"a"));
+            config
         };
         let (output, calls) = stream_script(vec![1], &blocked_at_start);
         match output {
@@ -2206,10 +2184,11 @@ mod tests {
         }
         assert!(calls.is_empty());
 
-        let dead_end = GenerateConfig {
-            max_new_tokens: 4,
-            grammar: Some(scripted_grammar("root ::= \"b\" \"c\"\n", b"b")),
-            ..Default::default()
+        let dead_end = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.grammar = Some(scripted_grammar("root ::= \"b\" \"c\"\n", b"b"));
+            config
         };
         let (output, calls) = stream_script(vec![1], &dead_end);
         match output {
@@ -2237,7 +2216,7 @@ mod tests {
     ) -> Result<GenerateOutput, InferenceError> {
         let mut session = ScriptedSession {
             caps: DIRECT_CAPABILITIES,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new().expect("a fresh ledger identity"),
             script,
             selects: 0,
         };
@@ -2251,11 +2230,10 @@ mod tests {
     }
 
     fn with_stop_strings(max_new_tokens: usize, stop_strings: &[&str]) -> GenerateConfig {
-        GenerateConfig {
-            max_new_tokens,
-            stop_strings: stop_strings.iter().map(|s| (*s).to_string()).collect(),
-            ..Default::default()
-        }
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = max_new_tokens;
+        config.stop_strings = stop_strings.iter().map(|s| (*s).to_string()).collect();
+        config
     }
 
     /// "ax" is completed only by the second token of the pair, so the match
@@ -2318,10 +2296,11 @@ mod tests {
     /// `stopped: true` (control).
     #[test]
     fn direct_grammar_rejection_reports_not_stopped() {
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 4,
-            grammar: Some(scripted_grammar("root ::= \"x\" \"x\"\n", b"b")),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.grammar = Some(scripted_grammar("root ::= \"x\" \"x\"\n", b"b"));
+            config
         };
         let rejected = direct_script(vec![2, 0], &gen_cfg).expect("a rejection is not an error");
         assert_eq!(rejected.token_ids, vec![2]);
@@ -2340,10 +2319,11 @@ mod tests {
     /// decode-step message (control).
     #[test]
     fn direct_grammar_block_messages_distinguish_step_zero() {
-        let blocked_at_start = GenerateConfig {
-            max_new_tokens: 4,
-            grammar: Some(scripted_grammar("root ::= \"b\"\n", b"a")),
-            ..Default::default()
+        let blocked_at_start = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.grammar = Some(scripted_grammar("root ::= \"b\"\n", b"a"));
+            config
         };
         match direct_script(vec![1], &blocked_at_start) {
             Err(InferenceError::GrammarConstraintBlocked(message)) => {
@@ -2352,10 +2332,11 @@ mod tests {
             other => panic!("expected the step-0 grammar block, got {other:?}"),
         }
 
-        let dead_end = GenerateConfig {
-            max_new_tokens: 4,
-            grammar: Some(scripted_grammar("root ::= \"x\" \"c\"\n", b"b")),
-            ..Default::default()
+        let dead_end = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.grammar = Some(scripted_grammar("root ::= \"x\" \"c\"\n", b"b"));
+            config
         };
         match direct_script(vec![2], &dead_end) {
             Err(InferenceError::GrammarConstraintBlocked(message)) => {
@@ -2384,7 +2365,7 @@ mod tests {
     ) -> (PrefixStreamRun, Vec<(String, u32)>) {
         let mut session = ScriptedSession {
             caps: PREFIX_CACHE_CAPABILITIES,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new().expect("a fresh ledger identity"),
             script,
             selects: 0,
         };
@@ -2412,10 +2393,9 @@ mod tests {
     }
 
     fn capped(max_new_tokens: usize) -> GenerateConfig {
-        GenerateConfig {
-            max_new_tokens,
-            ..Default::default()
-        }
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = max_new_tokens;
+        config
     }
 
     /// Ids: 0 reads "a", 1 renders U+FFFD only in the final flush, 2 reads "x"
@@ -2439,9 +2419,10 @@ mod tests {
         assert_eq!(run.commit, PrefixCommit::Save { silent_step: false });
 
         // A grammar the first token completes: the token was never forwarded.
-        let completes = GenerateConfig {
-            grammar: Some(scripted_grammar("root ::= \"a\"\n", b"b")),
-            ..capped(4)
+        let completes = {
+            let mut config = capped(4);
+            config.grammar = Some(scripted_grammar("root ::= \"a\"\n", b"b"));
+            config
         };
         let (run, _) = prefix_script(vec![0], &completes, None, None);
         assert_eq!(run.output.stop_reason, Some(StopReason::Grammar));
@@ -2450,11 +2431,12 @@ mod tests {
 
         // A budget-forced token the grammar rejects: the loop top forwarded the
         // last pushed token, so the silent step must not forward it again.
-        let rejects = GenerateConfig {
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
-            ..capped(4)
+        let rejects = {
+            let mut config = capped(4);
+            config.enable_thinking = true;
+            config.reasoning_budget = Some(1);
+            config.grammar = Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b"));
+            config
         };
         let (run, _) = prefix_script(vec![3], &rejects, None, None);
         assert_eq!(run.output.stop_reason, Some(StopReason::Grammar));
@@ -2485,15 +2467,17 @@ mod tests {
         assert_eq!(run.commit, PrefixCommit::Leave);
 
         // A stop string the first token completes, and one a later token does.
-        let first = GenerateConfig {
-            stop_strings: vec!["a".into()],
-            ..capped(4)
+        let first = {
+            let mut config = capped(4);
+            config.stop_strings = vec!["a".into()];
+            config
         };
         let (run, _) = prefix_script(vec![0, 0], &first, None, None);
         assert_eq!(run.commit, PrefixCommit::Leave);
-        let later = GenerateConfig {
-            stop_strings: vec!["x".into()],
-            ..capped(4)
+        let later = {
+            let mut config = capped(4);
+            config.stop_strings = vec!["x".into()];
+            config
         };
         let (run, _) = prefix_script(vec![0, 2], &later, None, None);
         assert_eq!(run.output.text, "a");
@@ -2501,9 +2485,10 @@ mod tests {
 
         // A grammar that blocks every token before the first one and is
         // complete without a continuation.
-        let complete_at_start = GenerateConfig {
-            grammar: Some(scripted_grammar("root ::= \"\"\n", b"b")),
-            ..capped(4)
+        let complete_at_start = {
+            let mut config = capped(4);
+            config.grammar = Some(scripted_grammar("root ::= \"\"\n", b"b"));
+            config
         };
         let (run, _) = prefix_script(vec![0], &complete_at_start, None, None);
         assert_eq!(run.output.stop_reason, Some(StopReason::Grammar));
@@ -2533,9 +2518,10 @@ mod tests {
     /// exit is unchanged, but the caller's text was still truncated by the match.
     #[test]
     fn prefix_commit_reads_a_stop_string_completed_by_the_flush_per_exit() {
-        let flush = |gen_cfg: GenerateConfig| GenerateConfig {
-            stop_strings: vec!["\u{fffd}".into()],
-            ..gen_cfg
+        let flush = |gen_cfg: GenerateConfig| {
+            let mut config = gen_cfg;
+            config.stop_strings = vec!["\u{fffd}".into()];
+            config
         };
 
         let (run, _) = prefix_script(vec![0, 1], &flush(capped(2)), None, None);
@@ -2547,11 +2533,12 @@ mod tests {
             "a length stop the flush ends"
         );
 
-        let rejects = GenerateConfig {
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
-            ..capped(4)
+        let rejects = {
+            let mut config = capped(4);
+            config.enable_thinking = true;
+            config.reasoning_budget = Some(1);
+            config.grammar = Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b"));
+            config
         };
         let (run, _) = prefix_script(vec![3], &flush(rejects), None, None);
         assert_eq!(

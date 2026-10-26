@@ -57,7 +57,7 @@ use std::collections::HashMap;
 use crate::error::InferenceError;
 use crate::quarot::pipeline::TensorEntry;
 use crate::quarot::rmsnorm_fusion::RmsNormFusionTarget;
-use lattice_model_config::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_config::Qwen35Config;
 
 /// SafeTensors name of Qwen3.5's input embedding matrix.
 pub const QWEN35_EMBED_TOKENS_NAME: &str = "model.language_model.embed_tokens.weight";
@@ -192,7 +192,7 @@ pub fn untie_word_embeddings_in_cfg(cfg: &mut Qwen35Config) {
 }
 
 /// Mutate a raw HF `config.json` string so that on reload by
-/// [`lattice_model_config::qwen35_config::Qwen35Config::from_config_json_str`] the
+/// [`lattice_arch::qwen35_config::Qwen35Config::from_config_json_str`] the
 /// parsed `cfg.tie_word_embeddings` evaluates to `false`. Returns the new
 /// JSON.
 ///

@@ -406,8 +406,8 @@ mod inner {
     // translation unit). The batched prefill kernels continue the same unit
     // from `qwen35_prefill.metal`, which uses `qwen35.metal` definitions
     // (`gdn_softplus`, `GDN_QK_NORM_EPS`) and so follows it.
-    const MSL_SOURCE: &str = concat!(
-        include_str!("shaders/rms_reduce.metal"),
+    const MSL_SOURCE: &str = crate::forward::metal_runtime::concat_msl!(
+        crate::forward::metal_runtime::msl::RMS_REDUCE,
         include_str!("shaders/qwen35.metal"),
         include_str!("shaders/qwen35_prefill.metal")
     );

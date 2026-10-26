@@ -8,7 +8,7 @@ use crate::attention::gdn::GatedDeltaNetWeights;
 use crate::error::InferenceError;
 use crate::model::qwen35_config::{Qwen35Config, ValidatedQwen35Config};
 use crate::weights::TensorSource;
-use lattice_model_config::qwen35_tensors::{qwen_layer_tensor_prefix, qwen_required_tensor_names};
+use lattice_arch::qwen35_tensors::{qwen_layer_tensor_prefix, qwen_required_tensor_names};
 
 /// CLASS C ingress: takes `&ValidatedQwen35Config` rather than a raw `&Qwen35Config`, so an
 /// unvalidated config cannot reach the required-tensor-name derivation for a checkpoint on

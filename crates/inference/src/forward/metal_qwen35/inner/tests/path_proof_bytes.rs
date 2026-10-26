@@ -162,17 +162,18 @@ fn compact_and_full_logit_readback_differ_in_bytes_while_both_count_one() {
     // One of the precompiled `LM_HEAD_LOCAL_KS` Stage-1 variants, so the compact
     // arm actually resolves a block-top-k route instead of falling back.
     const LOCAL_K: usize = 8;
-    let base = || GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 1,
-        top_k: LOCAL_K,
+    let base = || {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 1;
+        config.top_k = LOCAL_K;
         // top_p < 1.0 requires the approximate-top-p opt-in, which this test
         // does not set; an exact-nucleus request would route to CpuFallback.
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        grammar: None,
-        logprobs: None,
-        ..GenerateConfig::default()
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.grammar = None;
+        config.logprobs = None;
+        config
     };
 
     let environment = SamplingRouteEnvironment {
@@ -186,10 +187,11 @@ fn compact_and_full_logit_readback_differ_in_bytes_while_both_count_one() {
     // every other test sharing the binary.
     let compact_plan = plan_sampling_route(&base(), true, environment);
     let exact_plan = plan_sampling_route(
-        &GenerateConfig {
-            min_p: 0.0,
-            logprobs: Some(1),
-            ..base()
+        &{
+            let mut config = base();
+            config.min_p = 0.0;
+            config.logprobs = Some(1);
+            config
         },
         true,
         environment,

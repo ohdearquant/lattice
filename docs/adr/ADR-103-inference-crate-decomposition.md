@@ -592,6 +592,202 @@ The GatedDeltaNet recurrent kernels join `lattice-compute`, beside the CPU atten
    so a measured A/B is required before merge. This amendment records the extraction and its validation obligation; it
    does not assert a measurement result or a structural waiver.
 
+## Amendment 19 (2026-10-26)
+
+Standard and tiled attention and the attention variant taxonomy join `lattice-compute`. Recorded:
+
+1. **D8.1.** `standard` (with `AttentionBuffers`) and `flash` (the tiled configuration, scratch and projection
+   wrappers) move from `lattice_inference::attention` into `lattice_compute::attention` with their tests, as do
+   `AttentionKind` and `AttentionTag` with their tests. The only source changes are imports (the layer weights now name
+   `lattice_weights::f32_weights`, and `flash` names `AttentionBuffers` at `attention::standard`), two comments that
+   named facade paths, and the visibility of the shape check described in item 3. Their crate-internal dependencies are
+   the CPU primitives, the LoRA hook contract and the grouped-query configuration, all already in compute, so compute
+   gains no dependency and its publish tier is unchanged. `gdn_backward` stays in the facade.
+2. **D1.** `lattice_inference::attention::standard` and `::flash` keep named public re-exports of every public item,
+   and `lattice_inference::attention` keeps `AttentionBuffers`, `multi_head_attention`, `AttentionKind` and
+   `AttentionTag` by name in place of the former glob over `standard`. Under `bench-internals`,
+   `attention::standard::bench_support` and `attention::bench_support` keep their paths as re-exports of the moved
+   module, which was already public through the facade and so stays a public compute item (D4, last paragraph).
+3. **D4.** Three crate-private items are called from the facade and take disposition 3, as `#[inline]` forwarding
+   functions in `lattice_compute::__internal` that the facade calls by full path: `multi_head_attention_in_place` and
+   `multi_head_attention_batched`, the BERT encoder's single-sequence and packed-batch entry points, and
+   `assert_standard_no_overflow`, which becomes crate-visible in compute for its wrapper. Disposition 2 does not fit
+   the two entry points: they take the facade BERT model's load-time fused Q/K/V layout and raw scratch slices, glue
+   whose shape follows that model rather than a stable compute contract. The test-only padded batched reference, used
+   only by the BERT packed-batch parity test, moves to the facade (`attention/standard/padded_reference.rs`, compiled
+   under `cfg(test)`) and calls the shape check by that full path. `total_scratch_len` and
+   `tiled_multi_head_attention_in_place` stay crate-private in compute with their only callers, the moved tests.
+4. **D5.** Amendment 2 applies to `bench_support`, which is gated on the consumer feature `bench-internals`: compute
+   gains a `bench-internals` feature of the same meaning, forwarded by the facade's `bench-internals`. No other
+   feature, default-feature or target gate changes. The CI step that lints the facade under `bench-internals` also
+   lints compute under its feature, so the moved module keeps its clippy coverage.
+5. **D6.1.** The 64 test functions of the three moved test modules move with them, names unchanged. `facade_api_parity`
+   adds `attention_standard_parity`, covering the five types and four functions at both paths, the `attention::`
+   convenience paths of `AttentionBuffers` and `multi_head_attention`, and the `AttentionKind` methods through the
+   facade.
+6. **D6.4.** `inference_bench` times `multi_head_attention` with `AttentionBuffers` under default features and the
+   packed-batch path under `bench-internals`; `e2e_bench` runs the BERT encoder, which now calls the two attention
+   entry points across the boundary, given a BGE checkpoint; `attention_dispatch_bench` matches on `AttentionKind`; and
+   the CPU batch prefill builds a `TiledAttentionConfig` once per scratch. The boundary and the feature table are
+   changed build inputs on the BERT hot path, so a measured A/B of those targets is required before merge. This
+   amendment records the extraction and its validation obligation; it does not assert a measurement result or a
+   structural waiver.
+
+## Amendment 20 (2026-10-26)
+
+The model-file layer joins a new crate, `lattice-model-io`: what every model uses to find its files and read engine
+switches, and nothing that belongs to one model. Recorded:
+
+1. **D8.1.** The crate is `lattice-model-io`. `download` (canonical model names, checksum verification and the
+   cache-miss download), `default_cache_dir` and the by-value switch reader `env_switch_enabled` move out of
+   `lattice_inference` with their tests, as does the checkpoint-directory resolver from `test_support`. The only
+   source changes are imports (the error type is named at `lattice_inference_core`), the visibility changes in item 3,
+   an `#[inline]` hint on `env_switch_enabled`, and comments that named facade paths. Its only internal dependency is
+   `lattice-inference-core`, so it publishes in the second tier beside the tokenizer. The name was checked free on
+   crates.io in the same pass as a control read of `serde`.
+2. **D1.** `lattice_inference::download::ensure_model_files` keeps its path as a named re-export, and
+   `facade_api_parity` adds `model_io_parity`, which checks that both paths name one function. `default_cache_dir` and
+   `env_switch_enabled` stay crate-private in the facade through a `pub(crate) use`, so every `crate::` caller is
+   unchanged.
+3. **D4.** `default_cache_dir` and `env_switch_enabled` were crate-private and are called from the facade, so they take
+   disposition 2 and become documented public items of the new crate: a path rule and a by-value switch rule that
+   `CONFIG.md` already documents. `switch_value_enabled` stays private to the new crate beside its only callers.
+   `require_checkpoint_dir` becomes a `#[doc(hidden)]` item of a `test_support` module compiled only for the crate's
+   own tests and under its `test-utils` feature; the facade keeps its crate-local `test_support::require_checkpoint_dir`
+   path as a re-export for its checkpoint-gated unit tests, and the facade's source-policy tests over its own tree stay
+   in the facade.
+4. **D5.** The facade's `download` feature forwards to the new crate's `download`, which owns the optional HTTP client.
+   The new crate enables `download` by default, as the facade does, and the facade depends on it with default features
+   off, so the facade's no-default build still carries no HTTP client. No other feature, default-feature or target
+   gate changes.
+5. **D6.1.** The 19 test functions of the moved code move with it, names unchanged: 12 download tests, 4
+   checkpoint-resolver tests and 3 switch tests. The environment-variable contract moves its `LATTICE_OFFLINE` anchor
+   to the new crate and adds the new crate as a reader of `LATTICE_MODEL_CACHE`, and the trust-boundary scan lists the
+   new crate among the sources it must reach.
+6. **D6.4.** `env_switch_enabled` is called three times per Metal decode step (`forward/metal_qwen35/inner/step.rs`),
+   once per generation (`model/qwen35/generation.rs`) and at load (`model/qwen.rs`), now across a crate boundary; the
+   BERT and Qwen `from_pretrained` paths, which `e2e_bench` times given a checkpoint, call `default_cache_dir` and
+   `ensure_model_files`. The boundary and the feature table are changed build inputs on the Metal decode path, so a
+   measured A/B of a Metal decode target is required before merge. This amendment records the extraction and its
+   validation obligation; it does not assert a measurement result or a structural waiver.
+
+## Amendment 21 (2026-10-26)
+
+The maintainer's design rule for model code, recorded here as the target the remaining steps of this decomposition
+serve: split by layer; code that exists for one model family lives only in that family's crate under `crates/models/`,
+and the central crate `lattice-arch` holds the model interface, the shared generation machinery and the registry. The
+facade, `lattice-serve` and `lattice-embed` reach models through that interface. The end state is that no crate below
+the family crates names a model; items 2 and 6 say how and in which release that is reached. Recorded:
+
+1. **D8.1.** `lattice-model-config` is renamed `lattice-arch`. Neither name has been published; the name is re-checked
+   on crates.io immediately before its first upload, as this ADR's publish rule requires. Each family gets one crate,
+   `crates/models/<family>/`, published as `lattice-model-<family>` (`bert`, `qwen3`, `qwen35`, `gemma4`,
+   `embeddinggemma2`, `ernie45`, `paddleocr-vl`), with the same re-check. A family crate holds that family's
+   configuration (from step 7 on), weight-name mapping, weight bundles and loaders, layer composition, inherent impls,
+   generation policy (chat tokens, stop strings, decode caps) and the dispatch of kernels only it uses. Family crates
+   depend on lower crates and `lattice-arch` only, never on each other; code two families share moves into
+   `lattice-arch` or a lower crate. Two named exemptions from "names no model": tokenizer serialization dialects, which
+   are formats selected by the caller, and `lattice-model-io`'s download catalog (model names, pinned revisions,
+   checksums and tokenizer-file choice), which stays as data until family descriptors supply resolved artifact
+   descriptors; pinned checksums and offline behaviour are preserved through that change.
+2. **What the lower crates hold today, by item.** Before the first code step an ownership and API ledger is committed
+   beside this ADR: every item below with its destination, its disposition (moves with its family, stays as a neutral
+   kernel contract, or is replaced by a neutral input) and its public-path consequence. The ledger is reviewed before
+   any code moves, and each later step cites its rows.
+   - `lattice-compute`: the GatedDeltaNet kernels and `GatedDeltaNetState::new` take `&Qwen35Config` (`attention::gdn`,
+     `attention::gdn_fused`); standard, batched and tiled attention take `TransformerLayerWeights`, the per-layer BERT
+     bundle; `LoraHook::validate_against` and `validate_against_bert` validate against model types, and the
+     Metal-servable GDN module list is backend policy; `default_bert_pooling_for_model_name` chooses pooling from a
+     model name; the BERT CPU policy types are BERT metadata. The pooling math and the RoPE tables that Gemma 4,
+     EmbeddingGemma2 and ERNIE 4.5 share stay.
+   - `lattice-weights`: `TransformerLayerWeights`, `BertWeights`, `CrossEncoderWeights`, `QwenLayerWeights`,
+     `QwenWeights` and `ShardedQwenBacking`; the loaders `SafetensorsFile::{load_bert_weights,
+     load_cross_encoder_weights, load_qwen_weights}` and `ShardedSafetensors::load_qwen_weights_owned`, which are
+     inherent methods of storage types that stay; the F16 hybrid model assembly (`F16ModelWeights` with its attention,
+     feed-forward and mixture-of-experts aggregates), where a GDN, GQA or MoE operand record may instead be classified
+     as a neutral kernel contract; and `ModelFamily`/`detect_family`. Loaders reach storage through its public tensor
+     read methods; no field is widened to make a move compile, and backing lifetimes are preserved.
+   - `lattice-quant`: the Qwen recipes of QuaRot (`convert`, the Qwen naming in `io`, `lm_head`, the plan builders in
+     `plan`, the configuration plumbing of `rmsnorm_fusion`, `forward_equivalence`, the `lora` and `pipeline`
+     orchestration that consumes them, and the hidden seed reader in `__internal`) are split from the neutral plan and
+     reader records, the Hadamard and rotation math, the R3 reference, `q4_manifest` and the quantized format types,
+     item by item rather than file by file. Qwen3's required tensor list goes to Qwen3, not Qwen3.5.
+3. **The interface.** New orchestration paths dispatch through this interface; compatibility exports may still name
+   concrete types. `lattice-arch` sits where `lattice-model-config` sits today, above `lattice-weights` and below
+   `lattice-compute`, and gains, moved from the facade:
+   - ADR-090's `DecoderSession`, its vocabulary (`GenerateConfig`, `TopLogprob`, the stop and decode policy types,
+     `StopReason`), sampling and the shared generation driver, which depend on `lattice-grammar` and on nothing in
+     `lattice-compute`. Family generation policy that sits in the shared generation code today (the Qwen chat end
+     token, stop strings, decode cap, think closing) becomes data each family supplies. Promoting the trait makes it a
+     public API, so its supporting types, construction, errors and lifecycle are closed in the same step; prediction
+     ids stay opaque and session state stays session-local; sessions carry no `Send` or `Sync` requirement.
+   - a registry type and a per-family descriptor (name, a decoder constructor, an encoder constructor, or both, at
+     least one being present, the `model_type` strings it claims, the backends it offers). `lattice-arch` cannot list
+     the families, so each family crate exports its descriptor and each consumer builds its table from the families it
+     links; the table refuses a duplicate family name or a duplicate claim of one `model_type` for one kind when it is
+     built, and resolves by exact string. A loaded decoder admits a prompt into an owned request (the prompt ids, the
+     configuration and the family's token policy), hands out a read-only text decoder, and opens one session at a time
+     over an admitted request. Neither the loaded decoder nor its sessions carry a `Send` or `Sync` requirement, so a
+     consumer moves the constructor and its load request across threads, never the loaded model. The family and backend
+     are chosen once, when a session or encoder is constructed; the session's coarse methods are called per token, as
+     ADR-090 already does, and no per-kernel dispatch is added. A name whose family is not compiled in is an error at
+     resolution. The legacy `detect_family` keeps its current fallback (an unrecognized configuration resolves to
+     Qwen3.5) on its own path.
+     Registration stays in the facade until each constructor moves with its family.
+   - an encoder handle that binds one loaded local model and reports its capabilities, its effective output dimension
+     and identity (checkpoint revision and the tokenizer, prompt and pooling semantics, not load time), token counts and
+     truncation. `lattice-embed` keeps the service layer on top of it: `EmbeddingService`, `EmbeddingModel` and its
+     methods, `EmbeddingRole`, the `EmbedError` categories, `MAX_TEXT_BYTES` and `DEFAULT_MAX_BATCH_SIZE`, caching,
+     scheduling and remote providers, and the native and cached service types under its `native` feature. This is not
+     a second service trait. Reusing one loaded model across separately constructed services needs a named cache
+     owner and is not promised by this amendment. Image and document inputs are separate capabilities, not a
+     requirement on every encoder.
+4. **D1, D4 and the release split.** Free functions and moved owning types keep their public paths by named
+   re-export (D1). Items whose published signature names a model type, or whose name and contract belong to one family
+   while their owner stays in a lower crate, cannot keep their signature or their name once the family leaves the
+   lower crate, and D4's internal bridges are never re-exported, so no facade wrapper preserves them:
+   `GatedDeltaNetState::new`, `LoraHook::validate_against` and `validate_against_bert`, the four `SafetensorsFile` and
+   `ShardedSafetensors` loaders, and the `quarot` plan and descriptor methods whose owners stay in `lattice-quant`.
+   0.15.0 adds the neutral replacements beside them, moves every other caller in the workspace to the replacements,
+   and marks them deprecated; none of these items changes signature in 0.15.0. 0.16.0 removes them (item 6). That
+   removal is this ADR's second D1 exception: it is listed in the release notes with the path map, and D6.2's
+   identical-path test is replaced for those items by migration compile probes at the new paths. `lattice-tune`'s
+   `LoraAdapter` implements `LoraHook` and overrides both validators; it moves to the replacement in the change that
+   adds it. The new validation method defaults to accepting, as the two existing ones do, and through 0.15.0 the code
+   that installs a hook calls the deprecated validator as well as the new one, so an implementor that overrides only
+   the old method keeps its check; validation still rejects before any state changes.
+5. **D5.** A consumer selects families by depending on their crates. The facade takes each family crate as an optional
+   dependency behind a feature named for the family and forwards it, and its default set keeps every family path that
+   is unconditional today, so the facade's default public surface stays; manifests and cfg change. Families form a
+   finite additive feature graph: the cross-encoder is part of `bert`, `paddleocr-vl` implies `ernie45`, and support
+   that several families use stays outside any family gate. If a facade `--no-default-features` build loses a model
+   path, that is listed as an intentional change. `lattice-arch` states its own minimal feature set.
+6. **D9.** Order: (1) the ledger of item 2; (2) the rename and the interface of item 3, with the family configurations
+   still in `lattice-arch`, which its crate documentation states; (3) the neutral inputs and deprecations of item 4;
+   (4) BERT and the cross-encoder; (5) Qwen3 on CPU and EmbeddingGemma2, and the CPU f16 path of the Qwen3.5 vision
+   encoder into the Qwen3.5 family crate, after which `lattice-embed` with its default features depends on
+   `lattice-arch`, `lattice-compute` and those family crates instead of the facade; (6) Qwen3.5 including its Metal
+   forward and the vision encoder's Metal variant, after ADR-102 has moved the shared Metal engine out of
+   `forward/metal_qwen35`, then Gemma 4, ERNIE 4.5 and PaddleOCR-VL, each family's Metal code behind its `metal-gpu`
+   feature; (7) in 0.16.0, the deprecated items of item 4 are removed, and the configurations, weight bundles and model
+   policy leave `lattice-arch` and the lower crates for their families. Until (7), the lower crates still name models
+   through the deprecated items; that is the transition, not the target. Step (5)'s acceptance:
+   `cargo tree -p lattice-embed -e normal` shows no `lattice-inference v` node.
+7. **Acceptance.** `lattice-arch` depends on no family crate and not on `lattice-compute`. After each family step,
+   `cargo tree -i <family crate> --workspace -e normal,build,dev` lists only the facade, `lattice-embed`,
+   `lattice-serve` and `lattice-tune` through the facade, and no family crate depends on another; the graph is read for
+   each feature arm the step touches, and a dev-dependency (test-only) edge from a lower crate to a family crate fails
+   the step as a normal or build edge does.
+   After step 7, a source census of the lower crates for model types and names, run with a known-present control in the
+   same pass, finds only the item 1 exemptions. Feature coverage: a build with no family, each family alone with
+   defaults off, all families, and the implication pairs; a disabled family's registry entry is absent or returns the
+   defined error.
+8. **D6.1 and D6.4.** Tests move with their code, and each step compares test-name lists before and after. Kernel
+   tests in lower crates that build a family configuration get neutral fixtures or move to the family. Steps 4, 5 and 6
+   move code that bench targets execute and each takes a measured A/B on the targets that reach it; step 6 takes a Metal
+   decode and prefill A/B. This amendment records the target and its obligations; it does not assert a measurement
+   result.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

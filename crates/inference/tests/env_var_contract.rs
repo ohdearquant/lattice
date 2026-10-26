@@ -641,9 +641,10 @@ fn names_of(hits: &[Hit]) -> BTreeSet<String> {
 /// parser that stopped matching) would otherwise find nothing and pass.
 const ANCHORS: &[(&str, &str, Kind)] = &[
     ("LATTICE_NO_GPU", "inference", Kind::Switch),
-    ("LATTICE_OFFLINE", "inference", Kind::Switch),
+    ("LATTICE_OFFLINE", "model-io", Kind::Switch),
     ("LATTICE_MODEL_CACHE", "embed", Kind::Value),
     ("LATTICE_MODEL_CACHE", "inference", Kind::Value),
+    ("LATTICE_MODEL_CACHE", "model-io", Kind::Value),
     ("LATTICE_MODEL_CACHE", "tune", Kind::Value),
     ("LATTICE_EMBED_DIM", "embed", Kind::Value),
 ];

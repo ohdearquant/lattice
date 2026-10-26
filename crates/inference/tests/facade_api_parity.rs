@@ -1190,6 +1190,42 @@ mod quant_parity {
     }
 
     #[test]
+    fn neutral_rotation_targets_resolve_at_facade_paths() {
+        same_type(
+            PhantomData::<facade::quarot::plan::RotationTarget>,
+            PhantomData::<extracted::quarot::plan::RotationTarget>,
+        );
+        same_function(
+            facade::quarot::plan::RotationTarget::new,
+            extracted::quarot::plan::RotationTarget::new,
+        );
+        same_function(
+            facade::quarot::plan::qwen35_rotation_target,
+            extracted::quarot::plan::qwen35_rotation_target,
+        );
+        same_function(
+            facade::quarot::plan::qwen35_residual_stream_linear_layers,
+            extracted::quarot::plan::qwen35_residual_stream_linear_layers,
+        );
+        same_function(
+            facade::quarot::plan::OnlineRotationSpec::attention_output_r3,
+            extracted::quarot::plan::OnlineRotationSpec::attention_output_r3,
+        );
+        same_function(
+            facade::quarot::plan::OnlineRotationSpec::mlp_down_r4,
+            extracted::quarot::plan::OnlineRotationSpec::mlp_down_r4,
+        );
+        same_function(
+            facade::quarot::plan::OnlineRotationSpec::validate_target,
+            extracted::quarot::plan::OnlineRotationSpec::validate_target,
+        );
+        same_function(
+            facade::quarot::io::OnlineArtifactDescriptor::validate_target,
+            extracted::quarot::io::OnlineArtifactDescriptor::validate_target,
+        );
+    }
+
+    #[test]
     fn quarot_conversion_functions_are_the_same_items_at_both_paths() {
         same_function(
             facade::quarot::convert::convert_quarot_qwen35,
@@ -1299,8 +1335,8 @@ mod quant_parity {
 }
 
 mod model_config_parity {
+    use lattice_arch as extracted;
     use lattice_inference::model as facade;
-    use lattice_model_config as extracted;
     use std::marker::PhantomData;
 
     fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
@@ -1408,6 +1444,83 @@ mod model_config_parity {
     }
 }
 
+mod interface_parity {
+    use lattice_arch as extracted;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    #[test]
+    fn generation_types_are_the_same_type_at_every_path() {
+        use lattice_inference::generation as facade;
+        same_type(
+            PhantomData::<facade::GenerateConfig>,
+            PhantomData::<extracted::generation::GenerateConfig>,
+        );
+        same_type(
+            PhantomData::<facade::GenerateOutput>,
+            PhantomData::<extracted::generation::GenerateOutput>,
+        );
+        same_type(
+            PhantomData::<facade::TokenLogprob>,
+            PhantomData::<extracted::generation::TokenLogprob>,
+        );
+        same_type(
+            PhantomData::<facade::TopLogprob>,
+            PhantomData::<extracted::generation::TopLogprob>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::GenerateConfig>,
+            PhantomData::<extracted::generation::GenerateConfig>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::GenerateOutput>,
+            PhantomData::<extracted::generation::GenerateOutput>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::TokenLogprob>,
+            PhantomData::<extracted::generation::TokenLogprob>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::TopLogprob>,
+            PhantomData::<extracted::generation::TopLogprob>,
+        );
+    }
+
+    #[test]
+    fn sampling_types_are_the_same_type_at_both_paths() {
+        use lattice_inference::sampling as facade;
+        same_type(
+            PhantomData::<facade::SamplingConfig>,
+            PhantomData::<extracted::sampling::SamplingConfig>,
+        );
+        same_type(
+            PhantomData::<facade::Candidate>,
+            PhantomData::<extracted::sampling::Candidate>,
+        );
+        same_type(
+            PhantomData::<facade::CandidateSet>,
+            PhantomData::<extracted::sampling::CandidateSet>,
+        );
+        same_type(
+            PhantomData::<facade::Sampler>,
+            PhantomData::<extracted::sampling::Sampler>,
+        );
+    }
+
+    #[test]
+    fn stop_reason_is_the_same_type_at_every_path() {
+        same_type(
+            PhantomData::<lattice_inference::stop_reason::StopReason>,
+            PhantomData::<extracted::stop_reason::StopReason>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::StopReason>,
+            PhantomData::<extracted::stop_reason::StopReason>,
+        );
+    }
+}
+
 mod compute_parity {
     use lattice_compute as extracted;
     use lattice_inference::rope as facade;
@@ -1508,6 +1621,24 @@ mod compute_parity {
         same_type(
             PhantomData::<lattice_inference::kv_cache::FlatKVCacheConfig>,
             PhantomData::<extracted::kv_cache::flat::FlatKVCacheConfig>,
+        );
+    }
+
+    /// Migration probe: `FlatKVCacheConfig::new`, the replacement for the deprecated `for_qwen3`,
+    /// is reachable at the facade path with the same arguments.
+    #[test]
+    fn flat_cache_config_new_is_reachable_at_the_facade_path() {
+        let new: fn(usize, usize, usize, usize) -> lattice_inference::kv_cache::FlatKVCacheConfig =
+            lattice_inference::kv_cache::FlatKVCacheConfig::new;
+        let config = new(2, 4, 8, 16);
+        assert_eq!(
+            (
+                config.num_layers,
+                config.num_kv_heads,
+                config.head_dim,
+                config.max_seq_len
+            ),
+            (2, 4, 8, 16)
         );
     }
 
@@ -2045,5 +2176,173 @@ mod gdn_parity {
             facade::gdn_fused::simd_gated_rms_norm,
             extracted::gdn_fused::simd_gated_rms_norm,
         );
+    }
+}
+
+mod attention_standard_parity {
+    use lattice_compute::attention as extracted;
+    use lattice_inference::attention as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn standard_and_tiled_attention_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::standard::AttentionBuffers>,
+            PhantomData::<extracted::standard::AttentionBuffers>,
+        );
+        same_type(
+            PhantomData::<facade::AttentionBuffers>,
+            PhantomData::<extracted::standard::AttentionBuffers>,
+        );
+        same_type(
+            PhantomData::<facade::flash::TiledAttentionConfig>,
+            PhantomData::<extracted::flash::TiledAttentionConfig>,
+        );
+        same_type(
+            PhantomData::<facade::flash::TiledAttentionBuffers>,
+            PhantomData::<extracted::flash::TiledAttentionBuffers>,
+        );
+        same_type(
+            PhantomData::<facade::AttentionKind>,
+            PhantomData::<extracted::AttentionKind>,
+        );
+        same_type(
+            PhantomData::<facade::AttentionTag>,
+            PhantomData::<extracted::AttentionTag>,
+        );
+    }
+
+    #[test]
+    fn standard_and_tiled_attention_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::flash::estimate_materialized_attention_buffer_bytes,
+            extracted::flash::estimate_materialized_attention_buffer_bytes,
+        );
+        same_function(
+            facade::flash::tiled_attention_head,
+            extracted::flash::tiled_attention_head,
+        );
+    }
+
+    /// The facade keeps the BERT-layer attention signatures; `lattice-compute`'s kernels take the
+    /// layer's projection view instead.
+    #[test]
+    #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+    fn attention_entry_points_keep_their_facade_signatures() {
+        use lattice_inference::lora_hook::LoraHook;
+        use lattice_inference::weights::TransformerLayerWeights;
+
+        same_type(
+            PhantomData::<facade::standard::AttentionProjections<'static>>,
+            PhantomData::<extracted::standard::AttentionProjections<'static>>,
+        );
+        let _: fn(
+            &[f32],
+            &TransformerLayerWeights<'_>,
+            &[u32],
+            usize,
+            usize,
+            usize,
+            usize,
+            &mut facade::AttentionBuffers,
+            &dyn LoraHook,
+            usize,
+        ) -> Vec<f32> = facade::standard::multi_head_attention;
+        same_function(
+            facade::multi_head_attention,
+            facade::standard::multi_head_attention,
+        );
+        let _: fn(
+            &[f32],
+            &extracted::standard::AttentionProjections<'_>,
+            &[u32],
+            usize,
+            usize,
+            usize,
+            usize,
+            &mut extracted::standard::AttentionBuffers,
+            &dyn lattice_compute::lora_hook::LoraHook,
+            usize,
+        ) -> Vec<f32> = extracted::standard::multi_head_attention;
+        let _: fn(
+            &[f32],
+            &TransformerLayerWeights<'_>,
+            &[u32],
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            &mut facade::AttentionBuffers,
+            &mut facade::flash::TiledAttentionBuffers,
+            &facade::flash::TiledAttentionConfig,
+        ) -> Vec<f32> = facade::flash::tiled_multi_head_attention;
+        let _: fn(
+            &[f32],
+            &extracted::standard::AttentionProjections<'_>,
+            &[u32],
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            &mut extracted::standard::AttentionBuffers,
+            &mut extracted::flash::TiledAttentionBuffers,
+            &extracted::flash::TiledAttentionConfig,
+        ) -> Vec<f32> = extracted::flash::tiled_multi_head_attention;
+        #[cfg(feature = "bench-internals")]
+        {
+            let _: fn(
+                &[f32],
+                &TransformerLayerWeights<'_>,
+                &[f32],
+                &[f32],
+                &[usize],
+                usize,
+                usize,
+                usize,
+                &mut [f32],
+                &mut [f32],
+                &mut [f32],
+                &mut [f32],
+                &mut [f32],
+                &mut [f32],
+                &dyn LoraHook,
+                usize,
+            ) = facade::standard::bench_support::multi_head_attention_batched;
+            same_function(
+                facade::bench_support::multi_head_attention_batched,
+                facade::standard::bench_support::multi_head_attention_batched,
+            );
+        }
+    }
+
+    #[test]
+    fn attention_kind_reports_the_same_tag_through_the_facade() {
+        let cfg = facade::gqa::GqaConfig {
+            num_heads: 16,
+            num_kv_heads: 8,
+            head_dim: 64,
+        };
+        let kind = facade::AttentionKind::Gqa(cfg);
+        assert_eq!(kind.tag(), extracted::AttentionTag::Gqa);
+        assert_eq!(kind.name(), "gqa");
+        assert!(kind.is_causal());
+        assert!(kind.supports_kv_cache());
+    }
+}
+
+mod model_io_parity {
+    use lattice_inference::download as facade;
+    use lattice_model_io::download as extracted;
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn ensure_model_files_is_the_same_function_at_both_paths() {
+        same_function(facade::ensure_model_files, extracted::ensure_model_files);
     }
 }

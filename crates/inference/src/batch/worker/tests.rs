@@ -200,12 +200,14 @@ fn submit_seeds_prompt_history_for_repetition_penalty() {
     let mut worker = test_worker();
     worker.submit(InferenceRequest {
         prompt_ids: vec![3], // token 3 is in the prompt; must be penalized
-        sampling: SamplingConfig {
-            min_p: 0.0,
-            temperature: 0.0, // greedy fast path
-            top_k: 1,
-            top_p: 1.0,
-            repetition_penalty: 2.0,
+        sampling: {
+            let mut config = SamplingConfig::default();
+            config.min_p = 0.0;
+            config.temperature = 0.0; // greedy fast path
+            config.top_k = 1;
+            config.top_p = 1.0;
+            config.repetition_penalty = 2.0;
+            config
         },
         lora_adapter: None,
         max_new_tokens: 1,

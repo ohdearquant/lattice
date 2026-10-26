@@ -12,9 +12,10 @@ members = [
     "crates/transport",
     "crates/weights",
     "crates/quant",
-    "crates/model-config",
+    "crates/arch",
     "crates/serve",
     "crates/compute",
+    "crates/model-io",
 ]
 
 [workspace.package]

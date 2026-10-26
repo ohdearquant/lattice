@@ -1,4 +1,4 @@
-//! Shared Metal buffers, command encoding and pipeline construction.
+//! Shared Metal buffers, command encoding, pipeline construction and shader sources.
 
 #![cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #![warn(missing_docs)]
@@ -9,6 +9,8 @@ use metal::{
 };
 
 use lattice_inference_core::InferenceError;
+
+pub mod msl;
 
 /// Threads per group for elementwise dispatch.
 pub const ELEMENT_THREADS: u64 = 256;

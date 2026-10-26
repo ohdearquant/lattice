@@ -14,7 +14,7 @@
 //! 7. Gated RMSNorm + output projection
 
 use crate::forward::cpu::matmul_bt;
-use lattice_model_config::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_config::Qwen35Config;
 
 /// **Unstable**: weight tensors for a GatedDeltaNet layer; field layout follows Qwen3.5 checkpoint format.
 #[derive(Debug, Clone)]

@@ -6,7 +6,8 @@
 //! ([`lora_hook::LoraHook`]), the numerical diagnostics
 //! ([`metrics::OnlineSoftmaxEntropy`], [`pruning::BlockInfluence`]), option-letter scoring
 //! ([`option_scoring::OptionScores`]), shared attention row semantics
-//! ([`attention::softmax_row`]), CPU forward kernels ([`forward::cpu`]), and BERT-family pooling
+//! ([`attention::softmax_row`]), the CPU attention kernels and their variant taxonomy
+//! ([`attention::AttentionKind`]), CPU forward kernels ([`forward::cpu`]), and BERT-family pooling
 //! ([`pool`]); sampling moves here in a later release.
 //!
 //! `lattice-inference` re-exports the supported items at their original paths, so
@@ -29,12 +30,14 @@ pub mod pool;
 pub mod pruning;
 pub mod rope;
 
-/// Cache glue used by the `lattice-inference` facade.
+/// Cache and attention glue used by the `lattice-inference` facade.
 ///
-/// Not part of the supported API. The facade calls these free functions by their full path;
-/// they are not re-exported by that facade.
+/// Not part of the supported API. The facade reaches these free functions under this module's
+/// path and never re-exports them publicly.
 #[doc(hidden)]
 pub mod __internal {
+    use crate::attention::standard::{AttentionBuffers, AttentionProjections};
+    use crate::lora_hook::LoraHook;
     use lattice_inference_core::InferenceError;
 
     /// Checked count of floats in a paged cache allocation.
@@ -42,5 +45,93 @@ pub mod __internal {
         config: &crate::kv_cache::PagedKVCacheConfig,
     ) -> Result<usize, InferenceError> {
         config.try_floats_per_page()
+    }
+
+    /// Shape checks shared by the standard attention entry points.
+    #[inline]
+    pub fn assert_standard_no_overflow(
+        seq_len: usize,
+        hidden_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) {
+        crate::attention::standard::assert_standard_no_overflow(
+            seq_len,
+            hidden_size,
+            num_heads,
+            head_dim,
+        )
+    }
+
+    /// Single-sequence standard attention over a fused Q/K/V projection, writing into `buffers`.
+    #[inline]
+    pub fn multi_head_attention_in_place(
+        hidden_states: &[f32],
+        projections: &AttentionProjections<'_>,
+        fused_qkv_weight: &[f32],
+        fused_qkv_bias: &[f32],
+        attention_mask: &[u32],
+        seq_len: usize,
+        hidden_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        buffers: &mut AttentionBuffers,
+        lora: &dyn LoraHook,
+        layer_idx: usize,
+    ) {
+        crate::attention::standard::multi_head_attention_in_place(
+            hidden_states,
+            projections,
+            fused_qkv_weight,
+            fused_qkv_bias,
+            attention_mask,
+            seq_len,
+            hidden_size,
+            num_heads,
+            head_dim,
+            buffers,
+            lora,
+            layer_idx,
+        )
+    }
+
+    /// Packed-batch standard attention over `cu_seqlens`-indexed sequences.
+    #[inline]
+    pub fn multi_head_attention_batched(
+        hidden_states: &[f32],
+        projections: &AttentionProjections<'_>,
+        fused_qkv_weight: &[f32],
+        fused_qkv_bias: &[f32],
+        cu_seqlens: &[usize],
+        hidden_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+        qkv: &mut [f32],
+        concat: &mut [f32],
+        output: &mut [f32],
+        lora: &dyn LoraHook,
+        layer_idx: usize,
+    ) {
+        crate::attention::standard::multi_head_attention_batched(
+            hidden_states,
+            projections,
+            fused_qkv_weight,
+            fused_qkv_bias,
+            cu_seqlens,
+            hidden_size,
+            num_heads,
+            head_dim,
+            q,
+            k,
+            v,
+            qkv,
+            concat,
+            output,
+            lora,
+            layer_idx,
+        )
     }
 }

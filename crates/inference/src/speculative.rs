@@ -871,7 +871,7 @@ impl<'a> MtpVerifier<'a> {
         // RopeTable built with head_dim=rope_dim so half_dim = rope_dim/2
         let rope = crate::rope::RopeTable::new(rope_dim, max_seq_len.max(1), config.rope_theta);
 
-        let cache_cfg = crate::kv_cache::flat::FlatKVCacheConfig::for_qwen3(
+        let cache_cfg = crate::kv_cache::flat::FlatKVCacheConfig::new(
             1,
             config.num_key_value_heads,
             config.head_dim,

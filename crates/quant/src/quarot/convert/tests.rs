@@ -2,7 +2,7 @@ use super::*;
 use crate::quarot::lm_head::{
     QWEN35_EMBED_TOKENS_NAME, QWEN35_FINAL_NORM_NAME, QWEN35_LM_HEAD_NAME,
 };
-use lattice_model_config::qwen35_config::{LayerType, compute_layer_types};
+use lattice_arch::qwen35_config::{LayerType, compute_layer_types};
 use lattice_weights::q4_weights::q4_f32_to_f16;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -684,7 +684,7 @@ fn prepared_equivalence_streams_original_tensors_and_refuses_corruption() {
 
     let mut fusion_plan = qwen35_per_layer_fusion_plan(&cfg).unwrap();
     fusion_plan.push(qwen35_final_norm_fusion_target());
-    let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let rotation_plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     fuse_rmsnorms(&mut working_set, &fusion_plan).unwrap();
     absorb_rotations(&mut working_set, &rotation_plan, &rotation).unwrap();
 
@@ -1874,7 +1874,11 @@ fn convert_quarot_qwen35_skips_mtp_when_config_has_zero_layers() {
 fn read_quarot_seed_from_index_absent_file_is_none() {
     let tmp = tempfile::tempdir().unwrap();
     assert_eq!(
-        read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
+        read_quarot_seed_from_index(
+            tmp.path(),
+            &crate::quarot::plan::qwen35_rotation_target(&Qwen35Config::qwen35_0_8b()),
+            None
+        ),
         Ok(None),
         "missing quantize_index.json must yield Ok(None), not an error"
     );
@@ -1890,7 +1894,12 @@ fn read_quarot_seed_from_index_object_form_without_seed_is_refused() {
         "control: this fixture's config must declare no legacy seed, or the \
              refusal under test is not the one being exercised"
     );
-    let err = read_quarot_seed_from_index(tmp.path(), &cfg).expect_err(
+    let err = read_quarot_seed_from_index(
+        tmp.path(),
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        cfg.quarot_rotation_seed,
+    )
+    .expect_err(
         "object-form manifest with no seed in either channel must be refused, not \
              read as an unrotated artifact",
     );
@@ -1912,7 +1921,11 @@ fn read_quarot_seed_from_index_object_form_without_seed_defers_to_legacy_config(
     let mut cfg = Qwen35Config::qwen35_0_8b();
     cfg.quarot_rotation_seed = Some(12_648_430);
     assert_eq!(
-        read_quarot_seed_from_index(tmp.path(), &cfg),
+        read_quarot_seed_from_index(
+            tmp.path(),
+            &crate::quarot::plan::qwen35_rotation_target(&cfg),
+            cfg.quarot_rotation_seed
+        ),
         Ok(None),
         "with a legacy config seed present the manifest read must succeed and \
              return None, leaving the caller's `.or` to supply the seed"
@@ -1929,7 +1942,11 @@ fn read_quarot_seed_from_index_bare_array_without_any_seed_still_loads() {
     let cfg = Qwen35Config::qwen35_0_8b();
     assert_eq!(cfg.quarot_rotation_seed, None, "control: no legacy seed");
     assert_eq!(
-        read_quarot_seed_from_index(tmp.path(), &cfg),
+        read_quarot_seed_from_index(
+            tmp.path(),
+            &crate::quarot::plan::qwen35_rotation_target(&cfg),
+            cfg.quarot_rotation_seed
+        ),
         Ok(None),
         "bare-array manifest with no seed anywhere must stay loadable"
     );
@@ -1950,7 +1967,11 @@ fn read_quarot_seed_from_index_bare_array_is_none() {
     )
     .unwrap();
     assert_eq!(
-        read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
+        read_quarot_seed_from_index(
+            tmp.path(),
+            &crate::quarot::plan::qwen35_rotation_target(&Qwen35Config::qwen35_0_8b()),
+            None
+        ),
         Ok(None),
         "bare tensor-array quantize_index.json (plain quantize_q4 shape) must yield Ok(None)"
     );
@@ -1965,7 +1986,11 @@ fn read_quarot_seed_from_index_finds_seed() {
     )
     .unwrap();
     assert_eq!(
-        read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
+        read_quarot_seed_from_index(
+            tmp.path(),
+            &crate::quarot::plan::qwen35_rotation_target(&Qwen35Config::qwen35_0_8b()),
+            None
+        ),
         Ok(Some(13_258_600_446_175_248_384_u64)),
         "index with quarot_seed key must round-trip the u64 exactly"
     );
@@ -1980,8 +2005,12 @@ fn read_quarot_seed_from_index_rejects_malformed_json() {
     // a checkpoint that actually needed one.
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("quantize_index.json"), "not json").unwrap();
-    let err = read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b())
-        .expect_err("malformed quantize_index.json must be rejected, not silently None");
+    let err = read_quarot_seed_from_index(
+        tmp.path(),
+        &crate::quarot::plan::qwen35_rotation_target(&Qwen35Config::qwen35_0_8b()),
+        None,
+    )
+    .expect_err("malformed quantize_index.json must be rejected, not silently None");
     assert!(
         err.contains("malformed quantize_index.json"),
         "error must name the malformed-index failure; got: {err}"
@@ -2005,7 +2034,12 @@ fn read_quarot_seed_from_index_rejects_incomplete_object_form_entry() {
         r#"{"quarot_seed":42,"tensors":[{"name":"foo","file":"foo.q4"}]}"#,
     )
     .unwrap();
-    let err = read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()).expect_err(
+    let err = read_quarot_seed_from_index(
+        tmp.path(),
+        &crate::quarot::plan::qwen35_rotation_target(&Qwen35Config::qwen35_0_8b()),
+        None,
+    )
+    .expect_err(
         "object-form manifest with an incomplete tensor entry must be rejected, \
              not silently accepted",
     );
@@ -2031,7 +2065,11 @@ fn read_quarot_seed_from_index_bare_array_with_malformed_entries_is_none() {
     )
     .unwrap();
     assert_eq!(
-        read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
+        read_quarot_seed_from_index(
+            tmp.path(),
+            &crate::quarot::plan::qwen35_rotation_target(&Qwen35Config::qwen35_0_8b()),
+            None
+        ),
         Ok(None),
         "a bare array with malformed entries still carries no rotation seed \
              and must yield Ok(None), not an error"
@@ -2049,7 +2087,12 @@ fn read_quarot_seed_from_index_rejects_wrong_schema_shape() {
     )
     .unwrap();
     assert!(
-        read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()).is_err(),
+        read_quarot_seed_from_index(
+            tmp.path(),
+            &crate::quarot::plan::qwen35_rotation_target(&Qwen35Config::qwen35_0_8b()),
+            None
+        )
+        .is_err(),
         "schema-shape mismatch (tensors not an array) must be rejected"
     );
 }
@@ -2065,7 +2108,12 @@ fn read_quarot_seed_from_index_rejects_truncated_file() {
     )
     .unwrap();
     assert!(
-        read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()).is_err(),
+        read_quarot_seed_from_index(
+            tmp.path(),
+            &crate::quarot::plan::qwen35_rotation_target(&Qwen35Config::qwen35_0_8b()),
+            None
+        )
+        .is_err(),
         "truncated quantize_index.json must be rejected"
     );
 }
@@ -2083,8 +2131,12 @@ fn read_quarot_seed_from_index_rejects_oversized_file() {
     f.set_len(crate::q4_manifest::MAX_QUANTIZE_INDEX_LEN + 1)
         .unwrap();
     drop(f);
-    let err = read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b())
-        .expect_err("oversized quantize_index.json must be rejected");
+    let err = read_quarot_seed_from_index(
+        tmp.path(),
+        &crate::quarot::plan::qwen35_rotation_target(&Qwen35Config::qwen35_0_8b()),
+        None,
+    )
+    .expect_err("oversized quantize_index.json must be rejected");
     assert!(
         err.contains("too large"),
         "error must name the size-cap failure; got: {err}"
@@ -2099,13 +2151,18 @@ fn read_quarot_seed_from_index_rejects_oversized_file() {
 #[test]
 fn quantize_index_online_field_round_trips_through_json() {
     let cfg = Qwen35Config::qwen35_0_8b();
-    let r3 = crate::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+    let r3 = crate::quarot::plan::OnlineRotationSpec::attention_output_r3(
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        42,
+        8,
+    )
+    .unwrap();
     let names: Vec<String> = (0..cfg.num_hidden_layers)
         .filter(|&i| cfg.is_full_attention(i))
         .map(|i| {
             format!(
                 "{}.self_attn.o_proj.weight",
-                lattice_model_config::qwen35_tensors::qwen_layer_tensor_prefix(i)
+                lattice_arch::qwen35_tensors::qwen_layer_tensor_prefix(i)
             )
         })
         .collect();
@@ -2139,13 +2196,18 @@ fn quantize_index_online_field_round_trips_through_json() {
 #[test]
 fn quantize_index_v1_online_manifest_is_rejected_at_load_not_silently_accepted() {
     let cfg = Qwen35Config::qwen35_0_8b();
-    let r3 = crate::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+    let r3 = crate::quarot::plan::OnlineRotationSpec::attention_output_r3(
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        42,
+        8,
+    )
+    .unwrap();
     let names: Vec<String> = (0..cfg.num_hidden_layers)
         .filter(|&i| cfg.is_full_attention(i))
         .map(|i| {
             format!(
                 "{}.self_attn.o_proj.weight",
-                lattice_model_config::qwen35_tensors::qwen_layer_tensor_prefix(i)
+                lattice_arch::qwen35_tensors::qwen_layer_tensor_prefix(i)
             )
         })
         .collect();
@@ -2164,8 +2226,12 @@ fn quantize_index_v1_online_manifest_is_rejected_at_load_not_silently_accepted()
     let json = serde_json::to_string(&index).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("quantize_index.json"), &json).unwrap();
-    let err = read_quarot_seed_from_index(tmp.path(), &cfg)
-        .expect_err("a well-formed V1Online manifest must be rejected at load, not accepted as V0");
+    let err = read_quarot_seed_from_index(
+        tmp.path(),
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        cfg.quarot_rotation_seed,
+    )
+    .expect_err("a well-formed V1Online manifest must be rejected at load, not accepted as V0");
     assert!(
         err.contains("does not yet execute V1 online rotation recipes"),
         "got: {err}"
@@ -2185,7 +2251,11 @@ fn quantize_index_without_online_field_parses_identically_to_v0() {
     )
     .unwrap();
     assert_eq!(
-        read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
+        read_quarot_seed_from_index(
+            tmp.path(),
+            &crate::quarot::plan::qwen35_rotation_target(&Qwen35Config::qwen35_0_8b()),
+            None
+        ),
         Ok(Some(13_258_600_446_175_248_384_u64)),
         "a V0 manifest with no online field must parse exactly as before"
     );
@@ -2202,7 +2272,12 @@ fn quantize_index_with_invalid_online_descriptor_is_rejected_at_load() {
     // other V1Online manifest, not a `validate`-specific message; the
     // manifest is still rejected either way.
     let cfg = Qwen35Config::qwen35_0_8b();
-    let r3 = crate::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+    let r3 = crate::quarot::plan::OnlineRotationSpec::attention_output_r3(
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        42,
+        8,
+    )
+    .unwrap();
     let invalid_descriptor = OnlineArtifactDescriptor {
         version: crate::quarot::io::ArtifactVersion::V1Online,
         online_rotations: vec![r3],
@@ -2218,8 +2293,12 @@ fn quantize_index_with_invalid_online_descriptor_is_rejected_at_load() {
     let json = serde_json::to_string(&index).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("quantize_index.json"), &json).unwrap();
-    let err = read_quarot_seed_from_index(tmp.path(), &cfg)
-        .expect_err("a manifest carrying an invalid online descriptor must be rejected");
+    let err = read_quarot_seed_from_index(
+        tmp.path(),
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        cfg.quarot_rotation_seed,
+    )
+    .expect_err("a manifest carrying an invalid online descriptor must be rejected");
     assert!(
         err.contains("does not yet execute V1 online rotation recipes"),
         "got: {err}"
@@ -2268,8 +2347,12 @@ fn quantize_index_v1_online_large_layer_scope_is_rejected_without_running_valida
     let json = serde_json::to_string(&index).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("quantize_index.json"), &json).unwrap();
-    let err = read_quarot_seed_from_index(tmp.path(), &cfg)
-        .expect_err("an adversarially-shaped V1Online manifest must still be rejected");
+    let err = read_quarot_seed_from_index(
+        tmp.path(),
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        cfg.quarot_rotation_seed,
+    )
+    .expect_err("an adversarially-shaped V1Online manifest must still be rejected");
     assert!(
         err.contains("does not yet execute V1 online rotation recipes"),
         "expected the unconditional version-reject message (proving \
@@ -2295,7 +2378,12 @@ fn quantize_index_v1_version_without_online_key_is_rejected_fail_closed() {
         r#"{"quarot_seed":7,"tensors":[],"artifact_version":"v1-online-r3r4"}"#,
     )
     .unwrap();
-    let err = read_quarot_seed_from_index(tmp.path(), &cfg).expect_err(
+    let err = read_quarot_seed_from_index(
+        tmp.path(),
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        cfg.quarot_rotation_seed,
+    )
+    .expect_err(
         "a manifest declaring artifact_version v1-online-r3r4 with no online \
              key must be rejected, not silently loaded as V0",
     );
@@ -2317,7 +2405,12 @@ fn quantize_index_v1_version_with_null_online_is_rejected_fail_closed() {
         r#"{"quarot_seed":7,"tensors":[],"online":null,"artifact_version":"v1-online-r3r4"}"#,
     )
     .unwrap();
-    let err = read_quarot_seed_from_index(tmp.path(), &cfg).expect_err(
+    let err = read_quarot_seed_from_index(
+        tmp.path(),
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        cfg.quarot_rotation_seed,
+    )
+    .expect_err(
         "a manifest declaring artifact_version v1-online-r3r4 with online \
              explicitly null must be rejected, not silently loaded as V0",
     );

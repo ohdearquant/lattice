@@ -439,14 +439,14 @@ mod scoring {
             source: &RefitSource,
             adapters: &[ReferenceAdapter<'_>],
         ) -> Result<Vec<ReferencePayloadSummary>, ReferenceError> {
-            use crate::quant::quarot::plan::{AbsorptionSide, RotationPlan};
+            use crate::quant::quarot::plan::AbsorptionSide;
             let cfg = &state.engine.config;
             if adapters.len() != source.adapter_names().len() || adapters.is_empty() {
                 return Err(invalid(
                     "payload set differs from the trained adapter schema",
                 ));
             }
-            let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+            let plan = crate::quant::quarot::plan::qwen35_residual_stream_linear_layers();
             let mut summaries = Vec::new();
             for (adapter, name) in adapters.iter().zip(source.adapter_names()) {
                 if adapter.name != name || adapter.layers.is_empty() || adapter.descriptor.rank == 0

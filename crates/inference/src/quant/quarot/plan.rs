@@ -5,6 +5,7 @@
 #[doc(inline)]
 pub use lattice_quant::quarot::plan::{
     AbsorptionSide, CoverageReport, OnlineRotationSpec, OnlineTransformSite, RotationId,
-    RotationPlan, RuleRequirement, TensorRotation, apply_tensor_rotation,
-    apply_tensor_rotation_f64, qwen3_required_tensor_names,
+    RotationPlan, RotationTarget, RuleRequirement, TensorRotation, apply_tensor_rotation,
+    apply_tensor_rotation_f64, qwen3_required_tensor_names, qwen35_residual_stream_linear_layers,
+    qwen35_rotation_target,
 };

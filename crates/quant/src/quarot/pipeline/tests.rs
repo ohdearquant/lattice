@@ -1,6 +1,6 @@
 use super::*;
 use crate::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use lattice_model_config::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_weights::q4_weights::{dequantize_q4_to_f32, quantize_f64_to_q4};
 use lattice_weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
 
@@ -175,7 +175,7 @@ fn fuse_rmsnorms_rejects_empty_downstream_without_neutralizing_norm() {
 fn absorb_rotations_applies_planned_sides() {
     let hidden = 16;
     let inter = 32;
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let r = RandomizedHadamard::new(0xCAFE_BABE, hidden).unwrap();
 
     let mut tensors = HashMap::new();
@@ -237,7 +237,7 @@ fn absorb_rotations_applies_planned_sides() {
 fn absorb_rotations_leaves_unplanned_tensors_untouched() {
     // `linear_attn.norm.weight` is unplanned (plain-gamma GDN norm; see plan.rs).
     let hidden = 16;
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let r = RandomizedHadamard::new(0xFEED_FACE, hidden).unwrap();
 
     let mut tensors = HashMap::new();
@@ -258,7 +258,7 @@ fn absorb_rotations_leaves_unplanned_tensors_untouched() {
 #[test]
 fn absorb_rotations_errors_on_non_2d_planned_tensor() {
     let hidden = 16;
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let r = RandomizedHadamard::new(1, hidden).unwrap();
 
     let mut tensors = HashMap::new();
@@ -282,7 +282,7 @@ fn absorb_rotations_errors_on_non_2d_planned_tensor() {
 fn fuse_then_absorb_preserves_forward_pass() {
     let hidden = 16;
     let inter = 32;
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let r = RandomizedHadamard::new(0xABCDEF, hidden).unwrap();
 
     let q_name = "model.language_model.layers.0.self_attn.q_proj.weight";
@@ -332,7 +332,7 @@ fn qwen35_fusion_plan_targets_resolve_within_required_tensor_set() {
     // between the fusion plan and the loader's required-name helper.
     let cfg = Qwen35Config::qwen35_0_8b();
     let required: std::collections::HashSet<String> =
-        lattice_model_config::qwen35_tensors::qwen_required_tensor_names(&cfg)
+        lattice_arch::qwen35_tensors::qwen_required_tensor_names(&cfg)
             .into_iter()
             .collect();
     let plan = qwen35_per_layer_fusion_plan(&cfg).unwrap();
@@ -366,7 +366,6 @@ fn quarot_rotated_q4_forward_matches_f64_reference() {
 
     use crate::quarot::hadamard::RandomizedHadamard;
     use crate::quarot::pipeline::{TensorEntry, absorb_rotations};
-    use crate::quarot::plan::RotationPlan;
 
     const HIDDEN: usize = 32;
     const Q_ROWS: usize = 2; // q_proj input-side [2, 32]
@@ -448,7 +447,7 @@ fn quarot_rotated_q4_forward_matches_f64_reference() {
     let x_o = lcg_f64(HIDDEN, 0x4444_4444_4444_4444);
 
     let rotation = RandomizedHadamard::new(0x3200_0001, HIDDEN).expect("rotation init");
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
 
     // ---- Production path: absorb_rotations + quantize_f64_to_q4 + dequantize ----
     let mut tensors: HashMap<String, TensorEntry> = HashMap::new();

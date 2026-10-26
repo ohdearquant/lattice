@@ -23,10 +23,11 @@ use lattice_tokenizer::__internal::incremental_detokenizer_push;
 #[test]
 fn generate_streaming_with_cancel_true_before_prefill_returns_interrupt() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 5,
-        temperature: 0.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 5;
+        config.temperature = 0.0;
+        config
     };
     // Cancel on the very first `should_cancel` call only (the pre-prefill
     // checkpoint), so this test pins THAT checkpoint specifically rather
@@ -74,10 +75,11 @@ fn generate_streaming_with_cancel_true_before_prefill_returns_interrupt() {
 #[test]
 fn generate_streaming_with_cancel_true_after_prefill_returns_interrupt() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 5,
-        temperature: 0.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 5;
+        config.temperature = 0.0;
+        config
     };
     let calls = std::cell::Cell::new(0usize);
     let on_token_calls = std::cell::Cell::new(0usize);
@@ -130,10 +132,11 @@ fn generate_streaming_with_cancel_true_after_prefill_returns_interrupt() {
 #[test]
 fn generate_streaming_with_cancel_mid_decode_stops_early_fast_path() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 10,
-        temperature: 0.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 10;
+        config.temperature = 0.0;
+        config
     };
     let calls = std::cell::Cell::new(0usize);
     let result = model
@@ -167,10 +170,11 @@ fn generate_streaming_with_cancel_mid_decode_stops_early_fast_path() {
 #[test]
 fn generate_streaming_with_cancel_on_token_false_stops_generation_fast_path() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 10,
-        temperature: 0.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 10;
+        config.temperature = 0.0;
+        config
     };
     let result = model
         .generate_streaming_with_cancel("a", &gen_cfg, |_delta| false, || false)
@@ -197,11 +201,12 @@ fn generate_streaming_with_cancel_on_token_false_stops_generation_fast_path() {
 #[test]
 fn generate_streaming_with_cancel_on_token_false_stops_generation_stop_string_path() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 10,
-        temperature: 0.0,
-        stop_strings: vec!["ZZZZ".to_string()],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 10;
+        config.temperature = 0.0;
+        config.stop_strings = vec!["ZZZZ".to_string()];
+        config
     };
     let result = model
         .generate_streaming_with_cancel("a", &gen_cfg, |_delta| false, || false)
@@ -227,11 +232,12 @@ fn generate_streaming_with_cancel_on_token_false_stops_generation_stop_string_pa
 #[test]
 fn generate_streaming_with_cancel_mid_decode_stops_early_stop_string_path() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 10,
-        temperature: 0.0,
-        stop_strings: vec!["ZZZZ".to_string()],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 10;
+        config.temperature = 0.0;
+        config.stop_strings = vec!["ZZZZ".to_string()];
+        config
     };
     let calls = std::cell::Cell::new(0usize);
     let result = model
@@ -278,10 +284,11 @@ fn generate_streaming_with_cancel_mid_decode_stops_early_stop_string_path() {
 #[test]
 fn raw_observer_prefill_end_precedes_first_raw_token_monotonic_index() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        temperature: 0.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 3;
+        config.temperature = 0.0;
+        config
     };
     let events = std::cell::RefCell::new(Vec::<RawGenEvent>::new());
     let result = model
@@ -341,10 +348,11 @@ fn raw_observer_prefill_end_precedes_first_raw_token_monotonic_index() {
 fn raw_observer_prefill_end_precedes_first_sample_not_just_first_raw_token() {
     test_reset_sample_seam();
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        temperature: 0.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 3;
+        config.temperature = 0.0;
+        config
     };
     let result = model
         .generate_streaming_with_observer(
@@ -438,10 +446,11 @@ fn raw_observer_fires_before_on_token_for_buffered_incomplete_utf8_first_token()
              this test's premise depends on it"
     );
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 4,
-        temperature: 0.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config
     };
     let raw_indices = std::cell::RefCell::new(Vec::<usize>::new());
     let on_token_calls = std::cell::Cell::new(0usize);
@@ -508,14 +517,15 @@ fn eos_flushes_incomplete_utf8_tail_in_streaming_and_nonstreaming() {
     "vocab":{"ĊÂ":0,"<unk>":1,"a":2},"merges":[]}
 }"#;
     let model = build_tiny_zero_model_tok(TOK_JSON);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        temperature: 0.0,
-        enable_thinking: true,
-        reasoning_budget: Some(1),
-        stop_token_ids: vec![7],
-        stop_strings: vec!["never".to_string()],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 3;
+        config.temperature = 0.0;
+        config.enable_thinking = true;
+        config.reasoning_budget = Some(1);
+        config.stop_token_ids = vec![7];
+        config.stop_strings = vec!["never".to_string()];
+        config
     };
 
     let nonstreaming = model.generate("a", &gen_cfg).unwrap();
@@ -549,11 +559,12 @@ fn eos_flushes_incomplete_utf8_tail_in_streaming_and_nonstreaming() {
 #[test]
 fn streaming_flushes_held_back_stop_prefix_bytes_when_the_detokenizer_tail_is_empty() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        temperature: 0.0,
-        stop_strings: vec!["never".to_string()],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 3;
+        config.temperature = 0.0;
+        config.stop_strings = vec!["never".to_string()];
+        config
     };
 
     let nonstreaming = model
@@ -599,12 +610,13 @@ fn streaming_flushes_held_back_stop_prefix_bytes_when_the_detokenizer_tail_is_em
 #[test]
 fn stop_string_truncation_drops_stale_token_logprobs() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 10,
-        temperature: 0.0,
-        logprobs: Some(0),
-        stop_strings: vec!["k><unk".to_string()],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 10;
+        config.temperature = 0.0;
+        config.logprobs = Some(0);
+        config.stop_strings = vec!["k><unk".to_string()];
+        config
     };
     let result = model
         .generate("a", &gen_cfg)
@@ -649,11 +661,12 @@ fn stop_string_truncation_drops_stale_token_logprobs() {
 #[test]
 fn decode_policy_record_logprob_noop_when_not_requested() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        temperature: 0.0,
-        logprobs: None,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 3;
+        config.temperature = 0.0;
+        config.logprobs = None;
+        config
     };
     let result = model
         .generate("a", &gen_cfg)
@@ -687,11 +700,12 @@ fn decode_policy_record_logprob_noop_when_not_requested() {
 #[test]
 fn init_records_the_prefill_tokens_logprob_before_any_transition_call() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        temperature: 0.0,
-        logprobs: Some(0),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.logprobs = Some(0);
+        config
     };
     let result = model
         .generate("a", &gen_cfg)
@@ -731,11 +745,12 @@ fn init_records_the_prefill_tokens_logprob_before_any_transition_call() {
 #[test]
 fn transition_records_one_logprob_per_generated_token() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        temperature: 0.0,
-        logprobs: Some(0),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 3;
+        config.temperature = 0.0;
+        config.logprobs = Some(0);
+        config
     };
     let result = model
         .generate("a", &gen_cfg)
@@ -782,11 +797,12 @@ fn assert_batched_prefill_matches_serial(model: &Qwen35Model, prompt: &str, max_
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let gen_cfg = crate::generation::GenerateConfig {
-        max_new_tokens,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.max_new_tokens = max_new_tokens;
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config
     };
 
     FORCE_SERIAL_PREFILL.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -833,11 +849,12 @@ fn generate_streaming_batched_prefill_matches_nonstreaming_text() {
     let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
         .expect("dense Qwen3.5 model should load successfully");
 
-    let gen_cfg = crate::generation::GenerateConfig {
-        max_new_tokens: 20,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.max_new_tokens = 20;
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config
     };
     let prompt = "The quick brown fox jumps over the lazy dog. In a distant future,";
 
@@ -888,11 +905,12 @@ fn public_prefill_ttft_ab_sweep() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let gen_cfg = crate::generation::GenerateConfig {
-        max_new_tokens: 1,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config
     };
 
     println!("words\tprompt_tokens\tserial_ms\tbatched_ms\tspeedup");
@@ -957,12 +975,13 @@ fn initially_cancelled_preflight(
 #[test]
 fn streaming_cold_preflight_refusals_and_zero_tokens_precede_cancellation() {
     let model = super::super::super::test_support::tiny_zero_model_with_context(1);
-    let mut cfg = GenerateConfig {
-        max_new_tokens: 0,
-        reasoning_budget: Some(1),
-        enable_thinking: true,
-        logprobs: Some(3),
-        ..Default::default()
+    let mut cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config.reasoning_budget = Some(1);
+        config.enable_thinking = true;
+        config.logprobs = Some(3);
+        config
     };
     let empty = initially_cancelled_preflight(&model, "", &cfg);
     assert!(
@@ -1006,12 +1025,13 @@ fn streaming_cold_preflight_refusals_and_zero_tokens_precede_cancellation() {
 #[test]
 fn streaming_cold_preflight_valid_request_reaches_initial_cancellation_once() {
     let model = super::super::super::test_support::tiny_zero_model_with_context(2);
-    let cfg = GenerateConfig {
-        max_new_tokens: 1,
-        reasoning_budget: Some(2),
-        enable_thinking: false,
-        logprobs: Some(3),
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.reasoning_budget = Some(2);
+        config.enable_thinking = false;
+        config.logprobs = Some(3);
+        config
     };
     assert_eq!(cfg.effective_reasoning_budget(), None);
     assert_eq!(model.tokenizer.tokenize("a").real_length, 1);
@@ -1123,20 +1143,21 @@ fn cold_preflight_seed_and_temperature_match_between_generation_entries() {
         (seed_b, expected_b),
         (seed_a, expected_a),
     ] {
-        let cfg = GenerateConfig {
-            max_new_tokens: 12,
-            temperature: 0.75,
-            top_k: 3,
-            top_p: 1.0,
-            min_p: 0.0,
-            repetition_penalty: 1.0,
-            seed: Some(seed),
-            stop_token_ids: vec![],
-            stop_strings: vec![],
-            enable_thinking: false,
-            reasoning_budget: None,
-            logprobs: Some(3),
-            ..Default::default()
+        let cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 12;
+            config.temperature = 0.75;
+            config.top_k = 3;
+            config.top_p = 1.0;
+            config.min_p = 0.0;
+            config.repetition_penalty = 1.0;
+            config.seed = Some(seed);
+            config.stop_token_ids = vec![];
+            config.stop_strings = vec![];
+            config.enable_thinking = false;
+            config.reasoning_budget = None;
+            config.logprobs = Some(3);
+            config
         };
         let (nonstreaming, trace) = model.generate_with_trace("a", &cfg).unwrap();
         assert_sampling_fixture_output(&model, &nonstreaming, trace, &expected);

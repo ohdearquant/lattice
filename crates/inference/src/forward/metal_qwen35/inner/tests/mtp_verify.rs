@@ -1336,22 +1336,22 @@ fn real_loop_truncate_at_stop(mut ids: Vec<u32>, stop: u32) -> Vec<u32> {
 }
 
 fn real_loop_gen_cfg() -> crate::generation::GenerateConfig {
-    crate::generation::GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: REAL_LOOP_NEW_TOKENS,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
-    }
+    let mut config = crate::generation::GenerateConfig::default();
+    config.min_p = 0.0;
+    config.max_new_tokens = REAL_LOOP_NEW_TOKENS;
+    config.temperature = 0.0;
+    config.top_k = 1;
+    config.top_p = 1.0;
+    config.repetition_penalty = 1.0;
+    config.seed = Some(42);
+    config.stop_token_ids = vec![];
+    config.enable_thinking = false;
+    config.enable_mtp = Some(false);
+    config.grammar = None;
+    config.stop_strings = vec![];
+    config.reasoning_budget = None;
+    config.logprobs = None;
+    config
 }
 
 /// Compare the generic loop with plain greedy decoding for every prompt on one

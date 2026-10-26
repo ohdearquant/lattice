@@ -218,7 +218,7 @@ fn memory_bytes_calculation() {
     // kv_dim = 8 * 128 = 1024
     // Per side: 28 * 4096 * 1024 * 2 bytes (f16)
     // Total: 2 * that = 469,762,048 bytes ~ 448 MB (was 896 MB with f32)
-    let config = FlatKVCacheConfig::for_qwen3(28, 8, 128, 4096);
+    let config = FlatKVCacheConfig::new(28, 8, 128, 4096);
     let kv_dim = 8 * 128; // 1024
     let expected = 2 * 28 * 4096 * kv_dim * 2; // 2 bytes per f16
     assert_eq!(config.total_bytes(), expected);
@@ -541,7 +541,7 @@ fn constructed_cache_eagerly_initializes_configured_len() {
     // Verifies that FlatKVCache::new immediately materializes all buffers
     // at max_seq_len capacity (eager-allocation contract; callers must provide
     // their bounded capacity up front).
-    let config = FlatKVCacheConfig::for_qwen3(2, 2, 4, 16);
+    let config = FlatKVCacheConfig::new(2, 2, 4, 16);
     let cache = FlatKVCache::new(config);
     let kv_dim = cache.kv_dim(); // 2 * 4 = 8
     let max_seq = cache.max_seq_len(); // 16
@@ -1074,7 +1074,7 @@ fn try_new_overflow_kv_dim_returns_err() {
 /// try_new rejects configs whose max_seq_len * kv_dim overflows usize.
 ///
 /// This is the exact overflow described in issue #407:
-/// `for_qwen3(1, 8, 128, usize::MAX / kv_dim + 2)` wraps layer_capacity
+/// `FlatKVCacheConfig::new(1, 8, 128, usize::MAX / kv_dim + 2)` wraps layer_capacity
 /// to 1024 in the infallible `new()`, silently under-allocating the buffer
 /// and causing an out-of-bounds index on a later `append_kv`. `try_new`
 /// must return Err before any allocation.
@@ -1083,7 +1083,7 @@ fn try_new_overflow_layer_capacity_returns_err() {
     // kv_dim = 8 * 128 = 1024; max_seq_len chosen so max_seq_len * 1024 overflows usize.
     let kv_dim: usize = 8 * 128;
     let overflow_seq = usize::MAX / kv_dim + 2;
-    let config = FlatKVCacheConfig::for_qwen3(1, 8, 128, overflow_seq);
+    let config = FlatKVCacheConfig::new(1, 8, 128, overflow_seq);
     let r = FlatKVCache::try_new(config);
     assert!(
         matches!(r, Err(InferenceError::InvalidInput(_))),
@@ -1117,7 +1117,7 @@ fn try_new_overflow_total_elements_returns_err() {
 /// Confirms the happy path is not broken by the overflow guards.
 #[test]
 fn try_new_valid_config_succeeds() {
-    let config = FlatKVCacheConfig::for_qwen3(2, 4, 8, 16);
+    let config = FlatKVCacheConfig::new(2, 4, 8, 16);
     let cache = FlatKVCache::try_new(config).expect("valid config must succeed");
     assert_eq!(cache.seq_len(), 0);
     assert_eq!(cache.num_layers(), 2);
@@ -1133,7 +1133,7 @@ fn try_new_valid_config_succeeds() {
 #[test]
 fn advance_requires_all_layers_written() {
     // Two-layer cache; write only layer 0 then try to advance.
-    let config = FlatKVCacheConfig::for_qwen3(2, 1, 4, 4);
+    let config = FlatKVCacheConfig::new(2, 1, 4, 4);
     let kv_dim = config.kv_dim();
     let mut cache = FlatKVCache::new(config);
 
@@ -1157,7 +1157,7 @@ fn advance_requires_all_layers_written() {
 /// advance() succeeds once all layers have been written.
 #[test]
 fn advance_succeeds_when_all_layers_written() {
-    let config = FlatKVCacheConfig::for_qwen3(2, 1, 4, 4);
+    let config = FlatKVCacheConfig::new(2, 1, 4, 4);
     let kv_dim = config.kv_dim();
     let mut cache = FlatKVCache::new(config);
 
@@ -1175,7 +1175,7 @@ fn advance_succeeds_when_all_layers_written() {
 /// starts clean and requires all layers to be written again.
 #[test]
 fn advance_resets_layer_tracking_between_steps() {
-    let config = FlatKVCacheConfig::for_qwen3(2, 1, 4, 4);
+    let config = FlatKVCacheConfig::new(2, 1, 4, 4);
     let kv_dim = config.kv_dim();
     let mut cache = FlatKVCache::new(config);
 
@@ -1193,5 +1193,17 @@ fn advance_resets_layer_tracking_between_steps() {
     assert!(
         matches!(r, Err(InferenceError::InvalidInput(_))),
         "advance must Err on step 1 when layer 1 not written; got {r:?}"
+    );
+}
+
+#[test]
+#[allow(deprecated)] // the deprecated constructor is the subject
+fn for_qwen3_builds_the_same_configuration_as_new() {
+    let fields = |c: &FlatKVCacheConfig| (c.num_layers, c.num_kv_heads, c.head_dim, c.max_seq_len);
+    let config = FlatKVCacheConfig::new(28, 8, 128, 4096);
+    assert_eq!(fields(&config), (28, 8, 128, 4096));
+    assert_eq!(
+        fields(&FlatKVCacheConfig::for_qwen3(28, 8, 128, 4096)),
+        fields(&config)
     );
 }
