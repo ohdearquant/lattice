@@ -36,10 +36,9 @@ pub mod rope;
 /// path and never re-exports them publicly.
 #[doc(hidden)]
 pub mod __internal {
-    use crate::attention::standard::AttentionBuffers;
+    use crate::attention::standard::{AttentionBuffers, AttentionProjections};
     use crate::lora_hook::LoraHook;
     use lattice_inference_core::InferenceError;
-    use lattice_weights::f32_weights::TransformerLayerWeights;
 
     /// Checked count of floats in a paged cache allocation.
     pub fn paged_cache_try_floats_per_page(
@@ -68,7 +67,7 @@ pub mod __internal {
     #[inline]
     pub fn multi_head_attention_in_place(
         hidden_states: &[f32],
-        layer_weights: &TransformerLayerWeights<'_>,
+        projections: &AttentionProjections<'_>,
         fused_qkv_weight: &[f32],
         fused_qkv_bias: &[f32],
         attention_mask: &[u32],
@@ -82,7 +81,7 @@ pub mod __internal {
     ) {
         crate::attention::standard::multi_head_attention_in_place(
             hidden_states,
-            layer_weights,
+            projections,
             fused_qkv_weight,
             fused_qkv_bias,
             attention_mask,
@@ -100,7 +99,7 @@ pub mod __internal {
     #[inline]
     pub fn multi_head_attention_batched(
         hidden_states: &[f32],
-        layer_weights: &TransformerLayerWeights<'_>,
+        projections: &AttentionProjections<'_>,
         fused_qkv_weight: &[f32],
         fused_qkv_bias: &[f32],
         cu_seqlens: &[usize],
@@ -118,7 +117,7 @@ pub mod __internal {
     ) {
         crate::attention::standard::multi_head_attention_batched(
             hidden_states,
-            layer_weights,
+            projections,
             fused_qkv_weight,
             fused_qkv_bias,
             cu_seqlens,

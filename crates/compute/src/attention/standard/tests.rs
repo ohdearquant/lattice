@@ -1,6 +1,6 @@
 use super::*;
 use crate::lora_hook::NoopLoraHook;
-use lattice_weights::f32_weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
+use lattice_weights::f32_weights::{Tensor1D, Tensor2D};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct RowShapeHook {
@@ -38,15 +38,10 @@ fn test_attention_simd_matches_expected() {
     ];
     let zero_bias_4: Vec<f32> = vec![0.0; 4];
 
-    // Attention layer norm weights: gamma=1, beta=0 (passthrough)
-    let ones_4: Vec<f32> = vec![1.0; 4];
-
-    // FFN weights: use identity for intermediate (but size could differ).
-    // For this test we only care about the attention part, so make FFN
-    // a passthrough too.  intermediate_size = hidden_size for simplicity.
+    // `AttentionBuffers` also sizes an FFN scratch, which attention does not use.
     let intermediate_size = hidden_size;
 
-    let layer = TransformerLayerWeights {
+    let layer = AttentionProjections {
         query_weight: Tensor2D {
             data: &identity_4x4,
             rows: hidden_size,
@@ -74,46 +69,12 @@ fn test_attention_simd_matches_expected() {
             data: &zero_bias_4,
             len: hidden_size,
         },
-        attn_output_weight: Tensor2D {
+        output_weight: Tensor2D {
             data: &identity_4x4,
             rows: hidden_size,
             cols: hidden_size,
         },
-        attn_output_bias: Tensor1D {
-            data: &zero_bias_4,
-            len: hidden_size,
-        },
-        attn_layer_norm_weight: Tensor1D {
-            data: &ones_4,
-            len: hidden_size,
-        },
-        attn_layer_norm_bias: Tensor1D {
-            data: &zero_bias_4,
-            len: hidden_size,
-        },
-        ffn_intermediate_weight: Tensor2D {
-            data: &identity_4x4,
-            rows: intermediate_size,
-            cols: hidden_size,
-        },
-        ffn_intermediate_bias: Tensor1D {
-            data: &zero_bias_4,
-            len: intermediate_size,
-        },
-        ffn_output_weight: Tensor2D {
-            data: &identity_4x4,
-            rows: hidden_size,
-            cols: intermediate_size,
-        },
-        ffn_output_bias: Tensor1D {
-            data: &zero_bias_4,
-            len: hidden_size,
-        },
-        ffn_layer_norm_weight: Tensor1D {
-            data: &ones_4,
-            len: hidden_size,
-        },
-        ffn_layer_norm_bias: Tensor1D {
+        output_bias: Tensor1D {
             data: &zero_bias_4,
             len: hidden_size,
         },
@@ -179,11 +140,10 @@ fn test_attention_mask_suppresses_tokens() {
 
     let identity_2x2: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
     let zero_bias_2: Vec<f32> = vec![0.0; 2];
-    let ones_2: Vec<f32> = vec![1.0; 2];
 
     let intermediate_size = hidden_size;
 
-    let layer = TransformerLayerWeights {
+    let layer = AttentionProjections {
         query_weight: Tensor2D {
             data: &identity_2x2,
             rows: hidden_size,
@@ -211,46 +171,12 @@ fn test_attention_mask_suppresses_tokens() {
             data: &zero_bias_2,
             len: hidden_size,
         },
-        attn_output_weight: Tensor2D {
+        output_weight: Tensor2D {
             data: &identity_2x2,
             rows: hidden_size,
             cols: hidden_size,
         },
-        attn_output_bias: Tensor1D {
-            data: &zero_bias_2,
-            len: hidden_size,
-        },
-        attn_layer_norm_weight: Tensor1D {
-            data: &ones_2,
-            len: hidden_size,
-        },
-        attn_layer_norm_bias: Tensor1D {
-            data: &zero_bias_2,
-            len: hidden_size,
-        },
-        ffn_intermediate_weight: Tensor2D {
-            data: &identity_2x2,
-            rows: intermediate_size,
-            cols: hidden_size,
-        },
-        ffn_intermediate_bias: Tensor1D {
-            data: &zero_bias_2,
-            len: intermediate_size,
-        },
-        ffn_output_weight: Tensor2D {
-            data: &identity_2x2,
-            rows: hidden_size,
-            cols: intermediate_size,
-        },
-        ffn_output_bias: Tensor1D {
-            data: &zero_bias_2,
-            len: hidden_size,
-        },
-        ffn_layer_norm_weight: Tensor1D {
-            data: &ones_2,
-            len: hidden_size,
-        },
-        ffn_layer_norm_bias: Tensor1D {
+        output_bias: Tensor1D {
             data: &zero_bias_2,
             len: hidden_size,
         },
@@ -322,10 +248,9 @@ fn masked_token_value_does_not_leak_when_valid_score_below_sentinel() {
     let key_w: Vec<f32> = vec![-100.0, 0.0, 0.0, 0.0];
     let identity_2x2: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
     let zero_bias_2: Vec<f32> = vec![0.0; 2];
-    let ones_2: Vec<f32> = vec![1.0; 2];
     let intermediate_size = hidden_size;
 
-    let layer = TransformerLayerWeights {
+    let layer = AttentionProjections {
         query_weight: Tensor2D {
             data: &query_w,
             rows: hidden_size,
@@ -353,46 +278,12 @@ fn masked_token_value_does_not_leak_when_valid_score_below_sentinel() {
             data: &zero_bias_2,
             len: hidden_size,
         },
-        attn_output_weight: Tensor2D {
+        output_weight: Tensor2D {
             data: &identity_2x2,
             rows: hidden_size,
             cols: hidden_size,
         },
-        attn_output_bias: Tensor1D {
-            data: &zero_bias_2,
-            len: hidden_size,
-        },
-        attn_layer_norm_weight: Tensor1D {
-            data: &ones_2,
-            len: hidden_size,
-        },
-        attn_layer_norm_bias: Tensor1D {
-            data: &zero_bias_2,
-            len: hidden_size,
-        },
-        ffn_intermediate_weight: Tensor2D {
-            data: &identity_2x2,
-            rows: intermediate_size,
-            cols: hidden_size,
-        },
-        ffn_intermediate_bias: Tensor1D {
-            data: &zero_bias_2,
-            len: intermediate_size,
-        },
-        ffn_output_weight: Tensor2D {
-            data: &identity_2x2,
-            rows: hidden_size,
-            cols: intermediate_size,
-        },
-        ffn_output_bias: Tensor1D {
-            data: &zero_bias_2,
-            len: hidden_size,
-        },
-        ffn_layer_norm_weight: Tensor1D {
-            data: &ones_2,
-            len: hidden_size,
-        },
-        ffn_layer_norm_bias: Tensor1D {
+        output_bias: Tensor1D {
             data: &zero_bias_2,
             len: hidden_size,
         },
@@ -499,7 +390,6 @@ fn batched_attention_matches_single_sequence_per_row_packed() {
         m
     };
     let zero_bias_8: Vec<f32> = vec![0.0; hidden_size];
-    let ones_8: Vec<f32> = vec![1.0; hidden_size];
 
     // Distinct Q/K/V projections: different diagonal scale AND different
     // per-dim bias, so Q != K != V and the split offsets are load-bearing.
@@ -519,7 +409,7 @@ fn batched_attention_matches_single_sequence_per_row_packed() {
     fused_qkv_bias.extend_from_slice(&key_bias_v);
     fused_qkv_bias.extend_from_slice(&value_bias_v);
 
-    let layer = TransformerLayerWeights {
+    let layer = AttentionProjections {
         query_weight: Tensor2D {
             data: &query_w,
             rows: hidden_size,
@@ -547,46 +437,12 @@ fn batched_attention_matches_single_sequence_per_row_packed() {
             data: &value_bias_v,
             len: hidden_size,
         },
-        attn_output_weight: Tensor2D {
+        output_weight: Tensor2D {
             data: &identity_8x8,
             rows: hidden_size,
             cols: hidden_size,
         },
-        attn_output_bias: Tensor1D {
-            data: &zero_bias_8,
-            len: hidden_size,
-        },
-        attn_layer_norm_weight: Tensor1D {
-            data: &ones_8,
-            len: hidden_size,
-        },
-        attn_layer_norm_bias: Tensor1D {
-            data: &zero_bias_8,
-            len: hidden_size,
-        },
-        ffn_intermediate_weight: Tensor2D {
-            data: &identity_8x8,
-            rows: intermediate_size,
-            cols: hidden_size,
-        },
-        ffn_intermediate_bias: Tensor1D {
-            data: &zero_bias_8,
-            len: intermediate_size,
-        },
-        ffn_output_weight: Tensor2D {
-            data: &identity_8x8,
-            rows: intermediate_size,
-            cols: hidden_size,
-        },
-        ffn_output_bias: Tensor1D {
-            data: &zero_bias_8,
-            len: hidden_size,
-        },
-        ffn_layer_norm_weight: Tensor1D {
-            data: &ones_8,
-            len: hidden_size,
-        },
-        ffn_layer_norm_bias: Tensor1D {
+        output_bias: Tensor1D {
             data: &zero_bias_8,
             len: hidden_size,
         },
@@ -775,7 +631,6 @@ fn nan_in_one_packed_segment_does_not_leak_into_a_sibling_segment() {
     let hidden_size = 8;
     let num_heads = 2;
     let head_dim = 4;
-    let intermediate_size = hidden_size;
 
     let identity_8x8: Vec<f32> = {
         let mut m = vec![0.0f32; hidden_size * hidden_size];
@@ -785,7 +640,6 @@ fn nan_in_one_packed_segment_does_not_leak_into_a_sibling_segment() {
         m
     };
     let zero_bias_8: Vec<f32> = vec![0.0; hidden_size];
-    let ones_8: Vec<f32> = vec![1.0; hidden_size];
     let fused_qkv_weight: Vec<f32> = identity_8x8
         .iter()
         .chain(identity_8x8.iter())
@@ -794,7 +648,7 @@ fn nan_in_one_packed_segment_does_not_leak_into_a_sibling_segment() {
         .collect();
     let fused_qkv_bias: Vec<f32> = vec![0.0; 3 * hidden_size];
 
-    let layer = TransformerLayerWeights {
+    let layer = AttentionProjections {
         query_weight: Tensor2D {
             data: &identity_8x8,
             rows: hidden_size,
@@ -822,46 +676,12 @@ fn nan_in_one_packed_segment_does_not_leak_into_a_sibling_segment() {
             data: &zero_bias_8,
             len: hidden_size,
         },
-        attn_output_weight: Tensor2D {
+        output_weight: Tensor2D {
             data: &identity_8x8,
             rows: hidden_size,
             cols: hidden_size,
         },
-        attn_output_bias: Tensor1D {
-            data: &zero_bias_8,
-            len: hidden_size,
-        },
-        attn_layer_norm_weight: Tensor1D {
-            data: &ones_8,
-            len: hidden_size,
-        },
-        attn_layer_norm_bias: Tensor1D {
-            data: &zero_bias_8,
-            len: hidden_size,
-        },
-        ffn_intermediate_weight: Tensor2D {
-            data: &identity_8x8,
-            rows: intermediate_size,
-            cols: hidden_size,
-        },
-        ffn_intermediate_bias: Tensor1D {
-            data: &zero_bias_8,
-            len: intermediate_size,
-        },
-        ffn_output_weight: Tensor2D {
-            data: &identity_8x8,
-            rows: intermediate_size,
-            cols: hidden_size,
-        },
-        ffn_output_bias: Tensor1D {
-            data: &zero_bias_8,
-            len: hidden_size,
-        },
-        ffn_layer_norm_weight: Tensor1D {
-            data: &ones_8,
-            len: hidden_size,
-        },
-        ffn_layer_norm_bias: Tensor1D {
+        output_bias: Tensor1D {
             data: &zero_bias_8,
             len: hidden_size,
         },

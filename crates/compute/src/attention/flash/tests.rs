@@ -2,7 +2,7 @@ use super::*;
 use crate::attention::standard::{AttentionBuffers, multi_head_attention};
 use crate::forward::cpu::{matmul_bt, softmax_attention};
 use crate::lora_hook::NoopLoraHook;
-use lattice_weights::f32_weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
+use lattice_weights::f32_weights::{Tensor1D, Tensor2D};
 
 /// Keeps `estimate_materialized_attention_buffer_bytes` honest against the
 /// real `AttentionBuffers` field set (#678): the helper's
@@ -172,7 +172,6 @@ fn reference_projected_attention(
 
 struct OwnedLayer {
     hidden_size: usize,
-    intermediate_size: usize,
     q_proj_dim: usize,
     kv_proj_dim: usize,
     q_weight: Box<[f32]>,
@@ -183,19 +182,11 @@ struct OwnedLayer {
     v_bias: Box<[f32]>,
     out_weight: Box<[f32]>,
     out_bias: Box<[f32]>,
-    attn_ln_w: Box<[f32]>,
-    attn_ln_b: Box<[f32]>,
-    ffn_int_w: Box<[f32]>,
-    ffn_int_b: Box<[f32]>,
-    ffn_out_w: Box<[f32]>,
-    ffn_out_b: Box<[f32]>,
-    ffn_ln_w: Box<[f32]>,
-    ffn_ln_b: Box<[f32]>,
 }
 
 impl OwnedLayer {
-    fn borrowed(&self) -> TransformerLayerWeights<'_> {
-        TransformerLayerWeights {
+    fn borrowed(&self) -> AttentionProjections<'_> {
+        AttentionProjections {
             query_weight: Tensor2D {
                 data: &self.q_weight,
                 rows: self.q_proj_dim,
@@ -223,47 +214,13 @@ impl OwnedLayer {
                 data: &self.v_bias,
                 len: self.kv_proj_dim,
             },
-            attn_output_weight: Tensor2D {
+            output_weight: Tensor2D {
                 data: &self.out_weight,
                 rows: self.hidden_size,
                 cols: self.hidden_size,
             },
-            attn_output_bias: Tensor1D {
+            output_bias: Tensor1D {
                 data: &self.out_bias,
-                len: self.hidden_size,
-            },
-            attn_layer_norm_weight: Tensor1D {
-                data: &self.attn_ln_w,
-                len: self.hidden_size,
-            },
-            attn_layer_norm_bias: Tensor1D {
-                data: &self.attn_ln_b,
-                len: self.hidden_size,
-            },
-            ffn_intermediate_weight: Tensor2D {
-                data: &self.ffn_int_w,
-                rows: self.intermediate_size,
-                cols: self.hidden_size,
-            },
-            ffn_intermediate_bias: Tensor1D {
-                data: &self.ffn_int_b,
-                len: self.intermediate_size,
-            },
-            ffn_output_weight: Tensor2D {
-                data: &self.ffn_out_w,
-                rows: self.hidden_size,
-                cols: self.intermediate_size,
-            },
-            ffn_output_bias: Tensor1D {
-                data: &self.ffn_out_b,
-                len: self.hidden_size,
-            },
-            ffn_layer_norm_weight: Tensor1D {
-                data: &self.ffn_ln_w,
-                len: self.hidden_size,
-            },
-            ffn_layer_norm_bias: Tensor1D {
-                data: &self.ffn_ln_b,
                 len: self.hidden_size,
             },
         }
@@ -275,7 +232,6 @@ fn build_test_layer(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    intermediate_size: usize,
     rng: &mut Lcg,
 ) -> OwnedLayer {
     let q_proj_dim = num_q_heads * head_dim;
@@ -283,7 +239,6 @@ fn build_test_layer(
 
     OwnedLayer {
         hidden_size,
-        intermediate_size,
         q_proj_dim,
         kv_proj_dim,
         q_weight: random_vec(q_proj_dim * hidden_size, rng).into_boxed_slice(),
@@ -294,14 +249,6 @@ fn build_test_layer(
         v_bias: random_vec(kv_proj_dim, rng).into_boxed_slice(),
         out_weight: random_vec(hidden_size * hidden_size, rng).into_boxed_slice(),
         out_bias: random_vec(hidden_size, rng).into_boxed_slice(),
-        attn_ln_w: vec![1.0f32; hidden_size].into_boxed_slice(),
-        attn_ln_b: vec![0.0f32; hidden_size].into_boxed_slice(),
-        ffn_int_w: random_vec(intermediate_size * hidden_size, rng).into_boxed_slice(),
-        ffn_int_b: random_vec(intermediate_size, rng).into_boxed_slice(),
-        ffn_out_w: random_vec(hidden_size * intermediate_size, rng).into_boxed_slice(),
-        ffn_out_b: random_vec(hidden_size, rng).into_boxed_slice(),
-        ffn_ln_w: vec![1.0f32; hidden_size].into_boxed_slice(),
-        ffn_ln_b: vec![0.0f32; hidden_size].into_boxed_slice(),
     }
 }
 
@@ -361,14 +308,7 @@ fn test_tiled_multi_head_attention_matches_materialized_mha() {
     let hidden_states = random_vec(seq_len * hidden_size, &mut rng);
     let attention_mask = patterned_mask(seq_len);
 
-    let owned_layer = build_test_layer(
-        hidden_size,
-        num_heads,
-        num_heads,
-        head_dim,
-        intermediate_size,
-        &mut rng,
-    );
+    let owned_layer = build_test_layer(hidden_size, num_heads, num_heads, head_dim, &mut rng);
     let layer = owned_layer.borrowed();
 
     let mut materialized_buffers =
@@ -412,7 +352,7 @@ fn test_tiled_multi_head_attention_matches_materialized_mha() {
 
 fn reference_general_projected_attention(
     hidden_states: &[f32],
-    layer: &TransformerLayerWeights<'_>,
+    layer: &AttentionProjections<'_>,
     attention_mask: &[u32],
     seq_len: usize,
     hidden_size: usize,
@@ -468,13 +408,13 @@ fn reference_general_projected_attention(
     let mut output = vec![0.0f32; seq_len * hidden_size];
     matmul_bt(
         &concat,
-        layer.attn_output_weight.data,
+        layer.output_weight.data,
         &mut output,
         seq_len,
         hidden_size,
         hidden_size,
     );
-    add_bias(&mut output, layer.attn_output_bias.data, hidden_size);
+    add_bias(&mut output, layer.output_bias.data, hidden_size);
     output
 }
 
@@ -490,14 +430,7 @@ fn test_tiled_multi_head_attention_matches_reference_gqa() {
     let hidden_states = random_vec(seq_len * hidden_size, &mut rng);
     let attention_mask = patterned_mask(seq_len);
 
-    let owned_layer = build_test_layer(
-        hidden_size,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        intermediate_size,
-        &mut rng,
-    );
+    let owned_layer = build_test_layer(hidden_size, num_q_heads, num_kv_heads, head_dim, &mut rng);
     let layer = owned_layer.borrowed();
 
     let reference = reference_general_projected_attention(
@@ -547,14 +480,7 @@ fn test_tiled_multi_head_attention_matches_reference_mqa() {
     let hidden_states = random_vec(seq_len * hidden_size, &mut rng);
     let attention_mask = patterned_mask(seq_len);
 
-    let owned_layer = build_test_layer(
-        hidden_size,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        intermediate_size,
-        &mut rng,
-    );
+    let owned_layer = build_test_layer(hidden_size, num_q_heads, num_kv_heads, head_dim, &mut rng);
     let layer = owned_layer.borrowed();
 
     let reference = reference_general_projected_attention(
@@ -852,7 +778,7 @@ fn entry_shape_overflow_is_rejected_not_silently_accepted() {
     // `hidden_size == num_q_heads * head_dim` release assert would accept an impossible head
     // layout and per-head extraction would index out of bounds. Exercised directly because the
     // only call site (`tiled_multi_head_attention_in_place`) needs a fully-populated
-    // 16-tensor `TransformerLayerWeights`; the guard placement before the products is verified
+    // eight-tensor `AttentionProjections`; the guard placement before the products is verified
     // by inspection/review.
     assert_flash_tiled_no_overflow((1usize << 63) + 1, 1, 2, 2, 2);
 }

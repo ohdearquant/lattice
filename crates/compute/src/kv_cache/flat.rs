@@ -46,8 +46,9 @@ impl FlatKVCacheConfig {
         2 * self.num_layers * self.layer_capacity() * std::mem::size_of::<f16>()
     }
 
-    /// **Unstable**: convenience constructor for Qwen3 models.
-    pub fn for_qwen3(
+    /// **Unstable**: a configuration for `num_layers` layers of `num_kv_heads` key-value heads of
+    /// width `head_dim`, holding up to `max_seq_len` positions.
+    pub fn new(
         num_layers: usize,
         num_kv_heads: usize,
         head_dim: usize,
@@ -59,6 +60,20 @@ impl FlatKVCacheConfig {
             head_dim,
             max_seq_len,
         }
+    }
+
+    /// **Unstable**: convenience constructor for Qwen3 models.
+    #[deprecated(
+        since = "0.15.0",
+        note = "use `FlatKVCacheConfig::new`, which takes the same arguments"
+    )]
+    pub fn for_qwen3(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Self {
+        Self::new(num_layers, num_kv_heads, head_dim, max_seq_len)
     }
 }
 

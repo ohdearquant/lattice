@@ -1588,6 +1588,24 @@ mod compute_parity {
         );
     }
 
+    /// Migration probe: `FlatKVCacheConfig::new`, the replacement for the deprecated `for_qwen3`,
+    /// is reachable at the facade path with the same arguments.
+    #[test]
+    fn flat_cache_config_new_is_reachable_at_the_facade_path() {
+        let new: fn(usize, usize, usize, usize) -> lattice_inference::kv_cache::FlatKVCacheConfig =
+            lattice_inference::kv_cache::FlatKVCacheConfig::new;
+        let config = new(2, 4, 8, 16);
+        assert_eq!(
+            (
+                config.num_layers,
+                config.num_kv_heads,
+                config.head_dim,
+                config.max_seq_len
+            ),
+            (2, 4, 8, 16)
+        );
+    }
+
     #[test]
     fn paged_cache_types_are_the_same_type_at_both_paths() {
         same_type(
@@ -2164,14 +2182,6 @@ mod attention_standard_parity {
     #[test]
     fn standard_and_tiled_attention_functions_are_the_same_items_at_both_paths() {
         same_function(
-            facade::standard::multi_head_attention,
-            extracted::standard::multi_head_attention,
-        );
-        same_function(
-            facade::multi_head_attention,
-            extracted::standard::multi_head_attention,
-        );
-        same_function(
             facade::flash::estimate_materialized_attention_buffer_bytes,
             extracted::flash::estimate_materialized_attention_buffer_bytes,
         );
@@ -2179,10 +2189,99 @@ mod attention_standard_parity {
             facade::flash::tiled_attention_head,
             extracted::flash::tiled_attention_head,
         );
-        same_function(
-            facade::flash::tiled_multi_head_attention,
-            extracted::flash::tiled_multi_head_attention,
+    }
+
+    /// The facade keeps the BERT-layer attention signatures; `lattice-compute`'s kernels take the
+    /// layer's projection view instead.
+    #[test]
+    #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+    fn attention_entry_points_keep_their_facade_signatures() {
+        use lattice_inference::lora_hook::LoraHook;
+        use lattice_inference::weights::TransformerLayerWeights;
+
+        same_type(
+            PhantomData::<facade::standard::AttentionProjections<'static>>,
+            PhantomData::<extracted::standard::AttentionProjections<'static>>,
         );
+        let _: fn(
+            &[f32],
+            &TransformerLayerWeights<'_>,
+            &[u32],
+            usize,
+            usize,
+            usize,
+            usize,
+            &mut facade::AttentionBuffers,
+            &dyn LoraHook,
+            usize,
+        ) -> Vec<f32> = facade::standard::multi_head_attention;
+        same_function(
+            facade::multi_head_attention,
+            facade::standard::multi_head_attention,
+        );
+        let _: fn(
+            &[f32],
+            &extracted::standard::AttentionProjections<'_>,
+            &[u32],
+            usize,
+            usize,
+            usize,
+            usize,
+            &mut extracted::standard::AttentionBuffers,
+            &dyn lattice_compute::lora_hook::LoraHook,
+            usize,
+        ) -> Vec<f32> = extracted::standard::multi_head_attention;
+        let _: fn(
+            &[f32],
+            &TransformerLayerWeights<'_>,
+            &[u32],
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            &mut facade::AttentionBuffers,
+            &mut facade::flash::TiledAttentionBuffers,
+            &facade::flash::TiledAttentionConfig,
+        ) -> Vec<f32> = facade::flash::tiled_multi_head_attention;
+        let _: fn(
+            &[f32],
+            &extracted::standard::AttentionProjections<'_>,
+            &[u32],
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            &mut extracted::standard::AttentionBuffers,
+            &mut extracted::flash::TiledAttentionBuffers,
+            &extracted::flash::TiledAttentionConfig,
+        ) -> Vec<f32> = extracted::flash::tiled_multi_head_attention;
+        #[cfg(feature = "bench-internals")]
+        {
+            let _: fn(
+                &[f32],
+                &TransformerLayerWeights<'_>,
+                &[f32],
+                &[f32],
+                &[usize],
+                usize,
+                usize,
+                usize,
+                &mut [f32],
+                &mut [f32],
+                &mut [f32],
+                &mut [f32],
+                &mut [f32],
+                &mut [f32],
+                &dyn LoraHook,
+                usize,
+            ) = facade::standard::bench_support::multi_head_attention_batched;
+            same_function(
+                facade::bench_support::multi_head_attention_batched,
+                facade::standard::bench_support::multi_head_attention_batched,
+            );
+        }
     }
 
     #[test]

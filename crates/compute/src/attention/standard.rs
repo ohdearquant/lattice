@@ -1,7 +1,25 @@
 //! Standard attention buffers, multi-head attention, and in-place attention helpers.
 use crate::forward::cpu::{add_bias, matmul_bt, softmax_attention};
 use crate::lora_hook::{LoraHook, apply_lora_rows};
-use lattice_weights::f32_weights::TransformerLayerWeights;
+use lattice_weights::f32_weights::{Tensor1D, Tensor2D};
+
+/// **Unstable**: borrowed weight and bias views of one attention block's four projections.
+///
+/// Each weight is row-major `[out_features, in_features]` and is applied as `x · Wᵀ + b`. Query,
+/// key and value map `hidden_size` to `num_heads * head_dim` (to `num_kv_heads * head_dim` for key
+/// and value under grouped-query attention); the output projection maps the concatenated heads back
+/// to `hidden_size`.
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionProjections<'a> {
+    pub query_weight: Tensor2D<'a>,
+    pub query_bias: Tensor1D<'a>,
+    pub key_weight: Tensor2D<'a>,
+    pub key_bias: Tensor1D<'a>,
+    pub value_weight: Tensor2D<'a>,
+    pub value_bias: Tensor1D<'a>,
+    pub output_weight: Tensor2D<'a>,
+    pub output_bias: Tensor1D<'a>,
+}
 
 /// **Unstable**: pre-allocated buffers for multi-head attention computation; field layout may change.
 #[derive(Debug, Clone)]
@@ -17,7 +35,7 @@ pub struct AttentionBuffers {
 
     // Fused Q/K/V projection scratch: `[max_seq_len, 3*hidden_size]`. One
     // `matmul_bt` against the layer's fused QKV weight (built once at load
-    // time and threaded in alongside `TransformerLayerWeights`, see
+    // time and threaded in alongside the layer's `AttentionProjections`, see
     // `lattice_inference::model::bert::LayerFusedQkv`) lands Q/K/V here interleaved per
     // row; the result is split into the contiguous `q`/`k`/`v` buffers above
     // before any per-head work, so `apply_lora_rows` can still hand
@@ -94,7 +112,7 @@ impl AttentionBuffers {
 /// **Unstable**: compute multi-head self-attention and return the output projection.
 pub fn multi_head_attention(
     hidden_states: &[f32],
-    layer_weights: &TransformerLayerWeights<'_>,
+    projections: &AttentionProjections<'_>,
     attention_mask: &[u32],
     seq_len: usize,
     hidden_size: usize,
@@ -110,25 +128,25 @@ pub fn multi_head_attention(
     // once at model-load time). Building the fused weight/bias here per call
     // keeps this function's public signature stable across #678 while still
     // exercising the single-fused-matmul code path.
-    let fused_qkv_weight: Vec<f32> = layer_weights
+    let fused_qkv_weight: Vec<f32> = projections
         .query_weight
         .data
         .iter()
-        .chain(layer_weights.key_weight.data.iter())
-        .chain(layer_weights.value_weight.data.iter())
+        .chain(projections.key_weight.data.iter())
+        .chain(projections.value_weight.data.iter())
         .copied()
         .collect();
-    let fused_qkv_bias: Vec<f32> = layer_weights
+    let fused_qkv_bias: Vec<f32> = projections
         .query_bias
         .data
         .iter()
-        .chain(layer_weights.key_bias.data.iter())
-        .chain(layer_weights.value_bias.data.iter())
+        .chain(projections.key_bias.data.iter())
+        .chain(projections.value_bias.data.iter())
         .copied()
         .collect();
     multi_head_attention_in_place(
         hidden_states,
-        layer_weights,
+        projections,
         &fused_qkv_weight,
         &fused_qkv_bias,
         attention_mask,
@@ -197,13 +215,11 @@ pub(crate) fn assert_standard_no_overflow(
 /// `fused_qkv_weight`/`fused_qkv_bias` are the layer's Q/K/V weight and bias
 /// concatenated vertically (`[3*hidden_size, hidden_size]` / `[3*hidden_size]`),
 /// built once per layer at model-load time and threaded in alongside
-/// `layer_weights` rather than stored on `TransformerLayerWeights` itself --
-/// that struct is a publicly constructible API surface and gaining fields
-/// there is a breaking change (#678).
+/// `projections`, whose output projection this kernel applies.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn multi_head_attention_in_place(
     hidden_states: &[f32],
-    layer_weights: &TransformerLayerWeights<'_>,
+    projections: &AttentionProjections<'_>,
     fused_qkv_weight: &[f32],
     fused_qkv_bias: &[f32],
     attention_mask: &[u32],
@@ -423,13 +439,13 @@ pub(crate) fn multi_head_attention_in_place(
         let output = &mut buffers.temp[..used_hidden];
         matmul_bt(
             concat,
-            layer_weights.attn_output_weight.data,
+            projections.output_weight.data,
             output,
             seq_len,
             hidden_size,
             hidden_size,
         );
-        add_bias(output, layer_weights.attn_output_bias.data, hidden_size);
+        add_bias(output, projections.output_bias.data, hidden_size);
         apply_lora_rows(
             lora,
             layer_idx,
@@ -481,7 +497,7 @@ pub(crate) fn multi_head_attention_in_place(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn multi_head_attention_batched(
     hidden_states: &[f32],
-    layer_weights: &TransformerLayerWeights<'_>,
+    projections: &AttentionProjections<'_>,
     fused_qkv_weight: &[f32],
     fused_qkv_bias: &[f32],
     cu_seqlens: &[usize],
@@ -719,13 +735,13 @@ pub(crate) fn multi_head_attention_batched(
     let output = &mut output[..used_hidden];
     matmul_bt(
         concat,
-        layer_weights.attn_output_weight.data,
+        projections.output_weight.data,
         output,
         total,
         hidden_size,
         hidden_size,
     );
-    add_bias(output, layer_weights.attn_output_bias.data, hidden_size);
+    add_bias(output, projections.output_bias.data, hidden_size);
     apply_lora_rows(
         lora,
         layer_idx,
@@ -754,7 +770,7 @@ pub mod bench_support {
     #[allow(clippy::too_many_arguments)]
     pub fn multi_head_attention_batched(
         hidden_states: &[f32],
-        layer_weights: &TransformerLayerWeights<'_>,
+        projections: &AttentionProjections<'_>,
         fused_qkv_weight: &[f32],
         fused_qkv_bias: &[f32],
         cu_seqlens: &[usize],
@@ -772,7 +788,7 @@ pub mod bench_support {
     ) {
         super::multi_head_attention_batched(
             hidden_states,
-            layer_weights,
+            projections,
             fused_qkv_weight,
             fused_qkv_bias,
             cu_seqlens,

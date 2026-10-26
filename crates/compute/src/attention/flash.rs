@@ -1,9 +1,8 @@
 //! Tiled attention configuration and scratch-buffer support for tiled attention kernels.
-use crate::attention::standard::AttentionBuffers;
+use crate::attention::standard::{AttentionBuffers, AttentionProjections};
 use crate::forward::cpu::{add_bias, matmul_bt};
 use core::cmp::min;
 use core::mem::size_of;
-use lattice_weights::f32_weights::TransformerLayerWeights;
 
 /// L1 data cache budget for tile working set.
 ///
@@ -659,7 +658,7 @@ pub fn tiled_attention_head(
 #[allow(clippy::too_many_arguments)]
 pub fn tiled_multi_head_attention(
     hidden_states: &[f32],
-    layer_weights: &TransformerLayerWeights<'_>,
+    projections: &AttentionProjections<'_>,
     attention_mask: &[u32],
     seq_len: usize,
     hidden_size: usize,
@@ -672,7 +671,7 @@ pub fn tiled_multi_head_attention(
 ) -> Vec<f32> {
     tiled_multi_head_attention_in_place(
         hidden_states,
-        layer_weights,
+        projections,
         attention_mask,
         seq_len,
         hidden_size,
@@ -689,7 +688,7 @@ pub fn tiled_multi_head_attention(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tiled_multi_head_attention_in_place(
     hidden_states: &[f32],
-    layer_weights: &TransformerLayerWeights<'_>,
+    projections: &AttentionProjections<'_>,
     attention_mask: &[u32],
     seq_len: usize,
     hidden_size: usize,
@@ -724,14 +723,14 @@ pub(crate) fn tiled_multi_head_attention_in_place(
     let used_kv = seq_len * kv_proj_dim;
     let scale = 1.0 / (head_dim as f32).sqrt();
 
-    debug_assert_eq!(layer_weights.query_weight.rows, q_proj_dim);
-    debug_assert_eq!(layer_weights.query_weight.cols, hidden_size);
-    debug_assert_eq!(layer_weights.key_weight.rows, kv_proj_dim);
-    debug_assert_eq!(layer_weights.key_weight.cols, hidden_size);
-    debug_assert_eq!(layer_weights.value_weight.rows, kv_proj_dim);
-    debug_assert_eq!(layer_weights.value_weight.cols, hidden_size);
-    debug_assert_eq!(layer_weights.attn_output_weight.rows, hidden_size);
-    debug_assert_eq!(layer_weights.attn_output_weight.cols, hidden_size);
+    debug_assert_eq!(projections.query_weight.rows, q_proj_dim);
+    debug_assert_eq!(projections.query_weight.cols, hidden_size);
+    debug_assert_eq!(projections.key_weight.rows, kv_proj_dim);
+    debug_assert_eq!(projections.key_weight.cols, hidden_size);
+    debug_assert_eq!(projections.value_weight.rows, kv_proj_dim);
+    debug_assert_eq!(projections.value_weight.cols, hidden_size);
+    debug_assert_eq!(projections.output_weight.rows, hidden_size);
+    debug_assert_eq!(projections.output_weight.cols, hidden_size);
 
     tiled_buffers.ensure_capacity(seq_len, config);
 
@@ -739,39 +738,39 @@ pub(crate) fn tiled_multi_head_attention_in_place(
         let q = &mut buffers.q[..used_q];
         matmul_bt(
             hidden_states,
-            layer_weights.query_weight.data,
+            projections.query_weight.data,
             q,
             seq_len,
             hidden_size,
             q_proj_dim,
         );
-        add_bias(q, layer_weights.query_bias.data, q_proj_dim);
+        add_bias(q, projections.query_bias.data, q_proj_dim);
     }
 
     {
         let k = &mut buffers.k[..used_kv];
         matmul_bt(
             hidden_states,
-            layer_weights.key_weight.data,
+            projections.key_weight.data,
             k,
             seq_len,
             hidden_size,
             kv_proj_dim,
         );
-        add_bias(k, layer_weights.key_bias.data, kv_proj_dim);
+        add_bias(k, projections.key_bias.data, kv_proj_dim);
     }
 
     {
         let v = &mut buffers.v[..used_kv];
         matmul_bt(
             hidden_states,
-            layer_weights.value_weight.data,
+            projections.value_weight.data,
             v,
             seq_len,
             hidden_size,
             kv_proj_dim,
         );
-        add_bias(v, layer_weights.value_bias.data, kv_proj_dim);
+        add_bias(v, projections.value_bias.data, kv_proj_dim);
     }
 
     let q_all = &buffers.q[..used_q];
@@ -828,13 +827,13 @@ pub(crate) fn tiled_multi_head_attention_in_place(
     let output = &mut buffers.temp[..used_hidden];
     matmul_bt(
         &buffers.concat[..used_hidden],
-        layer_weights.attn_output_weight.data,
+        projections.output_weight.data,
         output,
         seq_len,
         hidden_size,
         hidden_size,
     );
-    add_bias(output, layer_weights.attn_output_bias.data, hidden_size);
+    add_bias(output, projections.output_bias.data, hidden_size);
 }
 
 #[cfg(test)]

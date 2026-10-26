@@ -5,6 +5,7 @@
 //! to share a single inference path.
 
 use crate::attention::AttentionBuffers;
+use crate::attention::standard::bert_attention_projections;
 use crate::download::ensure_model_files;
 use crate::error::InferenceError;
 use crate::forward::cpu::{
@@ -691,7 +692,7 @@ impl BertModel {
 
             lattice_compute::__internal::multi_head_attention_in_place(
                 &hidden,
-                layer,
+                &bert_attention_projections(layer),
                 &fused.weight,
                 &fused.bias,
                 attention_mask,
@@ -879,7 +880,7 @@ impl BertModel {
 
             lattice_compute::__internal::multi_head_attention_batched(
                 &hidden,
-                layer,
+                &bert_attention_projections(layer),
                 &fused.weight,
                 &fused.bias,
                 cu_seqlens,
