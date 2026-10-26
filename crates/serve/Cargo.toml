@@ -68,6 +68,18 @@ name = "lattice_serve"
 path = "src/bin/lattice_serve/main.rs"
 required-features = ["f16", "metal-gpu"]
 
+[[bin]]
+name = "quantize_q4"
+path = "src/bin/quantize_q4.rs"
+
+[[bin]]
+name = "quantize_quarot"
+path = "src/bin/quantize_quarot.rs"
+
+[[bin]]
+name = "moe_admission_sim"
+path = "src/bin/moe_admission_sim.rs"
+
 [[test]]
 name = "vision_serve_e2e_test"
 required-features = ["download", "f16", "metal-gpu"]

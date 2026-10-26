@@ -1027,7 +1027,7 @@ jobs:
           shared-key: quarot-artifact
 
       - name: Build QuaRot converter
-        run: cargo build --release -p lattice-inference --bin quantize_quarot --features f16
+        run: cargo build --release -p lattice-serve --bin quantize_quarot --features f16
 
       - name: Generate and verify QuaRot Q4 artifact
         run: |
@@ -1298,7 +1298,9 @@ jobs:
       - name: Build eval_perplexity + quantize_q4
         run: |
           cargo build --release -p lattice-inference \
-            --bin eval_perplexity --bin quantize_q4 --features "f16,metal-gpu"
+            --bin eval_perplexity --features "f16,metal-gpu"
+          cargo build --release -p lattice-serve \
+            --bin quantize_q4 --features "f16,metal-gpu"
 
       # Regenerate the ephemeral unrotated Q4 artifact (NOT committed) from the
       # real weights. Deterministic: quantize_q4 has no random seed.

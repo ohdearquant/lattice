@@ -7,7 +7,6 @@ pub(crate) mod q8_matmul;
 #[cfg(target_arch = "aarch64")]
 #[doc(inline)]
 pub use lattice_compute::forward::cpu::matmul_neon;
-pub(crate) use lattice_compute::forward::cpu::simd_config;
 #[doc(inline)]
 pub use lattice_compute::forward::cpu::{
     BertCpuKernelPolicy, BertCpuKernelProfile, add_bias, add_bias_gelu, elementwise_mul, gelu,
