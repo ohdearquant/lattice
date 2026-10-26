@@ -11,7 +11,8 @@ use lattice_arch::qwen35_config::Qwen35Config;
 /// Every Gated DeltaNet projection a LoRA adapter can target, in the order the
 /// trainers emit them.
 ///
-/// This is the geometry set: [`qwen35_projection_shape`] returns a shape for all
+/// This is the geometry set: `lattice_inference::lora_hook::qwen35_projection_shape`
+/// returns a shape for all
 /// five. Whether a given backend can APPLY one is a separate question, answered
 /// by [`GDN_LORA_MODULES_SERVABLE`].
 pub const GDN_LORA_MODULES: [&str; 5] = [
@@ -59,53 +60,16 @@ pub struct LoraProjectionShape {
     pub d_out: usize,
 }
 
-/// Return the LoRA projection shape for a Qwen3.5 layer and module.
-///
-/// Full-attention modules are valid only on full-attention layers, Gated
-/// DeltaNet modules are valid only on linear-attention layers, and MLP modules
-/// are valid on both. The returned geometry includes `in_proj_a` and
-/// `in_proj_b`; a backend that cannot apply those projections must enforce that
-/// capability restriction separately.
-pub fn qwen35_projection_shape(
-    config: &Qwen35Config,
-    layer_idx: usize,
-    module: &str,
-) -> Result<LoraProjectionShape, String> {
-    if layer_idx >= config.num_hidden_layers {
-        return Err(format!(
-            "layer {layer_idx} is out of range for Qwen3.5 model with {} layers",
-            config.num_hidden_layers
-        ));
-    }
-
-    let hidden = config.hidden_size;
-    let intermediate = config.intermediate_size;
-    let is_full = config.is_full_attention(layer_idx);
-    let (d_in, d_out) = match (module, is_full) {
-        ("q_proj", true) => (hidden, 2 * config.full_q_dim()),
-        ("k_proj", true) => (hidden, config.full_kv_dim()),
-        ("v_proj", true) => (hidden, config.full_kv_dim()),
-        ("o_proj", true) => (config.full_q_dim(), hidden),
-        ("in_proj_qkv", false) => (hidden, config.linear_qkv_dim()),
-        ("in_proj_z", false) => (hidden, config.linear_output_dim()),
-        ("in_proj_b" | "in_proj_a", false) => (hidden, config.linear_num_value_heads()),
-        ("out_proj", false) => (config.linear_output_dim(), hidden),
-        ("gate_proj", _) | ("up_proj", _) => (hidden, intermediate),
-        ("down_proj", _) => (intermediate, hidden),
-        ("q_proj" | "k_proj" | "v_proj" | "o_proj", false) => {
-            return Err(format!(
-                "module '{module}' is a full-attention projection but layer {layer_idx} is GDN"
-            ));
-        }
-        ("in_proj_qkv" | "in_proj_z" | "in_proj_b" | "in_proj_a" | "out_proj", true) => {
-            return Err(format!(
-                "module '{module}' is a GDN projection but layer {layer_idx} is full-attention"
-            ));
-        }
-        _ => return Err(format!("unknown LoRA module '{module}'")),
-    };
-
-    Ok(LoraProjectionShape { d_in, d_out })
+/// **Unstable**: the projection geometry a LoRA hook is checked against before it is installed.
+pub trait LoraTargetGeometry {
+    /// Number of layers a hook may target; valid layer indices are `0..num_layers()`.
+    fn num_layers(&self) -> usize;
+    /// Shape of `module` on `layer_idx`, or an error saying why that pair is not a projection of this model.
+    fn projection_shape(
+        &self,
+        layer_idx: usize,
+        module: &str,
+    ) -> Result<LoraProjectionShape, String>;
 }
 
 /// **Unstable**: trait for LoRA adapter injection into linear projections.
@@ -128,6 +92,19 @@ pub trait LoraHook: Send + Sync {
     /// * `output` - The corresponding base projection output row to modify in-place
     fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]);
 
+    /// **Unstable**: check this hook's declared projection geometry before installation or use.
+    ///
+    /// Model installers and hooked scoring entry points call this before changing
+    /// state or running a forward pass. Hooks with known dimensions should reject
+    /// invalid layer indices, unknown modules, and input/output width mismatches.
+    /// The default accepts the caller's geometry without checking it.
+    ///
+    /// This may be called more than once for one request. Implement it as a
+    /// repeatable read of declared dimensions, without one-shot side effects.
+    fn validate_geometry(&self, _geometry: &dyn LoraTargetGeometry) -> Result<(), String> {
+        Ok(())
+    }
+
     /// **Unstable**: self-check this hook's declared rank/shape against a
     /// Qwen3.5 model's geometry before it is installed.
     ///
@@ -137,6 +114,10 @@ pub trait LoraHook: Send + Sync {
     /// `debug_assert` in a release build). Default: no-op (trusts the
     /// caller) — real adapters with known geometry (e.g.
     /// `lattice_tune::lora::LoraAdapter`) override it.
+    #[deprecated(
+        since = "0.15.0",
+        note = "use validate_geometry with lattice_inference::lora_hook::Qwen35LoraGeometry"
+    )]
     fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
         Ok(())
     }
@@ -145,9 +126,10 @@ pub trait LoraHook: Send + Sync {
     /// against a BERT cross-encoder model's dimensions before it is used
     /// for hooked scoring.
     ///
-    /// This is the hook's OWN check, and the default below returns `Ok(())`:
-    /// a hook that does not override it is trusted, and nothing else on the
-    /// scoring path re-checks its geometry.
+    /// This compatibility check defaults to `Ok(())`. Through 0.15.0 the
+    /// scoring path calls it before [`Self::validate_geometry`], so a hook
+    /// overriding only this method retains its rejection. The neutral check
+    /// may also reject a hook that this default accepts.
     ///
     /// `lattice_inference::model::cross_encoder::CrossEncoderModel::score_with_hook`
     /// and `score_batch_with_hook` call this before the forward pass (and
@@ -166,6 +148,10 @@ pub trait LoraHook: Send + Sync {
     /// documents calls it N+1 times, once at the batch boundary and once per
     /// document. Implement it as a repeatable read of declared dimensions, not
     /// as a one-shot operation with side effects.
+    #[deprecated(
+        since = "0.15.0",
+        note = "use validate_geometry with lattice_inference::lora_hook::BertLoraGeometry"
+    )]
     fn validate_against_bert(
         &self,
         _num_hidden_layers: usize,

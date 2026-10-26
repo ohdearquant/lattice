@@ -790,6 +790,8 @@ mod lora_serving {
                  rejected this hook via validate_against before installing it"
             );
         }
+        // Keep the legacy-only validation compatibility witness.
+        #[allow(deprecated)]
         fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
             Err("synthetic shape mismatch".to_string())
         }
@@ -1005,4 +1007,79 @@ fn from_safetensors_missing_config_json_is_hard_error() {
         "error must name the missing config.json, not a guessed preset: {msg}"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+mod lora_geometry_validation {
+    use crate::lora_hook::{LoraHook, LoraTargetGeometry};
+    use crate::model::qwen35_config::Qwen35Config;
+    use std::sync::{Arc, Mutex};
+
+    struct PreviousHook;
+    impl LoraHook for PreviousHook {
+        fn apply(&self, _layer: usize, _module: &str, _input: &[f32], output: &mut [f32]) {
+            output.fill(17.0);
+        }
+    }
+
+    struct RejectingHook {
+        reject_old: bool,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+    impl LoraHook for RejectingHook {
+        fn apply(&self, _layer: usize, _module: &str, _input: &[f32], _output: &mut [f32]) {
+            panic!("a rejected hook must not replace the previous hook");
+        }
+        // Keep the legacy-only validation compatibility witness.
+        #[allow(deprecated)]
+        fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
+            self.calls.lock().unwrap().push("old");
+            if self.reject_old {
+                Err("legacy rejection".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        fn validate_geometry(&self, _geometry: &dyn LoraTargetGeometry) -> Result<(), String> {
+            self.calls.lock().unwrap().push("new");
+            if self.reject_old {
+                Ok(())
+            } else {
+                Err("neutral rejection".to_string())
+            }
+        }
+    }
+
+    fn assert_rejection_preserves_previous_hook(reject_old: bool) {
+        let mut model = super::super::test_support::tiny_zero_model_with_context(32);
+        model.set_lora(Box::new(PreviousHook)).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let error = model
+            .set_lora(Box::new(RejectingHook {
+                reject_old,
+                calls: Arc::clone(&calls),
+            }))
+            .unwrap_err();
+        assert!(matches!(error, crate::InferenceError::InvalidInput(_)));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            if reject_old {
+                vec!["old"]
+            } else {
+                vec!["old", "new"]
+            }
+        );
+        let mut output = [0.0];
+        model.lora.apply(0, "query", &[0.0], &mut output);
+        assert_eq!(output, [17.0]);
+    }
+
+    #[test]
+    fn set_lora_rejects_new_geometry_without_replacing_previous_hook() {
+        assert_rejection_preserves_previous_hook(false);
+    }
+
+    #[test]
+    fn set_lora_preserves_legacy_rejection_before_neutral_validation() {
+        assert_rejection_preserves_previous_hook(true);
+    }
 }

@@ -1694,6 +1694,10 @@ mod lora_hook_parity {
             PhantomData::<dyn facade::LoraHook>,
             PhantomData::<dyn extracted::LoraHook>,
         );
+        same_type(
+            PhantomData::<dyn facade::LoraTargetGeometry>,
+            PhantomData::<dyn extracted::LoraTargetGeometry>,
+        );
         let _: extracted::NoopLoraHook = facade::NoopLoraHook;
         send_sync::<dyn facade::LoraHook>();
         send_sync::<facade::NoopLoraHook>();
@@ -1705,10 +1709,11 @@ mod lora_hook_parity {
             facade::gdn_lora_module_is_servable,
             extracted::gdn_lora_module_is_servable,
         );
-        same_function(
-            facade::qwen35_projection_shape,
-            extracted::qwen35_projection_shape,
-        );
+        let _: fn(
+            &lattice_inference::model::qwen35_config::Qwen35Config,
+            usize,
+            &str,
+        ) -> Result<facade::LoraProjectionShape, String> = facade::qwen35_projection_shape;
     }
 
     #[test]
