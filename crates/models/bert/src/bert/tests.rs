@@ -697,3 +697,79 @@ fn bert_model_pool_has_an_arm_for_every_pooling_variant() {
         );
     }
 }
+
+#[test]
+fn attention_projection_view_reads_each_attention_tensor_of_the_layer() {
+    use lattice_weights::{Tensor1D, Tensor2D};
+
+    let (hidden, kv) = (4, 2);
+    let lens = [
+        hidden * hidden,
+        hidden,
+        kv * hidden,
+        kv,
+        kv * hidden,
+        kv,
+        hidden * hidden,
+        hidden,
+    ];
+    let attention: [Vec<f32>; 8] = std::array::from_fn(|i| vec![i as f32 + 1.0; lens[i]]);
+    let unused = vec![0.0f32; hidden * hidden];
+    let row = &unused[..hidden];
+    fn matrix(data: &[f32], rows: usize, cols: usize) -> Tensor2D<'_> {
+        Tensor2D { data, rows, cols }
+    }
+    fn vector(data: &[f32]) -> Tensor1D<'_> {
+        Tensor1D {
+            data,
+            len: data.len(),
+        }
+    }
+    let a = &attention;
+    let layer = TransformerLayerWeights {
+        query_weight: matrix(&a[0], hidden, hidden),
+        query_bias: vector(&a[1]),
+        key_weight: matrix(&a[2], kv, hidden),
+        key_bias: vector(&a[3]),
+        value_weight: matrix(&a[4], kv, hidden),
+        value_bias: vector(&a[5]),
+        attn_output_weight: matrix(&a[6], hidden, hidden),
+        attn_output_bias: vector(&a[7]),
+        attn_layer_norm_weight: vector(row),
+        attn_layer_norm_bias: vector(row),
+        ffn_intermediate_weight: matrix(&unused, hidden, hidden),
+        ffn_intermediate_bias: vector(row),
+        ffn_output_weight: matrix(&unused, hidden, hidden),
+        ffn_output_bias: vector(row),
+        ffn_layer_norm_weight: vector(row),
+        ffn_layer_norm_bias: vector(row),
+    };
+
+    let view = bert_attention_projections(&layer);
+    let weights = [
+        (view.query_weight, 0, hidden),
+        (view.key_weight, 2, kv),
+        (view.value_weight, 4, kv),
+        (view.output_weight, 6, hidden),
+    ];
+    for (tensor, index, rows) in weights {
+        assert!(
+            std::ptr::eq(tensor.data, a[index].as_slice()),
+            "weight {index}"
+        );
+        assert_eq!((tensor.rows, tensor.cols), (rows, hidden), "weight {index}");
+    }
+    let biases = [
+        (view.query_bias, 1),
+        (view.key_bias, 3),
+        (view.value_bias, 5),
+        (view.output_bias, 7),
+    ];
+    for (tensor, index) in biases {
+        assert!(
+            std::ptr::eq(tensor.data, a[index].as_slice()),
+            "bias {index}"
+        );
+        assert_eq!(tensor.len, lens[index], "bias {index}");
+    }
+}
