@@ -109,6 +109,9 @@ pub mod download;
 pub mod encoder;
 /// Crate error taxonomy; see [`InferenceError`].
 pub mod error;
+/// The family contract: static descriptors naming each family's loaders, a registry built from
+/// them, and the Qwen3.5 CPU decoder they load. See [`family::registry`].
+pub mod family;
 /// Time-series forecasting: context preparation and native forecasting models. See
 /// [`forecast::Reverso`].
 pub mod forecast;

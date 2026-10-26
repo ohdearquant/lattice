@@ -721,12 +721,18 @@ the family crates names a model; items 2 and 6 say how and in which release that
      token, stop strings, decode cap, think closing) becomes data each family supplies. Promoting the trait makes it a
      public API, so its supporting types, construction, errors and lifecycle are closed in the same step; prediction
      ids stay opaque and session state stays session-local; sessions carry no `Send` or `Sync` requirement.
-   - a registry type and a per-family descriptor (name, decoder or encoder, the `model_type` strings it claims,
-     constructors). `lattice-arch` cannot list the families, so each family crate exports its descriptor and each
-     consumer builds its table from the families it links. The family and backend are chosen once, when a session or
-     encoder is constructed; the session's coarse methods are called per token, as ADR-090 already does, and no
-     per-kernel dispatch is added. A name whose family is not compiled in is an error at resolution. The legacy
-     `detect_family` keeps its current fallback (an unrecognized configuration resolves to Qwen3.5) on its own path.
+   - a registry type and a per-family descriptor (name, a decoder constructor, an encoder constructor, or both, at
+     least one being present, the `model_type` strings it claims, the backends it offers). `lattice-arch` cannot list
+     the families, so each family crate exports its descriptor and each consumer builds its table from the families it
+     links; the table refuses a duplicate family name or a duplicate claim of one `model_type` for one kind when it is
+     built, and resolves by exact string. A loaded decoder admits a prompt into an owned request (the prompt ids, the
+     configuration and the family's token policy), hands out a read-only text decoder, and opens one session at a time
+     over an admitted request. Neither the loaded decoder nor its sessions carry a `Send` or `Sync` requirement, so a
+     consumer moves the constructor and its load request across threads, never the loaded model. The family and backend
+     are chosen once, when a session or encoder is constructed; the session's coarse methods are called per token, as
+     ADR-090 already does, and no per-kernel dispatch is added. A name whose family is not compiled in is an error at
+     resolution. The legacy `detect_family` keeps its current fallback (an unrecognized configuration resolves to
+     Qwen3.5) on its own path.
      Registration stays in the facade until each constructor moves with its family.
    - an encoder handle that binds one loaded local model and reports its capabilities, its effective output dimension
      and identity (checkpoint revision and the tokenizer, prompt and pooling semantics, not load time), token counts and
