@@ -819,6 +819,52 @@ in its own change, ahead of those steps, which is the separate change D6.5 asks 
 4. The environment-variable table in `crates/inference/CONFIG.md` keeps the four lock variables and names
    `metal-runtime` as the crate that reads them.
 
+## Amendment 23 (2026-10-26)
+
+Amendment 21 item 1 lists `ernie45` and `paddleocr-vl` as two family crates, which never depend on each other, and
+item 5 makes `paddleocr-vl` imply `ernie45`. PaddleOCR-VL cannot be split that way without a new interface between the
+two crates. `PaddleOcrVlModel` owns an `Ernie45Model` and its `Ernie45Config`. It loads both from the checkpoint's one
+`config.json` and `model.safetensors`, reads the decoder's token-embedding table (`embed_tokens`) to splice the image
+rows into the prompt, and then drives the decoder through its embedding-input methods (`forward_embeds_last_logits`,
+`kv_prefill`, `kv_decode_step`) and an `Ernie45KvCache`. Its one public item that names an ERNIE type is `config()`,
+which returns `&Ernie45Config`. In the other direction, nothing in the workspace selects the ERNIE 4.5 decoder without
+PaddleOCR-VL: it has no registry entry and no generation entry point of its own, and no reader in `lattice-serve`,
+`lattice-embed` or `lattice-tune`; its other readers are its own Metal forward, its tests, the decoder goldens and a
+trace example. Changed:
+
+1. A family crate is the unit a consumer selects. ERNIE 4.5 and PaddleOCR-VL are one such unit today, so they share one
+   crate. `lattice-model-ernie45` (`crates/models/ernie45/`) holds the ERNIE 4.5 decoder (its configuration, weights
+   and CPU forward, and its Metal forward behind `metal-gpu`) and, behind the crate's own `paddleocr-vl` feature, the
+   PaddleOCR-VL image processor, vision encoder and projector and `PaddleOcrVlModel`. Item 1's crate list loses
+   `lattice-model-paddleocr-vl`; no crate of that name is created or published.
+2. The crate's default feature set does not include `paddleocr-vl`. Item 5's facade features keep their names and their
+   implication: `ernie45` enables the crate, and `paddleocr-vl` implies `ernie45` and forwards to
+   `lattice-model-ernie45?/paddleocr-vl`. Both stay in the facade's default set, so its default public surface does not
+   change, and these paths stay as named re-exports (D1): `lattice_inference::model::{ernie45, paddleocr_vl}`,
+   `lattice_inference::vision::{paddleocr_preprocess, paddleocr_vit}`, and, under `metal-gpu`,
+   `lattice_inference::forward::metal_ernie45`. A build with `ernie45` and without `paddleocr-vl` compiles no
+   PaddleOCR-VL code; that pair joins item 7's implication-pair coverage. Because the crate's default build leaves the
+   PaddleOCR-VL tests out, CI runs its tests with `--features paddleocr-vl`, and its macOS Metal step with
+   `--features metal-gpu,paddleocr-vl`.
+3. Item 1's rule that family crates never depend on each other, and item 7's mechanical check of it, are unchanged.
+   Item 6's step (6) moves ERNIE 4.5 and PaddleOCR-VL in one family step.
+4. Considered and not taken:
+   - Keeping `PaddleOcrVlModel` in the facade as glue over two family crates. Its prompt assembly, position rows and
+     decode loop exist only for PaddleOCR-VL, and item 1 puts code that exists for one family in a family crate.
+   - A `lattice-arch` interface for a decoder that takes injected embeddings (token-embedding table, three-row
+     positions, a cache type, prefill and decode step, and a loader), with `PaddleOcrVlModel` generic over it and the
+     facade naming the ERNIE instantiation by a type alias. This keeps item 1's rule and the facade paths. Its cost is a
+     public trait shaped by one implementor and one consumer, which item 3 requires to be closed (construction, errors,
+     lifecycle) in the same step. `config()` keeps returning `&Ernie45Config` only while that configuration sits in
+     `lattice-arch`; it lives in the facade today, so it would first move there, and item 6's step (7) moves
+     configurations out of `lattice-arch` again, after which `config()` returns an associated type.
+   - A named exception letting `lattice-model-paddleocr-vl` depend on `lattice-model-ernie45`. It is the smallest code
+     change, but it breaks the one invariant item 7 checks mechanically, and a first exception makes the next cheaper.
+
+   If ERNIE 4.5 gains a consumer that selects it without PaddleOCR-VL, the two can be split then. That split removes
+   the PaddleOCR-VL modules from `lattice-model-ernie45`, a breaking release of that crate (the facade paths stay), and
+   it needs the interface or the exception above at that point.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
