@@ -512,8 +512,8 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
 ];
 const IN_CRATE_COMMAND_BUFFER_TESTS: &[(&str, &str)] = &[
     (
-        ".",
-        "src/forward/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
+        "../models/qwen3",
+        "src/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
     ),
     (
         ".",
@@ -578,7 +578,7 @@ const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
     CallSelector::Path(&["MetalQwen35State", "new"]),
     CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
     // QwenModel::from_directory attempts MetalForwardPass::new internally
-    // (crates/inference/src/model/qwen.rs) whenever Metal is available, so
+    // (crates/models/qwen3/src/lib.rs) whenever Metal is available, so
     // every caller of it is a helper-mediated Metal construction site (#1274).
     CallSelector::Path(&["QwenModel", "from_directory"]),
 ];
@@ -2934,9 +2934,9 @@ fn prior_lock_owners_and_existing_bench_use_the_shared_module() {
     let packages = scanned_packages();
     let callers = [
         (
-            ".",
-            "src/forward/metal.rs",
-            "use crate::measurement::gpu_test_lock;",
+            "../models/qwen3",
+            "src/metal.rs",
+            "use lattice_metal_runtime::measurement::gpu_test_lock;",
         ),
         (
             ".",

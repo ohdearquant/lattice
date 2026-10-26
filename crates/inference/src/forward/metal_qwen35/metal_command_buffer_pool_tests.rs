@@ -15,7 +15,7 @@ const EXEMPT: &[(&str, &str)] = &[("forward/metal_qwen35/inner/bench_support.rs"
 /// scanned and enforced. Catches the walk itself breaking (an exclusion rule drawn
 /// too wide, a rename) before that reads as "nothing left to fix".
 const EXPECTED_FILES: &[&str] = &[
-    "forward/metal.rs",
+    "models/qwen3/src/metal.rs",
     "forward/metal_gemm.rs",
     "forward/metal_qwen35/inner/prefill_chunk.rs",
 ];
@@ -179,6 +179,28 @@ fn every_production_command_buffer_creator_runs_inside_an_autorelease_pool() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rs_files(&src_root, &mut files);
+    // Model family crates carry their own Metal code; their files are labelled by
+    // their path under `crates/`.
+    let crates_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let family_root = crates_root.join("models");
+    let mut family_files = Vec::new();
+    for entry in std::fs::read_dir(&family_root)
+        .unwrap_or_else(|e| panic!("failed to read directory {}: {e}", family_root.display()))
+    {
+        let family_src = entry
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to read an entry under {}: {e}",
+                    family_root.display()
+                )
+            })
+            .path()
+            .join("src");
+        if family_src.is_dir() {
+            collect_rs_files(&family_src, &mut family_files);
+        }
+    }
+    files.extend(family_files);
     files.sort();
     assert!(
         !files.is_empty(),
@@ -191,7 +213,10 @@ fn every_production_command_buffer_creator_runs_inside_an_autorelease_pool() {
     let mut total_sites = 0usize;
 
     for path in &files {
-        let relative = path.strip_prefix(&src_root).unwrap_or(path);
+        let relative = path
+            .strip_prefix(&src_root)
+            .or_else(|_| path.strip_prefix(&crates_root))
+            .unwrap_or(path);
         let label = relative.to_string_lossy().replace('\\', "/");
         let source = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));

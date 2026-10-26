@@ -126,6 +126,7 @@ fn canonical_generation_contract_remains() {
         assert_eq!(legacy_model.max_new_tokens, config.max_new_tokens);
         let _ = std::mem::size_of::<lattice_inference::model::qwen35_config::GenerateOutput>();
     }
+    #[cfg(feature = "qwen3")]
     let _ = std::mem::size_of::<lattice_inference::QwenModel>();
 
     let _ = lattice_inference::model::Qwen35Model::generate;

@@ -1686,6 +1686,7 @@ dependencies = [
  "lattice-model-bert",
  "lattice-model-embeddinggemma2",
  "lattice-model-io",
+ "lattice-model-qwen3",
  "lattice-quant",
  "lattice-tokenizer",
  "lattice-weights",
@@ -1780,6 +1781,26 @@ dependencies = [
  "tempfile",
  "tracing",
  "ureq",
+]
+
+[[package]]
+name = "lattice-model-qwen3"
+version = "0.15.0"
+dependencies = [
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-inference-core",
+ "lattice-metal-runtime",
+ "lattice-model-io",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "metal 0.33.0",
+ "objc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

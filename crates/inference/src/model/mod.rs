@@ -33,7 +33,9 @@ pub use self::cross_encoder::CrossEncoderModel;
 pub use self::embeddinggemma2::EmbeddingGemma2Model;
 // Re-export key types from other model modules
 pub use self::gemma4_model::Gemma4Model;
-pub use self::qwen::{LayerTimings, ProfileTimings, QwenConfig, QwenModel};
+pub use self::qwen::QwenConfig;
+#[cfg(feature = "qwen3")]
+pub use self::qwen::{LayerTimings, ProfileTimings, QwenModel};
 pub use self::qwen35::{HiddenPooling, Qwen35Model};
 #[deprecated(
     since = "0.11.0",

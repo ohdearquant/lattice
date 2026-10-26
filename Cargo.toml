@@ -18,6 +18,7 @@ members = [
     "crates/model-io",
     "crates/models/embeddinggemma2",
     "crates/models/bert",
+    "crates/models/qwen3",
 ]
 
 [workspace.package]
@@ -123,6 +124,7 @@ lattice-tokenizer = { version = "0.15.0", path = "crates/tokenizer" }
 lattice-weights = { version = "0.15.0", path = "crates/weights" }
 lattice-model-embeddinggemma2 = { version = "0.15.0", path = "crates/models/embeddinggemma2" }
 lattice-model-bert = { version = "0.15.0", path = "crates/models/bert", default-features = false }
+lattice-model-qwen3 = { version = "0.15.0", path = "crates/models/qwen3", default-features = false }
 
 [workspace.lints.clippy]
 # Correctness

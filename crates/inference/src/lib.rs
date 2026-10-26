@@ -159,7 +159,7 @@ pub mod moe_admission;
 /// the CPU and Metal Qwen3.5 scorers. See [`model`] and [`tokenizer`].
 pub mod option_scoring;
 /// Embedding pooling helpers (mean, CLS, last-token) including [`BertPooling`]. Used by
-/// `model::BertModel` and [`model::QwenModel`].
+/// `model::BertModel` and `model::QwenModel`.
 pub mod pool;
 /// ShortGPT-style block influence scoring. See [`model`].
 pub mod pruning;
@@ -204,9 +204,10 @@ mod test_support;
 #[cfg(feature = "train-backward")]
 pub mod backward;
 
-/// Model cache directory and by-value environment switches, from `lattice-model-io` (ADR-103
-/// Amendment 20); the crate-local paths stay for this crate's callers.
-pub(crate) use lattice_model_io::{default_cache_dir, env_switch_enabled};
+/// By-value environment switches, from `lattice-model-io` (ADR-103 Amendment 20); the
+/// crate-local path stays for this crate's Metal Qwen3.5 callers and their tests.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) use lattice_model_io::env_switch_enabled;
 
 // Re-exports for public API backward compatibility
 /// Root error type for inference, tokenizer, model loading, and runtime failures. See [`error`].
@@ -246,13 +247,16 @@ pub use crate::model::BertModel;
 pub use crate::model::CrossEncoderModel;
 /// Per-layer profiling data collected during Qwen embedding inference. See [`ProfileTimings`]
 /// and [`QwenModel`].
+#[cfg(feature = "qwen3")]
 pub use crate::model::LayerTimings;
 /// Aggregate profiling report for Qwen inference. See [`LayerTimings`] and [`QwenModel`].
+#[cfg(feature = "qwen3")]
 pub use crate::model::ProfileTimings;
-/// Qwen embedding model configuration. See [`QwenModel`] and [`weights`].
+/// Qwen embedding model configuration. See `QwenModel` and [`weights`].
 pub use crate::model::QwenConfig;
 /// Qwen embedding model exposing `encode` for producing embeddings. See [`QwenConfig`],
 /// [`Tokenizer`], and [`weights`].
+#[cfg(feature = "qwen3")]
 pub use crate::model::QwenModel;
 /// BERT pooling strategy selector (mean or CLS). See [`pool`] and `BertModel`.
 #[doc(no_inline)]
@@ -264,7 +268,7 @@ pub use crate::stop_reason::StopReason;
 /// Byte-level BPE tokenizer used by Qwen-family models. See [`Tokenizer`] and [`TokenizedInput`].
 pub use crate::tokenizer::BpeTokenizer;
 /// Token counts of one embedding input before and after the model's length limit. See
-/// `BertModel::embedding_token_counts` and [`QwenModel::embedding_token_counts`].
+/// `BertModel::embedding_token_counts` and `QwenModel::embedding_token_counts`.
 pub use crate::tokenizer::EmbeddingTokenCounts;
 /// Additive Gemma-family BPE tokenizer (literal-space `Split` + `▁` metaspace normalizer),
 /// explicitly selected — never reached via [`load_tokenizer`]'s model-type sniffing. See

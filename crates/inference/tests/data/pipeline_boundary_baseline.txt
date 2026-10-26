@@ -29,7 +29,6 @@
 ../serve:src/serving_worker.rs	.:crate::forward::metal_qwen35::LoraLayerData
 ../serve:src/serving_worker.rs	.:crate::forward::metal_qwen35::MetalQwen35State
 ../serve:src/serving_worker.rs	.:crate::forward::metal_qwen35::format_chat_template
-.:src/bin/backfill_qwen3.rs	.:crate::model::qwen::QwenModel
 .:src/bin/bench_decode_ab.rs	.:crate::forward::metal_qwen35::ChatMessage
 .:src/bin/bench_decode_ab.rs	.:crate::forward::metal_qwen35::MetalQwen35State
 .:src/bin/bench_decode_ab.rs	.:crate::model::qwen35::model::Qwen35Model

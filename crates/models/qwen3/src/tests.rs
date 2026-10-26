@@ -1,6 +1,6 @@
 use super::*;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use crate::measurement::gpu_test_lock;
+use lattice_metal_runtime::measurement::gpu_test_lock;
 
 #[test]
 fn test_qwen_config_dimensions() {
@@ -161,7 +161,8 @@ fn test_parse_config_json() {
 #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn test_qwen_long_text_bench() {
-    let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let model_dir =
+        lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
     let _gpu_lock = gpu_test_lock();
     let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
     // Warmup
@@ -183,7 +184,8 @@ fn test_qwen_long_text_bench() {
 #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn test_qwen_multilingual() {
-    let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let model_dir =
+        lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
     let _gpu_lock = gpu_test_lock();
     let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
 
@@ -225,7 +227,8 @@ fn test_qwen_multilingual() {
 #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn test_qwen_encode_real_model() {
-    let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let model_dir =
+        lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
 
     let _gpu_lock = gpu_test_lock();
     let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
@@ -1065,10 +1068,10 @@ fn qwen_embedding_cache_rejects_truncated_record() {
 /// here is unreachable in the tests that use the fixture.
 struct NullTokenizer;
 impl Tokenizer for NullTokenizer {
-    fn tokenize(&self, _text: &str) -> crate::tokenizer::common::TokenizedInput {
+    fn tokenize(&self, _text: &str) -> lattice_tokenizer::common::TokenizedInput {
         unimplemented!("NullTokenizer is a cache-test fixture; tokenize is never called")
     }
-    fn tokenize_batch(&self, _texts: &[&str]) -> Vec<crate::tokenizer::common::TokenizedInput> {
+    fn tokenize_batch(&self, _texts: &[&str]) -> Vec<lattice_tokenizer::common::TokenizedInput> {
         unimplemented!("NullTokenizer is a cache-test fixture; tokenize_batch is never called")
     }
     fn vocab_size(&self) -> usize {
@@ -1081,8 +1084,8 @@ impl Tokenizer for NullTokenizer {
 
 struct TwoTokenTokenizer;
 impl Tokenizer for TwoTokenTokenizer {
-    fn tokenize(&self, _text: &str) -> crate::tokenizer::common::TokenizedInput {
-        crate::tokenizer::common::TokenizedInput {
+    fn tokenize(&self, _text: &str) -> lattice_tokenizer::common::TokenizedInput {
+        lattice_tokenizer::common::TokenizedInput {
             input_ids: vec![0, 1],
             attention_mask: vec![1, 1],
             token_type_ids: vec![0, 0],
@@ -1091,7 +1094,7 @@ impl Tokenizer for TwoTokenTokenizer {
         }
     }
 
-    fn tokenize_batch(&self, texts: &[&str]) -> Vec<crate::tokenizer::common::TokenizedInput> {
+    fn tokenize_batch(&self, texts: &[&str]) -> Vec<lattice_tokenizer::common::TokenizedInput> {
         texts.iter().map(|text| self.tokenize(text)).collect()
     }
 
@@ -1127,12 +1130,12 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
     };
     let rope = RopeTable::new(2, 1, 10_000.0);
     let weights = QwenWeights {
-        embed_tokens: crate::weights::Tensor2D {
+        embed_tokens: lattice_weights::Tensor2D {
             data: &[],
             rows: 0,
             cols: 0,
         },
-        norm_weight: crate::weights::Tensor1D { data: &[], len: 0 },
+        norm_weight: lattice_weights::Tensor1D { data: &[], len: 0 },
         layers: Vec::new(),
     };
     let file = tempfile::NamedTempFile::new().unwrap();
@@ -1173,12 +1176,12 @@ fn build_rope_capacity_test_model() -> QwenModel {
     );
     model.tokenizer = Box::new(TwoTokenTokenizer);
     model.weights = ManuallyDrop::new(QwenWeights {
-        embed_tokens: crate::weights::Tensor2D {
+        embed_tokens: lattice_weights::Tensor2D {
             data: &EMBED_TOKENS,
             rows: 2,
             cols: 2,
         },
-        norm_weight: crate::weights::Tensor1D {
+        norm_weight: lattice_weights::Tensor1D {
             data: &NORM_WEIGHT,
             len: 2,
         },
