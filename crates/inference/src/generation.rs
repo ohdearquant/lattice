@@ -7,6 +7,6 @@
 #[doc(inline)]
 pub use lattice_arch::generation::{GenerateConfig, GenerateOutput, TokenLogprob, TopLogprob};
 
-pub(crate) use lattice_arch::__internal::{
-    DecodePolicy, StepOutcome, StopCheckOutcome, truncate_token_logprobs_to_retained_text,
-};
+pub(crate) use lattice_arch::__internal::truncate_token_logprobs_to_retained_text;
+#[cfg(test)]
+pub(crate) use lattice_arch::__internal::{DecodePolicy, StepOutcome};

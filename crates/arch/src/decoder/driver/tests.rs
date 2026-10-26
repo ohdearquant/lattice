@@ -2,7 +2,7 @@ use super::*;
 use crate::decoder::{
     PredictionId, PredictionLedger, SelectionCandidate, StepStamp, TokenMetadata,
 };
-use crate::grammar::GrammarSpec;
+use lattice_grammar::GrammarSpec;
 use std::sync::Arc;
 
 #[test]
@@ -156,10 +156,9 @@ impl DecoderSession for FakeSession {
 
 fn run_with_capabilities(caps: ExecutionCapabilities) -> Result<DriverResult, InferenceError> {
     let mut session = FakeSession { caps };
-    let gen_cfg = {
-        let mut config = GenerateConfig::default();
-        config.grammar = Some(a_trivial_grammar());
-        config
+    let gen_cfg = GenerateConfig {
+        grammar: Some(a_trivial_grammar()),
+        ..Default::default()
     };
     let cancel = || false;
     let mut text = String::new();
@@ -194,12 +193,11 @@ fn run_with_capabilities(caps: ExecutionCapabilities) -> Result<DriverResult, In
 #[test]
 fn request_buffers_reserve_history() {
     for (reasoning_budget, max_new_tokens) in [(None, 0), (None, 16), (Some(7), 16)] {
-        let config = {
-            let mut config = GenerateConfig::default();
-            config.reasoning_budget = reasoning_budget;
-            config.enable_thinking = reasoning_budget.is_some();
-            config.max_new_tokens = max_new_tokens;
-            config
+        let config = GenerateConfig {
+            reasoning_budget,
+            enable_thinking: reasoning_budget.is_some(),
+            max_new_tokens,
+            ..Default::default()
         };
         let prompt = [1, 2, 3];
         let cap = decode_cap(config.effective_reasoning_budget(), max_new_tokens);
@@ -224,10 +222,9 @@ fn request_buffers_reuse_driver_delta() {
         script: vec![TEXT_TOKEN],
         selects: 0,
     };
-    let config = {
-        let mut config = GenerateConfig::default();
-        config.max_new_tokens = 8;
-        config
+    let config = GenerateConfig {
+        max_new_tokens: 8,
+        ..Default::default()
     };
     let mut text = String::new();
     let mut offsets = Vec::new();
@@ -433,11 +430,10 @@ fn on_push_fires_before_metadata_for_every_token_with_logprobs_enabled() {
     // `logprobs: Some(_)` is what makes `record_metadata` a real, non-skipped
     // call at every step (see `DecodePolicy::transition_inner`'s doc comment) --
     // the ordering this test exists to pin has no observable effect otherwise.
-    let gen_cfg = {
-        let mut config = GenerateConfig::default();
-        config.max_new_tokens = 3;
-        config.logprobs = Some(0);
-        config
+    let gen_cfg = GenerateConfig {
+        max_new_tokens: 3,
+        logprobs: Some(0),
+        ..Default::default()
     };
     let cancel = || false;
     let mut text = String::new();
@@ -567,11 +563,10 @@ fn run_streaming_script(
         script,
         selects: 0,
     };
-    let gen_cfg = {
-        let mut config = GenerateConfig::default();
-        config.max_new_tokens = max_new_tokens;
-        config.stop_strings = vec!["ZZ".to_string()];
-        config
+    let gen_cfg = GenerateConfig {
+        max_new_tokens,
+        stop_strings: vec!["ZZ".to_string()],
+        ..Default::default()
     };
     let cancel = || false;
     let mut text = String::new();

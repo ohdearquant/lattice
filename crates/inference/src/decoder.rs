@@ -1,23 +1,10 @@
-//! Crate-private decoder session vocabulary (ADR-090 D1/D2).
+//! Decoder sessions (ADR-090 D1/D2).
 //!
-//! This module lands the type surface D1's illustrative `DecoderSession` trait sketches,
-//! plus the ledger mechanism that makes "a stale prediction id is rejected" a state fact
-//! the type system enforces rather than a comment a future caller has to remember.
-//!
-//! ADR-090 row C (`driver`) adds the one autoregressive loop over `&mut dyn DecoderSession`,
-//! and `model::qwen35::generation`'s `generate()`/`generate_with_trace()` are its production
-//! callers. Row R03 routes grammar-constrained decoding and `logprobs` capture through it too
-//! (`select` returns [`SelectOutcome`] and `metadata` is a real per-step call now, not reserved
-//! surface). Grammar ownership lives in `driver`, not in this trait: `select` reads a borrowed
-//! mask through [`SelectionRequest::grammar_mask`] and the driver calls `advance` /
-//! `is_complete_without_continuation` on its own owned engine and state -- see `driver`'s own
-//! module doc comment for the full per-step ordering and the reasoning for that split.
-//!
-//! Everything in this module is `pub(crate)`.
-
-use crate::error::InferenceError;
-use crate::generation::{GenerateConfig, TopLogprob};
-use std::sync::atomic::{AtomicU64, Ordering};
+//! The session vocabulary (the `DecoderSession` trait, the prediction ledger, the per-step request
+//! and result types) and the shared driver live in `lattice-arch`, which every model family can
+//! reach. This module re-exports them at their previous paths and holds the concrete sessions,
+//! which move to their family crates later. `model::qwen35::generation`'s
+//! `generate()`/`generate_with_trace()` are the driver's production callers.
 
 /// First concrete [`DecoderSession`] implementation (ADR-090 row B): the CPU dense
 /// Qwen3.5 entry point wrapped over this module's typed vocabulary.
@@ -36,504 +23,124 @@ pub(crate) mod qwen_metal;
 #[cfg(feature = "bench-internals")]
 pub mod bench_support;
 
-/// The autoregressive driver (ADR-090 row C): one loop over `&mut dyn DecoderSession`
-/// that drives [`DecodePolicy`](crate::generation::DecodePolicy) unchanged.
-pub(crate) mod driver;
-
 /// One [`DecoderSession`] for the three standalone CPU generation wrappers
 /// (`generate_f16`, `generate_q8`, `generate_q8_neon`), run by the shared driver.
 pub(crate) mod standalone_cpu;
 
-// ---------------------------------------------------------------------------
-// PredictionId / PredictionLedger
-// ---------------------------------------------------------------------------
+pub(crate) use lattice_arch::__internal::decoder::{
+    AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
+    MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectOutcome,
+    SelectionCandidate, SelectionRequest, StepStamp, TokenMetadata,
+};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use lattice_arch::__internal::decoder::{
+    SpeculativeSession, SpeculativeTrace, VerifiedRound,
+};
 
-/// Opaque identity for one open prediction: a sampled candidate awaiting policy
-/// finalization and, if accepted, consumption by the next decode step.
-///
-/// `Copy` and comparable, but mintable only by [`PredictionLedger::open`] -- there is no
-/// `From<u64>`, no public constructor, and both fields are private to this module (visible
-/// to this module's own `tests` submodule, never to the rest of the crate). A caller
-/// holding a `PredictionId` therefore has proof it went through the ledger that owns its
-/// validity, not a bare integer it could have fabricated.
-///
-/// **`ledger` is not the `epoch` field this type used to carry.** That one was bumped on
-/// every reset and read by nothing: `seq` is monotonic within a ledger and never reused, so
-/// it already made ids unique across resets, which is pinned by a test below. `ledger`
-/// answers a different question the sequence cannot: WHICH ledger minted this. Without it
-/// two freshly constructed ledgers both mint `seq = 0`, and since `is_live`/`consume`
-/// compare ids by value, session A's live prediction would be accepted and consumed by
-/// session B -- the exact cross-session confusion this type exists to make impossible. The
-/// id is assigned once per ledger from a process-wide counter, not once per token, so the
-/// decode path pays no atomic per step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PredictionId {
-    ledger: u64,
-    seq: u64,
-}
+/// The autoregressive driver (ADR-090 row C), defined in `lattice-arch`.
+pub(crate) mod driver {
+    #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+    pub(crate) use counted::{run, run_into, test_driver_run_count};
+    #[cfg(test)]
+    pub(crate) use lattice_arch::__internal::decoder::driver::DriverResult;
+    pub(crate) use lattice_arch::__internal::decoder::driver::DriverTrace;
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub(crate) use lattice_arch::__internal::decoder::driver::run_speculative;
+    #[cfg(not(all(test, target_os = "macos", feature = "metal-gpu")))]
+    pub(crate) use lattice_arch::__internal::decoder::driver::{run, run_into};
 
-/// Source of ledger identities. Relaxed ordering is sufficient: the only property required
-/// is that no two `fetch_add` results are equal, which `fetch_add` guarantees on its own
-/// without any happens-before relationship between ledgers.
-static NEXT_LEDGER_ID: AtomicU64 = AtomicU64::new(0);
+    /// Test builds with Metal count driver runs, so the speculative-route tests can assert that
+    /// a request reached the driver. Each wrapper counts once and delegates unchanged.
+    #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+    mod counted {
+        use super::DriverResult;
+        use crate::decoder::{Cancellation, DecoderSession};
+        use crate::error::InferenceError;
+        use crate::generation::GenerateConfig;
+        use lattice_arch::__internal::decoder::driver as arch_driver;
+        use std::cell::Cell;
+        use std::sync::Arc;
 
-/// The mechanism that makes "a stale prediction id is rejected" a state fact rather than a
-/// comment. Owns its own identity, a sequence counter that is monotonic within that
-/// identity and never reused, and at most one live prediction.
-///
-/// D2: "There is one current prediction per evaluated prefix." Selection consumes no
-/// token; eligibility survives candidate selection and final-token metadata reads, and
-/// ends at consumption, cancellation, failure, finish, or another prefill/reset.
-///
-/// No `Default`: constructing a ledger takes an identity from a process-wide counter, and a
-/// `Default` impl would hide that side effect behind a call that reads as inert.
-#[derive(Debug)]
-pub(crate) struct PredictionLedger {
-    id: u64,
-    next_seq: u64,
-    live: Option<PredictionId>,
-}
-
-impl PredictionLedger {
-    /// A ledger with a fresh identity no other ledger in this process shares.
-    pub(crate) fn new() -> Self {
-        Self {
-            id: NEXT_LEDGER_ID.fetch_add(1, Ordering::Relaxed),
-            next_seq: 0,
-            live: None,
+        thread_local! {
+            static TEST_DRIVER_RUN_COUNT: Cell<usize> = const { Cell::new(0) };
         }
-    }
 
-    /// Mint a new prediction id and make it the ledger's one live prediction.
-    ///
-    /// **Decision (documented and tested below): supersede, not refuse.** `open` cannot
-    /// report failure -- its signature returns `PredictionId`, not a `Result` -- so a
-    /// caller that opens a second prediction while the first is still live cannot be told
-    /// no. The ledger instead enforces its own "at most one live prediction" invariant by
-    /// retiring the old id before minting the new one: the superseded id fails the same
-    /// `is_live` check a cancelled, consumed, or reset-invalidated id would fail, through
-    /// the same mechanism, rather than inventing a second way for a `PredictionId` to go
-    /// bad. A driver that opens twice per step has a bug either way; this choice makes
-    /// that bug surface as an ordinary stale-id rejection on whichever id the driver kept,
-    /// instead of two simultaneously "live" ids racing to be consumed.
-    pub(crate) fn open(&mut self) -> PredictionId {
-        let id = PredictionId {
-            ledger: self.id,
-            seq: self.next_seq,
-        };
-        self.next_seq += 1;
-        self.live = Some(id);
-        id
-    }
+        pub(crate) fn test_driver_run_count() -> usize {
+            TEST_DRIVER_RUN_COUNT.with(Cell::get)
+        }
 
-    /// Whether `id` is the ledger's current live prediction. This is the eligibility check
-    /// a concrete session's `select`/`metadata` operations must consult: a cancelled,
-    /// consumed, superseded, or reset-invalidated id is never live again.
-    pub(crate) fn is_live(&self, id: PredictionId) -> bool {
-        self.live == Some(id)
-    }
+        pub(crate) fn run(
+            session: &mut dyn DecoderSession,
+            gen_cfg: &GenerateConfig,
+            think_close_id: Option<u32>,
+            reasoning_newline_boundary: Option<Arc<[bool]>>,
+            prompt_ids: &[u32],
+            eos_token_id: u32,
+            streaming: bool,
+            cancel: &dyn Cancellation,
+            on_push: impl FnMut(usize),
+            decode_delta: impl FnMut(u32) -> String,
+            text: &mut String,
+            token_logprob_end_offsets: &mut Vec<usize>,
+            emit_confirmed: impl FnMut(&str, u32) -> bool,
+            on_prefill_end: impl FnMut(),
+            finish_tail: impl FnOnce() -> String,
+        ) -> Result<DriverResult, InferenceError> {
+            TEST_DRIVER_RUN_COUNT.with(|count| count.set(count.get() + 1));
+            arch_driver::run(
+                session,
+                gen_cfg,
+                think_close_id,
+                reasoning_newline_boundary,
+                prompt_ids,
+                eos_token_id,
+                streaming,
+                cancel,
+                on_push,
+                decode_delta,
+                text,
+                token_logprob_end_offsets,
+                emit_confirmed,
+                on_prefill_end,
+                finish_tail,
+            )
+        }
 
-    /// Another prefill/reset happened: the live prediction, if any, is no longer eligible.
-    ///
-    /// **Behaviourally identical to [`Self::invalidate`] today, and that is stated rather
-    /// than hidden.** The two exist as separate entry points because the call sites are
-    /// different -- a prefill is not a cancellation -- and because a reader at either call
-    /// site should not have to decide which generic verb to reach for. Nothing currently
-    /// distinguishes an id invalidated by a reset from one invalidated by a cancellation.
-    /// If a later row needs that distinction, it has to be added and tested deliberately;
-    /// it must not be assumed present because the methods have different names.
-    // Reserved for a later row (see the doc comment above): neither `QwenCpuSession`
-    // nor the row C driver re-prefills a session, so nothing calls this outside this
-    // module's own tests yet.
-    #[allow(dead_code)]
-    pub(crate) fn reset(&mut self) {
-        self.live = None;
-    }
-
-    /// Cancellation, failure, or finish: the live prediction, if any, is no longer
-    /// eligible. See [`Self::reset`] on why these are two methods with one behaviour.
-    pub(crate) fn invalidate(&mut self) {
-        self.live = None;
-    }
-
-    /// Consume `id`: the live prediction must currently be `id`, and after this call it no
-    /// longer is. A second `consume` of the same id -- whether the original caller retried
-    /// it or a different caller captured a copy -- finds no matching live prediction and is
-    /// rejected the same way any other stale id would be.
-    pub(crate) fn consume(&mut self, id: PredictionId) -> Result<(), PredictionError> {
-        if self.live == Some(id) {
-            self.live = None;
-            Ok(())
-        } else {
-            Err(PredictionError::Stale)
+        pub(crate) fn run_into(
+            session: &mut dyn DecoderSession,
+            gen_cfg: &GenerateConfig,
+            think_close_id: Option<u32>,
+            reasoning_newline_boundary: Option<Arc<[bool]>>,
+            prompt_ids: &[u32],
+            eos_token_id: u32,
+            streaming: bool,
+            cancel: &dyn Cancellation,
+            on_push: impl FnMut(usize),
+            decode_delta: impl FnMut(u32, &mut String),
+            text: &mut String,
+            token_logprob_end_offsets: &mut Vec<usize>,
+            emit_confirmed: impl FnMut(&str, u32) -> bool,
+            on_prefill_end: impl FnMut(),
+            finish_tail: impl FnOnce() -> String,
+        ) -> Result<DriverResult, InferenceError> {
+            TEST_DRIVER_RUN_COUNT.with(|count| count.set(count.get() + 1));
+            arch_driver::run_into(
+                session,
+                gen_cfg,
+                think_close_id,
+                reasoning_newline_boundary,
+                prompt_ids,
+                eos_token_id,
+                streaming,
+                cancel,
+                on_push,
+                decode_delta,
+                text,
+                token_logprob_end_offsets,
+                emit_confirmed,
+                on_prefill_end,
+                finish_tail,
+            )
         }
     }
 }
-
-/// Crate-private failure taxonomy for the prediction ledger. See
-/// `impl From<PredictionError> for InferenceError` for how this maps into the crate's
-/// public error type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PredictionError {
-    /// `consume` was called with an id that is not the ledger's current live prediction:
-    /// already consumed, superseded, cancelled, or invalidated by a prefill/reset.
-    Stale,
-}
-
-/// Maps into the crate's general execution-failure bucket. `InferenceError` is
-/// `#[non_exhaustive]`; this row does not add a new public variant. A stale prediction id
-/// is a session-internal protocol error (the driver misused the ledger), not
-/// caller-supplied invalid input, so it is not routed through `InvalidInput`.
-impl From<PredictionError> for InferenceError {
-    fn from(value: PredictionError) -> Self {
-        match value {
-            PredictionError::Stale => InferenceError::Inference(
-                "stale prediction id: no matching live prediction in the ledger".into(),
-            ),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AcceptedToken / SelectionCandidate / SelectionRequest
-// ---------------------------------------------------------------------------
-
-/// Binds an accepted final token id to the prediction that produced its candidate: "the
-/// final token pending evaluation" in D1's vocabulary. Fields are readable in-crate, but
-/// the only way to obtain a `PredictionId` to put in one is [`PredictionLedger::open`], so
-/// construction is gated by the ledger even without a dedicated constructor function.
-///
-/// Not `Clone`, not `Copy` -- but that is a hint, not the enforcement, and the difference
-/// matters. D1's `decode(&mut self, accepted: &AcceptedToken, ..)` takes a SHARED borrow, so
-/// the type cannot stop a caller from passing the same token twice; and the embedded
-/// `PredictionId` is `Copy`, so the identity can be lifted out and reused on its own.
-/// Consume-at-most-once is therefore a property of [`PredictionLedger::consume`], which
-/// clears the live slot so the second attempt finds nothing and is rejected exactly like any
-/// other stale id. The non-`Clone` shape only removes the most casual way to get it wrong.
-#[derive(Debug)]
-pub(crate) struct AcceptedToken {
-    pub(crate) final_id: u32,
-    pub(crate) prediction: PredictionId,
-}
-
-/// A sampled candidate id and the prediction it belongs to. Sampling alone authorizes
-/// neither publication nor consumption (D1); the candidate becomes an [`AcceptedToken`]
-/// only after policy finalization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SelectionCandidate {
-    pub(crate) candidate_id: u32,
-    pub(crate) prediction: PredictionId,
-}
-
-/// Grammar mask closure carried by [`SelectionRequest::grammar_mask`]: applies grammar
-/// masking to a session's own logits in place, or fails with the same error
-/// `crate::grammar::GrammarEngine::mask_logits` returns. Named as its own alias (rather than
-/// spelled out inline) purely to keep `SelectionRequest`'s and `decoder::driver::run`'s type
-/// signatures readable -- clippy's `type_complexity` lint flags the unaliased form.
-pub(crate) type GrammarMaskFn<'a> = dyn Fn(&mut [f32]) -> Result<(), InferenceError> + 'a;
-
-/// What a concrete session's `select` operation borrows to sample the next candidate.
-///
-/// RNG ownership stays in the driver/session, never in this request: randomness crosses
-/// this boundary as already-drawn values baked into the session's own state, never as a
-/// sampler handle passed through the request. That is what lets `select` take
-/// `&SelectionRequest` (shared borrow) instead of a mutable one -- the mutation happens
-/// through `&mut self` on the session, not through this type. Note for a future row: the
-/// legacy `TokenSampler::sample` draws its RNG internally rather than accepting
-/// already-drawn values; reconciling that draw schedule with this boundary is row B/C
-/// work and is not solved here.
-///
-/// `grammar_mask` is the one field that is not `Copy`-trivial to reason about but still lets
-/// this type stay `#[derive(Copy)]`: a shared reference to a `dyn Fn` is `Copy` regardless of
-/// what the closure behind it captures. The driver builds this closure once per `run()` call
-/// over its own owned `GrammarEngine`/`GrammarState` (interior mutability via `RefCell`, since
-/// masking needs `&mut GrammarState` but `select` only ever sees `&SelectionRequest`), and
-/// hands a borrow of it to every step's request. `None` when no grammar was set on
-/// `GenerateConfig` -- the ADR-090 D1 owner of grammar transitions is the driver, not any
-/// concrete session, so a session with no grammar support simply never receives `Some` here.
-/// See `decoder::driver`'s module doc comment for the full per-step ordering.
-#[derive(Clone, Copy)]
-pub(crate) struct SelectionRequest<'a> {
-    pub(crate) config: &'a GenerateConfig,
-    pub(crate) history: &'a [u32],
-    pub(crate) grammar_mask: Option<&'a GrammarMaskFn<'a>>,
-}
-
-/// Outcome of [`DecoderSession::select`]: either a real sampled candidate, or a signal that
-/// grammar masking blocked every token, i.e. no finite logit remained after applying
-/// [`SelectionRequest::grammar_mask`]. This variant does not by itself distinguish "the
-/// grammar reached a valid accepting state with no further legal continuation" (a completed
-/// grammar -- generation ends here with no new token sampled) from "no legal continuation
-/// exists and the grammar is not in an accepting state" (a hard error): resolving that
-/// requires the grammar engine and state, which the session no longer holds (ADR-090 D1: the
-/// driver owns grammar transitions). The driver makes that call itself right after `select`
-/// returns this variant, via its own owned `is_complete_without_continuation` check, and
-/// returns `InferenceError::GrammarConstraintBlocked` directly (never as a variant of this
-/// enum) for the not-complete case -- mirroring the pre-driver inline loops' identical
-/// distinction, just relocated to the caller that still has the state to make it.
-pub(crate) enum SelectOutcome {
-    Candidate(SelectionCandidate),
-    GrammarExhausted,
-}
-
-// ---------------------------------------------------------------------------
-// MetadataRequest / TokenMetadata
-// ---------------------------------------------------------------------------
-
-/// What the entry profile asked for from the `metadata` operation. Mirrors
-/// [`GenerateConfig::logprobs`] exactly: `None` disables metadata capture entirely; `Some(n)`
-/// requests the final token's log-probability plus its `n` highest-probability
-/// alternatives (`n == 0` is valid: report only the final token's log-probability).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MetadataRequest {
-    pub(crate) top_logprobs: Option<usize>,
-}
-
-/// The result of scoring one final token against the prediction that produced its
-/// candidate. Identifies both: `prediction` names which ledger entry was scored,
-/// `final_token_id` names which token id was scored -- these can differ from the
-/// originally sampled candidate id when policy finalization overrides it (D1's
-/// policy-final-token role), so a caller cannot recover the final id from the prediction
-/// alone.
-///
-/// `final_logprob` is named for what it is on purpose: it is the *final* token's
-/// log-probability under the prediction's pre-advance scoring view, never the candidate's.
-/// Reuses [`crate::generation::TopLogprob`] rather than defining a second alternative-token
-/// type.
-#[derive(Debug, Clone)]
-pub(crate) struct TokenMetadata {
-    // `driver::run`'s `record_metadata` closure trusts the session's own bookkeeping and
-    // reads only `final_logprob`/`top`; these two identity fields exist for the
-    // consistency guarantee this doc comment describes and are exercised by this
-    // module's and `qwen_cpu`'s tests (e.g. `assert_eq!(metadata.prediction, ...)`),
-    // never by production code, so a CPU-only production build reports them unread.
-    #[allow(dead_code)]
-    pub(crate) prediction: PredictionId,
-    #[allow(dead_code)]
-    pub(crate) final_token_id: u32,
-    pub(crate) final_logprob: f32,
-    pub(crate) top: Vec<TopLogprob>,
-}
-
-// ---------------------------------------------------------------------------
-// StepStamp
-// ---------------------------------------------------------------------------
-
-/// Identifies the evaluated input prefix and the current prediction, if one was produced,
-/// after a `prefill` or `decode` step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StepStamp {
-    pub(crate) evaluated_len: usize,
-    pub(crate) prediction: Option<PredictionId>,
-}
-
-// ---------------------------------------------------------------------------
-// ExecutionCapabilities
-// ---------------------------------------------------------------------------
-
-/// Capabilities negotiated per concrete model + backend + entry profile (D3).
-///
-/// Every field here names an unsupported-control refusal that already exists in this
-/// crate today, so this type describes real, currently-varying behavior rather than
-/// speculative future switches:
-///
-/// - `grammar` mirrors `check_grammar_not_set` (`model::qwen35::generation`): the base
-///   Qwen CPU `generate()`/`generate_streaming()` wire grammar masking directly, while
-///   `generate_q8`, `generate_f16`, `generate_q8_neon` fail closed on a set
-///   `GenerateConfig::grammar` (#397).
-/// - `logprobs` mirrors `check_logprobs_not_set`: the same base CPU paths and the Metal
-///   `generate_streaming()` wire per-step logprob capture directly, while the same
-///   standalone wrappers fail closed on a set `GenerateConfig::logprobs` (#585).
-/// - `stop_strings` mirrors `check_stop_strings_not_set` (ADR-080 C3, #783): the base CPU
-///   and Metal families wire stop-string matching directly, while the standalone CPU
-///   wrappers fail closed on a non-empty `GenerateConfig::stop_strings`.
-/// - `reasoning_budget` mirrors `check_reasoning_budget_not_set` (ADR-080 C3, #783): the
-///   base CPU paths and Metal `generate_streaming()` family wire budget-forcing directly,
-///   while the standalone CPU wrappers fail closed on a set `GenerateConfig::reasoning_budget`.
-///
-/// Left out, deliberately: prefix-cache and speculative-execution capability fields. D3
-/// lists "Qwen prefix cache" and "Qwen speculative routes" as their own entry profiles
-/// today, but there is no generic, per-session negotiation of them yet -- only Qwen has
-/// the methods at all, and nothing in this row (no driver, no concrete session) would read
-/// such a field. Naming a field for behavior nothing here can point at would be exactly
-/// the guess-shaped field this ADR forbids; that negotiation is row B/C work, once a
-/// concrete session and driver exist to consult it. One permissive family-level boolean
-/// must not widen a narrower entry point (D1); this type adds no `everything: bool`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ExecutionCapabilities {
-    pub(crate) grammar: bool,
-    pub(crate) logprobs: bool,
-    pub(crate) stop_strings: bool,
-    pub(crate) reasoning_budget: bool,
-}
-
-// ---------------------------------------------------------------------------
-// FinishDisposition
-// ---------------------------------------------------------------------------
-
-/// How a session's execution ended, and whether its typed state may be reused for another
-/// prefill (D2). Distinct from [`crate::stop_reason::StopReason`], which answers *why*
-/// generation stopped (EOS, length, grammar dead end, ...) -- a question orthogonal to
-/// whether the session's internal state is still valid to reuse. This row does not
-/// duplicate that type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FinishDisposition {
-    /// Generation completed normally, or a failure occurred before any state mutation:
-    /// the session's typed state remains valid and may be reused for another prefill.
-    Reusable,
-    /// A partial execution mutated session state without completing. The session must be
-    /// destroyed or reset through its typed owner -- never made reusable by changing a
-    /// common sequence-length integer (D2).
-    Poisoned,
-}
-
-// ---------------------------------------------------------------------------
-// Cancellation
-// ---------------------------------------------------------------------------
-
-/// Object-safe cancellation check, so a concrete session can hold `&dyn Cancellation`
-/// without a generic parameter.
-///
-/// Today cancellation is a generic closure parameter (`should_cancel: C where C: FnMut()
-/// -> bool`) at `model::qwen35::generation`'s `generate_streaming_with_cancel` and its
-/// siblings; this row does not change that call site.
-///
-/// **The blanket impl below is narrower than that call site's bound, and the gap is real.**
-/// `is_cancelled` takes `&self`, which is forced by D1's `cancel: &dyn Cancellation`
-/// shape, so the impl can only cover `Fn() -> bool`. An `FnMut` closure that mutates
-/// captured state is not `Fn` and does not adapt. Worse for the serving path specifically:
-/// `crates/serve/src/bin/lattice/serve.rs` threads cancellation as an erased
-/// `&mut dyn FnMut() -> bool`, and `&mut dyn FnMut()` implements neither `Fn` nor this
-/// trait. Today's concrete closure there (`move || *cancel_rx.borrow()`) only reads its
-/// capture and so is `Fn`, but the type it travels under is not, which is what a future
-/// row will actually have to convert. So the covered case is: a non-mutating closure,
-/// passed unerased. Everything else needs either a wrapper with interior mutability or a
-/// change to the erased type along the serving chain. That choice belongs to the row that
-/// wires a driver through it, and it is a choice, not a formality.
-pub(crate) trait Cancellation {
-    fn is_cancelled(&self) -> bool;
-}
-
-impl<F> Cancellation for F
-where
-    F: Fn() -> bool,
-{
-    fn is_cancelled(&self) -> bool {
-        self()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DecoderSession
-// ---------------------------------------------------------------------------
-
-/// The crate-private, object-safe execution boundary D1 introduces. A concrete session
-/// owns or safely borrows its immutable model and owns its mutable cache, scratch,
-/// position, validated layer plan, and backend resources. No implementation lands in this
-/// row; object safety is proven by the `&dyn DecoderSession` coercion in this module's
-/// tests.
-pub(crate) trait DecoderSession {
-    fn capabilities(&self) -> &ExecutionCapabilities;
-
-    fn prefill(&mut self, cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError>;
-
-    /// Opts into cancellation during prefill; `None` requires a poisoned finish.
-    /// The default preserves existing backends' driver-owned cancellation checkpoints.
-    fn prefill_interruptible(
-        &mut self,
-        _cancel: &dyn Cancellation,
-    ) -> Result<Option<StepStamp>, InferenceError> {
-        self.prefill(&|| false).map(Some)
-    }
-
-    fn decode(
-        &mut self,
-        accepted: &AcceptedToken,
-        cancel: &dyn Cancellation,
-    ) -> Result<StepStamp, InferenceError>;
-
-    fn select(&mut self, request: &SelectionRequest<'_>) -> Result<SelectOutcome, InferenceError>;
-
-    fn metadata(
-        &mut self,
-        prediction: PredictionId,
-        final_token: u32,
-        request: &MetadataRequest,
-    ) -> Result<TokenMetadata, InferenceError>;
-
-    fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError>;
-}
-
-// ---------------------------------------------------------------------------
-// SpeculativeSession / VerifiedRound / SpeculativeTrace
-// ---------------------------------------------------------------------------
-
-/// What one speculative round hands the driver (ADR-090 D2, D6): the tokens the round
-/// evaluated and committed, in order, and the target's own prediction that follows them.
-///
-/// Every token in `committed` is the target's greedy successor of the one before it, and
-/// was evaluated by the target in this round: the pending token itself, then each draft
-/// token the target agreed with. A draft token the target rejected never appears here; the
-/// round has already restored the session to the state after the committed span. `next` is
-/// the target's prediction for the position after the span. It has not been evaluated and
-/// is not yet published: the driver applies the stop policy to it, then offers it as the
-/// next round's pending token.
-///
-/// `committed` may end in a token the stop policy will refuse (an accepted draft that is a
-/// stop token): the driver, not the session, decides what is published, so the session
-/// reports it and stops there. `next` is `None` exactly when the round ends the request
-/// itself, that is when `cache_full` is set or when the last committed token is such a
-/// stop token.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VerifiedRound {
-    pub(crate) committed: Vec<u32>,
-    pub(crate) next: Option<u32>,
-    /// The cache had no room for another round; `committed` holds the pending token alone.
-    pub(crate) cache_full: bool,
-}
-
-/// The typed speculative extension of the execution boundary (ADR-090 D2, D6): a session
-/// that verifies draft tokens against the target and returns verified spans, with its own
-/// snapshot and rollback. It is a separate trait rather than optional methods on
-/// [`DecoderSession`]: only the Qwen Metal routes have it, and a session without it cannot
-/// be asked to speculate. The driver applies the shared decode policy to what it returns
-/// (`driver::run_speculative`); the session never publishes a token.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-pub(crate) trait SpeculativeSession {
-    /// The target's greedy prediction for the first output position, read from the prefill
-    /// the caller already ran.
-    fn first_candidate(&mut self) -> u32;
-
-    /// Evaluates `pending` and verifies draft tokens after it, restoring the session to
-    /// the committed span's end before it returns. `room` is the most tokens the driver
-    /// can still publish, including `pending`: a session uses it only to avoid verifying
-    /// past the length limit. `is_stop` is the driver's own stop predicate: a session uses
-    /// it only to cut a draft chain short at a token the driver will refuse, never to
-    /// decide what is committed.
-    fn advance(
-        &mut self,
-        pending: u32,
-        room: usize,
-        is_stop: &dyn Fn(u32) -> bool,
-    ) -> Result<VerifiedRound, InferenceError>;
-
-    /// Ends the request. Called once, after the last round the driver ran.
-    fn finish(&mut self, disposition: FinishDisposition) -> Result<(), InferenceError>;
-}
-
-/// Ledger-transition counters for the speculative driver, the bypass detector the
-/// per-token [`driver::DriverTrace`] is for the ordinary loop: `offered` counts the tokens
-/// the shared policy saw. A request whose output did not pass through the policy leaves
-/// `offered` below the number of tokens it published.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SpeculativeTrace {
-    /// Rounds the session ran.
-    pub(crate) rounds: usize,
-    /// Committed tokens offered to the shared decode policy, published or refused.
-    pub(crate) offered: usize,
-}
-
-#[cfg(test)]
-mod tests;

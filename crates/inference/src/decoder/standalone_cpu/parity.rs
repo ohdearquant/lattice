@@ -590,11 +590,12 @@ pub(crate) fn assert_select_refuses_config_controls(
             "{control}: the refused select drew from the RNG"
         );
         assert_eq!(
-            session.ledger.next_seq, 0,
+            session.ledger.next_seq(),
+            0,
             "{control}: the refused select opened a prediction"
         );
         assert!(
-            session.ledger.live.is_none(),
+            !session.ledger.has_live(),
             "{control}: the refused select left a live prediction"
         );
     }
@@ -617,7 +618,11 @@ pub(crate) fn assert_select_refuses_config_controls(
         "the refusals moved the sampling state"
     );
     assert_eq!(session.rng_state, twin.rng_state, "RNG state after select");
-    assert_eq!(session.ledger.next_seq, 1, "exactly one prediction opened");
+    assert_eq!(
+        session.ledger.next_seq(),
+        1,
+        "exactly one prediction opened"
+    );
 }
 
 /// `finish` ends the live prediction whatever the disposition: after

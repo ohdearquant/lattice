@@ -175,7 +175,7 @@ fn the_blanket_impl_covers_a_capturing_non_mutating_closure() {
 
 // -----------------------------------------------------------------
 // Object safety of DecoderSession, plus a happy-path exercise of
-// every remaining pub(crate) item in this module through the trait's
+// every remaining public item in this module through the trait's
 // full lifecycle (prefill -> select -> metadata -> decode -> finish).
 // -----------------------------------------------------------------
 
