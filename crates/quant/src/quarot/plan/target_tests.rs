@@ -34,7 +34,7 @@ fn rotation_target_accepts_recurrent_layout_and_preserves_dimensions() {
     assert_eq!(target.num_hidden_layers(), 5);
     assert_eq!(target.num_attention_heads(), 8);
     assert_eq!(target.intermediate_size(), 16);
-    assert_eq!(target.full_attention_layers(), &[]);
+    assert!(target.full_attention_layers().is_empty());
     assert!(target.dense_mlp());
     assert!(!target.is_full_attention(0));
     assert!(!target.is_full_attention(5));

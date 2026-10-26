@@ -743,11 +743,9 @@ impl OnlineArtifactDescriptor {
         &self,
         cfg: Option<&lattice_arch::qwen35_config::Qwen35Config>,
     ) -> Result<(), InferenceError> {
-        self.validate_with_layout(
-            cfg,
-            |spec, cfg| spec.validate_qwen35_layout(cfg),
-            |cfg| self.derive_expected_tensor_names(&qwen35_rotation_dimensions(cfg)),
-        )
+        self.validate_with_layout(cfg, OnlineRotationSpec::validate_qwen35_layout, |cfg| {
+            self.derive_expected_tensor_names(&qwen35_rotation_dimensions(cfg))
+        })
     }
 }
 

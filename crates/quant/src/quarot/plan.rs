@@ -526,11 +526,10 @@ fn check_r3_block_size(
     if !num_attention_heads.is_multiple_of(block_size) {
         return Err(InferenceError::Inference(format!(
             "OnlineRotationSpec::r3_full_attention: block_size {block_size} \
-             does not divide num_attention_heads {} — R3's online factor \
+             does not divide num_attention_heads {num_attention_heads} — R3's online factor \
              is QuaRot Eq. 9's cross-head Hadamard (H_num_heads ⊗ \
              I_head_dim), so block_size divides the head axis, not \
-             head_dim",
-            num_attention_heads
+             head_dim"
         )));
     }
     check_block_hadamard_num_blocks_cap("num_attention_heads", num_attention_heads, block_size)?;
