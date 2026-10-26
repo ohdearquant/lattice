@@ -80,18 +80,18 @@ Omit any field to use the default. An empty `{}` is valid and equivalent to all 
 
 ## SamplingConfig
 
-**Source**: `src/sampling.rs:9`
+**Source**: `../arch/src/sampling.rs:48` (re-exported as `lattice_inference::sampling::SamplingConfig`)
 
 Token sampling parameters for text generation.
 
 | Field                | Type    | Default | Source                             | Why                                                                                                            |
 | -------------------- | ------- | ------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `temperature`        | `f32`   | `0.7`   | `Default` impl at `sampling.rs:21` | Standard "creative but coherent" temperature. 0.0 = greedy (deterministic), 1.0 = full entropy                 |
+| `temperature`        | `f32`   | `0.7`   | `Default` impl at `sampling.rs:64` | Standard "creative but coherent" temperature. 0.0 = greedy (deterministic), 1.0 = full entropy                 |
 | `top_k`              | `usize` | `50`    | `Default` impl                     | Keep only 50 highest-probability tokens before sampling. 0 = disabled. Reduces noise from low-probability tail |
 | `top_p`              | `f32`   | `0.9`   | `Default` impl                     | Nucleus sampling: keep tokens covering 90% cumulative probability. 1.0 = disabled                              |
 | `repetition_penalty` | `f32`   | `1.1`   | `Default` impl                     | Penalize previously generated tokens. 1.0 = no penalty. Higher = more diverse but may degrade coherence        |
 
-**Preset**: `SamplingConfig::greedy()` at `sampling.rs:33` — temperature=0.0, top_k=1, top_p=1.0, repetition_penalty=1.0.
+**Preset**: `SamplingConfig::greedy()` at `sampling.rs:78` — temperature=0.0, top_k=1, top_p=1.0, repetition_penalty=1.0.
 
 ---
 

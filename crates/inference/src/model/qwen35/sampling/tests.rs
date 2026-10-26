@@ -1,13 +1,12 @@
 use super::*;
 
 fn cfg(temperature: f32, top_k: usize) -> GenerateConfig {
-    GenerateConfig {
-        temperature,
-        top_k,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
-    }
+    let mut config = GenerateConfig::default();
+    config.temperature = temperature;
+    config.top_k = top_k;
+    config.top_p = 1.0;
+    config.repetition_penalty = 1.0;
+    config
 }
 
 #[test]
@@ -294,24 +293,27 @@ fn cross_path_parity_sampler_vs_sample_token() {
     let n = 200usize;
 
     // Path A: Sampler — internal Rng seeded to `seed` via `with_seed`.
-    let config_a = SamplingConfig {
-        min_p: 0.0,
-        temperature,
-        top_k,
-        top_p,
-        repetition_penalty: 1.0,
+    let config_a = {
+        let mut config = SamplingConfig::default();
+        config.min_p = 0.0;
+        config.temperature = temperature;
+        config.top_k = top_k;
+        config.top_p = top_p;
+        config.repetition_penalty = 1.0;
+        config
     };
     let mut sampler = Sampler::new(config_a).with_seed(seed);
     let tokens_a: Vec<u32> = (0..n).map(|_| sampler.sample(&logits)).collect();
 
     // Path B: sample_token — rng_state initialised to the same seed; the first
     // xorshift64_next call advances identically to Rng::next_u64 in Path A.
-    let config_b = GenerateConfig {
-        temperature,
-        top_k,
-        top_p,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let config_b = {
+        let mut config = GenerateConfig::default();
+        config.temperature = temperature;
+        config.top_k = top_k;
+        config.top_p = top_p;
+        config.repetition_penalty = 1.0;
+        config
     };
     let mut rng_state = seed;
     let tokens_b: Vec<u32> = (0..n)
@@ -333,19 +335,22 @@ fn min_p_is_active_and_identical_across_cpu_sampling_paths() {
     let seed = 0x5870_5870_5870_5870;
     let draws = 128;
     let min_p = 0.5;
-    let cfg = GenerateConfig {
-        temperature: 1.0,
-        top_k: 0,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 1.0;
+        config.top_k = 0;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config
     };
-    let mut sampler = Sampler::new(SamplingConfig {
-        min_p: 0.0,
-        temperature: cfg.temperature,
-        top_k: cfg.top_k,
-        top_p: cfg.top_p,
-        repetition_penalty: cfg.repetition_penalty,
+    let mut sampler = Sampler::new({
+        let mut config = SamplingConfig::default();
+        config.min_p = 0.0;
+        config.temperature = cfg.temperature;
+        config.top_k = cfg.top_k;
+        config.top_p = cfg.top_p;
+        config.repetition_penalty = cfg.repetition_penalty;
+        config
     })
     .with_seed(seed)
     .with_min_p(min_p);
@@ -397,22 +402,24 @@ fn sample_token_reads_min_p_from_generate_config() {
     let seed = 0x5870_5870_5870_5870;
     let draws = 128;
 
-    let disabled = GenerateConfig {
-        temperature: 1.0,
-        top_k: 0,
-        top_p: 1.0,
-        min_p: 0.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let disabled = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 1.0;
+        config.top_k = 0;
+        config.top_p = 1.0;
+        config.min_p = 0.0;
+        config.repetition_penalty = 1.0;
+        config
     };
     let mut rng_disabled = seed;
     let tokens_without_min_p: Vec<u32> = (0..draws)
         .map(|_| sample_token(&logits, &disabled, &[], &mut rng_disabled))
         .collect();
 
-    let enabled = GenerateConfig {
-        min_p: 0.5,
-        ..disabled.clone()
+    let enabled = {
+        let mut config = disabled.clone();
+        config.min_p = 0.5;
+        config
     };
     let mut rng_enabled = seed;
     let tokens_with_min_p: Vec<u32> = (0..draws)
@@ -442,19 +449,22 @@ fn top_n_sigma_is_active_and_identical_across_cpu_sampling_paths() {
     let logits = [10.0_f32, 9.5, 9.0, 8.0, 7.0, 2.0, 1.0, 0.0];
     let min_p = 0.02;
     let top_n_sigma = 1.5;
-    let cfg = GenerateConfig {
-        temperature: 2.0,
-        top_k: 6,
-        top_p: 0.67,
-        repetition_penalty: 2.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 2.0;
+        config.top_k = 6;
+        config.top_p = 0.67;
+        config.repetition_penalty = 2.0;
+        config
     };
-    let sampler_cfg = SamplingConfig {
-        min_p: 0.0,
-        temperature: cfg.temperature,
-        top_k: cfg.top_k,
-        top_p: cfg.top_p,
-        repetition_penalty: cfg.repetition_penalty,
+    let sampler_cfg = {
+        let mut config = SamplingConfig::default();
+        config.min_p = 0.0;
+        config.temperature = cfg.temperature;
+        config.top_k = cfg.top_k;
+        config.top_p = cfg.top_p;
+        config.repetition_penalty = cfg.repetition_penalty;
+        config
     };
     let mut seen = [false; 8];
 
@@ -630,12 +640,14 @@ fn cross_path_parity_with_logit_ties() {
 
     // Path A: Sampler (CandidateSet::sample_min_p_top_p_with_scratch). Keeps {0,1,2}
     // (idx 2 wins the rank-3 tie by lower id), ordered [0,1,2] (lower id first).
-    let config_a = SamplingConfig {
-        min_p: 0.0,
-        temperature,
-        top_k,
-        top_p,
-        repetition_penalty: 1.0,
+    let config_a = {
+        let mut config = SamplingConfig::default();
+        config.min_p = 0.0;
+        config.temperature = temperature;
+        config.top_k = top_k;
+        config.top_p = top_p;
+        config.repetition_penalty = 1.0;
+        config
     };
     let mut sampler = Sampler::new(config_a).with_seed(seed);
     let tokens_a: Vec<u32> = (0..n).map(|_| sampler.sample(&logits)).collect();
@@ -643,12 +655,13 @@ fn cross_path_parity_with_logit_ties() {
     // Path B: sample_token (this module's pipeline). With matching tie-breaks it
     // also keeps {0,1,2} ordered [0,1,2]; a reversed tie-break keeps {0,1,3}
     // and/or orders the max tie [1,0], diverging the stream.
-    let config_b = GenerateConfig {
-        temperature,
-        top_k,
-        top_p,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let config_b = {
+        let mut config = GenerateConfig::default();
+        config.temperature = temperature;
+        config.top_k = top_k;
+        config.top_p = top_p;
+        config.repetition_penalty = 1.0;
+        config
     };
     let mut rng_state = seed;
     let tokens_b: Vec<u32> = (0..n)
@@ -689,12 +702,13 @@ fn optimized_sampler_matches_reference_default_issue_config() {
         })
         .collect();
 
-    let cfg = GenerateConfig {
-        temperature: 0.7,
-        top_k: 40,
-        top_p: 0.9,
-        repetition_penalty: 1.1,
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.7;
+        config.top_k = 40;
+        config.top_p = 0.9;
+        config.repetition_penalty = 1.1;
+        config
     };
     let seed = 0x5eed_f00d_1234_5678_u64;
     let steps = 256usize;
@@ -735,12 +749,13 @@ fn optimized_sampler_penalty_before_topk_boundary() {
     // token 3's raw logit is barely inside the top-4 window; after penalty it
     // must fall below the raw rank-4 logit (token 4), swapping who survives.
     let logits: Vec<f32> = vec![10.0, 9.9, 9.8, 9.7, 9.6, 1.0, 0.5, 0.1];
-    let cfg = GenerateConfig {
-        temperature: 1.0,
-        top_k: 4,
-        top_p: 1.0,
-        repetition_penalty: 1.1,
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 1.0;
+        config.top_k = 4;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.1;
+        config
     };
     let previous_ids = [3u32];
     let seed = 0xabad_1dea_dead_beefu64;
@@ -796,20 +811,23 @@ fn min_p_reference_oracle_matches_engine_at_f32_cdf_boundary_1454() {
     let logits = [-3.3551474_f32, -2.813463_f32];
     let min_p = 0.4651115_f32;
     let seed = 0xfe10_e067_caad_7327_u64;
-    let cfg = GenerateConfig {
-        temperature: 1.0,
-        top_k: 0,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 1.0;
+        config.top_k = 0;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config
     };
 
-    let mut sampler = Sampler::new(SamplingConfig {
-        temperature: cfg.temperature,
-        top_k: cfg.top_k,
-        top_p: cfg.top_p,
-        min_p: cfg.min_p,
-        repetition_penalty: cfg.repetition_penalty,
+    let mut sampler = Sampler::new({
+        let mut config = SamplingConfig::default();
+        config.temperature = cfg.temperature;
+        config.top_k = cfg.top_k;
+        config.top_p = cfg.top_p;
+        config.min_p = cfg.min_p;
+        config.repetition_penalty = cfg.repetition_penalty;
+        config
     })
     .with_seed(seed)
     .with_min_p(min_p);

@@ -224,21 +224,27 @@ and the conversion reads the Qwen3.5 configuration and tensor names from
 `arch`. The inference facade retains every `quant::q4_manifest` and
 `quant::quarot::*` path.
 
-### lattice-arch — Model configurations
+### lattice-arch — Model interface and configurations
 
-| Module                      | Purpose                                | Key Exports                                          |
-| --------------------------- | -------------------------------------- | ---------------------------------------------------- |
-| `qwen35_config.rs`          | Qwen3.5 / 3.6 `config.json` and bounds | `Qwen35Config`, `ValidatedQwen35Config`, `LayerType` |
-| `gemma4_config.rs`          | Gemma 4 text decoder config            | `Gemma4Config`, `Gemma4LayerType`                    |
-| `embeddinggemma2_config.rs` | EmbeddingGemma 2 text tower config     | `EmbeddingGemma2Config`, `EmbeddingGemma2LayerShape` |
-| `bitnet_config.rs`          | BitNet b1.58 config                    | `BitNetConfig`                                       |
+| Module                      | Purpose                                        | Key Exports                                                      |
+| --------------------------- | ---------------------------------------------- | ---------------------------------------------------------------- |
+| `generation.rs`             | Generation request/result types, decode policy | `GenerateConfig`, `GenerateOutput`, `TokenLogprob`, `TopLogprob` |
+| `sampling.rs`               | Logit sampling and candidate sets              | `SamplingConfig`, `Sampler`, `Candidate`, `CandidateSet`         |
+| `stop_reason.rs`            | Why a generation request stopped               | `StopReason`                                                     |
+| `qwen35_config.rs`          | Qwen3.5 / 3.6 `config.json` and bounds         | `Qwen35Config`, `ValidatedQwen35Config`, `LayerType`             |
+| `gemma4_config.rs`          | Gemma 4 text decoder config                    | `Gemma4Config`, `Gemma4LayerType`                                |
+| `embeddinggemma2_config.rs` | EmbeddingGemma 2 text tower config             | `EmbeddingGemma2Config`, `EmbeddingGemma2LayerShape`             |
+| `bitnet_config.rs`          | BitNet b1.58 config                            | `BitNetConfig`                                                   |
 
-Its internal runtime dependencies are `inference-core` and `weights`; every
-parser reads `config.json` through the bounded reader from `weights`. The
-inference facade retains the existing `model::qwen35_config`,
-`model::gemma4_config`, `model::embeddinggemma2_config` and
-`model::bitnet_config` paths; the deprecated generation aliases and the
-reasoning-budget helpers in `model::qwen35_config` stay in inference.
+Its internal runtime dependencies are `inference-core`, `grammar` and
+`weights`; every parser reads `config.json` through the bounded reader from
+`weights`. The stop-string matcher and the reasoning-budget arithmetic are
+private modules that the inference facade reaches through the hidden
+`__internal` bridge. The facade retains the `generation`, `sampling` and
+`stop_reason` paths, the root re-exports, and the existing
+`model::qwen35_config`, `model::gemma4_config`,
+`model::embeddinggemma2_config` and `model::bitnet_config` paths; the
+deprecated generation aliases in `model::qwen35_config` stay in inference.
 
 ### lattice-compute — Host-side compute
 

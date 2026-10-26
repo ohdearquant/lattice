@@ -46,7 +46,7 @@ const MAX_ENCODED_IMAGE_BYTES: usize = 4 * MAX_DECODED_IMAGE_BYTES.div_ceil(3);
 /// [`parse_stop_strings`] before the string is stored in a
 /// `StopStringMatcher`. `StopStringMatcher` rescans a `max_stop`-byte window
 /// of the accumulated decode text on every generated token
-/// (`crates/inference/src/model/qwen35/stop_strings.rs`), where `max_stop` is
+/// (`crates/arch/src/stop_strings.rs`), where `max_stop` is
 /// the longest configured stop string — so an unbounded stop string turns
 /// every decode step for the rest of generation into a scan proportional to
 /// that string's length, and the matcher also retains that many bytes of

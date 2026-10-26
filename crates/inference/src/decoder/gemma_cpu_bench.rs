@@ -220,11 +220,12 @@ fn sample(model: &Gemma4Model, ids: &[u32]) -> Sample {
     assert_eq!(stamp.evaluated_len, ids.len());
     assert_eq!(stamp.prediction, None);
     let mut phases = vec![evidence(&session)];
-    let config = GenerateConfig {
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        max_new_tokens: DECODE_STEPS,
-        ..Default::default()
+    let config = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config.max_new_tokens = DECODE_STEPS;
+        config
     };
     let mut history = ids.to_vec();
     let mut selected = [0; DECODE_STEPS];

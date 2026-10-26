@@ -162,21 +162,23 @@ fn thinking_fixture(
         GrammarEngine::new(&GrammarSpec::Gbnf(gbnf.to_string()), vocab_bytes)
             .expect("grammar engine builds over the thinking vocab"),
     );
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: true,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: Some(reasoning_budget),
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = max_new_tokens;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = true;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = Some(reasoning_budget);
+        config.logprobs = None;
+        config
     };
     (tokenizer, gen_cfg)
 }
@@ -223,13 +225,14 @@ fn lone_byte_cfg(
     let (_, grammar_bytes) = lone_byte_vocabulary();
     let engine = GrammarEngine::new(&GrammarSpec::Gbnf(gbnf.to_string()), grammar_bytes)
         .expect("grammar engine builds over the lone-byte vocabulary");
-    GenerateConfig {
-        grammar: Some(std::sync::Arc::new(engine)),
-        stop_token_ids: stop_token_ids.to_vec(),
-        stop_strings: stop_strings.iter().map(ToString::to_string).collect(),
-        enable_thinking: reasoning_budget.is_some(),
-        reasoning_budget,
-        ..cross_turn_test_gen_cfg(1, max_new_tokens)
+    {
+        let mut config = cross_turn_test_gen_cfg(1, max_new_tokens);
+        config.grammar = Some(std::sync::Arc::new(engine));
+        config.stop_token_ids = stop_token_ids.to_vec();
+        config.stop_strings = stop_strings.iter().map(ToString::to_string).collect();
+        config.enable_thinking = reasoning_budget.is_some();
+        config.reasoning_budget = reasoning_budget;
+        config
     }
 }
 

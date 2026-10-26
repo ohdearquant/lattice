@@ -121,22 +121,22 @@ fn mtp_state(
 }
 
 fn greedy_cfg(max_new_tokens: usize, stop: &[u32], mtp: bool) -> GenerateConfig {
-    GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: stop.to_vec(),
-        enable_thinking: false,
-        enable_mtp: Some(mtp),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
-    }
+    let mut config = GenerateConfig::default();
+    config.min_p = 0.0;
+    config.max_new_tokens = max_new_tokens;
+    config.temperature = 0.0;
+    config.top_k = 1;
+    config.top_p = 1.0;
+    config.repetition_penalty = 1.0;
+    config.seed = Some(42);
+    config.stop_token_ids = stop.to_vec();
+    config.enable_thinking = false;
+    config.enable_mtp = Some(mtp);
+    config.grammar = None;
+    config.stop_strings = vec![];
+    config.reasoning_budget = None;
+    config.logprobs = None;
+    config
 }
 
 fn state_line(state: &MetalQwen35State) -> String {

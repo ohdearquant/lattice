@@ -211,13 +211,17 @@ pub use crate::forward::cpu::BertCpuKernelPolicy;
 pub use crate::forward::cpu::BertCpuKernelProfile;
 /// Sampling and stop configuration for a generation request. Canonical path under ADR-092;
 /// `model::qwen35_config::GenerateConfig` remains as a deprecated alias. See [`generation`].
+#[doc(no_inline)]
 pub use crate::generation::GenerateConfig;
 /// Result of a generation request: text, token ids, counts and stop reason. Canonical path
 /// under ADR-092. See [`generation`] and [`StopReason`].
+#[doc(no_inline)]
 pub use crate::generation::GenerateOutput;
 /// Per-token log-probability data for one generated token. See [`GenerateConfig::logprobs`].
+#[doc(no_inline)]
 pub use crate::generation::TokenLogprob;
 /// One alternative token and its log-probability at a single step. See [`TokenLogprob`].
+#[doc(no_inline)]
 pub use crate::generation::TopLogprob;
 /// Grammar-constrained decoding engine, reachable from the root because
 /// [`GenerateConfig::grammar`] carries one. See [`grammar`].
@@ -244,6 +248,7 @@ pub use crate::model::QwenModel;
 pub use crate::pool::BertPooling;
 /// Reason a generation request stopped (e.g. EOS, max tokens). See [`stop_reason`] and
 /// [`model`].
+#[doc(no_inline)]
 pub use crate::stop_reason::StopReason;
 /// Byte-level BPE tokenizer used by Qwen-family models. See [`Tokenizer`] and [`TokenizedInput`].
 pub use crate::tokenizer::BpeTokenizer;

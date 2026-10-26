@@ -1417,11 +1417,12 @@ fn print_q8_neon_generate_goldens() {
     let (cfg, model, rope) = make_nonzero_q8_neon_generate_fixture();
     let tokenizer = nonzero_fixture_tokenizer_q8_neon();
 
-    let greedy_cfg = GenerateConfig {
-        max_new_tokens: 6,
-        temperature: 0.0,
-        seed: Some(7),
-        ..Default::default()
+    let greedy_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 6;
+        config.temperature = 0.0;
+        config.seed = Some(7);
+        config
     };
     let greedy = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "world", &greedy_cfg)
         .expect("greedy golden must succeed");
@@ -1432,14 +1433,15 @@ fn print_q8_neon_generate_goldens() {
     );
     println!("GREEDY text={:?}", greedy.text);
 
-    let seeded_cfg = GenerateConfig {
-        max_new_tokens: 6,
-        temperature: 0.8,
-        top_k: 5,
-        top_p: 0.9,
-        repetition_penalty: 1.1,
-        seed: Some(1234),
-        ..Default::default()
+    let seeded_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 6;
+        config.temperature = 0.8;
+        config.top_k = 5;
+        config.top_p = 0.9;
+        config.repetition_penalty = 1.1;
+        config.seed = Some(1234);
+        config
     };
     let seeded = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "world", &seeded_cfg)
         .expect("seeded golden must succeed");
@@ -1455,12 +1457,13 @@ fn print_q8_neon_generate_goldens() {
         "need at least 2 greedy tokens to derive a mid-stream stop token"
     );
     let stop_tok = greedy.token_ids[1];
-    let stop_cfg = GenerateConfig {
-        max_new_tokens: 6,
-        temperature: 0.0,
-        seed: Some(7),
-        stop_token_ids: vec![stop_tok],
-        ..Default::default()
+    let stop_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 6;
+        config.temperature = 0.0;
+        config.seed = Some(7);
+        config.stop_token_ids = vec![stop_tok];
+        config
     };
     let stopped = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "world", &stop_cfg)
         .expect("stop-token golden must succeed");
@@ -1472,11 +1475,12 @@ fn print_q8_neon_generate_goldens() {
     );
     println!("STOP text={:?}", stopped.text);
 
-    let one_tok_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        temperature: 0.0,
-        seed: Some(7),
-        ..Default::default()
+    let one_tok_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.seed = Some(7);
+        config
     };
     let one_tok = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "world", &one_tok_cfg)
         .expect("max_new_tokens=1 golden must succeed");
@@ -1501,11 +1505,12 @@ fn print_q8_neon_generate_goldens() {
 fn generate_q8_neon_greedy_golden() {
     let (cfg, model, rope) = make_nonzero_q8_neon_generate_fixture();
     let tokenizer = nonzero_fixture_tokenizer_q8_neon();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 6,
-        temperature: 0.0,
-        seed: Some(7),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 6;
+        config.temperature = 0.0;
+        config.seed = Some(7);
+        config
     };
     let out = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "world", &gen_cfg)
         .expect("greedy golden must succeed");
@@ -1531,14 +1536,15 @@ fn generate_q8_neon_greedy_golden() {
 fn generate_q8_neon_seeded_sampling_golden() {
     let (cfg, model, rope) = make_nonzero_q8_neon_generate_fixture();
     let tokenizer = nonzero_fixture_tokenizer_q8_neon();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 6,
-        temperature: 0.8,
-        top_k: 5,
-        top_p: 0.9,
-        repetition_penalty: 1.1,
-        seed: Some(1234),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 6;
+        config.temperature = 0.8;
+        config.top_k = 5;
+        config.top_p = 0.9;
+        config.repetition_penalty = 1.1;
+        config.seed = Some(1234);
+        config
     };
     let out = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "world", &gen_cfg)
         .expect("seeded golden must succeed");
@@ -1562,12 +1568,13 @@ fn generate_q8_neon_seeded_sampling_golden() {
 fn generate_q8_neon_stop_token_golden() {
     let (cfg, model, rope) = make_nonzero_q8_neon_generate_fixture();
     let tokenizer = nonzero_fixture_tokenizer_q8_neon();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 6,
-        temperature: 0.0,
-        seed: Some(7),
-        stop_token_ids: vec![80],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 6;
+        config.temperature = 0.0;
+        config.seed = Some(7);
+        config.stop_token_ids = vec![80];
+        config
     };
     let out = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "world", &gen_cfg)
         .expect("stop-token golden must succeed");
@@ -1586,11 +1593,12 @@ fn generate_q8_neon_stop_token_golden() {
 fn generate_q8_neon_max_new_tokens_one_golden() {
     let (cfg, model, rope) = make_nonzero_q8_neon_generate_fixture();
     let tokenizer = nonzero_fixture_tokenizer_q8_neon();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        temperature: 0.0,
-        seed: Some(7),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.seed = Some(7);
+        config
     };
     let out = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "world", &gen_cfg)
         .expect("max_new_tokens=1 golden must succeed");
@@ -2045,9 +2053,10 @@ fn test_generate_q8_neon_rejects_context_overflow() {
         lm_head_cols: 0,
         layers: vec![],
     };
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: usize::MAX,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = usize::MAX;
+        config
     };
 
     let err = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "hello", &gen_cfg)
@@ -2136,11 +2145,12 @@ fn test_generate_q8_neon_honors_stop_token_ids() {
     let merges = vec![("h".to_string(), "e".to_string())];
     let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap();
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 4,
-        stop_token_ids: vec![0], // token 0 is the stop signal, NOT eos (5)
-        temperature: 0.0,        // greedy: all-zero logits always yield token 0
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 4;
+        config.stop_token_ids = vec![0]; // token 0 is the stop signal, NOT eos (5)
+        config.temperature = 0.0; // greedy: all-zero logits always yield token 0
+        config
     };
 
     let out = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "h", &gen_cfg)
@@ -2257,11 +2267,12 @@ fn test_generate_q8_neon_honors_stop_token_ids_decode_loop() {
     let merges = vec![("h".to_string(), "e".to_string())];
     let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap();
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 10,
-        stop_token_ids: vec![1], // stop on token 1 mid-decode-loop; eos_token_id=5≠1
-        temperature: 0.0,        // greedy: deterministic bouncing sequence
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 10;
+        config.stop_token_ids = vec![1]; // stop on token 1 mid-decode-loop; eos_token_id=5≠1
+        config.temperature = 0.0; // greedy: deterministic bouncing sequence
+        config
     };
 
     // Prompt "e" → token 1.
@@ -2397,9 +2408,10 @@ fn generate_q8_neon_rejects_out_of_vocab_prompt_id() {
     vocab_map.insert("z".to_string(), cfg.vocab_size as u32);
     let mismatched_tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, vec![])
         .expect("tokenizer with an OOV vocab entry still constructs");
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config
     };
 
     let err = generate_q8_neon(&model, &cfg, &mismatched_tokenizer, &rope, "z", &gen_cfg)
@@ -2448,9 +2460,10 @@ fn generate_q8_neon_rejects_logprobs_config_before_sampling() {
         layers: vec![],
     };
 
-    let gen_cfg = GenerateConfig {
-        logprobs: Some(0),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.logprobs = Some(0);
+        config
     };
 
     let result = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
@@ -2507,9 +2520,10 @@ fn generate_q8_neon_rejects_grammar_config_before_sampling() {
     let grammar_vocab = vec![b"t".to_vec(), b"f".to_vec()];
     let engine = GrammarEngine::new(&spec, grammar_vocab).expect("trivial grammar must compile");
 
-    let gen_cfg = GenerateConfig {
-        grammar: Some(Arc::new(engine)),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.grammar = Some(Arc::new(engine));
+        config
     };
 
     let result = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
@@ -2552,9 +2566,10 @@ fn generate_q8_neon_rejects_stop_strings_config_before_sampling() {
         layers: vec![],
     };
 
-    let gen_cfg = GenerateConfig {
-        stop_strings: vec!["</s>".to_string()],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.stop_strings = vec!["</s>".to_string()];
+        config
     };
 
     let result = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
@@ -2597,9 +2612,10 @@ fn generate_q8_neon_rejects_reasoning_budget_config_before_sampling() {
         layers: vec![],
     };
 
-    let gen_cfg = GenerateConfig {
-        reasoning_budget: Some(16),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.reasoning_budget = Some(16);
+        config
     };
 
     let result = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
@@ -2643,9 +2659,10 @@ fn generate_q8_neon_max_new_tokens_zero_returns_empty() {
         layers: vec![],
     };
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config
     };
 
     let out = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "hello", &gen_cfg)

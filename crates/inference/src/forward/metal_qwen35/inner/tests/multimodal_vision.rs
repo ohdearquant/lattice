@@ -39,9 +39,10 @@ fn generate_multimodal_max_new_tokens_zero_returns_empty() {
     };
 
     let tokenizer = minimal_bpe_tokenizer();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config
     };
 
     let out = state
@@ -158,13 +159,14 @@ fn generate_multimodal_vision_cancel_immediate_preserves_and_reuses_state() {
     let (cfg, weights) = tiny_metal_qwen35_vision_fixture();
     let request = vision_gate_fixture(&cfg, 0.01);
     let tokenizer = minimal_bpe_tokenizer();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 4,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config
     };
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny vision state");
 
@@ -208,13 +210,14 @@ fn generate_multimodal_vision_cancel_during_prefill_stops_before_next_token() {
     let (cfg, weights) = tiny_metal_qwen35_vision_fixture();
     let request = vision_gate_fixture(&cfg, 0.01);
     let tokenizer = minimal_bpe_tokenizer();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 4,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config
     };
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny vision state");
 
@@ -248,13 +251,14 @@ fn generate_multimodal_vision_cancel_mid_decode_is_bounded_and_reuses_state() {
     let request = vision_gate_fixture(&cfg, 0.01);
     let prompt_len = request.input_ids.len();
     let tokenizer = minimal_bpe_tokenizer();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 4,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config
     };
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny vision state");
 
@@ -374,13 +378,14 @@ fn generate_multimodal_vision_injection_is_mutation_sensitive() {
 
     let cfg = model.config().clone();
     let tokenizer = minimal_bpe_tokenizer();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 2,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 2;
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config
     };
 
     let mut state =
@@ -1138,13 +1143,14 @@ fn generate_multimodal_vision_text_only_matches_plain_forward_bit_identical() {
     };
     request.validate().expect("text-only request is valid");
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 3;
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config
     };
 
     let mut state_vision =
@@ -1360,13 +1366,14 @@ fn generate_multimodal_vision_decode_step_uses_rope_delta_coordinate() {
                  discriminate the decode coordinate from the physical position"
     );
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 2,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 2;
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config
     };
 
     // Manual replication of `generate_multimodal_vision`'s exact
@@ -1583,13 +1590,14 @@ fn generate_multimodal_vision_matches_cpu_oracle_on_real_fixture() {
         .validate()
         .expect("fixture-derived request is valid");
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 3;
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config
     };
 
     // The CPU oracle (`generate_multimodal_f16`) needs `F16ModelWeights`,

@@ -41,12 +41,11 @@ fn plan_for(
 /// The four configs the standalone wrappers pin generation goldens for, plus the step-0 stop
 /// and zero-budget cases that reach the driver's early returns.
 pub(crate) fn greedy_case() -> GenerateConfig {
-    GenerateConfig {
-        max_new_tokens: 6,
-        temperature: 0.0,
-        seed: Some(7),
-        ..Default::default()
-    }
+    let mut config = GenerateConfig::default();
+    config.max_new_tokens = 6;
+    config.temperature = 0.0;
+    config.seed = Some(7);
+    config
 }
 
 /// The output a wrapper is pinned to for one config over the shared synthetic fixture: the
@@ -76,9 +75,10 @@ pub(crate) fn deterministic_cases() -> Vec<(&'static str, GenerateConfig, Record
         ),
         (
             "stop_token",
-            GenerateConfig {
-                stop_token_ids: vec![80],
-                ..base.clone()
+            {
+                let mut config = base.clone();
+                config.stop_token_ids = vec![80];
+                config
             },
             Recorded {
                 token_ids: &[36],
@@ -89,9 +89,10 @@ pub(crate) fn deterministic_cases() -> Vec<(&'static str, GenerateConfig, Record
         ),
         (
             "stops_at_step_zero",
-            GenerateConfig {
-                stop_token_ids: vec![36],
-                ..base.clone()
+            {
+                let mut config = base.clone();
+                config.stop_token_ids = vec![36];
+                config
             },
             Recorded {
                 token_ids: &[],
@@ -102,9 +103,10 @@ pub(crate) fn deterministic_cases() -> Vec<(&'static str, GenerateConfig, Record
         ),
         (
             "one_token",
-            GenerateConfig {
-                max_new_tokens: 1,
-                ..base.clone()
+            {
+                let mut config = base.clone();
+                config.max_new_tokens = 1;
+                config
             },
             Recorded {
                 token_ids: &[36],
@@ -115,9 +117,10 @@ pub(crate) fn deterministic_cases() -> Vec<(&'static str, GenerateConfig, Record
         ),
         (
             "zero_tokens",
-            GenerateConfig {
-                max_new_tokens: 0,
-                ..base
+            {
+                let mut config = base;
+                config.max_new_tokens = 0;
+                config
             },
             Recorded {
                 token_ids: &[],
@@ -130,15 +133,14 @@ pub(crate) fn deterministic_cases() -> Vec<(&'static str, GenerateConfig, Record
 }
 
 pub(crate) fn seeded_case() -> GenerateConfig {
-    GenerateConfig {
-        max_new_tokens: 6,
-        temperature: 0.8,
-        top_k: 5,
-        top_p: 0.9,
-        repetition_penalty: 1.1,
-        seed: Some(1234),
-        ..Default::default()
-    }
+    let mut config = GenerateConfig::default();
+    config.max_new_tokens = 6;
+    config.temperature = 0.8;
+    config.top_k = 5;
+    config.top_p = 0.9;
+    config.repetition_penalty = 1.1;
+    config.seed = Some(1234);
+    config
 }
 
 /// The seeded config's recorded output over the shared fixture.
@@ -541,26 +543,29 @@ pub(crate) fn assert_select_refuses_config_controls(
     let controls: Vec<(&str, GenerateConfig, &str)> = vec![
         (
             "logprobs",
-            GenerateConfig {
-                logprobs: Some(0),
-                ..gen_cfg.clone()
+            {
+                let mut config = gen_cfg.clone();
+                config.logprobs = Some(0);
+                config
             },
             "session does not declare logprobs support but the selection config sets logprobs",
         ),
         (
             "stop_strings",
-            GenerateConfig {
-                stop_strings: vec!["</s>".to_string()],
-                ..gen_cfg.clone()
+            {
+                let mut config = gen_cfg.clone();
+                config.stop_strings = vec!["</s>".to_string()];
+                config
             },
             "session does not declare stop_strings support but the selection config sets \
                  stop_strings",
         ),
         (
             "reasoning_budget",
-            GenerateConfig {
-                reasoning_budget: Some(16),
-                ..gen_cfg.clone()
+            {
+                let mut config = gen_cfg.clone();
+                config.reasoning_budget = Some(16);
+                config
             },
             "session does not declare reasoning_budget support but the selection config sets \
                  reasoning_budget",

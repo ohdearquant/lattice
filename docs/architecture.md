@@ -18,11 +18,12 @@ lattice-weights     ←── lattice-inference-core   (weight storage, model-di
 lattice-metal-runtime ←── lattice-inference-core (shared Metal helpers, macOS + `metal-gpu`)
 lattice-compute     ←── lattice-inference-core   (host-side RoPE tables and KV caches)
 lattice-model-io    ←── lattice-inference-core   (model cache, checksum-verified downloads, env switches)
-lattice-arch ←── lattice-inference-core
+lattice-arch        ←── lattice-inference-core
+                    ←── lattice-grammar         (generation types, sampling, decode policy)
                     ←── lattice-weights         (Qwen3.5, Gemma 4, EmbeddingGemma 2, BitNet configs)
 lattice-quant       ←── lattice-inference-core
                     ←── lattice-weights
-                    ←── lattice-arch    (Q4 manifests, Hadamard rotations, QuaRot conversion)
+                    ←── lattice-arch            (Q4 manifests, Hadamard rotations, QuaRot conversion)
 lattice-inference   ←── lattice-inference-core
                     ←── lattice-tokenizer
                     ←── lattice-grammar
@@ -107,13 +108,20 @@ configuration and tensor names from arch. The facade retains every `lattice_infe
 
 ### lattice-arch
 
-Parsed and validated `config.json` for the Qwen3.5 and 3.6 hybrid models, Gemma 4,
-EmbeddingGemma 2 and BitNet b1.58, with the validation bounds those parsers enforce. Its
-internal runtime dependencies are `lattice-inference-core` and `lattice-weights`; every
-parser reads through the bounded config reader from weights. The facade retains the
+The model interface every decoder shares: the generation request and result types
+(`GenerateConfig`, `GenerateOutput`, `TokenLogprob`, `TopLogprob`), the stop-reason
+taxonomy, sampling (`SamplingConfig`, `Sampler`), and the decode policy, stop-string
+matching and reasoning-budget arithmetic each decode loop runs. Until the model families
+move into their own crates it also holds the parsed and validated `config.json` for the
+Qwen3.5 and 3.6 hybrid models, Gemma 4, EmbeddingGemma 2 and BitNet b1.58, with the
+validation bounds those parsers enforce. Its internal runtime dependencies are
+`lattice-inference-core`, `lattice-grammar` (a generation request can carry a grammar) and
+`lattice-weights`; every parser reads through the bounded config reader from weights. The
+facade retains the `lattice_inference::{generation, sampling, stop_reason}` paths, the
+root re-exports of the generation types and `StopReason`, and the
 `lattice_inference::model::{qwen35_config, gemma4_config, embeddinggemma2_config,
-bitnet_config}` paths. The deprecated generation aliases and the reasoning-budget helpers
-stay in `lattice_inference::model::qwen35_config`.
+bitnet_config}` paths. The deprecated generation aliases stay in
+`lattice_inference::model::qwen35_config`.
 
 ### lattice-compute
 
@@ -224,7 +232,7 @@ lattice-inference        ← transformer forward pass
     │   Qwen3 decoder path (BPE, GQA, RoPE, SwiGLU, last-token pooling)
     │   lattice-weights: f32, f16, Q3, Q4, Q8 storage and model-format detection
     │   lattice-quant: Q4 manifests, Hadamard transforms and rotation absorption
-    │   lattice-arch: validated model configurations
+    │   lattice-arch: model interface (generation, sampling) and validated configurations
     │   lattice-compute: RoPE tables and KV caches
     │   lattice-model-io: model cache and checksum-verified downloads
     ▼

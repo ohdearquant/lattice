@@ -590,12 +590,11 @@ fn sampling_route_block_helper_gate() {
 }
 
 fn compact_sampling_config(top_k: usize) -> GenerateConfig {
-    GenerateConfig {
-        top_k,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
-    }
+    let mut config = GenerateConfig::default();
+    config.top_k = top_k;
+    config.top_p = 1.0;
+    config.repetition_penalty = 1.0;
+    config
 }
 
 fn compact_sampling_environment() -> SamplingRouteEnvironment {
@@ -681,10 +680,11 @@ fn sampling_route_plan_requires_full_logits_when_logprobs_requested() {
         "no logprobs requested must stay eligible for compact sampling"
     );
 
-    let with_logprobs = GenerateConfig {
-        min_p: 0.0,
-        logprobs: Some(5),
-        ..compact_sampling_config(1)
+    let with_logprobs = {
+        let mut config = compact_sampling_config(1);
+        config.min_p = 0.0;
+        config.logprobs = Some(5);
+        config
     };
     assert_eq!(
         plan_sampling_route(&with_logprobs, false, compact_sampling_environment()),
@@ -699,10 +699,11 @@ fn sampling_route_plan_requires_full_logits_when_logprobs_requested() {
 
 #[test]
 fn sampling_route_plan_preserves_grammar_and_repetition_gates() {
-    let penalized = GenerateConfig {
-        min_p: 0.0,
-        repetition_penalty: 1.1,
-        ..compact_sampling_config(8)
+    let penalized = {
+        let mut config = compact_sampling_config(8);
+        config.min_p = 0.0;
+        config.repetition_penalty = 1.1;
+        config
     };
     assert!(
         !plan_sampling_route(&penalized, false, compact_sampling_environment(),).use_compact,
@@ -719,10 +720,11 @@ fn sampling_route_plan_preserves_grammar_and_repetition_gates() {
         vec![b"a".to_vec()],
     )
     .expect("trivial grammar must compile");
-    let constrained = GenerateConfig {
-        min_p: 0.0,
-        grammar: Some(std::sync::Arc::new(grammar)),
-        ..compact_sampling_config(8)
+    let constrained = {
+        let mut config = compact_sampling_config(8);
+        config.min_p = 0.0;
+        config.grammar = Some(std::sync::Arc::new(grammar));
+        config
     };
     assert!(
         !plan_sampling_route(&constrained, false, compact_sampling_environment(),).use_compact,
@@ -855,21 +857,23 @@ fn direct_generate_rejects_logprobs_before_configuring_sampling_route() {
     state.session.compact_topk = sentinel_topk;
     state.session.compact_result = sentinel_result.clone();
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: true,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: Some(0),
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = true;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = Some(0);
+        config
     };
 
     let result = state.generate("a", &tokenizer, &gen_cfg);

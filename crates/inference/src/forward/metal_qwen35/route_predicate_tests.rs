@@ -2,22 +2,22 @@ use super::{mtp_route_active, self_spec_route_active, use_batch_gemm_verifier};
 use crate::generation::GenerateConfig;
 
 fn greedy_gen_cfg(stop_strings: Vec<String>) -> GenerateConfig {
-    GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(true),
-        grammar: None,
-        stop_strings,
-        reasoning_budget: None,
-        logprobs: None,
-    }
+    let mut config = GenerateConfig::default();
+    config.min_p = 0.0;
+    config.max_new_tokens = 4;
+    config.temperature = 0.0;
+    config.top_k = 1;
+    config.top_p = 1.0;
+    config.repetition_penalty = 1.0;
+    config.seed = Some(42);
+    config.stop_token_ids = vec![];
+    config.enable_thinking = false;
+    config.enable_mtp = Some(true);
+    config.grammar = None;
+    config.stop_strings = stop_strings;
+    config.reasoning_budget = None;
+    config.logprobs = None;
+    config
 }
 
 /// Baseline: with every other precondition satisfied and NO stop strings,
@@ -76,10 +76,11 @@ fn self_spec_route_blocked_by_nonempty_stop_strings() {
 /// MTP takes over decoding.
 #[test]
 fn mtp_route_blocked_by_set_reasoning_budget() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        reasoning_budget: Some(64),
-        ..greedy_gen_cfg(vec![])
+    let gen_cfg = {
+        let mut config = greedy_gen_cfg(vec![]);
+        config.min_p = 0.0;
+        config.reasoning_budget = Some(64);
+        config
     };
     assert!(
         !mtp_route_active(true, true, &gen_cfg, false),
@@ -92,10 +93,11 @@ fn mtp_route_blocked_by_set_reasoning_budget() {
 /// self-speculative route (ADR-080 C3, #783).
 #[test]
 fn self_spec_route_blocked_by_set_reasoning_budget() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        reasoning_budget: Some(64),
-        ..greedy_gen_cfg(vec![])
+    let gen_cfg = {
+        let mut config = greedy_gen_cfg(vec![]);
+        config.min_p = 0.0;
+        config.reasoning_budget = Some(64);
+        config
     };
     assert!(
         !self_spec_route_active(true, true, &gen_cfg, false, 1),
@@ -116,10 +118,11 @@ fn self_spec_route_blocked_by_set_reasoning_budget() {
 /// active), reproducing the reported failure mode exactly.
 #[test]
 fn mtp_route_blocked_by_nonidentity_repetition_penalty() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        repetition_penalty: 1.1,
-        ..greedy_gen_cfg(vec![])
+    let gen_cfg = {
+        let mut config = greedy_gen_cfg(vec![]);
+        config.min_p = 0.0;
+        config.repetition_penalty = 1.1;
+        config
     };
     assert!(
         !mtp_route_active(true, true, &gen_cfg, false),
@@ -133,10 +136,11 @@ fn mtp_route_blocked_by_nonidentity_repetition_penalty() {
 /// the self-speculative route (PR #787).
 #[test]
 fn self_spec_route_blocked_by_nonidentity_repetition_penalty() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        repetition_penalty: 1.1,
-        ..greedy_gen_cfg(vec![])
+    let gen_cfg = {
+        let mut config = greedy_gen_cfg(vec![]);
+        config.min_p = 0.0;
+        config.repetition_penalty = 1.1;
+        config
     };
     assert!(
         !self_spec_route_active(true, true, &gen_cfg, false, 1),
@@ -175,10 +179,11 @@ fn nonidentity_repetition_penalty_flips_winner_vs_raw_argmax() {
     // Canonical path with the caller's non-identity penalty and the
     // argmax token already in history: the penalized pick flips to the
     // runner-up.
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        repetition_penalty: 1.1,
-        ..greedy_gen_cfg(vec![])
+    let gen_cfg = {
+        let mut config = greedy_gen_cfg(vec![]);
+        config.min_p = 0.0;
+        config.repetition_penalty = 1.1;
+        config
     };
     let mut rng = 7u64;
     let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng, 0.0, 0.0);
@@ -213,10 +218,11 @@ fn nonidentity_repetition_penalty_flips_winner_vs_raw_argmax() {
 /// active), reproducing the reported failure mode exactly.
 #[test]
 fn mtp_route_blocked_by_set_logprobs() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        logprobs: Some(0),
-        ..greedy_gen_cfg(vec![])
+    let gen_cfg = {
+        let mut config = greedy_gen_cfg(vec![]);
+        config.min_p = 0.0;
+        config.logprobs = Some(0);
+        config
     };
     assert!(
         !mtp_route_active(true, true, &gen_cfg, false),
@@ -231,10 +237,11 @@ fn mtp_route_blocked_by_set_logprobs() {
 /// return.
 #[test]
 fn self_spec_route_blocked_by_set_logprobs() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        logprobs: Some(0),
-        ..greedy_gen_cfg(vec![])
+    let gen_cfg = {
+        let mut config = greedy_gen_cfg(vec![]);
+        config.min_p = 0.0;
+        config.logprobs = Some(0);
+        config
     };
     assert!(
         !self_spec_route_active(true, true, &gen_cfg, false, 1),

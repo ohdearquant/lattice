@@ -300,11 +300,11 @@ fn byte_level_token(byte_encoder: &[char], bytes: &[u8]) -> String {
 /// token 1's delta must be the complete "好", not mojibake or U+FFFD.
 #[test]
 fn token_level_split_cjk_codepoint_decodes_without_mojibake() {
-    use crate::tokenizer::bpe::BpeTokenizer;
     use lattice_tokenizer::__internal::bytes_to_unicode;
     use lattice_tokenizer::__internal::{
         incremental_detokenizer_new, incremental_detokenizer_push,
     };
+    use lattice_tokenizer::bpe::BpeTokenizer;
     use std::collections::HashMap;
 
     let byte_encoder = bytes_to_unicode();
@@ -334,11 +334,11 @@ fn token_level_split_cjk_codepoint_decodes_without_mojibake() {
 /// never emitting a dropped/garbled tail for the preceding ASCII text.
 #[test]
 fn stop_streamer_matches_split_cjk_stop_string_no_dropped_tail() {
-    use crate::tokenizer::bpe::BpeTokenizer;
     use lattice_tokenizer::__internal::bytes_to_unicode;
     use lattice_tokenizer::__internal::{
         incremental_detokenizer_new, incremental_detokenizer_push,
     };
+    use lattice_tokenizer::bpe::BpeTokenizer;
     use std::collections::HashMap;
 
     let byte_encoder = bytes_to_unicode();

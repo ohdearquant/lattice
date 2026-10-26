@@ -286,10 +286,11 @@ mod tests {
     fn finish_invalidates_the_prediction_for_every_disposition() {
         let model = tiny_zero_model();
         let prompt_ids = vec![2, 3];
-        let config = GenerateConfig {
-            temperature: 0.0,
-            max_new_tokens: 2,
-            ..Default::default()
+        let config = {
+            let mut config = GenerateConfig::default();
+            config.temperature = 0.0;
+            config.max_new_tokens = 2;
+            config
         };
         for disposition in [FinishDisposition::Reusable, FinishDisposition::Poisoned] {
             let mut session = GemmaCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), 16)
@@ -376,10 +377,11 @@ mod tests {
         );
 
         let history = prompt_ids.clone();
-        let gen_cfg = GenerateConfig {
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config
         };
         let request = SelectionRequest {
             config: &gen_cfg,
@@ -573,10 +575,11 @@ mod tests {
             .prefill(&cancel_false())
             .expect("prefill must succeed");
 
-        let gen_cfg = GenerateConfig {
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config
         };
         let request = SelectionRequest {
             config: &gen_cfg,
@@ -631,10 +634,11 @@ mod tests {
         #[test]
         fn long_session_matches_scalar_prefill_and_two_selections() {
             let model = tiny_nonzero_model();
-            let config = GenerateConfig {
-                temperature: 0.0,
-                repetition_penalty: 1.0,
-                ..Default::default()
+            let config = {
+                let mut config = GenerateConfig::default();
+                config.temperature = 0.0;
+                config.repetition_penalty = 1.0;
+                config
             };
             for len in [63, 64, 65, 127, 128, 129] {
                 let ids = prompt(len);

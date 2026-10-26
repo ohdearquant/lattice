@@ -20,7 +20,7 @@ lattice-tokenizer, lattice-grammar, lattice-weights, lattice-metal-runtime, latt
                                 (depend on lattice-inference-core)
         │
         ▼  (wait for crates.io indexing)
-lattice-arch            (depends on lattice-inference-core and lattice-weights)
+lattice-arch            (depends on lattice-inference-core, lattice-grammar and lattice-weights)
         │
         ▼  (wait for crates.io indexing)
 lattice-quant, lattice-compute  (depend on lattice-inference-core, lattice-weights and lattice-arch;

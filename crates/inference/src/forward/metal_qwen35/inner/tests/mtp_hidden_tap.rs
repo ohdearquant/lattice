@@ -639,21 +639,23 @@ fn rollback_speculative_state_to_preserves_mtp_cursor_after_k1_reject() {
         "constant-draft MTP fixture must populate session.mtp"
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 1,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(true),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(true);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     // Force `pending_first == 2` directly rather than relying on a real
@@ -731,21 +733,23 @@ fn generate_greedy_mtp_restores_correct_hidden_after_k1_reject() {
     );
 
     let mut state = metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 1,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(true),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(true);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
     let mut prefill_logits = vec![-1.0f32; cfg.vocab_size];
     prefill_logits[2] = 100.0;
@@ -820,21 +824,23 @@ fn full_accept_appends_mtp_cache_row_for_accepted_draft_token() {
         "constant-draft MTP fixture must populate session.mtp"
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 1,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(true),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(true);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     // Force `pending_first == 0` directly rather than relying on a real
@@ -1046,21 +1052,23 @@ fn full_accept_mtp_cache_row_pairs_accepted_token_with_target_hidden() {
 
     // Now drive the real production round.
     let mut state = metal_state_with_nonzero_kv_mtp_for_test(&weights, &cfg);
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 1,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(true),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(true);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
     let mut prefill_logits = vec![-1.0f32; cfg.vocab_size];
     prefill_logits[1] = 100.0;

@@ -201,11 +201,12 @@ pub(crate) fn assert_q8_session_scratch_reuse(
     );
     assert_state(&session, &reference_gdn, &reference_kv, &reference_scratch);
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: DECODE_STEPS + 1,
-        temperature: 0.0,
-        seed: Some(7),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = DECODE_STEPS + 1;
+        config.temperature = 0.0;
+        config.seed = Some(7);
+        config
     };
     let mut history = PROMPT.to_vec();
     let mut previous_logits = session.scratch.logits[..cfg.vocab_size].to_vec();
