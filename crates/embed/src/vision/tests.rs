@@ -1,9 +1,9 @@
 use super::*;
-use lattice_inference::model::qwen35_config::{LayerType, RopeParams, VisionModelConfig};
 use lattice_inference::vision::checkpoint::{
     VisualBlockWeights, VisualMergerWeights, resolve_qwen35_single_decoder_safetensors,
 };
-use lattice_inference::weights::f16_weights::{
+use lattice_model_config::qwen35_config::{LayerType, RopeParams, VisionModelConfig};
+use lattice_weights::f16_weights::{
     F16AttentionWeights, F16CommonLayerWeights, F16FeedForwardWeights,
     F16FullAttentionLayerWeights, f32_to_f16_slice,
 };
