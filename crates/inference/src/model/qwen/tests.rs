@@ -1137,7 +1137,7 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
     };
     let file = tempfile::NamedTempFile::new().unwrap();
     let mut header = br#"{"unused":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
-    while header.len() % 8 != 0 {
+    while !header.len().is_multiple_of(8) {
         header.push(b' ');
     }
     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
