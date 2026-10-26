@@ -756,6 +756,14 @@ the family crates names a model; items 2 and 6 say how and in which release that
    adds it. The new validation method defaults to accepting, as the two existing ones do, and through 0.15.0 the code
    that installs a hook calls the deprecated validator as well as the new one, so an implementor that overrides only
    the old method keeps its check; validation still rejects before any state changes.
+
+   For the four storage-owned weight loaders, the step 3 replacement is the composition of model-neutral tensor-reading
+   operations in `lattice-weights` and family assembly functions initially in the facade's existing BERT and Qwen3
+   modules. The neutral operations sit beside the deprecated inherent methods; the family assembly does not remain in
+   the lower crate. The old signatures and compatibility bodies remain through 0.15 and never delegate upward. The upper
+   functions and their owning result follow their families at steps 4 and 5; the existing lower bundle definitions
+   remain until step 7. This is the specific meaning of replacement beside these four storage methods; it does not
+   advance family-crate creation or the other family moves.
 5. **D5.** A consumer selects families by depending on their crates. The facade takes each family crate as an optional
    dependency behind a feature named for the family and forwards it, and its default set keeps every family path that
    is unconditional today, so the facade's default public surface stays; manifests and cfg change. Families form a

@@ -672,6 +672,15 @@ impl SafetensorsFile {
     ///
     /// Encoder tensors may be flat or share one dot-delimited namespace.
     /// Mixed encoder namespaces are rejected, including misplaced pooler tensors.
+    ///
+    /// This compatibility method remains through 0.15. For BERT assembly, use
+    /// `lattice_inference::model::bert::weight_loading::load_weights`; neutral
+    /// reads are `SafetensorsFile::tensor_names_iter`, `SafetensorsFile::view_1d`
+    /// and `SafetensorsFile::view_2d`.
+    #[deprecated(
+        since = "0.15.0",
+        note = "Use SafetensorsFile::tensor_names_iter, SafetensorsFile::view_1d and SafetensorsFile::view_2d for neutral reads, or lattice_inference::model::bert::weight_loading::load_weights for BERT assembly"
+    )]
     pub fn load_bert_weights(
         &self,
         num_layers: usize,
@@ -829,6 +838,14 @@ impl SafetensorsFile {
     /// Accepts `classifier.weight` shaped `[1, hidden_size]` or `[hidden_size]` and
     /// `classifier.bias` shaped `[1]`. Classifier tensors must remain at the top
     /// level, independently of the BERT encoder namespace.
+    ///
+    /// This compatibility method remains through 0.15. For classifier assembly, use
+    /// `lattice_inference::model::bert::weight_loading::load_classifier_weights`;
+    /// neutral reads are available through `SafetensorsFile::get_f32_tensor`.
+    #[deprecated(
+        since = "0.15.0",
+        note = "Use SafetensorsFile::get_f32_tensor for neutral reads, or lattice_inference::model::bert::weight_loading::load_classifier_weights for classifier assembly"
+    )]
     pub fn load_cross_encoder_weights(
         &self,
         hidden_size: usize,
@@ -1026,6 +1043,14 @@ impl SafetensorsFile {
     /// **Unstable**: load Qwen3 weights; tensor name conventions and fused-weight strategy may change.
     ///
     /// Load all Qwen3 weights from the safetensors file.
+    ///
+    /// This compatibility method remains through 0.15. For Qwen3 assembly, use
+    /// `lattice_inference::model::qwen::weight_loading::load_weights`; neutral
+    /// reads are `SafetensorsFile::view_1d` and `SafetensorsFile::view_2d`.
+    #[deprecated(
+        since = "0.15.0",
+        note = "Use SafetensorsFile::view_1d and SafetensorsFile::view_2d for neutral reads, or lattice_inference::model::qwen::weight_loading::load_weights for Qwen3 assembly"
+    )]
     pub fn load_qwen_weights(
         &self,
         num_layers: usize,
@@ -1734,6 +1759,15 @@ impl ShardedSafetensors {
     /// The caller MUST keep `backing` alive until after `weights` is dropped.
     /// `QwenModel` enforces this with `ManuallyDrop` fields and an explicit
     /// `Drop` impl that drops `weights` before `_storage`.
+    ///
+    /// This compatibility method remains through 0.15. For Qwen3 assembly, use
+    /// `lattice_inference::model::qwen::weight_loading::load_owned_weights`, then
+    /// call `assemble_borrowed_weights` on its owning result. Neutral owned reads
+    /// are available through `TensorSource::get_f32_tensor_owned`.
+    #[deprecated(
+        since = "0.15.0",
+        note = "Use TensorSource::get_f32_tensor_owned for neutral owned reads, or lattice_inference::model::qwen::weight_loading::load_owned_weights followed by OwnedQwenWeights::assemble_borrowed_weights for Qwen3 assembly"
+    )]
     pub fn load_qwen_weights_owned(
         &mut self,
         num_layers: usize,
