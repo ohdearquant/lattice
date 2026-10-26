@@ -7,7 +7,8 @@ the numerical diagnostics (metrics accumulators and block-influence pruning scor
 It also holds option-letter scoring over a full-vocabulary logit row, shared
 attention row semantics, the CPU forward kernels, BERT-family pooling, and the CPU
 attention kernels that build only on those primitives (grouped-query, single-token decode,
-differential, causal flash, sigmoid output gating and native sparse attention).
+differential, causal flash, sigmoid output gating and native sparse attention), and the
+GatedDeltaNet recurrent kernels.
 Sampling moves here in a later release.
 `lattice-inference` re-exports the supported items at their original paths.
 

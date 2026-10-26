@@ -1971,3 +1971,79 @@ mod attention_kernel_parity {
         );
     }
 }
+
+mod gdn_parity {
+    use lattice_compute::attention as extracted;
+    use lattice_inference::attention as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn gdn_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::gdn::GatedDeltaNetWeights>,
+            PhantomData::<extracted::gdn::GatedDeltaNetWeights>,
+        );
+        same_type(
+            PhantomData::<facade::gdn::GatedDeltaNetState>,
+            PhantomData::<extracted::gdn::GatedDeltaNetState>,
+        );
+        same_type(
+            PhantomData::<facade::gdn::GatedDeltaNetScratch>,
+            PhantomData::<extracted::gdn::GatedDeltaNetScratch>,
+        );
+        same_type(
+            PhantomData::<facade::gdn::GdnLayerSnapshot>,
+            PhantomData::<extracted::gdn::GdnLayerSnapshot>,
+        );
+        same_type(
+            PhantomData::<facade::gdn::GdnSnapshot>,
+            PhantomData::<extracted::gdn::GdnSnapshot>,
+        );
+        same_type(
+            PhantomData::<facade::gdn_fused::GatedDeltaNetFusedScratch>,
+            PhantomData::<extracted::gdn_fused::GatedDeltaNetFusedScratch>,
+        );
+    }
+
+    #[test]
+    fn gdn_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::gdn::gated_delta_net_step,
+            extracted::gdn::gated_delta_net_step,
+        );
+        same_function(facade::gdn::gated_rms_norm, extracted::gdn::gated_rms_norm);
+        same_function(
+            facade::gdn::l2_normalize_vec,
+            extracted::gdn::l2_normalize_vec,
+        );
+        same_function(facade::gdn::sigmoid, extracted::gdn::sigmoid);
+        same_function(facade::gdn::softplus, extracted::gdn::softplus);
+        same_function(
+            facade::gdn_fused::gated_delta_net_step_fused,
+            extracted::gdn_fused::gated_delta_net_step_fused,
+        );
+        same_function(
+            facade::gdn_fused::conv1d_silu_fused,
+            extracted::gdn_fused::conv1d_silu_fused,
+        );
+        same_function(
+            facade::gdn_fused::simd_l2_normalize,
+            extracted::gdn_fused::simd_l2_normalize,
+        );
+        same_function(
+            facade::gdn_fused::simd_matvec_transpose,
+            extracted::gdn_fused::simd_matvec_transpose,
+        );
+        same_function(
+            facade::gdn_fused::simd_decay_and_rank1_update,
+            extracted::gdn_fused::simd_decay_and_rank1_update,
+        );
+        same_function(
+            facade::gdn_fused::simd_gated_rms_norm,
+            extracted::gdn_fused::simd_gated_rms_norm,
+        );
+    }
+}

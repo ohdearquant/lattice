@@ -30,6 +30,7 @@ rustc-hash.workspace = true
 
 [dev-dependencies]
 approx = "0.5"
+proptest = { workspace = true }
 
 [lints]
 workspace = true

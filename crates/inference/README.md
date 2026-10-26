@@ -104,8 +104,8 @@ Wire the new architecture into `lattice-embed`'s `EmbeddingModel` enum when read
 
 **Attention kernel change.** CPU attention kernels that build only on the CPU primitives
 live in `lattice-compute` (`crates/compute/src/attention/`, e.g. `flash_causal.rs`) and keep
-their `lattice_inference::attention` paths through named re-exports. Standard attention, the
-GDN modules and `AttentionTag` stay in `attention/` here. A new kernel goes in its own file,
+their `lattice_inference::attention` paths through named re-exports, as do the GatedDeltaNet
+kernels. Standard attention, GDN backward and `AttentionTag` stay in `attention/` here. A new kernel goes in its own file,
 registers a variant on `AttentionTag`, and dispatches from the relevant `forward/` backend. See
 `docs/architecture.md` for the full forward-pass walkthrough before touching this path.
 

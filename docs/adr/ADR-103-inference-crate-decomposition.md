@@ -563,6 +563,35 @@ The CPU attention kernels that build only on the CPU primitives join `lattice-co
    amendment records the extraction and its validation obligation; it does not assert a measurement result or a
    structural waiver.
 
+## Amendment 18 (2026-10-26)
+
+The GatedDeltaNet recurrent kernels join `lattice-compute`, beside the CPU attention kernels. Recorded:
+
+1. **D8.1.** `gdn` and `gdn_fused` move from `lattice_inference::attention` into `lattice_compute::attention` with
+   their tests. The only source change is the import of `Qwen35Config`, which now names
+   `lattice_model_config::qwen35_config` directly instead of the facade's `model::qwen35_config` re-export of the same
+   type. Their other crate-internal dependencies are the CPU primitives and the LoRA hook contract (Amendment 10), both
+   already in compute, and compute already depends on `lattice-model-config`, so it gains no runtime dependency and its
+   publish tier is unchanged. `gdn_backward`, gated on `train-backward` and calling the facade's LoRA VJP, stays in the
+   facade for its own move.
+2. **D1.** `lattice_inference::attention::gdn` and `::gdn_fused` keep named public re-exports of every public item:
+   the weight and state types, the two scratch types, the two snapshot aliases and the eleven functions. The Qwen3.5
+   CPU, Q8, F16, batch prefill, Metal and speculative paths and `lattice-tune` keep their paths.
+3. **D4 and D5.** Every moved item was already public: no crate-private crossing, no `__internal` bridge, no feature
+   or target gate.
+4. **D6.1.** The 41 test functions and the property tests of the two modules move with them, names unchanged; the
+   property tests need `proptest`, so compute gains it as a dev-dependency (a lockfile change to compute's own entry
+   only, no new package). `facade_api_parity` adds `gdn_parity`, covering the six types and eleven functions at both
+   paths.
+5. **D6.4.** The Qwen3.5 CPU forward steps (f32, F16 and Q8) call `gated_delta_net_step_fused` or its SIMD helpers once
+   per linear-attention layer per token, and these are `#[inline]`. `gated_rms_norm` is not, and the Q8 NEON forward
+   step and the batch prefill path call it across the new boundary; `gated_delta_net_step` is not either, and only tests
+   and examples call it. `inference_perf` reaches the code through its `q8_neon_forward` group under `bench-internals`
+   and its `qwen_cpu_driver_allocations` group under `bench-internals` and `test-utils` with a Qwen3.5 checkpoint, and
+   `backward_stage0` uses the weight type under `train-backward`. The boundary is a changed build input on a hot path,
+   so a measured A/B is required before merge. This amendment records the extraction and its validation obligation; it
+   does not assert a measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
