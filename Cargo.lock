@@ -1585,6 +1585,7 @@ dependencies = [
  "lattice-model-config",
  "lattice-tokenizer",
  "lattice-weights",
+ "proptest",
  "rayon",
  "rustc-hash 2.1.3",
 ]

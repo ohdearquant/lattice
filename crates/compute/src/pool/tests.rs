@@ -141,3 +141,18 @@ fn last_token_pool_rejects_short_hidden_states() {
 fn last_token_pool_rejects_zero_seq_len() {
     let _ = last_token_pool(&[], &[], 0, 4);
 }
+
+#[test]
+fn every_pooling_variant_is_known_to_the_bert_model() {
+    // `BertPooling::ALL` is what the facade's
+    // `bert_model_pool_has_an_arm_for_every_pooling_variant` iterates, so each variant must
+    // appear in it exactly once.
+    for (i, pooling) in BertPooling::ALL.iter().enumerate() {
+        assert!(
+            !BertPooling::ALL[..i].contains(pooling),
+            "{pooling:?} is listed twice"
+        );
+    }
+    assert!(BertPooling::ALL.contains(&BertPooling::Mean));
+    assert!(BertPooling::ALL.contains(&BertPooling::CLS));
+}

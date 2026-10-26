@@ -488,6 +488,110 @@ code sits below the facade. Recorded:
    A measured A/B of that target is required before merge. This amendment records the extraction and its validation
    obligation; it does not assert a measurement result or a structural waiver.
 
+## Amendment 15 (2026-10-25)
+
+BERT-family pooling joins `lattice-compute`, next to the SIMD detection it dispatches on. Recorded:
+
+1. **D8.1.** `BertPooling`, `default_bert_pooling_for_model_name`, `mean_pool`, `last_token_pool`, `cls_pool` and
+   `l2_normalize`, with their NEON and AVX2 paths, move from `lattice_inference::pool` into a new
+   `lattice_compute::pool` module, byte-identical. Its only crate-internal dependency is `simd_config`, already in
+   compute after Amendment 14, so compute gains no dependency and its publish tier is unchanged. The BERT, cross-encoder
+   and Qwen embedding models that call pooling stay in the facade.
+2. **D1.** `lattice_inference::pool` keeps named public re-exports of the six items, and the crate-root
+   `lattice_inference::BertPooling` stays the same type. Every existing caller keeps its path.
+3. **D4 and D5.** The six items were already public: no crate-private crossing, no `__internal` bridge, no feature or
+   target gate. Compute keeps an empty default feature set.
+4. **D6.1.** The twelve pooling tests move with the module, names unchanged. `facade_api_parity` adds `pool_parity`,
+   covering the type at both facade paths and the five functions.
+5. **Non-exhaustive match.** `BertPooling` is `#[non_exhaustive]`, so `BertModel::pool` in the facade now needs a
+   wildcard arm; it applies mean pooling, the type's default, and the two existing variants behave as before. Because
+   the wildcard would also accept a variant added later, compute adds
+   `every_pooling_variant_is_known_to_the_bert_model`, an exhaustive match that stops compiling when a variant is
+   added and names `BertModel::pool` as the second place to handle it.
+6. **D6.4.** The `mean_pool_l2_normalize` group of `inference_bench` runs `mean_pool` and `l2_normalize` directly, and
+   the crate boundary is a changed build input, so a measured A/B of that group is required before merge. This
+   amendment records the extraction and its validation obligation; it does not assert a measurement result or a
+   structural waiver.
+
+## Amendment 16 (2026-10-25)
+
+Three command-line tools move from the facade into the application crate. Recorded:
+
+1. **D7, application crate.** `quantize_q4`, `quantize_quarot` and `moe_admission_sim` move from
+   `crates/inference/src/bin/` to `crates/serve/src/bin/`, byte-identical. They call only the facade's public API, so
+   no item changes visibility and there is no D4 crossing. `lattice-serve` already depends on `lattice-inference` and
+   `lattice-weights` under Amendment 4 item 1; it gains no dependency, no feature and no lockfile change. The
+   facade's library source is unchanged. Its manifest loses the two explicit `[[bin]]` tables, and `lattice-serve`
+   declares all three binaries explicitly. None of the three has a feature-conditional path. Under the application
+   crate's default features they link the facade with `std`, `download` and `image`, the facade's own defaults, plus
+   `serving-support`.
+2. **D6.1, tests and fixtures.** `quantize_q4_reader_refactor` and its two golden fixtures move to
+   `crates/serve/tests/`, test names and fixture bytes unchanged; the fixtures load relative to the test file.
+3. **D6.5, CI and tooling reach.** Every invocation that named the binaries on the facade now names `lattice-serve`: the
+   parity workflow's Q4 and QuaRot build steps, the CI contract test anchors for those steps, the app build and
+   packaging scripts, and the tool documentation. The Metal lock contract and the measurement inventory list the three
+   files at their new paths; all three stay classified as non-measurement surfaces.
+4. **D6.4.** None of the three binaries is a bench target, and no declared bench or measurement target of the facade
+   reaches their code. The facade's library source, dependencies, features, profiles, bench tables and lockfile are
+   identical between base and head; the only manifest change removes `[[bin]]` tables, which Cargo does not build for
+   a bench target. This is a structural disposition: the move is unmeasured, and a later change to the tools'
+   behaviour takes its own measurement where a target reaches it.
+
+## Amendment 17 (2026-10-26)
+
+The CPU attention kernels that build only on the CPU primitives join `lattice-compute`. Recorded:
+
+1. **D8.1.** `gqa`, `decode`, `differential`, `flash_causal`, `gated` and `native_sparse` move from
+   `lattice_inference::attention` into `lattice_compute::attention`, byte-identical, with their tests. Their only
+   crate-internal dependencies are the CPU primitives (Amendment 14) and the softmax row rules (Amendment 13), both
+   already in compute at the same paths, so compute gains no dependency and its publish tier is unchanged. Standard
+   attention, the flash projection wrappers, `AttentionBuffers`, the GDN modules and `AttentionKind`/`AttentionTag`
+   stay in the facade for later moves.
+2. **D1.** Each of the six facade modules keeps named public re-exports of every public item it had, including
+   `apply_sigmoid_gate_neon` on aarch64 and `apply_sigmoid_gate_avx2` on x86_64 under the same target gates.
+   `AttentionKind::Gqa` carries the same `GqaConfig` type. Every existing caller keeps its path.
+3. **D4.** Every moved item was already public, so no crate-private item crosses and there is no `__internal` bridge.
+   The facade's crate-private re-export of `simd_config` had only `gated` and `decode` as users and is removed.
+4. **D5.** No feature, default-feature or target gate changes.
+5. **D6.1.** The 90 test functions of the six modules (some target-gated) move with them, names unchanged.
+   `facade_api_parity` adds `attention_kernel_parity`, covering the nine types, fifteen functions (the two
+   target-gated ones under their gates) and the two tile constants at both paths.
+6. **D6.4.** Declared targets that reach the moved code: `attn_opt_bench`, `differential_attention_bench`,
+   `elementwise_bench`, `gated_attention_bench`, `native_sparse_attention_bench`, `inference_perf`, and
+   `decode_attn_bench` under `f16`; the Qwen CPU decode path calls `decode_attention` and `apply_gqa_attention`. The
+   crate boundary is a changed build input, so a measured A/B of those targets is required before merge. This
+   amendment records the extraction and its validation obligation; it does not assert a measurement result or a
+   structural waiver.
+
+## Amendment 18 (2026-10-26)
+
+The GatedDeltaNet recurrent kernels join `lattice-compute`, beside the CPU attention kernels. Recorded:
+
+1. **D8.1.** `gdn` and `gdn_fused` move from `lattice_inference::attention` into `lattice_compute::attention` with
+   their tests. The only source change is the import of `Qwen35Config`, which now names
+   `lattice_model_config::qwen35_config` directly instead of the facade's `model::qwen35_config` re-export of the same
+   type. Their other crate-internal dependencies are the CPU primitives and the LoRA hook contract (Amendment 10), both
+   already in compute, and compute already depends on `lattice-model-config`, so it gains no runtime dependency and its
+   publish tier is unchanged. `gdn_backward`, gated on `train-backward` and calling the facade's LoRA VJP, stays in the
+   facade for its own move.
+2. **D1.** `lattice_inference::attention::gdn` and `::gdn_fused` keep named public re-exports of every public item:
+   the weight and state types, the two scratch types, the two snapshot aliases and the eleven functions. The Qwen3.5
+   CPU, Q8, F16, batch prefill, Metal and speculative paths and `lattice-tune` keep their paths.
+3. **D4 and D5.** Every moved item was already public: no crate-private crossing, no `__internal` bridge, no feature
+   or target gate.
+4. **D6.1.** The 41 test functions and the property tests of the two modules move with them, names unchanged; the
+   property tests need `proptest`, so compute gains it as a dev-dependency (a lockfile change to compute's own entry
+   only, no new package). `facade_api_parity` adds `gdn_parity`, covering the six types and eleven functions at both
+   paths.
+5. **D6.4.** The Qwen3.5 CPU forward steps (f32, F16 and Q8) call `gated_delta_net_step_fused` or its SIMD helpers once
+   per linear-attention layer per token, and these are `#[inline]`. `gated_rms_norm` is not, and the Q8 NEON forward
+   step and the batch prefill path call it across the new boundary; `gated_delta_net_step` is not either, and only tests
+   and examples call it. `inference_perf` reaches the code through its `q8_neon_forward` group under `bench-internals`
+   and its `qwen_cpu_driver_allocations` group under `bench-internals` and `test-utils` with a Qwen3.5 checkpoint, and
+   `backward_stage0` uses the weight type under `train-backward`. The boundary is a changed build input on a hot path,
+   so a measured A/B is required before merge. This amendment records the extraction and its validation obligation; it
+   does not assert a measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

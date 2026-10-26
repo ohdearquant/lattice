@@ -478,7 +478,7 @@ jobs:
   # vector against the committed release baseline.
   #
   # Runs on ubuntu-24.04-arm (aarch64) to exercise the NEON normalise path that
-  # the native BERT pooling in crates/inference/src/pool.rs (via
+  # the native BERT pooling in crates/compute/src/pool.rs (via
   # crates/inference/src/model/bert.rs) dispatches on aarch64, the same ISA
   # path that production lattice deployments use. Relocated from
   # macos-latest (also aarch64) to cut the shared macOS-runner queue tax;
@@ -1027,7 +1027,7 @@ jobs:
           shared-key: quarot-artifact
 
       - name: Build QuaRot converter
-        run: cargo build --release -p lattice-inference --bin quantize_quarot --features f16
+        run: cargo build --release -p lattice-serve --bin quantize_quarot --features f16
 
       - name: Generate and verify QuaRot Q4 artifact
         run: |
@@ -1298,7 +1298,9 @@ jobs:
       - name: Build eval_perplexity + quantize_q4
         run: |
           cargo build --release -p lattice-inference \
-            --bin eval_perplexity --bin quantize_q4 --features "f16,metal-gpu"
+            --bin eval_perplexity --features "f16,metal-gpu"
+          cargo build --release -p lattice-serve \
+            --bin quantize_q4 --features "f16,metal-gpu"
 
       # Regenerate the ephemeral unrotated Q4 artifact (NOT committed) from the
       # real weights. Deterministic: quantize_q4 has no random seed.

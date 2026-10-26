@@ -5,8 +5,11 @@ Host-side compute for Lattice inference: rotary position embedding (RoPE) tables
 flat/paged KV caches with prefix reuse, LoRA adapter hooks and row application, and
 the numerical diagnostics (metrics accumulators and block-influence pruning scores).
 It also holds option-letter scoring over a full-vocabulary logit row, shared
-attention row semantics and the CPU forward kernels.
-Pooling and sampling move here in later releases.
+attention row semantics, the CPU forward kernels, BERT-family pooling, and the CPU
+attention kernels that build only on those primitives (grouped-query, single-token decode,
+differential, causal flash, sigmoid output gating and native sparse attention), and the
+GatedDeltaNet recurrent kernels.
+Sampling moves here in a later release.
 `lattice-inference` re-exports the supported items at their original paths.
 
 The crate depends on `lattice-inference-core` for the shared error type and on

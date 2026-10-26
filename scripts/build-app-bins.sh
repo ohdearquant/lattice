@@ -33,12 +33,12 @@ build_bin() {
 
 # lattice-inference — default features (already covered by --workspace, built
 # here too so the gate reflects the full app binary set).
-for BIN in quantize_q4 quantize_quarot qwen35_generate; do
-    build_bin -p lattice-inference --bin "$BIN"
-done
+build_bin -p lattice-inference --bin qwen35_generate
 
-# lattice-serve — the `lattice` CLI under default features.
-build_bin -p lattice-serve --bin lattice
+# lattice-serve — the `lattice` CLI and the two quantizers under default features.
+for BIN in lattice quantize_q4 quantize_quarot; do
+    build_bin -p lattice-serve --bin "$BIN"
+done
 
 # required-features binaries — the ones `cargo build --workspace` silently skips.
 build_bin -p lattice-tune      --bin train_grad_full --features train-backward
