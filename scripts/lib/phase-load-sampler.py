@@ -29,19 +29,32 @@ benchmark executable is launched by the cooperative supervisor as a SIBLING of
 the impl script, not a descendant of it, so bench-compare-impl.sh passes its
 own PARENT PID instead in that case -- the supervisor that launched both.
 
-PER-PROCESS CPU FIGURE. This samples `ps -Ao pid,ppid,pcpu,comm` (Darwin) /
-`ps -eo pid,ppid,pcpu,comm` (Linux) once per cadence tick. `ps`'s pcpu field
-is a DECAYING AVERAGE over the process's recent lifetime, not an interval-
-exact figure for the sampling window -- unlike quiet-probe.py's idle-percent,
-which is computed from two point-in-time reads bracketing a short sleep. A
-short-lived foreign process that spikes and exits between two sampler ticks
-can therefore be under- or over-counted relative to what it actually drew
-during this exact interval. This is the FALLBACK figure the constraint
-allows: an interval-exact per-process reading (`top -l 2 -stats
-pid,ppid,cpu` on macOS, two `/proc/<pid>/stat` reads on Linux) would be more
-precise but is not implemented here. The artifact this script produces
-carries the decaying-average `ps` figure described above, not an
-interval-exact one.
+PER-PROCESS CPU FIGURE, which differs by platform; every row names its
+source in `cpu_source`.
+
+Linux (`proc-stat-interval`): the same one-second window that yields the idle
+share also brackets two reads of every `/proc/<pid>/stat`. A process's share
+is its utime+stime delta over that window divided by the aggregate `/proc/stat`
+delta, so self, foreign and idle are shares of one window in one unit, and
+`100 - idle - self` (the report's implied figure) has nothing left in it that
+belongs to the bench. The process totals include every thread. This is what a
+benchmark that fans out needs: before it, `ps` pcpu was the source here too,
+and on Linux that is the process's average over its whole life, so a few
+seconds of a rayon matmul spread over 16 cores moved the bench's self figure
+by about one point while the idle reading dropped to about a third. The
+difference was booked as foreign load and the arm refused, at the same sample
+of every inference_bench run on a 16-core host. A process that exits inside
+the window loses that window's share (its time moves to the parent's cutime
+only when reaped), and a process with no first read is counted only when its
+start time falls inside the window, so a pid reused mid-window is not charged
+its predecessor's history.
+
+macOS (`ps-pcpu-decaying-avg`): `ps -Ao pid,ppid,pcpu,comm` once per tick.
+pcpu there is a DECAYING AVERAGE over the process's recent lifetime, not an
+interval-exact figure, so a short burst is under- or over-counted relative to
+what it drew in this interval. An interval-exact reading (`top -l 2 -stats
+pid,ppid,cpu`) is not implemented, and rows from this path carry the
+decaying-average figure.
 
 PARSER SHARING. Idle-percent parsing (parse_top_idle / parse_proc_stat /
 linux_idle_pct below) is a PINNED COPY of quiet-probe.py's own parsers, not
@@ -153,6 +166,82 @@ def logical_cpu_count() -> int:
     return count
 
 
+def parse_pid_stat(data: str) -> tuple[int, int, int, str]:
+    """(ppid, utime+stime ticks, start ticks, comm) from one /proc/<pid>/stat.
+
+    comm sits in parentheses and may itself hold spaces or parentheses, so the
+    numeric fields are read after the LAST ')'. Field n (1-based, proc(5)) is
+    rest[n - 3]: ppid is field 4, utime 14, stime 15, starttime 22.
+    """
+    open_paren = data.index("(")
+    close_paren = data.rindex(")")
+    comm = data[open_paren + 1:close_paren]
+    rest = data[close_paren + 2:].split()
+    return int(rest[1]), int(rest[11]) + int(rest[12]), int(rest[19]), comm
+
+
+def proc_snapshot() -> dict[int, tuple[int, int, int, str]]:
+    """pid -> parse_pid_stat(...) for every process this /proc lists."""
+    rows: dict[int, tuple[int, int, int, str]] = {}
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/stat") as fh:
+                rows[int(entry.name)] = parse_pid_stat(fh.read())
+        except (OSError, ValueError, IndexError):
+            continue
+    return rows
+
+
+def interval_rows(
+    line0: str,
+    line1: str,
+    snap0: dict[int, tuple[int, int, int, str]],
+    snap1: dict[int, tuple[int, int, int, str]],
+    window_start_ticks: int,
+) -> tuple[float, dict[int, tuple[int, float, str]]]:
+    """(idle %, pid -> (ppid, % of the machine over the window, comm)).
+
+    window_start_ticks is the uptime, in clock ticks, at the first read: a pid
+    absent from snap0, or present with a different start time, is a process
+    born in the window and is charged its whole time only if it started at or
+    after that instant; one that started earlier had no first read and is
+    charged nothing rather than its lifetime.
+    """
+    total0, idle0 = parse_proc_stat(line0)
+    total1, idle1 = parse_proc_stat(line1)
+    dt = total1 - total0
+    if dt <= 0:
+        raise RuntimeError("/proc/stat did not advance")
+    rows: dict[int, tuple[int, float, str]] = {}
+    for pid, (ppid, cpu1, start1, comm) in snap1.items():
+        before = snap0.get(pid)
+        if before is not None and before[2] == start1:
+            used = max(cpu1 - before[1], 0)
+        elif start1 >= window_start_ticks:
+            used = cpu1
+        else:
+            used = 0
+        rows[pid] = (ppid, 100.0 * used / dt, comm)
+    return 100.0 * (idle1 - idle0) / dt, rows
+
+
+def _linux_interval_sample() -> tuple[float, dict[int, tuple[int, float, str]]]:
+    def first_line() -> str:
+        with open("/proc/stat") as fh:
+            return fh.readline()
+
+    with open("/proc/uptime") as fh:
+        window_start = int(float(fh.read().split()[0]) * os.sysconf("SC_CLK_TCK"))
+    line0 = first_line()
+    snap0 = proc_snapshot()
+    time.sleep(1.0)
+    line1 = first_line()
+    snap1 = proc_snapshot()
+    return interval_rows(line0, line1, snap0, snap1, window_start)
+
+
 def ps_snapshot() -> dict[int, tuple[int, float, str]]:
     """pid -> (ppid, pcpu, comm) from one `ps` read."""
     if sys.platform.startswith("linux"):
@@ -189,26 +278,35 @@ def self_tree(rows: dict[int, tuple[int, float, str]], root_pid: int) -> set[int
     return tree
 
 
-def sample_once(self_pid: int, cores: int) -> dict:
-    idle = idle_percent()
-    rows = ps_snapshot()
+def sample_once(self_pid: int, cores: int, linux: bool | None = None) -> dict:
+    """One row. Shares are of the whole machine; top_foreign_pct is of one core."""
+    if linux is None:
+        linux = sys.platform.startswith("linux")
+    if linux:
+        idle, rows = _linux_interval_sample()
+        scale, source = 1.0, "proc-stat-interval"
+    else:
+        idle, rows = idle_percent(), ps_snapshot()
+        scale, source = 1.0 / cores, "ps-pcpu-decaying-avg"
     tree = self_tree(rows, self_pid)
     foreign_total = 0.0
     self_total = 0.0
     top_name, top_pct = "none", 0.0
-    for pid, (_ppid, pcpu, comm) in rows.items():
+    for pid, (_ppid, pct, comm) in rows.items():
+        share = pct * scale
         if pid in tree:
-            self_total += pcpu
+            self_total += share
         else:
-            foreign_total += pcpu
-            if pcpu > top_pct:
-                top_name, top_pct = os.path.basename(comm), pcpu
+            foreign_total += share
+            if share * cores > top_pct:
+                top_name, top_pct = os.path.basename(comm), share * cores
     return {
         "idle_pct": idle,
-        "foreign_pct": foreign_total / cores,
-        "self_pct": self_total / cores,
+        "foreign_pct": foreign_total,
+        "self_pct": self_total,
         "top_foreign": top_name,
         "top_foreign_pct": top_pct,
+        "cpu_source": source,
     }
 
 
