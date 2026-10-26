@@ -1,4 +1,5 @@
 use super::*;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::forward::cpu_q8::forward_step_q8;
 use crate::weights::q8_weights::Q8Matrix;
 
@@ -175,7 +176,7 @@ pub(crate) fn assert_q8_session_scratch_reuse(
     assert_eq!(session.q8_scratch.storage_snapshot(), storage);
 
     let mut reference_gdn: Vec<_> = (0..cfg.num_linear_attention_layers())
-        .map(|_| GatedDeltaNetState::new(cfg))
+        .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(cfg)))
         .collect();
     let mut reference_kv = KvCache::new(cfg.num_full_attention_layers());
     let mut reference_scratch = ForwardScratch::new();

@@ -3,7 +3,7 @@ use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
 use super::norm::qwen35_rms_norm;
 use super::weights::{AttentionWeights, FeedForwardWeights};
-use crate::attention::gdn::GatedDeltaNetState;
+use crate::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry, require_qwen35_gdn_geometry};
 use crate::attention::gdn_fused::gated_delta_net_step_fused;
 use crate::error::InferenceError;
 use crate::forward::cpu::matmul_bt;
@@ -15,8 +15,9 @@ impl Qwen35Model {
         let hidden = cfg.hidden_size;
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
+        let gdn_geometry = require_qwen35_gdn_geometry(cfg);
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-            .map(|_| GatedDeltaNetState::new(cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();
         let mut kv_cache = KvCache::new(num_full);
         let mut scratch = ForwardScratch::new();
@@ -168,8 +169,9 @@ impl Qwen35Model {
         let _hidden = cfg.hidden_size;
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
+        let gdn_geometry = qwen35_gdn_geometry(cfg)?;
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-            .map(|_| GatedDeltaNetState::new(cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();
         let mut kv_cache = KvCache::new(num_full);
         let mut scratch = ForwardScratch::new();

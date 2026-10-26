@@ -423,7 +423,9 @@ fn test_qwen36_greedy_one_token_smoke() {
 // ---------------------------------------------------------------------------
 mod lora_serving {
     use super::super::*;
-    use crate::attention::gdn::{GatedDeltaNetState, GatedDeltaNetWeights};
+    use crate::attention::gdn::{
+        GatedDeltaNetState, GatedDeltaNetWeights, require_qwen35_gdn_geometry,
+    };
     use crate::lora_hook::{LoraHook, NoopLoraHook};
     use crate::model::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
     use crate::rope::RopeTable;
@@ -606,7 +608,7 @@ mod lora_serving {
     /// Allocate the per-call mutable state `forward_step` needs.
     fn fresh_state(cfg: &Qwen35Config) -> (Vec<GatedDeltaNetState>, KvCache, ForwardScratch) {
         let gdn = (0..cfg.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(cfg)))
             .collect();
         let kv = KvCache::new(cfg.num_full_attention_layers());
         (gdn, kv, ForwardScratch::new())

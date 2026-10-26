@@ -1134,6 +1134,7 @@ mod scratch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::gdn::require_qwen35_gdn_geometry;
     use crate::lora_hook::LoraHook;
     use crate::model::qwen35::{ForwardScratch, ModelWeights};
     use crate::model::qwen35_config::LayerType;
@@ -1223,7 +1224,7 @@ mod tests {
         assert!(cfg.is_moe());
 
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(&cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
             .collect();
         let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
         let model = build_random_model(cfg, 0xfeed_face_cafe_beef);
@@ -1304,7 +1305,7 @@ mod tests {
         );
         assert_ne!(&normalized[..last_start], &expected[..last_start]);
         let mut gdn_states: Vec<_> = (0..cfg.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(&cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
             .collect();
         let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
         kv_cache.reserve(prompt_ids.len(), cfg.full_kv_dim());
@@ -1377,7 +1378,7 @@ mod tests {
 
         let baseline_logits = {
             let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-                .map(|_| GatedDeltaNetState::new(&cfg))
+                .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
                 .collect();
             let mut kv_cache = KvCache::new(num_full);
             let mut scratch = ForwardScratch::new();
@@ -1399,7 +1400,7 @@ mod tests {
 
         let lora_logits = {
             let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-                .map(|_| GatedDeltaNetState::new(&cfg))
+                .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
                 .collect();
             let mut kv_cache = KvCache::new(num_full);
             let mut scratch = ForwardScratch::new();
@@ -1588,7 +1589,7 @@ mod tests {
     ) -> (Vec<f32>, Vec<GatedDeltaNetState>, KvCache) {
         let cfg = &model.config;
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(cfg)))
             .collect();
         let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
         let mut scratch = ForwardScratch::new();
@@ -1615,7 +1616,7 @@ mod tests {
     ) -> (Vec<f32>, Vec<GatedDeltaNetState>, KvCache) {
         let cfg = &model.config;
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(cfg)))
             .collect();
         let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
 

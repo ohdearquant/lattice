@@ -1,4 +1,5 @@
 use super::*;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::decoder::standalone_cpu::parity;
 
 #[test]
@@ -395,7 +396,7 @@ fn test_gdn_f16_step_with_zeros() {
         out_proj_cols: output_dim,
     };
 
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let mut state = GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg));
     let mut scratch = GatedDeltaNetFusedScratch::default();
     let input = vec![0.0f32; hidden];
     let mut output = vec![0.0f32; hidden];

@@ -8,9 +8,10 @@
 //!
 //! Both modules coexist — callers choose which to use.
 
-use crate::attention::gdn::{GatedDeltaNetState, GatedDeltaNetWeights, sigmoid, softplus};
+use crate::attention::gdn::{
+    GatedDeltaNetState, GatedDeltaNetWeights, GdnGeometry, sigmoid, softplus,
+};
 use crate::forward::cpu::{matmul_bt, validate_gemm_nn};
-use lattice_arch::qwen35_config::Qwen35Config;
 
 /// **Unstable**: scratch buffers for the SIMD-fused GatedDeltaNet step; buffer layout evolving.
 ///
@@ -383,7 +384,7 @@ pub fn simd_gated_rms_norm(x: &[f32], z: &[f32], gamma: &[f32], out: &mut [f32],
 /// `input`: hidden state `[hidden_size]`
 /// `state`: mutable recurrent state for this layer
 /// `weights`: layer weights
-/// `cfg`: model config
+/// `geometry`: the layer's validated geometry
 /// `scratch`: reusable fused scratch buffers
 /// `output`: output buffer `[hidden_size]`, written in-place
 #[inline]
@@ -391,21 +392,21 @@ pub fn gated_delta_net_step_fused(
     input: &[f32],
     state: &mut GatedDeltaNetState,
     weights: &GatedDeltaNetWeights,
-    cfg: &Qwen35Config,
+    geometry: &GdnGeometry,
     scratch: &mut GatedDeltaNetFusedScratch,
     output: &mut [f32],
     lora: &dyn crate::lora_hook::LoraHook,
     layer_idx: usize,
 ) {
-    let hidden = cfg.hidden_size;
-    let num_heads = cfg.linear_num_key_heads;
-    let value_heads = cfg.linear_num_value_heads();
+    let hidden = geometry.hidden_size();
+    let num_heads = geometry.num_key_heads();
+    let value_heads = geometry.num_value_heads();
     let ratio = value_heads / num_heads;
-    let key_dim = cfg.linear_key_head_dim;
-    let value_dim = cfg.linear_value_head_dim;
-    let qkv_dim = cfg.linear_qkv_dim();
-    let output_dim = cfg.linear_output_dim();
-    let kernel_size = cfg.linear_conv_kernel_dim;
+    let key_dim = geometry.key_head_dim();
+    let value_dim = geometry.value_head_dim();
+    let qkv_dim = geometry.qkv_dim();
+    let output_dim = geometry.output_dim();
+    let kernel_size = geometry.conv_kernel_dim();
 
     debug_assert_eq!(
         value_heads % num_heads,
@@ -568,7 +569,7 @@ pub fn gated_delta_net_step_fused(
             &scratch.z_proj[start..end],
             gamma,
             &mut scratch.gated_norm_buf[start..end],
-            cfg.rms_norm_eps,
+            geometry.rms_norm_eps(),
         );
     }
 
