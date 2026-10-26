@@ -28,7 +28,7 @@ extract_re() {  # $1 = anchor substring unique to the wanted line
     | sed -E "s/^ *if grep -E '//; s/' <<<.*$//"
 }
 
-ENGINE_RE="$(extract_re 'crates/(inference|inference-core|metal-runtime|serve|tokenizer|grammar|weights|quant|model-config|compute|embed)/')"
+ENGINE_RE="$(extract_re 'crates/(inference|inference-core|metal-runtime|serve|tokenizer|grammar|weights|quant|model-config|compute|model-io|embed)/')"
 TUNE_RE="$(extract_re 'crates/tune/')"
 
 # FAIL CLOSED ON EMPTY. An extraction that resolved nothing would make every
@@ -125,6 +125,12 @@ check "compute manifest -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/compute/Cargo.toml')"
 check "compute README alone -> engine" false \
   "$(classify "$ENGINE_RE" <<<'crates/compute/README.md')"
+check "model-io source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/model-io/src/download.rs')"
+check "model-io manifest -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/model-io/Cargo.toml')"
+check "model-io README alone -> engine" false \
+  "$(classify "$ENGINE_RE" <<<'crates/model-io/README.md')"
 check "embed source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/embed/src/simd/mod.rs')"
 check "Cargo.lock -> engine" true \

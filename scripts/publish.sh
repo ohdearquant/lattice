@@ -24,10 +24,10 @@ esac
 
 # Publish order follows the internal dependency DAG (deps before dependents):
 #   fann, transport, inference-core   leaves, no internal deps
-#     -> tokenizer, grammar, weights, metal-runtime  depend on inference-core
+#     -> tokenizer, grammar, weights, metal-runtime, model-io  depend on inference-core
 #       -> model-config               depends on inference-core, weights
 #         -> quant, compute           quant depends on inference-core, weights, model-config; compute on inference-core, tokenizer, weights, model-config
-#           -> inference              depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, model-config, compute, metal-runtime
+#           -> inference              depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, model-config, compute, model-io, metal-runtime
 #             -> embed                depends on inference
 #             -> serve                depends on inference (exact version), fann, tokenizer, weights
 #             -> tune                 depends on fann, inference
@@ -39,7 +39,7 @@ esac
 # exceeds 10 MiB, and a rejection in tier 2 leaves tier 1 already published and
 # immutable. `cargo publish --dry-run` does not cover this: it can only validate
 # the leaf tier, because a crate whose internal path dependencies are not yet
-# live on the registry cannot be packaged at all. Measure all fourteen first.
+# live on the registry cannot be packaged at all. Measure all fifteen first.
 echo "--- Pre-publish: package size against the crates.io upload limit ---"
 "$(dirname "$0")/package-size-check.sh"
 
@@ -55,7 +55,7 @@ fi
 echo "Waiting for crates.io indexing..."
 sleep 30
 
-echo "--- Tier 2: tokenizer, grammar, weights and metal-runtime (depend on inference-core) ---"
+echo "--- Tier 2: tokenizer, grammar, weights, metal-runtime and model-io (depend on inference-core) ---"
 cargo publish -p lattice-tokenizer $FLAG
 # lattice-grammar's tests depend on the lattice-tokenizer release just uploaded.
 if [ -z "$FLAG" ]; then
@@ -65,6 +65,7 @@ fi
 cargo publish -p lattice-grammar $FLAG
 cargo publish -p lattice-weights $FLAG
 cargo publish -p lattice-metal-runtime $FLAG
+cargo publish -p lattice-model-io $FLAG
 
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."
@@ -88,7 +89,7 @@ if [ -z "$FLAG" ]; then
     sleep 30
 fi
 
-echo "--- Tier 5: inference (depends on fann, inference-core, tokenizer, grammar, weights, quant, model-config, compute, metal-runtime) ---"
+echo "--- Tier 5: inference (depends on fann, inference-core, tokenizer, grammar, weights, quant, model-config, compute, model-io, metal-runtime) ---"
 cargo publish -p lattice-inference $FLAG
 
 if [ -z "$FLAG" ]; then

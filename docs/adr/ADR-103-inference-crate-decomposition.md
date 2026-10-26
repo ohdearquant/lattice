@@ -633,6 +633,44 @@ Standard and tiled attention and the attention variant taxonomy join `lattice-co
    amendment records the extraction and its validation obligation; it does not assert a measurement result or a
    structural waiver.
 
+## Amendment 20 (2026-10-26)
+
+The model-file layer joins a new crate, `lattice-model-io`: what every model uses to find its files and read engine
+switches, and nothing that belongs to one model. Recorded:
+
+1. **D8.1.** The crate is `lattice-model-io`. `download` (canonical model names, checksum verification and the
+   cache-miss download), `default_cache_dir` and the by-value switch reader `env_switch_enabled` move out of
+   `lattice_inference` with their tests, as does the checkpoint-directory resolver from `test_support`. The only
+   source changes are imports (the error type is named at `lattice_inference_core`), the visibility changes in item 3,
+   an `#[inline]` hint on `env_switch_enabled`, and comments that named facade paths. Its only internal dependency is
+   `lattice-inference-core`, so it publishes in the second tier beside the tokenizer. The name was checked free on
+   crates.io in the same pass as a control read of `serde`.
+2. **D1.** `lattice_inference::download::ensure_model_files` keeps its path as a named re-export, and
+   `facade_api_parity` adds `model_io_parity`, which checks that both paths name one function. `default_cache_dir` and
+   `env_switch_enabled` stay crate-private in the facade through a `pub(crate) use`, so every `crate::` caller is
+   unchanged.
+3. **D4.** `default_cache_dir` and `env_switch_enabled` were crate-private and are called from the facade, so they take
+   disposition 2 and become documented public items of the new crate: a path rule and a by-value switch rule that
+   `CONFIG.md` already documents. `switch_value_enabled` stays private to the new crate beside its only callers.
+   `require_checkpoint_dir` becomes a `#[doc(hidden)]` item of a `test_support` module compiled only for the crate's
+   own tests and under its `test-utils` feature; the facade keeps its crate-local `test_support::require_checkpoint_dir`
+   path as a re-export for its checkpoint-gated unit tests, and the facade's source-policy tests over its own tree stay
+   in the facade.
+4. **D5.** The facade's `download` feature forwards to the new crate's `download`, which owns the optional HTTP client.
+   The new crate enables `download` by default, as the facade does, and the facade depends on it with default features
+   off, so the facade's no-default build still carries no HTTP client. No other feature, default-feature or target
+   gate changes.
+5. **D6.1.** The 19 test functions of the moved code move with it, names unchanged: 12 download tests, 4
+   checkpoint-resolver tests and 3 switch tests. The environment-variable contract moves its `LATTICE_OFFLINE` anchor
+   to the new crate and adds the new crate as a reader of `LATTICE_MODEL_CACHE`, and the trust-boundary scan lists the
+   new crate among the sources it must reach.
+6. **D6.4.** `env_switch_enabled` is called three times per Metal decode step (`forward/metal_qwen35/inner/step.rs`),
+   once per generation (`model/qwen35/generation.rs`) and at load (`model/qwen.rs`), now across a crate boundary; the
+   BERT and Qwen `from_pretrained` paths, which `e2e_bench` times given a checkpoint, call `default_cache_dir` and
+   `ensure_model_files`. The boundary and the feature table are changed build inputs on the Metal decode path, so a
+   measured A/B of a Metal decode target is required before merge. This amendment records the extraction and its
+   validation obligation; it does not assert a measurement result or a structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
