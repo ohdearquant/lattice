@@ -31,6 +31,22 @@ pub enum BertPooling {
     CLS,
 }
 
+impl BertPooling {
+    /// Every variant. A match on this `#[non_exhaustive]` enum in another crate needs a
+    /// wildcard arm, so it cannot fail to compile on a new variant; tests there iterate
+    /// this list instead. The match below is exhaustive, so a new variant stops this crate
+    /// compiling until it is listed here.
+    #[doc(hidden)]
+    pub const ALL: [BertPooling; 2] = {
+        const fn listed(pooling: BertPooling) -> BertPooling {
+            match pooling {
+                BertPooling::Mean | BertPooling::CLS => pooling,
+            }
+        }
+        [listed(BertPooling::Mean), listed(BertPooling::CLS)]
+    };
+}
+
 /// Default BERT pooling for a served embedding model, keyed on its directory
 /// or model name the same way `lattice_serve --embedding-model` identifies
 /// the model it loads. BGE-family checkpoint names all contain "bge"
