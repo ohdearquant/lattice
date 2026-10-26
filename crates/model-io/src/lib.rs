@@ -4,6 +4,7 @@
 //! downloads ([`download::ensure_model_files`]) and the by-value reader for boolean `LATTICE_*`
 //! environment switches ([`env_switch_enabled`]). Network access is compiled in only with the
 //! `download` feature and is refused at run time when `LATTICE_OFFLINE` is set.
+//! It also owns the shared [`multimodal::MultimodalInput`] prompt record.
 //!
 //! `lattice-inference` re-exports [`download::ensure_model_files`] at its original path, so
 //! `lattice_inference::download::ensure_model_files` and `lattice_model_io::download::ensure_model_files`
@@ -15,6 +16,8 @@ use lattice_inference_core::InferenceError;
 pub mod download;
 /// Bounded image decoding and shared vision errors.
 pub mod image;
+/// Shared multimodal prompt layout.
+pub mod multimodal;
 
 /// Checkpoint-directory resolver for checkpoint-gated tests in the model crates.
 /// Not part of the supported API.
