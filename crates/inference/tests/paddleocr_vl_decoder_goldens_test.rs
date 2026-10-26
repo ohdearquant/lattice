@@ -20,6 +20,8 @@
 //!     --test paddleocr_vl_decoder_goldens_test -- --nocapture
 //! ```
 
+#![cfg(feature = "ernie45")]
+
 #[test]
 fn decoder_forward_matches_hf_reference() {
     // BF16/F16 safetensors tensors decode to f32 unconditionally (no feature

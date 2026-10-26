@@ -11,6 +11,7 @@ pub mod embeddinggemma2_config;
 /// RGB image input and internal patch preparation for EmbeddingGemma 2.
 #[cfg(feature = "embeddinggemma2")]
 pub mod embeddinggemma2_image;
+#[cfg(feature = "ernie45")]
 pub mod ernie45;
 #[cfg(feature = "gemma4")]
 pub mod gemma4_cache;
@@ -20,6 +21,7 @@ pub mod gemma4_model;
 pub mod gemma4_ops;
 #[cfg(feature = "gemma4")]
 pub mod gemma4_preflight;
+#[cfg(feature = "paddleocr-vl")]
 pub mod paddleocr_vl;
 pub mod qwen;
 pub mod qwen35;

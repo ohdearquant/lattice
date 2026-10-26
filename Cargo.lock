@@ -1685,6 +1685,7 @@ dependencies = [
  "lattice-metal-runtime",
  "lattice-model-bert",
  "lattice-model-embeddinggemma2",
+ "lattice-model-ernie45",
  "lattice-model-gemma4",
  "lattice-model-io",
  "lattice-model-qwen3",
@@ -1769,6 +1770,21 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "lattice-model-ernie45"
+version = "0.15.0"
+dependencies = [
+ "bytemuck",
+ "lattice-compute",
+ "lattice-inference-core",
+ "lattice-metal-runtime",
+ "lattice-weights",
+ "metal 0.33.0",
+ "objc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

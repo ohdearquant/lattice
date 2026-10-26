@@ -2550,3 +2550,95 @@ fn model_cache_and_preflight_paths_name_family_items() {
     let new: Check = family::gemma4_preflight::preflight_check;
     assert!(std::ptr::fn_addr_eq(old, new));
 }
+
+#[cfg(feature = "ernie45")]
+fn same_ernie45_item<T>(_: T, _: T) {}
+
+#[cfg(feature = "ernie45")]
+#[test]
+fn ernie45_items_keep_family_identity() {
+    use lattice_inference::forward::metal_ernie45 as facade_metal;
+    use lattice_inference::model::ernie45 as facade;
+    use lattice_model_ernie45::forward::metal_ernie45 as family_metal;
+    use lattice_model_ernie45::model::ernie45 as family;
+    same_ernie45_item(
+        None::<facade_metal::MetalErnie45State>,
+        None::<family_metal::MetalErnie45State>,
+    );
+    same_ernie45_item(
+        None::<facade_metal::MetalErnie45KvCache>,
+        None::<family_metal::MetalErnie45KvCache>,
+    );
+
+    same_ernie45_item(None::<facade::Ernie45Config>, None::<family::Ernie45Config>);
+    same_ernie45_item(
+        None::<facade::Ernie45RopeScaling>,
+        None::<family::Ernie45RopeScaling>,
+    );
+    same_ernie45_item(
+        None::<facade::Ernie45LayerWeights>,
+        None::<family::Ernie45LayerWeights>,
+    );
+    same_ernie45_item(
+        None::<facade::Ernie45Weights>,
+        None::<family::Ernie45Weights>,
+    );
+    same_ernie45_item(None::<facade::Ernie45Trace>, None::<family::Ernie45Trace>);
+    same_ernie45_item(None::<facade::Ernie45Model>, None::<family::Ernie45Model>);
+    same_ernie45_item(
+        None::<facade::Ernie45KvCache>,
+        None::<family::Ernie45KvCache>,
+    );
+    assert_eq!(facade::MAX_LAYERS, family::MAX_LAYERS);
+    assert_eq!(facade::MAX_HIDDEN_SIZE, family::MAX_HIDDEN_SIZE);
+    assert_eq!(facade::MAX_INTERMEDIATE_SIZE, family::MAX_INTERMEDIATE_SIZE);
+    assert_eq!(facade::MAX_HEADS, family::MAX_HEADS);
+    assert_eq!(facade::MAX_KV_HEADS, family::MAX_KV_HEADS);
+    assert_eq!(facade::MAX_HEAD_DIM, family::MAX_HEAD_DIM);
+    assert_eq!(facade::MAX_VOCAB_SIZE, family::MAX_VOCAB_SIZE);
+    assert_eq!(facade::MAX_SEQ_LEN, family::MAX_SEQ_LEN);
+    same_ernie45_item(
+        facade::Ernie45Config::from_config_json_str,
+        family::Ernie45Config::from_config_json_str,
+    );
+    same_ernie45_item(
+        facade::Ernie45Weights::load::<lattice_weights::f32_weights::SafetensorsFile>,
+        family::Ernie45Weights::load::<lattice_weights::f32_weights::SafetensorsFile>,
+    );
+    same_ernie45_item(facade::Ernie45Model::new, family::Ernie45Model::new);
+    same_ernie45_item(
+        facade::Ernie45Model::forward_trace,
+        family::Ernie45Model::forward_trace,
+    );
+    same_ernie45_item(
+        facade::Ernie45Model::forward_embeds_trace,
+        family::Ernie45Model::forward_embeds_trace,
+    );
+    same_ernie45_item(
+        facade::Ernie45Model::forward_embeds_last_logits,
+        family::Ernie45Model::forward_embeds_last_logits,
+    );
+    same_ernie45_item(
+        facade::Ernie45Model::new_kv_cache,
+        family::Ernie45Model::new_kv_cache,
+    );
+    same_ernie45_item(
+        facade::Ernie45Model::kv_prefill,
+        family::Ernie45Model::kv_prefill,
+    );
+    same_ernie45_item(
+        facade::Ernie45Model::kv_decode_step,
+        family::Ernie45Model::kv_decode_step,
+    );
+    same_ernie45_item(facade::Ernie45KvCache::clear, family::Ernie45KvCache::clear);
+    same_ernie45_item(
+        facade::Ernie45KvCache::truncate,
+        family::Ernie45KvCache::truncate,
+    );
+    let cache: family::Ernie45KvCache = facade::Ernie45KvCache::new(2, 4, 5)
+        .expect("the old public path constructs the same cache type");
+    assert_eq!(cache.layers(), 2);
+    assert_eq!(cache.kv_dim(), 4);
+    assert_eq!(cache.capacity(), 5);
+    assert!(cache.is_empty());
+}

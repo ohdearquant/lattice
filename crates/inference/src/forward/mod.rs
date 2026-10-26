@@ -13,6 +13,7 @@ pub mod gpu_gemm;
 pub mod metal;
 #[cfg(feature = "embeddinggemma2")]
 pub mod metal_embeddinggemma2;
+#[cfg(feature = "ernie45")]
 pub mod metal_ernie45;
 pub mod metal_gemm;
 pub mod metal_qwen35;
