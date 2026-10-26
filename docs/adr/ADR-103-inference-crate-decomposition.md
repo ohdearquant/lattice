@@ -537,6 +537,32 @@ Three command-line tools move from the facade into the application crate. Record
    a bench target. This is a structural disposition: the move is unmeasured, and a later change to the tools'
    behaviour takes its own measurement where a target reaches it.
 
+## Amendment 17 (2026-10-26)
+
+The CPU attention kernels that build only on the CPU primitives join `lattice-compute`. Recorded:
+
+1. **D8.1.** `gqa`, `decode`, `differential`, `flash_causal`, `gated` and `native_sparse` move from
+   `lattice_inference::attention` into `lattice_compute::attention`, byte-identical, with their tests. Their only
+   crate-internal dependencies are the CPU primitives (Amendment 14) and the softmax row rules (Amendment 13), both
+   already in compute at the same paths, so compute gains no dependency and its publish tier is unchanged. Standard
+   attention, the flash projection wrappers, `AttentionBuffers`, the GDN modules and `AttentionKind`/`AttentionTag`
+   stay in the facade for later moves.
+2. **D1.** Each of the six facade modules keeps named public re-exports of every public item it had, including
+   `apply_sigmoid_gate_neon` on aarch64 and `apply_sigmoid_gate_avx2` on x86_64 under the same target gates.
+   `AttentionKind::Gqa` carries the same `GqaConfig` type. Every existing caller keeps its path.
+3. **D4.** Every moved item was already public, so no crate-private item crosses and there is no `__internal` bridge.
+   The facade's crate-private re-export of `simd_config` had only `gated` and `decode` as users and is removed.
+4. **D5.** No feature, default-feature or target gate changes.
+5. **D6.1.** The 90 test functions of the six modules (some target-gated) move with them, names unchanged.
+   `facade_api_parity` adds `attention_kernel_parity`, covering the nine types, fifteen functions (the two
+   target-gated ones under their gates) and the two tile constants at both paths.
+6. **D6.4.** Declared targets that reach the moved code: `attn_opt_bench`, `differential_attention_bench`,
+   `elementwise_bench`, `gated_attention_bench`, `native_sparse_attention_bench`, `inference_perf`, and
+   `decode_attn_bench` under `f16`; the Qwen CPU decode path calls `decode_attention` and `apply_gqa_attention`. The
+   crate boundary is a changed build input, so a measured A/B of those targets is required before merge. This
+   amendment records the extraction and its validation obligation; it does not assert a measurement result or a
+   structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

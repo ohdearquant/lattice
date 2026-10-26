@@ -53,7 +53,7 @@ pub(crate) fn compute_router_probs(
         .fold(f32::NEG_INFINITY, f32::max);
     if !max_logit.is_finite() {
         // Fail closed on a degenerate (all non-finite) router row, mirroring the
-        // attention softmax guard (attention/gqa.rs) and the sampler fallback
+        // attention softmax guard (lattice-compute attention/gqa.rs) and the sampler fallback
         // (qwen35/sampling.rs). A non-finite max means every logit is NaN/±inf
         // (corrupt router gate weight or an upstream activation overflow); the
         // exp below would otherwise leave NaN/zero pseudo-probabilities that

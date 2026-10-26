@@ -1844,3 +1844,130 @@ mod pool_parity {
         same_function(facade::l2_normalize, extracted::l2_normalize);
     }
 }
+
+mod attention_kernel_parity {
+    use lattice_compute::attention as extracted;
+    use lattice_inference::attention as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn attention_kernel_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::gqa::GqaConfig>,
+            PhantomData::<extracted::gqa::GqaConfig>,
+        );
+        same_type(
+            PhantomData::<facade::gqa::GqaScratch>,
+            PhantomData::<extracted::gqa::GqaScratch>,
+        );
+        same_type(
+            PhantomData::<facade::differential::DiffAttnConfig>,
+            PhantomData::<extracted::differential::DiffAttnConfig>,
+        );
+        same_type(
+            PhantomData::<facade::differential::DiffLambdaParams>,
+            PhantomData::<extracted::differential::DiffLambdaParams>,
+        );
+        same_type(
+            PhantomData::<facade::differential::DiffAttnScratch>,
+            PhantomData::<extracted::differential::DiffAttnScratch>,
+        );
+        same_type(
+            PhantomData::<facade::flash_causal::FlashAttentionConfig>,
+            PhantomData::<extracted::flash_causal::FlashAttentionConfig>,
+        );
+        same_type(
+            PhantomData::<facade::native_sparse::NsaConfig>,
+            PhantomData::<extracted::native_sparse::NsaConfig>,
+        );
+        same_type(
+            PhantomData::<facade::native_sparse::NsaWeights>,
+            PhantomData::<extracted::native_sparse::NsaWeights>,
+        );
+        same_type(
+            PhantomData::<facade::native_sparse::NsaScratch>,
+            PhantomData::<extracted::native_sparse::NsaScratch>,
+        );
+    }
+
+    #[test]
+    fn attention_kernel_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::gqa::apply_gqa_attention,
+            extracted::gqa::apply_gqa_attention,
+        );
+        same_function(
+            facade::decode::decode_attention,
+            extracted::decode::decode_attention,
+        );
+        same_function(
+            facade::decode::decode_attention_scores,
+            extracted::decode::decode_attention_scores,
+        );
+        same_function(
+            facade::differential::apply_differential_attention,
+            extracted::differential::apply_differential_attention,
+        );
+        same_function(
+            facade::differential::compute_lambda_full,
+            extracted::differential::compute_lambda_full,
+        );
+        same_function(
+            facade::flash_causal::flash_attention_causal,
+            extracted::flash_causal::flash_attention_causal,
+        );
+        same_function(
+            facade::flash_causal::flash_attention_causal_with_config,
+            extracted::flash_causal::flash_attention_causal_with_config,
+        );
+        same_function(
+            facade::gated::deinterleave_q_gate,
+            extracted::gated::deinterleave_q_gate,
+        );
+        same_function(
+            facade::gated::apply_sigmoid_gate,
+            extracted::gated::apply_sigmoid_gate,
+        );
+        same_function(
+            facade::gated::apply_sigmoid_gate_fast,
+            extracted::gated::apply_sigmoid_gate_fast,
+        );
+        same_function(
+            facade::gated::apply_sigmoid_gate_scalar,
+            extracted::gated::apply_sigmoid_gate_scalar,
+        );
+        same_function(
+            facade::gated::apply_sigmoid_gate_simd,
+            extracted::gated::apply_sigmoid_gate_simd,
+        );
+        #[cfg(target_arch = "aarch64")]
+        same_function(
+            facade::gated::apply_sigmoid_gate_neon,
+            extracted::gated::apply_sigmoid_gate_neon,
+        );
+        #[cfg(target_arch = "x86_64")]
+        same_function(
+            facade::gated::apply_sigmoid_gate_avx2,
+            extracted::gated::apply_sigmoid_gate_avx2,
+        );
+        same_function(
+            facade::native_sparse::apply_native_sparse_attention,
+            extracted::native_sparse::apply_native_sparse_attention,
+        );
+    }
+
+    #[test]
+    fn attention_kernel_constants_keep_their_values() {
+        assert_eq!(
+            facade::flash_causal::DEFAULT_BR,
+            extracted::flash_causal::DEFAULT_BR
+        );
+        assert_eq!(
+            facade::flash_causal::DEFAULT_BC,
+            extracted::flash_causal::DEFAULT_BC
+        );
+    }
+}
