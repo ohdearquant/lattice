@@ -2,7 +2,8 @@
 //! decoder path shares ([`generation::GenerateConfig`], [`generation::GenerateOutput`],
 //! [`generation::TokenLogprob`], [`generation::TopLogprob`], [`stop_reason::StopReason`]) and
 //! [`sampling`]; and the decoder session contract with its shared generation driver
-//! ([`decoder`], ADR-090), which a model family implements and runs.
+//! ([`decoder`], ADR-090), which a model family implements and runs; and the text encoder contract
+//! ([`encoder`]), which a loaded embedding model implements and a consumer shares across threads.
 //!
 //! Until each model family moves to its own crate, this crate also holds the model configurations:
 //! the parsed and validated `config.json` of the Qwen3.5 hybrid models, Gemma 4, EmbeddingGemma 2
@@ -24,6 +25,7 @@ pub mod bitnet_config;
 mod decode_budget;
 pub mod decoder;
 pub mod embeddinggemma2_config;
+pub mod encoder;
 pub mod gemma4_config;
 pub mod generation;
 pub mod qwen35_config;

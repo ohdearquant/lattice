@@ -685,6 +685,12 @@ impl EmbeddingGemma2Model {
         Ok(self)
     }
 
+    /// The longest token sequence [`EmbeddingGemma2Model::tokenize`] produces, beginning and end
+    /// tokens included, or `None` when no limit is set.
+    pub fn max_tokens(&self) -> Option<usize> {
+        self.max_tokens
+    }
+
     /// The parsed configuration.
     pub fn config(&self) -> &EmbeddingGemma2Config {
         &self.cfg
@@ -874,7 +880,7 @@ impl EmbeddingGemma2Model {
         Ok(combined)
     }
 
-    fn check_widths(&self, widths: &[usize]) -> Result<(), InferenceError> {
+    pub(crate) fn check_widths(&self, widths: &[usize]) -> Result<(), InferenceError> {
         for &width in widths {
             if width == 0 || width > self.cfg.embedding_dim {
                 return Err(InferenceError::InvalidInput(format!(
