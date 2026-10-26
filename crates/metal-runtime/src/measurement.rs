@@ -1,10 +1,12 @@
 //! Internal support for tests and measurement targets.
 //!
 //! Cargo compiles integration tests, benches, examples, and binaries as crates
-//! separate from `lattice-inference`, so their shared machine-level guards must
-//! cross the library boundary. This module is public only for those repository
-//! targets: it is hidden from generated documentation and is not a supported
-//! production API.
+//! separate from the library they exercise, so their shared machine-level guards
+//! must cross the library boundary. The guard lives here, below every crate that
+//! drives Metal, and `lattice-inference` re-exports it as
+//! `lattice_inference::measurement::gpu_test_lock`. This module is public only for
+//! those repository targets: it is hidden from generated documentation and is not a
+//! supported production API.
 //!
 //! Concurrent Metal work corrupts both timing and numerics: confirmed
 //! contention inflated top-k boundary margins roughly threefold and produced

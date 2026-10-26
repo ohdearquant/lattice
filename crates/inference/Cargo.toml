@@ -123,9 +123,9 @@ lattice-quant = { version = "0.15.0", path = "../quant" }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
 
-# Unix-only uses: `router_state/storage.rs` opens router state with `O_NOFOLLOW`/`O_NONBLOCK`,
-# and `measurement.rs` probes the bench supervisor with `kill(pid, 0)` and `futimes`. The
-# weight-loading uses (`F_GETPATH`, the trust-boundary open flags) moved with lattice-weights.
+# Unix-only uses: `router_state/storage.rs` opens router state with `O_NOFOLLOW`/`O_NONBLOCK`.
+# The weight-loading uses (`F_GETPATH`, the trust-boundary open flags) moved with lattice-weights,
+# and the GPU test lock's `kill(pid, 0)` and `futimes` with lattice-metal-runtime.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

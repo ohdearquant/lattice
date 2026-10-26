@@ -86,8 +86,8 @@ PENDING_DIR = "/tmp/lion-bench-window-pending"
 LOCK_EXIT = 75
 REFUSAL_EXIT = 2
 
-# Read by lattice_inference::measurement::gpu_test_lock_for_path (Rust side:
-# crates/inference/src/measurement.rs). Set on any launch route below where
+# Read by lattice_metal_runtime::measurement::gpu_test_lock_for_path (Rust side:
+# crates/metal-runtime/src/measurement.rs). Set on any launch route below where
 # this process retains GPU_LOCK and does not hand it to the child: a target
 # that calls gpu_test_lock() itself would otherwise wait out its own 30-minute
 # timeout against a lock this process is holding (#1643). The --pass-lock-fds

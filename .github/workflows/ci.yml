@@ -1034,11 +1034,11 @@ jobs:
       # The timestamp regressions for #1882 need the macOS/Metal module but use
       # temporary lock paths without GPU work. The handoff test also runs a
       # one-test child harness; only the parent has a two-test summary.
-      - name: inference — measurement lock timestamp regressions (macOS only)
+      - name: metal-runtime — measurement lock timestamp regressions (macOS only)
         if: runner.os == 'macOS'
         run: |
           lock_refresh_log="${RUNNER_TEMP:-/tmp}/measurement-lock-refresh-tests.log"
-          if cargo test --locked -p lattice-inference --lib --features f16,metal-gpu \
+          if cargo test --locked -p lattice-metal-runtime --lib --features metal-gpu \
             measurement::lock_file_refresh_tests:: \
             -- --nocapture --test-threads=1 --color never >"$lock_refresh_log" 2>&1
           then
@@ -1062,6 +1062,12 @@ jobs:
             echo "::error::expected exactly one passing two-test parent summary for measurement lock timestamp regressions"
             exit 1
           fi
+      # The crate is macOS/metal-gpu-gated, so the workspace test run never builds its
+      # unit tests: the shared shader concatenation and the GPU test lock's own tests
+      # (temporary lock paths, no Metal device).
+      - name: metal-runtime — lib tests (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p lattice-metal-runtime --lib --features metal-gpu -- --test-threads=1
       # The worker module is macOS/metal-gpu-gated, but this lifecycle test
       # uses only a blocking thread-local destructor and never acquires a
       # Metal device. Run it explicitly so compiling the test is not mistaken

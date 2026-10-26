@@ -1718,8 +1718,12 @@ version = "0.15.0"
 dependencies = [
  "bytemuck",
  "lattice-inference-core",
+ "libc",
  "metal 0.33.0",
  "objc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

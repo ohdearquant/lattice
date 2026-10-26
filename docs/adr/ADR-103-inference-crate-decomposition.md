@@ -788,6 +788,29 @@ the family crates names a model; items 2 and 6 say how and in which release that
    decode and prefill A/B. This amendment records the target and its obligations; it does not assert a measurement
    result.
 
+## Amendment 22 (2026-10-26)
+
+Amendment 3 item 3 kept the GPU test lock in `lattice-inference`, because moving it inside an extraction would have
+been a harness change, which D6.5 keeps out of an extraction. Amendment 21 now requires the move: a family crate
+depends on lower crates and `lattice-arch` only (item 1), and the EmbeddingGemma2 (step 5) and Qwen3.5 (step 6) family
+crates carry Metal tests and measurement targets that must take the same machine-wide lock. The lock therefore moves
+in its own change, ahead of those steps, which is the separate change D6.5 asks for. Changed:
+
+1. The lock's implementation moves to `lattice-metal-runtime` as the hidden module `measurement`, under that crate's
+   existing `macos` and `metal-gpu` gate. `lattice-metal-runtime` is the lowest crate that every Metal-driving crate
+   depends on. The lock file path, the 30-minute wait, the supervisor handoff protocol and its environment variables
+   are unchanged; the code moves without edits apart from its module documentation.
+2. D1: `lattice_inference::measurement::gpu_test_lock` stays as a named re-export, so every existing caller and every
+   target the measurement harness admits are unchanged. A family crate calls
+   `lattice_metal_runtime::measurement::gpu_test_lock` directly; its targets join the harness admission list in the
+   step that moves them, not in this change.
+3. D6.1: the module's unit tests move with it, names unchanged, and run in a `lattice-metal-runtime` CI step on macOS,
+   because the workspace test run builds default features only and the crate's default build is empty. The
+   lock-coverage contract keeps its single-definition check and finds the one definition at
+   `crates/metal-runtime/src/measurement.rs`; it still lists the facade's guarded entry points.
+4. The environment-variable table in `crates/inference/CONFIG.md` keeps the four lock variables and names
+   `metal-runtime` as the crate that reads them.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

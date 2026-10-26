@@ -206,7 +206,7 @@ fn run() {
 
     let tok_path = tok_dir.join("tokenizer.json");
 
-    // Machine-wide GPU serialization (crates/inference/src/measurement.rs):
+    // Machine-wide GPU serialization (crates/metal-runtime/src/measurement.rs):
     // bound in this same function, before construction, per the shared
     // construction-site contract every Metal measurement harness follows.
     let _gpu_lock = lattice_inference::measurement::gpu_test_lock();

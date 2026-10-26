@@ -139,7 +139,9 @@ pub mod lora_hook;
 /// tests, benches, examples, and binaries as separate crates.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[doc(hidden)]
-pub mod measurement;
+pub mod measurement {
+    pub use lattice_metal_runtime::measurement::gpu_test_lock;
+}
 /// Inference metrics and entropy accumulation. See [`model`].
 pub mod metrics;
 /// Adapter routing and mixture support built on top of [`lora_hook`] and [`sampling`].
