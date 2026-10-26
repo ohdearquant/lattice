@@ -493,7 +493,7 @@ fn f32_owned_getter_copies_the_aligned_borrowed_view() {
 }
 #[test]
 fn public_loader_and_owner_paths_keep_the_receiver_borrow() {
-    use crate::model::qwen::weight_loading::{
+    use crate::weight_loading::{
         OwnedQwenWeights as PublicOwner, load_owned_weights as public_owned,
         load_weights as public_borrowed,
     };

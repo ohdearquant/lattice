@@ -1,0 +1,44 @@
+[package]
+name = "lattice-model-qwen3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Qwen3 embedding model, tensor assembly and optional Metal acceleration for Lattice"
+keywords = ["inference", "embeddings", "qwen3", "lattice"]
+categories = ["science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+download = ["lattice-model-io/download"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu"]
+x86-gemm = ["lattice-compute/x86-gemm"]
+
+[dependencies]
+lattice-arch.workspace = true
+lattice-compute.workspace = true
+lattice-inference-core.workspace = true
+lattice-model-io.workspace = true
+lattice-tokenizer.workspace = true
+lattice-weights.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing = { workspace = true, features = ["default"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+lattice-metal-runtime = { workspace = true, optional = true }
+metal = { workspace = true, optional = true }
+objc = { workspace = true, optional = true }
+
+[dev-dependencies]
+lattice-model-io = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

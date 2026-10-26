@@ -72,7 +72,7 @@ const GUARDED_CONSTRUCTION: &str = "fn main() { let _guard = lattice_inference::
 #[test]
 fn scanned_package_list_matches_serving_support_workspace_members() {
     validate_current_scanned_package_membership()
-        .expect("scanned packages must cover inference, EmbeddingGemma 2 and every serving-support consumer");
+        .expect("scanned packages must cover inference, EmbeddingGemma 2, Qwen3 and every serving-support consumer");
 }
 
 #[test]
@@ -289,4 +289,74 @@ fn scanned_package_membership_requires_embeddinggemma2_and_rejects_extra_package
     )
     .expect_err("an extra unrelated package must fail membership validation");
     assert!(extra.contains("membership mismatch"), "{extra}");
+}
+
+#[test]
+fn qwen_family_membership_and_construction_guards_are_required() {
+    let mut fixture = PackageFixture::new("fn main() {}", "fn main() {}");
+    let family = fixture.inference.join("../models/qwen3");
+    std::fs::create_dir_all(family.join("src")).unwrap();
+    std::fs::write(
+        family.join("Cargo.toml"),
+        "[package]\nname = \"lattice-model-qwen3\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    let guarded = "#[cfg(test)] mod tests { #[test] fn checkpoint() { let _guard = gpu_test_lock(); QwenModel::from_directory(); } }";
+    std::fs::write(family.join("src/lib.rs"), guarded).unwrap();
+    let workspace = fixture.inference.join("../Cargo.toml");
+    let members = std::fs::read_to_string(&workspace).unwrap();
+    std::fs::write(
+        &workspace,
+        members.replace("\"grammar\"]", "\"grammar\", \"models/qwen3\"]"),
+    )
+    .unwrap();
+    fixture.metadata["packages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "fixture:lattice-model-qwen3",
+            "name": "lattice-model-qwen3",
+            "manifest_path": family.join("Cargo.toml"),
+            "dependencies": [],
+        }));
+    fixture.metadata["workspace_members"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("fixture:lattice-model-qwen3"));
+    assert!(
+        validate_scanned_package_membership(
+            &fixture.inference,
+            &[".", "../serve"],
+            &fixture.metadata
+        )
+        .is_err()
+    );
+    validate_scanned_package_membership(
+        &fixture.inference,
+        &[".", "../serve", "../models/qwen3"],
+        &fixture.metadata,
+    )
+    .unwrap();
+    fixture.packages =
+        scanned_packages_at(&fixture.inference, &[".", "../serve", "../models/qwen3"]).unwrap();
+    let inventory = measurement_lock_construction::scan_constructions(&fixture.packages, &[]);
+    assert_eq!(inventory.discovered.len(), 1);
+    assert!(
+        inventory
+            .discovered
+            .iter()
+            .all(|site| site.starts_with("../models/qwen3:")
+                && site.contains("src/lib.rs::tests::checkpoint::QwenModel::from_directory()#1"))
+    );
+    assert_eq!(inventory.discovered, inventory.classified);
+    assert!(inventory.violations.is_empty());
+    std::fs::write(
+        family.join("src/lib.rs"),
+        guarded.replace("let _guard = gpu_test_lock(); ", ""),
+    )
+    .unwrap();
+    let unguarded = measurement_lock_construction::scan_constructions(&fixture.packages, &[]);
+    assert_eq!(unguarded.discovered, inventory.discovered);
+    assert!(unguarded.classified.is_empty());
+    assert_eq!(unguarded.violations.len(), 1);
 }

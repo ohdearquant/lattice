@@ -4,10 +4,11 @@
 //! rustfmt splits `var_os(..).is_some()` chains across lines and a comment that names a
 //! variable must not satisfy either check:
 //!
-//! (a) No non-test source under `crates/*/src/` reads a `LATTICE_*` variable by presence
-//!     (`NAME=0` would then enable the feature) unless the name is on
-//!     `PRESENCE_ALLOWLIST` with a reason. Switches go through `crate::env_switch_enabled`.
-//! (b) The set of `LATTICE_*` names that non-test source under `crates/*/src/` names
+//! (a) No non-test source under `crates/*/src/` or `crates/models/*/src/` reads a
+//!     `LATTICE_*` variable by presence (`NAME=0` would then enable the feature) unless the
+//!     name is on `PRESENCE_ALLOWLIST` with a reason. Switches go through
+//!     `crate::env_switch_enabled`.
+//! (b) The set of `LATTICE_*` names that non-test source under those directories names
 //!     equals the union of the inference and optional serve `CONFIG.md` tables.
 //!     A name must occur in exactly one row across both tables.
 //!
@@ -495,6 +496,13 @@ fn scan_population_once() -> Population {
         .map(|entry| entry.expect("read crates entry").path())
         .filter(|path| path.join("src").is_dir())
         .collect();
+    // Model family crates sit one level down, under `crates/models/`.
+    crate_dirs.extend(
+        std::fs::read_dir(crates_dir.join("models"))
+            .expect("read crates/models directory")
+            .map(|entry| entry.expect("read crates/models entry").path())
+            .filter(|path| path.join("src").is_dir()),
+    );
     crate_dirs.sort();
 
     // Parse each non-test file once and keep the trees, so the constant table is built
@@ -504,10 +512,10 @@ fn scan_population_once() -> Population {
     let mut test_only_files = 0;
     for crate_dir in &crate_dirs {
         let krate = crate_dir
-            .file_name()
-            .expect("crate directory name")
+            .strip_prefix(&crates_dir)
+            .expect("crate directory under crates/")
             .to_string_lossy()
-            .into_owned();
+            .replace('\\', "/");
         let roots = crate_roots(crate_dir);
         let canonical_crate = crate_dir.canonicalize().expect("resolve crate directory");
         let non_test = closure(&canonical_crate, &roots, false);
@@ -640,7 +648,7 @@ fn names_of(hits: &[Hit]) -> BTreeSet<String> {
 /// Names a healthy scan must find. A scan that lost its discovery (an empty closure, a
 /// parser that stopped matching) would otherwise find nothing and pass.
 const ANCHORS: &[(&str, &str, Kind)] = &[
-    ("LATTICE_NO_GPU", "inference", Kind::Switch),
+    ("LATTICE_NO_GPU", "models/qwen3", Kind::Switch),
     ("LATTICE_OFFLINE", "model-io", Kind::Switch),
     ("LATTICE_MODEL_CACHE", "embed", Kind::Value),
     ("LATTICE_MODEL_CACHE", "inference", Kind::Value),
