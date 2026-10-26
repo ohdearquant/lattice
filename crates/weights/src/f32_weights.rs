@@ -696,7 +696,7 @@ impl SafetensorsFile {
                 name: encoder
                     .name("embeddings.word_embeddings.weight")
                     .into_owned(),
-                expected: vec![word_shape[0], hidden_size],
+                expected: vec![word_shape.first().copied().unwrap_or_default(), hidden_size],
                 actual: word_shape.to_vec(),
             });
         }
@@ -705,7 +705,10 @@ impl SafetensorsFile {
                 name: encoder
                     .name("embeddings.position_embeddings.weight")
                     .into_owned(),
-                expected: vec![position_shape[0], hidden_size],
+                expected: vec![
+                    position_shape.first().copied().unwrap_or_default(),
+                    hidden_size,
+                ],
                 actual: position_shape.to_vec(),
             });
         }
@@ -714,7 +717,10 @@ impl SafetensorsFile {
                 name: encoder
                     .name("embeddings.token_type_embeddings.weight")
                     .into_owned(),
-                expected: vec![token_type_shape[0], hidden_size],
+                expected: vec![
+                    token_type_shape.first().copied().unwrap_or_default(),
+                    hidden_size,
+                ],
                 actual: token_type_shape.to_vec(),
             });
         }
@@ -746,7 +752,10 @@ impl SafetensorsFile {
                 name: encoder
                     .name("encoder.layer.0.intermediate.dense.weight")
                     .into_owned(),
-                expected: vec![intermediate_shape[0], hidden_size],
+                expected: vec![
+                    intermediate_shape.first().copied().unwrap_or_default(),
+                    hidden_size,
+                ],
                 actual: intermediate_shape.to_vec(),
             });
         }
@@ -1067,7 +1076,10 @@ impl SafetensorsFile {
         if embed_shape.len() != 2 || embed_shape[1] != hidden_size {
             return Err(InferenceError::ShapeMismatch {
                 name: "embed_tokens.weight".into(),
-                expected: vec![embed_shape[0], hidden_size],
+                expected: vec![
+                    embed_shape.first().copied().unwrap_or_default(),
+                    hidden_size,
+                ],
                 actual: embed_shape.to_vec(),
             });
         }
@@ -1787,7 +1799,10 @@ impl ShardedSafetensors {
         if embed_shape.len() != 2 || embed_shape[1] != hidden_size {
             return Err(InferenceError::ShapeMismatch {
                 name: "embed_tokens.weight".into(),
-                expected: vec![embed_shape[0], hidden_size],
+                expected: vec![
+                    embed_shape.first().copied().unwrap_or_default(),
+                    hidden_size,
+                ],
                 actual: embed_shape,
             });
         }
