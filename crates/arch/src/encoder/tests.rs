@@ -40,7 +40,11 @@ fn a_new_identity_has_unavailable_provenance_and_the_raw_convention() {
     let identity = EncoderIdentity::new(Pooling::Mean, Normalization::L2, dim(8));
     assert_eq!(identity.checkpoint(), &Provenance::Unavailable);
     assert_eq!(identity.tokenizer(), &Provenance::Unavailable);
-    assert_eq!(identity.prompt_convention(), "raw");
+    assert_eq!(
+        identity.prompt_convention(),
+        EncoderIdentity::RAW_PROMPT_CONVENTION
+    );
+    assert_eq!(EncoderIdentity::RAW_PROMPT_CONVENTION, "raw");
     assert_eq!(identity.variant(), "");
     assert_eq!(identity.pooling(), Pooling::Mean);
     assert_eq!(identity.normalization(), Normalization::L2);

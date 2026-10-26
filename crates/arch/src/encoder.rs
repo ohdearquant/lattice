@@ -182,8 +182,11 @@ pub struct EncoderIdentity {
 }
 
 impl EncoderIdentity {
-    /// An identity with unavailable provenance, the `raw` prompt convention (prepared text is
-    /// embedded as given) and an empty execution variant.
+    /// The prompt convention that embeds prepared text as given, the default of [`Self::new`].
+    pub const RAW_PROMPT_CONVENTION: &'static str = "raw";
+
+    /// An identity with unavailable provenance, the [`Self::RAW_PROMPT_CONVENTION`] prompt
+    /// convention and an empty execution variant.
     pub fn new(
         pooling: Pooling,
         normalization: Normalization,
@@ -192,7 +195,7 @@ impl EncoderIdentity {
         Self {
             checkpoint: Provenance::Unavailable,
             tokenizer: Provenance::Unavailable,
-            prompt_convention: "raw".to_string(),
+            prompt_convention: Self::RAW_PROMPT_CONVENTION.to_string(),
             pooling,
             normalization,
             output_dimension,

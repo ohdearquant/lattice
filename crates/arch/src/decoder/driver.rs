@@ -160,7 +160,8 @@ pub(super) fn check_capabilities(
 /// then finishes the session as reusable. Every other path that returns, success or
 /// error, calls `finish` once: poisoned when the request failed or was interrupted after
 /// prefill started, reusable otherwise; when both the request and `finish` fail, the
-/// request's error is returned.
+/// request's error is returned. What a session must refuse is stated on
+/// [`DecoderSession`].
 ///
 /// `eos_token_id` is threaded in directly (rather than a `&Qwen35Config`)
 /// because it is the one field `should_stop_token`-equivalent logic needs that

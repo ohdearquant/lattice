@@ -1,4 +1,5 @@
 use super::*;
+use crate::decoder::tests::fresh_ledger;
 use crate::decoder::{
     PredictionId, PredictionLedger, SelectionCandidate, StepStamp, TokenMetadata,
 };
@@ -218,7 +219,7 @@ fn request_buffers_reserve_history() {
 fn request_buffers_reuse_driver_delta() {
     let mut session = ScriptedSession {
         caps: ExecutionCapabilities::default(),
-        ledger: PredictionLedger::new().expect("a fresh ledger identity"),
+        ledger: fresh_ledger(),
         script: vec![TEXT_TOKEN],
         selects: 0,
     };
@@ -424,7 +425,7 @@ fn on_push_fires_before_metadata_for_every_token_with_logprobs_enabled() {
             logprobs: true,
             ..ExecutionCapabilities::default()
         },
-        ledger: PredictionLedger::new().expect("a fresh ledger identity"),
+        ledger: fresh_ledger(),
         events: events.clone(),
     };
     // `logprobs: Some(_)` is what makes `record_metadata` a real, non-skipped
@@ -559,7 +560,7 @@ fn run_streaming_script(
             stop_strings: true,
             ..ExecutionCapabilities::default()
         },
-        ledger: PredictionLedger::new().expect("a fresh ledger identity"),
+        ledger: fresh_ledger(),
         script,
         selects: 0,
     };
