@@ -83,6 +83,45 @@ fn plan_metadata_mismatch_is_full_refill() {
 }
 
 #[test]
+fn plan_for_slot_declines_an_entry_from_another_slot() {
+    let e = entry(vec![1, 2, 3], 3, 3);
+    let other_slot = CrossTurnSlotId::new(7);
+    assert_ne!(e.slot_id, other_slot);
+    // Without the slot check the same entry is an exact prefix and would be reused.
+    let unchecked = plan_prefix_reuse(Some(&e), &metadata(), &[1, 2, 3, 4], &[2]);
+    assert_eq!(unchecked.mode, PrefixReuseMode::ExactAppend);
+    let plan = plan_prefix_reuse_for_slot(other_slot, Some(&e), &metadata(), &[1, 2, 3, 4], &[2]);
+    assert_eq!(
+        plan,
+        plan_prefix_reuse(None, &metadata(), &[1, 2, 3, 4], &[2])
+    );
+    assert_eq!(plan.mode, PrefixReuseMode::FullRefill);
+    assert_eq!(plan.reusable_len, 0);
+}
+
+#[test]
+fn plan_for_slot_matches_unchecked_plan_for_the_entrys_own_slot() {
+    let e = entry(vec![1, 2, 3, 9], 4, 4);
+    let cases: [(&[u32], &[usize], PrefixReuseMode); 2] = [
+        (
+            &[1, 2, 3, 4, 5],
+            &[2],
+            PrefixReuseMode::ReplayFromCheckpoint { checkpoint_len: 2 },
+        ),
+        (&[1, 2, 3, 9, 5], &[], PrefixReuseMode::ExactAppend),
+    ];
+    for (prompt, checkpoints, mode) in cases {
+        let plan =
+            plan_prefix_reuse_for_slot(e.slot_id, Some(&e), &metadata(), prompt, checkpoints);
+        assert_eq!(plan.mode, mode);
+        assert_eq!(
+            plan,
+            plan_prefix_reuse(Some(&e), &metadata(), prompt, checkpoints)
+        );
+    }
+}
+
+#[test]
 fn plan_empty_new_prompt_is_full_refill() {
     let e = entry(vec![1, 2, 3], 3, 3);
     let plan = plan_prefix_reuse(Some(&e), &metadata(), &[], &[]);
