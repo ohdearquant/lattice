@@ -6,7 +6,7 @@
 //!
 //! The default `NoopLoraHook` does nothing — zero overhead when no adapter is loaded.
 
-use lattice_model_config::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_config::Qwen35Config;
 
 /// Every Gated DeltaNet projection a LoRA adapter can target, in the order the
 /// trainers emit them.

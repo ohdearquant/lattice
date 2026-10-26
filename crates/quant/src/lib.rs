@@ -24,7 +24,7 @@ pub mod quarot;
 /// not re-exported by that facade.
 #[doc(hidden)]
 pub mod __internal {
-    use lattice_model_config::qwen35_config::Qwen35Config;
+    use lattice_arch::qwen35_config::Qwen35Config;
     use std::path::Path;
 
     /// The QuaRot rotation seed recorded in a Q4 checkpoint's `quantize_index.json`, validated against

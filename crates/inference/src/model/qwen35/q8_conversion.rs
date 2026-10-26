@@ -604,7 +604,7 @@ fn infer_full_attention_shapes(
     let hidden = cfg.hidden_size;
     let q_dim = cfg.checked_full_q_dim()?;
     let kv_dim = cfg.checked_full_kv_dim()?;
-    let q_rows = lattice_model_config::__internal::checked_double(q_dim, "full_q_dim")?;
+    let q_rows = lattice_arch::__internal::checked_double(q_dim, "full_q_dim")?;
 
     validate_cfg_len(w.q_norm.len(), head_dim, Q8_ATTENTION_SOURCE, "q_norm")?;
     validate_cfg_len(w.k_norm.len(), head_dim, Q8_ATTENTION_SOURCE, "k_norm")?;

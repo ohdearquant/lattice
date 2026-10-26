@@ -901,8 +901,8 @@ fn sharded_index_entry_unsupported_dtype_is_not_readable() {
 /// this test fails to compile.
 #[test]
 fn qwen_required_tensor_names_is_publicly_reachable() {
-    use lattice_model_config::qwen35_config::Qwen35Config;
-    use lattice_model_config::qwen35_tensors::qwen_required_tensor_names;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
     // We don't construct a config (it has many required fields); we
     // just want a fn pointer to prove visibility.
     let _f: fn(&Qwen35Config) -> Vec<String> = qwen_required_tensor_names;
@@ -945,7 +945,7 @@ fn artifact_version_refuses_case_variant() {
 }
 
 fn sample_r3_cfg() -> Qwen35Config {
-    lattice_model_config::qwen35_config::Qwen35Config::qwen35_0_8b()
+    lattice_arch::qwen35_config::Qwen35Config::qwen35_0_8b()
 }
 
 fn sample_r3_spec() -> OnlineRotationSpec {
@@ -1463,7 +1463,7 @@ fn v1_online_with_distinct_sites_is_valid() {
     for i in 0..cfg.num_hidden_layers {
         names.push(format!(
             "{}.mlp.down_proj.weight",
-            lattice_model_config::qwen35_tensors::qwen_layer_tensor_prefix(i)
+            lattice_arch::qwen35_tensors::qwen_layer_tensor_prefix(i)
         ));
     }
     let descriptor = OnlineArtifactDescriptor {

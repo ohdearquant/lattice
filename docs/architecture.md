@@ -18,17 +18,17 @@ lattice-weights     ←── lattice-inference-core   (weight storage, model-di
 lattice-metal-runtime ←── lattice-inference-core (shared Metal helpers, macOS + `metal-gpu`)
 lattice-compute     ←── lattice-inference-core   (host-side RoPE tables and KV caches)
 lattice-model-io    ←── lattice-inference-core   (model cache, checksum-verified downloads, env switches)
-lattice-model-config ←── lattice-inference-core
+lattice-arch ←── lattice-inference-core
                     ←── lattice-weights         (Qwen3.5, Gemma 4, EmbeddingGemma 2, BitNet configs)
 lattice-quant       ←── lattice-inference-core
                     ←── lattice-weights
-                    ←── lattice-model-config    (Q4 manifests, Hadamard rotations, QuaRot conversion)
+                    ←── lattice-arch    (Q4 manifests, Hadamard rotations, QuaRot conversion)
 lattice-inference   ←── lattice-inference-core
                     ←── lattice-tokenizer
                     ←── lattice-grammar
                     ←── lattice-weights
                     ←── lattice-quant
-                    ←── lattice-model-config
+                    ←── lattice-arch
                     ←── lattice-compute
                     ←── lattice-model-io
                     ←── lattice-metal-runtime (optional, `metal-gpu` feature)
@@ -44,8 +44,8 @@ lattice-tune    ←── lattice-fann
 
 The three leaf crates (`inference-core`, `fann`, `transport`) have zero intra-workspace
 dependencies and can be used standalone. `tokenizer`, `grammar`, `weights` and `model-io` each depend
-only on `inference-core` at runtime; grammar uses tokenizer in tests. `model-config`
-depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`; `compute` depends on `inference-core`, `tokenizer`, `weights` and `model-config`. `inference` depends on all eight unconditionally (plus
+only on `inference-core` at runtime; grammar uses tokenizer in tests. `arch`
+depends on `inference-core` and `weights`; `quant` depends on those two and on `arch`; `compute` depends on `inference-core`, `tokenizer`, `weights` and `arch`. `inference` depends on all eight unconditionally (plus
 `fann` under the optional `mixture` or `metal-gpu` features), re-exporting tokenizer,
 grammar, weight, model-format, quantization primitive, model configuration, compute, model-file and error items at their original
 paths. `metal-runtime` depends only on `inference-core` internally; the facade enables
@@ -100,12 +100,12 @@ and block Hadamard rotations, input/output rotation absorption for weight matric
 the offline QuaRot conversion of Qwen3.5 checkpoints: the rotation plan, RMSNorm fusion,
 LM-head and LoRA handling, the source-tensor reader and the online-rotation artifact
 descriptor, and the equivalence checks. Its internal runtime dependencies are
-`lattice-inference-core`, `lattice-weights` and `lattice-model-config`; the Q4 manifest
+`lattice-inference-core`, `lattice-weights` and `lattice-arch`; the Q4 manifest
 reader uses the bounded file reader from weights, and the conversion takes the Qwen3.5
-configuration and tensor names from model-config. The facade retains every `lattice_inference::quant::q4_manifest` and
+configuration and tensor names from arch. The facade retains every `lattice_inference::quant::q4_manifest` and
 `lattice_inference::quant::quarot::*` path.
 
-### lattice-model-config
+### lattice-arch
 
 Parsed and validated `config.json` for the Qwen3.5 and 3.6 hybrid models, Gemma 4,
 EmbeddingGemma 2 and BitNet b1.58, with the validation bounds those parsers enforce. Its
@@ -224,7 +224,7 @@ lattice-inference        ← transformer forward pass
     │   Qwen3 decoder path (BPE, GQA, RoPE, SwiGLU, last-token pooling)
     │   lattice-weights: f32, f16, Q3, Q4, Q8 storage and model-format detection
     │   lattice-quant: Q4 manifests, Hadamard transforms and rotation absorption
-    │   lattice-model-config: validated model configurations
+    │   lattice-arch: validated model configurations
     │   lattice-compute: RoPE tables and KV caches
     │   lattice-model-io: model cache and checksum-verified downloads
     ▼

@@ -169,8 +169,8 @@ use crate::quarot::rmsnorm_fusion::{
     RmsNormFusionTarget, fuse_shifted_rmsnorm_into_next_layer_f64, qwen35_per_layer_fusion_plan,
 };
 use crate::quarot::rotation::{absorb_input_rotation_f64, absorb_output_rotation_f64};
-use lattice_model_config::qwen35_config::Qwen35Config;
-use lattice_model_config::qwen35_tensors::qwen_required_tensor_names;
+use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
 
 #[cfg(test)]
 pub(crate) mod pre_admission_allocation_tracking;

@@ -1574,6 +1574,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "lattice-arch"
+version = "0.15.0"
+dependencies = [
+ "lattice-inference-core",
+ "lattice-weights",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "lattice-compute"
 version = "0.15.0"
 dependencies = [
@@ -1581,8 +1592,8 @@ dependencies = [
  "gemm",
  "half",
  "indexmap",
+ "lattice-arch",
  "lattice-inference-core",
- "lattice-model-config",
  "lattice-tokenizer",
  "lattice-weights",
  "proptest",
@@ -1599,10 +1610,10 @@ dependencies = [
  "console_error_panic_hook",
  "criterion",
  "image",
+ "lattice-arch",
  "lattice-compute",
  "lattice-inference",
  "lattice-inference-core",
- "lattice-model-config",
  "lattice-tokenizer",
  "lattice-transport",
  "lattice-weights",
@@ -1662,12 +1673,12 @@ dependencies = [
  "half",
  "image",
  "indexmap",
+ "lattice-arch",
  "lattice-compute",
  "lattice-fann",
  "lattice-grammar",
  "lattice-inference-core",
  "lattice-metal-runtime",
- "lattice-model-config",
  "lattice-model-io",
  "lattice-quant",
  "lattice-tokenizer",
@@ -1710,17 +1721,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lattice-model-config"
-version = "0.15.0"
-dependencies = [
- "lattice-inference-core",
- "lattice-weights",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "lattice-model-io"
 version = "0.15.0"
 dependencies = [
@@ -1736,8 +1736,8 @@ dependencies = [
 name = "lattice-quant"
 version = "0.15.0"
 dependencies = [
+ "lattice-arch",
  "lattice-inference-core",
- "lattice-model-config",
  "lattice-weights",
  "libc",
  "memmap2",

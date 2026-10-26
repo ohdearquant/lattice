@@ -46,8 +46,8 @@ use crate::quarot::lm_head::{
 use crate::quarot::pipeline::{TensorEntry, absorb_rotations, fuse_rmsnorms, load_tensors_f64};
 use crate::quarot::plan::RotationPlan;
 use crate::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use lattice_model_config::qwen35_config::Qwen35Config;
-use lattice_model_config::qwen35_tensors::qwen_required_tensor_names;
+use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
 use lattice_weights::ingress::DecodedTensorValidator;
 use lattice_weights::q4_weights::q4_f32_to_finite_f16;
 use lattice_weights::q4_weights::{quantize_f64_to_q4, save_q4_file};

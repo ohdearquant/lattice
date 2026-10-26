@@ -47,8 +47,8 @@ use serde_json::Value;
 
 use crate::error::InferenceError;
 use crate::quarot::plan::{OnlineRotationSpec, OnlineTransformSite};
-use lattice_model_config::qwen35_config::Qwen35Config;
-use lattice_model_config::qwen35_tensors::qwen_layer_tensor_prefix;
+use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_tensors::qwen_layer_tensor_prefix;
 use lattice_weights::ingress::DecodedTensorValidator;
 use lattice_weights::safetensors_layout::{
     safetensors_dtype_name, safetensors_layout_entry, validate_safetensors_layout,

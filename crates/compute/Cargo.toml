@@ -23,7 +23,7 @@ x86-gemm = ["dep:gemm"]
 half.workspace = true
 gemm = { version = "=0.18.2", optional = true }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
-lattice-model-config = { version = "0.15.0", path = "../model-config" }
+lattice-arch = { version = "0.15.0", path = "../arch" }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
 indexmap.workspace = true

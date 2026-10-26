@@ -108,11 +108,11 @@ fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
                                        |
                      tokenizer (8K)   grammar   weights   metal-runtime   model-io   ← depend on inference-core
                                                  |
-                                              model-config   ← depends on inference-core + weights
+                                              arch           ← depends on inference-core + weights
                                                  |
-                                               quant   compute   ← quant depends on inference-core + weights + model-config; compute on inference-core + tokenizer + weights + model-config
+                                               quant   compute   ← quant depends on inference-core + weights + arch; compute on inference-core + tokenizer + weights + arch
     |                                  |
-inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + model-config + compute + model-io;
+inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + arch + compute + model-io;
                                                    optional metal-runtime under `metal-gpu`;
     |                                               optional dep on fann (`mixture` or `metal-gpu` feature)
 embed (12K)   tune (20K)   serve               ← embed uses inference; tune uses fann + inference;
@@ -120,12 +120,12 @@ embed (12K)   tune (20K)   serve               ← embed uses inference; tune us
 ```
 
 `inference-core` (the shared `InferenceError`), `tokenizer`, `grammar`,
-`weights`, `quant`, `model-config`, `compute` and `model-io` were split out of `inference`;
+`weights`, `quant`, `arch`, `compute` and `model-io` were split out of `inference`;
 all eight edges into them are unconditional. `metal-runtime` depends on
 `inference-core` and is enabled by inference's opt-in `metal-gpu` feature.
-`model-config` depends on `inference-core` and `weights`; `quant` depends on
-those two and on `model-config`, while `compute` depends on `inference-core`,
-`tokenizer`, `weights` and `model-config`. `model-io` depends only on
+`arch` depends on `inference-core` and `weights`; `quant` depends on
+those two and on `arch`, while `compute` depends on `inference-core`,
+`tokenizer`, `weights` and `arch`. `model-io` depends only on
 `inference-core`. `inference` re-exports the extracted public items at their
 original paths. Of the four edges among the other crates, three are
 feature-gated, and the gates do not all default the same way, so "depends on" in
@@ -219,12 +219,12 @@ retains its existing `weights` and `model_format` paths.
 | `quarot/forward_equivalence.rs` | Pre-quantization forward-equivalence check | `assert_forward_equivalence_qwen35`                |
 
 Its internal runtime dependencies are `inference-core`, `weights` and
-`model-config`; the manifest reader uses the bounded file reader from `weights`,
+`arch`; the manifest reader uses the bounded file reader from `weights`,
 and the conversion reads the Qwen3.5 configuration and tensor names from
-`model-config`. The inference facade retains every `quant::q4_manifest` and
+`arch`. The inference facade retains every `quant::q4_manifest` and
 `quant::quarot::*` path.
 
-### lattice-model-config — Model configurations
+### lattice-arch — Model configurations
 
 | Module                      | Purpose                                | Key Exports                                          |
 | --------------------------- | -------------------------------------- | ---------------------------------------------------- |
@@ -257,7 +257,7 @@ reasoning-budget helpers in `model::qwen35_config` stay in inference.
 | `forward/cpu/`             | CPU forward kernels: matmul, GEMM, norms, activations, softmax | `matmul_bt`, `rms_norm`, `softmax_attention`        |
 
 Its internal runtime dependencies are `inference-core` for the shared error type,
-`model-config` for Qwen3.5 geometry in the LoRA hook contract, `tokenizer` for
+`arch` for Qwen3.5 geometry in the LoRA hook contract, `tokenizer` for
 option scoring and `weights` for the F16 storage type in the CPU F16 matmul. Flat and
 paged storage, prefix sharing and cross-turn planning are available under
 `kv_cache`; pooling and sampling move here in later changes. The inference facade retains the `lattice_inference::rope::RopeTable`,
@@ -435,7 +435,7 @@ ubuntu + macos (x86 + ARM SIMD). Rust 1.94.1 pinned. No deno in remote CI.
 
 Every PR that touches `crates/inference/`, `crates/inference-core/`,
 `crates/metal-runtime/`, `crates/tokenizer/`, `crates/grammar/`,
-`crates/weights/`, `crates/quant/`, `crates/model-config/`, `crates/compute/`, `crates/model-io/`,
+`crates/weights/`, `crates/quant/`, `crates/arch/`, `crates/compute/`, `crates/model-io/`,
 `crates/embed/`, or `crates/fann/` must include a bench-compare disposition in
 its description. By default, run `make bench-compare` and paste its A/B table
 into the PR body. If the result shows no change, state that as the disposition.
@@ -454,7 +454,7 @@ binaries" alone as sufficient.
 
 PRs touching `crates/inference/src/`, `crates/inference-core/src/`,
 `crates/metal-runtime/src/`, `crates/tokenizer/src/`, `crates/grammar/src/`,
-`crates/weights/src/`, `crates/quant/src/`, `crates/model-config/src/`,
+`crates/weights/src/`, `crates/quant/src/`, `crates/arch/src/`,
 `crates/compute/src/`, `crates/model-io/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs
 HF transformers (reference) then lattice on the same macOS runner and compares
 greedy generation output. First 3 greedy tokens must match HF (2 for the

@@ -84,7 +84,7 @@ class PublishScriptArgs(unittest.TestCase):
                 "cargo publish -p lattice-metal-runtime",
                 "cargo publish -p lattice-model-io",
                 "sleep 30",
-                "cargo publish -p lattice-model-config",
+                "cargo publish -p lattice-arch",
                 "sleep 30",
                 "cargo publish -p lattice-quant",
                 "cargo publish -p lattice-compute",

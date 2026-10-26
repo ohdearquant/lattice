@@ -1,15 +1,15 @@
-//! Qwen3.5 configuration facade over `lattice-model-config`.
+//! Qwen3.5 configuration facade over `lattice-arch`.
 //!
 //! Every public item keeps the path it had before the configuration moved into its own crate. The
 //! re-exports are named rather than globbed so the facade never widens the supported API. The
 //! deprecated generation aliases and the reasoning-budget helpers below are generation code and stay
 //! in this crate.
 
-pub(crate) use lattice_model_config::qwen35_config::MAX_VISION_TENSOR_BYTES;
+pub(crate) use lattice_arch::qwen35_config::MAX_VISION_TENSOR_BYTES;
 #[cfg(any(test, feature = "test-utils"))]
-pub(crate) use lattice_model_config::qwen35_config::compute_layer_types;
+pub(crate) use lattice_arch::qwen35_config::compute_layer_types;
 #[doc(inline)]
-pub use lattice_model_config::qwen35_config::{
+pub use lattice_arch::qwen35_config::{
     LayerType, MAX_HIDDEN_LAYERS, QWEN_CHAT_IM_END_TOKEN_ID, QWEN3_NEWLINE_TOKEN_ID,
     QWEN3_NO_THINK_PREFIX, QWEN3_THINK_CLOSE_TOKEN_ID, QWEN3_THINK_OPEN_TOKEN_ID, Qwen35Config,
     RopeParams, ValidatedQwen35Config, VisionModelConfig,

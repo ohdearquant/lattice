@@ -16,7 +16,7 @@
 //! For one full-attention Qwen3.5-0.8B layer's attention-axis shape (GQA:
 //! `num_attention_heads=8`, `num_key_value_heads=2`, `head_dim=256`, so
 //! `q_dim=2048`, `kv_dim=512`, groups=4 — read from
-//! [`lattice_model_config::qwen35_config::Qwen35Config::qwen35_0_8b`]; the test
+//! [`lattice_arch::qwen35_config::Qwen35Config::qwen35_0_8b`]; the test
 //! fixture's `HIDDEN` constant is intentionally smaller than the real
 //! `hidden_size=1024` — see that constant's doc for why), the winning
 //! orientation is:

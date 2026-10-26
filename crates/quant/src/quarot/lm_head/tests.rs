@@ -228,7 +228,7 @@ fn final_norm_fusion_target_norm_name_matches_loader() {
     // Round-trip: the final_norm name we emit must match what the loader
     // actually requests for this config.
     let cfg = tied_qwen35_test_cfg();
-    let required = lattice_model_config::qwen35_tensors::qwen_required_tensor_names(&cfg);
+    let required = lattice_arch::qwen35_tensors::qwen_required_tensor_names(&cfg);
     let tgt = qwen35_final_norm_fusion_target();
     assert!(
         required.contains(&tgt.norm_tensor),

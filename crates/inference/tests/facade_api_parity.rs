@@ -1299,8 +1299,8 @@ mod quant_parity {
 }
 
 mod model_config_parity {
+    use lattice_arch as extracted;
     use lattice_inference::model as facade;
-    use lattice_model_config as extracted;
     use std::marker::PhantomData;
 
     fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}

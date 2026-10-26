@@ -10,7 +10,7 @@
 
 use crate::attention::gdn::{GatedDeltaNetState, GatedDeltaNetWeights, sigmoid, softplus};
 use crate::forward::cpu::{matmul_bt, validate_gemm_nn};
-use lattice_model_config::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_config::Qwen35Config;
 
 /// **Unstable**: scratch buffers for the SIMD-fused GatedDeltaNet step; buffer layout evolving.
 ///
