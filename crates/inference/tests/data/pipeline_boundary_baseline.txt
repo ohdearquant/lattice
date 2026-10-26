@@ -14,7 +14,6 @@
 ../serve:src/serve/metal_worker.rs	.:crate::forward::metal_qwen35::format_chat_template
 ../serve:src/serve/mod.rs	.:crate::forward::metal_qwen35::ChatMessage
 ../serve:src/serve/prepare.rs	.:crate::forward::metal_qwen35::ChatMessage
-../serve:src/serving_provider/providers/bert/embedding.rs	.:crate::model::bert::BertModel
 ../serve:src/serving_provider/providers/qwen.rs	.:crate::model::qwen35::model::Qwen35Model
 ../serve:src/serving_provider/providers/qwen/adapters.rs	.:crate::forward::metal_qwen35::LoraLayerData
 ../serve:src/serving_provider/providers/qwen/adapters.rs	.:crate::forward::metal_qwen35::MetalQwen35State
