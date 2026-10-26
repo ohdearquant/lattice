@@ -197,6 +197,27 @@ fn registry_errors_convert_by_cause() {
         matches!(&miss, InferenceError::UnsupportedModel(m) if m == "family a is not available in this registry"),
         "{miss}"
     );
+    assert!(matches!(
+        InferenceError::from(RegistryError::DuplicateClaim {
+            kind: ModelKind::Encoder,
+            model_type: "t",
+            families: vec!["a", "b"],
+        }),
+        InferenceError::InvalidInput(_)
+    ));
+    assert!(matches!(
+        InferenceError::from(RegistryError::UnregisteredModelType {
+            model_type: "t".into()
+        }),
+        InferenceError::UnsupportedModel(_)
+    ));
+    assert!(matches!(
+        InferenceError::from(RegistryError::WrongKind {
+            requested: ModelKind::Decoder,
+            families: vec!["a"],
+        }),
+        InferenceError::UnsupportedModel(_)
+    ));
     assert_eq!(
         RegistryError::WrongKind {
             requested: ModelKind::Decoder,

@@ -3,10 +3,11 @@
 //! [`Registry`] that validates a table of them and resolves a family by exact name or
 //! `model_type`.
 //!
-//! **Unstable**: this module is the supported family contract. A family crate (today the
-//! `lattice-inference` facade) defines its descriptors as statics; a consumer builds a registry
-//! from the descriptors it was compiled with. This crate names no family and keeps no list of
-//! them, so "unavailable" means absent from the consumer's table, never unknown to Lattice.
+//! **Unstable**: this module is the public family contract, and it may still change in a minor
+//! release. A family crate (today the `lattice-inference` facade) defines its descriptors as
+//! statics; a consumer builds a registry from the descriptors it was compiled with. This crate
+//! names no family and keeps no list of them, so "unavailable" means absent from the consumer's
+//! table, never unknown to Lattice.
 //!
 //! Resolution does no I/O and never falls back to another family: a miss, a family that does not
 //! offer the requested kind, and a backend the family does not offer are distinct refusals.
@@ -345,7 +346,11 @@ impl From<RegistryError> for InferenceError {
             RegistryError::DuplicateFamily { .. } | RegistryError::DuplicateClaim { .. } => {
                 InferenceError::InvalidInput(value.to_string())
             }
-            _ => InferenceError::UnsupportedModel(value.to_string()),
+            RegistryError::UnavailableFamily { .. }
+            | RegistryError::UnregisteredModelType { .. }
+            | RegistryError::WrongKind { .. } => {
+                InferenceError::UnsupportedModel(value.to_string())
+            }
         }
     }
 }

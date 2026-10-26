@@ -8,10 +8,11 @@
 //! `is_complete_without_continuation` on its own owned engine and state -- see `driver`'s own
 //! module doc comment for the full per-step ordering and the reasoning for that split.
 //!
-//! **Unstable**: this module is the supported session contract (ADR-103 Amendment 21 item 3). A
-//! model family implements [`DecoderSession`] and runs it with [`driver::run`]; the records the
-//! trait exchanges are `#[non_exhaustive]` and built with their constructors, so an implementation
-//! outside this crate can return every value the trait asks for.
+//! **Unstable**: this module is the public session contract (ADR-103 Amendment 21 item 3), and it
+//! may still change in a minor release. A model family implements [`DecoderSession`] and runs it
+//! with [`driver::run`]; the records the trait exchanges are `#[non_exhaustive]` and built with
+//! their constructors, so an implementation outside this crate can return every value the trait
+//! asks for.
 //!
 //! **One request per session.** A session serves one request: [`DecoderSession::finish`] ends its
 //! use through this trait, whatever the disposition. An implementation refuses calls out of

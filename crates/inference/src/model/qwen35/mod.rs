@@ -86,10 +86,17 @@ pub(crate) use generation::check_prompt_ids_in_vocab;
 // it. The standalone CPU paths (cpu_f16, cpu_q8, neon_forward) enforce the
 // same bound through `prepare_generation`, and `generation.rs` uses
 // `check_context_budget` directly within its own module.
+pub(crate) use generation::check_context_budget;
+
+// The reasoning close token a reasoning budget needs: resolved per request by
+// the Metal generation entry points and by `family::Qwen35CpuDecoder`.
+pub(crate) use generation::resolve_reasoning_close_token;
+
+// The close marker's text, read only by the Metal entry points and the Metal
+// prefix cache, which look up its token ids themselves.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::REASONING_CLOSE_MARKER;
-pub(crate) use generation::check_context_budget;
-pub(crate) use generation::resolve_reasoning_close_token;
+
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{

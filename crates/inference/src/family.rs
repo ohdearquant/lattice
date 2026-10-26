@@ -82,21 +82,10 @@ impl DecoderModel for Qwen35CpuDecoder {
         if config.max_new_tokens == 0 {
             return Ok(SessionRequest::new(prompt_ids, config, cfg.eos_token_id));
         }
-        check_context_budget(
-            prompt_ids.len(),
-            config.effective_reasoning_budget(),
-            config.max_new_tokens,
-            model.max_context(),
-        )?;
-        let think_close_id = resolve_reasoning_close_token(
-            model.tokenizer(),
-            config.reasoning_budget,
-            config.enable_thinking,
-            cfg.vocab_size,
-        )?;
+        let reasoning_close = decode_admission(model, prompt_ids.len(), &config)?;
         let request = SessionRequest::new(prompt_ids, config, cfg.eos_token_id);
-        Ok(match think_close_id {
-            Some(id) => request.with_reasoning_close(id, newline_boundary_table(model.tokenizer())),
+        Ok(match reasoning_close {
+            Some((id, table)) => request.with_reasoning_close(id, table),
             None => request,
         })
     }
@@ -132,31 +121,20 @@ impl DecoderModel for Qwen35CpuDecoder {
             )));
         }
         if gen_cfg.max_new_tokens > 0 {
-            check_context_budget(
-                prompt.len(),
-                gen_cfg.effective_reasoning_budget(),
-                gen_cfg.max_new_tokens,
-                model.max_context(),
-            )?;
-            let think_close_id = resolve_reasoning_close_token(
-                model.tokenizer(),
-                gen_cfg.reasoning_budget,
-                gen_cfg.enable_thinking,
-                cfg.vocab_size,
-            )?;
+            let reasoning_close = decode_admission(model, prompt.len(), gen_cfg)?;
+            let think_close_id = reasoning_close.as_ref().map(|(id, _)| *id);
             if request.think_close_id() != think_close_id {
                 return Err(InferenceError::InvalidInput(format!(
                     "the request's reasoning close token {:?} differs from the model's {think_close_id:?}",
                     request.think_close_id()
                 )));
             }
-            if think_close_id.is_some() {
-                let table = newline_boundary_table(model.tokenizer());
-                if request.reasoning_newline_boundary() != Some(&table) {
-                    return Err(InferenceError::InvalidInput(
-                        "the request's line-ending table differs from the model's tokenizer".into(),
-                    ));
-                }
+            if let Some((_, table)) = &reasoning_close
+                && request.reasoning_newline_boundary() != Some(table)
+            {
+                return Err(InferenceError::InvalidInput(
+                    "the request's line-ending table differs from the model's tokenizer".into(),
+                ));
             }
         }
         let mut session =
@@ -167,6 +145,33 @@ impl DecoderModel for Qwen35CpuDecoder {
         )));
         Ok(Box::new(session))
     }
+}
+
+/// A request's reasoning close token and the tokenizer's line-ending table.
+type ReasoningClose = (u32, Arc<[bool]>);
+
+/// The admission rule for a request with a non-zero decode cap, in [`Qwen35Model::generate`]'s
+/// order: the context budget, then the reasoning close token and, when one is set, the tokenizer's
+/// line-ending table. `admit` attaches the result to the request; `session` recomputes it to
+/// refuse a request this model would not have admitted.
+fn decode_admission(
+    model: &Qwen35Model,
+    prompt_len: usize,
+    config: &GenerateConfig,
+) -> Result<Option<ReasoningClose>, InferenceError> {
+    check_context_budget(
+        prompt_len,
+        config.effective_reasoning_budget(),
+        config.max_new_tokens,
+        model.max_context(),
+    )?;
+    let think_close_id = resolve_reasoning_close_token(
+        model.tokenizer(),
+        config.reasoning_budget,
+        config.enable_thinking,
+        model.config().vocab_size,
+    )?;
+    Ok(think_close_id.map(|id| (id, newline_boundary_table(model.tokenizer()))))
 }
 
 /// The text of a Qwen3.5 model's token ids. Holds a clone of the model's tokenizer, which is a

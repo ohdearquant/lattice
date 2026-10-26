@@ -1,10 +1,10 @@
 //! Text encoder contract (ADR-103 Amendment 21 item 3): a loaded embedding model behind one
 //! object-safe trait, shared as `Arc<dyn Encoder>`.
 //!
-//! **Unstable**: this module is the supported encoder contract. A model family implements
-//! [`Encoder`]; a consumer loads it once and shares the handle across threads. The records the
-//! trait exchanges have private fields and are built with their constructors, so an
-//! implementation outside this crate can return every value the trait asks for.
+//! **Unstable**: this module is the public encoder contract, and it may still change in a minor
+//! release. A model family implements [`Encoder`]; a consumer loads it once and shares the handle
+//! across threads. The records the trait exchanges have private fields and are built with their
+//! constructors, so an implementation outside this crate can return every value the trait asks for.
 //!
 //! The contract covers execution only. Choosing a role or instruction prefix, request caps,
 //! scheduling, caching and remote providers stay with the embedding service above this boundary:
