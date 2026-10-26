@@ -604,7 +604,7 @@ fn assert_forward_equivalence_snapshot<S: OriginalTensorSource>(
     // 2. Per-tensor rotation-equivalence check. Covers every planned tensor,
     //    including the ones the chain probe shortcuts past (k_proj, v_proj,
     //    gate-z half of q_proj, in_proj_qkv, in_proj_a, in_proj_b).
-    let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let rotation_plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let fusion_plan = full_fusion_plan(cfg)?;
     let per_tensor_max_abs = check_per_tensor_rotation_equivalence(
         original,

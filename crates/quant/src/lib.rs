@@ -24,15 +24,17 @@ pub mod quarot;
 /// not re-exported by that facade.
 #[doc(hidden)]
 pub mod __internal {
-    use lattice_arch::qwen35_config::Qwen35Config;
+    use crate::quarot::plan::RotationTarget;
     use std::path::Path;
 
     /// The QuaRot rotation seed recorded in a Q4 checkpoint's `quantize_index.json`, validated against
-    /// the configuration; `Ok(None)` when the checkpoint has no manifest.
+    /// the target; `Ok(None)` when the checkpoint has no manifest.
+    /// A legacy seed allows an object-form manifest to defer seed recovery to its caller.
     pub fn read_quarot_seed_from_index(
         q4_dir: &Path,
-        cfg: &Qwen35Config,
+        target: &RotationTarget,
+        legacy_seed: Option<u64>,
     ) -> Result<Option<u64>, String> {
-        crate::quarot::convert::read_quarot_seed_from_index(q4_dir, cfg)
+        crate::quarot::convert::read_quarot_seed_from_index(q4_dir, target, legacy_seed)
     }
 }

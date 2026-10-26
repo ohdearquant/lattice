@@ -171,7 +171,7 @@ fn output_side_naive_skip_is_wrong() {
 
 #[test]
 fn needs_counter_rotation_input_side_modules() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let input_side = [
         "q_proj",
         "k_proj",
@@ -197,7 +197,7 @@ fn needs_counter_rotation_input_side_modules() {
 
 #[test]
 fn needs_b_rotation_output_side_modules() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let output_side = ["o_proj", "down_proj", "out_proj"];
     for module in output_side {
         assert!(
@@ -213,7 +213,7 @@ fn needs_b_rotation_output_side_modules() {
 
 #[test]
 fn unknown_module_needs_neither() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     assert!(!needs_counter_rotation(&plan, "some_random_proj"));
     assert!(!needs_b_rotation(&plan, "some_random_proj"));
 }
@@ -225,7 +225,7 @@ fn rotate_adapter_batch_applies_both_sides() {
     let hidden_dim = 64;
     let rank = 4;
     let seed = 7_u64;
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
 
     let mut a_q = synthetic_vector(rank * hidden_dim, 100);
     let mut b_q = synthetic_vector(hidden_dim * rank, 101); // d_out != hidden for q_proj (2*q_dim), but test uses hidden
@@ -276,7 +276,7 @@ fn rotate_adapter_unknown_module_rejected() {
     let hidden_dim = 64;
     let rank = 4;
     let seed = 7_u64;
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
 
     let mut a = synthetic_vector(rank * hidden_dim, 200);
     let mut b = synthetic_vector(hidden_dim * rank, 201);
@@ -303,7 +303,7 @@ fn rotate_adapter_unknown_module_rejected() {
 fn rotate_adapter_misspelled_target_rejected() {
     let hidden_dim = 64;
     let rank = 4;
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
 
     let mut a = synthetic_vector(rank * hidden_dim, 210);
     let mut b = synthetic_vector(hidden_dim * rank, 211);
@@ -328,7 +328,7 @@ fn rotate_adapter_misspelled_target_rejected() {
 
 #[test]
 fn rotate_adapter_input_side_dimension_mismatch_rejected() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let mut a = synthetic_vector(4 * 32, 300);
     let mut b = synthetic_vector(64 * 4, 301);
 
@@ -348,7 +348,7 @@ fn rotate_adapter_input_side_dimension_mismatch_rejected() {
 
 #[test]
 fn rotate_adapter_output_side_dimension_mismatch_rejected() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let mut a = synthetic_vector(4 * 64, 400);
     let mut b = synthetic_vector(32 * 4, 401);
 
