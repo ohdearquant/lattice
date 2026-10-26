@@ -110,11 +110,10 @@ fn drive(
     session: &mut RecordingSession,
     cancel: &dyn Cancellation,
 ) -> Result<DriverResult, InferenceError> {
-    let config = {
-        let mut config = GenerateConfig::default();
-        config.max_new_tokens = 2;
-        config.logprobs = Some(0);
-        config
+    let config = GenerateConfig {
+        max_new_tokens: 2,
+        logprobs: Some(0),
+        ..Default::default()
     };
     run(
         session,

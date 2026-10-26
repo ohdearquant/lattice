@@ -1,12 +1,15 @@
 //! The autoregressive driver (ADR-090 D1/D2, row C; grammar/logprobs routing
 //! added by row R03, grammar ownership relocated here in this rework): one loop
-//! over `&mut dyn DecoderSession` that drives the existing [`DecodePolicy`]
-//! unchanged -- every canonical Qwen3.5 CPU generate/stream request now runs
-//! through this driver, no exceptions.
+//! over `&mut dyn DecoderSession` that drives the existing
+//! [`DecodePolicy`](crate::generation::DecodePolicy) unchanged -- every
+//! canonical Qwen3.5 CPU generate/stream request now runs through this driver,
+//! no exceptions.
 //!
-//! **Grammar.** This driver, not the session, owns the [`GrammarEngine`] and
-//! [`GrammarState`] (built from `gen_cfg.grammar`; `None` when no grammar is
-//! set): ADR-090 D1 names grammar transitions as the driver's responsibility,
+//! **Grammar.** This driver, not the session, owns the
+//! [`GrammarEngine`](lattice_grammar::GrammarEngine) and
+//! [`GrammarState`](lattice_grammar::pda::GrammarState) (built from
+//! `gen_cfg.grammar`; `None` when no grammar is set): ADR-090 D1 names grammar
+//! transitions as the driver's responsibility,
 //! and a per-session copy would be exactly the duplication this refactor exists
 //! to remove -- every future session (Gemma CPU, Metal Qwen, ...) would
 //! otherwise have to reimplement it. State needs interior mutability
@@ -64,31 +67,17 @@ use super::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
     GrammarMaskFn, MetadataRequest, SelectOutcome, SelectionRequest,
 };
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use super::{SpeculativeSession, SpeculativeTrace};
+use crate::decode_budget::decode_cap;
 use crate::error::InferenceError;
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use crate::generation::TopLogprob;
 use crate::generation::{
     DecodePolicy, GenerateConfig, StepOutcome, StopCheckOutcome, TokenLogprob,
 };
-use crate::grammar::{GrammarEngine, pda::GrammarState};
-use crate::model::qwen35_config::decode_cap;
 use crate::stop_reason::StopReason;
-#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
-use std::cell::Cell;
+use lattice_grammar::{GrammarEngine, pda::GrammarState};
 use std::cell::RefCell;
 use std::sync::Arc;
-
-#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
-thread_local! {
-    static TEST_DRIVER_RUN_COUNT: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
-pub(crate) fn test_driver_run_count() -> usize {
-    TEST_DRIVER_RUN_COUNT.with(Cell::get)
-}
 
 /// Ledger-transition counters the driver maintains as it runs: one prediction
 /// is opened per `select` call, one is consumed per `decode` call. ADR-090
@@ -98,9 +87,9 @@ pub(crate) fn test_driver_run_count() -> usize {
 /// `consumed` short of what a real run would have produced, in a way the
 /// golden's token-id comparison cannot see by construction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DriverTrace {
-    pub(crate) opened: usize,
-    pub(crate) consumed: usize,
+pub struct DriverTrace {
+    pub opened: usize,
+    pub consumed: usize,
 }
 
 /// Everything [`run`] produces: `model::qwen35::generation`'s
@@ -108,17 +97,17 @@ pub(crate) struct DriverTrace {
 /// directly off the returned value, replacing the by-hand assembly the deleted
 /// pre-driver `decode_loop`/`decode_loop_with_stops` functions used to require
 /// from their own local `generated_ids`/`token_logprobs`.
-pub(crate) struct DriverResult {
-    pub(crate) generated_ids: Vec<u32>,
-    pub(crate) token_logprobs: Vec<TokenLogprob>,
-    pub(crate) stopped: bool,
-    pub(crate) stop_reason: StopReason,
+pub struct DriverResult {
+    pub generated_ids: Vec<u32>,
+    pub token_logprobs: Vec<TokenLogprob>,
+    pub stopped: bool,
+    pub stop_reason: StopReason,
     /// Set only on [`StepOutcome::Stopped`] (a confirmed stop-string match);
     /// `generate_via_driver`'s stop-strings branch reads this exactly as the
     /// deleted `decode_loop_with_stops` read its own local of the same name,
     /// to skip a redundant tail-flush attempt.
-    pub(crate) confirmed_stop_string_match: bool,
-    pub(crate) trace: DriverTrace,
+    pub confirmed_stop_string_match: bool,
+    pub trace: DriverTrace,
 }
 
 /// Refuses (`InferenceError::InvalidInput`) when `gen_cfg` requests a control `caps` does not
@@ -196,7 +185,7 @@ fn check_capabilities(
 /// timed off it drifts whenever `record_metadata` does real (session-scored)
 /// work, i.e. whenever `gen_cfg.logprobs` is set.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run(
+pub fn run(
     session: &mut dyn DecoderSession,
     gen_cfg: &GenerateConfig,
     think_close_id: Option<u32>,
@@ -234,7 +223,7 @@ pub(crate) fn run(
 
 /// Drive generation while reusing a delta buffer through selection and stop policy.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_into(
+pub fn run_into(
     session: &mut dyn DecoderSession,
     gen_cfg: &GenerateConfig,
     think_close_id: Option<u32>,
@@ -251,9 +240,6 @@ pub(crate) fn run_into(
     on_prefill_end: impl FnMut(),
     finish_tail: impl FnOnce() -> String,
 ) -> Result<DriverResult, InferenceError> {
-    #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
-    TEST_DRIVER_RUN_COUNT.with(|count| count.set(count.get() + 1));
-
     check_capabilities(*session.capabilities(), gen_cfg)?;
     let mut prefill_started = false;
     let result = run_inner(
@@ -284,6 +270,7 @@ pub(crate) fn run_into(
     result.and_then(|result| finished.map(|()| result))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     session: &mut dyn DecoderSession,
     gen_cfg: &GenerateConfig,
@@ -820,19 +807,17 @@ fn prompt_history(prompt_ids: &[u32], gen_cfg: &GenerateConfig) -> Vec<u32> {
 /// Everything [`run_speculative`] produces. Logprobs and stop-string text are not
 /// carried: the speculative routes refuse both, so the driver's own buffers for them stay
 /// empty and the caller decodes the published ids.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-pub(crate) struct SpeculativeResult {
-    pub(crate) generated_ids: Vec<u32>,
-    pub(crate) stopped: bool,
-    pub(crate) stop_reason: StopReason,
-    pub(crate) trace: SpeculativeTrace,
+pub struct SpeculativeResult {
+    pub generated_ids: Vec<u32>,
+    pub stopped: bool,
+    pub stop_reason: StopReason,
+    pub trace: SpeculativeTrace,
 }
 
 /// A speculative route verifies draft tokens by argmax, so it admits only the greedy
 /// configuration its route predicate already selects it for. Refused here as well, in every
 /// build, for the reason [`check_capabilities`] is a hard error: a driver that accepted any
 /// configuration would let a caller believe sampling or a repetition penalty was applied.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn check_greedy(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
     if gen_cfg.temperature > 0.0 || gen_cfg.top_k > 1 || gen_cfg.repetition_penalty != 1.0 {
         return Err(InferenceError::InvalidInput(
@@ -871,9 +856,8 @@ fn check_greedy(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
 /// `decode_delta`, `text`, `token_logprob_end_offsets` and `emit_confirmed` are the raw
 /// I/O primitives [`run`] takes, handed to the same policy call; a text sink that refuses a
 /// delta ends the request with [`StopReason::Interrupt`].
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_speculative(
+pub fn run_speculative(
     session: &mut dyn SpeculativeSession,
     gen_cfg: &GenerateConfig,
     eos_token_id: u32,
@@ -903,7 +887,7 @@ pub(crate) fn run_speculative(
     result.and_then(|result| finished.map(|()| result))
 }
 
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+#[allow(clippy::too_many_arguments)]
 fn run_speculative_inner(
     session: &mut dyn SpeculativeSession,
     gen_cfg: &GenerateConfig,

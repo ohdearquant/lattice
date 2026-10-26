@@ -1,7 +1,9 @@
 //! The model interface for Lattice inference (ADR-103 Amendment 21): the generation types every
 //! decoder path shares ([`generation::GenerateConfig`], [`generation::GenerateOutput`],
 //! [`generation::TokenLogprob`], [`generation::TopLogprob`], [`stop_reason::StopReason`]) and
-//! [`sampling`].
+//! [`sampling`]. It also holds the decoder session vocabulary and the shared generation driver
+//! (ADR-090), which `lattice-inference` reaches through `__internal`; they are not yet part of the
+//! supported API.
 //!
 //! Until each model family moves to its own crate, this crate also holds the model configurations:
 //! the parsed and validated `config.json` of the Qwen3.5 hybrid models, Gemma 4, EmbeddingGemma 2
@@ -21,6 +23,7 @@ mod error {
 
 pub mod bitnet_config;
 mod decode_budget;
+mod decoder;
 pub mod embeddinggemma2_config;
 pub mod gemma4_config;
 pub mod generation;
@@ -48,6 +51,17 @@ pub mod __internal {
         temperature_degenerate, uniform_f32_from_u64, xorshift64_next,
     };
     pub use crate::stop_strings::{StopStringMatcher, earliest_stop_match};
+
+    /// The decoder session vocabulary and the shared driver (ADR-090), which the facade's
+    /// concrete sessions implement and run.
+    pub mod decoder {
+        pub use crate::decoder::{
+            AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
+            GrammarMaskFn, MetadataRequest, PredictionError, PredictionId, PredictionLedger,
+            SelectOutcome, SelectionCandidate, SelectionRequest, SpeculativeSession,
+            SpeculativeTrace, StepStamp, TokenMetadata, VerifiedRound, driver,
+        };
+    }
 
     /// Checked doubling of a config-derived dimension, with the Qwen config error on overflow.
     pub fn checked_double(value: usize, what: &str) -> Result<usize, InferenceError> {

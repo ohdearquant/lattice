@@ -82,12 +82,13 @@ fn drive(
 }
 
 fn cfg(max_new_tokens: usize) -> GenerateConfig {
-    let mut config = GenerateConfig::default();
-    config.max_new_tokens = max_new_tokens;
-    config.temperature = 0.0;
-    config.top_k = 1;
-    config.repetition_penalty = 1.0;
-    config
+    GenerateConfig {
+        max_new_tokens,
+        temperature: 0.0,
+        top_k: 1,
+        repetition_penalty: 1.0,
+        ..Default::default()
+    }
 }
 
 #[test]
