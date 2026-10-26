@@ -1,6 +1,6 @@
 use super::*;
 use crate::lora_hook::NoopLoraHook;
-use crate::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
+use lattice_weights::f32_weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct RowShapeHook {

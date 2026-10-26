@@ -102,11 +102,12 @@ A deeper Qwen3.5-specific walkthrough lives in `docs/forward-pass.md`.
 `model/qwen.rs` (config struct, weights struct, `load` function, `encode`/`forward` method).
 Wire the new architecture into `lattice-embed`'s `EmbeddingModel` enum when ready.
 
-**Attention kernel change.** CPU attention kernels that build only on the CPU primitives
-live in `lattice-compute` (`crates/compute/src/attention/`, e.g. `flash_causal.rs`) and keep
-their `lattice_inference::attention` paths through named re-exports, as do the GatedDeltaNet
-kernels. Standard attention, GDN backward and `AttentionTag` stay in `attention/` here. A new kernel goes in its own file,
-registers a variant on `AttentionTag`, and dispatches from the relevant `forward/` backend. See
+**Attention kernel change.** The CPU attention kernels (standard, tiled, grouped-query,
+decode and the other variants), the GatedDeltaNet kernels and the `AttentionKind`/`AttentionTag`
+taxonomy live in `lattice-compute` (`crates/compute/src/attention/`, e.g. `flash_causal.rs`) and
+keep their `lattice_inference::attention` paths through named re-exports. GDN backward stays in
+`attention/` here. A new kernel goes in its own file in compute, registers a variant on
+`AttentionTag`, and dispatches from the relevant `forward/` backend. See
 `docs/architecture.md` for the full forward-pass walkthrough before touching this path.
 
 **Sampling or generation.** `sampling.rs` owns the shared `Sampler` and `SamplingConfig`
