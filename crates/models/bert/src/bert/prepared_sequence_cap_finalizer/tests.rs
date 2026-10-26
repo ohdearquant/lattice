@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::bert::prepared_sequence_cap::{
+use crate::bert::prepared_sequence_cap::{
     RawPreparedBertSequenceCapCandidate, RawPreparedBertSequenceCapCandidates,
     resolve_prepared_bert_sequence_cap,
 };

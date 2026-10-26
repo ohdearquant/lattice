@@ -1,7 +1,7 @@
 use super::*;
-use crate::model::BertModel;
-use crate::pool::BertPooling;
-use crate::weights::SafetensorsFile;
+use crate::bert::BertModel;
+use lattice_compute::pool::BertPooling;
+use lattice_weights::SafetensorsFile;
 
 #[test]
 fn checkpoint_is_deterministic_and_loads_all_twenty_one_tensors() {

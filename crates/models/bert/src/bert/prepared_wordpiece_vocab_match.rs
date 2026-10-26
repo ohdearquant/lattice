@@ -91,7 +91,7 @@ fn validate_cardinality_with_platform_max(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::bert::prepared_vocab_txt::{
+    use crate::bert::prepared_vocab_txt::{
         PreparedBertVocabTxtLimits, parse_prepared_bert_vocab_txt,
         validate_prepared_bert_wordpiece_vocab_txt,
     };

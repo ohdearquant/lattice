@@ -28,7 +28,8 @@ esac
 #       -> arch                       depends on inference-core, grammar, weights
 #         -> quant, compute           quant depends on inference-core, weights, arch; compute on inference-core, tokenizer, weights, arch
 #           -> embeddinggemma2        depends on arch, compute, inference-core, tokenizer, weights, model-io and optional metal-runtime
-#             -> inference            depends on embeddinggemma2 and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime
+#           -> bert                   depends on arch, compute, inference-core, tokenizer, weights, model-io
+#             -> inference            depends on embeddinggemma2, bert and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime
 #               -> embed              depends on inference and embeddinggemma2
 #             -> serve                depends on inference (exact version), fann, tokenizer, weights
 #             -> tune                 depends on fann, inference
@@ -90,15 +91,16 @@ if [ -z "$FLAG" ]; then
     sleep 30
 fi
 
-echo "--- Tier 5: model family (depends on arch, compute and lower crates) ---"
+echo "--- Tier 5: model families (depend on arch, compute and lower crates) ---"
 cargo publish -p lattice-model-embeddinggemma2 $FLAG
+cargo publish -p lattice-model-bert $FLAG
 
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."
     sleep 30
 fi
 
-echo "--- Tier 6: inference (depends on the model family and lower crates) ---"
+echo "--- Tier 6: inference (depends on the model families and lower crates) ---"
 cargo publish -p lattice-inference $FLAG
 
 if [ -z "$FLAG" ]; then

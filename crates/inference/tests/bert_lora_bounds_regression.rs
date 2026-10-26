@@ -1,3 +1,5 @@
+#![cfg(feature = "bert")]
+
 //! Regression for the BERT cross-encoder LoRA geometry bounds bug.
 //!
 //! `apply_lora` (crates/tune/src/lora/apply.rs) slices

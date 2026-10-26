@@ -1,5 +1,5 @@
 use super::*;
-use crate::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
+use lattice_weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
 use std::num::NonZeroU64;
 
 fn nz(value: u64) -> NonZeroU64 {

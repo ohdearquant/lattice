@@ -347,6 +347,7 @@ fn the_registry_resolves_each_family_by_kind() {
         name(ResolveKey::ModelType("qwen3_5_moe"), ModelKind::Decoder),
         Ok("qwen35")
     );
+    #[cfg(feature = "bert")]
     assert_eq!(
         name(ResolveKey::ModelType("bert"), ModelKind::Encoder),
         Ok("bert")
@@ -356,6 +357,7 @@ fn the_registry_resolves_each_family_by_kind() {
         name(ResolveKey::Family("embeddinggemma2"), ModelKind::Encoder),
         Ok("embeddinggemma2")
     );
+    #[cfg(feature = "bert")]
     assert_eq!(
         name(ResolveKey::ModelType("bert"), ModelKind::Decoder),
         Err(RegistryError::WrongKind {
@@ -379,6 +381,7 @@ fn the_registry_resolves_each_family_by_kind() {
             .load_decoder(&LoadRequest::new("/nonexistent"))
             .is_err()
     );
+    #[cfg(feature = "bert")]
     assert!(
         BERT.load_encoder(&LoadRequest::new("/nonexistent"))
             .is_err()
@@ -394,4 +397,14 @@ fn registry_omits_disabled_embeddinggemma2() {
             .resolve(ResolveKey::Family("embeddinggemma2"), ModelKind::Encoder)
             .is_err()
     );
+}
+
+#[test]
+#[cfg(not(feature = "bert"))]
+fn registry_does_not_register_a_disabled_bert_family() {
+    let registry = registry().expect("the enabled family table is valid");
+    assert!(matches!(
+        registry.resolve(ResolveKey::Family("bert"), ModelKind::Encoder),
+        Err(RegistryError::UnavailableFamily { .. })
+    ));
 }

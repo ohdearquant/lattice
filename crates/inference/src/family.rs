@@ -2,7 +2,7 @@
 //! the model families this crate loads.
 //!
 //! **Unstable**: [`QWEN35`](crate::family::QWEN35) offers a Qwen3.5 decoder on the CPU through
-//! [`Qwen35CpuDecoder`](crate::family::Qwen35CpuDecoder); [`BERT`](crate::family::BERT) and
+//! [`Qwen35CpuDecoder`](crate::family::Qwen35CpuDecoder); `BERT` (when `bert` is enabled) and
 //! `EMBEDDING_GEMMA2` (when `embeddinggemma2` is enabled) offer the CPU encoders of
 //! [`crate::encoder`]. [`registry`](crate::family::registry) builds their available descriptors. The
 //! Qwen3 embedding model has no descriptor yet: its loader chooses the Metal backend itself, so a
@@ -16,10 +16,8 @@ pub use lattice_arch::family::{
 
 use crate::decoder::DecoderSession;
 use crate::decoder::qwen_cpu::QwenCpuSession;
-use crate::encoder::{BertEncoder, Encoder};
 use crate::error::InferenceError;
 use crate::generation::GenerateConfig;
-use crate::model::BertModel;
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{
     check_context_budget, check_prompt_ids_in_vocab, check_prompt_not_empty,
@@ -212,11 +210,6 @@ fn load_qwen35(request: &LoadRequest) -> Result<Box<dyn DecoderModel>, Inference
     Ok(Box::new(Qwen35CpuDecoder::new(model)))
 }
 
-fn load_bert(request: &LoadRequest) -> Result<Arc<dyn Encoder>, InferenceError> {
-    let model = BertModel::from_directory(request.model_dir())?;
-    Ok(Arc::new(BertEncoder::new(Arc::new(model))?))
-}
-
 /// Qwen3.5 text generation on the CPU: `model_type` `qwen3_5`, `qwen3_5_moe` or `qwen3_5_text`.
 pub static QWEN35: FamilyDescriptor = FamilyDescriptor::decoder(
     "qwen35",
@@ -224,14 +217,16 @@ pub static QWEN35: FamilyDescriptor = FamilyDescriptor::decoder(
     load_qwen35,
 );
 
-/// BERT-family text embeddings on the CPU: `model_type` `bert`.
-pub static BERT: FamilyDescriptor = FamilyDescriptor::encoder("bert", &["bert"], load_bert);
+/// BERT-family text embeddings on the CPU.
+#[cfg(feature = "bert")]
+#[doc(inline)]
+pub use lattice_model_bert::family::BERT;
 
 #[cfg(feature = "embeddinggemma2")]
 #[doc(inline)]
 pub use lattice_model_embeddinggemma2::family::EMBEDDING_GEMMA2;
 
-/// A registry of [`QWEN35`], [`BERT`] and the enabled embedding families.
+/// A registry of [`QWEN35`] and the enabled embedding families.
 ///
 /// # Errors
 ///
@@ -240,6 +235,7 @@ pub use lattice_model_embeddinggemma2::family::EMBEDDING_GEMMA2;
 pub fn registry() -> Result<Registry, RegistryError> {
     Registry::new(&[
         &QWEN35,
+        #[cfg(feature = "bert")]
         &BERT,
         #[cfg(feature = "embeddinggemma2")]
         &EMBEDDING_GEMMA2,

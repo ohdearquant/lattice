@@ -17,6 +17,7 @@ members = [
     "crates/compute",
     "crates/model-io",
     "crates/models/embeddinggemma2",
+    "crates/models/bert",
 ]
 
 [workspace.package]
@@ -111,6 +112,7 @@ tower = "0.5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 metal = "0.33"
 objc = "0.2"
+approx = "0.5"
 
 lattice-arch = { version = "0.15.0", path = "crates/arch" }
 lattice-compute = { version = "0.15.0", path = "crates/compute" }
@@ -120,6 +122,7 @@ lattice-model-io = { version = "0.15.0", path = "crates/model-io", default-featu
 lattice-tokenizer = { version = "0.15.0", path = "crates/tokenizer" }
 lattice-weights = { version = "0.15.0", path = "crates/weights" }
 lattice-model-embeddinggemma2 = { version = "0.15.0", path = "crates/models/embeddinggemma2" }
+lattice-model-bert = { version = "0.15.0", path = "crates/models/bert", default-features = false }
 
 [workspace.lints.clippy]
 # Correctness

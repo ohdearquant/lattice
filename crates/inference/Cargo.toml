@@ -45,17 +45,18 @@ bins = [
 ]
 
 [features]
-default = ["std", "download", "image", "embeddinggemma2"]
+default = ["std", "download", "image", "bert", "embeddinggemma2"]
+bert = ["dep:lattice-model-bert"]
 embeddinggemma2 = ["dep:lattice-model-embeddinggemma2"]
 # Unsupported, version-coupled interface for `lattice-serve` (ADR-103
 # Amendment 4): the hidden `serving_support` module and the router items it
 # needs. Off by default; `lattice-serve` depends on this crate with an exact
 # version and enables it. Not part of the public API.
 serving-support = []
-std = []
+std = ["lattice-model-bert?/std"]
 # Encoded PNG/JPEG input; raw image tensors remain available without decoding.
 image = ["dep:image", "lattice-model-io/image", "lattice-model-embeddinggemma2?/image"]
-f16 = ["lattice-weights/f16"]
+f16 = ["lattice-weights/f16", "lattice-model-bert?/f16"]
 # lattice-fann supplies the shared LoRA descriptor/blend-validation module
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
 # be present whenever this feature is — not just under `mixture`.
@@ -63,10 +64,10 @@ metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:l
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 bench-internals = ["lattice-compute/bench-internals", "lattice-grammar/bench-internals"]
 # Stock `gemm` for multi-row `matmul_bt` on Linux x86_64 (ADR-099 F1, step 1). Off by default.
-x86-gemm = ["lattice-compute/x86-gemm"]
+x86-gemm = ["lattice-compute/x86-gemm", "lattice-model-bert?/x86-gemm"]
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
 backfill = ["dep:rusqlite", "f16"]
-download = ["lattice-model-io/download"]
+download = ["lattice-model-io/download", "lattice-model-bert?/download"]
 train-backward = []
 # AdapterRouter gate: enables the lattice-fann backed routing module.
 # generate_with_lora_mixture does NOT require this feature — it is always
@@ -90,9 +91,10 @@ signpost = []
 # lattice_serve.rs) link against this crate as an ordinary dependency and
 # cannot see its `#[cfg(test)]`-only internals -- only a real Cargo feature
 # crosses that boundary.
-test-utils = []
+test-utils = ["lattice-model-bert?/test-utils"]
 
 [dependencies]
+lattice-model-bert = { workspace = true, optional = true }
 half.workspace = true
 memmap2 = "0.9"
 indexmap.workspace = true
@@ -331,6 +333,7 @@ harness = false
 
 [[bench]]
 name = "inference_bench"
+required-features = ["bert"]
 harness = false
 
 [[bench]]
@@ -339,6 +342,7 @@ harness = false
 
 [[bench]]
 name = "e2e_bench"
+required-features = ["bert"]
 harness = false
 
 [[bench]]
@@ -438,3 +442,11 @@ required-features = ["embeddinggemma2"]
 [[example]]
 name = "dump_embeddinggemma2_vision"
 required-features = ["embeddinggemma2"]
+
+[[example]]
+name = "bench_embed_quality"
+required-features = ["bert"]
+
+[[example]]
+name = "load_cross_encoder"
+required-features = ["bert"]

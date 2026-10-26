@@ -1,9 +1,9 @@
 use super::CrossEncoderModel;
-use crate::attention::AttentionBuffers;
-use crate::error::InferenceError;
-use crate::forward::cpu::matmul_bt;
-use crate::model::bert::weight_loading::{load_classifier_weights, load_weights};
-use crate::weights::SafetensorsFile;
+use crate::bert::weight_loading::{load_classifier_weights, load_weights};
+use lattice_compute::attention::standard::AttentionBuffers;
+use lattice_compute::forward::cpu::matmul_bt;
+use lattice_inference_core::InferenceError;
+use lattice_weights::SafetensorsFile;
 
 use lattice_weights::test_fixtures::bert_namespace as fixture;
 

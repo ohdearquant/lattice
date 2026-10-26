@@ -1,3 +1,5 @@
+#![cfg(feature = "bert")]
+
 //! `BertModel::from_bytes_with_max_tokens` caps the input length the model
 //! embeds at the caller's value, keeps the closing separator, never exceeds
 //! the position-embedding table, and refuses a cap with no room for the two

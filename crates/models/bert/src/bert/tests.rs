@@ -1,13 +1,14 @@
 use super::*;
-use crate::forward::cpu::gelu;
-use crate::pool::{cls_pool, l2_normalize, mean_pool};
 use approx::assert_relative_eq;
+use lattice_compute::forward::cpu::gelu;
+use lattice_compute::pool::{cls_pool, l2_normalize, mean_pool};
 use std::sync::Mutex;
 
 #[test]
 #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
 fn test_encode_output_shape_and_l2_norm() {
-    let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let model_dir =
+        lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
 
     let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
     let embedding = model.encode("hello world").unwrap();
@@ -26,7 +27,7 @@ fn test_encode_output_shape_and_l2_norm() {
 #[ignore = "requires LATTICE_INFERENCE_BYTES_MODEL_DIR"]
 fn test_from_bytes_matches_from_directory() {
     let model_dir =
-        crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_BYTES_MODEL_DIR");
+        lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_BYTES_MODEL_DIR");
     let dir = Path::new(&model_dir);
 
     let weights_bytes = fs::read(dir.join("model.safetensors")).unwrap();
@@ -87,7 +88,8 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
 fn test_encode_batch_matches_per_item_encode_mixed_lengths() {
-    let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let model_dir =
+        lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
     let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
 
     // Mixed lengths (short to long) force real padding across the batch.
@@ -135,7 +137,8 @@ fn test_encode_batch_matches_per_item_encode_mixed_lengths() {
 #[test]
 #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
 fn test_encode_batch_boundary_max_and_min_length() {
-    let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let model_dir =
+        lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
     let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
 
     // One sequence at exactly the model's max position length, one at length 1
@@ -171,7 +174,7 @@ fn test_encode_batch_boundary_max_and_min_length() {
 // packed `cu_seqlens`-indexed forward pass must match `encode_batch_padded_reference`'s
 // independently computed pre-#677 padded forward pass (preserved verbatim as a
 // `#[cfg(test)]`-only reference; see `forward_batch_padded_reference` and
-// `crate::attention::multi_head_attention_batched_padded_reference`).
+// `crate::bert::padded_reference::multi_head_attention_batched_padded_reference`).
 //
 // Both sides call `encode_batch_packed`/`encode_batch_padded_reference`
 // directly, bypassing the public `encode_batch`'s single-item shortcut
@@ -218,7 +221,8 @@ fn test_encode_batch_boundary_max_and_min_length() {
 #[test]
 #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
 fn encode_batch_packed_matches_padded() {
-    let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let model_dir =
+        lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
     let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
 
     let short = "hi";
@@ -424,7 +428,7 @@ impl LoraHook for CapturingDeltaHook {
 fn tokenize_and_buffers(
     model: &BertModel,
     text: &str,
-) -> (crate::tokenizer::TokenizedInput, AttentionBuffers) {
+) -> (lattice_tokenizer::TokenizedInput, AttentionBuffers) {
     let input = model.tokenizer.tokenize(text);
     let seq_len = input.real_length;
     let buffers = AttentionBuffers::new(
@@ -439,7 +443,8 @@ fn tokenize_and_buffers(
 #[test]
 #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
 fn test_ffn_intermediate_lora_delta_lands_before_gelu() {
-    let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let model_dir =
+        lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
     let mut model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
 
     // Truncate to a single transformer layer so the adapter's effect does
@@ -690,5 +695,81 @@ fn bert_model_pool_has_an_arm_for_every_pooling_variant() {
             expected,
             "{pooling:?}"
         );
+    }
+}
+
+#[test]
+fn attention_projection_view_reads_each_attention_tensor_of_the_layer() {
+    use lattice_weights::{Tensor1D, Tensor2D};
+
+    let (hidden, kv) = (4, 2);
+    let lens = [
+        hidden * hidden,
+        hidden,
+        kv * hidden,
+        kv,
+        kv * hidden,
+        kv,
+        hidden * hidden,
+        hidden,
+    ];
+    let attention: [Vec<f32>; 8] = std::array::from_fn(|i| vec![i as f32 + 1.0; lens[i]]);
+    let unused = vec![0.0f32; hidden * hidden];
+    let row = &unused[..hidden];
+    fn matrix(data: &[f32], rows: usize, cols: usize) -> Tensor2D<'_> {
+        Tensor2D { data, rows, cols }
+    }
+    fn vector(data: &[f32]) -> Tensor1D<'_> {
+        Tensor1D {
+            data,
+            len: data.len(),
+        }
+    }
+    let a = &attention;
+    let layer = TransformerLayerWeights {
+        query_weight: matrix(&a[0], hidden, hidden),
+        query_bias: vector(&a[1]),
+        key_weight: matrix(&a[2], kv, hidden),
+        key_bias: vector(&a[3]),
+        value_weight: matrix(&a[4], kv, hidden),
+        value_bias: vector(&a[5]),
+        attn_output_weight: matrix(&a[6], hidden, hidden),
+        attn_output_bias: vector(&a[7]),
+        attn_layer_norm_weight: vector(row),
+        attn_layer_norm_bias: vector(row),
+        ffn_intermediate_weight: matrix(&unused, hidden, hidden),
+        ffn_intermediate_bias: vector(row),
+        ffn_output_weight: matrix(&unused, hidden, hidden),
+        ffn_output_bias: vector(row),
+        ffn_layer_norm_weight: vector(row),
+        ffn_layer_norm_bias: vector(row),
+    };
+
+    let view = bert_attention_projections(&layer);
+    let weights = [
+        (view.query_weight, 0, hidden),
+        (view.key_weight, 2, kv),
+        (view.value_weight, 4, kv),
+        (view.output_weight, 6, hidden),
+    ];
+    for (tensor, index, rows) in weights {
+        assert!(
+            std::ptr::eq(tensor.data, a[index].as_slice()),
+            "weight {index}"
+        );
+        assert_eq!((tensor.rows, tensor.cols), (rows, hidden), "weight {index}");
+    }
+    let biases = [
+        (view.query_bias, 1),
+        (view.key_bias, 3),
+        (view.value_bias, 5),
+        (view.output_bias, 7),
+    ];
+    for (tensor, index) in biases {
+        assert!(
+            std::ptr::eq(tensor.data, a[index].as_slice()),
+            "bias {index}"
+        );
+        assert_eq!(tensor.len, lens[index], "bias {index}");
     }
 }

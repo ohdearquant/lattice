@@ -618,9 +618,9 @@ fn bert_family_public_function_paths_preserve_borrowed_and_owned_signatures() {
         &'a SafetensorsFile,
         usize,
         usize,
-    ) -> Result<BertWeights<'a>, InferenceError> = crate::model::bert::weight_loading::load_weights;
+    ) -> Result<BertWeights<'a>, InferenceError> = crate::bert::weight_loading::load_weights;
     let classify: fn(&SafetensorsFile, usize) -> Result<CrossEncoderWeights, InferenceError> =
-        crate::model::bert::weight_loading::load_classifier_weights;
+        crate::bert::weight_loading::load_classifier_weights;
     let source = source_from(&fixture::checkpoint("bert.", false));
     let weights = load(&source, 2, 4).unwrap();
     assert_eq!(

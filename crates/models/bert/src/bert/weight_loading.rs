@@ -1,7 +1,7 @@
 //! BERT encoder and classifier weight assembly from safetensors.
 
-use crate::error::InferenceError;
-use crate::weights::{
+use lattice_inference_core::InferenceError;
+use lattice_weights::{
     BertWeights, CrossEncoderWeights, SafetensorsFile, Tensor1D, Tensor2D, TransformerLayerWeights,
 };
 use std::borrow::Cow;
@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 /// A borrowed result keeps its source lifetime:
 ///
 /// ```rust,no_run
-/// use lattice_inference::model::bert::weight_loading::load_weights;
-/// use lattice_inference::weights::{BertWeights, SafetensorsFile};
+/// use lattice_model_bert::bert::weight_loading::load_weights;
+/// use lattice_weights::{BertWeights, SafetensorsFile};
 ///
 /// fn borrowed(source: &SafetensorsFile) -> BertWeights<'_> {
 ///     load_weights(source, 2, 4).unwrap()
@@ -27,8 +27,8 @@ use std::collections::BTreeSet;
 /// An owned source cannot lend an escaping static result:
 ///
 /// ```compile_fail
-/// use lattice_inference::model::bert::weight_loading::load_weights;
-/// use lattice_inference::weights::{BertWeights, SafetensorsFile};
+/// use lattice_model_bert::bert::weight_loading::load_weights;
+/// use lattice_weights::{BertWeights, SafetensorsFile};
 ///
 /// fn detached(source: SafetensorsFile) -> BertWeights<'static> {
 ///     load_weights(&source, 2, 4).unwrap()
@@ -194,8 +194,8 @@ pub fn load_weights(
 /// The owned result can leave a local source behind:
 ///
 /// ```rust,no_run
-/// use lattice_inference::model::bert::weight_loading::load_classifier_weights;
-/// use lattice_inference::weights::{CrossEncoderWeights, SafetensorsFile};
+/// use lattice_model_bert::bert::weight_loading::load_classifier_weights;
+/// use lattice_weights::{CrossEncoderWeights, SafetensorsFile};
 ///
 /// fn owned(source: SafetensorsFile) -> CrossEncoderWeights {
 ///     load_classifier_weights(&source, 4).unwrap()

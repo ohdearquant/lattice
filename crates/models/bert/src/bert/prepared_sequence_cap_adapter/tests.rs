@@ -1,9 +1,9 @@
 use super::*;
-use crate::model::bert::prepared_config::{
+use crate::bert::prepared_config::{
     PreparedBertConfigLimits, PreparedBertConfigValueKind, parse_prepared_bert_config_json,
 };
-use crate::model::bert::prepared_sequence_cap::PreparedBertSequenceCapSource;
-use crate::model::bert::prepared_tokenizer_config::{
+use crate::bert::prepared_sequence_cap::PreparedBertSequenceCapSource;
+use crate::bert::prepared_tokenizer_config::{
     PreparedBertTokenizerConfigLimits, parse_prepared_bert_tokenizer_config_json,
 };
 use std::num::NonZeroU64;
