@@ -348,7 +348,6 @@ fn test_conv_state_rolling() {
 
 #[test]
 fn test_gated_delta_net_single_step_known_output() {
-    // Create a minimal config for testing
     let geometry = geometry_of(qwen35_2b_like());
     let num_heads = geometry.num_key_heads();
     let _key_dim = geometry.key_head_dim();

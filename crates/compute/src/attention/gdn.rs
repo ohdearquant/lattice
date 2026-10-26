@@ -40,9 +40,9 @@ pub struct GdnDimensions {
 ///
 /// Built only by [`GdnGeometry::new`], which checks that every dimension is non-zero, that the
 /// value heads divide evenly over the key heads, that the norm epsilon is finite and positive,
-/// and that every width the kernels derive from these values, and the recurrent state they
-/// allocate, fits in memory's address range. The derived widths are computed on read, never
-/// stored separately.
+/// that the QKV and output widths do not overflow `usize`, and that the recurrent state and the
+/// convolution weights each fit in the largest allocation. Scratch buffers sized from these widths
+/// are not bounded here. The derived widths are computed on read, never stored separately.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GdnGeometry {
     dims: GdnDimensions,
