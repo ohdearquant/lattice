@@ -9,6 +9,3 @@ pub use lattice_compute::gemma_ops::{
 pub use lattice_compute::gemma_rope::{
     gemma4_rope_cos_sin, gemma4_rope_inv_freq, vision_axial_rope_inv_freq,
 };
-
-#[cfg(test)]
-mod tests;

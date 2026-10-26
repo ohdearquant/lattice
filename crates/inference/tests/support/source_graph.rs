@@ -27,6 +27,7 @@ pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &[
     "../models/qwen3",
     "../models/gemma4",
     "../models/ernie45",
+    "../models/qwen35",
 ];
 
 #[derive(Clone, Debug)]
@@ -173,6 +174,7 @@ pub(crate) fn validate_scanned_package_membership(
             || name == "lattice-model-qwen3"
             || name == "lattice-model-gemma4"
             || name == "lattice-model-ernie45"
+            || name == "lattice-model-qwen35"
         {
             expected.insert(identity.clone());
         }

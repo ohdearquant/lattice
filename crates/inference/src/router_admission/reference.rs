@@ -364,6 +364,7 @@ mod scoring {
     }
 
     #[cfg(all(
+        feature = "qwen35",
         feature = "serving-support",
         feature = "f16",
         target_os = "macos",
@@ -440,7 +441,7 @@ mod scoring {
             adapters: &[ReferenceAdapter<'_>],
         ) -> Result<Vec<ReferencePayloadSummary>, ReferenceError> {
             use crate::quant::quarot::plan::AbsorptionSide;
-            let cfg = &state.engine.config;
+            let cfg = lattice_model_qwen35::__internal::engine_config(state);
             if adapters.len() != source.adapter_names().len() || adapters.is_empty() {
                 return Err(invalid(
                     "payload set differs from the trained adapter schema",
@@ -460,7 +461,8 @@ mod scoring {
                 )
                 .map_err(invalid)?;
                 if adapter.quarot_seed.is_some()
-                    && adapter.quarot_seed != state.engine.base_quarot_seed
+                    && adapter.quarot_seed
+                        != lattice_model_qwen35::__internal::base_quarot_seed(state)
                 {
                     return Err(invalid(
                         "adapter rotation seed does not match the base model",
@@ -530,7 +532,7 @@ mod scoring {
                             "adapter payload shape or finite-value validation failed",
                         ));
                     }
-                    if state.engine.base_quarot_seed.is_some() {
+                    if lattice_model_qwen35::__internal::base_quarot_seed(state).is_some() {
                         match plan.absorption_for_module(&layer.module) {
                             Some(AbsorptionSide::InputSide) if layer.d_in == cfg.hidden_size => {}
                             Some(AbsorptionSide::OutputSide) if layer.d_out == cfg.hidden_size => {}
@@ -748,9 +750,9 @@ mod scoring {
                 &mut execution,
                 &serde_json::to_vec(&(
                     bounds,
-                    state.engine.config.vocab_size,
+                    lattice_model_qwen35::__internal::engine_config(state).vocab_size,
                     state.max_context(),
-                    state.engine.base_quarot_seed,
+                    lattice_model_qwen35::__internal::base_quarot_seed(state),
                 ))
                 .map_err(|e| invalid(e.to_string()))?,
             )?;
@@ -820,7 +822,7 @@ mod scoring {
                 }
                 prepared.push((prompt, completion, parent, candidate));
             }
-            let vocab = state.engine.config.vocab_size;
+            let vocab = lattice_model_qwen35::__internal::engine_config(state).vocab_size;
             let mut arm = Arm(state);
             let mut totals = [0.0f64; 3];
             for (prompt, completion, parent, candidate) in prepared {
@@ -865,7 +867,8 @@ mod scoring {
             #[test]
             fn reference_scoring_metal_blend_changes_nll_and_cleans_up() {
                 let _gpu = gpu_test_lock();
-                let (cfg, weights) = crate::forward::metal_qwen35::reference_scoring_fixture();
+                let (cfg, weights) =
+                    lattice_model_qwen35::test_support::reference_scoring_fixture();
                 let mut state = MetalQwen35State::new(&weights, &cfg, 8)
                     .expect("reference witness requires a real Metal device");
                 let layers = |sign: f32| {
@@ -1280,6 +1283,7 @@ mod scoring {
 }
 
 #[cfg(all(
+    feature = "qwen35",
     feature = "serving-support",
     feature = "f16",
     target_os = "macos",

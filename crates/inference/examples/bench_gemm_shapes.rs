@@ -429,7 +429,8 @@ fn matmul_source() -> String {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-const Q4_TILED_SOURCE: &str = include_str!("../src/forward/shaders/gemm_q4_tiled.metal");
+const Q4_TILED_SOURCE: &str =
+    lattice_model_qwen35::forward::metal_qwen35::Q4_TILED_GEMM_SHADER_SOURCE;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 const F32_SG_SOURCE: &str = lattice_model_embeddinggemma2::shaders::GEMM_F32_SG;

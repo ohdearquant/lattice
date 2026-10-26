@@ -839,6 +839,7 @@ fn explicit_evaluation_budget_refuses_without_advancing_history() {
 }
 
 #[cfg(all(
+    feature = "qwen35",
     feature = "serving-support",
     feature = "f16",
     target_os = "macos",
@@ -846,11 +847,10 @@ fn explicit_evaluation_budget_refuses_without_advancing_history() {
 ))]
 mod reference_embedder_contract {
     use super::*;
-    use crate::forward::metal_qwen35::{
-        ChatMessage, MetalQwen35State, format_chat_template, reference_scoring_fixture,
-    };
+    use crate::forward::metal_qwen35::{ChatMessage, MetalQwen35State, format_chat_template};
     use crate::measurement::gpu_test_lock;
     use crate::tokenizer::bpe::BpeTokenizer;
+    use lattice_model_qwen35::test_support::reference_scoring_fixture;
     use std::cell::Cell;
 
     const REPRESENTATION_REFUSAL: &str =

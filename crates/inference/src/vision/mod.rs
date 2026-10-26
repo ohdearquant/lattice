@@ -84,7 +84,9 @@ pub mod paddleocr_preprocess;
 pub mod paddleocr_vit;
 pub mod pooled_embed;
 pub mod preprocess;
+#[cfg(feature = "qwen35")]
 pub mod qwen35_merger;
+#[cfg(feature = "qwen35")]
 pub mod qwen35_mrope;
 pub mod qwen35_vit;
 pub mod qwen35_vit_metal;

@@ -24,6 +24,7 @@ pub mod gemma4_preflight;
 #[cfg(feature = "paddleocr-vl")]
 pub mod paddleocr_vl;
 pub mod qwen;
+#[cfg(feature = "qwen35")]
 pub mod qwen35;
 pub mod qwen35_config;
 
@@ -40,6 +41,7 @@ pub use self::gemma4_model::Gemma4Model;
 pub use self::qwen::QwenConfig;
 #[cfg(feature = "qwen3")]
 pub use self::qwen::{LayerTimings, ProfileTimings, QwenModel};
+#[cfg(feature = "qwen35")]
 pub use self::qwen35::{HiddenPooling, Qwen35Model};
 #[deprecated(
     since = "0.11.0",

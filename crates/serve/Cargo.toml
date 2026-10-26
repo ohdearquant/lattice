@@ -23,7 +23,7 @@ bench-internals = ["lattice-inference/bench-internals"]
 [dependencies]
 # Exact version: `serving-support` is an unsupported interface that changes
 # with the facade, so the two crates release together (ADR-103 Amendment 4).
-lattice-inference = { version = "=0.15.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image"] }
+lattice-inference = { version = "=0.15.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image", "qwen35"] }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
 lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
@@ -52,7 +52,7 @@ tower = { workspace = true, features = ["util"] }
 metal = { version = "0.33", optional = true }
 
 [dev-dependencies]
-lattice-inference = { version = "=0.15.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image", "test-utils"] }
+lattice-inference = { version = "=0.15.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image", "test-utils", "qwen35"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }

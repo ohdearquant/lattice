@@ -1,0 +1,53 @@
+[package]
+name = "lattice-model-qwen35"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Qwen3.5 CPU and Metal model, checkpoint assembly and generation for Lattice"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+image = ["dep:image"]
+f16 = ["lattice-weights/f16"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:rayon", "dep:lattice-fann", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu"]
+bench-internals = ["lattice-compute/bench-internals"]
+gdn-state-counters = []
+router-learning = []
+serving-support = []
+signpost = []
+test-utils = []
+train-backward = []
+
+[dependencies]
+lattice-arch.workspace = true
+lattice-compute.workspace = true
+lattice-grammar.workspace = true
+lattice-inference-core.workspace = true
+lattice-model-io.workspace = true
+lattice-quant.workspace = true
+lattice-tokenizer.workspace = true
+lattice-weights.workspace = true
+lattice-fann = { workspace = true, optional = true }
+lattice-metal-runtime = { workspace = true, optional = true }
+half.workspace = true
+memmap2.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+image = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { workspace = true, optional = true }
+objc = { workspace = true, optional = true }
+
+[dev-dependencies]
+lattice-model-io = { workspace = true, features = ["test-utils"] }
+lattice-weights = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true

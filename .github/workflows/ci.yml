@@ -1316,6 +1316,21 @@ jobs:
           fi
           cat "$log"
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: qwen35 — metal-gpu Q4 tests (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/qwen35-metal-q4-tests.log"
+          if cargo test -p lattice-model-qwen35 --features f16,image,metal-gpu --lib q4 -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # ADR-080 C1 / #789: the Qwen3 Metal module's assembled-MSL check and the
       # The NaN/+inf fused_attention fail-closed regressions (#789) silently
       # early-returned when no Metal device was present and were never actually run
@@ -1368,7 +1383,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-compact-min-p-test.log"
-          if ! cargo test -p lattice-inference --features f16,metal-gpu --lib min_p_compact_sampling_tests:: -- --nocapture >"$log" 2>&1; then
+          if ! cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib min_p_compact_sampling_tests:: -- --nocapture >"$log" 2>&1; then
             cat "$log"
             exit 1
           fi
@@ -1386,7 +1401,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-prefill-gdn-refusal.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1407,7 +1422,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-prefix-cache-grammar-rejection.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::grammar::generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_saves_consistent_boundary' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1429,7 +1444,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-prefix-cache-disposition.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::prefix_cache_disposition::' \
             -- --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1455,7 +1470,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-gdn-qk-eps-scale.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::gdn_chunked_scan::gdn_850_failclosed::gdn_qk_l2_norm_is_not_scale_invariant_1583' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1472,7 +1487,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-gdn-qk-eps-cliff.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::gdn_chunked_scan::gdn_850_failclosed::gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1504,7 +1519,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-gdn-state.log"
-          if ! cargo test -p lattice-inference --features f16,metal-gpu --lib metal_gdn_state_ -- --nocapture >"$log" 2>&1; then
+          if ! cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib metal_gdn_state_ -- --nocapture >"$log" 2>&1; then
             cat "$log"
             exit 1
           fi
@@ -1517,7 +1532,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-mtp-cursor-preflight.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::mtp_hidden_tap::mtp_verifier_boundaries_reject_mismatched_live_cursor' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1536,7 +1551,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-raw-step-cursor-preflight.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::mtp_hidden_tap::raw_step_with_mtp_rejects_stale_live_cursor_without_mutation' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1555,7 +1570,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-raw-prefill-fresh-session.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::mtp_hidden_tap::raw_prefills_with_mtp_reject_live_session_without_mutation' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1576,7 +1591,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-bench-prefill-cursor-preflight.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu,bench-internals --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,bench-internals,image --lib \
             'forward::metal_qwen35::inner::tests::mtp_hidden_tap::bench_prefill_helpers_reject_stale_cursor_without_mutation' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1599,7 +1614,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-step-proof.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1616,7 +1631,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-prefill-proof.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1636,7 +1651,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-hybrid-gdn-proof.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::mtp_hidden_tap::forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1698,7 +1713,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-vision-driver-bypass.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::speculative_route::generate_multimodal_vision_keeps_its_declared_driver_bypass' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1715,7 +1730,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-text-patch-driver-bypass.log"
-          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib \
             'forward::metal_qwen35::inner::tests::speculative_route::generate_multimodal_text_patch_keeps_its_declared_driver_bypass' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
@@ -1750,7 +1765,13 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-grammar-failclosed-test.log"
-          cargo test -p lattice-inference --features f16,metal-gpu --lib fails_closed_on_all_blocking_grammar -- --nocapture 2>&1 | tee "$log"
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib fails_closed_on_all_blocking_grammar -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
           grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # #611 (medium): the three tests above only reach
       # the post-prefill masking site (their fixture blocks every vocab entry
@@ -1770,7 +1791,13 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-grammar-failclosed-decode-test.log"
-          cargo test -p lattice-inference --features f16,metal-gpu --lib fails_closed_on_grammar_dead_end -- --nocapture 2>&1 | tee "$log"
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib fails_closed_on_grammar_dead_end -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
           grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # Issue #252 (#238 follow-up): the f16 KV-cache Metal path (opt-in via
       # LATTICE_KV_F16) had no automated test. GitHub's hosted macos-latest
@@ -1791,7 +1818,13 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/f16-kv-metal-test.log"
-          cargo test -p lattice-inference --features f16,metal-gpu --lib f16_kv_metal_path_executes_and_reports_capability -- --nocapture 2>&1 | tee "$log"
+          if cargo test -p lattice-model-qwen35 --features f16,metal-gpu,image --lib f16_kv_metal_path_executes_and_reports_capability -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
           grep -Fq '[METAL_F16_KV_CAPABILITY] supported=true' "$log"
 

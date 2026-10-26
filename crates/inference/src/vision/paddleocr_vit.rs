@@ -23,11 +23,11 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use super::qwen35_merger::gelu_exact;
-use super::qwen35_vit::{apply_rope_inplace, multihead_attention_full};
 use super::vit::{batch_matvec, gelu, layer_norm};
 use crate::error::InferenceError;
 use crate::weights::TensorSource;
+use lattice_compute::vision::gelu_exact;
+use lattice_compute::vision::{apply_rope_inplace, multihead_attention_full};
 
 /// Vision-tower and projector hyperparameters read from the checkpoint's
 /// `config.json` (`vision_config` plus the text `hidden_size` the projector

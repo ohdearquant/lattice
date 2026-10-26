@@ -1689,6 +1689,7 @@ dependencies = [
  "lattice-model-gemma4",
  "lattice-model-io",
  "lattice-model-qwen3",
+ "lattice-model-qwen35",
  "lattice-quant",
  "lattice-tokenizer",
  "lattice-weights",
@@ -1832,6 +1833,33 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "lattice-model-qwen35"
+version = "0.15.0"
+dependencies = [
+ "half",
+ "image",
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-fann",
+ "lattice-grammar",
+ "lattice-inference-core",
+ "lattice-metal-runtime",
+ "lattice-model-io",
+ "lattice-quant",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "memmap2",
+ "metal 0.33.0",
+ "objc",
+ "rayon",
+ "rustc-hash 2.1.3",
+ "serde",
+ "serde_json",
  "tempfile",
  "tracing",
 ]
