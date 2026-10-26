@@ -12,13 +12,13 @@ use metal::{
     MTLCommandBufferStatus, MTLSize,
 };
 
-use crate::error::InferenceError;
-use crate::forward::metal_runtime::{
-    self, BufferPolicy, ELEMENT_THREADS, UploadCopy, ZeroLengthPolicy, bind, element_dispatch,
-    scalar,
-};
 use crate::model::ernie45::{Ernie45Config, Ernie45LayerWeights, Ernie45Weights, MAX_SEQ_LEN};
-use crate::model::gemma4_ops::{gemma4_rope_cos_sin, gemma4_rope_inv_freq};
+use lattice_compute::gemma_rope::{gemma4_rope_cos_sin, gemma4_rope_inv_freq};
+use lattice_inference_core::InferenceError;
+use lattice_metal_runtime::{
+    self as metal_runtime, BufferPolicy, ELEMENT_THREADS, UploadCopy, ZeroLengthPolicy, bind,
+    element_dispatch, scalar,
+};
 
 const SHADERS: &str = metal_runtime::concat_msl!(
     metal_runtime::msl::RMS_REDUCE,

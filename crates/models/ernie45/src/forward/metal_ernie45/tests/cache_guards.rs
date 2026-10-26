@@ -1,7 +1,7 @@
 use super::super::{MetalErnie45KvCache, MetalErnie45State};
-use crate::InferenceError;
-use crate::measurement::gpu_test_lock;
 use crate::model::ernie45::{Ernie45Config, Ernie45LayerWeights, Ernie45Weights};
+use lattice_inference_core::InferenceError;
+use lattice_metal_runtime::measurement::gpu_test_lock;
 
 const STATE_CAPACITY: usize = 4;
 const VOCAB: usize = 8;

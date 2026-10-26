@@ -44,6 +44,8 @@
 //!     --test paddleocr_vl_e2e_goldens_test -- --nocapture
 //! ```
 
+#![cfg(feature = "paddleocr-vl")]
+
 #[test]
 fn e2e_forward_matches_hf_reference() {
     // BF16/F16 safetensors tensors decode to f32 unconditionally (no feature

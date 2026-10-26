@@ -360,3 +360,47 @@ fn qwen_family_membership_and_construction_guards_are_required() {
     assert!(unguarded.classified.is_empty());
     assert_eq!(unguarded.violations.len(), 1);
 }
+
+#[test]
+fn scanned_package_membership_requires_ernie45_and_rejects_extra_packages() {
+    let mut fixture = PackageFixture::new("fn main() {}", "fn main() {}");
+    let family = fixture._directory.path().join("models/ernie45");
+    std::fs::create_dir_all(family.join("src")).expect("create family fixture source directory");
+    std::fs::write(family.join("src/lib.rs"), "").expect("write family fixture source");
+    let manifest = family.join("Cargo.toml");
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"lattice-model-ernie45\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write family fixture manifest");
+    fixture.metadata["packages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "fixture:lattice-model-ernie45",
+            "name": "lattice-model-ernie45",
+            "manifest_path": manifest,
+            "dependencies": [],
+        }));
+    fixture.metadata["workspace_members"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("fixture:lattice-model-ernie45"));
+    let complete = [".", "../serve", "../models/ernie45"];
+    validate_scanned_package_membership(&fixture.inference, &complete, &fixture.metadata)
+        .expect("accept the family and serving consumers together");
+    let omitted = validate_scanned_package_membership(
+        &fixture.inference,
+        &[".", "../serve"],
+        &fixture.metadata,
+    )
+    .expect_err("omitting the family must fail membership validation");
+    assert!(omitted.contains("membership mismatch"), "{omitted}");
+    let extra = validate_scanned_package_membership(
+        &fixture.inference,
+        &[".", "../serve", "../models/ernie45", "../core"],
+        &fixture.metadata,
+    )
+    .expect_err("an extra unrelated package must fail membership validation");
+    assert!(extra.contains("membership mismatch"), "{extra}");
+}

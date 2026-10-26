@@ -28,7 +28,7 @@ fn config(head_dim: usize) -> crate::model::ernie45::Ernie45Config {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn metal_ernie45_rejects_unsupported_head_dim() {
     use super::state::validate_shape;
-    use crate::InferenceError;
+    use lattice_inference_core::InferenceError;
     validate_shape(&config(128), 17).expect("supported HD128 configuration");
     let unsupported = config(64);
     unsupported
@@ -47,8 +47,8 @@ fn metal_ernie45_rejects_unsupported_head_dim() {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn metal_ernie45_rejects_empty_layers_and_invalid_capacity() {
     use super::state::validate_shape;
-    use crate::InferenceError;
     use crate::model::ernie45::MAX_SEQ_LEN;
+    use lattice_inference_core::InferenceError;
     let mut empty = config(128);
     empty.num_hidden_layers = 0;
     assert!(matches!(
@@ -71,10 +71,10 @@ mod real {
     mod mrope;
 
     use super::super::MetalErnie45State;
-    use crate::InferenceError;
-    use crate::measurement::gpu_test_lock;
     use crate::model::ernie45::{Ernie45Config, Ernie45Model, Ernie45Trace, Ernie45Weights};
-    use crate::weights::SafetensorsFile;
+    use lattice_inference_core::InferenceError;
+    use lattice_metal_runtime::measurement::gpu_test_lock;
+    use lattice_weights::f32_weights::SafetensorsFile;
     use serde::Deserialize;
     use std::path::PathBuf;
 

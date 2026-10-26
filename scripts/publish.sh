@@ -98,6 +98,7 @@ cargo publish -p lattice-model-embeddinggemma2 $FLAG
 cargo publish -p lattice-model-bert $FLAG
 cargo publish -p lattice-model-qwen3 $FLAG
 cargo publish -p lattice-model-gemma4 $FLAG
+cargo publish -p lattice-model-ernie45 $FLAG
 
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."
