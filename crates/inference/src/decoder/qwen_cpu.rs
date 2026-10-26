@@ -75,9 +75,7 @@ use crate::sampling::compute_step_logprobs;
 /// `model::qwen35::generation` (row R03): this is the one site that still masks logits
 /// before sampling; `model::qwen35::generation`'s own tests reach it via
 /// `crate::decoder::qwen_cpu::has_finite_logit`, not a private copy.
-pub(crate) fn has_finite_logit(logits: &[f32]) -> bool {
-    logits.iter().any(|&l| l > f32::NEG_INFINITY)
-}
+pub(crate) use lattice_arch::__internal::has_finite_logit;
 
 /// `ExecutionCapabilities` for the base CPU dense entry point. All four true: this is the
 /// same family `generate()`/`generate_streaming()` wire directly (see the doc comment on

@@ -39,7 +39,7 @@ pub mod sampling;
 pub mod stop_reason;
 mod stop_strings;
 
-/// Configuration and generation glue used by the `lattice-inference` facade.
+/// Configuration and generation glue used by model families and the inference facade.
 ///
 /// Not part of the supported API. The facade reaches these items by their full path and never
 /// re-exports them publicly.
@@ -62,6 +62,43 @@ pub mod __internal {
     };
     pub use crate::stop_strings::{StopStringMatcher, earliest_stop_match};
 
+    /// Shared generation seed mapping, including the nonzero clock fallback.
+    pub fn initial_rng_state(seed: Option<u64>) -> u64 {
+        match seed {
+            Some(s) => {
+                if s == 0 {
+                    1
+                } else {
+                    s
+                }
+            }
+            None => {
+                use std::time::SystemTime;
+                let t = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x12345678_9abcdef0);
+                if t == 0 { 1 } else { t }
+            }
+        }
+    }
+
+    /// Shared prompt admission used before allocating per-request state.
+    ///
+    /// # Errors
+    /// Returns `InferenceError::Inference` with the existing empty-prompt diagnostic.
+    pub fn check_prompt_not_empty(prompt_len: usize) -> Result<(), InferenceError> {
+        if prompt_len == 0 {
+            return Err(InferenceError::Inference("empty prompt".into()));
+        }
+        Ok(())
+    }
+
+    /// Shared masked-logit admission with the existing strict comparison semantics.
+    pub fn has_finite_logit(logits: &[f32]) -> bool {
+        logits.iter().any(|&l| l > f32::NEG_INFINITY)
+    }
+
     /// The speculative extension of the decoder session contract and its driver (ADR-090 D2,
     /// D6), which the facade's Qwen Metal routes implement and run.
     pub mod decoder {
@@ -75,3 +112,6 @@ pub mod __internal {
         crate::qwen35_config::checked_double(value, what)
     }
 }
+
+#[cfg(test)]
+mod generation_helpers_tests;
