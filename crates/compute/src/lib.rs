@@ -30,6 +30,8 @@ pub mod option_scoring;
 pub mod pool;
 pub mod pruning;
 pub mod rope;
+#[doc(hidden)]
+pub mod vision;
 
 /// Cache and attention glue used by the `lattice-inference` facade.
 ///

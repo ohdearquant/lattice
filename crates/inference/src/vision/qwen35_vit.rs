@@ -25,10 +25,11 @@
 
 use super::VisionError;
 use super::checkpoint::Qwen35VisionWeights;
-use super::vit::{batch_matvec, gelu, layer_norm, softmax_inplace};
+use super::vit::{batch_matvec, gelu, layer_norm};
 use crate::model::qwen35_config::VisionModelConfig;
 #[cfg(feature = "image")]
 use image::ImageReader;
+pub(crate) use lattice_compute::vision::{apply_rope_inplace, multihead_attention_full};
 #[cfg(feature = "image")]
 use std::io::Cursor;
 
@@ -447,25 +448,6 @@ fn bilinear_pos_embed(
     }
 }
 
-/// Apply rotate-half RoPE to one `[head_dim]` vector in place, given
-/// `cos`/`sin` each `[head_dim]` (matches `apply_rotary_pos_emb_vision` in
-/// the HF reference: `x_embed = x * cos + rotate_half(x) * sin`, where
-/// `rotate_half(x) = cat(-x[half:], x[:half])`).
-///
-/// `pub(crate)` so the S3b Metal port (`qwen35_vit_metal.rs`) can reuse this
-/// exact function for its own RoPE application rather than re-deriving the
-/// rotate-half convention (ADR-069 S3b's "zero independent convention
-/// decisions" contract).
-pub(crate) fn apply_rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32]) {
-    let half = x.len() / 2;
-    for i in 0..half {
-        let a = x[i];
-        let b = x[half + i];
-        x[i] = a * cos[i] + (-b) * sin[i];
-        x[half + i] = b * cos[half + i] + a * sin[half + i];
-    }
-}
-
 /// Build the per-patch bilinear-interpolated position-embedding contribution
 /// (`[n * hidden]`, to be added into the patch-embedded hidden states) and
 /// the per-patch 2-axis vision RoPE `cos`/`sin` tables (`[n * head_dim]`
@@ -675,63 +657,6 @@ pub fn qwen35_vit_forward(
     }
 
     Ok(hidden_states)
-}
-
-/// Standard full multi-head self-attention (no causal mask, no windowing —
-/// the entire `[n, ...]` sequence is one attention segment).
-/// `qkv`: `[n, 3 * hidden]` with per-row layout `[Q(hidden) | K(hidden) | V(hidden)]`,
-/// each of Q/K/V split into `n_heads` contiguous `head_dim`-wide chunks.
-pub(crate) fn multihead_attention_full(
-    qkv: &[f32],
-    n: usize,
-    hidden: usize,
-    n_heads: usize,
-    head_dim: usize,
-    scale: f32,
-) -> Vec<f32> {
-    let mut out = vec![0.0f32; n * hidden];
-
-    for h in 0..n_heads {
-        let mut q_h = vec![0.0f32; n * head_dim];
-        let mut k_h = vec![0.0f32; n * head_dim];
-        let mut v_h = vec![0.0f32; n * head_dim];
-        for i in 0..n {
-            let base = i * 3 * hidden;
-            q_h[i * head_dim..(i + 1) * head_dim]
-                .copy_from_slice(&qkv[base + h * head_dim..base + (h + 1) * head_dim]);
-            k_h[i * head_dim..(i + 1) * head_dim].copy_from_slice(
-                &qkv[base + hidden + h * head_dim..base + hidden + (h + 1) * head_dim],
-            );
-            v_h[i * head_dim..(i + 1) * head_dim].copy_from_slice(
-                &qkv[base + 2 * hidden + h * head_dim..base + 2 * hidden + (h + 1) * head_dim],
-            );
-        }
-
-        let mut scores = vec![0.0f32; n * n];
-        for i in 0..n {
-            let qi = &q_h[i * head_dim..(i + 1) * head_dim];
-            for j in 0..n {
-                let kj = &k_h[j * head_dim..(j + 1) * head_dim];
-                let dot: f32 = qi.iter().zip(kj.iter()).map(|(a, b)| a * b).sum();
-                scores[i * n + j] = dot * scale;
-            }
-        }
-        for i in 0..n {
-            softmax_inplace(&mut scores[i * n..(i + 1) * n]);
-        }
-        for i in 0..n {
-            let attn_row = &scores[i * n..(i + 1) * n];
-            for j in 0..head_dim {
-                let mut acc = 0.0f32;
-                for k in 0..n {
-                    acc += attn_row[k] * v_h[k * head_dim + j];
-                }
-                out[i * hidden + h * head_dim + j] = acc;
-            }
-        }
-    }
-
-    out
 }
 
 #[cfg(test)]

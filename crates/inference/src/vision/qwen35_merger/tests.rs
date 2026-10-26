@@ -41,25 +41,6 @@ fn make_test_merger_weights(cfg: &VisionModelConfig) -> VisualMergerWeights {
 }
 
 #[test]
-fn erf_matches_known_values() {
-    // Reference values from a standard erf table.
-    assert!((erf(0.0) - 0.0).abs() < 1e-6);
-    assert!((erf(1.0) - 0.842_700_79).abs() < 1e-6);
-    assert!((erf(-1.0) + 0.842_700_79).abs() < 1e-6);
-    assert!((erf(2.0) - 0.995_322_3).abs() < 1e-6);
-}
-
-#[test]
-fn gelu_exact_matches_known_values() {
-    // gelu_exact(0) = 0; gelu_exact is odd-ish but not exactly odd.
-    assert!((gelu_exact(0.0)).abs() < 1e-6);
-    // gelu_exact(1.0) ~= 0.8413447
-    assert!((gelu_exact(1.0) - 0.841_344_7).abs() < 1e-4);
-    // gelu_exact(-1.0) ~= -0.1586553
-    assert!((gelu_exact(-1.0) + 0.158_655_3).abs() < 1e-4);
-}
-
-#[test]
 fn merger_forward_output_shape_and_finite() {
     let cfg = tiny_cfg();
     let weights = make_test_merger_weights(&cfg);
