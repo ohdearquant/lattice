@@ -683,7 +683,7 @@ the family crates names a model; items 2 and 6 say how and in which release that
    on crates.io immediately before its first upload, as this ADR's publish rule requires. Each family gets one crate,
    `crates/models/<family>/`, published as `lattice-model-<family>` (`bert`, `qwen3`, `qwen35`, `gemma4`,
    `embeddinggemma2`, `ernie45`, `paddleocr-vl`), with the same re-check. A family crate holds that family's
-   configuration (from item 6 on), weight-name mapping, weight bundles and loaders, layer composition, inherent impls,
+   configuration (from step 7 on), weight-name mapping, weight bundles and loaders, layer composition, inherent impls,
    generation policy (chat tokens, stop strings, decode caps) and the dispatch of kernels only it uses. Family crates
    depend on lower crates and `lattice-arch` only, never on each other; code two families share moves into
    `lattice-arch` or a lower crate. Two named exemptions from "names no model": tokenizer serialization dialects, which
@@ -768,9 +768,10 @@ the family crates names a model; items 2 and 6 say how and in which release that
    through the deprecated items; that is the transition, not the target. Step (5)'s acceptance:
    `cargo tree -p lattice-embed -e normal` shows no `lattice-inference v` node.
 7. **Acceptance.** `lattice-arch` depends on no family crate and not on `lattice-compute`. After each family step,
-   `cargo tree -i <family crate> --workspace -e normal` lists only the facade, `lattice-embed`, `lattice-serve` and
-   `lattice-tune` through the facade, and no family crate depends on another; the graph is read for each feature arm the
-   step touches, test dependencies included, and a test-only edge from a lower crate to a family crate fails the step.
+   `cargo tree -i <family crate> --workspace -e normal,build,dev` lists only the facade, `lattice-embed`,
+   `lattice-serve` and `lattice-tune` through the facade, and no family crate depends on another; the graph is read for
+   each feature arm the step touches, and a dev-dependency (test-only) edge from a lower crate to a family crate fails
+   the step as a normal or build edge does.
    After step 7, a source census of the lower crates for model types and names, run with a known-present control in the
    same pass, finds only the item 1 exemptions. Feature coverage: a build with no family, each family alone with
    defaults off, all families, and the implication pairs; a disabled family's registry entry is absent or returns the
