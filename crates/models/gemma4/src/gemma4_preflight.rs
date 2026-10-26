@@ -14,6 +14,8 @@
 //! shape, and never wires them into a module. Every other tensor (including
 //! `q_proj`/`o_proj`/`q_norm`, which are never shared) is validated for
 //! presence, exact shape, and dtype, fail-closed.
+//!
+//! [`Gemma4Config`]: lattice_arch::gemma4_config::Gemma4Config
 
 use lattice_arch::gemma4_config::{GEMMA4_EXPECTED_DTYPE, Gemma4Config};
 use lattice_inference_core::InferenceError;
