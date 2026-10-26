@@ -164,7 +164,7 @@ impl Qwen35Model {
             .map(|_| lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer));
 
         let mut session =
-            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
+            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed)?;
         session.reserve_generation(prompt_len.saturating_add(decode_cap(
             gen_cfg.effective_reasoning_budget(),
             gen_cfg.max_new_tokens,
@@ -488,7 +488,7 @@ impl Qwen35Model {
             .map(|_| lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer));
 
         let mut session =
-            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
+            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed)?;
         session.reserve_generation(prompt_len.saturating_add(decode_cap(
             gen_cfg.effective_reasoning_budget(),
             gen_cfg.max_new_tokens,

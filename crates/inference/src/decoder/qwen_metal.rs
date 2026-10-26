@@ -107,31 +107,25 @@ pub(crate) enum MetalEntryProfile {
 /// The direct entry refuses `reasoning_budget` and `logprobs` before
 /// tokenization-dependent work (`GenerationEntryContract::MetalDirect`) and
 /// wires grammar masking and a stop-string matcher itself.
-const DIRECT_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
-    grammar: true,
-    logprobs: false,
-    stop_strings: true,
-    reasoning_budget: false,
-};
+const DIRECT_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::none()
+    .with_grammar(true)
+    .with_stop_strings(true);
 
 /// The streaming entry refuses none of the four controls
 /// (`GenerationEntryContract::MetalStreaming`) and wires all of them.
-const STREAMING_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
-    grammar: true,
-    logprobs: true,
-    stop_strings: true,
-    reasoning_budget: true,
-};
+const STREAMING_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::none()
+    .with_grammar(true)
+    .with_logprobs(true)
+    .with_stop_strings(true)
+    .with_reasoning_budget(true);
 
 /// The prefix-cache entry refuses `logprobs` and `enable_mtp`
 /// (`GenerationEntryContract::MetalPrefixCacheStreaming`) and wires grammar
 /// masking, stop strings and the reasoning budget like the streaming entry.
-const PREFIX_CACHE_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
-    grammar: true,
-    logprobs: false,
-    stop_strings: true,
-    reasoning_budget: true,
-};
+const PREFIX_CACHE_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::none()
+    .with_grammar(true)
+    .with_stop_strings(true)
+    .with_reasoning_budget(true);
 
 /// Readback route for every forward pass of one request. See the module doc
 /// comment.
@@ -396,7 +390,7 @@ impl<'state> QwenMetalSession<'state> {
             suffix_start,
             rng_state: plan.rng_state,
             temperature: gen_cfg.temperature,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new()?,
             readback: Readback::Empty,
             prefill_token_pending: false,
             route_engaged,
@@ -456,10 +450,7 @@ impl DecoderSession for QwenMetalSession<'_> {
             ReadbackMode::Dense | ReadbackMode::GreedyArgmax => Readback::Dense(logits),
         };
         self.prefill_token_pending = true;
-        Ok(StepStamp {
-            evaluated_len: self.state.session.position(),
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.state.session.position(), None))
     }
 
     /// Consumes `accepted.prediction`, then runs one decode forward pass at
@@ -501,10 +492,7 @@ impl DecoderSession for QwenMetalSession<'_> {
             ),
         };
 
-        Ok(StepStamp {
-            evaluated_len: self.state.session.position(),
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.state.session.position(), None))
     }
 
     /// Samples the next candidate from the current readback and opens a
@@ -572,11 +560,11 @@ impl DecoderSession for QwenMetalSession<'_> {
             }
             Readback::Argmax(id) => *id,
         };
-        let prediction = self.ledger.open();
-        Ok(SelectOutcome::Candidate(SelectionCandidate {
+        let prediction = self.ledger.open()?;
+        Ok(SelectOutcome::Candidate(SelectionCandidate::new(
             candidate_id,
             prediction,
-        }))
+        )))
     }
 
     /// Scores `final_token` against the live prediction's dense logits, after
@@ -590,6 +578,11 @@ impl DecoderSession for QwenMetalSession<'_> {
         final_token: u32,
         request: &MetadataRequest,
     ) -> Result<TokenMetadata, InferenceError> {
+        let Some(top_n) = request.top_logprobs else {
+            return Err(InferenceError::InvalidInput(
+                "metadata capture is disabled in this request".into(),
+            ));
+        };
         if !self.ledger.is_live(prediction) {
             return Err(PredictionError::Stale.into());
         }
@@ -599,18 +592,14 @@ impl DecoderSession for QwenMetalSession<'_> {
                 self.mode
             )));
         };
-        let (final_logprob, top) = compute_step_logprobs(
-            logits,
-            final_token,
-            self.temperature,
-            request.top_logprobs.unwrap_or(0),
-        );
-        Ok(TokenMetadata {
+        let (final_logprob, top) =
+            compute_step_logprobs(logits, final_token, self.temperature, top_n);
+        Ok(TokenMetadata::new(
             prediction,
-            final_token_id: final_token,
+            final_token,
             final_logprob,
             top,
-        })
+        ))
     }
 
     /// Tears down the compact route and ends the live prediction, whatever
@@ -1159,30 +1148,24 @@ mod tests {
     fn capabilities_mirror_each_entry_profiles_refusals() {
         assert_eq!(
             DIRECT_CAPABILITIES,
-            ExecutionCapabilities {
-                grammar: true,
-                logprobs: false,
-                stop_strings: true,
-                reasoning_budget: false,
-            }
+            ExecutionCapabilities::none()
+                .with_grammar(true)
+                .with_stop_strings(true)
         );
         assert_eq!(
             STREAMING_CAPABILITIES,
-            ExecutionCapabilities {
-                grammar: true,
-                logprobs: true,
-                stop_strings: true,
-                reasoning_budget: true,
-            }
+            ExecutionCapabilities::none()
+                .with_grammar(true)
+                .with_logprobs(true)
+                .with_stop_strings(true)
+                .with_reasoning_budget(true)
         );
         assert_eq!(
             PREFIX_CACHE_CAPABILITIES,
-            ExecutionCapabilities {
-                grammar: true,
-                logprobs: false,
-                stop_strings: true,
-                reasoning_budget: true,
-            }
+            ExecutionCapabilities::none()
+                .with_grammar(true)
+                .with_stop_strings(true)
+                .with_reasoning_budget(true)
         );
     }
 
@@ -1444,17 +1427,14 @@ mod tests {
     }
 
     fn request<'a>(gen_cfg: &'a GenerateConfig, history: &'a [u32]) -> SelectionRequest<'a> {
-        SelectionRequest {
-            config: gen_cfg,
-            history,
-            grammar_mask: None,
-        }
+        SelectionRequest::new(gen_cfg, history)
     }
 
     fn candidate(outcome: SelectOutcome) -> SelectionCandidate {
         match outcome {
             SelectOutcome::Candidate(candidate) => candidate,
             SelectOutcome::GrammarExhausted => panic!("no grammar is set"),
+            _ => unreachable!("a select outcome this test does not model"),
         }
     }
 
@@ -1549,9 +1529,18 @@ mod tests {
         let first = candidate(s.select(&request(&gen_cfg, &history)).expect("select"));
         assert_eq!(first.candidate_id, 5);
         assert!(s.ledger.is_live(first.prediction));
-        let meta = MetadataRequest {
-            top_logprobs: Some(1),
-        };
+        let meta = MetadataRequest::with_top_logprobs(1);
+        // A disabled request is refused and leaves the prediction live.
+        let disabled = s.metadata(
+            first.prediction,
+            first.candidate_id,
+            &MetadataRequest::disabled(),
+        );
+        assert!(
+            matches!(&disabled, Err(InferenceError::InvalidInput(msg)) if msg.contains("disabled")),
+            "{disabled:?}"
+        );
+        assert!(s.ledger.is_live(first.prediction));
         // Control: the live prediction scores.
         s.metadata(first.prediction, first.candidate_id, &meta)
             .expect("metadata of the live prediction");
@@ -1566,10 +1555,7 @@ mod tests {
         ));
 
         // A stale id is refused by decode before any forward pass runs.
-        let stale = AcceptedToken {
-            final_id: first.candidate_id,
-            prediction: first.prediction,
-        };
+        let stale = AcceptedToken::new(first.candidate_id, first.prediction);
         let before = s.state.session.position();
         let refused = s.decode(&stale, &|| false);
         assert!(
@@ -1601,11 +1587,7 @@ mod tests {
         let mut s = session(&mut state, &gen_cfg, MetalEntryProfile::Direct, DENSE_ENV);
         assert_eq!(s.mode(), ReadbackMode::GreedyArgmax);
         let mask = |_: &mut [f32]| -> Result<(), InferenceError> { Ok(()) };
-        let masked = SelectionRequest {
-            config: &gen_cfg,
-            history: &history,
-            grammar_mask: Some(&mask),
-        };
+        let masked = SelectionRequest::new(&gen_cfg, &history).with_grammar_mask(&mask);
 
         s.readback = Readback::Argmax(4);
         assert!(matches!(
@@ -1853,13 +1835,7 @@ mod tests {
 
             let full = s.state.max_context();
             s.state.session.set_position(full);
-            let failed = s.decode(
-                &AcceptedToken {
-                    final_id: c.candidate_id,
-                    prediction: c.prediction,
-                },
-                &|| false,
-            );
+            let failed = s.decode(&AcceptedToken::new(c.candidate_id, c.prediction), &|| false);
             assert!(
                 matches!(&failed, Err(InferenceError::Inference(msg)) if msg.contains("KV cache is full")),
                 "{failed:?}"
@@ -2034,10 +2010,7 @@ mod tests {
         }
 
         fn prefill(&mut self, _cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
-            Ok(StepStamp {
-                evaluated_len: 1,
-                prediction: None,
-            })
+            Ok(StepStamp::new(1, None))
         }
 
         fn decode(
@@ -2046,10 +2019,7 @@ mod tests {
             _cancel: &dyn Cancellation,
         ) -> Result<StepStamp, InferenceError> {
             self.ledger.consume(accepted.prediction)?;
-            Ok(StepStamp {
-                evaluated_len: 2,
-                prediction: None,
-            })
+            Ok(StepStamp::new(2, None))
         }
 
         fn select(
@@ -2065,10 +2035,10 @@ mod tests {
                     return Ok(SelectOutcome::GrammarExhausted);
                 }
             }
-            Ok(SelectOutcome::Candidate(SelectionCandidate {
+            Ok(SelectOutcome::Candidate(SelectionCandidate::new(
                 candidate_id,
-                prediction: self.ledger.open(),
-            }))
+                self.ledger.open()?,
+            )))
         }
 
         fn metadata(
@@ -2093,7 +2063,7 @@ mod tests {
     ) -> (Result<GenerateOutput, InferenceError>, Vec<(String, u32)>) {
         let mut session = ScriptedSession {
             caps: STREAMING_CAPABILITIES,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new().expect("a fresh ledger identity"),
             script,
             selects: 0,
         };
@@ -2246,7 +2216,7 @@ mod tests {
     ) -> Result<GenerateOutput, InferenceError> {
         let mut session = ScriptedSession {
             caps: DIRECT_CAPABILITIES,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new().expect("a fresh ledger identity"),
             script,
             selects: 0,
         };
@@ -2395,7 +2365,7 @@ mod tests {
     ) -> (PrefixStreamRun, Vec<(String, u32)>) {
         let mut session = ScriptedSession {
             caps: PREFIX_CACHE_CAPABILITIES,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new().expect("a fresh ledger identity"),
             script,
             selects: 0,
         };

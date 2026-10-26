@@ -1,9 +1,10 @@
 //! Decoder sessions (ADR-090 D1/D2).
 //!
-//! The session vocabulary (the `DecoderSession` trait, the prediction ledger, the per-step request
-//! and result types) and the shared driver live in `lattice-arch`, which every model family can
-//! reach. This module re-exports them at their previous paths and holds the concrete sessions,
-//! which move to their family crates later. `model::qwen35::generation`'s
+//! The session contract (the `DecoderSession` trait, the prediction ledger, the per-step request
+//! and result types) and the shared driver live in `lattice_arch::decoder`, which every model
+//! family can reach; the speculative extension stays behind `lattice_arch::__internal`. This
+//! module re-exports them at their previous paths and holds the concrete sessions, which move
+//! to their family crates later. `model::qwen35::generation`'s
 //! `generate()`/`generate_with_trace()` are the driver's production callers.
 
 /// First concrete [`DecoderSession`] implementation (ADR-090 row B): the CPU dense
@@ -27,27 +28,27 @@ pub mod bench_support;
 /// (`generate_f16`, `generate_q8`, `generate_q8_neon`), run by the shared driver.
 pub(crate) mod standalone_cpu;
 
-pub(crate) use lattice_arch::__internal::decoder::{
-    AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
-    MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectOutcome,
-    SelectionCandidate, SelectionRequest, StepStamp, TokenMetadata,
-};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use lattice_arch::__internal::decoder::{
     SpeculativeSession, SpeculativeTrace, VerifiedRound,
+};
+pub(crate) use lattice_arch::decoder::{
+    AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
+    MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectOutcome,
+    SelectionCandidate, SelectionRequest, StepStamp, TokenMetadata,
 };
 
 /// The autoregressive driver (ADR-090 row C), defined in `lattice-arch`.
 pub(crate) mod driver {
     #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
     pub(crate) use counted::{run, run_into, test_driver_run_count};
-    #[cfg(test)]
-    pub(crate) use lattice_arch::__internal::decoder::driver::DriverResult;
-    pub(crate) use lattice_arch::__internal::decoder::driver::DriverTrace;
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    pub(crate) use lattice_arch::__internal::decoder::driver::run_speculative;
+    pub(crate) use lattice_arch::__internal::decoder::run_speculative;
+    #[cfg(test)]
+    pub(crate) use lattice_arch::decoder::driver::DriverResult;
+    pub(crate) use lattice_arch::decoder::driver::DriverTrace;
     #[cfg(not(all(test, target_os = "macos", feature = "metal-gpu")))]
-    pub(crate) use lattice_arch::__internal::decoder::driver::{run, run_into};
+    pub(crate) use lattice_arch::decoder::driver::{run, run_into};
 
     /// Test builds with Metal count driver runs, so the speculative-route tests can assert that
     /// a request reached the driver. Each wrapper counts once and delegates unchanged.
@@ -57,7 +58,7 @@ pub(crate) mod driver {
         use crate::decoder::{Cancellation, DecoderSession};
         use crate::error::InferenceError;
         use crate::generation::GenerateConfig;
-        use lattice_arch::__internal::decoder::driver as arch_driver;
+        use lattice_arch::decoder::driver as arch_driver;
         use std::cell::Cell;
         use std::sync::Arc;
 

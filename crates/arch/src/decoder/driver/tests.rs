@@ -218,7 +218,7 @@ fn request_buffers_reserve_history() {
 fn request_buffers_reuse_driver_delta() {
     let mut session = ScriptedSession {
         caps: ExecutionCapabilities::default(),
-        ledger: PredictionLedger::new(),
+        ledger: PredictionLedger::new().expect("a fresh ledger identity"),
         script: vec![TEXT_TOKEN],
         selects: 0,
     };
@@ -394,7 +394,7 @@ fn on_push_fires_before_metadata_for_every_token_with_logprobs_enabled() {
         ) -> Result<SelectOutcome, InferenceError> {
             Ok(SelectOutcome::Candidate(SelectionCandidate {
                 candidate_id: CANDIDATE_ID,
-                prediction: self.ledger.open(),
+                prediction: self.ledger.open().expect("an unspent sequence number"),
             }))
         }
 
@@ -424,7 +424,7 @@ fn on_push_fires_before_metadata_for_every_token_with_logprobs_enabled() {
             logprobs: true,
             ..ExecutionCapabilities::default()
         },
-        ledger: PredictionLedger::new(),
+        ledger: PredictionLedger::new().expect("a fresh ledger identity"),
         events: events.clone(),
     };
     // `logprobs: Some(_)` is what makes `record_metadata` a real, non-skipped
@@ -528,7 +528,7 @@ impl DecoderSession for ScriptedSession {
         self.selects += 1;
         Ok(SelectOutcome::Candidate(SelectionCandidate {
             candidate_id: self.script[index],
-            prediction: self.ledger.open(),
+            prediction: self.ledger.open().expect("an unspent sequence number"),
         }))
     }
 
@@ -559,7 +559,7 @@ fn run_streaming_script(
             stop_strings: true,
             ..ExecutionCapabilities::default()
         },
-        ledger: PredictionLedger::new(),
+        ledger: PredictionLedger::new().expect("a fresh ledger identity"),
         script,
         selects: 0,
     };

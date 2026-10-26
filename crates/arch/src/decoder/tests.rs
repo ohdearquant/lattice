@@ -7,10 +7,10 @@ use super::*;
 
 #[test]
 fn consume_rejects_a_stale_id_but_accepts_a_live_one() {
-    let mut ledger = PredictionLedger::new();
-    let first = ledger.open();
+    let mut ledger = PredictionLedger::new().expect("a fresh ledger identity");
+    let first = ledger.open().expect("an unspent sequence number");
     ledger.reset(); // invalidates `first`; it is now genuinely stale
-    let second = ledger.open();
+    let second = ledger.open().expect("an unspent sequence number");
 
     assert_eq!(
         ledger.consume(first),
@@ -28,8 +28,8 @@ fn consume_rejects_a_stale_id_but_accepts_a_live_one() {
 
 #[test]
 fn accepted_token_cannot_be_consumed_twice() {
-    let mut ledger = PredictionLedger::new();
-    let id = ledger.open();
+    let mut ledger = PredictionLedger::new().expect("a fresh ledger identity");
+    let id = ledger.open().expect("an unspent sequence number");
     let token = AcceptedToken {
         final_id: 7,
         prediction: id,
@@ -53,8 +53,8 @@ fn accepted_token_cannot_be_consumed_twice() {
 
 #[test]
 fn cancelled_prediction_is_not_eligible_control_checks_before_cancel() {
-    let mut ledger = PredictionLedger::new();
-    let id = ledger.open();
+    let mut ledger = PredictionLedger::new().expect("a fresh ledger identity");
+    let id = ledger.open().expect("an unspent sequence number");
 
     // Control: before cancellation, the id passes the eligibility check a
     // concrete session's select/metadata operations would consult.
@@ -72,8 +72,8 @@ fn cancelled_prediction_is_not_eligible_control_checks_before_cancel() {
 
 #[test]
 fn reset_invalidates_the_live_prediction() {
-    let mut ledger = PredictionLedger::new();
-    let id = ledger.open();
+    let mut ledger = PredictionLedger::new().expect("a fresh ledger identity");
+    let id = ledger.open().expect("an unspent sequence number");
     assert!(ledger.is_live(id)); // control: live immediately after open
 
     ledger.reset();
@@ -88,11 +88,11 @@ fn reset_invalidates_the_live_prediction() {
 
 #[test]
 fn opening_while_one_is_live_supersedes_the_previous_prediction() {
-    let mut ledger = PredictionLedger::new();
-    let first = ledger.open();
+    let mut ledger = PredictionLedger::new().expect("a fresh ledger identity");
+    let first = ledger.open().expect("an unspent sequence number");
     assert!(ledger.is_live(first)); // control: live immediately after open
 
-    let second = ledger.open(); // opening again while `first` is still live
+    let second = ledger.open().expect("an unspent sequence number"); // opening again while `first` is still live
 
     assert_ne!(first, second);
     assert!(
@@ -112,10 +112,10 @@ fn one_ledgers_prediction_is_not_live_or_consumable_in_another() {
     // `consume` compare ids by value, session A's live prediction was accepted and
     // consumed by session B -- the cross-session confusion the whole type exists to
     // prevent, reported as a clean success.
-    let mut a = PredictionLedger::new();
-    let mut b = PredictionLedger::new();
-    let from_a = a.open();
-    let from_b = b.open();
+    let mut a = PredictionLedger::new().expect("a fresh ledger identity");
+    let mut b = PredictionLedger::new().expect("a fresh ledger identity");
+    let from_a = a.open().expect("an unspent sequence number");
+    let from_b = b.open().expect("an unspent sequence number");
 
     assert_ne!(
         from_a, from_b,
@@ -142,10 +142,10 @@ fn ids_are_never_reused_across_resets() {
     // actually provides it, so it is pinned here instead of implied by a field nothing
     // reads. A ledger that reset its counter would hand out an id equal to a retired
     // one, and `is_live` would then answer `true` for a genuinely stale prediction.
-    let mut ledger = PredictionLedger::new();
+    let mut ledger = PredictionLedger::new().expect("a fresh ledger identity");
     let mut seen = Vec::new();
     for _ in 0..4 {
-        seen.push(ledger.open());
+        seen.push(ledger.open().expect("an unspent sequence number"));
         ledger.reset();
     }
     let first = seen[0];
@@ -157,6 +157,135 @@ fn ids_are_never_reused_across_resets() {
         !ledger.is_live(first),
         "and the retired id must not be live after three further opens"
     );
+}
+
+#[test]
+fn a_spent_identity_counter_refuses_instead_of_wrapping() {
+    // The last identity below the counter's ceiling is still handed out; the ceiling itself
+    // is not, and the refusal leaves the counter where it was, so a retry is refused again
+    // rather than wrapping to identity zero, which the process's first ledger holds.
+    let counter = AtomicU64::new(u64::MAX - 1);
+    assert_eq!(allocate_ledger_id(&counter), Ok(u64::MAX - 1));
+    assert_eq!(
+        allocate_ledger_id(&counter),
+        Err(PredictionError::Exhausted)
+    );
+    assert_eq!(
+        allocate_ledger_id(&counter),
+        Err(PredictionError::Exhausted)
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+}
+
+#[test]
+fn a_spent_sequence_refuses_without_retiring_the_live_prediction() {
+    let mut ledger = PredictionLedger::new().expect("a fresh ledger identity");
+    ledger.next_seq = u64::MAX - 1;
+    let last = ledger.open().expect("the last unspent sequence number");
+    assert_eq!(ledger.open(), Err(PredictionError::Exhausted));
+    // The refused open changed nothing: the last minted id is still the live one and is
+    // still consumable once.
+    assert!(ledger.is_live(last));
+    assert_eq!(ledger.next_seq, u64::MAX);
+    assert_eq!(ledger.consume(last), Ok(()));
+    assert_eq!(ledger.open(), Err(PredictionError::Exhausted));
+}
+
+#[test]
+fn prediction_errors_display_and_convert_with_the_same_text() {
+    for (error, text) in [
+        (
+            PredictionError::Stale,
+            "stale prediction id: no matching live prediction in the ledger",
+        ),
+        (
+            PredictionError::Exhausted,
+            "prediction ledger exhausted: no unused prediction id remains",
+        ),
+    ] {
+        assert_eq!(error.to_string(), text);
+        let source: &dyn std::error::Error = &error;
+        assert!(source.source().is_none());
+        match InferenceError::from(error) {
+            InferenceError::Inference(message) => assert_eq!(message, text),
+            other => panic!("{error:?} converted to {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn constructors_set_every_field() {
+    let mut ledger = PredictionLedger::new().expect("a fresh ledger identity");
+    let id = ledger.open().expect("an unspent sequence number");
+
+    let accepted = AcceptedToken::new(3, id);
+    assert_eq!((accepted.final_id, accepted.prediction), (3, id));
+    let candidate = SelectionCandidate::new(4, id);
+    assert_eq!((candidate.candidate_id, candidate.prediction), (4, id));
+    let stamp = StepStamp::new(5, Some(id));
+    assert_eq!((stamp.evaluated_len, stamp.prediction), (5, Some(id)));
+    let top = vec![TopLogprob {
+        token_id: 6,
+        logprob: -0.5,
+    }];
+    let metadata = TokenMetadata::new(id, 7, -0.25, top.clone());
+    assert_eq!(metadata.prediction, id);
+    assert_eq!(metadata.final_token_id, 7);
+    assert_eq!(metadata.final_logprob, -0.25);
+    assert_eq!(metadata.top, top);
+
+    assert_eq!(MetadataRequest::disabled().top_logprobs, None);
+    assert_eq!(MetadataRequest::with_top_logprobs(0).top_logprobs, Some(0));
+    assert_eq!(MetadataRequest::with_top_logprobs(5).top_logprobs, Some(5));
+
+    assert_eq!(
+        ExecutionCapabilities::none(),
+        ExecutionCapabilities::default()
+    );
+    let each = [
+        ExecutionCapabilities::none().with_grammar(true),
+        ExecutionCapabilities::none().with_logprobs(true),
+        ExecutionCapabilities::none().with_stop_strings(true),
+        ExecutionCapabilities::none().with_reasoning_budget(true),
+    ];
+    let flags =
+        |c: &ExecutionCapabilities| [c.grammar, c.logprobs, c.stop_strings, c.reasoning_budget];
+    for (index, caps) in each.iter().enumerate() {
+        let mut expected = [false; 4];
+        expected[index] = true;
+        assert_eq!(
+            flags(caps),
+            expected,
+            "builder {index} set the wrong control"
+        );
+        assert_eq!(
+            flags(
+                &caps
+                    .with_grammar(false)
+                    .with_logprobs(false)
+                    .with_stop_strings(false)
+                    .with_reasoning_budget(false)
+            ),
+            [false; 4],
+            "builder {index} cannot be withdrawn"
+        );
+    }
+
+    let config = GenerateConfig::default();
+    let history = [1u32, 2];
+    let plain = SelectionRequest::new(&config, &history);
+    assert!(std::ptr::eq(plain.config, &config));
+    assert_eq!(plain.history, &history);
+    assert!(plain.grammar_mask.is_none());
+    let mask = |logits: &mut [f32]| -> Result<(), InferenceError> {
+        logits[0] = f32::NEG_INFINITY;
+        Ok(())
+    };
+    let masked = plain.with_grammar_mask(&mask);
+    let mut logits = [0.0f32; 2];
+    (masked.grammar_mask.expect("the mask was set"))(&mut logits).expect("the mask applies");
+    assert_eq!(logits[0], f32::NEG_INFINITY);
+    assert_eq!(masked.history, &history);
 }
 
 #[test]
@@ -212,7 +341,7 @@ impl DecoderSession for DummySession {
     }
 
     fn select(&mut self, _request: &SelectionRequest<'_>) -> Result<SelectOutcome, InferenceError> {
-        let prediction = self.ledger.open();
+        let prediction = self.ledger.open().expect("an unspent sequence number");
         Ok(SelectOutcome::Candidate(SelectionCandidate {
             candidate_id: 11,
             prediction,
@@ -252,7 +381,7 @@ impl DecoderSession for DummySession {
 fn default_interruptible_prefill_preserves_driver_owned_cancellation() {
     let mut session = DummySession {
         caps: ExecutionCapabilities::default(),
-        ledger: PredictionLedger::new(),
+        ledger: PredictionLedger::new().expect("a fresh ledger identity"),
     };
     let polls = std::cell::Cell::new(0);
     let cancel = || {
@@ -274,7 +403,7 @@ fn decoder_session_is_object_safe() {
             logprobs: true,
             ..ExecutionCapabilities::default()
         },
-        ledger: PredictionLedger::new(),
+        ledger: PredictionLedger::new().expect("a fresh ledger identity"),
     };
 
     // The coercion below is the object-safety proof: it only type-checks if every

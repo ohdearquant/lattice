@@ -232,19 +232,12 @@ fn sample(model: &Gemma4Model, ids: &[u32]) -> Sample {
     let mut decode = [Duration::ZERO; DECODE_STEPS];
     for index in 0..DECODE_STEPS {
         let outcome = session
-            .select(&SelectionRequest {
-                config: &config,
-                history: &history,
-                grammar_mask: None,
-            })
+            .select(&SelectionRequest::new(&config, &history))
             .expect("greedy session selection");
         let SelectOutcome::Candidate(candidate) = outcome else {
             panic!("unconstrained selection must produce a candidate")
         };
-        let accepted = AcceptedToken {
-            final_id: candidate.candidate_id,
-            prediction: candidate.prediction,
-        };
+        let accepted = AcceptedToken::new(candidate.candidate_id, candidate.prediction);
         selected[index] = accepted.final_id;
         history.push(accepted.final_id);
         let start = Instant::now();

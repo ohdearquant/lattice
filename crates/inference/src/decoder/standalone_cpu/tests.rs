@@ -74,7 +74,8 @@ fn with_each_hollow_session(check: impl Fn(&str, StandaloneCpuSession<'_>)) {
         ("q8", StandaloneWeights::Q8(&q8)),
         ("q8_neon", StandaloneWeights::Q8Neon(&neon)),
     ] {
-        let session = StandaloneCpuSession::new(weights, &cfg, &rope, plan(&cfg, &rope, 8));
+        let session = StandaloneCpuSession::new(weights, &cfg, &rope, plan(&cfg, &rope, 8))
+            .expect("an unspent ledger identity");
         check(name, session);
     }
 }
@@ -186,7 +187,8 @@ fn neon_session_reserves_kv_for_prompt_plus_budget() {
         "the fixture has no full-attention layer, so there is no cache to reserve"
     );
 
-    let session = StandaloneCpuSession::new(StandaloneWeights::Q8Neon(&neon), &cfg, &rope, plan);
+    let session = StandaloneCpuSession::new(StandaloneWeights::Q8Neon(&neon), &cfg, &rope, plan)
+        .expect("an unspent ledger identity");
 
     let wanted = required * cfg.full_kv_dim();
     for (layer, (k, v)) in session
@@ -222,7 +224,8 @@ fn q8_session_does_not_prereserve_kv() {
         &cfg,
         &rope,
         plan(&cfg, &rope, 8),
-    );
+    )
+    .expect("an unspent ledger identity");
 
     assert!(session.kv_cache.k.iter().all(|k| k.capacity() == 0));
     assert!(session.kv_cache.v.iter().all(|v| v.capacity() == 0));
@@ -246,7 +249,8 @@ fn f16_session_does_not_prereserve_kv() {
         &cfg,
         &rope,
         plan(&cfg, &rope, 8),
-    );
+    )
+    .expect("an unspent ledger identity");
 
     assert!(session.kv_cache.k.iter().all(|k| k.capacity() == 0));
     assert!(session.kv_cache.v.iter().all(|v| v.capacity() == 0));

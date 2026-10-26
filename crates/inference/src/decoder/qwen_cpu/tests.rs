@@ -22,14 +22,11 @@ fn finish_invalidates_the_prediction_for_every_disposition() {
         config
     };
     for disposition in [FinishDisposition::Reusable, FinishDisposition::Poisoned] {
-        let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7));
+        let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7))
+            .expect("an unspent ledger identity");
         session.prefill(&cancel_false()).expect("prefill");
         let outcome = session
-            .select(&SelectionRequest {
-                config: &config,
-                history: &prompt_ids,
-                grammar_mask: None,
-            })
+            .select(&SelectionRequest::new(&config, &prompt_ids))
             .expect("selection");
         let SelectOutcome::Candidate(candidate) = outcome else {
             panic!("unconstrained selection must yield a candidate")
@@ -54,7 +51,8 @@ fn request_buffers_keep_kv_capacity() {
     let prompt_ids = tokenize(&model, "abc");
     let max_new_tokens = 16;
     let required = prompt_ids.len() + max_new_tokens;
-    let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7));
+    let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7))
+        .expect("an unspent ledger identity");
     session.reserve_generation(required);
     let kv_needed = required * model.config.full_kv_dim();
     for store in session.kv_cache.k.iter().chain(&session.kv_cache.v) {
@@ -82,21 +80,14 @@ fn request_buffers_keep_kv_capacity() {
     let mut history = prompt_ids;
     for _ in 0..max_new_tokens {
         let selected = session
-            .select(&SelectionRequest {
-                config: &config,
-                history: &history,
-                grammar_mask: None,
-            })
+            .select(&SelectionRequest::new(&config, &history))
             .unwrap();
         let SelectOutcome::Candidate(candidate) = selected else {
             panic!("unconstrained fixture must select");
         };
         session
             .decode(
-                &AcceptedToken {
-                    final_id: candidate.candidate_id,
-                    prediction: candidate.prediction,
-                },
+                &AcceptedToken::new(candidate.candidate_id, candidate.prediction),
                 &cancel,
             )
             .unwrap();
@@ -134,7 +125,8 @@ fn full_step_lifecycle_over_tiny_dense_model() {
     );
     let prompt_len = prompt_ids.len();
 
-    let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7));
+    let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7))
+        .expect("an unspent ledger identity");
 
     let cancel = cancel_false();
     let stamp = session
@@ -153,25 +145,32 @@ fn full_step_lifecycle_over_tiny_dense_model() {
         config.repetition_penalty = 1.0;
         config
     };
-    let request = SelectionRequest {
-        config: &gen_cfg,
-        history: &history,
-        grammar_mask: None,
-    };
+    let request = SelectionRequest::new(&gen_cfg, &history);
     let candidate = match session
         .select(&request)
         .expect("select over freshly prefilled logits must succeed")
     {
         SelectOutcome::Candidate(c) => c,
         SelectOutcome::GrammarExhausted => panic!("no grammar set on this session"),
+        _ => unreachable!("a select outcome this test does not model"),
     };
 
     // Ledger lifecycle, open half: live immediately after select.
     assert!(session.ledger.is_live(candidate.prediction));
 
-    let meta_request = MetadataRequest {
-        top_logprobs: Some(2),
-    };
+    // A disabled request is refused and leaves the prediction live.
+    let disabled = session.metadata(
+        candidate.prediction,
+        candidate.candidate_id,
+        &MetadataRequest::disabled(),
+    );
+    assert!(
+        matches!(&disabled, Err(InferenceError::InvalidInput(message)) if message.contains("disabled")),
+        "{disabled:?}"
+    );
+    assert!(session.ledger.is_live(candidate.prediction));
+
+    let meta_request = MetadataRequest::with_top_logprobs(2);
     let metadata = session
         .metadata(candidate.prediction, candidate.candidate_id, &meta_request)
         .expect("metadata over a live prediction must succeed");
@@ -190,10 +189,7 @@ fn full_step_lifecycle_over_tiny_dense_model() {
     // metadata does not consume: still live after scoring.
     assert!(session.ledger.is_live(candidate.prediction));
 
-    let accepted = AcceptedToken {
-        final_id: metadata.final_token_id,
-        prediction: candidate.prediction,
-    };
+    let accepted = AcceptedToken::new(metadata.final_token_id, candidate.prediction);
     let stamp2 = session
         .decode(&accepted, &cancel)
         .expect("decode of the freshly opened prediction must succeed");
@@ -227,7 +223,8 @@ fn moe_fallback_precedes_mutation_of_gdn_states_and_kv_cache() {
     let prompt_ids = tokenize(&model, "abc");
     assert!(!prompt_ids.is_empty());
 
-    let mut session = QwenCpuSession::new(&model, prompt_ids, 0.0, Some(7));
+    let mut session =
+        QwenCpuSession::new(&model, prompt_ids, 0.0, Some(7)).expect("an unspent ledger identity");
 
     let pre_gdn: Vec<(Vec<f32>, Vec<f32>)> = session
         .gdn_states
@@ -284,7 +281,8 @@ fn escape_hatch_forces_the_serial_branch() {
     let model = tiny_zero_model();
     let prompt_ids = tokenize(&model, "abc");
     let prompt_len = prompt_ids.len();
-    let mut session = QwenCpuSession::new(&model, prompt_ids, 0.0, Some(7));
+    let mut session =
+        QwenCpuSession::new(&model, prompt_ids, 0.0, Some(7)).expect("an unspent ledger identity");
 
     FORCE_SERIAL_PREFILL.store(true, std::sync::atomic::Ordering::SeqCst);
     let result = session.prefill(&cancel_false());
@@ -307,7 +305,8 @@ fn escape_hatch_forces_the_serial_branch() {
 fn cancelled_decode_consumes_nothing_and_finish_poisoned_invalidates() {
     let model = tiny_zero_model();
     let prompt_ids = tokenize(&model, "abc");
-    let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7));
+    let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7))
+        .expect("an unspent ledger identity");
     session
         .prefill(&cancel_false())
         .expect("prefill must succeed");
@@ -318,21 +317,15 @@ fn cancelled_decode_consumes_nothing_and_finish_poisoned_invalidates() {
         config.repetition_penalty = 1.0;
         config
     };
-    let request = SelectionRequest {
-        config: &gen_cfg,
-        history: &prompt_ids,
-        grammar_mask: None,
-    };
+    let request = SelectionRequest::new(&gen_cfg, &prompt_ids);
     let candidate = match session.select(&request).expect("select must succeed") {
         SelectOutcome::Candidate(c) => c,
         SelectOutcome::GrammarExhausted => panic!("no grammar set on this session"),
+        _ => unreachable!("a select outcome this test does not model"),
     };
     assert!(session.ledger.is_live(candidate.prediction)); // control: live before
 
-    let accepted = AcceptedToken {
-        final_id: candidate.candidate_id,
-        prediction: candidate.prediction,
-    };
+    let accepted = AcceptedToken::new(candidate.candidate_id, candidate.prediction);
     let cancelled = session.decode(&accepted, &cancel_true());
     assert!(cancelled.is_err(), "a cancelled decode must not succeed");
     assert!(
@@ -368,7 +361,8 @@ fn full_step_lifecycle_over_real_checkpoint() {
     assert!(!prompt_ids.is_empty());
     let prompt_len = prompt_ids.len();
 
-    let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(1234));
+    let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(1234))
+        .expect("an unspent ledger identity");
 
     let cancel = cancel_false();
     let stamp = session
@@ -383,20 +377,15 @@ fn full_step_lifecycle_over_real_checkpoint() {
         config.repetition_penalty = 1.0;
         config
     };
-    let request = SelectionRequest {
-        config: &gen_cfg,
-        history: &prompt_ids,
-        grammar_mask: None,
-    };
+    let request = SelectionRequest::new(&gen_cfg, &prompt_ids);
     let candidate = match session.select(&request).expect("select must succeed") {
         SelectOutcome::Candidate(c) => c,
         SelectOutcome::GrammarExhausted => panic!("no grammar set on this session"),
+        _ => unreachable!("a select outcome this test does not model"),
     };
     assert!(session.ledger.is_live(candidate.prediction)); // open at select
 
-    let meta_request = MetadataRequest {
-        top_logprobs: Some(3),
-    };
+    let meta_request = MetadataRequest::with_top_logprobs(3);
     let metadata = session
         .metadata(candidate.prediction, candidate.candidate_id, &meta_request)
         .expect("metadata must succeed");
@@ -404,10 +393,7 @@ fn full_step_lifecycle_over_real_checkpoint() {
     assert!(metadata.final_logprob.is_finite());
     assert_eq!(metadata.top.len(), 3);
 
-    let accepted = AcceptedToken {
-        final_id: metadata.final_token_id,
-        prediction: candidate.prediction,
-    };
+    let accepted = AcceptedToken::new(metadata.final_token_id, candidate.prediction);
     let stamp2 = session
         .decode(&accepted, &cancel)
         .expect("decode must succeed");
