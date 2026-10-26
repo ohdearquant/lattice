@@ -144,12 +144,15 @@ fn last_token_pool_rejects_zero_seq_len() {
 
 #[test]
 fn every_pooling_variant_is_known_to_the_bert_model() {
-    // This match is exhaustive, so a new `BertPooling` variant stops it compiling. Handle the
-    // variant in `lattice_inference::model::bert::BertModel::pool` as well: that match sits in
-    // another crate, needs a wildcard arm, and would otherwise mean-pool the new variant.
-    for pooling in [BertPooling::Mean, BertPooling::CLS] {
-        match pooling {
-            BertPooling::Mean | BertPooling::CLS => {}
-        }
+    // `BertPooling::ALL` is what the facade's
+    // `bert_model_pool_has_an_arm_for_every_pooling_variant` iterates, so each variant must
+    // appear in it exactly once.
+    for (i, pooling) in BertPooling::ALL.iter().enumerate() {
+        assert!(
+            !BertPooling::ALL[..i].contains(pooling),
+            "{pooling:?} is listed twice"
+        );
     }
+    assert!(BertPooling::ALL.contains(&BertPooling::Mean));
+    assert!(BertPooling::ALL.contains(&BertPooling::CLS));
 }

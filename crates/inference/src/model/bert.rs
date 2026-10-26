@@ -545,21 +545,13 @@ impl BertModel {
     /// Both `encode` and `encode_batch` delegate here so the pooling branch
     /// is in one place.  L2 normalization is applied by the caller.
     fn pool(&self, hidden_states: &[f32], attention_mask: &[u32], seq_len: usize) -> Vec<f32> {
-        match self.pooling {
-            BertPooling::Mean => mean_pool(
-                hidden_states,
-                attention_mask,
-                seq_len,
-                self.config.hidden_size,
-            ),
-            BertPooling::CLS => cls_pool(hidden_states, seq_len, self.config.hidden_size),
-            _ => mean_pool(
-                hidden_states,
-                attention_mask,
-                seq_len,
-                self.config.hidden_size,
-            ),
-        }
+        pool_hidden_states(
+            self.pooling,
+            hidden_states,
+            attention_mask,
+            seq_len,
+            self.config.hidden_size,
+        )
     }
 
     /// Forward pass for a pre-tokenized input; used by `CrossEncoderModel`.
@@ -1356,6 +1348,23 @@ fn infer_num_attention_heads(hidden_size: usize) -> Result<usize, InferenceError
         _ => Err(InferenceError::Inference(format!(
             "unable to infer num_attention_heads for hidden_size {hidden_size}"
         ))),
+    }
+}
+
+/// `BertPooling` is `#[non_exhaustive]` and defined in `lattice-compute`, so this match needs
+/// a wildcard arm and cannot fail to compile on a new variant;
+/// `tests::bert_model_pool_has_an_arm_for_every_pooling_variant` fails instead.
+fn pool_hidden_states(
+    pooling: BertPooling,
+    hidden_states: &[f32],
+    attention_mask: &[u32],
+    seq_len: usize,
+    hidden_size: usize,
+) -> Vec<f32> {
+    match pooling {
+        BertPooling::Mean => mean_pool(hidden_states, attention_mask, seq_len, hidden_size),
+        BertPooling::CLS => cls_pool(hidden_states, seq_len, hidden_size),
+        _ => mean_pool(hidden_states, attention_mask, seq_len, hidden_size),
     }
 }
 
