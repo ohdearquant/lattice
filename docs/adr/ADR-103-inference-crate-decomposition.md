@@ -737,8 +737,9 @@ the family crates names a model; items 2 and 6 say how and in which release that
      owner and is not promised by this amendment. Image and document inputs are separate capabilities, not a
      requirement on every encoder.
 4. **D1, D4 and the release split.** Free functions and moved owning types keep their public paths by named
-   re-export (D1). Items whose published signature names a model type cannot keep an identical signature once that type
-   leaves the lower crate, and D4's internal bridges are never re-exported, so no facade wrapper preserves them:
+   re-export (D1). Items whose published signature names a model type, or whose name and contract belong to one family
+   while their owner stays in a lower crate, cannot keep an identical signature once that type leaves the lower crate,
+   and D4's internal bridges are never re-exported, so no facade wrapper preserves them:
    `GatedDeltaNetState::new`, `LoraHook::validate_against` and `validate_against_bert`, the four `SafetensorsFile` and
    `ShardedSafetensors` loaders, and the `quarot` plan and descriptor methods whose owners stay in `lattice-quant`.
    0.15.0 adds the neutral replacements beside them, moves every other caller in the workspace to the replacements,
