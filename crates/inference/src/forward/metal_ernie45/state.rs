@@ -20,10 +20,10 @@ use crate::forward::metal_runtime::{
 use crate::model::ernie45::{Ernie45Config, Ernie45LayerWeights, Ernie45Weights, MAX_SEQ_LEN};
 use crate::model::gemma4_ops::{gemma4_rope_cos_sin, gemma4_rope_inv_freq};
 
-const SHADERS: &str = concat!(
-    include_str!("../shaders/rms_reduce.metal"),
-    include_str!("../shaders/flash_attention.metal"),
-    include_str!("../shaders/ernie45_rope.metal"),
+const SHADERS: &str = metal_runtime::concat_msl!(
+    metal_runtime::msl::RMS_REDUCE,
+    metal_runtime::msl::FLASH_ATTENTION,
+    metal_runtime::msl::ERNIE45_ROPE,
     include_str!("../shaders/ernie45_embed.metal"),
     include_str!("../shaders/ernie45_decode.metal")
 );
