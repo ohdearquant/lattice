@@ -2174,6 +2174,11 @@ jobs:
       # driven against a real process tree shaped like the supervisor's.
       - name: python3 tests/test_bench_phase_sampler_handoff_attribution.py
         run: python3 tests/test_bench_phase_sampler_handoff_attribution.py -v
+      # The sampler's Linux per-process figure: utime+stime deltas over the
+      # same window as the idle share, on fixture /proc text plus one real
+      # /proc read on this Linux runner. No benchmark runs.
+      - name: python3 tests/test_phase_load_sampler_interval.py
+        run: python3 tests/test_phase_load_sampler_interval.py -v
       # bench_quality.sh's canonical-artifact publication guard. Runs the
       # shipping script in a disposable repo with stub lattice/MLX scorers,
       # proving failures preserve the tracked TSV and a complete run publishes
