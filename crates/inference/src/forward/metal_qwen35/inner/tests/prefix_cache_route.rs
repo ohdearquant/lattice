@@ -250,13 +250,12 @@ fn greedy(seed: u64, max_new_tokens: usize) -> GenerateConfig {
 }
 
 fn sampled(seed: u64, max_new_tokens: usize, repetition_penalty: f32) -> GenerateConfig {
-    GenerateConfig {
-        temperature: 0.9,
-        top_k: 8,
-        top_p: 0.95,
-        repetition_penalty,
-        ..cross_turn_test_gen_cfg(seed, max_new_tokens)
-    }
+    let mut config = cross_turn_test_gen_cfg(seed, max_new_tokens);
+    config.temperature = 0.9;
+    config.top_k = 8;
+    config.top_p = 0.95;
+    config.repetition_penalty = repetition_penalty;
+    config
 }
 
 /// A greedy request whose grammar fixes the generated ids.
@@ -267,32 +266,30 @@ fn forced(fixture: &Fixture, gbnf: &str, max_new_tokens: usize) -> GenerateConfi
         fixture.grammar_bytes.clone(),
     )
     .expect("grammar engine builds over the fixture vocabulary");
-    GenerateConfig {
-        grammar: Some(std::sync::Arc::new(engine)),
-        ..greedy(1, max_new_tokens)
+    {
+        let mut config = greedy(1, max_new_tokens);
+        config.grammar = Some(std::sync::Arc::new(engine));
+        config
     }
 }
 
 fn with_stop_tokens(cfg: GenerateConfig, ids: &[u32]) -> GenerateConfig {
-    GenerateConfig {
-        stop_token_ids: ids.to_vec(),
-        ..cfg
-    }
+    let mut config = cfg;
+    config.stop_token_ids = ids.to_vec();
+    config
 }
 
 fn with_stop_strings(cfg: GenerateConfig, strings: &[&str]) -> GenerateConfig {
-    GenerateConfig {
-        stop_strings: strings.iter().map(ToString::to_string).collect(),
-        ..cfg
-    }
+    let mut config = cfg;
+    config.stop_strings = strings.iter().map(ToString::to_string).collect();
+    config
 }
 
 fn thinking(cfg: GenerateConfig, reasoning_budget: usize) -> GenerateConfig {
-    GenerateConfig {
-        enable_thinking: true,
-        reasoning_budget: Some(reasoning_budget),
-        ..cfg
-    }
+    let mut config = cfg;
+    config.enable_thinking = true;
+    config.reasoning_budget = Some(reasoning_budget);
+    config
 }
 
 #[derive(Clone, Copy, Debug)]

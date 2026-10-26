@@ -15,10 +15,11 @@ fn cancel_true() -> impl Fn() -> bool {
 fn finish_invalidates_the_prediction_for_every_disposition() {
     let model = tiny_zero_model();
     let prompt_ids = tokenize(&model, "abc");
-    let config = GenerateConfig {
-        temperature: 0.0,
-        max_new_tokens: 2,
-        ..Default::default()
+    let config = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.0;
+        config.max_new_tokens = 2;
+        config
     };
     for disposition in [FinishDisposition::Reusable, FinishDisposition::Poisoned] {
         let mut session = QwenCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7));
@@ -71,11 +72,12 @@ fn request_buffers_keep_kv_capacity() {
         .collect();
     let cancel = cancel_false();
     session.prefill(&cancel).unwrap();
-    let config = GenerateConfig {
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        max_new_tokens,
-        ..Default::default()
+    let config = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config.max_new_tokens = max_new_tokens;
+        config
     };
     let mut history = prompt_ids;
     for _ in 0..max_new_tokens {
@@ -145,10 +147,11 @@ fn full_step_lifecycle_over_tiny_dense_model() {
     );
 
     let history = prompt_ids.clone();
-    let gen_cfg = GenerateConfig {
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config
     };
     let request = SelectionRequest {
         config: &gen_cfg,
@@ -309,10 +312,11 @@ fn cancelled_decode_consumes_nothing_and_finish_poisoned_invalidates() {
         .prefill(&cancel_false())
         .expect("prefill must succeed");
 
-    let gen_cfg = GenerateConfig {
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config
     };
     let request = SelectionRequest {
         config: &gen_cfg,
@@ -373,10 +377,11 @@ fn full_step_lifecycle_over_real_checkpoint() {
     assert_eq!(stamp.evaluated_len, prompt_len);
     assert_eq!(stamp.prediction, None);
 
-    let gen_cfg = GenerateConfig {
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config
     };
     let request = SelectionRequest {
         config: &gen_cfg,

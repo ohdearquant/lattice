@@ -25,7 +25,7 @@ esac
 # Publish order follows the internal dependency DAG (deps before dependents):
 #   fann, transport, inference-core   leaves, no internal deps
 #     -> tokenizer, grammar, weights, metal-runtime, model-io  depend on inference-core
-#       -> arch                       depends on inference-core, weights
+#       -> arch                       depends on inference-core, grammar, weights
 #         -> quant, compute           quant depends on inference-core, weights, arch; compute on inference-core, tokenizer, weights, arch
 #           -> inference              depends on fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime
 #             -> embed                depends on inference
@@ -72,7 +72,7 @@ if [ -z "$FLAG" ]; then
     sleep 30
 fi
 
-echo "--- Tier 3: arch (depends on inference-core, weights) ---"
+echo "--- Tier 3: arch (depends on inference-core, grammar, weights) ---"
 cargo publish -p lattice-arch $FLAG
 
 if [ -z "$FLAG" ]; then

@@ -63,10 +63,11 @@ fn seed_normalization_preserves_nonzero_and_repairs_zero() {
 #[test]
 fn preparation_applies_seed_normalization_to_the_returned_plan() {
     let tokenizer = tokenizer(&[("a", 0)]);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        seed: Some(0),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.seed = Some(0);
+        config
     };
     let result = prepare(&tokenizer, "a", &gen_cfg, 1, 2).expect("preparation succeeds");
     let GenerationPreparation::Ready(plan) = result else {
@@ -79,11 +80,12 @@ fn preparation_applies_seed_normalization_to_the_returned_plan() {
 #[test]
 fn ready_plan_owns_prompt_seed_and_capacity_and_preserves_mtp_contract() {
     let tokenizer = tokenizer(&[("a", 0), ("b", 1)]);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        seed: Some(17),
-        enable_mtp: Some(true),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 3;
+        config.seed = Some(17);
+        config.enable_mtp = Some(true);
+        config
     };
     let result = prepare(&tokenizer, "ab", &gen_cfg, 2, 5).expect("preparation succeeds");
     let GenerationPreparation::Ready(plan) = result else {
@@ -99,10 +101,11 @@ fn ready_plan_owns_prompt_seed_and_capacity_and_preserves_mtp_contract() {
 #[test]
 fn empty_prompt_precedes_zero_budget_and_capability_checks() {
     let tokenizer = tokenizer(&[("a", 0)]);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 0,
-        stop_strings: vec!["stop".to_string()],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config.stop_strings = vec!["stop".to_string()];
+        config
     };
     let err = prepare(&tokenizer, "", &gen_cfg, 1, 0)
         .expect_err("empty prompt must reject before every later branch");
@@ -116,9 +119,10 @@ fn empty_prompt_precedes_zero_budget_and_capability_checks() {
 #[test]
 fn prompt_id_admission_precedes_zero_budget() {
     let tokenizer = tokenizer(&[("z", 2)]);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config
     };
     let err = prepare(&tokenizer, "z", &gen_cfg, 2, usize::MAX)
         .expect_err("out-of-vocabulary prompt must reject before zero-budget completion");
@@ -129,10 +133,11 @@ fn prompt_id_admission_precedes_zero_budget() {
 #[test]
 fn zero_budget_precedes_capabilities_and_context() {
     let tokenizer = tokenizer(&[("a", 0)]);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 0,
-        stop_strings: vec!["stop".to_string()],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config.stop_strings = vec!["stop".to_string()];
+        config
     };
     let result = prepare(&tokenizer, "a", &gen_cfg, 1, 0)
         .expect("zero budget must complete before unsupported features and context");
@@ -158,21 +163,25 @@ fn standalone_cpu_contract_rejects_every_unwired_feature() {
     )
     .expect("test grammar compiles");
     let configs = [
-        GenerateConfig {
-            grammar: Some(Arc::new(grammar)),
-            ..Default::default()
+        {
+            let mut config = GenerateConfig::default();
+            config.grammar = Some(Arc::new(grammar));
+            config
         },
-        GenerateConfig {
-            logprobs: Some(0),
-            ..Default::default()
+        {
+            let mut config = GenerateConfig::default();
+            config.logprobs = Some(0);
+            config
         },
-        GenerateConfig {
-            stop_strings: vec!["stop".to_string()],
-            ..Default::default()
+        {
+            let mut config = GenerateConfig::default();
+            config.stop_strings = vec!["stop".to_string()];
+            config
         },
-        GenerateConfig {
-            reasoning_budget: Some(1),
-            ..Default::default()
+        {
+            let mut config = GenerateConfig::default();
+            config.reasoning_budget = Some(1);
+            config
         },
     ];
 
@@ -191,12 +200,13 @@ fn metal_direct_contract_preserves_its_capability_set_and_guard_order() {
         vec![b"a".to_vec()],
     )
     .expect("test grammar compiles");
-    let supported = GenerateConfig {
-        max_new_tokens: 1,
-        grammar: Some(Arc::new(grammar)),
-        stop_strings: vec!["stop".to_string()],
-        enable_mtp: Some(true),
-        ..Default::default()
+    let supported = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.grammar = Some(Arc::new(grammar));
+        config.stop_strings = vec!["stop".to_string()];
+        config.enable_mtp = Some(true);
+        config
     };
     let result = prepare_with_contract(
         &tokenizer,
@@ -209,11 +219,12 @@ fn metal_direct_contract_preserves_its_capability_set_and_guard_order() {
     .expect("Metal direct supports grammar, stop strings, and MTP routing");
     assert!(matches!(result, GenerationPreparation::Ready(_)));
 
-    let rejected = GenerateConfig {
-        max_new_tokens: 1,
-        reasoning_budget: Some(1),
-        logprobs: Some(0),
-        ..Default::default()
+    let rejected = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.reasoning_budget = Some(1);
+        config.logprobs = Some(0);
+        config
     };
     let err = prepare_with_contract(
         &tokenizer,
@@ -239,14 +250,15 @@ fn metal_streaming_contract_accepts_its_wired_features() {
         vec![b"a".to_vec()],
     )
     .expect("test grammar compiles");
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        grammar: Some(Arc::new(grammar)),
-        logprobs: Some(0),
-        stop_strings: vec!["stop".to_string()],
-        reasoning_budget: Some(1),
-        enable_mtp: Some(true),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.grammar = Some(Arc::new(grammar));
+        config.logprobs = Some(0);
+        config.stop_strings = vec!["stop".to_string()];
+        config.reasoning_budget = Some(1);
+        config.enable_mtp = Some(true);
+        config
     };
     let result = prepare_with_contract(
         &tokenizer,
@@ -267,9 +279,10 @@ fn metal_streaming_contract_accepts_its_wired_features() {
 #[test]
 fn metal_contracts_preserve_no_prompt_id_admission() {
     let tokenizer = tokenizer(&[("z", 2)]);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config
     };
 
     for contract in [
@@ -286,9 +299,10 @@ fn metal_contracts_preserve_no_prompt_id_admission() {
 #[test]
 fn metal_prefix_cache_streaming_contract_accepts_unset_capabilities() {
     let tokenizer = tokenizer(&[("a", 0)]);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config
     };
     let result = prepare_with_contract(
         &tokenizer,
@@ -316,10 +330,11 @@ fn metal_prefix_cache_streaming_contract_accepts_unset_capabilities() {
 fn metal_prefix_cache_streaming_contract_rejects_capabilities_before_empty_prompt() {
     let tokenizer = tokenizer(&[("a", 0)]);
 
-    let logprobs_and_empty = GenerateConfig {
-        max_new_tokens: 1,
-        logprobs: Some(0),
-        ..Default::default()
+    let logprobs_and_empty = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.logprobs = Some(0);
+        config
     };
     let err = prepare_with_contract(
         &tokenizer,
@@ -338,10 +353,11 @@ fn metal_prefix_cache_streaming_contract_rejects_capabilities_before_empty_promp
         "expected the logprobs error ahead of the empty-prompt error; got {err:?}"
     );
 
-    let mtp_and_empty = GenerateConfig {
-        max_new_tokens: 1,
-        enable_mtp: Some(true),
-        ..Default::default()
+    let mtp_and_empty = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.enable_mtp = Some(true);
+        config
     };
     let err = prepare_with_contract(
         &tokenizer,
@@ -367,11 +383,12 @@ fn metal_prefix_cache_streaming_contract_rejects_capabilities_before_empty_promp
 #[test]
 fn metal_prefix_cache_streaming_contract_rejects_logprobs_before_mtp() {
     let tokenizer = tokenizer(&[("a", 0)]);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        logprobs: Some(0),
-        enable_mtp: Some(true),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.logprobs = Some(0);
+        config.enable_mtp = Some(true);
+        config
     };
     let err = prepare_with_contract(
         &tokenizer,
@@ -402,10 +419,11 @@ fn metal_prefix_cache_streaming_contract_rejects_logprobs_before_mtp() {
 fn metal_prefix_cache_streaming_contract_rejects_capabilities_before_zero_budget() {
     let tokenizer = tokenizer(&[("a", 0)]);
 
-    let logprobs_and_zero_budget = GenerateConfig {
-        max_new_tokens: 0,
-        logprobs: Some(0),
-        ..Default::default()
+    let logprobs_and_zero_budget = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config.logprobs = Some(0);
+        config
     };
     let err = prepare_with_contract(
         &tokenizer,
@@ -424,10 +442,11 @@ fn metal_prefix_cache_streaming_contract_rejects_capabilities_before_zero_budget
         "expected the logprobs error ahead of the zero-budget completion; got {err:?}"
     );
 
-    let mtp_and_zero_budget = GenerateConfig {
-        max_new_tokens: 0,
-        enable_mtp: Some(true),
-        ..Default::default()
+    let mtp_and_zero_budget = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config.enable_mtp = Some(true);
+        config
     };
     let err = prepare_with_contract(
         &tokenizer,
@@ -450,10 +469,11 @@ fn metal_prefix_cache_streaming_contract_rejects_capabilities_before_zero_budget
 #[test]
 fn metal_streaming_context_uses_reasoning_aware_decode_cap() {
     let tokenizer = tokenizer(&[("a", 0)]);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        reasoning_budget: Some(1),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.reasoning_budget = Some(1);
+        config
     };
     let err = prepare_with_contract(
         &tokenizer,
@@ -477,9 +497,10 @@ fn metal_streaming_context_uses_reasoning_aware_decode_cap() {
 #[test]
 fn context_preflight_preserves_the_standalone_cpu_error() {
     let tokenizer = tokenizer(&[("a", 0)]);
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 2,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 2;
+        config
     };
     let err = prepare(&tokenizer, "a", &gen_cfg, 1, 2)
         .expect_err("prompt plus decode budget must fit the context");

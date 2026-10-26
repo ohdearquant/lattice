@@ -1202,23 +1202,21 @@ mod tests {
     };
 
     fn greedy() -> GenerateConfig {
-        GenerateConfig {
-            temperature: 0.0,
-            top_k: 1,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
-        }
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config
     }
 
     fn sampled_block_topk() -> GenerateConfig {
-        GenerateConfig {
-            temperature: 0.8,
-            top_k: 40,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
-        }
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.8;
+        config.top_k = 40;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config
     }
 
     fn mode_for(
@@ -1273,14 +1271,16 @@ mod tests {
         );
 
         // Grammar and logprobs turn the compact route off in the planner.
-        let grammar = GenerateConfig {
-            grammar: Some(a_grammar()),
-            ..greedy()
+        let grammar = {
+            let mut config = greedy();
+            config.grammar = Some(a_grammar());
+            config
         };
         assert_eq!(mode_for(Direct, &grammar, COMPACT_ENV), ReadbackMode::Dense);
-        let logprobs = GenerateConfig {
-            logprobs: Some(2),
-            ..greedy()
+        let logprobs = {
+            let mut config = greedy();
+            config.logprobs = Some(2);
+            config
         };
         assert_eq!(
             mode_for(Streaming, &logprobs, COMPACT_ENV),
@@ -1294,13 +1294,15 @@ mod tests {
             route: GpuTopkRoute::BlockArgmax,
             top_k: 1,
         };
-        let grammar = GenerateConfig {
-            grammar: Some(a_grammar()),
-            ..greedy()
+        let grammar = {
+            let mut config = greedy();
+            config.grammar = Some(a_grammar());
+            config
         };
-        let logprobs = GenerateConfig {
-            logprobs: Some(1),
-            ..greedy()
+        let logprobs = {
+            let mut config = greedy();
+            config.logprobs = Some(1);
+            config
         };
         for (gen_cfg, mode) in [
             (&grammar, compact),
@@ -1628,9 +1630,10 @@ mod tests {
         let mut state =
             MetalQwen35State::new(&weights, &cfg, TINY_CACHE).expect("tiny Metal state");
         // The direct entry's own logprobs refusal, before any mutation.
-        let logprobs = GenerateConfig {
-            logprobs: Some(1),
-            ..greedy()
+        let logprobs = {
+            let mut config = greedy();
+            config.logprobs = Some(1);
+            config
         };
         let refused = QwenMetalSession::with_route_environment(
             &mut state,
@@ -1774,9 +1777,10 @@ mod tests {
         let prefix = [1u32, 2, 3];
         let mut state = state_restored_to(&weights, &cfg, &prefix);
 
-        let logprobs = GenerateConfig {
-            logprobs: Some(1),
-            ..greedy()
+        let logprobs = {
+            let mut config = greedy();
+            config.logprobs = Some(1);
+            config
         };
         let refused = QwenMetalSession::over_restored_state(
             &mut state,
@@ -2116,9 +2120,10 @@ mod tests {
     /// placeholder id the driver hands the flush.
     #[test]
     fn streaming_tail_flush_reports_the_last_emitted_token_id() {
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 2,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 2;
+            config
         };
         let (output, calls) = stream_script(vec![0, 1], &gen_cfg);
         let output = output.expect("an unconstrained scripted stream runs to its cap");
@@ -2140,12 +2145,13 @@ mod tests {
     /// completes no stop string.
     #[test]
     fn streaming_grammar_rejection_reports_not_stopped() {
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 4,
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.enable_thinking = true;
+            config.reasoning_budget = Some(1);
+            config.grammar = Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b"));
+            config
         };
         let (output, calls) = stream_script(vec![3], &gen_cfg);
         let output = output.expect("a grammar rejection is not an error");
@@ -2170,13 +2176,14 @@ mod tests {
     /// and the matched text never reaches `on_token`.
     #[test]
     fn streaming_grammar_rejection_then_flushed_stop_string_reports_eos() {
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 4,
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
-            stop_strings: vec!["\n\u{fffd}".to_string()],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.enable_thinking = true;
+            config.reasoning_budget = Some(1);
+            config.grammar = Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b"));
+            config.stop_strings = vec!["\n\u{fffd}".to_string()];
+            config
         };
         let (output, calls) = stream_script(vec![3], &gen_cfg);
         let output = output.expect("a grammar rejection is not an error");
@@ -2192,10 +2199,11 @@ mod tests {
     /// decode-step message (control: the step-0 message is not applied to it).
     #[test]
     fn streaming_grammar_block_messages_distinguish_step_zero() {
-        let blocked_at_start = GenerateConfig {
-            max_new_tokens: 4,
-            grammar: Some(scripted_grammar("root ::= \"b\"\n", b"a")),
-            ..Default::default()
+        let blocked_at_start = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.grammar = Some(scripted_grammar("root ::= \"b\"\n", b"a"));
+            config
         };
         let (output, calls) = stream_script(vec![1], &blocked_at_start);
         match output {
@@ -2206,10 +2214,11 @@ mod tests {
         }
         assert!(calls.is_empty());
 
-        let dead_end = GenerateConfig {
-            max_new_tokens: 4,
-            grammar: Some(scripted_grammar("root ::= \"b\" \"c\"\n", b"b")),
-            ..Default::default()
+        let dead_end = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.grammar = Some(scripted_grammar("root ::= \"b\" \"c\"\n", b"b"));
+            config
         };
         let (output, calls) = stream_script(vec![1], &dead_end);
         match output {
@@ -2251,11 +2260,10 @@ mod tests {
     }
 
     fn with_stop_strings(max_new_tokens: usize, stop_strings: &[&str]) -> GenerateConfig {
-        GenerateConfig {
-            max_new_tokens,
-            stop_strings: stop_strings.iter().map(|s| (*s).to_string()).collect(),
-            ..Default::default()
-        }
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = max_new_tokens;
+        config.stop_strings = stop_strings.iter().map(|s| (*s).to_string()).collect();
+        config
     }
 
     /// "ax" is completed only by the second token of the pair, so the match
@@ -2318,10 +2326,11 @@ mod tests {
     /// `stopped: true` (control).
     #[test]
     fn direct_grammar_rejection_reports_not_stopped() {
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 4,
-            grammar: Some(scripted_grammar("root ::= \"x\" \"x\"\n", b"b")),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.grammar = Some(scripted_grammar("root ::= \"x\" \"x\"\n", b"b"));
+            config
         };
         let rejected = direct_script(vec![2, 0], &gen_cfg).expect("a rejection is not an error");
         assert_eq!(rejected.token_ids, vec![2]);
@@ -2340,10 +2349,11 @@ mod tests {
     /// decode-step message (control).
     #[test]
     fn direct_grammar_block_messages_distinguish_step_zero() {
-        let blocked_at_start = GenerateConfig {
-            max_new_tokens: 4,
-            grammar: Some(scripted_grammar("root ::= \"b\"\n", b"a")),
-            ..Default::default()
+        let blocked_at_start = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.grammar = Some(scripted_grammar("root ::= \"b\"\n", b"a"));
+            config
         };
         match direct_script(vec![1], &blocked_at_start) {
             Err(InferenceError::GrammarConstraintBlocked(message)) => {
@@ -2352,10 +2362,11 @@ mod tests {
             other => panic!("expected the step-0 grammar block, got {other:?}"),
         }
 
-        let dead_end = GenerateConfig {
-            max_new_tokens: 4,
-            grammar: Some(scripted_grammar("root ::= \"x\" \"c\"\n", b"b")),
-            ..Default::default()
+        let dead_end = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.grammar = Some(scripted_grammar("root ::= \"x\" \"c\"\n", b"b"));
+            config
         };
         match direct_script(vec![2], &dead_end) {
             Err(InferenceError::GrammarConstraintBlocked(message)) => {
@@ -2412,10 +2423,9 @@ mod tests {
     }
 
     fn capped(max_new_tokens: usize) -> GenerateConfig {
-        GenerateConfig {
-            max_new_tokens,
-            ..Default::default()
-        }
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = max_new_tokens;
+        config
     }
 
     /// Ids: 0 reads "a", 1 renders U+FFFD only in the final flush, 2 reads "x"
@@ -2439,9 +2449,10 @@ mod tests {
         assert_eq!(run.commit, PrefixCommit::Save { silent_step: false });
 
         // A grammar the first token completes: the token was never forwarded.
-        let completes = GenerateConfig {
-            grammar: Some(scripted_grammar("root ::= \"a\"\n", b"b")),
-            ..capped(4)
+        let completes = {
+            let mut config = capped(4);
+            config.grammar = Some(scripted_grammar("root ::= \"a\"\n", b"b"));
+            config
         };
         let (run, _) = prefix_script(vec![0], &completes, None, None);
         assert_eq!(run.output.stop_reason, Some(StopReason::Grammar));
@@ -2450,11 +2461,12 @@ mod tests {
 
         // A budget-forced token the grammar rejects: the loop top forwarded the
         // last pushed token, so the silent step must not forward it again.
-        let rejects = GenerateConfig {
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
-            ..capped(4)
+        let rejects = {
+            let mut config = capped(4);
+            config.enable_thinking = true;
+            config.reasoning_budget = Some(1);
+            config.grammar = Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b"));
+            config
         };
         let (run, _) = prefix_script(vec![3], &rejects, None, None);
         assert_eq!(run.output.stop_reason, Some(StopReason::Grammar));
@@ -2485,15 +2497,17 @@ mod tests {
         assert_eq!(run.commit, PrefixCommit::Leave);
 
         // A stop string the first token completes, and one a later token does.
-        let first = GenerateConfig {
-            stop_strings: vec!["a".into()],
-            ..capped(4)
+        let first = {
+            let mut config = capped(4);
+            config.stop_strings = vec!["a".into()];
+            config
         };
         let (run, _) = prefix_script(vec![0, 0], &first, None, None);
         assert_eq!(run.commit, PrefixCommit::Leave);
-        let later = GenerateConfig {
-            stop_strings: vec!["x".into()],
-            ..capped(4)
+        let later = {
+            let mut config = capped(4);
+            config.stop_strings = vec!["x".into()];
+            config
         };
         let (run, _) = prefix_script(vec![0, 2], &later, None, None);
         assert_eq!(run.output.text, "a");
@@ -2501,9 +2515,10 @@ mod tests {
 
         // A grammar that blocks every token before the first one and is
         // complete without a continuation.
-        let complete_at_start = GenerateConfig {
-            grammar: Some(scripted_grammar("root ::= \"\"\n", b"b")),
-            ..capped(4)
+        let complete_at_start = {
+            let mut config = capped(4);
+            config.grammar = Some(scripted_grammar("root ::= \"\"\n", b"b"));
+            config
         };
         let (run, _) = prefix_script(vec![0], &complete_at_start, None, None);
         assert_eq!(run.output.stop_reason, Some(StopReason::Grammar));
@@ -2533,9 +2548,10 @@ mod tests {
     /// exit is unchanged, but the caller's text was still truncated by the match.
     #[test]
     fn prefix_commit_reads_a_stop_string_completed_by_the_flush_per_exit() {
-        let flush = |gen_cfg: GenerateConfig| GenerateConfig {
-            stop_strings: vec!["\u{fffd}".into()],
-            ..gen_cfg
+        let flush = |gen_cfg: GenerateConfig| {
+            let mut config = gen_cfg;
+            config.stop_strings = vec!["\u{fffd}".into()];
+            config
         };
 
         let (run, _) = prefix_script(vec![0, 1], &flush(capped(2)), None, None);
@@ -2547,11 +2563,12 @@ mod tests {
             "a length stop the flush ends"
         );
 
-        let rejects = GenerateConfig {
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            grammar: Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b")),
-            ..capped(4)
+        let rejects = {
+            let mut config = capped(4);
+            config.enable_thinking = true;
+            config.reasoning_budget = Some(1);
+            config.grammar = Some(scripted_grammar("root ::= \"b\" \"b\"\n", b"b"));
+            config
         };
         let (run, _) = prefix_script(vec![3], &flush(rejects), None, None);
         assert_eq!(

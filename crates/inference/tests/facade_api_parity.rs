@@ -1408,6 +1408,83 @@ mod model_config_parity {
     }
 }
 
+mod interface_parity {
+    use lattice_arch as extracted;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    #[test]
+    fn generation_types_are_the_same_type_at_every_path() {
+        use lattice_inference::generation as facade;
+        same_type(
+            PhantomData::<facade::GenerateConfig>,
+            PhantomData::<extracted::generation::GenerateConfig>,
+        );
+        same_type(
+            PhantomData::<facade::GenerateOutput>,
+            PhantomData::<extracted::generation::GenerateOutput>,
+        );
+        same_type(
+            PhantomData::<facade::TokenLogprob>,
+            PhantomData::<extracted::generation::TokenLogprob>,
+        );
+        same_type(
+            PhantomData::<facade::TopLogprob>,
+            PhantomData::<extracted::generation::TopLogprob>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::GenerateConfig>,
+            PhantomData::<extracted::generation::GenerateConfig>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::GenerateOutput>,
+            PhantomData::<extracted::generation::GenerateOutput>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::TokenLogprob>,
+            PhantomData::<extracted::generation::TokenLogprob>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::TopLogprob>,
+            PhantomData::<extracted::generation::TopLogprob>,
+        );
+    }
+
+    #[test]
+    fn sampling_types_are_the_same_type_at_both_paths() {
+        use lattice_inference::sampling as facade;
+        same_type(
+            PhantomData::<facade::SamplingConfig>,
+            PhantomData::<extracted::sampling::SamplingConfig>,
+        );
+        same_type(
+            PhantomData::<facade::Candidate>,
+            PhantomData::<extracted::sampling::Candidate>,
+        );
+        same_type(
+            PhantomData::<facade::CandidateSet>,
+            PhantomData::<extracted::sampling::CandidateSet>,
+        );
+        same_type(
+            PhantomData::<facade::Sampler>,
+            PhantomData::<extracted::sampling::Sampler>,
+        );
+    }
+
+    #[test]
+    fn stop_reason_is_the_same_type_at_every_path() {
+        same_type(
+            PhantomData::<lattice_inference::stop_reason::StopReason>,
+            PhantomData::<extracted::stop_reason::StopReason>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::StopReason>,
+            PhantomData::<extracted::stop_reason::StopReason>,
+        );
+    }
+}
+
 mod compute_parity {
     use lattice_compute as extracted;
     use lattice_inference::rope as facade;

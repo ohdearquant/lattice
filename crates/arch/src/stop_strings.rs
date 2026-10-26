@@ -1,6 +1,7 @@
-//! Shared string-level stop-sequence matcher for Qwen3.5 generation.
+//! Shared string-level stop-sequence matcher for generation.
 //!
-//! Both the CPU path (`generation.rs`) and the Metal path (`forward::metal_qwen35`)
+//! Both the CPU path (`lattice_inference::model::qwen35::generation`) and the Metal path
+//! (`lattice_inference::forward::metal_qwen35`)
 //! call the same [`StopStringMatcher`] and [`earliest_stop_match`] so that stop-string
 //! enforcement has CPU-identical semantics everywhere: incremental scan over decoded
 //! text, a held-back partial suffix for spans that could still complete a stop string
@@ -11,9 +12,9 @@
 // `earliest_stop_match` / `earliest_stop_match_from` calls, regardless of which
 // of the two a caller uses. This lets a deterministic test observe the *real*
 // scan cost incurred by the production call site in `StopStringMatcher::push`
-// (crates/inference/src/model/qwen35/stop_strings.rs) and
+// (crates/arch/src/stop_strings.rs) and
 // `DecodePolicy::stop_check`'s `FullScan` branch
-// (crates/inference/src/generation.rs):
+// (crates/arch/src/generation.rs):
 // if either regresses back to the full-rescan `earliest_stop_match`, the
 // counter grows with `haystack.len()` on every call instead of with the
 // bounded window, and a linear-bound assertion over many pushes fails.
@@ -32,7 +33,7 @@ pub(crate) fn scan_bytes_counter() -> usize {
 
 /// Returns the smallest byte index in `haystack` at which any stop string begins,
 /// or `None` if no stop string is present.
-pub(crate) fn earliest_stop_match(haystack: &str, stops: &[String]) -> Option<usize> {
+pub fn earliest_stop_match(haystack: &str, stops: &[String]) -> Option<usize> {
     stops
         .iter()
         .filter_map(|s| {
@@ -117,7 +118,7 @@ pub(crate) fn stop_scan_search_start(haystack: &str, prev_len: usize, max_stop: 
 /// `finish` is called once after the decode loop ends (natural stop / EOS / token cap).
 /// If `stopped` is already true it is a no-op; otherwise it appends the `detok.finish()` tail,
 /// checks for a stop in the result, and emits whatever is safe.
-pub(crate) struct StopStringMatcher {
+pub struct StopStringMatcher {
     full: String,
     emitted: usize,
     max_stop: usize,
@@ -132,7 +133,7 @@ impl StopStringMatcher {
     /// infecting `DecodePolicy` itself with a lifetime parameter threaded
     /// through every call site; the stop-string list is tiny and constructed
     /// once per generation, so cloning it is free relative to the decode loop.
-    pub(crate) fn new(stops: &[String]) -> Self {
+    pub fn new(stops: &[String]) -> Self {
         let max_stop = stops.iter().map(String::len).max().unwrap_or(1);
         Self {
             full: String::new(),
@@ -157,7 +158,7 @@ impl StopStringMatcher {
     /// token even when that token's delta happens to be empty. Skipping the
     /// scan here (as the previous `if delta.is_empty() { return false; }`
     /// early-return did) silently swallowed that first-token stop.
-    pub(crate) fn push(&mut self, delta: &str, sink: &mut impl FnMut(&str)) -> bool {
+    pub fn push(&mut self, delta: &str, sink: &mut impl FnMut(&str)) -> bool {
         // Any match entirely within `full[..prev_len]` would already have been
         // found by a prior call (see `earliest_stop_match_from`'s doc comment),
         // so only the suffix that could contain a NEW match — the previous
@@ -204,7 +205,7 @@ impl StopStringMatcher {
     ///
     /// No-op when already stopped (a stop string was found in the decode loop).
     /// Otherwise appends `tail`, checks for a late stop, and emits whatever remains.
-    pub(crate) fn finish(&mut self, tail: &str, sink: &mut impl FnMut(&str)) {
+    pub fn finish(&mut self, tail: &str, sink: &mut impl FnMut(&str)) {
         if self.stopped {
             return;
         }
@@ -230,7 +231,7 @@ impl StopStringMatcher {
     }
 
     /// Whether a stop string has matched so far.
-    pub(crate) fn stopped(&self) -> bool {
+    pub fn stopped(&self) -> bool {
         self.stopped
     }
 
@@ -242,8 +243,7 @@ impl StopStringMatcher {
     /// this module's own tests; every `DecodePolicy`-driven call site
     /// (CPU and Metal streaming) accumulates into a caller-owned
     /// `text: &mut String` via `stop_check`/`finish_stop` instead (PR #787).
-    #[cfg(any(test, feature = "metal-gpu"))]
-    pub(crate) fn into_text(self) -> String {
+    pub fn into_text(self) -> String {
         self.full
     }
 }

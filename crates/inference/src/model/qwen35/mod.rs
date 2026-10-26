@@ -24,7 +24,13 @@ mod norm;
 pub(crate) mod q8_conversion;
 mod rerank;
 mod sampling;
-pub(crate) mod stop_strings;
+/// The shared stop-string matcher, moved to `lattice-arch` (ADR-103 Amendment 21); its
+/// crate-local path stays for this crate's CPU and Metal decode loops.
+pub(crate) mod stop_strings {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub(crate) use lattice_arch::__internal::StopStringMatcher;
+    pub(crate) use lattice_arch::__internal::earliest_stop_match;
+}
 mod weights;
 
 pub use embed::HiddenPooling;

@@ -1,5 +1,6 @@
 use super::*;
 use crate::generation::GenerateConfig;
+use crate::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID;
 
 #[test]
 fn test_generate_config_defaults() {
