@@ -906,9 +906,6 @@ impl<'a> BertTensorReader<'a> {
     }
 }
 
-#[cfg(test)]
-mod bert_namespace_tests;
-
 /// **Unstable**: per-layer Qwen3 decoder weights; field set may change with model variants.
 ///
 /// Weights for one Qwen3 decoder layer (GQA + SwiGLU + QK-norm).

@@ -62,6 +62,9 @@ mod prepared_merges_txt;
 #[cfg_attr(not(test), allow(dead_code))]
 mod prepared_bpe_vocab_match;
 
+/// **Unstable**: BERT and classifier weight assembly from safetensors.
+pub mod weight_loading;
+
 /// Per-layer fused Q/K/V weight+bias, built once at model-load time from a
 /// `TransformerLayerWeights` layer's separate `query`/`key`/`value` tensors.
 ///
@@ -357,8 +360,11 @@ impl BertModel {
             );
         }
 
-        let weights_tmp =
-            safetensors.load_bert_weights(config.num_hidden_layers, config.hidden_size)?;
+        let weights_tmp = weight_loading::load_weights(
+            &safetensors,
+            config.num_hidden_layers,
+            config.hidden_size,
+        )?;
         let fused_qkv: Vec<LayerFusedQkv> = weights_tmp
             .layers
             .iter()
