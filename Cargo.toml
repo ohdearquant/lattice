@@ -19,6 +19,7 @@ members = [
     "crates/models/embeddinggemma2",
     "crates/models/bert",
     "crates/models/qwen3",
+    "crates/models/gemma4",
 ]
 
 [workspace.package]
@@ -117,6 +118,7 @@ approx = "0.5"
 
 lattice-arch = { version = "0.15.0", path = "crates/arch" }
 lattice-compute = { version = "0.15.0", path = "crates/compute" }
+lattice-grammar = { version = "0.15.0", path = "crates/grammar" }
 lattice-inference-core = { version = "0.15.0", path = "crates/inference-core" }
 lattice-metal-runtime = { version = "0.15.0", path = "crates/metal-runtime" }
 lattice-model-io = { version = "0.15.0", path = "crates/model-io", default-features = false }
@@ -125,6 +127,7 @@ lattice-weights = { version = "0.15.0", path = "crates/weights" }
 lattice-model-embeddinggemma2 = { version = "0.15.0", path = "crates/models/embeddinggemma2" }
 lattice-model-bert = { version = "0.15.0", path = "crates/models/bert", default-features = false }
 lattice-model-qwen3 = { version = "0.15.0", path = "crates/models/qwen3", default-features = false }
+lattice-model-gemma4 = { version = "0.15.0", path = "crates/models/gemma4", default-features = false }
 
 [workspace.lints.clippy]
 # Correctness

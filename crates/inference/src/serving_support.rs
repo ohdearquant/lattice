@@ -13,6 +13,7 @@ use crate::decoder::driver::DriverTrace;
 use crate::error::InferenceError;
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::Qwen35Model;
+#[cfg(feature = "gemma4")]
 use crate::model::gemma4_model::Gemma4Model;
 use crate::model::qwen35_config::VisionModelConfig;
 use crate::vision::VisionError;
@@ -77,13 +78,13 @@ where
 ///
 /// # Errors
 /// Propagates generation failures.
+#[cfg(feature = "gemma4")]
 pub fn gemma_generate_traced(
     model: &Gemma4Model,
     prompt_ids: &[u32],
     gen_cfg: &GenerateConfig,
 ) -> Result<(GenerateOutput, TraceObservation), InferenceError> {
-    model
-        .generate_with_trace(prompt_ids, gen_cfg)
+    lattice_model_gemma4::__internal::generate_traced(model, prompt_ids, gen_cfg)
         .map(|(output, trace)| (output, trace.into()))
 }
 
@@ -92,6 +93,7 @@ pub fn gemma_generate_traced(
 ///
 /// # Errors
 /// Propagates generation failures.
+#[cfg(feature = "gemma4")]
 pub fn gemma_generate_streaming_traced<F, C>(
     model: &Gemma4Model,
     prompt_ids: &[u32],
@@ -103,9 +105,14 @@ where
     F: FnMut(&str) -> bool,
     C: FnMut() -> bool,
 {
-    model
-        .generate_streaming_via_driver(prompt_ids, gen_cfg, on_token, should_cancel)
-        .map(|(output, trace)| (output, trace.into()))
+    lattice_model_gemma4::__internal::generate_streaming_traced(
+        model,
+        prompt_ids,
+        gen_cfg,
+        on_token,
+        should_cancel,
+    )
+    .map(|(output, trace)| (output, trace.into()))
 }
 
 /// Metal prefix-cache streaming generation with the driver's counters kept.

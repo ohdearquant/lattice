@@ -30,7 +30,8 @@ esac
 #           -> embeddinggemma2        depends on arch, compute, inference-core, tokenizer, weights, model-io and optional metal-runtime
 #           -> bert                   depends on arch, compute, inference-core, tokenizer, weights, model-io
 #           -> qwen3                  depends on arch, compute, inference-core, tokenizer, weights, model-io and optional metal-runtime
-#             -> inference            depends on embeddinggemma2, bert, qwen3 and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime
+#           -> gemma4                 depends on arch, compute, inference-core, tokenizer, weights
+#             -> inference            depends on embeddinggemma2, bert, qwen3, gemma4 and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime
 #               -> embed              depends on inference and embeddinggemma2
 #             -> serve                depends on inference (exact version), fann, tokenizer, weights
 #             -> tune                 depends on fann, inference
@@ -96,6 +97,7 @@ echo "--- Tier 5: model families (depend on arch, compute and lower crates) ---"
 cargo publish -p lattice-model-embeddinggemma2 $FLAG
 cargo publish -p lattice-model-bert $FLAG
 cargo publish -p lattice-model-qwen3 $FLAG
+cargo publish -p lattice-model-gemma4 $FLAG
 
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."

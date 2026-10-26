@@ -11,10 +11,6 @@
 /// Qwen3.5 entry point wrapped over this module's typed vocabulary.
 pub(crate) mod qwen_cpu;
 
-/// Second concrete [`DecoderSession`] implementation (ADR-090 row R04): the Gemma 4 E2B
-/// text CPU entry point wrapped over this module's typed vocabulary.
-pub(crate) mod gemma_cpu;
-
 /// The ordinary Qwen3.5 Metal generation path as a concrete [`DecoderSession`] (ADR-090
 /// row R06).
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -44,7 +40,7 @@ pub(crate) mod driver {
     pub(crate) use counted::{run, run_into, test_driver_run_count};
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     pub(crate) use lattice_arch::__internal::decoder::run_speculative;
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
     pub(crate) use lattice_arch::decoder::driver::DriverResult;
     pub(crate) use lattice_arch::decoder::driver::DriverTrace;
     #[cfg(not(all(test, target_os = "macos", feature = "metal-gpu")))]

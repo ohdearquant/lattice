@@ -1,5 +1,5 @@
-//! `GemmaCpuSession`: the Gemma 4 E2B text CPU concrete [`super::DecoderSession`]
-//! (ADR-090 row R04), the Gemma sibling of [`super::qwen_cpu::QwenCpuSession`].
+//! `GemmaCpuSession`: the Gemma 4 E2B text CPU concrete [`lattice_arch::decoder::DecoderSession`]
+//! (ADR-090 row R04), the Gemma sibling of `QwenCpuSession`.
 //!
 //! Wraps `Gemma4Model`'s bounded prompt prefill and per-token `forward_step`
 //! behind the object-safe session boundary D1 introduces. Short or invalid-ID
@@ -17,10 +17,9 @@
 //!
 //! **Prediction ledger**: one per session, same rationale as `QwenCpuSession`.
 //!
-//! **RNG / sampling**: reuses [`crate::model::qwen35::sample_token`] (a thin,
-//! model-agnostic wrapper over `crate::sampling::sample_full_logits`) and
-//! [`crate::model::qwen35::initial_rng_state`] through their existing
-//! crate-wide paths -- neither function reads anything Qwen-specific: both
+//! **RNG / sampling**: reuses [`lattice_arch::__internal::sample_full_logits`] with the
+//! original wrapper's min-p and disabled top-n-sigma filtering, plus
+//! [`lattice_arch::__internal::initial_rng_state`] -- neither reads anything Qwen-specific: both
 //! take `&GenerateConfig`, raw logit/id slices, or a bare RNG state.
 //!
 //! **Capabilities**: all four `false`. This row implements full
@@ -34,17 +33,17 @@
 //! `logprobs: false`. A later row can flip these to `true` once each control
 //! is actually wired and tested end to end.
 
-use super::qwen_cpu::has_finite_logit;
-use super::{
+use crate::gemma4_cache::Gemma4KvCache;
+use crate::gemma4_model::{Gemma4Model, Gemma4Scratch};
+use lattice_arch::__internal::compute_step_logprobs;
+use lattice_arch::__internal::has_finite_logit;
+use lattice_arch::__internal::{initial_rng_state, sample_full_logits};
+use lattice_arch::decoder::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
     MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectOutcome,
     SelectionCandidate, SelectionRequest, StepStamp, TokenMetadata,
 };
-use crate::error::InferenceError;
-use crate::model::gemma4_cache::Gemma4KvCache;
-use crate::model::gemma4_model::{Gemma4Model, Gemma4Scratch};
-use crate::model::qwen35::{initial_rng_state, sample_token};
-use crate::sampling::compute_step_logprobs;
+use lattice_inference_core::InferenceError;
 
 /// `ExecutionCapabilities` for the Gemma 4 E2B text CPU session (ADR-090 row
 /// R04): all `false`. Grammar masking, per-token logprobs, `stop_strings`, and
@@ -187,7 +186,7 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
     /// before this method is ever called -- kept as a real, working branch
     /// rather than an `unreachable!()` so a future row that flips the
     /// capability does not have to rewrite this method), then samples via
-    /// [`sample_token`] (the crate's existing sampling path:
+    /// [`sample_full_logits`] (the crate's existing sampling path:
     /// temperature/top-k/top-p/min-p/repetition-penalty/seed, all read from
     /// `request.config`/`self.rng_state`), and opens a new ledger prediction
     /// for the sampled candidate. Mirrors `QwenCpuSession::select` exactly.
@@ -201,11 +200,13 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
             }
         }
 
-        let candidate_id = sample_token(
+        let candidate_id = sample_full_logits(
             &self.scratch.logits[..vocab_size],
             request.config,
             request.history,
             &mut self.rng_state,
+            request.config.min_p,
+            0.0,
         );
         let prediction = self.ledger.open()?;
 
@@ -216,7 +217,7 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
     }
 
     /// Scores `final_token` against the prediction's logits via
-    /// `crate::sampling::compute_step_logprobs`, exactly as
+    /// `lattice_arch::__internal::compute_step_logprobs`, exactly as
     /// `QwenCpuSession::metadata` does. Real and working (see this module's
     /// doc comment on why it is not a stub), though unreachable through the
     /// driver today since `CAPABILITIES.logprobs` is `false`.
@@ -264,8 +265,8 @@ mod prefill_bench;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generation::GenerateConfig;
-    use crate::model::gemma4_model::{tiny_nonzero_model, tiny_zero_model};
+    use crate::gemma4_model::{tiny_nonzero_model, tiny_zero_model};
+    use lattice_arch::generation::GenerateConfig;
 
     fn cancel_false() -> impl Fn() -> bool {
         || false
@@ -747,8 +748,8 @@ mod tests {
 
     mod driver_lifecycle_regressions {
         use super::*;
-        use crate::decoder::driver;
-        use crate::stop_reason::StopReason;
+        use lattice_arch::decoder::driver;
+        use lattice_arch::stop_reason::StopReason;
         use std::cell::Cell;
 
         struct RecordingGemmaSession<'model> {

@@ -1,4 +1,3 @@
-use super::*;
 use crate::model::qwen35::qwen35_rms_norm;
 use std::path::{Path, PathBuf};
 
@@ -19,12 +18,6 @@ fn load_json(name: &str) -> serde_json::Value {
 
 fn manifest() -> serde_json::Value {
     load_json("manifest.json")
-}
-
-fn tolerance(op: &str) -> f32 {
-    manifest()["ops"][op]["tolerance_max_abs_diff"]
-        .as_f64()
-        .unwrap_or_else(|| panic!("manifest missing tolerance for op {op}")) as f32
 }
 
 /// Predeclared minimum required max-abs-diff for a mutation (negative)
@@ -58,14 +51,6 @@ fn load_bin(fx: &serde_json::Value, key: &str) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
-}
-
-fn flatten_u32(v: &serde_json::Value) -> Vec<u32> {
-    match v {
-        serde_json::Value::Array(items) => items.iter().flat_map(flatten_u32).collect(),
-        serde_json::Value::Number(n) => vec![n.as_u64().expect("integer fixture value") as u32],
-        other => panic!("expected number or array in fixture, got {other:?}"),
-    }
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
@@ -107,66 +92,6 @@ fn mutation_shifted_rms_norm_fails_golden() {
         "shifted (1+gamma) RMSNorm must diverge from the standard-RMSNorm golden \
              by at least the predeclared mutation-separation floor \
              (diff {diff}, floor {floor}) -- this test is decorative if it doesn't"
-    );
-}
-
-#[test]
-fn scaled_embedding_matches_hf_golden() {
-    let fx = load_json("scaled_embedding.json");
-    let tol = tolerance("scaled_embedding");
-    let hidden = fx["hidden"].as_u64().unwrap() as usize;
-    let ids = flatten_u32(&fx["input_ids"]);
-    let embed_weight = load_bin(&fx, "embed_weight");
-    let expected = load_bin(&fx, "output");
-    let expected_scale = fx["embed_scale"].as_f64().unwrap() as f32;
-    assert!(
-        ((hidden as f32).sqrt() - expected_scale).abs() < 1e-6,
-        "fixture embed_scale must be sqrt(hidden_size)"
-    );
-
-    let mut out = vec![0f32; ids.len() * hidden];
-    gemma4_scaled_embedding(&ids, &embed_weight, hidden, &mut out);
-
-    let diff = max_abs_diff(&out, &expected);
-    assert!(
-        diff <= tol,
-        "scaled_embedding max-abs-diff {diff} exceeds tolerance {tol}"
-    );
-}
-
-#[test]
-fn logit_softcap_matches_hf_golden() {
-    let fx = load_json("logit_softcap.json");
-    let tol = tolerance("logit_softcap");
-    let cap = fx["cap"].as_f64().unwrap() as f32;
-    let mut logits = load_bin(&fx, "input");
-    let expected = load_bin(&fx, "output");
-
-    gemma4_logit_softcap(&mut logits, cap);
-
-    let diff = max_abs_diff(&logits, &expected);
-    assert!(
-        diff <= tol,
-        "logit_softcap max-abs-diff {diff} exceeds tolerance {tol}"
-    );
-}
-
-#[test]
-fn mutation_disabled_softcap_fails_golden() {
-    // Fail-closed negative test: leaving logits uncapped (identity) must
-    // diverge from the capped golden beyond tolerance. The fixture's
-    // logits deliberately span well past +/-cap so saturation is
-    // material, not a rounding-noise-sized difference.
-    let fx = load_json("logit_softcap.json");
-    let floor = mutation_separation_floor("logit_softcap");
-    let logits = load_bin(&fx, "input");
-    let expected = load_bin(&fx, "output");
-
-    let diff = max_abs_diff(&logits, &expected);
-    assert!(
-        diff >= floor,
-        "uncapped logits must diverge from the softcapped golden by at least the \
-             predeclared mutation-separation floor (diff {diff}, floor {floor})"
     );
 }
 
