@@ -2323,7 +2323,7 @@ mod tests {
     // agree, LoRA off.
     #[test]
     fn source_parity_forward_save_vs_fused_asymmetric_heads() {
-        use crate::attention::gdn::GatedDeltaNetState;
+        use crate::attention::gdn::{GatedDeltaNetState, require_qwen35_gdn_geometry};
         use crate::attention::gdn_fused::{GatedDeltaNetFusedScratch, gated_delta_net_step_fused};
         use crate::lora_hook::NoopLoraHook;
 
@@ -2382,7 +2382,7 @@ mod tests {
         );
 
         // --- Path B: gated_delta_net_step_fused (shipping inference path), per token ---
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg));
         let mut scratch = GatedDeltaNetFusedScratch::default();
         let hook = NoopLoraHook;
         let mut outputs_b = vec![0.0f32; seq_len * hidden];

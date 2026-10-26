@@ -15,8 +15,170 @@
 
 use crate::forward::cpu::matmul_bt;
 use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_inference_core::InferenceError;
 
-/// **Unstable**: weight tensors for a GatedDeltaNet layer; field layout follows Qwen3.5 checkpoint format.
+/// **Unstable**: the dimensions of one GatedDeltaNet layer, as passed to [`GdnGeometry::new`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GdnDimensions {
+    /// Width of the hidden state the layer reads and writes.
+    pub hidden_size: usize,
+    /// Number of query/key heads.
+    pub num_key_heads: usize,
+    /// Number of value heads; a whole multiple of `num_key_heads`.
+    pub num_value_heads: usize,
+    /// Width of one query/key head.
+    pub key_head_dim: usize,
+    /// Width of one value head.
+    pub value_head_dim: usize,
+    /// Length of the causal depthwise convolution kernel.
+    pub conv_kernel_dim: usize,
+    /// Epsilon of the gated RMS norm applied to each output head.
+    pub rms_norm_eps: f32,
+}
+
+/// **Unstable**: validated geometry of one GatedDeltaNet layer.
+///
+/// Built only by [`GdnGeometry::new`], which checks that every dimension is non-zero, that the
+/// value heads divide evenly over the key heads, that the norm epsilon is finite and positive,
+/// and that every width the kernels derive from these values, and the recurrent state they
+/// allocate, fits in memory's address range. The derived widths are computed on read, never
+/// stored separately.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GdnGeometry {
+    dims: GdnDimensions,
+}
+
+impl GdnGeometry {
+    /// **Unstable**: validate `dims` as the geometry of one GatedDeltaNet layer.
+    ///
+    /// Returns [`InferenceError::InvalidInput`] naming the first dimension that fails.
+    pub fn new(dims: GdnDimensions) -> Result<Self, InferenceError> {
+        let invalid = |reason: String| {
+            InferenceError::InvalidInput(format!("invalid GatedDeltaNet geometry: {reason}"))
+        };
+        for (name, value) in [
+            ("hidden_size", dims.hidden_size),
+            ("num_key_heads", dims.num_key_heads),
+            ("num_value_heads", dims.num_value_heads),
+            ("key_head_dim", dims.key_head_dim),
+            ("value_head_dim", dims.value_head_dim),
+            ("conv_kernel_dim", dims.conv_kernel_dim),
+        ] {
+            if value == 0 {
+                return Err(invalid(format!("{name} must be > 0")));
+            }
+        }
+        if !dims.num_value_heads.is_multiple_of(dims.num_key_heads) {
+            return Err(invalid(format!(
+                "num_value_heads ({}) must be a multiple of num_key_heads ({})",
+                dims.num_value_heads, dims.num_key_heads
+            )));
+        }
+        if !(dims.rms_norm_eps.is_finite() && dims.rms_norm_eps > 0.0) {
+            return Err(invalid(format!(
+                "rms_norm_eps ({}) must be finite and > 0.0",
+                dims.rms_norm_eps
+            )));
+        }
+        let overflow = |what: &str| invalid(format!("{what} overflows usize"));
+        let query_key = dims
+            .num_key_heads
+            .checked_mul(dims.key_head_dim)
+            .and_then(|width| width.checked_mul(2))
+            .ok_or_else(|| overflow("2 * num_key_heads * key_head_dim"))?;
+        let output = dims
+            .num_value_heads
+            .checked_mul(dims.value_head_dim)
+            .ok_or_else(|| overflow("num_value_heads * value_head_dim"))?;
+        let qkv = query_key
+            .checked_add(output)
+            .ok_or_else(|| overflow("the qkv width"))?;
+        let conv_weights = qkv
+            .checked_mul(dims.conv_kernel_dim)
+            .ok_or_else(|| overflow("qkv width * conv_kernel_dim"))?;
+        let state = output
+            .checked_mul(dims.key_head_dim)
+            .ok_or_else(|| overflow("num_value_heads * key_head_dim * value_head_dim"))?;
+        let max_floats = isize::MAX as usize / std::mem::size_of::<f32>();
+        for (what, floats) in [
+            ("the recurrent state", state),
+            ("the conv1d weights", conv_weights),
+        ] {
+            if floats > max_floats {
+                return Err(invalid(format!(
+                    "{what} ({floats} f32 values) exceeds the largest allocation"
+                )));
+            }
+        }
+        Ok(Self { dims })
+    }
+
+    /// **Unstable**: the dimensions this geometry was built from.
+    #[inline]
+    pub fn dimensions(&self) -> GdnDimensions {
+        self.dims
+    }
+
+    /// **Unstable**: width of the hidden state.
+    #[inline]
+    pub fn hidden_size(&self) -> usize {
+        self.dims.hidden_size
+    }
+
+    /// **Unstable**: number of query/key heads.
+    #[inline]
+    pub fn num_key_heads(&self) -> usize {
+        self.dims.num_key_heads
+    }
+
+    /// **Unstable**: number of value heads.
+    #[inline]
+    pub fn num_value_heads(&self) -> usize {
+        self.dims.num_value_heads
+    }
+
+    /// **Unstable**: width of one query/key head.
+    #[inline]
+    pub fn key_head_dim(&self) -> usize {
+        self.dims.key_head_dim
+    }
+
+    /// **Unstable**: width of one value head.
+    #[inline]
+    pub fn value_head_dim(&self) -> usize {
+        self.dims.value_head_dim
+    }
+
+    /// **Unstable**: length of the causal convolution kernel.
+    #[inline]
+    pub fn conv_kernel_dim(&self) -> usize {
+        self.dims.conv_kernel_dim
+    }
+
+    /// **Unstable**: epsilon of the gated RMS norm.
+    #[inline]
+    pub fn rms_norm_eps(&self) -> f32 {
+        self.dims.rms_norm_eps
+    }
+
+    /// **Unstable**: width of the fused QKV projection, `2 * num_key_heads * key_head_dim +
+    /// num_value_heads * value_head_dim`.
+    #[inline]
+    pub fn qkv_dim(&self) -> usize {
+        self.dims.num_key_heads * self.dims.key_head_dim
+            + self.dims.num_key_heads * self.dims.key_head_dim
+            + self.dims.num_value_heads * self.dims.value_head_dim
+    }
+
+    /// **Unstable**: width of the layer's head outputs, `num_value_heads * value_head_dim`.
+    #[inline]
+    pub fn output_dim(&self) -> usize {
+        self.dims.num_value_heads * self.dims.value_head_dim
+    }
+}
+
+/// **Unstable**: weight tensors for one GatedDeltaNet layer, one field per operator input in
+/// the row-major layouts noted on each field.
 #[derive(Debug, Clone)]
 pub struct GatedDeltaNetWeights {
     /// QKV projection: [qkv_dim, hidden_size] where qkv_dim = Q_dim + K_dim + V_dim
@@ -75,7 +237,27 @@ pub struct GatedDeltaNetState {
 }
 
 impl GatedDeltaNetState {
+    /// **Unstable**: allocate zeroed recurrent state for one layer of `geometry`.
+    pub fn from_geometry(geometry: &GdnGeometry) -> Self {
+        let value_heads = geometry.num_value_heads();
+        let key_dim = geometry.key_head_dim();
+        let value_dim = geometry.value_head_dim();
+        let conv_dim = geometry.qkv_dim();
+        let buf_len = geometry.conv_kernel_dim() - 1;
+
+        Self {
+            s_matrices: vec![0.0; value_heads * key_dim * value_dim],
+            conv_buffer: vec![0.0; conv_dim * buf_len],
+            key_dim,
+            value_dim,
+        }
+    }
+
     /// **Unstable**: allocate zeroed recurrent state for one layer from config.
+    #[deprecated(
+        since = "0.15.0",
+        note = "use `GatedDeltaNetState::from_geometry`; `lattice_inference::attention::gdn::qwen35_gdn_geometry` builds the geometry from a Qwen3.5 configuration"
+    )]
     pub fn new(cfg: &Qwen35Config) -> Self {
         let value_heads = cfg.linear_num_value_heads();
         let key_dim = cfg.linear_key_head_dim;
@@ -178,26 +360,26 @@ fn resize_if_needed(buf: &mut Vec<f32>, needed: usize) {
 /// `input`: hidden state `[hidden_size]`
 /// `state`: mutable recurrent state for this layer
 /// `weights`: layer weights
-/// `cfg`: model config
+/// `geometry`: the layer's validated geometry
 /// `scratch`: reusable scratch buffers
 /// `output`: output buffer `[hidden_size]`, written in-place
 pub fn gated_delta_net_step(
     input: &[f32],
     state: &mut GatedDeltaNetState,
     weights: &GatedDeltaNetWeights,
-    cfg: &Qwen35Config,
+    geometry: &GdnGeometry,
     scratch: &mut GatedDeltaNetScratch,
     output: &mut [f32],
 ) {
-    let hidden = cfg.hidden_size;
-    let num_heads = cfg.linear_num_key_heads;
-    let value_heads = cfg.linear_num_value_heads();
+    let hidden = geometry.hidden_size();
+    let num_heads = geometry.num_key_heads();
+    let value_heads = geometry.num_value_heads();
     let ratio = value_heads / num_heads;
-    let key_dim = cfg.linear_key_head_dim;
-    let value_dim = cfg.linear_value_head_dim;
-    let qkv_dim = cfg.linear_qkv_dim();
-    let output_dim = cfg.linear_output_dim();
-    let kernel_size = cfg.linear_conv_kernel_dim;
+    let key_dim = geometry.key_head_dim();
+    let value_dim = geometry.value_head_dim();
+    let qkv_dim = geometry.qkv_dim();
+    let output_dim = geometry.output_dim();
+    let kernel_size = geometry.conv_kernel_dim();
 
     scratch.ensure_capacity(qkv_dim, output_dim, value_heads, hidden);
 
@@ -332,7 +514,7 @@ pub fn gated_delta_net_step(
     // 8. Gated RMSNorm + output projection
     // norm_weight is [value_dim] (per-head), applied to each head independently
     // Then gated with z: out = z * (x / rms(x)) * gamma (per head)
-    let value_dim = cfg.linear_value_head_dim;
+    let value_dim = geometry.value_head_dim();
     for h in 0..value_heads {
         let start = h * value_dim;
         let end = start + value_dim;
@@ -341,7 +523,7 @@ pub fn gated_delta_net_step(
             &scratch.z_proj[start..end],
             &weights.norm_weight[..value_dim],
             &mut scratch.gated_norm_buf[start..end],
-            cfg.rms_norm_eps,
+            geometry.rms_norm_eps(),
         );
     }
 

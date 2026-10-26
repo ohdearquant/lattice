@@ -7,7 +7,7 @@
 //! The purpose is to halve memory bandwidth for weight-bound inference while preserving numerical
 //! accuracy in the accumulation path (all dot products widen f16 elements on the fly).
 
-use crate::attention::gdn::{GatedDeltaNetState, sigmoid, softplus};
+use crate::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry, sigmoid, softplus};
 use crate::attention::gdn_fused::{
     GatedDeltaNetFusedScratch, conv1d_silu_fused, simd_decay_and_rank1_update, simd_gated_rms_norm,
     simd_l2_normalize, simd_matvec_transpose,
@@ -1064,8 +1064,9 @@ pub fn generate_multimodal_f16(
 
     let num_linear = cfg.num_linear_attention_layers();
     let num_full = cfg.num_full_attention_layers();
+    let gdn_geometry = qwen35_gdn_geometry(cfg)?;
     let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-        .map(|_| GatedDeltaNetState::new(cfg))
+        .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
         .collect();
     let mut kv_cache = KvCache::new(num_full);
     let mut scratch = ForwardScratch::new();
@@ -1366,8 +1367,9 @@ pub fn prefill_hidden_states_f16(
 
     let num_linear = cfg.num_linear_attention_layers();
     let num_full = cfg.num_full_attention_layers();
+    let gdn_geometry = qwen35_gdn_geometry(cfg)?;
     let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-        .map(|_| GatedDeltaNetState::new(cfg))
+        .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
         .collect();
     let mut kv_cache = KvCache::new(num_full);
     let mut scratch = ForwardScratch::new();

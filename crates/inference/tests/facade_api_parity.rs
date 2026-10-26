@@ -2083,14 +2083,63 @@ mod gdn_parity {
             PhantomData::<facade::gdn_fused::GatedDeltaNetFusedScratch>,
             PhantomData::<extracted::gdn_fused::GatedDeltaNetFusedScratch>,
         );
+        same_type(
+            PhantomData::<facade::gdn::GdnDimensions>,
+            PhantomData::<extracted::gdn::GdnDimensions>,
+        );
+        same_type(
+            PhantomData::<facade::gdn::GdnGeometry>,
+            PhantomData::<extracted::gdn::GdnGeometry>,
+        );
+    }
+
+    /// The facade keeps the configuration-taking step signatures; `lattice-compute`'s steps take
+    /// a validated geometry instead.
+    #[test]
+    #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+    fn gdn_configuration_steps_keep_their_facade_signatures() {
+        use lattice_inference::model::qwen35_config::Qwen35Config;
+
+        let _: fn(
+            &[f32],
+            &mut facade::gdn::GatedDeltaNetState,
+            &facade::gdn::GatedDeltaNetWeights,
+            &Qwen35Config,
+            &mut facade::gdn::GatedDeltaNetScratch,
+            &mut [f32],
+        ) = facade::gdn::gated_delta_net_step;
+        let _: fn(
+            &[f32],
+            &mut facade::gdn::GatedDeltaNetState,
+            &facade::gdn::GatedDeltaNetWeights,
+            &Qwen35Config,
+            &mut facade::gdn_fused::GatedDeltaNetFusedScratch,
+            &mut [f32],
+            &dyn lattice_inference::lora_hook::LoraHook,
+            usize,
+        ) = facade::gdn_fused::gated_delta_net_step_fused;
+        let _: fn(
+            &[f32],
+            &mut extracted::gdn::GatedDeltaNetState,
+            &extracted::gdn::GatedDeltaNetWeights,
+            &extracted::gdn::GdnGeometry,
+            &mut extracted::gdn::GatedDeltaNetScratch,
+            &mut [f32],
+        ) = extracted::gdn::gated_delta_net_step;
+        let _: fn(
+            &[f32],
+            &mut extracted::gdn::GatedDeltaNetState,
+            &extracted::gdn::GatedDeltaNetWeights,
+            &extracted::gdn::GdnGeometry,
+            &mut extracted::gdn_fused::GatedDeltaNetFusedScratch,
+            &mut [f32],
+            &dyn lattice_compute::lora_hook::LoraHook,
+            usize,
+        ) = extracted::gdn_fused::gated_delta_net_step_fused;
     }
 
     #[test]
     fn gdn_functions_are_the_same_items_at_both_paths() {
-        same_function(
-            facade::gdn::gated_delta_net_step,
-            extracted::gdn::gated_delta_net_step,
-        );
         same_function(facade::gdn::gated_rms_norm, extracted::gdn::gated_rms_norm);
         same_function(
             facade::gdn::l2_normalize_vec,
@@ -2098,10 +2147,6 @@ mod gdn_parity {
         );
         same_function(facade::gdn::sigmoid, extracted::gdn::sigmoid);
         same_function(facade::gdn::softplus, extracted::gdn::softplus);
-        same_function(
-            facade::gdn_fused::gated_delta_net_step_fused,
-            extracted::gdn_fused::gated_delta_net_step_fused,
-        );
         same_function(
             facade::gdn_fused::conv1d_silu_fused,
             extracted::gdn_fused::conv1d_silu_fused,

@@ -1,5 +1,21 @@
 use super::*;
 
+fn qwen35_2b_like() -> GdnDimensions {
+    GdnDimensions {
+        hidden_size: 2048,
+        num_key_heads: 16,
+        num_value_heads: 16,
+        key_head_dim: 128,
+        value_head_dim: 128,
+        conv_kernel_dim: 4,
+        rms_norm_eps: 1e-6,
+    }
+}
+
+fn geometry_of(dims: GdnDimensions) -> GdnGeometry {
+    GdnGeometry::new(dims).expect("fixture dimensions are a valid geometry")
+}
+
 #[test]
 fn test_l2_normalization_correctness() {
     let mut v = vec![3.0, 4.0];
@@ -211,8 +227,8 @@ fn test_decay_gate_finite_on_exp_overflow() {
 
 #[test]
 fn test_state_decay_reduces_magnitude() {
-    let cfg = Qwen35Config::qwen35_2b();
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let geometry = geometry_of(qwen35_2b_like());
+    let mut state = GatedDeltaNetState::from_geometry(&geometry);
 
     // Set state to non-zero values
     for v in state.s_matrices.iter_mut() {
@@ -333,14 +349,14 @@ fn test_conv_state_rolling() {
 #[test]
 fn test_gated_delta_net_single_step_known_output() {
     // Create a minimal config for testing
-    let cfg = Qwen35Config::qwen35_2b();
-    let num_heads = cfg.linear_num_key_heads;
-    let _key_dim = cfg.linear_key_head_dim;
-    let _value_dim = cfg.linear_value_head_dim;
-    let hidden = cfg.hidden_size;
-    let qkv_dim = cfg.linear_qkv_dim();
-    let output_dim = cfg.linear_output_dim();
-    let kernel_size = cfg.linear_conv_kernel_dim;
+    let geometry = geometry_of(qwen35_2b_like());
+    let num_heads = geometry.num_key_heads();
+    let _key_dim = geometry.key_head_dim();
+    let _value_dim = geometry.value_head_dim();
+    let hidden = geometry.hidden_size();
+    let qkv_dim = geometry.qkv_dim();
+    let output_dim = geometry.output_dim();
+    let kernel_size = geometry.conv_kernel_dim();
 
     // Create zero weights (output should be zero for zero weights + zero input)
     let weights = GatedDeltaNetWeights {
@@ -361,13 +377,13 @@ fn test_gated_delta_net_single_step_known_output() {
         conv1d_weight: vec![0.0; qkv_dim * kernel_size],
         conv_dim: qkv_dim,
         kernel_size,
-        norm_weight: vec![1.0; cfg.linear_value_head_dim],
+        norm_weight: vec![1.0; geometry.value_head_dim()],
         out_proj: vec![0.0; hidden * output_dim],
         out_proj_rows: hidden,
         out_proj_cols: output_dim,
     };
 
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let mut state = GatedDeltaNetState::from_geometry(&geometry);
     let mut scratch = GatedDeltaNetScratch::default();
     let input = vec![0.0f32; hidden];
     let mut output = vec![0.0f32; hidden];
@@ -376,7 +392,7 @@ fn test_gated_delta_net_single_step_known_output() {
         &input,
         &mut state,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch,
         &mut output,
     );
@@ -411,7 +427,7 @@ fn test_gated_delta_net_single_step_known_output() {
 /// deviation means either NaN leaked past step 0 (not fail-closed) or the guard
 /// takes a numerically different path than a genuinely-never-poisoned run.
 ///
-/// Uses a degenerate `linear_conv_kernel_dim = 1` config (pointwise conv1d, no
+/// Uses a degenerate `conv_kernel_dim = 1` geometry (pointwise conv1d, no
 /// rolling history window), the same disclosed test-design choice as
 /// `gdn_fused::tests::gated_delta_net_step_fused_k_poison_step1_state_isolation_through_shipping_path`:
 /// with a real multi-tap kernel, step 0's NaN raw projection also gets pushed
@@ -436,22 +452,23 @@ fn test_gated_delta_net_single_step_known_output() {
 /// fail immediately.
 #[test]
 fn test_l2_normalize_vec_state_isolation_poisoned_token_matches_never_poisoned_reference() {
-    let mut cfg = Qwen35Config::qwen35_2b();
-    cfg.linear_conv_kernel_dim = 1;
-    let num_heads = cfg.linear_num_key_heads;
-    let value_heads = cfg.linear_num_value_heads();
+    let mut dims = qwen35_2b_like();
+    dims.conv_kernel_dim = 1;
+    let geometry = geometry_of(dims);
+    let num_heads = geometry.num_key_heads();
+    let value_heads = geometry.num_value_heads();
     assert_eq!(
         num_heads, value_heads,
         "this test assumes qwen35_2b's ratio=1 (num_key_heads == num_value_heads) \
              so in_proj_b/in_proj_a can be sized by num_heads alone, matching the \
              existing test_gated_delta_net_single_step_known_output fixture pattern"
     );
-    let key_dim = cfg.linear_key_head_dim;
-    let value_dim = cfg.linear_value_head_dim;
-    let hidden = cfg.hidden_size;
-    let qkv_dim = cfg.linear_qkv_dim();
-    let output_dim = cfg.linear_output_dim();
-    let kernel_size = cfg.linear_conv_kernel_dim;
+    let key_dim = geometry.key_head_dim();
+    let value_dim = geometry.value_head_dim();
+    let hidden = geometry.hidden_size();
+    let qkv_dim = geometry.qkv_dim();
+    let output_dim = geometry.output_dim();
+    let kernel_size = geometry.conv_kernel_dim();
 
     // Deterministic pseudo-random fill (no external `rand` dependency), matching
     // the small-magnitude range other GDN tests in this file use.
@@ -519,14 +536,21 @@ fn test_l2_normalize_vec_state_isolation_poisoned_token_matches_never_poisoned_r
         .collect();
 
     let run = |step0_weights: &GatedDeltaNetWeights| -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(&geometry);
         let mut scratch = GatedDeltaNetScratch::default();
         let mut outputs = Vec::with_capacity(3);
         let mut state_snapshots = Vec::with_capacity(3);
         let step_weights = [step0_weights, &clean_weights, &clean_weights];
         for (tok, weights) in tokens.iter().zip(step_weights.iter()) {
             let mut output = vec![0.0f32; hidden];
-            gated_delta_net_step(tok, &mut state, weights, &cfg, &mut scratch, &mut output);
+            gated_delta_net_step(
+                tok,
+                &mut state,
+                weights,
+                &geometry,
+                &mut scratch,
+                &mut output,
+            );
             outputs.push(output);
             state_snapshots.push(state.s_matrices.clone());
         }
@@ -615,9 +639,10 @@ fn test_k_head_mapping_identity() {
 
 #[test]
 fn test_s_matrix_allocation_asymmetric() {
-    let mut cfg = Qwen35Config::qwen35_2b();
-    cfg.linear_num_value_heads = Some(48);
-    let state = GatedDeltaNetState::new(&cfg);
+    let mut dims = qwen35_2b_like();
+    dims.num_value_heads = 48;
+    let geometry = geometry_of(dims);
+    let state = GatedDeltaNetState::from_geometry(&geometry);
     let expected = 48 * 128 * 128;
     assert_eq!(
         state.s_matrices.len(),
@@ -629,8 +654,8 @@ fn test_s_matrix_allocation_asymmetric() {
 
 #[test]
 fn test_s_matrix_allocation_symmetric() {
-    let cfg = Qwen35Config::qwen35_2b();
-    let state = GatedDeltaNetState::new(&cfg);
+    let geometry = geometry_of(qwen35_2b_like());
+    let state = GatedDeltaNetState::from_geometry(&geometry);
     let expected = 16 * 128 * 128;
     assert_eq!(
         state.s_matrices.len(),
@@ -642,21 +667,22 @@ fn test_s_matrix_allocation_symmetric() {
 
 #[test]
 fn test_output_dim_asymmetric() {
-    let mut cfg = Qwen35Config::qwen35_2b();
-    cfg.linear_num_value_heads = Some(48);
-    assert_eq!(cfg.linear_output_dim(), 48 * 128);
+    let mut dims = qwen35_2b_like();
+    dims.num_value_heads = 48;
+    let geometry = geometry_of(dims);
+    assert_eq!(geometry.output_dim(), 48 * 128);
 }
 
 #[test]
 fn test_output_dim_symmetric() {
-    let cfg = Qwen35Config::qwen35_2b();
-    assert_eq!(cfg.linear_output_dim(), 16 * 128);
+    let geometry = geometry_of(qwen35_2b_like());
+    assert_eq!(geometry.output_dim(), 16 * 128);
 }
 
 #[test]
 fn snapshot_roundtrip_preserves_state() {
-    let cfg = Qwen35Config::qwen35_2b();
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let geometry = geometry_of(qwen35_2b_like());
+    let mut state = GatedDeltaNetState::from_geometry(&geometry);
     for (i, v) in state.s_matrices.iter_mut().enumerate() {
         *v = (i as f32) * 0.001;
     }
@@ -673,8 +699,8 @@ fn snapshot_roundtrip_preserves_state() {
 
 #[test]
 fn snapshot_independent_after_state_mutation() {
-    let cfg = Qwen35Config::qwen35_2b();
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let geometry = geometry_of(qwen35_2b_like());
+    let mut state = GatedDeltaNetState::from_geometry(&geometry);
     state.s_matrices[0] = 1.0;
     let snap = state.snapshot();
     state.s_matrices[0] = 999.0;

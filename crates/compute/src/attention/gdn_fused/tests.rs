@@ -1,9 +1,25 @@
 use super::*;
 use crate::attention::gdn::{
-    GatedDeltaNetScratch, gated_delta_net_step, gated_rms_norm, l2_normalize_vec,
+    GatedDeltaNetScratch, GdnDimensions, gated_delta_net_step, gated_rms_norm, l2_normalize_vec,
 };
 use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
+
+fn qwen35_2b_like() -> GdnDimensions {
+    GdnDimensions {
+        hidden_size: 2048,
+        num_key_heads: 16,
+        num_value_heads: 16,
+        key_head_dim: 128,
+        value_head_dim: 128,
+        conv_kernel_dim: 4,
+        rms_norm_eps: 1e-6,
+    }
+}
+
+fn geometry_of(dims: GdnDimensions) -> GdnGeometry {
+    GdnGeometry::new(dims).expect("fixture dimensions are a valid geometry")
+}
 
 #[derive(Clone, Debug)]
 struct XorShift64 {
@@ -49,17 +65,20 @@ impl XorShift64 {
     }
 }
 
-fn make_test_weights(seed: u64) -> (GatedDeltaNetWeights, Qwen35Config) {
-    make_test_weights_for_cfg(Qwen35Config::qwen35_2b(), seed)
+fn make_test_weights(seed: u64) -> (GatedDeltaNetWeights, GdnGeometry) {
+    make_test_weights_for_cfg(geometry_of(qwen35_2b_like()), seed)
 }
 
-fn make_test_weights_for_cfg(cfg: Qwen35Config, seed: u64) -> (GatedDeltaNetWeights, Qwen35Config) {
-    let hidden = cfg.hidden_size;
-    let value_heads = cfg.linear_num_value_heads();
-    let qkv_dim = cfg.linear_qkv_dim();
-    let output_dim = cfg.linear_output_dim();
-    let value_dim = cfg.linear_value_head_dim;
-    let kernel_size = cfg.linear_conv_kernel_dim;
+fn make_test_weights_for_cfg(
+    geometry: GdnGeometry,
+    seed: u64,
+) -> (GatedDeltaNetWeights, GdnGeometry) {
+    let hidden = geometry.hidden_size();
+    let value_heads = geometry.num_value_heads();
+    let qkv_dim = geometry.qkv_dim();
+    let output_dim = geometry.output_dim();
+    let value_dim = geometry.value_head_dim();
+    let kernel_size = geometry.conv_kernel_dim();
 
     let mut rng = XorShift64::new(seed ^ 0xA5A5_5A5A_DEAD_BEEF);
 
@@ -113,7 +132,7 @@ fn make_test_weights_for_cfg(cfg: Qwen35Config, seed: u64) -> (GatedDeltaNetWeig
             out_proj_rows: hidden,
             out_proj_cols: output_dim,
         },
-        cfg,
+        geometry,
     )
 }
 
@@ -168,19 +187,19 @@ proptest! {
         input in prop::collection::vec(-1.0f32..1.0, 2048),
         seed in 0u64..1000,
     ) {
-        let (weights, cfg) = make_test_weights(seed);
-        let mut state_ref = GatedDeltaNetState::new(&cfg);
+        let (weights, geometry) = make_test_weights(seed);
+        let mut state_ref = GatedDeltaNetState::from_geometry(&geometry);
         let mut state_fused = state_ref.clone();
         let mut scratch_ref = GatedDeltaNetScratch::default();
         let mut scratch_fused = GatedDeltaNetFusedScratch::default();
-        let mut output_ref = vec![0.0f32; cfg.hidden_size];
-        let mut output_fused = vec![0.0f32; cfg.hidden_size];
+        let mut output_ref = vec![0.0f32; geometry.hidden_size()];
+        let mut output_fused = vec![0.0f32; geometry.hidden_size()];
 
         gated_delta_net_step(
             &input,
             &mut state_ref,
             &weights,
-            &cfg,
+            &geometry,
             &mut scratch_ref,
             &mut output_ref,
         );
@@ -188,14 +207,14 @@ proptest! {
             &input,
             &mut state_fused,
             &weights,
-            &cfg,
+            &geometry,
             &mut scratch_fused,
             &mut output_fused,
             &crate::lora_hook::NoopLoraHook,
             0,
         );
 
-        for i in 0..cfg.hidden_size {
+        for i in 0..geometry.hidden_size() {
             prop_assert!(
                 (output_ref[i] - output_fused[i]).abs() < 1e-4,
                 "output mismatch at [{i}]: ref={}, fused={}",
@@ -226,15 +245,15 @@ proptest! {
 
 #[test]
 fn multi_step_accumulation_matches_reference() {
-    let (weights, cfg) = make_test_weights(7);
+    let (weights, geometry) = make_test_weights(7);
     let mut rng = XorShift64::new(123456789);
-    let mut state_ref = GatedDeltaNetState::new(&cfg);
+    let mut state_ref = GatedDeltaNetState::from_geometry(&geometry);
     let mut state_fused = state_ref.clone();
     let mut scratch_ref = GatedDeltaNetScratch::default();
     let mut scratch_fused = GatedDeltaNetFusedScratch::default();
-    let mut output_ref = vec![0.0f32; cfg.hidden_size];
-    let mut output_fused = vec![0.0f32; cfg.hidden_size];
-    let mut input = vec![0.0f32; cfg.hidden_size];
+    let mut output_ref = vec![0.0f32; geometry.hidden_size()];
+    let mut output_fused = vec![0.0f32; geometry.hidden_size()];
+    let mut input = vec![0.0f32; geometry.hidden_size()];
 
     for step in 0..10 {
         for v in &mut input {
@@ -245,7 +264,7 @@ fn multi_step_accumulation_matches_reference() {
             &input,
             &mut state_ref,
             &weights,
-            &cfg,
+            &geometry,
             &mut scratch_ref,
             &mut output_ref,
         );
@@ -253,7 +272,7 @@ fn multi_step_accumulation_matches_reference() {
             &input,
             &mut state_fused,
             &weights,
-            &cfg,
+            &geometry,
             &mut scratch_fused,
             &mut output_fused,
             &crate::lora_hook::NoopLoraHook,
@@ -376,20 +395,20 @@ fn conv1d_silu_fused_matches_scalar_reference() {
 
 #[test]
 fn zero_input_produces_zero_output() {
-    let (weights, cfg) = make_test_weights(21);
-    let input = vec![0.0f32; cfg.hidden_size];
-    let mut state_ref = GatedDeltaNetState::new(&cfg);
+    let (weights, geometry) = make_test_weights(21);
+    let input = vec![0.0f32; geometry.hidden_size()];
+    let mut state_ref = GatedDeltaNetState::from_geometry(&geometry);
     let mut state_fused = state_ref.clone();
     let mut scratch_ref = GatedDeltaNetScratch::default();
     let mut scratch_fused = GatedDeltaNetFusedScratch::default();
-    let mut output_ref = vec![0.0f32; cfg.hidden_size];
-    let mut output_fused = vec![0.0f32; cfg.hidden_size];
+    let mut output_ref = vec![0.0f32; geometry.hidden_size()];
+    let mut output_fused = vec![0.0f32; geometry.hidden_size()];
 
     gated_delta_net_step(
         &input,
         &mut state_ref,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch_ref,
         &mut output_ref,
     );
@@ -397,7 +416,7 @@ fn zero_input_produces_zero_output() {
         &input,
         &mut state_fused,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch_fused,
         &mut output_fused,
         &crate::lora_hook::NoopLoraHook,
@@ -417,22 +436,22 @@ fn zero_input_produces_zero_output() {
 
 #[test]
 fn large_values_remain_finite_and_match_reference() {
-    let (weights, cfg) = make_test_weights(42);
-    let input: Vec<f32> = (0..cfg.hidden_size)
+    let (weights, geometry) = make_test_weights(42);
+    let input: Vec<f32> = (0..geometry.hidden_size())
         .map(|i| if i % 2 == 0 { 1.0e4 } else { -1.0e4 })
         .collect();
-    let mut state_ref = GatedDeltaNetState::new(&cfg);
+    let mut state_ref = GatedDeltaNetState::from_geometry(&geometry);
     let mut state_fused = state_ref.clone();
     let mut scratch_ref = GatedDeltaNetScratch::default();
     let mut scratch_fused = GatedDeltaNetFusedScratch::default();
-    let mut output_ref = vec![0.0f32; cfg.hidden_size];
-    let mut output_fused = vec![0.0f32; cfg.hidden_size];
+    let mut output_ref = vec![0.0f32; geometry.hidden_size()];
+    let mut output_fused = vec![0.0f32; geometry.hidden_size()];
 
     gated_delta_net_step(
         &input,
         &mut state_ref,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch_ref,
         &mut output_ref,
     );
@@ -440,7 +459,7 @@ fn large_values_remain_finite_and_match_reference() {
         &input,
         &mut state_fused,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch_fused,
         &mut output_fused,
         &crate::lora_hook::NoopLoraHook,
@@ -465,31 +484,32 @@ fn large_values_remain_finite_and_match_reference() {
 
 #[test]
 fn single_head_isolation_matches_reference() {
-    let mut cfg = Qwen35Config::qwen35_2b();
-    cfg.hidden_size = 64;
-    cfg.linear_num_key_heads = 1;
-    cfg.linear_num_value_heads = Some(1);
-    cfg.linear_key_head_dim = 16;
-    cfg.linear_value_head_dim = 16;
-    cfg.linear_conv_kernel_dim = 4;
+    let mut dims = qwen35_2b_like();
+    dims.hidden_size = 64;
+    dims.num_key_heads = 1;
+    dims.num_value_heads = 1;
+    dims.key_head_dim = 16;
+    dims.value_head_dim = 16;
+    dims.conv_kernel_dim = 4;
+    let geometry = geometry_of(dims);
 
-    let (weights, cfg) = make_test_weights_for_cfg(cfg, 314159);
+    let (weights, geometry) = make_test_weights_for_cfg(geometry, 314159);
     let mut rng = XorShift64::new(271828);
-    let mut input = vec![0.0f32; cfg.hidden_size];
+    let mut input = vec![0.0f32; geometry.hidden_size()];
     rng.fill_gaussian(&mut input, 0.5);
 
-    let mut state_ref = GatedDeltaNetState::new(&cfg);
+    let mut state_ref = GatedDeltaNetState::from_geometry(&geometry);
     let mut state_fused = state_ref.clone();
     let mut scratch_ref = GatedDeltaNetScratch::default();
     let mut scratch_fused = GatedDeltaNetFusedScratch::default();
-    let mut output_ref = vec![0.0f32; cfg.hidden_size];
-    let mut output_fused = vec![0.0f32; cfg.hidden_size];
+    let mut output_ref = vec![0.0f32; geometry.hidden_size()];
+    let mut output_fused = vec![0.0f32; geometry.hidden_size()];
 
     gated_delta_net_step(
         &input,
         &mut state_ref,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch_ref,
         &mut output_ref,
     );
@@ -497,7 +517,7 @@ fn single_head_isolation_matches_reference() {
         &input,
         &mut state_fused,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch_fused,
         &mut output_fused,
         &crate::lora_hook::NoopLoraHook,
@@ -521,30 +541,31 @@ fn single_head_isolation_matches_reference() {
 
 #[test]
 fn test_fused_asymmetric_heads_nonzero_output() {
-    let mut cfg = Qwen35Config::qwen35_2b();
-    cfg.linear_num_value_heads = Some(48);
-    let (weights, cfg) = make_test_weights_for_cfg(cfg, 42);
+    let mut dims = qwen35_2b_like();
+    dims.num_value_heads = 48;
+    let geometry = geometry_of(dims);
+    let (weights, geometry) = make_test_weights_for_cfg(geometry, 42);
 
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let mut state = GatedDeltaNetState::from_geometry(&geometry);
     let mut scratch = GatedDeltaNetFusedScratch::default();
-    let mut output = vec![0.0f32; cfg.hidden_size];
+    let mut output = vec![0.0f32; geometry.hidden_size()];
 
     let mut rng = XorShift64::new(123);
-    let mut input = vec![0.0f32; cfg.hidden_size];
+    let mut input = vec![0.0f32; geometry.hidden_size()];
     rng.fill_gaussian(&mut input, 0.1);
 
     gated_delta_net_step_fused(
         &input,
         &mut state,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch,
         &mut output,
         &crate::lora_hook::NoopLoraHook,
         0,
     );
 
-    let output_dim = cfg.linear_output_dim();
+    let output_dim = geometry.output_dim();
     assert_eq!(output_dim, 48 * 128);
 
     for v_head in 0..48 {
@@ -560,23 +581,24 @@ fn test_fused_asymmetric_heads_nonzero_output() {
 
 #[test]
 fn test_fused_asymmetric_s_matrix_independence() {
-    let mut cfg = Qwen35Config::qwen35_2b();
-    cfg.linear_num_value_heads = Some(48);
-    let (weights, cfg) = make_test_weights_for_cfg(cfg, 77);
+    let mut dims = qwen35_2b_like();
+    dims.num_value_heads = 48;
+    let geometry = geometry_of(dims);
+    let (weights, geometry) = make_test_weights_for_cfg(geometry, 77);
 
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let mut state = GatedDeltaNetState::from_geometry(&geometry);
     let mut scratch = GatedDeltaNetFusedScratch::default();
-    let mut output = vec![0.0f32; cfg.hidden_size];
+    let mut output = vec![0.0f32; geometry.hidden_size()];
 
     let mut rng = XorShift64::new(456);
-    let mut input = vec![0.0f32; cfg.hidden_size];
+    let mut input = vec![0.0f32; geometry.hidden_size()];
     rng.fill_gaussian(&mut input, 0.1);
 
     gated_delta_net_step_fused(
         &input,
         &mut state,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch,
         &mut output,
         &crate::lora_hook::NoopLoraHook,
@@ -594,27 +616,27 @@ fn test_fused_asymmetric_s_matrix_independence() {
 
 #[test]
 fn test_fused_symmetric_backward_compat_produces_nonzero() {
-    let (weights, cfg) = make_test_weights(99);
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let (weights, geometry) = make_test_weights(99);
+    let mut state = GatedDeltaNetState::from_geometry(&geometry);
     let mut scratch = GatedDeltaNetFusedScratch::default();
-    let mut output = vec![0.0f32; cfg.hidden_size];
+    let mut output = vec![0.0f32; geometry.hidden_size()];
 
     let mut rng = XorShift64::new(789);
-    let mut input = vec![0.0f32; cfg.hidden_size];
+    let mut input = vec![0.0f32; geometry.hidden_size()];
     rng.fill_gaussian(&mut input, 0.1);
 
     gated_delta_net_step_fused(
         &input,
         &mut state,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch,
         &mut output,
         &crate::lora_hook::NoopLoraHook,
         0,
     );
 
-    let output_dim = cfg.linear_output_dim();
+    let output_dim = geometry.output_dim();
     assert_eq!(output_dim, 16 * 128);
 
     for h in 0..16 {
@@ -674,23 +696,24 @@ fn test_fused_decay_gate_finite_on_exp_overflow() {
 #[test]
 fn test_fused_asymmetric_decay_params_are_value_head_indexed() {
     // key=4, value=12, ratio=3. Value heads {3,4,5} share k_head=1.
-    let mut cfg = Qwen35Config::qwen35_2b();
-    cfg.hidden_size = 16;
-    cfg.linear_num_key_heads = 4;
-    cfg.linear_num_value_heads = Some(12);
-    cfg.linear_key_head_dim = 4;
-    cfg.linear_value_head_dim = 2;
-    cfg.linear_conv_kernel_dim = 1;
+    let mut dims = qwen35_2b_like();
+    dims.hidden_size = 16;
+    dims.num_key_heads = 4;
+    dims.num_value_heads = 12;
+    dims.key_head_dim = 4;
+    dims.value_head_dim = 2;
+    dims.conv_kernel_dim = 1;
+    let geometry = geometry_of(dims);
 
-    let key_heads = cfg.linear_num_key_heads;
-    let value_heads = cfg.linear_num_value_heads();
+    let key_heads = geometry.num_key_heads();
+    let value_heads = geometry.num_value_heads();
     let ratio = value_heads / key_heads; // 3
-    let hidden = cfg.hidden_size;
-    let qkv_dim = cfg.linear_qkv_dim(); // 4*4*2 + 12*2 = 56
-    let output_dim = cfg.linear_output_dim(); // 12*2 = 24
-    let key_dim = cfg.linear_key_head_dim;
-    let value_dim = cfg.linear_value_head_dim;
-    let kernel_size = cfg.linear_conv_kernel_dim;
+    let hidden = geometry.hidden_size();
+    let qkv_dim = geometry.qkv_dim(); // 4*4*2 + 12*2 = 56
+    let output_dim = geometry.output_dim(); // 12*2 = 24
+    let key_dim = geometry.key_head_dim();
+    let value_dim = geometry.value_head_dim();
+    let kernel_size = geometry.conv_kernel_dim();
 
     // in_proj_a: each value head h has a DISTINCT leading weight so alpha[h] differs.
     // in_proj_b: each head uses the SAME weight as its key head so beta[h] is equal
@@ -738,7 +761,7 @@ fn test_fused_asymmetric_decay_params_are_value_head_indexed() {
         out_proj_cols: output_dim,
     };
 
-    let mut state = GatedDeltaNetState::new(&cfg);
+    let mut state = GatedDeltaNetState::from_geometry(&geometry);
     let s_size = key_dim * value_dim; // 4*2 = 8
 
     // Pre-seed S matrices for group {3,4,5} with equal non-zero values so the
@@ -759,7 +782,7 @@ fn test_fused_asymmetric_decay_params_are_value_head_indexed() {
         &input,
         &mut state,
         &weights,
-        &cfg,
+        &geometry,
         &mut scratch,
         &mut output,
         &crate::lora_hook::NoopLoraHook,
@@ -1007,7 +1030,7 @@ fn simd_l2_normalize_backends_fail_closed_table() {
 
 /// State-isolation proof through the SHIPPING fused path
 /// (`gated_delta_net_step_fused`) using the REAL Qwen3.5 conv kernel size
-/// (`linear_conv_kernel_dim == 4`, i.e. `Qwen35Config::qwen35_2b()` unmodified — no
+/// (`conv_kernel_dim == 4`, i.e. `geometry_of(qwen35_2b_like())` unmodified — no
 /// `kernel_dim = 1` override), so `state.conv_buffer`'s rolling history is genuinely
 /// exercised, not sidestepped.
 ///
@@ -1082,23 +1105,24 @@ fn simd_l2_normalize_backends_fail_closed_table() {
 /// not (see PR body "CPU vs. Metal near-zero contract").
 #[test]
 fn gated_delta_net_step_fused_k_poison_window_state_isolation_production_kernel() {
-    let cfg = Qwen35Config::qwen35_2b();
+    let geometry = geometry_of(qwen35_2b_like());
     assert_eq!(
-        cfg.linear_conv_kernel_dim, 4,
+        geometry.conv_kernel_dim(),
+        4,
         "this test exists specifically to exercise the REAL production conv kernel \
-             size, not a degenerate override -- if qwen35_2b()'s default ever changes \
+             size, not a degenerate override -- if qwen35_2b_like()'s kernel ever changes \
              this test must be updated to keep testing the real value, not silently \
              test a stale one"
     );
-    let kernel_size = cfg.linear_conv_kernel_dim;
+    let kernel_size = geometry.conv_kernel_dim();
     let window = kernel_size; // # of dispatch steps a single poisoned raw value contaminates
     let clean_tail = 4; // extra clean tokens exercising post-window recovery (the poisoned value is already evicted by the post-step-3 snapshot)
     let total_steps = window + clean_tail;
 
-    let (base_weights, cfg) = make_test_weights_for_cfg(cfg, 77);
-    let hidden = cfg.hidden_size;
-    let key_dim = cfg.linear_key_head_dim;
-    let num_heads = cfg.linear_num_key_heads;
+    let (base_weights, geometry) = make_test_weights_for_cfg(geometry, 77);
+    let hidden = geometry.hidden_size();
+    let key_dim = geometry.key_head_dim();
+    let num_heads = geometry.num_key_heads();
     let q_total = num_heads * key_dim;
     let k0_row_start = q_total; // head-0 K rows begin right after all Q rows
 
@@ -1118,7 +1142,7 @@ fn gated_delta_net_step_fused_k_poison_window_state_isolation_production_kernel(
     };
     let weights_poison = build_window_weights(true);
     let weights_zero = build_window_weights(false);
-    let (weights_clean, _) = make_test_weights_for_cfg(cfg.clone(), 78);
+    let (weights_clean, _) = make_test_weights_for_cfg(geometry, 78);
 
     let mut rng = XorShift64::new(99);
     let mut inputs: Vec<Vec<f32>> = Vec::new();
@@ -1133,7 +1157,7 @@ fn gated_delta_net_step_fused_k_poison_window_state_isolation_production_kernel(
     let run = |step0_weights: &GatedDeltaNetWeights,
                window_weights: &GatedDeltaNetWeights|
      -> OutputsAndSnapshots {
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(&geometry);
         let mut scratch = GatedDeltaNetFusedScratch::default();
         let mut outputs = Vec::with_capacity(total_steps);
         let mut snapshots = Vec::with_capacity(total_steps);
@@ -1151,7 +1175,7 @@ fn gated_delta_net_step_fused_k_poison_window_state_isolation_production_kernel(
                 &inputs[step],
                 &mut state,
                 w,
-                &cfg,
+                &geometry,
                 &mut scratch,
                 &mut output,
                 &crate::lora_hook::NoopLoraHook,

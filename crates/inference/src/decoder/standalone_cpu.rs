@@ -37,7 +37,7 @@ use super::{
     MetadataRequest, PredictionId, PredictionLedger, SelectOutcome, SelectionCandidate,
     SelectionRequest, StepStamp, TokenMetadata,
 };
-use crate::attention::gdn::GatedDeltaNetState;
+use crate::attention::gdn::{GatedDeltaNetState, require_qwen35_gdn_geometry};
 use crate::error::InferenceError;
 use crate::forward::cpu_f16::forward_step_f16;
 use crate::forward::cpu_q8::forward_step_q8_with_scratch;
@@ -136,8 +136,9 @@ impl<'w> StandaloneCpuSession<'w> {
             }
         }
 
+        let gdn_geometry = require_qwen35_gdn_geometry(cfg);
         let gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();
         let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
         let mut scratch = ForwardScratch::new();

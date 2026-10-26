@@ -60,7 +60,7 @@ use super::{
     MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectOutcome,
     SelectionCandidate, SelectionRequest, StepStamp, TokenMetadata,
 };
-use crate::attention::gdn::GatedDeltaNetState;
+use crate::attention::gdn::{GatedDeltaNetState, require_qwen35_gdn_geometry};
 use crate::error::InferenceError;
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{ForwardScratch, KvCache, force_serial_prefill, initial_rng_state};
@@ -121,8 +121,9 @@ impl<'model> QwenCpuSession<'model> {
         let cfg = &model.config;
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
+        let gdn_geometry = require_qwen35_gdn_geometry(cfg);
         let gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-            .map(|_| GatedDeltaNetState::new(cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();
         let prompt_len = prompt_ids.len();
 
