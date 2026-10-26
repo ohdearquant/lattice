@@ -1,5 +1,4 @@
 use super::*;
-use crate::decoder::VerifiedRound;
 use std::cell::Cell;
 use std::collections::VecDeque;
 

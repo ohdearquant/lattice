@@ -54,12 +54,7 @@ use crate::sampling::compute_step_logprobs;
 /// (proven end to end in `model::gemma4_model`'s test module, one test per
 /// capability, through the crate's public `Gemma4Model::generate` entry
 /// point).
-const CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
-    grammar: false,
-    logprobs: false,
-    stop_strings: false,
-    reasoning_budget: false,
-};
+const CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::none();
 
 /// Gemma 4 E2B text CPU concrete [`DecoderSession`]. See the module doc
 /// comment for what it owns and why.
@@ -107,7 +102,7 @@ impl<'model> GemmaCpuSession<'model> {
             position: 0,
             rng_state: initial_rng_state(seed),
             temperature,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new()?,
         })
     }
 }
@@ -137,10 +132,7 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
             cancel,
         )?;
 
-        Ok(StepStamp {
-            evaluated_len: self.position,
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.position, None))
     }
 
     fn prefill_interruptible(
@@ -185,10 +177,7 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         )?;
         self.position += 1;
 
-        Ok(StepStamp {
-            evaluated_len: self.position,
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.position, None))
     }
 
     /// Masks the logits `prefill`/`decode` most recently left in
@@ -218,12 +207,12 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
             request.history,
             &mut self.rng_state,
         );
-        let prediction = self.ledger.open();
+        let prediction = self.ledger.open()?;
 
-        Ok(SelectOutcome::Candidate(SelectionCandidate {
+        Ok(SelectOutcome::Candidate(SelectionCandidate::new(
             candidate_id,
             prediction,
-        }))
+        )))
     }
 
     /// Scores `final_token` against the prediction's logits via
@@ -237,12 +226,16 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         final_token: u32,
         request: &MetadataRequest,
     ) -> Result<TokenMetadata, InferenceError> {
+        let Some(top_n) = request.top_logprobs else {
+            return Err(InferenceError::InvalidInput(
+                "metadata capture is disabled in this request".into(),
+            ));
+        };
         if !self.ledger.is_live(prediction) {
             return Err(PredictionError::Stale.into());
         }
 
         let vocab_size = self.model.config.vocab_size;
-        let top_n = request.top_logprobs.unwrap_or(0);
         let (final_logprob, top) = compute_step_logprobs(
             &self.scratch.logits[..vocab_size],
             final_token,
@@ -250,12 +243,12 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
             top_n,
         );
 
-        Ok(TokenMetadata {
+        Ok(TokenMetadata::new(
             prediction,
-            final_token_id: final_token,
+            final_token,
             final_logprob,
             top,
-        })
+        ))
     }
 
     fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
@@ -297,11 +290,7 @@ mod tests {
                 .expect("session");
             session.prefill(&cancel_false()).expect("prefill");
             let outcome = session
-                .select(&SelectionRequest {
-                    config: &config,
-                    history: &prompt_ids,
-                    grammar_mask: None,
-                })
+                .select(&SelectionRequest::new(&config, &prompt_ids))
                 .expect("selection");
             let SelectOutcome::Candidate(candidate) = outcome else {
                 panic!("unconstrained selection must yield a candidate")
@@ -338,15 +327,7 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn declared_capabilities_are_honestly_all_false() {
-        assert_eq!(
-            CAPABILITIES,
-            ExecutionCapabilities {
-                grammar: false,
-                logprobs: false,
-                stop_strings: false,
-                reasoning_budget: false,
-            }
-        );
+        assert_eq!(CAPABILITIES, ExecutionCapabilities::none());
     }
 
     // -----------------------------------------------------------------
@@ -383,26 +364,33 @@ mod tests {
             config.repetition_penalty = 1.0;
             config
         };
-        let request = SelectionRequest {
-            config: &gen_cfg,
-            history: &history,
-            grammar_mask: None,
-        };
+        let request = SelectionRequest::new(&gen_cfg, &history);
         let candidate = match session
             .select(&request)
             .expect("select over freshly prefilled logits must succeed")
         {
             SelectOutcome::Candidate(c) => c,
             SelectOutcome::GrammarExhausted => panic!("no grammar set on this session"),
+            _ => unreachable!("a select outcome this test does not model"),
         };
         // All-zero weights -> every logit is exactly 0.0 -> greedy sampling
         // (temperature 0.0) picks the first (lowest-id) token deterministically.
         assert_eq!(candidate.candidate_id, 0);
         assert!(session.ledger.is_live(candidate.prediction));
 
-        let meta_request = MetadataRequest {
-            top_logprobs: Some(2),
-        };
+        // A disabled request is refused and leaves the prediction live.
+        let disabled = session.metadata(
+            candidate.prediction,
+            candidate.candidate_id,
+            &MetadataRequest::disabled(),
+        );
+        assert!(
+            matches!(&disabled, Err(InferenceError::InvalidInput(message)) if message.contains("disabled")),
+            "{disabled:?}"
+        );
+        assert!(session.ledger.is_live(candidate.prediction));
+
+        let meta_request = MetadataRequest::with_top_logprobs(2);
         let metadata = session
             .metadata(candidate.prediction, candidate.candidate_id, &meta_request)
             .expect("metadata over a live prediction must succeed");
@@ -420,10 +408,7 @@ mod tests {
         // metadata does not consume: still live after scoring.
         assert!(session.ledger.is_live(candidate.prediction));
 
-        let accepted = AcceptedToken {
-            final_id: metadata.final_token_id,
-            prediction: candidate.prediction,
-        };
+        let accepted = AcceptedToken::new(metadata.final_token_id, candidate.prediction);
         let stamp2 = session
             .decode(&accepted, &cancel)
             .expect("decode of the freshly opened prediction must succeed");
@@ -581,21 +566,15 @@ mod tests {
             config.repetition_penalty = 1.0;
             config
         };
-        let request = SelectionRequest {
-            config: &gen_cfg,
-            history: &prompt_ids,
-            grammar_mask: None,
-        };
+        let request = SelectionRequest::new(&gen_cfg, &prompt_ids);
         let candidate = match session.select(&request).expect("select must succeed") {
             SelectOutcome::Candidate(c) => c,
             SelectOutcome::GrammarExhausted => panic!("no grammar set on this session"),
+            _ => unreachable!("a select outcome this test does not model"),
         };
         assert!(session.ledger.is_live(candidate.prediction)); // control: live before
 
-        let accepted = AcceptedToken {
-            final_id: candidate.candidate_id,
-            prediction: candidate.prediction,
-        };
+        let accepted = AcceptedToken::new(candidate.candidate_id, candidate.prediction);
         let cancelled = session.decode(&accepted, &cancel_true());
         assert!(cancelled.is_err(), "a cancelled decode must not succeed");
         assert!(
@@ -678,11 +657,7 @@ mod tests {
                     if step == 2 {
                         break;
                     }
-                    let request = SelectionRequest {
-                        config: &config,
-                        history: &history,
-                        grammar_mask: None,
-                    };
+                    let request = SelectionRequest::new(&config, &history);
                     let SelectOutcome::Candidate(a) = actual.select(&request).unwrap() else {
                         panic!("unconstrained selection");
                     };
@@ -691,22 +666,10 @@ mod tests {
                     };
                     assert_eq!(a.candidate_id, b.candidate_id);
                     actual
-                        .decode(
-                            &AcceptedToken {
-                                final_id: a.candidate_id,
-                                prediction: a.prediction,
-                            },
-                            &|| false,
-                        )
+                        .decode(&AcceptedToken::new(a.candidate_id, a.prediction), &|| false)
                         .unwrap();
                     expected
-                        .decode(
-                            &AcceptedToken {
-                                final_id: b.candidate_id,
-                                prediction: b.prediction,
-                            },
-                            &|| false,
-                        )
+                        .decode(&AcceptedToken::new(b.candidate_id, b.prediction), &|| false)
                         .unwrap();
                     history.push(a.candidate_id);
                 }

@@ -67,10 +67,8 @@ use super::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
     GrammarMaskFn, MetadataRequest, SelectOutcome, SelectionRequest,
 };
-use super::{SpeculativeSession, SpeculativeTrace};
 use crate::decode_budget::decode_cap;
 use crate::error::InferenceError;
-use crate::generation::TopLogprob;
 use crate::generation::{
     DecodePolicy, GenerateConfig, StepOutcome, StopCheckOutcome, TokenLogprob,
 };
@@ -87,6 +85,7 @@ use std::sync::Arc;
 /// `consumed` short of what a real run would have produced, in a way the
 /// golden's token-id comparison cannot see by construction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DriverTrace {
     pub opened: usize,
     pub consumed: usize,
@@ -97,6 +96,7 @@ pub struct DriverTrace {
 /// directly off the returned value, replacing the by-hand assembly the deleted
 /// pre-driver `decode_loop`/`decode_loop_with_stops` functions used to require
 /// from their own local `generated_ids`/`token_logprobs`.
+#[non_exhaustive]
 pub struct DriverResult {
     pub generated_ids: Vec<u32>,
     pub token_logprobs: Vec<TokenLogprob>,
@@ -113,7 +113,7 @@ pub struct DriverResult {
 /// Refuses (`InferenceError::InvalidInput`) when `gen_cfg` requests a control `caps` does not
 /// declare -- see this module's doc comment ("Capabilities are a hard error, not a debug
 /// assertion"). Checked once, at the top of [`run`], before any session call.
-fn check_capabilities(
+pub(super) fn check_capabilities(
     caps: ExecutionCapabilities,
     gen_cfg: &GenerateConfig,
 ) -> Result<(), InferenceError> {
@@ -152,6 +152,15 @@ fn check_capabilities(
 /// `select()` can call, so the first `decode()` this loop issues (consuming
 /// the first token's prediction) has no valid token to consume unless step 0
 /// went through `select()` too.
+///
+/// **Preflight.** Before any session call other than `capabilities`, the driver refuses a
+/// control the session does not declare and an empty `prompt_ids` with
+/// `InferenceError::InvalidInput`, and neither refusal calls `finish`. A zero
+/// `max_new_tokens` returns an empty result with [`StopReason::Length`] without prefill,
+/// then finishes the session as reusable. Every other path that returns, success or
+/// error, calls `finish` once: poisoned when the request failed or was interrupted after
+/// prefill started, reusable otherwise; when both the request and `finish` fail, the
+/// request's error is returned.
 ///
 /// `eos_token_id` is threaded in directly (rather than a `&Qwen35Config`)
 /// because it is the one field `should_stop_token`-equivalent logic needs that
@@ -241,6 +250,12 @@ pub fn run_into(
     finish_tail: impl FnOnce() -> String,
 ) -> Result<DriverResult, InferenceError> {
     check_capabilities(*session.capabilities(), gen_cfg)?;
+    if prompt_ids.is_empty() {
+        return Err(InferenceError::InvalidInput(
+            "the driver needs a non-empty prompt: a session predicts from the prompt it evaluated"
+                .into(),
+        ));
+    }
     let mut prefill_started = false;
     let result = run_inner(
         session,
@@ -351,6 +366,20 @@ fn run_inner(
     // (`FnMutCancellation`, `on_raw_event_cell`, `detok_cell` in
     // `model::qwen35::generation`'s `generate_streaming_via_driver`).
     let session = RefCell::new(session);
+
+    // A zero budget generates nothing and evaluates nothing, as `run_speculative` does: the
+    // step-0 candidate below is pushed before the loop consults its cap, so without this
+    // return a zero budget would still publish one token.
+    if gen_cfg.max_new_tokens == 0 {
+        return Ok(DriverResult {
+            generated_ids: Vec::new(),
+            token_logprobs: Vec::new(),
+            stopped: false,
+            stop_reason: StopReason::Length,
+            confirmed_stop_string_match: false,
+            trace: DriverTrace::default(),
+        });
+    }
 
     // Cancellation checkpoint 1/3 (mirrors the pre-migration streaming entry's own
     // first checkpoint): before the prefill pass starts, so a client that already
@@ -505,9 +534,7 @@ fn run_inner(
                 .metadata(
                     candidate0_prediction,
                     final_token,
-                    &MetadataRequest {
-                        top_logprobs: Some(top_n),
-                    },
+                    &MetadataRequest::with_top_logprobs(top_n),
                 )
                 .map(|m| (m.final_logprob, m.top))
         },
@@ -644,9 +671,7 @@ fn run_inner(
                         .metadata(
                             candidate_prediction,
                             final_token,
-                            &MetadataRequest {
-                                top_logprobs: Some(top_n),
-                            },
+                            &MetadataRequest::with_top_logprobs(top_n),
                         )
                         .map(|m| (m.final_logprob, m.top))
                 },
@@ -804,231 +829,8 @@ fn prompt_history(prompt_ids: &[u32], gen_cfg: &GenerateConfig) -> Vec<u32> {
     history
 }
 
-/// Everything [`run_speculative`] produces. Logprobs and stop-string text are not
-/// carried: the speculative routes refuse both, so the driver's own buffers for them stay
-/// empty and the caller decodes the published ids.
-pub struct SpeculativeResult {
-    pub generated_ids: Vec<u32>,
-    pub stopped: bool,
-    pub stop_reason: StopReason,
-    pub trace: SpeculativeTrace,
-}
-
-/// A speculative route verifies draft tokens by argmax, so it admits only the greedy
-/// configuration its route predicate already selects it for. Refused here as well, in every
-/// build, for the reason [`check_capabilities`] is a hard error: a driver that accepted any
-/// configuration would let a caller believe sampling or a repetition penalty was applied.
-fn check_greedy(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
-    if gen_cfg.temperature > 0.0 || gen_cfg.top_k > 1 || gen_cfg.repetition_penalty != 1.0 {
-        return Err(InferenceError::InvalidInput(
-            "a speculative route verifies draft tokens by argmax and admits only a greedy \
-             request with no repetition penalty"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
-/// The speculative sibling of [`run`] (ADR-090 D2, D6): one loop over a
-/// [`SpeculativeSession`] that applies the same [`DecodePolicy`] to the tokens a round
-/// verified and committed, and to nothing else.
-///
-/// **What the policy sees.** The session returns, per round, the tokens it evaluated and
-/// the target's prediction that follows them. Each committed token goes through
-/// [`DecodePolicy::transition_with_metadata`], in order, exactly once; a stop token is
-/// refused there and ends the request, and the length limit is checked before each offer,
-/// so a token past the limit is never published. The prediction that follows the span is
-/// checked against the same stop predicate before it becomes the next pending token, and
-/// not at all when the span has already filled the limit. A draft token the target
-/// rejected is never in a span, so the policy never sees one.
-///
-/// **Rounds are the session's, not the policy's.** The loop runs a round whenever the limit
-/// leaves room for the pending token, as the loops this replaces did, so a request whose
-/// last token is the pending one still runs the round that evaluates it. That keeps the
-/// forward passes, the end state and the stop reason at the cache boundary identical to
-/// those loops; the ordinary driver's one-token-at-a-time shape would not.
-///
-/// **Controls.** The four optional controls ([`ExecutionCapabilities`]) are refused, since
-/// a speculative route wires none of them, and so is a non-greedy request. Cancellation is
-/// polled at the top of every round, the point where the ordinary driver polls before a
-/// decode step; the prefill ran before this call, so there is no earlier point to poll.
-///
-/// `decode_delta`, `text`, `token_logprob_end_offsets` and `emit_confirmed` are the raw
-/// I/O primitives [`run`] takes, handed to the same policy call; a text sink that refuses a
-/// delta ends the request with [`StopReason::Interrupt`].
-#[allow(clippy::too_many_arguments)]
-pub fn run_speculative(
-    session: &mut dyn SpeculativeSession,
-    gen_cfg: &GenerateConfig,
-    eos_token_id: u32,
-    cancel: &dyn Cancellation,
-    decode_delta: impl FnMut(u32) -> String,
-    text: &mut String,
-    token_logprob_end_offsets: &mut Vec<usize>,
-    emit_confirmed: impl FnMut(&str, u32) -> bool,
-) -> Result<SpeculativeResult, InferenceError> {
-    check_capabilities(ExecutionCapabilities::default(), gen_cfg)?;
-    check_greedy(gen_cfg)?;
-    let result = run_speculative_inner(
-        session,
-        gen_cfg,
-        eos_token_id,
-        cancel,
-        decode_delta,
-        text,
-        token_logprob_end_offsets,
-        emit_confirmed,
-    );
-    let disposition = match &result {
-        Ok(result) if result.stop_reason != StopReason::Interrupt => FinishDisposition::Reusable,
-        _ => FinishDisposition::Poisoned,
-    };
-    let finished = session.finish(disposition);
-    result.and_then(|result| finished.map(|()| result))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_speculative_inner(
-    session: &mut dyn SpeculativeSession,
-    gen_cfg: &GenerateConfig,
-    eos_token_id: u32,
-    cancel: &dyn Cancellation,
-    mut decode_delta: impl FnMut(u32) -> String,
-    text: &mut String,
-    token_logprob_end_offsets: &mut Vec<usize>,
-    mut emit_confirmed: impl FnMut(&str, u32) -> bool,
-) -> Result<SpeculativeResult, InferenceError> {
-    let mut trace = SpeculativeTrace::default();
-    let mut generated_ids: Vec<u32> = Vec::new();
-    let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
-    let is_stop = |id: u32| id == eos_token_id || gen_cfg.stop_token_ids.contains(&id);
-
-    // A zero budget generates nothing, before any token is read (the loops this replaces
-    // returned here too, ahead of the prefill-derived candidate and its stop check).
-    if gen_cfg.max_new_tokens == 0 {
-        return Ok(SpeculativeResult {
-            generated_ids,
-            stopped: false,
-            stop_reason: StopReason::Length,
-            trace,
-        });
-    }
-
-    let first = session.first_candidate();
-    if is_stop(first) {
-        return Ok(SpeculativeResult {
-            generated_ids,
-            stopped: true,
-            stop_reason: StopReason::Eos,
-            trace,
-        });
-    }
-
-    // Capabilities leave no reasoning budget, so the cap is the plain token limit.
-    let cap = decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
-    generated_ids.reserve(cap);
-    let mut policy = DecodePolicy::for_verified_stream(gen_cfg, false);
-    let mut pending = first;
-    let mut stopped = false;
-    let mut stop_reason = StopReason::Length;
-
-    'rounds: while generated_ids.len() < cap {
-        if cancel.is_cancelled() {
-            stop_reason = StopReason::Interrupt;
-            break;
-        }
-        let round = session.advance(pending, cap - generated_ids.len(), &is_stop)?;
-        trace.rounds += 1;
-
-        for &token in &round.committed {
-            if generated_ids.len() >= cap {
-                break 'rounds;
-            }
-            trace.offered += 1;
-            let generated_len_before = generated_ids.len();
-            let outcome = policy.transition_with_metadata(
-                &mut token_logprobs,
-                token,
-                generated_len_before,
-                |_| Ok(true),
-                &is_stop,
-                |next_id| generated_ids.push(next_id),
-                |_, _| -> Result<(f32, Vec<TopLogprob>), InferenceError> {
-                    Err(InferenceError::Inference(
-                        "a speculative route records no token metadata".into(),
-                    ))
-                },
-                &mut decode_delta,
-                text,
-                token_logprob_end_offsets,
-                |s, id| emit_confirmed(s, id),
-            )?;
-            match outcome {
-                StepOutcome::GrammarStop => {
-                    stopped = true;
-                    stop_reason = StopReason::Grammar;
-                    break 'rounds;
-                }
-                StepOutcome::Eos => {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break 'rounds;
-                }
-                StepOutcome::Stopped => {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break 'rounds;
-                }
-                StepOutcome::Interrupted => {
-                    stop_reason = StopReason::Interrupt;
-                    break 'rounds;
-                }
-                StepOutcome::Emitted {
-                    answer_budget_exhausted,
-                    ..
-                } => {
-                    if answer_budget_exhausted {
-                        break 'rounds;
-                    }
-                }
-            }
-        }
-
-        // The cache boundary outranks the length limit, as in the loops this replaces: a
-        // request whose pending token fills the limit exactly still reports the full cache.
-        if round.cache_full {
-            stop_reason = StopReason::KvFull;
-            break;
-        }
-        if generated_ids.len() >= cap {
-            break;
-        }
-        let Some(next) = round.next else {
-            return Err(InferenceError::Inference(
-                "a speculative round ended without a continuation and without a full cache".into(),
-            ));
-        };
-        if is_stop(next) {
-            stopped = true;
-            stop_reason = StopReason::Eos;
-            break;
-        }
-        pending = next;
-    }
-
-    Ok(SpeculativeResult {
-        generated_ids,
-        stopped,
-        stop_reason,
-        trace,
-    })
-}
-
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod speculative_tests;
 
 #[cfg(test)]
 mod lifecycle_tests;

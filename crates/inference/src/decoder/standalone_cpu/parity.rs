@@ -242,7 +242,8 @@ pub(crate) fn assert_logits_replay(
     let prompt_ids = plan.prompt_ids.clone();
     let prompt_len = plan.prompt_len;
     let vocab = cfg.vocab_size;
-    let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan);
+    let mut session =
+        StandaloneCpuSession::new(weights, cfg, rope, plan).expect("an unspent ledger identity");
 
     let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
         .map(|_| GatedDeltaNetState::new(cfg))
@@ -274,23 +275,17 @@ pub(crate) fn assert_logits_replay(
         .map(|logit| logit.to_bits())
         .collect();
     for step in 0..steps {
-        let request = SelectionRequest {
-            config: gen_cfg,
-            history: &history,
-            grammar_mask: None,
-        };
+        let request = SelectionRequest::new(gen_cfg, &history);
         let candidate = match session.select(&request).expect("session select") {
             SelectOutcome::Candidate(candidate) => candidate,
             SelectOutcome::GrammarExhausted => panic!("no grammar is set, so none can exhaust"),
+            _ => unreachable!("a select outcome this test does not model"),
         };
         history.push(candidate.candidate_id);
 
         let stamp = session
             .decode(
-                &AcceptedToken {
-                    final_id: candidate.candidate_id,
-                    prediction: candidate.prediction,
-                },
+                &AcceptedToken::new(candidate.candidate_id, candidate.prediction),
                 &never,
             )
             .expect("session decode");
@@ -355,23 +350,18 @@ pub(crate) fn assert_rejects_stale_prediction(
     let plan = plan_for(cfg, tokenizer, rope, prompt, gen_cfg);
     let prompt_ids = plan.prompt_ids.clone();
     let vocab = cfg.vocab_size;
-    let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan);
+    let mut session =
+        StandaloneCpuSession::new(weights, cfg, rope, plan).expect("an unspent ledger identity");
 
     let never = || false;
     session.prefill(&never).expect("session prefill");
-    let request = SelectionRequest {
-        config: gen_cfg,
-        history: &prompt_ids,
-        grammar_mask: None,
-    };
+    let request = SelectionRequest::new(gen_cfg, &prompt_ids);
     let candidate = match session.select(&request).expect("session select") {
         SelectOutcome::Candidate(candidate) => candidate,
         SelectOutcome::GrammarExhausted => panic!("no grammar is set, so none can exhaust"),
+        _ => unreachable!("a select outcome this test does not model"),
     };
-    let accepted = AcceptedToken {
-        final_id: candidate.candidate_id,
-        prediction: candidate.prediction,
-    };
+    let accepted = AcceptedToken::new(candidate.candidate_id, candidate.prediction);
 
     session
         .decode(&accepted, &never)
@@ -414,7 +404,8 @@ pub(crate) fn assert_cancellation_precedes_state_change(
 ) {
     let plan = plan_for(cfg, tokenizer, rope, prompt, gen_cfg);
     let prompt_ids = plan.prompt_ids.clone();
-    let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan);
+    let mut session =
+        StandaloneCpuSession::new(weights, cfg, rope, plan).expect("an unspent ledger identity");
 
     let cancelled = || true;
     let never = || false;
@@ -440,19 +431,13 @@ pub(crate) fn assert_cancellation_precedes_state_change(
     );
 
     session.prefill(&never).expect("session prefill");
-    let request = SelectionRequest {
-        config: gen_cfg,
-        history: &prompt_ids,
-        grammar_mask: None,
-    };
+    let request = SelectionRequest::new(gen_cfg, &prompt_ids);
     let candidate = match session.select(&request).expect("session select") {
         SelectOutcome::Candidate(candidate) => candidate,
         SelectOutcome::GrammarExhausted => panic!("no grammar is set, so none can exhaust"),
+        _ => unreachable!("a select outcome this test does not model"),
     };
-    let accepted = AcceptedToken {
-        final_id: candidate.candidate_id,
-        prediction: candidate.prediction,
-    };
+    let accepted = AcceptedToken::new(candidate.candidate_id, candidate.prediction);
     let seq_len = session.kv_cache.seq_len;
 
     assert!(session.decode(&accepted, &cancelled).is_err());
@@ -477,36 +462,28 @@ pub(crate) fn assert_refuses_undeclared_controls(
 ) {
     let plan = plan_for(cfg, tokenizer, rope, prompt, gen_cfg);
     let prompt_ids = plan.prompt_ids.clone();
-    let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan);
+    let mut session =
+        StandaloneCpuSession::new(weights, cfg, rope, plan).expect("an unspent ledger identity");
     let never = || false;
     session.prefill(&never).expect("session prefill");
 
     let mask = |_logits: &mut [f32]| -> Result<(), InferenceError> { Ok(()) };
-    let masked = SelectionRequest {
-        config: gen_cfg,
-        history: &prompt_ids,
-        grammar_mask: Some(&mask),
-    };
+    let masked = SelectionRequest::new(gen_cfg, &prompt_ids).with_grammar_mask(&mask);
     assert!(matches!(
         session.select(&masked),
         Err(InferenceError::InvalidInput(_))
     ));
 
-    let plain = SelectionRequest {
-        config: gen_cfg,
-        history: &prompt_ids,
-        grammar_mask: None,
-    };
+    let plain = SelectionRequest::new(gen_cfg, &prompt_ids);
     let candidate = match session.select(&plain).expect("select without a mask") {
         SelectOutcome::Candidate(candidate) => candidate,
         SelectOutcome::GrammarExhausted => panic!("no grammar is set, so none can exhaust"),
+        _ => unreachable!("a select outcome this test does not model"),
     };
     let metadata = session.metadata(
         candidate.prediction,
         candidate.candidate_id,
-        &MetadataRequest {
-            top_logprobs: Some(0),
-        },
+        &MetadataRequest::with_top_logprobs(0),
     );
     assert!(matches!(metadata, Err(InferenceError::InvalidInput(_))));
 }
@@ -529,10 +506,12 @@ pub(crate) fn assert_select_refuses_config_controls(
         cfg,
         rope,
         plan_for(cfg, tokenizer, rope, prompt, gen_cfg),
-    );
+    )
+    .expect("an unspent ledger identity");
     let plan = plan_for(cfg, tokenizer, rope, prompt, gen_cfg);
     let prompt_ids = plan.prompt_ids.clone();
-    let mut twin = StandaloneCpuSession::new(weights, cfg, rope, plan);
+    let mut twin =
+        StandaloneCpuSession::new(weights, cfg, rope, plan).expect("an unspent ledger identity");
     session.prefill(&never).expect("session prefill");
     twin.prefill(&never).expect("twin prefill");
     assert!(
@@ -573,11 +552,7 @@ pub(crate) fn assert_select_refuses_config_controls(
     ];
     let rng_before = session.rng_state;
     for (control, refused_cfg, message) in &controls {
-        let request = SelectionRequest {
-            config: refused_cfg,
-            history: &prompt_ids,
-            grammar_mask: None,
-        };
+        let request = SelectionRequest::new(refused_cfg, &prompt_ids);
         match session.select(&request) {
             Err(InferenceError::InvalidInput(actual)) => {
                 assert_eq!(&actual, message, "{control}: refusal text")
@@ -589,39 +564,31 @@ pub(crate) fn assert_select_refuses_config_controls(
             session.rng_state, rng_before,
             "{control}: the refused select drew from the RNG"
         );
-        assert_eq!(
-            session.ledger.next_seq(),
-            0,
-            "{control}: the refused select opened a prediction"
-        );
         assert!(
             !session.ledger.has_live(),
             "{control}: the refused select left a live prediction"
         );
     }
 
-    let plain = SelectionRequest {
-        config: gen_cfg,
-        history: &prompt_ids,
-        grammar_mask: None,
-    };
+    let plain = SelectionRequest::new(gen_cfg, &prompt_ids);
     let candidate = match session.select(&plain).expect("select after the refusals") {
         SelectOutcome::Candidate(candidate) => candidate,
         SelectOutcome::GrammarExhausted => panic!("no grammar is set, so none can exhaust"),
+        _ => unreachable!("a select outcome this test does not model"),
     };
     let twin_candidate = match twin.select(&plain).expect("twin select") {
         SelectOutcome::Candidate(candidate) => candidate,
         SelectOutcome::GrammarExhausted => panic!("no grammar is set, so none can exhaust"),
+        _ => unreachable!("a select outcome this test does not model"),
     };
     assert_eq!(
         candidate.candidate_id, twin_candidate.candidate_id,
         "the refusals moved the sampling state"
     );
     assert_eq!(session.rng_state, twin.rng_state, "RNG state after select");
-    assert_eq!(
-        session.ledger.next_seq(),
-        1,
-        "exactly one prediction opened"
+    assert!(
+        session.ledger.is_live(candidate.prediction),
+        "the select after the refusals opened a live prediction"
     );
 }
 
@@ -639,23 +606,18 @@ pub(crate) fn assert_finish_invalidates_the_live_prediction(
     let plan = plan_for(cfg, tokenizer, rope, prompt, gen_cfg);
     let prompt_ids = plan.prompt_ids.clone();
     let vocab = cfg.vocab_size;
-    let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan);
+    let mut session =
+        StandaloneCpuSession::new(weights, cfg, rope, plan).expect("an unspent ledger identity");
 
     let never = || false;
     session.prefill(&never).expect("session prefill");
-    let request = SelectionRequest {
-        config: gen_cfg,
-        history: &prompt_ids,
-        grammar_mask: None,
-    };
+    let request = SelectionRequest::new(gen_cfg, &prompt_ids);
     let candidate = match session.select(&request).expect("session select") {
         SelectOutcome::Candidate(candidate) => candidate,
         SelectOutcome::GrammarExhausted => panic!("no grammar is set, so none can exhaust"),
+        _ => unreachable!("a select outcome this test does not model"),
     };
-    let accepted = AcceptedToken {
-        final_id: candidate.candidate_id,
-        prediction: candidate.prediction,
-    };
+    let accepted = AcceptedToken::new(candidate.candidate_id, candidate.prediction);
     assert!(
         session.ledger.is_live(accepted.prediction),
         "the selected prediction must be live before finish"
@@ -708,7 +670,8 @@ pub(crate) fn assert_second_prefill_is_refused(
     let plan = plan_for(cfg, tokenizer, rope, prompt, gen_cfg);
     let prompt_len = plan.prompt_len;
     let vocab = cfg.vocab_size;
-    let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan);
+    let mut session =
+        StandaloneCpuSession::new(weights, cfg, rope, plan).expect("an unspent ledger identity");
 
     let never = || false;
     session.prefill(&never).expect("first prefill");

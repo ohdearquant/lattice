@@ -74,22 +74,29 @@ pub(crate) use generation_setup::{
 // (forward::metal_qwen35) calls this instead of its own inline
 // `if prompt_len == 0` copy, unifying the CPU/Metal empty-prompt contract.
 pub(crate) use generation::check_prompt_not_empty;
-// Raw-token Metal generation entry points cannot rely on a tokenizer/model
-// pairing to keep prompt ids inside the embedding table.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+// Raw-token Metal generation entry points and `family::Qwen35CpuDecoder::session`
+// cannot rely on a tokenizer/model pairing to keep prompt ids inside the
+// embedding table.
 pub(crate) use generation::check_prompt_ids_in_vocab;
 // Shared total-context admission bound (#922): every Metal generation entry
 // point (forward::metal_qwen35) calls this after check_prompt_not_empty to
 // mirror the CPU `generate`/`generate_streaming` total bound
 // (prompt_len + decode budget <= max_context), instead of only bounding the
-// prompt alone. Only the Metal (`mod inner`, gated identically) consumer
-// needs the re-export; the standalone CPU paths (cpu_f16, cpu_q8,
-// neon_forward) enforce the same bound through `prepare_generation`, and
-// `generation.rs` uses `check_context_budget` directly within its own module.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+// prompt alone, and `family::Qwen35CpuDecoder` admits and opens sessions with
+// it. The standalone CPU paths (cpu_f16, cpu_q8, neon_forward) enforce the
+// same bound through `prepare_generation`, and `generation.rs` uses
+// `check_context_budget` directly within its own module.
 pub(crate) use generation::check_context_budget;
+
+// The reasoning close token a reasoning budget needs: resolved per request by
+// the Metal generation entry points and by `family::Qwen35CpuDecoder`.
+pub(crate) use generation::resolve_reasoning_close_token;
+
+// The close marker's text, read only by the Metal entry points and the Metal
+// prefix cache, which look up its token ids themselves.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) use generation::{REASONING_CLOSE_MARKER, resolve_reasoning_close_token};
+pub(crate) use generation::REASONING_CLOSE_MARKER;
+
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{

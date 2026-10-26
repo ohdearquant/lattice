@@ -104,8 +104,14 @@ pub use decoder::bench_support as decoder_bench_support;
 pub mod bert_pooling_fixture;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
+/// The text encoder contract and its adapters for the BERT-family, Qwen3 and EmbeddingGemma 2
+/// embedding models. See [`encoder::Encoder`].
+pub mod encoder;
 /// Crate error taxonomy; see [`InferenceError`].
 pub mod error;
+/// The family contract: static descriptors naming each family's loaders, a registry built from
+/// them, and the Qwen3.5 CPU decoder they load. See [`family::registry`].
+pub mod family;
 /// Time-series forecasting: context preparation and native forecasting models. See
 /// [`forecast::Reverso`].
 pub mod forecast;
