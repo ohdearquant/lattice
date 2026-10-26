@@ -98,21 +98,8 @@ fn resolve_max_patches(raw_override: Option<&str>, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// The temporal/height/width patch-grid shape for one image (`grid_thw` in
-/// the HF reference). `t` is always 1 for a still image (video is out of
-/// scope — ADR-069 Deferred list).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GridThw {
-    pub t: usize,
-    pub h: usize,
-    pub w: usize,
-}
-
-impl GridThw {
-    pub fn num_patches(&self) -> usize {
-        self.t * self.h * self.w
-    }
-}
+#[doc(inline)]
+pub use lattice_arch::multimodal::GridThw;
 
 /// Decode + preprocess raw image bytes into the checkpoint's flattened,
 /// temporal-patch-folded pixel tensor: `[num_patches, in_channels *

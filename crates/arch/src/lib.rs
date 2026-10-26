@@ -32,6 +32,7 @@ mod encoder_support;
 pub mod family;
 pub mod gemma4_config;
 pub mod generation;
+pub mod multimodal;
 pub mod qwen35_config;
 pub mod qwen35_tensors;
 pub mod qwen_config;
