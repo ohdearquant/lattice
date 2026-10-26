@@ -2054,6 +2054,8 @@ jobs:
         run: python3 tests/test_semver_checks_disclose.py -v
       - name: publish script argument tests
         run: python3 tests/test_publish_script.py -v
+      - name: crate README generator tests
+        run: python3 tests/test_crate_readme.py -v
       # The fixture generator builds tiny local crates with `cargo rustdoc` to
       # produce the rustdoc JSON the listing tests read, so this step needs the
       # pinned Rust toolchain installed above.
