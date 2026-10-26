@@ -4,9 +4,7 @@
 //! boxed `dyn Tokenizer`, allowing WordPiece, BPE, and SentencePiece tokenizers
 //! to share a single inference path.
 
-use crate::attention::{
-    AttentionBuffers, multi_head_attention_batched, multi_head_attention_in_place,
-};
+use crate::attention::AttentionBuffers;
 use crate::download::ensure_model_files;
 use crate::error::InferenceError;
 use crate::forward::cpu::{
@@ -70,7 +68,7 @@ mod prepared_bpe_vocab_match;
 /// externally constructible API surface (`crate::weights::TransformerLayerWeights`),
 /// so adding a field there is a breaking change under SemVer (adding a public
 /// field to an all-public struct forces every downstream struct literal to
-/// change). See `crate::attention::standard::multi_head_attention_in_place`'s
+/// change). See `lattice_compute::attention::standard::multi_head_attention_in_place`'s
 /// doc comment and PR #678.
 struct LayerFusedQkv {
     weight: Vec<f32>,
@@ -467,7 +465,7 @@ impl BertModel {
     /// stages (embedding lookup, Q/K/V projection, FFN, output projection) are each
     /// one `matmul_bt`/`layer_norm` call over every real row -- no wasted rows for
     /// padding. Only the O(seq_len^2) attention score/context step loops per
-    /// sequence (see `crate::attention::multi_head_attention_batched`) are run
+    /// sequence (see `lattice_compute::attention::standard::multi_head_attention_batched`) are run
     /// serially, one sequence at a time, over disjoint output slices. The
     /// implementation detail may change without API breakage.
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
@@ -691,7 +689,7 @@ impl BertModel {
             let layer = &self.weights.layers[layer_idx];
             let fused = &self.fused_qkv[layer_idx];
 
-            multi_head_attention_in_place(
+            lattice_compute::__internal::multi_head_attention_in_place(
                 &hidden,
                 layer,
                 &fused.weight,
@@ -879,7 +877,7 @@ impl BertModel {
             let layer = &self.weights.layers[layer_idx];
             let fused = &self.fused_qkv[layer_idx];
 
-            multi_head_attention_batched(
+            lattice_compute::__internal::multi_head_attention_batched(
                 &hidden,
                 layer,
                 &fused.weight,

@@ -1,8 +1,8 @@
 use super::*;
-use crate::attention::{AttentionBuffers, multi_head_attention};
+use crate::attention::standard::{AttentionBuffers, multi_head_attention};
 use crate::forward::cpu::{matmul_bt, softmax_attention};
 use crate::lora_hook::NoopLoraHook;
-use crate::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
+use lattice_weights::f32_weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
 
 /// Keeps `estimate_materialized_attention_buffer_bytes` honest against the
 /// real `AttentionBuffers` field set (#678): the helper's

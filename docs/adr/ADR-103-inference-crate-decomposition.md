@@ -592,6 +592,47 @@ The GatedDeltaNet recurrent kernels join `lattice-compute`, beside the CPU atten
    so a measured A/B is required before merge. This amendment records the extraction and its validation obligation; it
    does not assert a measurement result or a structural waiver.
 
+## Amendment 19 (2026-10-26)
+
+Standard and tiled attention and the attention variant taxonomy join `lattice-compute`. Recorded:
+
+1. **D8.1.** `standard` (with `AttentionBuffers`) and `flash` (the tiled configuration, scratch and projection
+   wrappers) move from `lattice_inference::attention` into `lattice_compute::attention` with their tests, as do
+   `AttentionKind` and `AttentionTag` with their tests. The only source changes are imports (the layer weights now name
+   `lattice_weights::f32_weights`, and `flash` names `AttentionBuffers` at `attention::standard`), two comments that
+   named facade paths, and the visibility of the shape check described in item 3. Their crate-internal dependencies are
+   the CPU primitives, the LoRA hook contract and the grouped-query configuration, all already in compute, so compute
+   gains no dependency and its publish tier is unchanged. `gdn_backward` stays in the facade.
+2. **D1.** `lattice_inference::attention::standard` and `::flash` keep named public re-exports of every public item,
+   and `lattice_inference::attention` keeps `AttentionBuffers`, `multi_head_attention`, `AttentionKind` and
+   `AttentionTag` by name in place of the former glob over `standard`. Under `bench-internals`,
+   `attention::standard::bench_support` and `attention::bench_support` keep their paths as re-exports of the moved
+   module, which was already public through the facade and so stays a public compute item (D4, last paragraph).
+3. **D4.** Three crate-private items are called from the facade and take disposition 3, as `#[inline]` forwarding
+   functions in `lattice_compute::__internal` that the facade calls by full path: `multi_head_attention_in_place` and
+   `multi_head_attention_batched`, the BERT encoder's single-sequence and packed-batch entry points, and
+   `assert_standard_no_overflow`, which becomes crate-visible in compute for its wrapper. Disposition 2 does not fit
+   the two entry points: they take the facade BERT model's load-time fused Q/K/V layout and raw scratch slices, glue
+   whose shape follows that model rather than a stable compute contract. The test-only padded batched reference, used
+   only by the BERT packed-batch parity test, moves to the facade (`attention/standard/padded_reference.rs`, compiled
+   under `cfg(test)`) and calls the shape check by that full path. `total_scratch_len` and
+   `tiled_multi_head_attention_in_place` stay crate-private in compute with their only callers, the moved tests.
+4. **D5.** Amendment 2 applies to `bench_support`, which is gated on the consumer feature `bench-internals`: compute
+   gains a `bench-internals` feature of the same meaning, forwarded by the facade's `bench-internals`. No other
+   feature, default-feature or target gate changes. The CI step that lints the facade under `bench-internals` also
+   lints compute under its feature, so the moved module keeps its clippy coverage.
+5. **D6.1.** The 64 test functions of the three moved test modules move with them, names unchanged. `facade_api_parity`
+   adds `attention_standard_parity`, covering the five types and four functions at both paths, the `attention::`
+   convenience paths of `AttentionBuffers` and `multi_head_attention`, and the `AttentionKind` methods through the
+   facade.
+6. **D6.4.** `inference_bench` times `multi_head_attention` with `AttentionBuffers` under default features and the
+   packed-batch path under `bench-internals`; `e2e_bench` runs the BERT encoder, which now calls the two attention
+   entry points across the boundary, given a BGE checkpoint; `attention_dispatch_bench` matches on `AttentionKind`; and
+   the CPU batch prefill builds a `TiledAttentionConfig` once per scratch. The boundary and the feature table are
+   changed build inputs on the BERT hot path, so a measured A/B of those targets is required before merge. This
+   amendment records the extraction and its validation obligation; it does not assert a measurement result or a
+   structural waiver.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

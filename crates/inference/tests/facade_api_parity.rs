@@ -2047,3 +2047,78 @@ mod gdn_parity {
         );
     }
 }
+
+mod attention_standard_parity {
+    use lattice_compute::attention as extracted;
+    use lattice_inference::attention as facade;
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn standard_and_tiled_attention_types_are_the_same_at_both_paths() {
+        same_type(
+            PhantomData::<facade::standard::AttentionBuffers>,
+            PhantomData::<extracted::standard::AttentionBuffers>,
+        );
+        same_type(
+            PhantomData::<facade::AttentionBuffers>,
+            PhantomData::<extracted::standard::AttentionBuffers>,
+        );
+        same_type(
+            PhantomData::<facade::flash::TiledAttentionConfig>,
+            PhantomData::<extracted::flash::TiledAttentionConfig>,
+        );
+        same_type(
+            PhantomData::<facade::flash::TiledAttentionBuffers>,
+            PhantomData::<extracted::flash::TiledAttentionBuffers>,
+        );
+        same_type(
+            PhantomData::<facade::AttentionKind>,
+            PhantomData::<extracted::AttentionKind>,
+        );
+        same_type(
+            PhantomData::<facade::AttentionTag>,
+            PhantomData::<extracted::AttentionTag>,
+        );
+    }
+
+    #[test]
+    fn standard_and_tiled_attention_functions_are_the_same_items_at_both_paths() {
+        same_function(
+            facade::standard::multi_head_attention,
+            extracted::standard::multi_head_attention,
+        );
+        same_function(
+            facade::multi_head_attention,
+            extracted::standard::multi_head_attention,
+        );
+        same_function(
+            facade::flash::estimate_materialized_attention_buffer_bytes,
+            extracted::flash::estimate_materialized_attention_buffer_bytes,
+        );
+        same_function(
+            facade::flash::tiled_attention_head,
+            extracted::flash::tiled_attention_head,
+        );
+        same_function(
+            facade::flash::tiled_multi_head_attention,
+            extracted::flash::tiled_multi_head_attention,
+        );
+    }
+
+    #[test]
+    fn attention_kind_reports_the_same_tag_through_the_facade() {
+        let cfg = facade::gqa::GqaConfig {
+            num_heads: 16,
+            num_kv_heads: 8,
+            head_dim: 64,
+        };
+        let kind = facade::AttentionKind::Gqa(cfg);
+        assert_eq!(kind.tag(), extracted::AttentionTag::Gqa);
+        assert_eq!(kind.name(), "gqa");
+        assert!(kind.is_causal());
+        assert!(kind.supports_kv_cache());
+    }
+}
