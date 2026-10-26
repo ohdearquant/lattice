@@ -460,11 +460,7 @@ impl PaddleOcrVlModel {
                 "paddleocr greedy: prompt {prompt_len} + {max_new_tokens} tokens overflows usize"
             ))
         })?;
-        let mut cache = Ernie45KvCache::new(
-            self.decoder_cfg.num_hidden_layers,
-            self.decoder_cfg.kv_dim()?,
-            capacity,
-        )?;
+        let mut cache: Ernie45KvCache = self.decoder.new_kv_cache(capacity)?;
         let last_logits =
             self.decoder
                 .kv_prefill(&assembly.spliced_embeds, &assembly.positions, &mut cache)?;
@@ -527,7 +523,6 @@ pub fn argmax_u32(row: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ernie45::Ernie45LayerWeights;
     use std::path::PathBuf;
 
     fn fixture_dir() -> PathBuf {
@@ -636,39 +631,64 @@ mod tests {
                 "tie_word_embeddings": false, "use_bias": false}"#,
         )
         .expect("test config");
-        Ernie45Model::new(
-            cfg,
-            Ernie45Weights {
-                embed_tokens: vec![0f32; 300 * 128],
-                layers: vec![
-                    Ernie45LayerWeights {
-                        q_proj: vec![0f32; 128 * 128],
-                        k_proj: vec![0f32; 32 * 128],
-                        v_proj: vec![0f32; 32 * 128],
-                        o_proj: vec![0f32; 128 * 128],
-                        gate_proj: vec![0f32; 256 * 128],
-                        up_proj: vec![0f32; 256 * 128],
-                        down_proj: vec![0f32; 128 * 256],
-                        input_layernorm: vec![1f32; 128],
-                        post_attention_layernorm: vec![1f32; 128],
-                    },
-                    Ernie45LayerWeights {
-                        q_proj: vec![0f32; 128 * 128],
-                        k_proj: vec![0f32; 32 * 128],
-                        v_proj: vec![0f32; 32 * 128],
-                        o_proj: vec![0f32; 128 * 128],
-                        gate_proj: vec![0f32; 256 * 128],
-                        up_proj: vec![0f32; 256 * 128],
-                        down_proj: vec![0f32; 128 * 256],
-                        input_layernorm: vec![1f32; 128],
-                        post_attention_layernorm: vec![1f32; 128],
-                    },
-                ],
-                final_norm: vec![1f32; 128],
-                lm_head: vec![0f32; 300 * 128],
-            },
-        )
-        .expect("test decoder")
+        struct EmptyDecoderSource {
+            shapes: std::collections::HashMap<String, (Vec<usize>, f32)>,
+        }
+
+        impl crate::weights::TensorSource for EmptyDecoderSource {
+            fn has_tensor(&mut self, name: &str) -> Result<bool, InferenceError> {
+                Ok(self.shapes.contains_key(name))
+            }
+
+            fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+                Ok(self.shapes.get(name).map(|(shape, _)| shape.clone()))
+            }
+
+            fn get_f32_tensor_owned(
+                &mut self,
+                name: &str,
+            ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+                let (shape, value) = self
+                    .shapes
+                    .get(name)
+                    .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?;
+                Ok((vec![*value; shape.iter().product()], shape.clone()))
+            }
+        }
+
+        let h = cfg.hidden_size;
+        let q = cfg.num_attention_heads * cfg.head_dim;
+        let kv = cfg.num_key_value_heads * cfg.head_dim;
+        let intermediate = cfg.intermediate_size;
+        let mut source = EmptyDecoderSource {
+            shapes: std::collections::HashMap::from([
+                (
+                    "model.embed_tokens.weight".to_string(),
+                    (vec![cfg.vocab_size, h], 0.0),
+                ),
+                ("model.norm.weight".to_string(), (vec![h], 1.0)),
+                ("lm_head.weight".to_string(), (vec![cfg.vocab_size, h], 0.0)),
+            ]),
+        };
+        for layer in 0..cfg.num_hidden_layers {
+            for (suffix, shape, value) in [
+                ("self_attn.q_proj.weight", vec![q, h], 0.0),
+                ("self_attn.k_proj.weight", vec![kv, h], 0.0),
+                ("self_attn.v_proj.weight", vec![kv, h], 0.0),
+                ("self_attn.o_proj.weight", vec![h, q], 0.0),
+                ("mlp.gate_proj.weight", vec![intermediate, h], 0.0),
+                ("mlp.up_proj.weight", vec![intermediate, h], 0.0),
+                ("mlp.down_proj.weight", vec![h, intermediate], 0.0),
+                ("input_layernorm.weight", vec![h], 1.0),
+                ("post_attention_layernorm.weight", vec![h], 1.0),
+            ] {
+                source
+                    .shapes
+                    .insert(format!("model.layers.{layer}.{suffix}"), (shape, value));
+            }
+        }
+        let weights = Ernie45Weights::load(&mut source, &cfg).expect("test decoder weights");
+        Ernie45Model::new(cfg, weights).expect("test decoder")
     }
 
     #[test]
