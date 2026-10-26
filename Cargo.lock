@@ -1668,6 +1668,7 @@ dependencies = [
  "lattice-inference-core",
  "lattice-metal-runtime",
  "lattice-model-config",
+ "lattice-model-io",
  "lattice-quant",
  "lattice-tokenizer",
  "lattice-weights",
@@ -1691,7 +1692,6 @@ dependencies = [
  "thiserror 2.0.19",
  "tokenizers",
  "tracing",
- "ureq",
  "wgpu 24.0.5",
 ]
 
@@ -1718,6 +1718,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "lattice-model-io"
+version = "0.15.0"
+dependencies = [
+ "lattice-inference-core",
+ "libc",
+ "sha2",
+ "tempfile",
+ "tracing",
+ "ureq",
 ]
 
 [[package]]

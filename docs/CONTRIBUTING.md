@@ -143,6 +143,8 @@ lattice/
       src/                — Qwen3.5, Gemma 4, EmbeddingGemma 2 and BitNet config parsing
     compute/              — host-side compute; depends on inference-core
       src/                — rotary position embedding tables and KV caches
+    model-io/             — model files and environment switches; depends on inference-core
+      src/                — cache directory, checksum-verified downloads, by-value switches
     metal-runtime/        — shared Metal helpers; depends on inference-core
       src/                — shared Metal buffers, encoding and pipeline construction
     embed/                — public embedding service

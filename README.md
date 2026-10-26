@@ -155,6 +155,7 @@ provenance comments). Reproduce: `./scripts/bench_quality.sh`
 | [`lattice-quant`](crates/quant/)                   | Quantization primitives: bounded Q4 manifest reading, Hadamard transforms and rotation absorption; re-exported by `lattice-inference`                                 | [![](https://img.shields.io/crates/v/lattice-quant.svg)](https://crates.io/crates/lattice-quant)                   |
 | [`lattice-model-config`](crates/model-config/)     | Model configurations: validated `config.json` parsing for Qwen3.5, Gemma 4, EmbeddingGemma 2 and BitNet; re-exported by `lattice-inference`                           | [![](https://img.shields.io/crates/v/lattice-model-config.svg)](https://crates.io/crates/lattice-model-config)     |
 | [`lattice-compute`](crates/compute/)               | Host-side compute: RoPE tables, KV caches, prefix reuse and LoRA hooks; re-exported by `lattice-inference`                                                            | [![](https://img.shields.io/crates/v/lattice-compute.svg)](https://crates.io/crates/lattice-compute)               |
+| [`lattice-model-io`](crates/model-io/)             | Model files: cache directory, checksum-verified downloads and environment switches; re-exported by `lattice-inference`                                                | [![](https://img.shields.io/crates/v/lattice-model-io.svg)](https://crates.io/crates/lattice-model-io)             |
 | [`lattice-inference-core`](crates/inference-core/) | Shared base types: `InferenceError`, re-exported by `lattice-inference`                                                                                               | [![](https://img.shields.io/crates/v/lattice-inference-core.svg)](https://crates.io/crates/lattice-inference-core) |
 | [`lattice-metal-runtime`](crates/metal-runtime/)   | Shared Metal buffers, command encoding and pipeline construction; macOS with the optional `metal-gpu` feature                                                         | [![](https://img.shields.io/crates/v/lattice-metal-runtime.svg)](https://crates.io/crates/lattice-metal-runtime)   |
 | [`lattice-serve`](crates/serve/)                   | HTTP server and the `lattice` CLI: OpenAI-compatible routes, model workers, LoRA serving; installed with `cargo install lattice-serve`                                | [![](https://img.shields.io/crates/v/lattice-serve.svg)](https://crates.io/crates/lattice-serve)                   |
@@ -162,9 +163,9 @@ provenance comments). Reproduce: `./scripts/bench_quality.sh`
 
 Three leaf crates (`fann`, `transport`, `inference-core`) have zero
 intra-workspace dependencies. `tokenizer`, `grammar` and `weights` each depend
-only on `inference-core` at runtime. `model-config` depends on `inference-core`
+only on `inference-core` at runtime, as does `model-io`. `model-config` depends on `inference-core`
 and `weights`; `quant` depends on those two and on `model-config`, and `compute`
-on `inference-core` and `model-config`. `inference` depends on all seven
+on `inference-core` and `model-config`. `inference` depends on all eight
 unconditionally and pulls in `fann` through the optional `mixture` or
 `metal-gpu` features. Each can be used on its own.
 
@@ -591,6 +592,8 @@ flowchart TD
     Inference --> Quant[lattice-quant]
     Inference --> ModelConfig[lattice-model-config]
     Inference --> Compute[lattice-compute]
+    Inference --> ModelIo[lattice-model-io]
+    ModelIo --> Core
     Compute --> Core
     Compute --> ModelConfig
     Compute --> Tokenizer
@@ -708,14 +711,14 @@ variable when the same requirement should apply to `make ci` or Git hooks.
 dependents:
 
 1. `fann`, `transport`, and `inference-core` (leaves).
-2. `tokenizer`, `grammar`, `weights`, `metal-runtime`, and `compute`.
+2. `tokenizer`, `grammar`, `weights`, `metal-runtime`, and `model-io`.
 3. `model-config`.
-4. `quant`.
+4. `quant` and `compute`.
 5. `inference`.
 6. `embed`, `tune` and `serve`.
 
 The script waits 30 seconds between tiers for registry indexing. Its dry-run
-mode checks package sizes for all fourteen crates, then runs
+mode checks package sizes for all fifteen crates, then runs
 `cargo publish --dry-run` for the leaf tier only; later tiers require this
 release's dependencies on crates.io.
 

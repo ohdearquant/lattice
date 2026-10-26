@@ -2122,3 +2122,15 @@ mod attention_standard_parity {
         assert!(kind.supports_kv_cache());
     }
 }
+
+mod model_io_parity {
+    use lattice_inference::download as facade;
+    use lattice_model_io::download as extracted;
+
+    fn same_function<F>(_: F, _: F) {}
+
+    #[test]
+    fn ensure_model_files_is_the_same_function_at_both_paths() {
+        same_function(facade::ensure_model_files, extracted::ensure_model_files);
+    }
+}

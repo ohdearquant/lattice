@@ -17,6 +17,7 @@ lattice-grammar     ←── lattice-inference-core   (JSON Schema, GBNF, const
 lattice-weights     ←── lattice-inference-core   (weight storage, model-directory format detection)
 lattice-metal-runtime ←── lattice-inference-core (shared Metal helpers, macOS + `metal-gpu`)
 lattice-compute     ←── lattice-inference-core   (host-side RoPE tables and KV caches)
+lattice-model-io    ←── lattice-inference-core   (model cache, checksum-verified downloads, env switches)
 lattice-model-config ←── lattice-inference-core
                     ←── lattice-weights         (Qwen3.5, Gemma 4, EmbeddingGemma 2, BitNet configs)
 lattice-quant       ←── lattice-inference-core
@@ -29,6 +30,7 @@ lattice-inference   ←── lattice-inference-core
                     ←── lattice-quant
                     ←── lattice-model-config
                     ←── lattice-compute
+                    ←── lattice-model-io
                     ←── lattice-metal-runtime (optional, `metal-gpu` feature)
                     ←── lattice-fann (optional, `mixture` or `metal-gpu` feature)
                                      (transformer forward pass, weights)
@@ -41,11 +43,11 @@ lattice-tune    ←── lattice-fann
 ```
 
 The three leaf crates (`inference-core`, `fann`, `transport`) have zero intra-workspace
-dependencies and can be used standalone. `tokenizer`, `grammar`, `weights` and `compute` each depend
+dependencies and can be used standalone. `tokenizer`, `grammar`, `weights` and `model-io` each depend
 only on `inference-core` at runtime; grammar uses tokenizer in tests. `model-config`
-depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`. `inference` depends on all seven unconditionally (plus
+depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`; `compute` depends on `inference-core`, `tokenizer`, `weights` and `model-config`. `inference` depends on all eight unconditionally (plus
 `fann` under the optional `mixture` or `metal-gpu` features), re-exporting tokenizer,
-grammar, weight, model-format, quantization primitive, model configuration, compute and error items at their original
+grammar, weight, model-format, quantization primitive, model configuration, compute, model-file and error items at their original
 paths. `metal-runtime` depends only on `inference-core` internally; the facade enables
 it under `metal-gpu`. Consumer crates (`embed`, `tune`) compose them.
 
@@ -121,6 +123,16 @@ reuse planning. Its internal runtime dependency is `lattice-inference-core` for 
 shared error type; CPU kernels, attention, pooling and sampling move here in later
 changes. The facade retains
 the `lattice_inference::rope::RopeTable` path.
+
+### lattice-model-io
+
+Model files below the facade: the model cache directory (`default_cache_dir`, read from
+`LATTICE_MODEL_CACHE`), canonical model names with checksum-verified downloads
+(`download::ensure_model_files`, HTTP client behind the `download` feature, refused when
+`LATTICE_OFFLINE` is set) and the by-value environment switch reader (`env_switch_enabled`).
+Its only internal runtime dependency is `lattice-inference-core`. The facade retains the
+`lattice_inference::download::ensure_model_files` path, and inference's `download` feature
+forwards to this crate's.
 
 ### lattice-inference
 
@@ -214,6 +226,7 @@ lattice-inference        ← transformer forward pass
     │   lattice-quant: Q4 manifests, Hadamard transforms and rotation absorption
     │   lattice-model-config: validated model configurations
     │   lattice-compute: RoPE tables and KV caches
+    │   lattice-model-io: model cache and checksum-verified downloads
     ▼
 CPU backends             Metal (macOS)    WGPU (cross-platform GPU)
 AVX2 / NEON kernels      Metal MSL kernels WGSL compute shaders
