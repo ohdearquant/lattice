@@ -19,48 +19,10 @@ use crate::tokenizer::EmbeddingTokenCounts;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-fn output_dimension(width: usize, model: &str) -> Result<NonZeroUsize, InferenceError> {
-    NonZeroUsize::new(width)
-        .ok_or_else(|| InferenceError::InvalidInput(format!("{model} has output dimension 0")))
-}
+use lattice_arch::__internal::encoder::{output_dimension, pair};
 
 fn usage(counts: EmbeddingTokenCounts) -> Result<TokenUsage, InferenceError> {
-    TokenUsage::new(counts.before_truncation, counts.embedded).ok_or_else(|| {
-        InferenceError::Inference(format!(
-            "token counts report {} embedded tokens of {}",
-            counts.embedded, counts.before_truncation
-        ))
-    })
-}
-
-/// Pairs each vector with its input's counts, refusing the whole call when the model returned a
-/// different number of vectors or a vector of another length.
-fn pair(
-    vectors: Vec<Vec<f32>>,
-    usages: Vec<TokenUsage>,
-    dimension: NonZeroUsize,
-) -> Result<Vec<EncodedText>, InferenceError> {
-    if vectors.len() != usages.len() {
-        return Err(InferenceError::Inference(format!(
-            "the model returned {} vectors for {} inputs",
-            vectors.len(),
-            usages.len()
-        )));
-    }
-    vectors
-        .into_iter()
-        .zip(usages)
-        .map(|(vector, usage)| {
-            if vector.len() == dimension.get() {
-                Ok(EncodedText::new(vector, usage))
-            } else {
-                Err(InferenceError::Inference(format!(
-                    "the model returned a vector of length {} for output dimension {dimension}",
-                    vector.len()
-                )))
-            }
-        })
-        .collect()
+    lattice_arch::__internal::encoder::usage(counts.before_truncation, counts.embedded)
 }
 
 /// A BERT-family model behind [`Encoder`]: mean or first-token pooling as the model is set, L2
@@ -238,6 +200,3 @@ impl Encoder for EmbeddingGemma2Encoder {
         pair(vectors, usages, dimension)
     }
 }
-
-#[cfg(test)]
-mod tests;
