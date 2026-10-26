@@ -56,11 +56,12 @@ fn bench_generate_q8_request_scratch() {
     ] {
         let prompt = "world".repeat(prompt_repeats);
         let prompt_tokens = 5 * prompt_repeats;
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: new_tokens,
-            temperature: 0.0,
-            seed: Some(7),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = new_tokens;
+            config.temperature = 0.0;
+            config.seed = Some(7);
+            config
         };
         assert!(prompt_tokens + new_tokens < cfg.max_position_embeddings);
 

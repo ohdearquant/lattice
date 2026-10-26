@@ -1,63 +1,15 @@
-//! LoRA adapter hook for the inference forward pass.
+//! LoRA adapter hooks and model-specific projection geometry.
 //!
-//! Defines a trait that the forward pass calls after each linear projection.
-//! This lives in foundation/inference (not platform/tune) so the dependency
-//! direction stays correct: platform/tune implements this trait.
-//!
-//! The default `NoopLoraHook` does nothing — zero overhead when no adapter is loaded.
+//! Named exports retain the existing public surface; the row helper stays crate-private.
+
+pub(crate) use lattice_compute::lora_hook::apply_lora_rows;
+#[doc(inline)]
+pub use lattice_compute::lora_hook::{
+    GDN_LORA_MODULES, GDN_LORA_MODULES_SERVABLE, LoraHook, LoraProjectionShape, LoraTargetGeometry,
+    NoopLoraHook, gdn_lora_module_is_servable,
+};
 
 use crate::model::qwen35_config::Qwen35Config;
-
-/// Every Gated DeltaNet projection a LoRA adapter can target, in the order the
-/// trainers emit them.
-///
-/// This is the geometry set: [`qwen35_projection_shape`] returns a shape for all
-/// five. Whether a given backend can APPLY one is a separate question, answered
-/// by [`GDN_LORA_MODULES_SERVABLE`].
-pub const GDN_LORA_MODULES: [&str; 5] = [
-    "in_proj_qkv",
-    "in_proj_z",
-    "in_proj_b",
-    "in_proj_a",
-    "out_proj",
-];
-
-/// The Gated DeltaNet projections the Metal forward can actually apply.
-///
-/// `in_proj_a` and `in_proj_b` are absent on purpose. Both are consumed inside
-/// the fused GDN recurrence kernel, which reads the base weights directly, so
-/// there is no post-projection row for a LoRA delta to be added to. That is a
-/// capability statement about the kernel, not a validation slip.
-///
-/// THIS EXISTS TO BE THE ONLY COPY. The trainers pick a module set and the Metal
-/// loader refuses one; when those two lists are written independently they drift,
-/// and the drift is silent until load time -- an adapter trains to completion and
-/// then cannot be served, with the loss having been minimised for a delta the
-/// server will never apply. A trainer that selects from this constant and a
-/// loader that refuses by this constant cannot disagree.
-///
-/// Widening this set is a kernel change, not an edit here: see the doc comment on
-/// `load_lora_adapter` in the Metal forward.
-pub const GDN_LORA_MODULES_SERVABLE: [&str; 3] = ["in_proj_qkv", "in_proj_z", "out_proj"];
-
-/// Whether `module` is a GDN projection the Metal forward can apply.
-///
-/// False for a non-GDN module name too, so callers that mean "is this GDN module
-/// servable" must already know they hold a GDN module name; [`GDN_LORA_MODULES`]
-/// is the membership test for that.
-#[must_use]
-pub fn gdn_lora_module_is_servable(module: &str) -> bool {
-    GDN_LORA_MODULES_SERVABLE.contains(&module)
-}
-
-/// Input and output dimensions for one LoRA-targetable linear projection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LoraProjectionShape {
-    /// Width of the activation consumed by the projection.
-    pub d_in: usize,
-    /// Width of the projection output.
-    pub d_out: usize,
-}
 
 /// Return the LoRA projection shape for a Qwen3.5 layer and module.
 ///
@@ -108,143 +60,79 @@ pub fn qwen35_projection_shape(
     Ok(LoraProjectionShape { d_in, d_out })
 }
 
-/// **Unstable**: trait for LoRA adapter injection into linear projections.
-///
-/// The inference forward pass calls `apply()` for each projected row after a
-/// `matmul_bt`.
-/// If a LoRA adapter exists for the given (layer, module), it adds:
-/// `output += scale * B @ (A @ x)`
-pub trait LoraHook: Send + Sync {
-    /// **Unstable**: apply LoRA delta to a projection output in-place.
-    ///
-    /// # Arguments
-    /// * `layer_idx` - Transformer layer index (0-based)
-    /// * `module` - Projection name. Full-attention layers (GQA): `"q_proj"`, `"k_proj"`,
-    ///   `"v_proj"`, `"o_proj"`. Linear-attention layers (GDN): `"in_proj_qkv"`,
-    ///   `"in_proj_z"`, `"in_proj_b"`, `"in_proj_a"`, `"out_proj"`.
-    ///   MLP (all layers): `"gate_proj"`, `"up_proj"`, `"down_proj"`.
-    ///   BERT: `"query"`, `"key"`, `"value"`, `"attn_output"`, `"ffn_intermediate"`, `"ffn_output"`.
-    /// * `x` - One input row (the same activation passed to the base projection)
-    /// * `output` - The corresponding base projection output row to modify in-place
-    fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]);
+/// **Unstable**: projection geometry borrowed from a Qwen3.5 model configuration.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen35LoraGeometry<'a> {
+    config: &'a Qwen35Config,
+}
 
-    /// **Unstable**: self-check this hook's declared rank/shape against a
-    /// Qwen3.5 model's geometry before it is installed.
-    ///
-    /// [`crate::model::qwen35::Qwen35Model::set_lora`] calls this before
-    /// swapping the hook in, so a mismatched adapter is rejected instead of
-    /// silently corrupting a projection's output prefix (or panicking past a
-    /// `debug_assert` in a release build). Default: no-op (trusts the
-    /// caller) — real adapters with known geometry (e.g.
-    /// `lattice_tune::lora::LoraAdapter`) override it.
-    fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
-        Ok(())
+impl<'a> Qwen35LoraGeometry<'a> {
+    /// Borrow a model configuration for LoRA validation.
+    pub fn new(config: &'a Qwen35Config) -> Self {
+        Self { config }
+    }
+}
+
+impl LoraTargetGeometry for Qwen35LoraGeometry<'_> {
+    fn num_layers(&self) -> usize {
+        self.config.num_hidden_layers
     }
 
-    /// **Unstable**: self-check this hook's declared projection geometry
-    /// against a BERT cross-encoder model's dimensions before it is used
-    /// for hooked scoring.
-    ///
-    /// This is the hook's OWN check, and the default below returns `Ok(())`:
-    /// a hook that does not override it is trusted, and nothing else on the
-    /// scoring path re-checks its geometry.
-    ///
-    /// [`crate::model::cross_encoder::CrossEncoderModel::score_with_hook`]
-    /// and `score_batch_with_hook` call this before the forward pass (and
-    /// before any row is sliced) and map an `Err` to
-    /// [`crate::error::InferenceError::InvalidInput`]. So it is an
-    /// OVERRIDING implementation — `lattice_tune::lora::LoraAdapter` is the
-    /// one in this workspace — that makes a mismatched adapter fail with a
-    /// recoverable error instead of `apply_lora` slicing
-    /// `output[..lora.d_out]` out of bounds past a `debug_assert` that
-    /// release builds compile out.
-    ///
-    /// Implement it for any hook whose geometry is known. Leaving it at the
-    /// default opts that hook out of the rejection, not into it.
-    ///
-    /// This may be called more than once for a single request: a batch of N
-    /// documents calls it N+1 times, once at the batch boundary and once per
-    /// document. Implement it as a repeatable read of declared dimensions, not
-    /// as a one-shot operation with side effects.
-    fn validate_against_bert(
+    fn projection_shape(
         &self,
-        _num_hidden_layers: usize,
-        _hidden_size: usize,
-        _intermediate_size: usize,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// **Unstable**: whether this hook has anything to apply for
-    /// `(layer_idx, module)`.
-    ///
-    /// `apply_lora_rows` calls this once per projection, before its
-    /// per-row loop, so a hook with nothing to do for this projection (the
-    /// default no-adapter case) skips the loop — and the one virtual call
-    /// per token row it would otherwise cost — entirely. Default: `true`
-    /// (assume active; correct but not optimized for hooks that don't
-    /// override it). [`NoopLoraHook`] overrides this to `false`.
-    fn is_active(&self, _layer_idx: usize, _module: &str) -> bool {
-        true
+        layer_idx: usize,
+        module: &str,
+    ) -> Result<LoraProjectionShape, String> {
+        qwen35_projection_shape(self.config, layer_idx, module)
     }
 }
 
-pub(crate) fn apply_lora_rows(
-    lora: &dyn LoraHook,
-    layer_idx: usize,
-    module: &str,
-    input: &[f32],
-    output: &mut [f32],
-    input_row_width: usize,
-    output_row_width: usize,
-) {
-    assert!(input_row_width > 0, "LoRA input row width must be non-zero");
-    assert!(
-        output_row_width > 0,
-        "LoRA output row width must be non-zero"
-    );
-    assert_eq!(
-        input.len() % input_row_width,
-        0,
-        "LoRA input must contain complete rows"
-    );
-    assert_eq!(
-        output.len() % output_row_width,
-        0,
-        "LoRA output must contain complete rows"
-    );
-    assert_eq!(
-        input.len() / input_row_width,
-        output.len() / output_row_width,
-        "LoRA input and output row counts must match"
-    );
+/// **Unstable**: projection geometry for a BERT encoder or cross-encoder.
+#[derive(Clone, Copy, Debug)]
+pub struct BertLoraGeometry {
+    num_hidden_layers: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+}
 
-    // Resolved once per projection rather than once per row: on the default
-    // (no-adapter) path this skips straight past the per-row loop below
-    // instead of paying one virtual dispatch per token.
-    if !lora.is_active(layer_idx, module) {
-        return;
-    }
-
-    for (input_row, output_row) in input
-        .chunks_exact(input_row_width)
-        .zip(output.chunks_exact_mut(output_row_width))
-    {
-        lora.apply(layer_idx, module, input_row, output_row);
+impl BertLoraGeometry {
+    /// Construct LoRA geometry from the model's layer count and projection widths.
+    pub fn new(num_hidden_layers: usize, hidden_size: usize, intermediate_size: usize) -> Self {
+        Self {
+            num_hidden_layers,
+            hidden_size,
+            intermediate_size,
+        }
     }
 }
 
-/// No-op implementation. Used when no adapter is loaded.
-/// The compiler should inline and eliminate these calls entirely.
-pub struct NoopLoraHook;
+impl LoraTargetGeometry for BertLoraGeometry {
+    fn num_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
 
-impl LoraHook for NoopLoraHook {
-    #[inline(always)]
-    fn apply(&self, _layer_idx: usize, _module: &str, _x: &[f32], _output: &mut [f32]) {}
-
-    #[inline(always)]
-    fn is_active(&self, _layer_idx: usize, _module: &str) -> bool {
-        false
+    fn projection_shape(
+        &self,
+        layer_idx: usize,
+        module: &str,
+    ) -> Result<LoraProjectionShape, String> {
+        if layer_idx >= self.num_hidden_layers {
+            return Err(format!(
+                "layer {layer_idx} is out of range for BERT model with {} layers (module: {module})",
+                self.num_hidden_layers
+            ));
+        }
+        let (d_in, d_out) = match module {
+            "query" | "key" | "value" | "attn_output" => (self.hidden_size, self.hidden_size),
+            "ffn_intermediate" => (self.hidden_size, self.intermediate_size),
+            "ffn_output" => (self.intermediate_size, self.hidden_size),
+            _ => {
+                return Err(format!(
+                    "unknown BERT LoRA module '{module}' on layer {layer_idx}"
+                ));
+            }
+        };
+        Ok(LoraProjectionShape { d_in, d_out })
     }
 }
 

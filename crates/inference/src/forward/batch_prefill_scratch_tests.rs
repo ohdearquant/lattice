@@ -1,5 +1,6 @@
 use super::tests::{assert_allclose, build_random_model, run_sequential_prefill, tiny_test_config};
 use super::*;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 
 fn expected_lengths(cfg: &Qwen35Config, seq_len: usize) -> ([usize; 5], [usize; 5], [usize; 3]) {
     let q = cfg.num_attention_heads * cfg.head_dim;
@@ -309,7 +310,7 @@ fn poisoned_reused_scratch_matches_sequential_mixed_prefill() {
         let (expected_logits, expected_states, expected_kv) =
             run_sequential_prefill(&model, &prompt);
         let mut states: Vec<_> = (0..cfg.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(&cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
             .collect();
         let mut kv = KvCache::new(cfg.num_full_attention_layers());
         poison_scratch(&mut scratch);
@@ -427,7 +428,7 @@ fn prefill_dimension_overflow_refuses_before_state_cache_or_scratch_mutation() {
     poison_scratch(&mut scratch);
     let before_scratch = scratch_snapshot(&scratch);
     let mut states: Vec<_> = (0..cfg.num_linear_attention_layers())
-        .map(|_| GatedDeltaNetState::new(&cfg))
+        .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
         .collect();
     for state in &mut states {
         state.s_matrices.fill(3.25);

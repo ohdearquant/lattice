@@ -609,6 +609,7 @@ pub(crate) fn unclassifiable_macro(mac: &syn::Macro) -> Option<String> {
             | "column"
             | "compile_error"
             | "concat"
+            | "concat_msl"
             | "env"
             | "file"
             | "include_bytes"
@@ -625,6 +626,8 @@ pub(crate) fn unclassifiable_macro(mac: &syn::Macro) -> Option<String> {
         // it could carry, and no completeness gap in treating it as fully
         // classifiable (lattice PR-B addendum, 2026-09-20, lifting this
         // file's out-of-scope rule for this one classification arm).
+        // `concat_msl!` (lattice-metal-runtime) joins constant `&str`
+        // fragments in a constant: it calls nothing at run time, as `concat!`.
         return None;
     }
     if matches!(

@@ -671,3 +671,24 @@ fn test_mean_pool_respects_padding_mask() {
     assert_relative_eq!(pooled[0], 1.0, epsilon = 1e-6);
     assert_relative_eq!(pooled[1], 0.0, epsilon = 1e-6);
 }
+
+#[test]
+fn bert_model_pool_has_an_arm_for_every_pooling_variant() {
+    // CLS ([1,0,0,0]) and the masked mean ([0.5,0.5,0,0]) differ here, so a variant routed to
+    // the wrong reduction fails, and a variant with no expectation below fails by name.
+    let (hidden, mask) = hidden_2x4();
+    for pooling in BertPooling::ALL {
+        let expected = match pooling {
+            BertPooling::Mean => mean_pool(&hidden, &mask, 2, 4),
+            BertPooling::CLS => cls_pool(&hidden, 2, 4),
+            other => panic!(
+                "no expectation for {other:?}: give BertModel::pool an arm, then add it here"
+            ),
+        };
+        assert_eq!(
+            pool_hidden_states(pooling, &hidden, &mask, 2, 4),
+            expected,
+            "{pooling:?}"
+        );
+    }
+}

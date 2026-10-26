@@ -13,16 +13,18 @@ fn compact_metal_candidate_path_applies_min_p() {
             logit: 0.49_f32.ln(),
         },
     ];
-    let disabled = GenerateConfig {
-        min_p: 0.0,
-        temperature: 1.0,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        ..Default::default()
+    let disabled = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.temperature = 1.0;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config
     };
-    let enabled = GenerateConfig {
-        min_p: 0.5,
-        ..disabled.clone()
+    let enabled = {
+        let mut config = disabled.clone();
+        config.min_p = 0.5;
+        config
     };
     let mut saw_tail_without_min_p = false;
 

@@ -1,12 +1,10 @@
-//! EmbeddingGemma 2 configuration facade over `lattice-model-config`.
+//! EmbeddingGemma 2 configuration facade over `lattice-arch`.
 //!
 //! Every public item keeps the path it had before the configuration moved into its own crate. The
 //! re-exports are named rather than globbed so the facade never widens the supported API.
 
 #[doc(inline)]
-pub use lattice_model_config::embeddinggemma2_config::{
+pub use lattice_arch::embeddinggemma2_config::{
     EmbeddingGemma2Config, EmbeddingGemma2LayerKind, EmbeddingGemma2LayerShape,
 };
-pub(crate) use lattice_model_config::embeddinggemma2_config::{
-    ImagePartsConfig, image_parts_config,
-};
+pub(crate) use lattice_arch::embeddinggemma2_config::{ImagePartsConfig, image_parts_config};

@@ -169,8 +169,8 @@ use crate::quarot::rmsnorm_fusion::{
     RmsNormFusionTarget, fuse_shifted_rmsnorm_into_next_layer_f64, qwen35_per_layer_fusion_plan,
 };
 use crate::quarot::rotation::{absorb_input_rotation_f64, absorb_output_rotation_f64};
-use lattice_model_config::qwen35_config::Qwen35Config;
-use lattice_model_config::qwen35_tensors::qwen_required_tensor_names;
+use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
 
 #[cfg(test)]
 pub(crate) mod pre_admission_allocation_tracking;
@@ -604,7 +604,7 @@ fn assert_forward_equivalence_snapshot<S: OriginalTensorSource>(
     // 2. Per-tensor rotation-equivalence check. Covers every planned tensor,
     //    including the ones the chain probe shortcuts past (k_proj, v_proj,
     //    gate-z half of q_proj, in_proj_qkv, in_proj_a, in_proj_b).
-    let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let rotation_plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let fusion_plan = full_fusion_plan(cfg)?;
     let per_tensor_max_abs = check_per_tensor_rotation_equivalence(
         original,

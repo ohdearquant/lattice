@@ -1,6 +1,6 @@
-//! BitNet configuration facade over `lattice-model-config`.
+//! BitNet configuration facade over `lattice-arch`.
 //!
 //! Every public item keeps the path it had before the configuration moved into its own crate.
 
 #[doc(inline)]
-pub use lattice_model_config::bitnet_config::BitNetConfig;
+pub use lattice_arch::bitnet_config::BitNetConfig;

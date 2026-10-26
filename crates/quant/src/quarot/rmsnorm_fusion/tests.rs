@@ -182,7 +182,7 @@ fn qwen35_fusion_plan_norm_names_match_loader() {
     // The norm tensor names must match what `qwen_required_tensor_names`
     // emits — otherwise the converter cannot find the tensors to fuse.
     let cfg = Qwen35Config::qwen35_0_8b();
-    let required = lattice_model_config::qwen35_tensors::qwen_required_tensor_names(&cfg);
+    let required = lattice_arch::qwen35_tensors::qwen_required_tensor_names(&cfg);
     let plan = qwen35_per_layer_fusion_plan(&cfg).unwrap();
     for tgt in &plan {
         assert!(

@@ -33,7 +33,7 @@ These modules contain submodules (directories with their own `mod.rs`).
 | Module        | Responsibility                                                                                                                                                                                                                                                                                                                                                                           |
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `batch`       | Continuous batching engine (ADR-048): `BatchWorker`, `FifoScheduler`, `Sequence`, `SequenceManager`, chunked prefill interleaved with decode steps.                                                                                                                                                                                                                                      |
-| `download`    | Model file cache and conditional download (`ensure_model_files`). Disabled unless the `download` feature is enabled.                                                                                                                                                                                                                                                                     |
+| `download`    | Model file cache and conditional download (`ensure_model_files`), re-exported from `lattice-model-io`. Disabled unless the `download` feature is enabled.                                                                                                                                                                                                                                |
 | `error`       | `InferenceError` — the crate's single error type, re-exported at the crate root. Stable; adding variants is backward-compatible.                                                                                                                                                                                                                                                         |
 | `grammar`     | Grammar-constrained decoding (ADR-046): `GrammarEngine` compiles a JSON Schema or GBNF spec to a byte-level PDA, then masks logits via `mask_logits` and advances state via `advance` each decode step.                                                                                                                                                                                  |
 | `kv_cache`    | Two KV cache implementations: `FlatKVCache` (contiguous pre-allocated, single request) and `PagedKVCache` (256-token pages, LRU eviction, multi-model serving). Includes `PrefixPageCache` for prefix reuse.                                                                                                                                                                             |
@@ -102,8 +102,11 @@ A deeper Qwen3.5-specific walkthrough lives in `docs/forward-pass.md`.
 `model/qwen.rs` (config struct, weights struct, `load` function, `encode`/`forward` method).
 Wire the new architecture into `lattice-embed`'s `EmbeddingModel` enum when ready.
 
-**Attention kernel change.** Work in `attention/` and `forward/`. A new kernel goes in its
-own file under `attention/` (e.g. `attention/flash_causal.rs`), registers a variant on
+**Attention kernel change.** The CPU attention kernels (standard, tiled, grouped-query,
+decode and the other variants), the GatedDeltaNet kernels and the `AttentionKind`/`AttentionTag`
+taxonomy live in `lattice-compute` (`crates/compute/src/attention/`, e.g. `flash_causal.rs`) and
+keep their `lattice_inference::attention` paths through named re-exports. GDN backward stays in
+`attention/` here. A new kernel goes in its own file in compute, registers a variant on
 `AttentionTag`, and dispatches from the relevant `forward/` backend. See
 `docs/architecture.md` for the full forward-pass walkthrough before touching this path.
 

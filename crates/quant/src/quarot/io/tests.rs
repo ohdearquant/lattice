@@ -1,5 +1,6 @@
 use super::*;
 use crate::quarot::plan::{AbsorptionSide, RotationId};
+use lattice_arch::qwen35_config::Qwen35Config;
 use std::fs::File;
 use std::io::Write;
 
@@ -901,8 +902,8 @@ fn sharded_index_entry_unsupported_dtype_is_not_readable() {
 /// this test fails to compile.
 #[test]
 fn qwen_required_tensor_names_is_publicly_reachable() {
-    use lattice_model_config::qwen35_config::Qwen35Config;
-    use lattice_model_config::qwen35_tensors::qwen_required_tensor_names;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
     // We don't construct a config (it has many required fields); we
     // just want a fn pointer to prove visibility.
     let _f: fn(&Qwen35Config) -> Vec<String> = qwen_required_tensor_names;
@@ -945,14 +946,19 @@ fn artifact_version_refuses_case_variant() {
 }
 
 fn sample_r3_cfg() -> Qwen35Config {
-    lattice_model_config::qwen35_config::Qwen35Config::qwen35_0_8b()
+    lattice_arch::qwen35_config::Qwen35Config::qwen35_0_8b()
 }
 
 fn sample_r3_spec() -> OnlineRotationSpec {
     let cfg = sample_r3_cfg();
     // block_size == num_attention_heads (8): one dense cross-head
     // Hadamard covering every head (QuaRot Eq. 9's H_num_heads).
-    OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap()
+    OnlineRotationSpec::attention_output_r3(
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        42,
+        8,
+    )
+    .unwrap()
 }
 
 /// Every tensor name `sample_r3_spec()`'s scope (`[3,7,11,15,19,23]`)
@@ -972,7 +978,7 @@ fn v0_residual_with_no_online_rotations_is_valid() {
         online_rotations: Vec::new(),
         asymmetric_tensor_names: Vec::new(),
     };
-    assert!(descriptor.validate(None).is_ok());
+    assert!(descriptor.validate_target(None).is_ok());
 }
 
 /// A V0Residual descriptor must never carry online rotation metadata —
@@ -986,7 +992,7 @@ fn v0_residual_with_online_rotation_is_refused() {
         online_rotations: vec![sample_r3_spec()],
         asymmetric_tensor_names: Vec::new(),
     };
-    let err = descriptor.validate(None).unwrap_err();
+    let err = descriptor.validate_target(None).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("never interpreted as online-capable"),
@@ -1008,7 +1014,7 @@ fn v0_residual_with_asymmetric_tensor_names_is_refused() {
             "model.language_model.layers.3.self_attn.o_proj.weight".to_string(),
         ],
     };
-    let err = descriptor.validate(None).unwrap_err();
+    let err = descriptor.validate_target(None).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("must not declare any asymmetric_tensor_names"),
@@ -1025,7 +1031,11 @@ fn v1_online_with_zero_rotations_is_refused() {
         online_rotations: Vec::new(),
         asymmetric_tensor_names: Vec::new(),
     };
-    let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+            &sample_r3_cfg(),
+        )))
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("at least one R3/R4"), "got: {msg}");
 }
@@ -1044,13 +1054,19 @@ fn v1_online_validate_without_cfg_is_refused() {
         online_rotations: vec![sample_r3_spec()],
         asymmetric_tensor_names: names,
     };
-    let err = descriptor.validate(None).unwrap_err();
+    let err = descriptor.validate_target(None).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("requires model config"), "got: {msg}");
     // The same descriptor passes once cfg is supplied — proving the
     // None case above was refused for lack of cfg, not some other
     // reason.
-    assert!(descriptor.validate(Some(&sample_r3_cfg())).is_ok());
+    assert!(
+        descriptor
+            .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+                &sample_r3_cfg()
+            )))
+            .is_ok()
+    );
 }
 
 /// Mutation/refusal: a declaration missing one scoped layer's tensor
@@ -1068,7 +1084,11 @@ fn v1_online_missing_asymmetric_declaration_is_refused() {
             "model.language_model.layers.3.self_attn.o_proj.weight".to_string(),
         ],
     };
-    let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+            &sample_r3_cfg(),
+        )))
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("coverage is incomplete"), "got: {msg}");
     assert!(msg.contains("layer 7"), "got: {msg}");
@@ -1084,7 +1104,11 @@ fn v1_online_empty_asymmetric_list_is_refused() {
         online_rotations: vec![sample_r3_spec()],
         asymmetric_tensor_names: vec![],
     };
-    let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+            &sample_r3_cfg(),
+        )))
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("self-contradictory"), "got: {msg}");
 }
@@ -1100,7 +1124,11 @@ fn validate_rejects_descriptor_exceeding_entry_cap() {
         online_rotations: vec![sample_r3_spec()],
         asymmetric_tensor_names: (0..over_cap).map(|i| format!("t{i}")).collect(),
     };
-    let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+            &sample_r3_cfg(),
+        )))
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("exceeding the maximum"), "got: {msg}");
 }
@@ -1124,7 +1152,11 @@ fn v1_online_unrelated_asymmetric_declaration_is_refused() {
         online_rotations: vec![sample_r3_spec()],
         asymmetric_tensor_names: names,
     };
-    let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+            &sample_r3_cfg(),
+        )))
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("unrelated") && msg.contains("does not match any tensor"),
@@ -1145,7 +1177,11 @@ fn v1_online_out_of_scope_layer_declaration_is_refused() {
         online_rotations: vec![sample_r3_spec()],
         asymmetric_tensor_names: names,
     };
-    let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+            &sample_r3_cfg(),
+        )))
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("layers.0.self_attn.o_proj.weight")
@@ -1166,7 +1202,13 @@ fn v1_online_with_full_asymmetric_coverage_is_valid() {
     };
     // cfg is mandatory for V1Online — see
     // `v1_online_validate_without_cfg_is_refused` for the None case.
-    assert!(descriptor.validate(Some(&sample_r3_cfg())).is_ok());
+    assert!(
+        descriptor
+            .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+                &sample_r3_cfg()
+            )))
+            .is_ok()
+    );
 }
 
 // --- OnlineRotationSpec::validate ---
@@ -1174,11 +1216,20 @@ fn v1_online_with_full_asymmetric_coverage_is_valid() {
 #[test]
 fn online_rotation_spec_accepts_constructor_built_specs() {
     let cfg = sample_r3_cfg();
-    assert!(sample_r3_spec().validate(None).is_ok());
-    assert!(sample_r3_spec().validate(Some(&cfg)).is_ok());
-    let r4 = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 256).unwrap();
-    assert!(r4.validate(None).is_ok());
-    assert!(r4.validate(Some(&cfg)).is_ok());
+    assert!(sample_r3_spec().validate_target(None).is_ok());
+    assert!(
+        sample_r3_spec()
+            .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+            .is_ok()
+    );
+    let r4 =
+        OnlineRotationSpec::mlp_down_r4(&crate::quarot::plan::qwen35_rotation_target(&cfg), 9, 256)
+            .unwrap();
+    assert!(r4.validate_target(None).is_ok());
+    assert!(
+        r4.validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+            .is_ok()
+    );
 }
 
 /// The exact malformed spec: an R3 id
@@ -1196,7 +1247,7 @@ fn online_rotation_spec_rejects_the_reported_malformed_r3_spec() {
         block_size: 3,
         layer_scope: None,
     };
-    assert!(malformed.validate(None).is_err());
+    assert!(malformed.validate_target(None).is_err());
 
     let descriptor = OnlineArtifactDescriptor {
         version: ArtifactVersion::V1Online,
@@ -1205,7 +1256,11 @@ fn online_rotation_spec_rejects_the_reported_malformed_r3_spec() {
             "model.language_model.layers.3.self_attn.o_proj.weight".to_string(),
         ],
     };
-    let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+            &sample_r3_cfg(),
+        )))
+        .unwrap_err();
     assert!(
         format!("{err}").contains("InputSide"),
         "descriptor validation must surface the spec-level rejection, got: {err}"
@@ -1221,7 +1276,7 @@ fn online_rotation_spec_rejects_wrong_side() {
         block_size: 64,
         layer_scope: None,
     };
-    let err = spec.validate(None).unwrap_err();
+    let err = spec.validate_target(None).unwrap_err();
     assert!(format!("{err}").contains("InputSide"));
 }
 
@@ -1234,7 +1289,7 @@ fn online_rotation_spec_rejects_non_power_of_two_block_size() {
         block_size: 96,
         layer_scope: None,
     };
-    let err = spec.validate(None).unwrap_err();
+    let err = spec.validate_target(None).unwrap_err();
     assert!(format!("{err}").contains("power-of-two"));
 }
 
@@ -1247,7 +1302,7 @@ fn online_rotation_spec_rejects_zero_block_size() {
         block_size: 0,
         layer_scope: Some(vec![3]),
     };
-    let err = spec.validate(None).unwrap_err();
+    let err = spec.validate_target(None).unwrap_err();
     assert!(format!("{err}").contains("power-of-two"));
 }
 
@@ -1260,7 +1315,7 @@ fn online_rotation_spec_rejects_r3_with_none_layer_scope() {
         block_size: 8,
         layer_scope: None,
     };
-    let err = spec.validate(None).unwrap_err();
+    let err = spec.validate_target(None).unwrap_err();
     assert!(format!("{err}").contains("layer_scope"));
 }
 
@@ -1273,7 +1328,7 @@ fn online_rotation_spec_rejects_r3_with_empty_layer_scope() {
         block_size: 8,
         layer_scope: Some(vec![]),
     };
-    let err = spec.validate(None).unwrap_err();
+    let err = spec.validate_target(None).unwrap_err();
     assert!(format!("{err}").contains("must not be empty"));
 }
 
@@ -1286,7 +1341,7 @@ fn online_rotation_spec_rejects_r4_with_some_layer_scope() {
         block_size: 64,
         layer_scope: Some(vec![0]),
     };
-    let err = spec.validate(None).unwrap_err();
+    let err = spec.validate_target(None).unwrap_err();
     assert!(format!("{err}").contains("must be None"));
 }
 
@@ -1299,7 +1354,7 @@ fn online_rotation_spec_rejects_residual_stream_id() {
         block_size: 8,
         layer_scope: None,
     };
-    let err = spec.validate(None).unwrap_err();
+    let err = spec.validate_target(None).unwrap_err();
     assert!(format!("{err}").contains("ResidualStream"));
 }
 
@@ -1317,7 +1372,11 @@ fn online_rotation_spec_cfg_aware_checks_catch_bad_divisibility_and_scope() {
         block_size: 4, // power of two, divides 8 — valid without extra checks
         layer_scope: Some(vec![3, 7, 11, 15, 19, 23]),
     };
-    assert!(good_block.validate(Some(&cfg)).is_ok());
+    assert!(
+        good_block
+            .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+            .is_ok()
+    );
 
     // A layer_scope entry that is not actually a full-attention layer
     // (layer 0 is GDN in qwen35_0_8b) must be rejected once cfg is known.
@@ -1329,7 +1388,9 @@ fn online_rotation_spec_cfg_aware_checks_catch_bad_divisibility_and_scope() {
         layer_scope: Some(vec![0]),
     };
     assert!(!cfg.is_full_attention(0), "sanity: layer 0 is GDN");
-    let err = bad_scope.validate(Some(&cfg)).unwrap_err();
+    let err = bad_scope
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+        .unwrap_err();
     assert!(format!("{err}").contains("layer 0"));
 }
 
@@ -1349,7 +1410,9 @@ fn online_rotation_spec_rejects_r3_scope_missing_full_attention_layers() {
         block_size: 8,
         layer_scope: Some(vec![3]),
     };
-    let err = partial_scope.validate(Some(&cfg)).unwrap_err();
+    let err = partial_scope
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("missing"), "got: {msg}");
     for missing in ["7", "11", "15", "19", "23"] {
@@ -1364,7 +1427,11 @@ fn online_rotation_spec_rejects_r3_scope_missing_full_attention_layers() {
         block_size: 8,
         layer_scope: Some(vec![3, 7, 11, 15, 19, 23]),
     };
-    assert!(full_scope.validate(Some(&cfg)).is_ok());
+    assert!(
+        full_scope
+            .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+            .is_ok()
+    );
 
     // A superset naming a non-full-attention layer is still rejected
     // (the membership direction, unaffected by the equality fix).
@@ -1375,7 +1442,9 @@ fn online_rotation_spec_rejects_r3_scope_missing_full_attention_layers() {
         block_size: 8,
         layer_scope: Some(vec![0, 3, 7, 11, 15, 19, 23]),
     };
-    let err = superset_with_non_member.validate(Some(&cfg)).unwrap_err();
+    let err = superset_with_non_member
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+        .unwrap_err();
     assert!(format!("{err}").contains("layer 0"));
 }
 
@@ -1393,14 +1462,16 @@ fn online_rotation_spec_rejects_duplicate_r3_layer_index() {
         block_size: 8,
         layer_scope: Some(vec![3, 3, 7, 11, 15, 19, 23]),
     };
-    let err = duplicate_scope.validate(None).unwrap_err();
+    let err = duplicate_scope.validate_target(None).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("strictly sorted ascending") && msg.contains("duplicates"),
         "got: {msg}"
     );
     let err = duplicate_scope
-        .validate(Some(&sample_r3_cfg()))
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+            &sample_r3_cfg(),
+        )))
         .unwrap_err();
     assert!(
         format!("{err}").contains("strictly sorted ascending"),
@@ -1420,7 +1491,7 @@ fn online_rotation_spec_rejects_unsorted_r3_layer_scope() {
         block_size: 8,
         layer_scope: Some(vec![7, 3, 11, 15, 19, 23]),
     };
-    let err = unsorted_scope.validate(None).unwrap_err();
+    let err = unsorted_scope.validate_target(None).unwrap_err();
     assert!(
         format!("{err}").contains("strictly sorted ascending"),
         "got: {err}"
@@ -1435,15 +1506,27 @@ fn online_rotation_spec_rejects_unsorted_r3_layer_scope() {
 #[test]
 fn v1_online_rejects_two_specs_targeting_the_same_site() {
     let cfg = sample_r3_cfg();
-    let first = OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
-    let second = OnlineRotationSpec::r3_full_attention(&cfg, 99, 8).unwrap();
+    let first = OnlineRotationSpec::attention_output_r3(
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        42,
+        8,
+    )
+    .unwrap();
+    let second = OnlineRotationSpec::attention_output_r3(
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        99,
+        8,
+    )
+    .unwrap();
     let names = full_r3_layer_names();
     let descriptor = OnlineArtifactDescriptor {
         version: ArtifactVersion::V1Online,
         online_rotations: vec![first, second],
         asymmetric_tensor_names: names,
     };
-    let err = descriptor.validate(Some(&cfg)).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("same runtime site") && msg.contains("AttentionOutputPreOProj"),
@@ -1457,13 +1540,20 @@ fn v1_online_rejects_two_specs_targeting_the_same_site() {
 #[test]
 fn v1_online_with_distinct_sites_is_valid() {
     let cfg = sample_r3_cfg();
-    let r3 = OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
-    let r4 = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 256).unwrap();
+    let r3 = OnlineRotationSpec::attention_output_r3(
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        42,
+        8,
+    )
+    .unwrap();
+    let r4 =
+        OnlineRotationSpec::mlp_down_r4(&crate::quarot::plan::qwen35_rotation_target(&cfg), 9, 256)
+            .unwrap();
     let mut names = full_r3_layer_names();
     for i in 0..cfg.num_hidden_layers {
         names.push(format!(
             "{}.mlp.down_proj.weight",
-            lattice_model_config::qwen35_tensors::qwen_layer_tensor_prefix(i)
+            lattice_arch::qwen35_tensors::qwen_layer_tensor_prefix(i)
         ));
     }
     let descriptor = OnlineArtifactDescriptor {
@@ -1471,7 +1561,11 @@ fn v1_online_with_distinct_sites_is_valid() {
         online_rotations: vec![r3, r4],
         asymmetric_tensor_names: names,
     };
-    assert!(descriptor.validate(Some(&cfg)).is_ok());
+    assert!(
+        descriptor
+            .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+            .is_ok()
+    );
 }
 
 // --- canonical Qwen3.5 tensor namespace ---
@@ -1497,7 +1591,11 @@ fn v1_online_per_layer_coverage_uses_canonical_qwen_namespace() {
         online_rotations: vec![sample_r3_spec()],
         asymmetric_tensor_names: canonical_names,
     };
-    assert!(descriptor.validate(Some(&cfg)).is_ok());
+    assert!(
+        descriptor
+            .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+            .is_ok()
+    );
 
     let old_namespace_names: Vec<String> = [3usize, 7, 11, 15, 19, 23]
         .iter()
@@ -1508,7 +1606,9 @@ fn v1_online_per_layer_coverage_uses_canonical_qwen_namespace() {
         online_rotations: vec![sample_r3_spec()],
         asymmetric_tensor_names: old_namespace_names,
     };
-    let err = old_descriptor.validate(Some(&cfg)).unwrap_err();
+    let err = old_descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+        .unwrap_err();
     assert!(
         format!("{err}").contains("coverage is incomplete"),
         "old model.layers.* namespace must be rejected as incomplete coverage"
@@ -1530,7 +1630,11 @@ fn v1_online_layer_scope_coverage_rejects_wrong_layer_declaration() {
             "model.language_model.layers.0.self_attn.o_proj.weight".to_string(),
         ],
     };
-    let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+            &sample_r3_cfg(),
+        )))
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("layer 3") && msg.contains("coverage is incomplete"),
@@ -1549,7 +1653,11 @@ fn v1_online_layer_scope_coverage_rejects_partial_declaration() {
         online_rotations: vec![sample_r3_spec()],
         asymmetric_tensor_names: names,
     };
-    let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+            &sample_r3_cfg(),
+        )))
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("layer 23") && msg.contains("coverage is incomplete"),
@@ -1569,7 +1677,9 @@ fn v1_online_layer_scope_coverage_rejects_partial_declaration() {
 #[test]
 fn v1_online_r4_partial_declaration_rejected_regardless_of_cfg() {
     let cfg = sample_r3_cfg();
-    let r4 = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 256).unwrap();
+    let r4 =
+        OnlineRotationSpec::mlp_down_r4(&crate::quarot::plan::qwen35_rotation_target(&cfg), 9, 256)
+            .unwrap();
     let partial_name = "model.language_model.layers.0.mlp.down_proj.weight".to_string();
     let descriptor = OnlineArtifactDescriptor {
         version: ArtifactVersion::V1Online,
@@ -1578,11 +1688,13 @@ fn v1_online_r4_partial_declaration_rejected_regardless_of_cfg() {
     };
     // Without cfg: refused immediately — no path claims completeness
     // without model config.
-    let err = descriptor.validate(None).unwrap_err();
+    let err = descriptor.validate_target(None).unwrap_err();
     assert!(format!("{err}").contains("requires model config"));
     // With cfg: full-layer coverage is enforced and layer 1..N are
     // missing, so validation must fail here too.
-    let err = descriptor.validate(Some(&cfg)).unwrap_err();
+    let err = descriptor
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+        .unwrap_err();
     assert!(format!("{err}").contains("coverage is incomplete"));
 }
 
@@ -1598,7 +1710,11 @@ fn verify_affected_accepts_exact_match() {
         asymmetric_tensor_names: names.clone(),
     };
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    assert!(descriptor.verify_affected(&cfg, &refs).is_ok());
+    assert!(
+        descriptor
+            .verify_affected(&crate::quarot::plan::qwen35_rotation_target(&cfg), &refs)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1610,10 +1726,18 @@ fn verify_affected_rejects_missing_and_extra() {
         asymmetric_tensor_names: full_r3_layer_names(),
     };
     // Missing: converter reports transforming nothing.
-    assert!(descriptor.verify_affected(&cfg, &[]).is_err());
+    assert!(
+        descriptor
+            .verify_affected(&crate::quarot::plan::qwen35_rotation_target(&cfg), &[])
+            .is_err()
+    );
     // Extra: converter reports an unrelated tensor alongside full coverage.
     let mut names = full_r3_layer_names();
     names.push("unrelated".to_string());
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    assert!(descriptor.verify_affected(&cfg, &refs).is_err());
+    assert!(
+        descriptor
+            .verify_affected(&crate::quarot::plan::qwen35_rotation_target(&cfg), &refs)
+            .is_err()
+    );
 }

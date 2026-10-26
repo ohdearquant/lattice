@@ -60,7 +60,7 @@ use super::{
     MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectOutcome,
     SelectionCandidate, SelectionRequest, StepStamp, TokenMetadata,
 };
-use crate::attention::gdn::GatedDeltaNetState;
+use crate::attention::gdn::{GatedDeltaNetState, require_qwen35_gdn_geometry};
 use crate::error::InferenceError;
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{ForwardScratch, KvCache, force_serial_prefill, initial_rng_state};
@@ -85,12 +85,11 @@ pub(crate) fn has_finite_logit(logits: &[f32]) -> bool {
 /// opposed to the standalone `generate_q8`/`generate_f16`/`generate_q8_neon` wrappers that
 /// fail closed via `check_*_not_set`. Declared narrower would be inventing caution the
 /// underlying entry point does not have.
-const CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
-    grammar: true,
-    logprobs: true,
-    stop_strings: true,
-    reasoning_budget: true,
-};
+const CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::none()
+    .with_grammar(true)
+    .with_logprobs(true)
+    .with_stop_strings(true)
+    .with_reasoning_budget(true);
 
 /// First concrete [`DecoderSession`]. See the module doc comment for what it owns and why.
 pub(crate) struct QwenCpuSession<'model> {
@@ -112,21 +111,23 @@ impl<'model> QwenCpuSession<'model> {
     /// doc comment on why `metadata` and the RNG draw need them independent of any later
     /// `SelectionRequest`). No `grammar` parameter: the driver owns the grammar engine and
     /// state now (module doc comment) and hands this session a mask per step instead.
+    /// Fails only when the process has spent every prediction-ledger identity.
     pub(crate) fn new(
         model: &'model Qwen35Model,
         prompt_ids: Vec<u32>,
         temperature: f32,
         seed: Option<u64>,
-    ) -> Self {
+    ) -> Result<Self, InferenceError> {
         let cfg = &model.config;
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
+        let gdn_geometry = require_qwen35_gdn_geometry(cfg);
         let gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-            .map(|_| GatedDeltaNetState::new(cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();
         let prompt_len = prompt_ids.len();
 
-        Self {
+        Ok(Self {
             model,
             gdn_states,
             kv_cache: KvCache::new(num_full),
@@ -135,8 +136,8 @@ impl<'model> QwenCpuSession<'model> {
             prompt_len,
             rng_state: initial_rng_state(seed),
             temperature,
-            ledger: PredictionLedger::new(),
-        }
+            ledger: PredictionLedger::new()?,
+        })
     }
 
     /// Reserve the request's full context before entering prefill and decode.
@@ -219,10 +220,7 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
         self.scratch.ensure_capacity(cfg, self.prompt_len);
         self.scratch.logits[..vocab_size].copy_from_slice(&prefill_logits);
 
-        Ok(StepStamp {
-            evaluated_len: self.kv_cache.seq_len,
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.kv_cache.seq_len, None))
     }
 
     /// Consumes `accepted.prediction` (rejecting a stale/foreign/already-consumed id through
@@ -251,10 +249,7 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
         );
         self.kv_cache.seq_len += 1;
 
-        Ok(StepStamp {
-            evaluated_len: self.kv_cache.seq_len,
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.kv_cache.seq_len, None))
     }
 
     /// Masks the logits `prefill`/`decode` most recently left in `self.scratch` through
@@ -286,21 +281,20 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
             request.history,
             &mut self.rng_state,
         );
-        let prediction = self.ledger.open();
+        let prediction = self.ledger.open()?;
 
-        Ok(SelectOutcome::Candidate(SelectionCandidate {
+        Ok(SelectOutcome::Candidate(SelectionCandidate::new(
             candidate_id,
             prediction,
-        }))
+        )))
     }
 
     /// Scores `final_token` against the prediction's logits via
     /// `crate::sampling::compute_step_logprobs` -- the same pure function
     /// `DecodePolicy::record_logprob` calls -- reusing it rather than writing a second
-    /// scorer. `request.top_logprobs: None` is treated as `top_n = 0` (report the final
-    /// token's log-probability with no alternatives) rather than refusing to score at all:
-    /// the underlying call is total over `top_n`, so there is no reason to make this
-    /// operation partial when the caller passed `None`. Rejects `prediction` if it is not
+    /// scorer. Refuses a request with metadata disabled (`top_logprobs: None`), as the
+    /// session contract requires; `Some(0)` reports the final token's log-probability with
+    /// no alternatives. Rejects `prediction` if it is not
     /// (or no longer) the ledger's live prediction -- the eligibility check
     /// `PredictionLedger::is_live`'s own doc comment names `select`/`metadata` as the
     /// operations that must consult it.
@@ -310,12 +304,16 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
         final_token: u32,
         request: &MetadataRequest,
     ) -> Result<TokenMetadata, InferenceError> {
+        let Some(top_n) = request.top_logprobs else {
+            return Err(InferenceError::InvalidInput(
+                "metadata capture is disabled in this request".into(),
+            ));
+        };
         if !self.ledger.is_live(prediction) {
             return Err(PredictionError::Stale.into());
         }
 
         let vocab_size = self.model.config.vocab_size;
-        let top_n = request.top_logprobs.unwrap_or(0);
         let (final_logprob, top) = compute_step_logprobs(
             &self.scratch.logits[..vocab_size],
             final_token,
@@ -323,12 +321,12 @@ impl<'model> DecoderSession for QwenCpuSession<'model> {
             top_n,
         );
 
-        Ok(TokenMetadata {
+        Ok(TokenMetadata::new(
             prediction,
-            final_token_id: final_token,
+            final_token,
             final_logprob,
             top,
-        })
+        ))
     }
 
     fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {

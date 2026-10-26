@@ -44,6 +44,9 @@ const RAW_GPU_SELECTORS: &[CallSelector] = &[
     NEW_COMMAND_BUFFER_UNRETAINED,
 ];
 const SHARED_LOCK_CALL: &str = "lattice_inference::measurement::gpu_test_lock()";
+/// The package that defines the lock; `lattice-inference` re-exports it as
+/// `measurement::gpu_test_lock`.
+const LOCK_DEFINITION_PACKAGE: &str = "../metal-runtime";
 const RAW_HARNESS_ENTRYPOINTS: &[(&str, &str, CallSelector)] = &[
     (
         ".",
@@ -501,9 +504,9 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     (".", "src/bin/bench_gemma4_driver_pair.rs"),
     (".", "src/bin/gramtime_profile.rs"),
     ("../serve", "src/bin/lattice_serve/main.rs"),
-    (".", "src/bin/moe_admission_sim.rs"),
-    (".", "src/bin/quantize_q4.rs"),
-    (".", "src/bin/quantize_quarot.rs"),
+    ("../serve", "src/bin/moe_admission_sim.rs"),
+    ("../serve", "src/bin/quantize_q4.rs"),
+    ("../serve", "src/bin/quantize_quarot.rs"),
     (".", "src/bin/qwen35_debug.rs"),
     (".", "src/bin/qwen35_generate.rs"),
 ];
@@ -2881,7 +2884,14 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
 
 #[test]
 fn rust_targets_have_one_gpu_lock_definition_and_path() {
-    let packages = scanned_packages();
+    let mut packages = scanned_packages();
+    packages.extend(
+        scanned_packages_at(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &[LOCK_DEFINITION_PACKAGE],
+        )
+        .unwrap_or_else(|reason| panic!("{reason}")),
+    );
     let definition = ["fn gpu", "_test_lock"].concat();
     let lock_path = ["/tmp/lion-metal", "-gpu-test.lock"].concat();
     let mut definitions = BTreeSet::new();
@@ -2905,7 +2915,10 @@ fn rust_targets_have_one_gpu_lock_definition_and_path() {
         }
     }
 
-    let only_shared_module = BTreeSet::from([package_path_key(".", "src/measurement.rs")]);
+    let only_shared_module = BTreeSet::from([package_path_key(
+        LOCK_DEFINITION_PACKAGE,
+        "src/measurement.rs",
+    )]);
     assert_eq!(
         definitions, only_shared_module,
         "GPU lock behavior must have exactly one Rust definition"

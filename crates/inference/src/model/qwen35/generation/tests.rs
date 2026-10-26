@@ -51,14 +51,15 @@ fn driver_trace_matches_ids_len_on_the_pre_migration_golden() {
         .unwrap_or_else(|e| panic!("loading {model_dir:?} failed: {e}"));
 
     for case in &golden.cases {
-        let cfg = GenerateConfig {
-            max_new_tokens: golden.max_new_tokens,
-            temperature: golden.generation.temperature,
-            repetition_penalty: golden.generation.repetition_penalty,
-            seed: golden.generation.seed,
-            enable_thinking: golden.generation.enable_thinking,
-            reasoning_budget: case.reasoning_budget,
-            ..Default::default()
+        let cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = golden.max_new_tokens;
+            config.temperature = golden.generation.temperature;
+            config.repetition_penalty = golden.generation.repetition_penalty;
+            config.seed = golden.generation.seed;
+            config.enable_thinking = golden.generation.enable_thinking;
+            config.reasoning_budget = case.reasoning_budget;
+            config
         };
 
         let (output, trace) = model
@@ -101,10 +102,11 @@ fn driver_trace_matches_ids_len_on_the_pre_migration_golden() {
         // token greedy decode picks, so the ids must be the same ids, and the
         // trace must show the same one-open-per-token / one-still-open-at-finish
         // shape driver::run maintains regardless of the logprobs flag.
-        let inline_cfg = GenerateConfig {
-            min_p: 0.0,
-            logprobs: Some(0),
-            ..cfg.clone()
+        let inline_cfg = {
+            let mut config = cfg.clone();
+            config.min_p = 0.0;
+            config.logprobs = Some(0);
+            config
         };
         let (inline_output, inline_trace) = model
             .generate_with_trace(&case.prompt, &inline_cfg)
@@ -181,14 +183,15 @@ fn streaming_driver_trace_matches_ids_len_on_the_pre_migration_golden() {
         .unwrap_or_else(|e| panic!("loading {model_dir:?} failed: {e}"));
 
     for case in &golden.cases {
-        let cfg = GenerateConfig {
-            max_new_tokens: golden.max_new_tokens,
-            temperature: golden.generation.temperature,
-            repetition_penalty: golden.generation.repetition_penalty,
-            seed: golden.generation.seed,
-            enable_thinking: golden.generation.enable_thinking,
-            reasoning_budget: case.reasoning_budget,
-            ..Default::default()
+        let cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = golden.max_new_tokens;
+            config.temperature = golden.generation.temperature;
+            config.repetition_penalty = golden.generation.repetition_penalty;
+            config.seed = golden.generation.seed;
+            config.enable_thinking = golden.generation.enable_thinking;
+            config.reasoning_budget = case.reasoning_budget;
+            config
         };
 
         // Acceptance 1: real consumer, real tokens -- pinned by the SAME
@@ -242,10 +245,11 @@ fn streaming_driver_trace_matches_ids_len_on_the_pre_migration_golden() {
         // path as acceptance 1 above, so this replays the same request with
         // `logprobs` set and asserts the same driver-routed shape rather than a
         // default (never-reached-the-driver) trace.
-        let inline_cfg = GenerateConfig {
-            min_p: 0.0,
-            logprobs: Some(0),
-            ..cfg.clone()
+        let inline_cfg = {
+            let mut config = cfg.clone();
+            config.min_p = 0.0;
+            config.logprobs = Some(0);
+            config
         };
         let (inline_output, inline_trace) = model
             .generate_streaming_with_trace(
@@ -350,9 +354,10 @@ fn grammar_masking_blocks_argmax_token() {
 
     // Greedy sampling (temperature=0) must choose the highest ALLOWED logit,
     // which is index 1 ("f", logit 2.0), not the blocked index 2.
-    let gen_cfg = GenerateConfig {
-        temperature: 0.0, // greedy
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.0; // greedy
+        config
     };
     let mut rng = 1u64;
     let sampled = sample_token(&logits, &gen_cfg, &[], &mut rng);
@@ -607,11 +612,12 @@ fn grammar_wiring_mask_logits_called_in_generate() {
         GrammarEngine::new(&spec, vocab_bytes).expect("grammar engine builds with empty vocab"),
     );
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 1,
-        temperature: 0.0,
-        grammar: Some(engine),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.grammar = Some(engine);
+        config
     };
 
     // The all-blocking grammar must trigger has_finite_logit inside generate()
@@ -631,9 +637,10 @@ fn generate_config_default_stop_strings_empty() {
 
 #[test]
 fn generate_config_stop_strings_field_explicit() {
-    let cfg = GenerateConfig {
-        stop_strings: vec!["</s>".to_string(), "\nUser:".to_string()],
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.stop_strings = vec!["</s>".to_string(), "\nUser:".to_string()];
+        config
     };
     assert_eq!(cfg.stop_strings.len(), 2);
     assert_eq!(cfg.stop_strings[0], "</s>");
@@ -651,9 +658,10 @@ fn generate_config_stop_strings_field_explicit() {
 /// unwired decode loop.
 #[test]
 fn check_stop_strings_not_set_rejects_nonempty() {
-    let cfg = GenerateConfig {
-        stop_strings: vec!["</s>".to_string()],
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.stop_strings = vec!["</s>".to_string()];
+        config
     };
     let result = check_stop_strings_not_set(&cfg);
     assert!(
@@ -679,9 +687,10 @@ fn check_stop_strings_not_set_allows_empty() {
 /// unwired decode loop.
 #[test]
 fn check_reasoning_budget_not_set_rejects_some() {
-    let cfg = GenerateConfig {
-        reasoning_budget: Some(128),
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.reasoning_budget = Some(128);
+        config
     };
     let result = check_reasoning_budget_not_set(&cfg);
     assert!(
@@ -836,12 +845,13 @@ fn check_context_budget_accounts_for_reasoning_budget() {
 /// `decode_cap(Some(1), 1) == 3` instead of `1`, and this assertion fails.
 #[test]
 fn decode_policy_cap_ignores_reasoning_budget_when_thinking_disabled() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        reasoning_budget: Some(1),
-        enable_thinking: false,
-        max_new_tokens: 1,
-        ..GenerateConfig::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.reasoning_budget = Some(1);
+        config.enable_thinking = false;
+        config.max_new_tokens = 1;
+        config
     };
     let mut token_logprobs = Vec::new();
     let policy = DecodePolicy::init(
@@ -877,12 +887,13 @@ fn decode_policy_cap_ignores_reasoning_budget_when_thinking_disabled() {
 /// assertion fails.
 #[test]
 fn context_admission_ignores_reasoning_budget_when_thinking_disabled() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        reasoning_budget: Some(3),
-        enable_thinking: false,
-        max_new_tokens: 2,
-        ..GenerateConfig::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.reasoning_budget = Some(3);
+        config.enable_thinking = false;
+        config.max_new_tokens = 2;
+        config
     };
     // Honouring the budget would compute decode_cap(Some(3), 2) = 6, and
     // 8 + 6 = 14 > 10 would be rejected (see
@@ -979,13 +990,12 @@ fn a_token_grammar(gbnf: &str) -> std::sync::Arc<crate::grammar::GrammarEngine> 
 }
 
 fn grammar_config(gbnf: &str) -> GenerateConfig {
-    GenerateConfig {
-        max_new_tokens: 4,
-        temperature: 0.0,
-        grammar: Some(a_token_grammar(gbnf)),
-        stop_token_ids: vec![],
-        ..Default::default()
-    }
+    let mut config = GenerateConfig::default();
+    config.max_new_tokens = 4;
+    config.temperature = 0.0;
+    config.grammar = Some(a_token_grammar(gbnf));
+    config.stop_token_ids = vec![];
+    config
 }
 
 #[test]
@@ -1163,10 +1173,11 @@ fn grammar_and_logprobs_combined_equivalence_across_stop_strings_and_streaming()
 #[test]
 fn stop_reason_length_on_zero_max_tokens() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 0,
-        temperature: 0.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config.temperature = 0.0;
+        config
     };
     let result = model
         .generate("a", &gen_cfg)
@@ -1199,10 +1210,11 @@ fn stop_reason_length_on_zero_max_tokens() {
 #[test]
 fn qwen35_model_generate_rejects_empty_prompt() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 4,
-        temperature: 0.0,
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config
     };
     let result = model.generate("", &gen_cfg);
     assert!(
@@ -1223,11 +1235,12 @@ fn qwen35_model_generate_rejects_empty_prompt() {
 #[test]
 fn stop_reason_eos_on_first_stop_token() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 5,
-        temperature: 0.0,
-        stop_token_ids: vec![0], // token 0 is greedy-sampled with all-zero logits
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 5;
+        config.temperature = 0.0;
+        config.stop_token_ids = vec![0]; // token 0 is greedy-sampled with all-zero logits
+        config
     };
     let result = model
         .generate("a", &gen_cfg)
@@ -1273,11 +1286,12 @@ fn stop_reason_eos_on_first_stop_token() {
 #[test]
 fn eos_token_id_override_forces_continuation_past_matching_stop_token() {
     let mut model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 5,
-        temperature: 0.0,
-        stop_token_ids: vec![], // benchmark profile: no configured stop tokens either
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 5;
+        config.temperature = 0.0;
+        config.stop_token_ids = vec![]; // benchmark profile: no configured stop tokens either
+        config
     };
 
     // Phase 1 (baseline): point eos_token_id at the always-sampled
@@ -1330,9 +1344,10 @@ fn eos_token_id_override_forces_continuation_past_matching_stop_token() {
 #[test]
 fn eos_token_id_override_suppresses_match_in_should_stop_token() {
     let mut model = build_tiny_zero_model();
-    let base_cfg = GenerateConfig {
-        stop_token_ids: vec![],
-        ..Default::default()
+    let base_cfg = {
+        let mut config = GenerateConfig::default();
+        config.stop_token_ids = vec![];
+        config
     };
     let original_eos_token_id = model.config.eos_token_id;
     assert!(
@@ -1370,12 +1385,13 @@ fn stop_reason_grammar_on_advance_false() {
     let vocab = vec![b"t".to_vec()];
     let engine = Arc::new(GrammarEngine::new(&spec, vocab).expect("single-token grammar compiles"));
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 5,
-        temperature: 0.0,
-        grammar: Some(engine),
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 5;
+        config.temperature = 0.0;
+        config.grammar = Some(engine);
+        config.stop_token_ids = vec![];
+        config
     };
     let result = model
         .generate("a", &gen_cfg)
@@ -1467,13 +1483,14 @@ fn reasoning_budget_parity(model: &Qwen35Model, gen_cfg: &GenerateConfig) {
 
 #[test]
 fn reasoning_budget_streaming_matches_nonstreaming_on_tiny_zero_model() {
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 40,
-        temperature: 0.0,
-        reasoning_budget: Some(4),
-        enable_thinking: true,
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 40;
+        config.temperature = 0.0;
+        config.reasoning_budget = Some(4);
+        config.enable_thinking = true;
+        config.stop_token_ids = vec![];
+        config
     };
     reasoning_budget_parity(&build_tiny_thinking_model(), &gen_cfg);
     reasoning_budget_parity(&build_tiny_newline_thinking_model(), &gen_cfg);
@@ -1486,13 +1503,14 @@ fn reasoning_budget_cap_can_end_generation_before_the_close() {
         .tokenizer
         .special_token_id("</think>")
         .expect("thinking model tokenizer resolves </think>");
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 2,
-        temperature: 0.0,
-        reasoning_budget: Some(4),
-        enable_thinking: true,
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 2;
+        config.temperature = 0.0;
+        config.reasoning_budget = Some(4);
+        config.enable_thinking = true;
+        config.stop_token_ids = vec![];
+        config
     };
 
     let output = model
@@ -1536,11 +1554,12 @@ fn prefill_end_fires_before_post_prefill_cancel_return() {
     let result = model
         .generate_streaming_with_observer(
             "a",
-            &GenerateConfig {
-                max_new_tokens: 3,
-                temperature: 0.0,
-                stop_token_ids: vec![],
-                ..Default::default()
+            &{
+                let mut config = GenerateConfig::default();
+                config.max_new_tokens = 3;
+                config.temperature = 0.0;
+                config.stop_token_ids = vec![];
+                config
             },
             |_delta| true,
             || {
@@ -1679,15 +1698,13 @@ fn reasoning_budget_absent_resolves_to_none_without_error() {
     // tokenizer that could not resolve the marker.
     let model = build_tiny_zero_model();
     let output = model
-        .generate(
-            "a",
-            &GenerateConfig {
-                max_new_tokens: 2,
-                temperature: 0.0,
-                stop_token_ids: vec![],
-                ..Default::default()
-            },
-        )
+        .generate("a", &{
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 2;
+            config.temperature = 0.0;
+            config.stop_token_ids = vec![];
+            config
+        })
         .expect("no-budget generation must be unaffected by close-marker resolution");
     assert_eq!(output.generated_tokens, 2);
 }
@@ -1697,17 +1714,15 @@ fn reasoning_budget_absent_resolves_to_none_without_error() {
 #[test]
 fn reasoning_budget_rejects_tokenizer_without_close_marker() {
     let model = build_tiny_zero_model();
-    let result = model.generate(
-        "a",
-        &GenerateConfig {
-            max_new_tokens: 1,
-            temperature: 0.0,
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            stop_token_ids: vec![],
-            ..Default::default()
-        },
-    );
+    let result = model.generate("a", &{
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.enable_thinking = true;
+        config.reasoning_budget = Some(1);
+        config.stop_token_ids = vec![];
+        config
+    });
 
     assert!(
         matches!(
@@ -1925,17 +1940,15 @@ fn reasoning_budget_rejects_duplicate_added_token_aliases_of_the_close_marker() 
 fn reasoning_budget_bypass_blocked_on_first_token_eos() {
     let mut model = build_tiny_zero_model();
     model.set_eos_token_id(0);
-    let result = model.generate(
-        "a",
-        &GenerateConfig {
-            max_new_tokens: 5,
-            temperature: 0.0,
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            stop_token_ids: vec![],
-            ..Default::default()
-        },
-    );
+    let result = model.generate("a", &{
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 5;
+        config.temperature = 0.0;
+        config.enable_thinking = true;
+        config.reasoning_budget = Some(1);
+        config.stop_token_ids = vec![];
+        config
+    });
 
     assert!(
         matches!(
@@ -1973,18 +1986,16 @@ fn reasoning_budget_bypass_blocked_on_grammar_advance_false() {
     let vocab = vec![b"t".to_vec()];
     let engine = Arc::new(GrammarEngine::new(&spec, vocab).expect("single-token grammar compiles"));
 
-    let result = model.generate(
-        "a",
-        &GenerateConfig {
-            max_new_tokens: 5,
-            temperature: 0.0,
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            grammar: Some(engine),
-            stop_token_ids: vec![],
-            ..Default::default()
-        },
-    );
+    let result = model.generate("a", &{
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 5;
+        config.temperature = 0.0;
+        config.enable_thinking = true;
+        config.reasoning_budget = Some(1);
+        config.grammar = Some(engine);
+        config.stop_token_ids = vec![];
+        config
+    });
 
     assert!(
         matches!(
@@ -2011,13 +2022,14 @@ fn reasoning_budget_bypass_blocked_on_first_token_eos_streaming() {
     model.set_eos_token_id(0);
     let result = model.generate_streaming_with_observer(
         "a",
-        &GenerateConfig {
-            max_new_tokens: 5,
-            temperature: 0.0,
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            stop_token_ids: vec![],
-            ..Default::default()
+        &{
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 5;
+            config.temperature = 0.0;
+            config.enable_thinking = true;
+            config.reasoning_budget = Some(1);
+            config.stop_token_ids = vec![];
+            config
         },
         |_delta| true,
         || false,
@@ -2044,13 +2056,14 @@ fn reasoning_budget_bypass_blocked_on_pre_prefill_cancel_streaming() {
     let model = build_tiny_zero_model();
     let result = model.generate_streaming_with_observer(
         "a",
-        &GenerateConfig {
-            max_new_tokens: 5,
-            temperature: 0.0,
-            enable_thinking: true,
-            reasoning_budget: Some(1),
-            stop_token_ids: vec![],
-            ..Default::default()
+        &{
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 5;
+            config.temperature = 0.0;
+            config.enable_thinking = true;
+            config.reasoning_budget = Some(1);
+            config.stop_token_ids = vec![];
+            config
         },
         |_delta| true,
         || true,
@@ -2078,12 +2091,13 @@ fn reasoning_budget_bypass_blocked_on_pre_prefill_cancel_streaming() {
 #[test]
 fn raw_observer_emits_no_raw_token_when_close_marker_resolution_fails() {
     let model = build_tiny_zero_model();
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        temperature: 0.0,
-        enable_thinking: true,
-        reasoning_budget: Some(1),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 3;
+        config.temperature = 0.0;
+        config.enable_thinking = true;
+        config.reasoning_budget = Some(1);
+        config
     };
     let events = std::cell::RefCell::new(Vec::<RawGenEvent>::new());
     let result = model.generate_streaming_with_observer(
@@ -2155,14 +2169,15 @@ fn grammar_budget_forced_close_fails_closed() {
     ];
     let engine = Arc::new(GrammarEngine::new(&spec, vocab).expect("aa grammar compiles"));
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 40,
-        temperature: 0.0,
-        enable_thinking: true,
-        reasoning_budget: Some(1),
-        grammar: Some(engine),
-        stop_token_ids: vec![],
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 40;
+        config.temperature = 0.0;
+        config.enable_thinking = true;
+        config.reasoning_budget = Some(1);
+        config.grammar = Some(engine);
+        config.stop_token_ids = vec![];
+        config
     };
     let result = model
         .generate("a", &gen_cfg)
@@ -2206,12 +2221,13 @@ fn grammar_budget_forced_close_fails_closed() {
 /// read back as the stale sample (3) instead of the forced close id (7).
 #[test]
 fn forced_close_with_logprobs_records_the_post_override_token() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        reasoning_budget: Some(1),
-        enable_thinking: true,
-        logprobs: Some(0),
-        ..GenerateConfig::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.reasoning_budget = Some(1);
+        config.enable_thinking = true;
+        config.logprobs = Some(0);
+        config
     };
     let close_id = 7u32;
     let stale_sample = 3u32;
@@ -2280,11 +2296,12 @@ fn forced_close_with_logprobs_records_the_post_override_token() {
 /// `Emitted`.
 #[test]
 fn transition_refuses_eos_on_the_stale_pre_override_sample() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        reasoning_budget: Some(1),
-        enable_thinking: true,
-        ..GenerateConfig::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.reasoning_budget = Some(1);
+        config.enable_thinking = true;
+        config
     };
     let close_id = 7u32;
     let stale_sample = 3u32;
@@ -2346,11 +2363,12 @@ fn transition_refuses_eos_on_the_stale_pre_override_sample() {
 /// test fails.
 #[test]
 fn transition_refuses_to_force_close_a_second_time_once_already_closed() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        reasoning_budget: Some(1),
-        enable_thinking: true,
-        ..GenerateConfig::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.reasoning_budget = Some(1);
+        config.enable_thinking = true;
+        config
     };
     let close_id = 7u32;
     let sampled_id = 3u32;
@@ -2409,12 +2427,13 @@ fn transition_refuses_to_force_close_a_second_time_once_already_closed() {
 /// first-token edge specifically.
 #[test]
 fn init_records_the_first_tokens_logprob_when_it_is_already_the_close_marker() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        reasoning_budget: Some(1),
-        enable_thinking: true,
-        logprobs: Some(0),
-        ..GenerateConfig::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.reasoning_budget = Some(1);
+        config.enable_thinking = true;
+        config.logprobs = Some(0);
+        config
     };
     let close_id = 7u32;
     let logits = [0.0f32; 10];
@@ -2455,12 +2474,13 @@ fn init_records_the_first_tokens_logprob_when_it_is_already_the_close_marker() {
 /// `answer_budget_exhausted` stay `false` here, and the assertion fails.
 #[test]
 fn answer_budget_exhausts_on_the_terminal_token_with_no_next_decode_expected() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        reasoning_budget: Some(1),
-        enable_thinking: true,
-        max_new_tokens: 1,
-        ..GenerateConfig::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.reasoning_budget = Some(1);
+        config.enable_thinking = true;
+        config.max_new_tokens = 1;
+        config
     };
     let close_id = 7u32;
     let sampled_id = 3u32;
@@ -2516,12 +2536,13 @@ fn answer_budget_exhausts_on_the_terminal_token_with_no_next_decode_expected() {
 /// contrasted against.
 #[test]
 fn transition_leaves_an_unspent_reasoning_budget_inert() {
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        reasoning_budget: Some(1_000),
-        enable_thinking: true,
-        logprobs: Some(0),
-        ..GenerateConfig::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.reasoning_budget = Some(1_000);
+        config.enable_thinking = true;
+        config.logprobs = Some(0);
+        config
     };
     let close_id = 7u32;
     let sampled_id = 3u32;
@@ -2614,11 +2635,12 @@ fn cold_preflight_results(
 #[test]
 fn cold_preflight_empty_prompt_precedes_zero_tokens_and_other_refusals() {
     let model = super::super::test_support::tiny_zero_model_with_context(1);
-    let cfg = GenerateConfig {
-        max_new_tokens: 0,
-        reasoning_budget: Some(2),
-        enable_thinking: true,
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config.reasoning_budget = Some(2);
+        config.enable_thinking = true;
+        config
     };
     assert_eq!(model.tokenizer.tokenize("").real_length, 0);
     for (entry, result) in cold_preflight_results(&model, "", &cfg) {
@@ -2632,12 +2654,13 @@ fn cold_preflight_empty_prompt_precedes_zero_tokens_and_other_refusals() {
 #[test]
 fn cold_preflight_zero_tokens_bypass_context_and_close_marker_resolution() {
     let model = super::super::test_support::tiny_zero_model_with_context(1);
-    let cfg = GenerateConfig {
-        max_new_tokens: 0,
-        reasoning_budget: Some(2),
-        enable_thinking: true,
-        logprobs: Some(3),
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 0;
+        config.reasoning_budget = Some(2);
+        config.enable_thinking = true;
+        config.logprobs = Some(3);
+        config
     };
     assert_eq!(model.tokenizer.tokenize("ab").real_length, 2);
     for (entry, result) in cold_preflight_results(&model, "ab", &cfg) {
@@ -2659,12 +2682,13 @@ fn cold_preflight_zero_tokens_bypass_context_and_close_marker_resolution() {
 
 #[test]
 fn cold_preflight_context_refusal_precedes_missing_and_oov_close_markers() {
-    let cfg = GenerateConfig {
-        max_new_tokens: 1,
-        temperature: 0.0,
-        reasoning_budget: Some(1),
-        enable_thinking: true,
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.reasoning_budget = Some(1);
+        config.enable_thinking = true;
+        config
     };
     for oov_marker in [false, true] {
         let mut model = super::super::test_support::tiny_zero_model_with_context(2);
@@ -2687,13 +2711,14 @@ fn cold_preflight_context_refusal_precedes_missing_and_oov_close_markers() {
 #[test]
 fn cold_preflight_context_uses_effective_reasoning_budget_at_exact_boundary() {
     let model = super::super::test_support::tiny_zero_model_with_context(2);
-    let mut cfg = GenerateConfig {
-        max_new_tokens: 1,
-        temperature: 0.0,
-        reasoning_budget: Some(2),
-        enable_thinking: false,
-        stop_token_ids: vec![],
-        ..Default::default()
+    let mut cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.reasoning_budget = Some(2);
+        config.enable_thinking = false;
+        config.stop_token_ids = vec![];
+        config
     };
     assert_eq!(model.tokenizer.tokenize("a").real_length, 1);
     assert_eq!(cfg.effective_reasoning_budget(), None);
@@ -2725,13 +2750,14 @@ fn cold_preflight_context_uses_effective_reasoning_budget_at_exact_boundary() {
 fn cold_preflight_close_marker_requires_positive_budget_and_thinking() {
     let model = build_tiny_zero_model();
     for (reasoning_budget, enable_thinking) in [(None, true), (Some(0), true), (Some(1), false)] {
-        let cfg = GenerateConfig {
-            max_new_tokens: 1,
-            temperature: 0.0,
-            reasoning_budget,
-            enable_thinking,
-            stop_token_ids: vec![],
-            ..Default::default()
+        let cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 1;
+            config.temperature = 0.0;
+            config.reasoning_budget = reasoning_budget;
+            config.enable_thinking = enable_thinking;
+            config.stop_token_ids = vec![];
+            config
         };
         for (entry, result) in cold_preflight_results(&model, "a", &cfg) {
             assert!(
@@ -2748,13 +2774,14 @@ fn cold_preflight_close_marker_requires_positive_budget_and_thinking() {
 
 #[test]
 fn cold_preflight_missing_and_oov_close_markers_share_the_error_variant() {
-    let cfg = GenerateConfig {
-        max_new_tokens: 1,
-        temperature: 0.0,
-        reasoning_budget: Some(1),
-        enable_thinking: true,
-        stop_token_ids: vec![],
-        ..Default::default()
+    let cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.reasoning_budget = Some(1);
+        config.enable_thinking = true;
+        config.stop_token_ids = vec![];
+        config
     };
     for oov_marker in [false, true] {
         let model = if oov_marker {

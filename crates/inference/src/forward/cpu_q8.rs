@@ -795,6 +795,7 @@ mod scratch_bench;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::gdn::require_qwen35_gdn_geometry;
     use crate::decoder::standalone_cpu::parity;
     use crate::weights::q8_weights::matmul_bt_q8;
 
@@ -1075,7 +1076,7 @@ mod tests {
             out_proj: make_zero_q8(hidden, output_dim),
         };
 
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg));
         let mut scratch = GatedDeltaNetFusedScratch::default();
         let input = vec![0.0f32; hidden];
         let mut output = vec![0.0f32; hidden];
@@ -1295,7 +1296,7 @@ mod tests {
             out_proj: make_zero_q8(hidden, output_dim),
         };
 
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg));
         let mut scratch = GatedDeltaNetFusedScratch::default();
         let input = vec![0.0f32; hidden];
         let mut output = vec![0.0f32; hidden];
@@ -1640,11 +1641,12 @@ mod tests {
         let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
         let tokenizer = nonzero_fixture_tokenizer_q8();
 
-        let greedy_cfg = GenerateConfig {
-            max_new_tokens: 6,
-            temperature: 0.0,
-            seed: Some(7),
-            ..Default::default()
+        let greedy_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 6;
+            config.temperature = 0.0;
+            config.seed = Some(7);
+            config
         };
         let greedy = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &greedy_cfg)
             .expect("greedy golden must succeed");
@@ -1655,14 +1657,15 @@ mod tests {
         );
         println!("GREEDY text={:?}", greedy.text);
 
-        let seeded_cfg = GenerateConfig {
-            max_new_tokens: 6,
-            temperature: 0.8,
-            top_k: 5,
-            top_p: 0.9,
-            repetition_penalty: 1.1,
-            seed: Some(1234),
-            ..Default::default()
+        let seeded_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 6;
+            config.temperature = 0.8;
+            config.top_k = 5;
+            config.top_p = 0.9;
+            config.repetition_penalty = 1.1;
+            config.seed = Some(1234);
+            config
         };
         let seeded = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &seeded_cfg)
             .expect("seeded golden must succeed");
@@ -1678,12 +1681,13 @@ mod tests {
             "need at least 2 greedy tokens to derive a mid-stream stop token"
         );
         let stop_tok = greedy.token_ids[1];
-        let stop_cfg = GenerateConfig {
-            max_new_tokens: 6,
-            temperature: 0.0,
-            seed: Some(7),
-            stop_token_ids: vec![stop_tok],
-            ..Default::default()
+        let stop_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 6;
+            config.temperature = 0.0;
+            config.seed = Some(7);
+            config.stop_token_ids = vec![stop_tok];
+            config
         };
         let stopped = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &stop_cfg)
             .expect("stop-token golden must succeed");
@@ -1695,11 +1699,12 @@ mod tests {
         );
         println!("STOP text={:?}", stopped.text);
 
-        let one_tok_cfg = GenerateConfig {
-            max_new_tokens: 1,
-            temperature: 0.0,
-            seed: Some(7),
-            ..Default::default()
+        let one_tok_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 1;
+            config.temperature = 0.0;
+            config.seed = Some(7);
+            config
         };
         let one_tok = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &one_tok_cfg)
             .expect("max_new_tokens=1 golden must succeed");
@@ -1725,11 +1730,12 @@ mod tests {
     fn generate_q8_greedy_golden() {
         let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
         let tokenizer = nonzero_fixture_tokenizer_q8();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 6,
-            temperature: 0.0,
-            seed: Some(7),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 6;
+            config.temperature = 0.0;
+            config.seed = Some(7);
+            config
         };
         let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
             .expect("greedy golden must succeed");
@@ -1755,14 +1761,15 @@ mod tests {
     fn generate_q8_seeded_sampling_golden() {
         let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
         let tokenizer = nonzero_fixture_tokenizer_q8();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 6,
-            temperature: 0.8,
-            top_k: 5,
-            top_p: 0.9,
-            repetition_penalty: 1.1,
-            seed: Some(1234),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 6;
+            config.temperature = 0.8;
+            config.top_k = 5;
+            config.top_p = 0.9;
+            config.repetition_penalty = 1.1;
+            config.seed = Some(1234);
+            config
         };
         let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
             .expect("seeded golden must succeed");
@@ -1785,12 +1792,13 @@ mod tests {
     fn generate_q8_stop_token_golden() {
         let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
         let tokenizer = nonzero_fixture_tokenizer_q8();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 6,
-            temperature: 0.0,
-            seed: Some(7),
-            stop_token_ids: vec![80],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 6;
+            config.temperature = 0.0;
+            config.seed = Some(7);
+            config.stop_token_ids = vec![80];
+            config
         };
         let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
             .expect("stop-token golden must succeed");
@@ -1809,11 +1817,12 @@ mod tests {
     fn generate_q8_max_new_tokens_one_golden() {
         let (cfg, weights, rope) = make_nonzero_q8_generate_fixture();
         let tokenizer = nonzero_fixture_tokenizer_q8();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 1,
-            temperature: 0.0,
-            seed: Some(7),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 1;
+            config.temperature = 0.0;
+            config.seed = Some(7);
+            config
         };
         let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "world", &gen_cfg)
             .expect("max_new_tokens=1 golden must succeed");
@@ -2022,9 +2031,10 @@ mod tests {
     fn test_generate_q8_max_new_tokens_zero_returns_empty() {
         let (cfg, weights, rope, tokenizer) = zero_layer_q8_fixture();
 
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 0,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 0;
+            config
         };
 
         let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "h", &gen_cfg)
@@ -2056,11 +2066,12 @@ mod tests {
     fn test_generate_q8_honors_stop_token_ids() {
         let (cfg, weights, rope, tokenizer) = zero_layer_q8_fixture();
 
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 4,
-            stop_token_ids: vec![0], // token 0 is the stop signal, NOT eos (5)
-            temperature: 0.0,        // greedy: all-zero logits always yield token 0
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 4;
+            config.stop_token_ids = vec![0]; // token 0 is the stop signal, NOT eos (5)
+            config.temperature = 0.0; // greedy: all-zero logits always yield token 0
+            config
         };
 
         let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "h", &gen_cfg)
@@ -2102,9 +2113,10 @@ mod tests {
             final_norm: vec![],
             layers: vec![],
         };
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: usize::MAX,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = usize::MAX;
+            config
         };
 
         let err = generate_q8(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg)
@@ -2178,9 +2190,10 @@ mod tests {
         vocab_map.insert("z".to_string(), cfg.vocab_size as u32);
         let mismatched_tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, vec![])
             .expect("tokenizer with an OOV vocab entry still constructs");
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 1,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 1;
+            config
         };
 
         let err = generate_q8(&weights, &cfg, &mismatched_tokenizer, &rope, "z", &gen_cfg)
@@ -2226,9 +2239,10 @@ mod tests {
             layers: vec![],
         };
 
-        let gen_cfg = GenerateConfig {
-            logprobs: Some(0),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.logprobs = Some(0);
+            config
         };
 
         let result = generate_q8(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
@@ -2283,9 +2297,10 @@ mod tests {
         let engine =
             GrammarEngine::new(&spec, grammar_vocab).expect("trivial grammar must compile");
 
-        let gen_cfg = GenerateConfig {
-            grammar: Some(Arc::new(engine)),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.grammar = Some(Arc::new(engine));
+            config
         };
 
         let result = generate_q8(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
@@ -2328,9 +2343,10 @@ mod tests {
             layers: vec![],
         };
 
-        let gen_cfg = GenerateConfig {
-            stop_strings: vec!["</s>".to_string()],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.stop_strings = vec!["</s>".to_string()];
+            config
         };
 
         let result = generate_q8(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
@@ -2370,9 +2386,10 @@ mod tests {
             layers: vec![],
         };
 
-        let gen_cfg = GenerateConfig {
-            reasoning_budget: Some(16),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.reasoning_budget = Some(16);
+            config
         };
 
         let result = generate_q8(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
@@ -2556,7 +2573,7 @@ mod tests {
 
         let decode_two_steps = |scratch: &mut ForwardScratch| -> Vec<f32> {
             let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-                .map(|_| GatedDeltaNetState::new(&cfg))
+                .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
                 .collect();
             let mut kv_cache = KvCache::new(num_full);
 

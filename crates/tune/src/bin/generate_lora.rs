@@ -806,7 +806,9 @@ fn main() {
 
         match lattice_tune::lora::LoraAdapter::from_safetensors(lora) {
             Ok(adapter) => {
-                if let Err(e) = adapter.validate_against(model.config()) {
+                if let Err(e) = adapter.validate_geometry(
+                    &lattice_inference::lora_hook::Qwen35LoraGeometry::new(model.config()),
+                ) {
                     eprintln!("LoRA adapter incompatible with loaded model: {e}");
                     std::process::exit(1);
                 }

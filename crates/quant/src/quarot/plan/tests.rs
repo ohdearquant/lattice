@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn qwen35_plan_covers_residual_stream_tensors() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     assert_eq!(plan.rule_count(), 14);
     let cases = [
         // GQA full-attention
@@ -74,7 +74,7 @@ fn qwen35_plan_covers_residual_stream_tensors() {
 
 #[test]
 fn qwen35_plan_misses_rmsnorm_and_scalar_weights() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let skipped = [
         "model.layers.0.input_layernorm.weight",
         "model.layers.0.post_attention_layernorm.weight",
@@ -94,7 +94,7 @@ fn qwen35_plan_misses_rmsnorm_and_scalar_weights() {
 
 /// Required-rule list that step 3b's converter MUST find in any Qwen3.5
 /// hybrid SafeTensors file. Suffixes match the loader's expectations at
-/// `qwen_required_tensor_names` (`crates/model-config/src/qwen35_tensors.rs`).
+/// `qwen_required_tensor_names` (`crates/arch/src/qwen35_tensors.rs`).
 fn qwen35_required_residual_tensor_suffixes() -> &'static [&'static str] {
     &[
         "self_attn.q_proj.weight",
@@ -136,7 +136,7 @@ fn validate_coverage_tied_embeddings_is_complete_without_lm_head() {
     // Qwen3.5 default: tie_word_embeddings=true, so lm_head.weight is
     // ABSENT from the SafeTensors file. The plan's lm_head rule is
     // Optional — its absence must NOT fail is_complete().
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let names = synthetic_qwen35_tensor_names(false);
     let report = plan.validate_coverage(names.iter().map(String::as_str));
     assert!(
@@ -161,7 +161,7 @@ fn validate_coverage_tied_embeddings_is_complete_without_lm_head() {
 #[test]
 fn validate_coverage_untied_embeddings_matches_lm_head() {
     // tie_word_embeddings=false case: lm_head.weight is loaded.
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let names = synthetic_qwen35_tensor_names(true);
     let report = plan.validate_coverage(names.iter().map(String::as_str));
     assert!(
@@ -174,7 +174,7 @@ fn validate_coverage_untied_embeddings_matches_lm_head() {
 
 #[test]
 fn validate_coverage_flags_unmatched_required_rule() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     // Drop o_proj — a Required rule
     let names: Vec<String> = synthetic_qwen35_tensor_names(false)
         .into_iter()
@@ -193,7 +193,7 @@ fn validate_coverage_flags_unmatched_required_rule() {
 
 #[test]
 fn validate_coverage_lists_unplanned_tensors() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let mut names = synthetic_qwen35_tensor_names(false);
     names.push("model.layers.0.input_layernorm.weight".to_string());
     names.push("model.mtp.head.weight".to_string());
@@ -215,7 +215,7 @@ fn validate_coverage_lists_unplanned_tensors() {
 #[test]
 fn qwen35_plan_misses_moe_expert_weights() {
     // Documents the v1 deferral — MoE expert tensors are NOT in the v0 plan.
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let moe_names = [
         "model.layers.0.mlp.experts.gate_up_proj.weight",
         "model.layers.0.mlp.experts.down_proj.weight",
@@ -230,7 +230,7 @@ fn qwen35_plan_misses_moe_expert_weights() {
 
 #[test]
 fn apply_tensor_rotation_skips_unplanned() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let hidden = 64;
     let r = RandomizedHadamard::new(7, hidden).unwrap();
     let mut weight = vec![1.0_f32; hidden * hidden];
@@ -259,7 +259,7 @@ fn apply_tensor_rotation_mlp_layer_pair_rotates_output() {
     // because down_proj writes BACK to the rotated residual stream.
     let hidden = 64;
     let intermediate = 128;
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let r = RandomizedHadamard::new(0xC0FFEE, hidden).unwrap();
 
     let mut state = 1_u64;
@@ -326,7 +326,7 @@ fn apply_tensor_rotation_mlp_layer_pair_rotates_output() {
 
 #[test]
 fn absorption_for_module_input_side() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     for module in [
         "q_proj",
         "k_proj",
@@ -348,7 +348,7 @@ fn absorption_for_module_input_side() {
 
 #[test]
 fn absorption_for_module_output_side() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     for module in ["o_proj", "down_proj", "out_proj"] {
         assert_eq!(
             plan.absorption_for_module(module),
@@ -360,7 +360,7 @@ fn absorption_for_module_output_side() {
 
 #[test]
 fn absorption_for_module_unknown() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     assert_eq!(plan.absorption_for_module("conv1d"), None);
     assert_eq!(plan.absorption_for_module("norm"), None);
 }
@@ -462,7 +462,7 @@ fn qwen3_0_6b_validate_coverage_complete_without_lm_head() {
 
 #[test]
 fn f64_apply_matches_f32_apply_pattern() {
-    let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let plan = crate::quarot::plan::qwen35_residual_stream_linear_layers();
     let hidden = 64;
     let r = RandomizedHadamard::new(11, hidden).unwrap();
     let mut weight_f32: Vec<f32> = (0..hidden * hidden)
@@ -506,7 +506,12 @@ fn r3_full_attention_scope_matches_qwen35_0_8b_layer_pattern() {
     let cfg = Qwen35Config::qwen35_0_8b();
     // block_size == num_attention_heads (8): one dense cross-head
     // Hadamard covering every head, matching the paper's H_num_heads.
-    let spec = OnlineRotationSpec::r3_full_attention(&cfg, 7, 8).unwrap();
+    let spec = OnlineRotationSpec::attention_output_r3(
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        7,
+        8,
+    )
+    .unwrap();
     assert_eq!(spec.id, RotationId::AttentionOutputR3);
     assert_eq!(spec.side, AbsorptionSide::InputSide);
     assert_eq!(spec.block_size, 8);
@@ -537,7 +542,14 @@ fn r3_full_attention_scope_matches_qwen35_0_8b_layer_pattern() {
 fn r3_rejects_block_size_not_dividing_num_attention_heads() {
     let cfg = Qwen35Config::qwen35_0_8b();
     // num_attention_heads = 8; 16 does not divide it.
-    assert!(OnlineRotationSpec::r3_full_attention(&cfg, 1, 16).is_err());
+    assert!(
+        OnlineRotationSpec::attention_output_r3(
+            &crate::quarot::plan::qwen35_rotation_target(&cfg),
+            1,
+            16
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -547,32 +559,60 @@ fn r3_accepts_block_size_grouping_non_power_of_two_head_count() {
     // 24 heads into 3 independently-rotated cross-head blocks — the
     // documented BlockHadamard fallback, not a randomized-orthogonal
     // matrix, for a non-power-of-two head count.
-    let cfg = lattice_model_config::qwen35_config::Qwen35Config::qwen36_27b();
+    let cfg = lattice_arch::qwen35_config::Qwen35Config::qwen36_27b();
     assert_eq!(cfg.num_attention_heads, 24);
-    let spec = OnlineRotationSpec::r3_full_attention(&cfg, 1, 8).unwrap();
+    let spec = OnlineRotationSpec::attention_output_r3(
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        1,
+        8,
+    )
+    .unwrap();
     assert_eq!(spec.block_size, 8);
     // 24 itself is not a power of two, so the "one dense H_num_heads"
     // form from the paper is unavailable here.
     assert!(!cfg.num_attention_heads.is_power_of_two());
-    assert!(OnlineRotationSpec::r3_full_attention(&cfg, 1, 24).is_err());
+    assert!(
+        OnlineRotationSpec::attention_output_r3(
+            &crate::quarot::plan::qwen35_rotation_target(&cfg),
+            1,
+            24
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn r3_rejects_non_power_of_two_block_size() {
     let cfg = Qwen35Config::qwen35_0_8b();
-    assert!(OnlineRotationSpec::r3_full_attention(&cfg, 1, 96).is_err());
+    assert!(
+        OnlineRotationSpec::attention_output_r3(
+            &crate::quarot::plan::qwen35_rotation_target(&cfg),
+            1,
+            96
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn r3_rejects_zero_block_size() {
     let cfg = Qwen35Config::qwen35_0_8b();
-    assert!(OnlineRotationSpec::r3_full_attention(&cfg, 1, 0).is_err());
+    assert!(
+        OnlineRotationSpec::attention_output_r3(
+            &crate::quarot::plan::qwen35_rotation_target(&cfg),
+            1,
+            0
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn r4_dense_mlp_has_no_layer_scope_restriction() {
     let cfg = Qwen35Config::qwen35_0_8b();
-    let spec = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 256).unwrap();
+    let spec =
+        OnlineRotationSpec::mlp_down_r4(&crate::quarot::plan::qwen35_rotation_target(&cfg), 9, 256)
+            .unwrap();
     assert_eq!(spec.id, RotationId::MlpDownR4);
     assert_eq!(spec.side, AbsorptionSide::InputSide);
     assert_eq!(spec.layer_scope, None);
@@ -593,7 +633,7 @@ fn r3_rejects_oversized_layer_scope() {
         block_size: 1,
         layer_scope: Some(oversized),
     };
-    let err = hand_built.validate(None).unwrap_err();
+    let err = hand_built.validate_target(None).unwrap_err();
     assert!(
         format!("{err}").contains(&OnlineRotationSpec::MAX_LAYER_SCOPE_ENTRIES.to_string()),
         "expected the layer_scope cap error naming the maximum, got: {err}"
@@ -608,7 +648,12 @@ fn r3_rejects_oversized_layer_scope() {
 fn r4_dense_mlp_rejects_moe_config() {
     let moe_cfg = Qwen35Config::qwen36_35b_a3b();
     assert!(moe_cfg.is_moe(), "sanity: qwen36_35b_a3b is MoE");
-    let err = OnlineRotationSpec::r4_dense_mlp(&moe_cfg, 9, 256).unwrap_err();
+    let err = OnlineRotationSpec::mlp_down_r4(
+        &crate::quarot::plan::qwen35_rotation_target(&moe_cfg),
+        9,
+        256,
+    )
+    .unwrap_err();
     assert!(format!("{err}").contains("MoE"), "got: {err}");
 
     // A hand-built R4 spec (bypassing the constructor) must also be
@@ -621,14 +666,29 @@ fn r4_dense_mlp_rejects_moe_config() {
         block_size: 256,
         layer_scope: None,
     };
-    let err = hand_built.validate(Some(&moe_cfg)).unwrap_err();
+    let err = hand_built
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&moe_cfg)))
+        .unwrap_err();
     assert!(format!("{err}").contains("MoE"), "got: {err}");
 
     // The dense 0.8B config is unaffected — still passes both paths.
     let dense_cfg = Qwen35Config::qwen35_0_8b();
     assert!(!dense_cfg.is_moe(), "sanity: qwen35_0_8b is dense");
-    assert!(OnlineRotationSpec::r4_dense_mlp(&dense_cfg, 9, 256).is_ok());
-    assert!(hand_built.validate(Some(&dense_cfg)).is_ok());
+    assert!(
+        OnlineRotationSpec::mlp_down_r4(
+            &crate::quarot::plan::qwen35_rotation_target(&dense_cfg),
+            9,
+            256
+        )
+        .is_ok()
+    );
+    assert!(
+        hand_built
+            .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(
+                &dense_cfg
+            )))
+            .is_ok()
+    );
 }
 
 #[test]
@@ -645,7 +705,14 @@ fn r4_rejects_block_size_not_dividing_intermediate_size() {
         512,
         "sanity: 1024 does not divide 3584"
     );
-    assert!(OnlineRotationSpec::r4_dense_mlp(&cfg, 1, 1024).is_err());
+    assert!(
+        OnlineRotationSpec::mlp_down_r4(
+            &crate::quarot::plan::qwen35_rotation_target(&cfg),
+            1,
+            1024
+        )
+        .is_err()
+    );
 }
 
 /// Qwen3.6-27B is dense (`intermediate_size = 17408`), and 4 is a
@@ -667,7 +734,9 @@ fn r4_dense_mlp_rejects_num_blocks_above_block_hadamard_cap() {
         "sanity: 17408 / 4 = 4352 blocks"
     );
 
-    let err = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 4).unwrap_err();
+    let err =
+        OnlineRotationSpec::mlp_down_r4(&crate::quarot::plan::qwen35_rotation_target(&cfg), 9, 4)
+            .unwrap_err();
     assert!(
         format!("{err}").contains("4352") && format!("{err}").contains("4096"),
         "expected the num_blocks cap error naming both the block count \
@@ -685,7 +754,9 @@ fn r4_dense_mlp_rejects_num_blocks_above_block_hadamard_cap() {
         block_size: 4,
         layer_scope: None,
     };
-    let err = hand_built.validate(Some(&cfg)).unwrap_err();
+    let err = hand_built
+        .validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+        .unwrap_err();
     assert!(
         format!("{err}").contains("4352") && format!("{err}").contains("4096"),
         "expected validate() to independently reject the hand-built \
@@ -710,8 +781,13 @@ fn r4_dense_mlp_accepts_block_size_within_num_blocks_cap() {
         "sanity: 17408 / 128 = 136 blocks"
     );
 
-    let spec = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 128).unwrap();
-    assert!(spec.validate(Some(&cfg)).is_ok());
+    let spec =
+        OnlineRotationSpec::mlp_down_r4(&crate::quarot::plan::qwen35_rotation_target(&cfg), 9, 128)
+            .unwrap();
+    assert!(
+        spec.validate_target(Some(&crate::quarot::plan::qwen35_rotation_target(&cfg)))
+            .is_ok()
+    );
 
     let bh = super::super::hadamard::BlockHadamard::new(9, cfg.intermediate_size, 128)
         .expect("136 blocks must be constructible — well under the 4096 cap");
@@ -737,8 +813,12 @@ fn r4_dense_mlp_rejects_dim_over_max_block_hadamard_len_even_within_block_cap() 
         "sanity: exactly at MAX_BLOCK_HADAMARD_BLOCKS, not over it"
     );
 
-    let err = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 8192)
-        .expect_err("dim over MAX_BLOCK_HADAMARD_LEN must be rejected by the plan gate");
+    let err = OnlineRotationSpec::mlp_down_r4(
+        &crate::quarot::plan::qwen35_rotation_target(&cfg),
+        9,
+        8192,
+    )
+    .expect_err("dim over MAX_BLOCK_HADAMARD_LEN must be rejected by the plan gate");
     assert!(
         format!("{err}").contains("MAX_BLOCK_HADAMARD_LEN"),
         "expected the plan gate to reject on the length bound, not the \
@@ -752,7 +832,14 @@ fn r4_dense_mlp_rejects_dim_over_max_block_hadamard_len_even_within_block_cap() 
     // A legitimate dimension at the same block_size still passes both
     // gates.
     let small_cfg = Qwen35Config::qwen35_0_8b();
-    assert!(OnlineRotationSpec::r4_dense_mlp(&small_cfg, 9, 128).is_ok());
+    assert!(
+        OnlineRotationSpec::mlp_down_r4(
+            &crate::quarot::plan::qwen35_rotation_target(&small_cfg),
+            9,
+            128
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -764,7 +851,14 @@ fn r4_accepts_all_named_design_doc_block_sizes() {
             0,
             "block size {b} must divide 3584"
         );
-        assert!(OnlineRotationSpec::r4_dense_mlp(&cfg, 1, b).is_ok());
+        assert!(
+            OnlineRotationSpec::mlp_down_r4(
+                &crate::quarot::plan::qwen35_rotation_target(&cfg),
+                1,
+                b
+            )
+            .is_ok()
+        );
     }
 }
 

@@ -1,5 +1,6 @@
 use super::*;
 use crate::attention::gdn::GatedDeltaNetWeights;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::lora_hook::NoopLoraHook;
 use crate::model::qwen35::ModelWeights;
 use crate::model::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
@@ -660,7 +661,7 @@ fn rope_cos_sin_tables_accepts_exact_capacity() {
 fn hand_read_last_logits(model: &Qwen35Model, prompt: &[u32]) -> Vec<f32> {
     let cfg = &model.config;
     let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
-        .map(|_| GatedDeltaNetState::new(cfg))
+        .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(cfg)))
         .collect();
     let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
     let mut scratch = ForwardScratch::new();

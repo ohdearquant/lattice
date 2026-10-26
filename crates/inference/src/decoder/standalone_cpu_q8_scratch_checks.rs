@@ -1,4 +1,5 @@
 use super::*;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::forward::cpu_q8::forward_step_q8;
 use crate::weights::q8_weights::Q8Matrix;
 
@@ -159,7 +160,8 @@ pub(crate) fn assert_q8_session_scratch_reuse(
         );
     }
 
-    let mut session = StandaloneCpuSession::new(StandaloneWeights::Q8(weights), cfg, rope, plan());
+    let mut session = StandaloneCpuSession::new(StandaloneWeights::Q8(weights), cfg, rope, plan())
+        .expect("an unspent ledger identity");
     let storage = session.q8_scratch.storage_snapshot();
     assert_eq!(session.q8_scratch.call_count(), 0);
     #[cfg(target_os = "macos")]
@@ -174,7 +176,7 @@ pub(crate) fn assert_q8_session_scratch_reuse(
     assert_eq!(session.q8_scratch.storage_snapshot(), storage);
 
     let mut reference_gdn: Vec<_> = (0..cfg.num_linear_attention_layers())
-        .map(|_| GatedDeltaNetState::new(cfg))
+        .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(cfg)))
         .collect();
     let mut reference_kv = KvCache::new(cfg.num_full_attention_layers());
     let mut reference_scratch = ForwardScratch::new();
@@ -201,34 +203,29 @@ pub(crate) fn assert_q8_session_scratch_reuse(
     );
     assert_state(&session, &reference_gdn, &reference_kv, &reference_scratch);
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: DECODE_STEPS + 1,
-        temperature: 0.0,
-        seed: Some(7),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = DECODE_STEPS + 1;
+        config.temperature = 0.0;
+        config.seed = Some(7);
+        config
     };
     let mut history = PROMPT.to_vec();
     let mut previous_logits = session.scratch.logits[..cfg.vocab_size].to_vec();
     for step in 0..DECODE_STEPS {
         let candidate = match session
-            .select(&SelectionRequest {
-                config: &gen_cfg,
-                history: &history,
-                grammar_mask: None,
-            })
+            .select(&SelectionRequest::new(&gen_cfg, &history))
             .expect("Q8 session select")
         {
             SelectOutcome::Candidate(candidate) => candidate,
             SelectOutcome::GrammarExhausted => panic!("no grammar was supplied"),
+            _ => unreachable!("a select outcome this test does not model"),
         };
         history.push(candidate.candidate_id);
         session.q8_scratch.poison();
         let stamp = session
             .decode(
-                &AcceptedToken {
-                    final_id: candidate.candidate_id,
-                    prediction: candidate.prediction,
-                },
+                &AcceptedToken::new(candidate.candidate_id, candidate.prediction),
                 &never,
             )
             .expect("Q8 session decode");
@@ -339,7 +336,8 @@ fn constructor_storage(
     rope: &RopeTable,
     expected_width: usize,
 ) -> [[usize; 3]; 2] {
-    let session = StandaloneCpuSession::new(StandaloneWeights::Q8(weights), cfg, rope, plan());
+    let session = StandaloneCpuSession::new(StandaloneWeights::Q8(weights), cfg, rope, plan())
+        .expect("an unspent ledger identity");
     let storage = session.q8_scratch.storage_snapshot();
     assert_eq!(session.q8_scratch.call_count(), 0);
     #[cfg(target_os = "macos")]

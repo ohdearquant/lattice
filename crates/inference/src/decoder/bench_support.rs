@@ -166,7 +166,7 @@ pub fn run_qwen_cpu_probed(
     let think_close_id = None;
 
     let mut inner =
-        QwenCpuSession::new(model, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
+        QwenCpuSession::new(model, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed)?;
     inner.reserve_generation(prompt_len.saturating_add(gen_cfg.max_new_tokens));
     let mut session = ProbedSession {
         inner,
@@ -236,10 +236,7 @@ impl DecoderSession for NullSession {
 
     fn prefill(&mut self, _cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
         self.evaluated = self.prompt_len;
-        Ok(StepStamp {
-            evaluated_len: self.evaluated,
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.evaluated, None))
     }
 
     fn decode(
@@ -249,18 +246,15 @@ impl DecoderSession for NullSession {
     ) -> Result<StepStamp, InferenceError> {
         self.ledger.consume(accepted.prediction)?;
         self.evaluated += 1;
-        Ok(StepStamp {
-            evaluated_len: self.evaluated,
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.evaluated, None))
     }
 
     fn select(&mut self, _request: &SelectionRequest<'_>) -> Result<SelectOutcome, InferenceError> {
-        let prediction = self.ledger.open();
-        Ok(SelectOutcome::Candidate(SelectionCandidate {
-            candidate_id: INTERFACE_ONLY_TOKEN,
+        let prediction = self.ledger.open()?;
+        Ok(SelectOutcome::Candidate(SelectionCandidate::new(
+            INTERFACE_ONLY_TOKEN,
             prediction,
-        }))
+        )))
     }
 
     fn metadata(
@@ -292,7 +286,7 @@ pub fn run_interface_only(
     let prompt_ids: Vec<u32> = vec![INTERFACE_ONLY_TOKEN; prompt_len];
     let mut session = ProbedSession {
         inner: NullSession {
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new()?,
             capabilities: ExecutionCapabilities::default(),
             prompt_len,
             evaluated: 0,

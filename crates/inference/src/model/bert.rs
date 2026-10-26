@@ -4,9 +4,8 @@
 //! boxed `dyn Tokenizer`, allowing WordPiece, BPE, and SentencePiece tokenizers
 //! to share a single inference path.
 
-use crate::attention::{
-    AttentionBuffers, multi_head_attention_batched, multi_head_attention_in_place,
-};
+use crate::attention::AttentionBuffers;
+use crate::attention::standard::bert_attention_projections;
 use crate::download::ensure_model_files;
 use crate::error::InferenceError;
 use crate::forward::cpu::{
@@ -73,7 +72,7 @@ pub mod weight_loading;
 /// externally constructible API surface (`crate::weights::TransformerLayerWeights`),
 /// so adding a field there is a breaking change under SemVer (adding a public
 /// field to an all-public struct forces every downstream struct literal to
-/// change). See `crate::attention::standard::multi_head_attention_in_place`'s
+/// change). See `lattice_compute::attention::standard::multi_head_attention_in_place`'s
 /// doc comment and PR #678.
 struct LayerFusedQkv {
     weight: Vec<f32>,
@@ -473,7 +472,7 @@ impl BertModel {
     /// stages (embedding lookup, Q/K/V projection, FFN, output projection) are each
     /// one `matmul_bt`/`layer_norm` call over every real row -- no wasted rows for
     /// padding. Only the O(seq_len^2) attention score/context step loops per
-    /// sequence (see `crate::attention::multi_head_attention_batched`) are run
+    /// sequence (see `lattice_compute::attention::standard::multi_head_attention_batched`) are run
     /// serially, one sequence at a time, over disjoint output slices. The
     /// implementation detail may change without API breakage.
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
@@ -553,15 +552,13 @@ impl BertModel {
     /// Both `encode` and `encode_batch` delegate here so the pooling branch
     /// is in one place.  L2 normalization is applied by the caller.
     fn pool(&self, hidden_states: &[f32], attention_mask: &[u32], seq_len: usize) -> Vec<f32> {
-        match self.pooling {
-            BertPooling::Mean => mean_pool(
-                hidden_states,
-                attention_mask,
-                seq_len,
-                self.config.hidden_size,
-            ),
-            BertPooling::CLS => cls_pool(hidden_states, seq_len, self.config.hidden_size),
-        }
+        pool_hidden_states(
+            self.pooling,
+            hidden_states,
+            attention_mask,
+            seq_len,
+            self.config.hidden_size,
+        )
     }
 
     /// Forward pass for a pre-tokenized input; used by `CrossEncoderModel`.
@@ -699,9 +696,9 @@ impl BertModel {
             let layer = &self.weights.layers[layer_idx];
             let fused = &self.fused_qkv[layer_idx];
 
-            multi_head_attention_in_place(
+            lattice_compute::__internal::multi_head_attention_in_place(
                 &hidden,
-                layer,
+                &bert_attention_projections(layer),
                 &fused.weight,
                 &fused.bias,
                 attention_mask,
@@ -887,9 +884,9 @@ impl BertModel {
             let layer = &self.weights.layers[layer_idx];
             let fused = &self.fused_qkv[layer_idx];
 
-            multi_head_attention_batched(
+            lattice_compute::__internal::multi_head_attention_batched(
                 &hidden,
-                layer,
+                &bert_attention_projections(layer),
                 &fused.weight,
                 &fused.bias,
                 cu_seqlens,
@@ -1358,6 +1355,23 @@ fn infer_num_attention_heads(hidden_size: usize) -> Result<usize, InferenceError
         _ => Err(InferenceError::Inference(format!(
             "unable to infer num_attention_heads for hidden_size {hidden_size}"
         ))),
+    }
+}
+
+/// `BertPooling` is `#[non_exhaustive]` and defined in `lattice-compute`, so this match needs
+/// a wildcard arm and cannot fail to compile on a new variant;
+/// `tests::bert_model_pool_has_an_arm_for_every_pooling_variant` fails instead.
+fn pool_hidden_states(
+    pooling: BertPooling,
+    hidden_states: &[f32],
+    attention_mask: &[u32],
+    seq_len: usize,
+    hidden_size: usize,
+) -> Vec<f32> {
+    match pooling {
+        BertPooling::Mean => mean_pool(hidden_states, attention_mask, seq_len, hidden_size),
+        BertPooling::CLS => cls_pool(hidden_states, seq_len, hidden_size),
+        _ => mean_pool(hidden_states, attention_mask, seq_len, hidden_size),
     }
 }
 

@@ -228,7 +228,7 @@ fn pack_full_attn_weights(
     // by the original, unwrapped head count.
     let q_dim = cfg.checked_full_q_dim()?;
     let kv_dim = cfg.checked_full_kv_dim()?;
-    let q_proj_rows = lattice_model_config::__internal::checked_double(q_dim, "full_q_dim")?; // Q + gate interleaved
+    let q_proj_rows = lattice_arch::__internal::checked_double(q_dim, "full_q_dim")?; // Q + gate interleaved
 
     validate_cfg_len(
         w.q_norm.len(),
@@ -974,6 +974,7 @@ pub fn generate_q8_neon(
 #[cfg(feature = "bench-internals")]
 pub mod bench_support {
     use super::*;
+    use crate::attention::gdn::require_qwen35_gdn_geometry;
     use crate::model::qwen35_config::LayerType;
     use crate::rope::RopeTable;
 
@@ -1299,8 +1300,9 @@ pub mod bench_support {
         ) -> Q8ForwardBenchState {
             let num_linear = self.cfg.num_linear_attention_layers();
             let num_full = self.cfg.num_full_attention_layers();
+            let gdn_geometry = require_qwen35_gdn_geometry(&self.cfg);
             let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-                .map(|_| GatedDeltaNetState::new(&self.cfg))
+                .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
                 .collect();
             let mut kv_cache = KvCache::new(num_full);
             let mut scratch = ForwardScratch::new();

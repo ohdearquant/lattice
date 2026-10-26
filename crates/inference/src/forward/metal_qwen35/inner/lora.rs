@@ -358,7 +358,6 @@ impl MetalQwen35State {
     ) -> Result<(), crate::error::InferenceError> {
         use crate::error::InferenceError;
         use crate::quant::quarot::lora::{LoraLayerMut, rotate_adapter_for_quarot};
-        use crate::quant::quarot::plan::RotationPlan;
 
         if self.lora.is_some() {
             return Err(InferenceError::Inference(
@@ -400,7 +399,7 @@ impl MetalQwen35State {
         };
 
         if let Some(seed) = resolved_seed {
-            let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+            let plan = crate::quant::quarot::plan::qwen35_residual_stream_linear_layers();
             let lora_muts: Vec<LoraLayerMut<'_>> = layers
                 .iter_mut()
                 .map(|l| LoraLayerMut {

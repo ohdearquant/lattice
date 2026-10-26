@@ -62,6 +62,11 @@ lattice-inference = { version = "0.15.0", path = "../inference", optional = true
     "std",
     "f16",
 ] }
+lattice-compute = { version = "0.15.0", path = "../compute", optional = true }
+lattice-inference-core = { version = "0.15.0", path = "../inference-core", optional = true }
+lattice-arch = { version = "0.15.0", path = "../arch", optional = true }
+lattice-tokenizer = { version = "0.15.0", path = "../tokenizer", optional = true }
+lattice-weights = { version = "0.15.0", path = "../weights", optional = true, features = ["f16"] }
 
 # `tokio` stays split into target-specific tables below (unlike `lattice-inference`
 # above, whose feature set is now the same on every target). Reason: this
@@ -96,6 +101,7 @@ console_error_panic_hook = { version = "0.1", optional = true }
 
 [dev-dependencies]
 lattice-inference = { version = "0.15.0", path = "../inference", default-features = false, features = ["std", "test-utils"] }
+lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 simsimd = "6"
@@ -112,7 +118,14 @@ serde_json = { workspace = true }
 
 [features]
 default = ["native", "download", "image"]
-native = ["dep:lattice-inference"]
+native = [
+    "dep:lattice-inference",
+    "dep:lattice-compute",
+    "dep:lattice-inference-core",
+    "dep:lattice-arch",
+    "dep:lattice-tokenizer",
+    "dep:lattice-weights",
+]
 image = ["native", "lattice-inference/image"]
 # First-use model downloads for the native `embed` binary (its `--download-only`
 # flag and the implicit fetch inside `BertModel::from_pretrained`). Implies

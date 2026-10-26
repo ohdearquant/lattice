@@ -69,21 +69,23 @@ fn generate_fails_closed_on_all_blocking_grammar() {
         GrammarEngine::new(&spec, vocab_bytes).expect("grammar engine builds with empty vocab"),
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 1,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let result = state.generate("a", &tokenizer, &gen_cfg);
@@ -126,21 +128,23 @@ fn generate_streaming_fails_closed_on_all_blocking_grammar() {
         GrammarEngine::new(&spec, vocab_bytes).expect("grammar engine builds with empty vocab"),
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 1,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let mut on_token_calls = 0u32;
@@ -197,21 +201,23 @@ fn generate_streaming_with_prefix_cache_fails_closed_on_all_blocking_grammar() {
         GrammarEngine::new(&spec, vocab_bytes).expect("grammar engine builds with empty vocab"),
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 1,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let result =
@@ -264,21 +270,23 @@ fn terminal_step_zero_grammar_cfg() -> GenerateConfig {
         "terminal epsilon grammar must mask every continuation"
     );
 
-    GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 1,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     }
 }
 
@@ -543,21 +551,23 @@ fn generate_streaming_with_prefix_cache_rejects_logprobs_request() {
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
     let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 2,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: Some(5),
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 2;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = Some(5);
+        config
     };
 
     let result =
@@ -604,7 +614,6 @@ fn generate_streaming_with_prefix_cache_rejects_logprobs_request_preserves_warm_
     let _guard = gpu_test_lock();
 
     use crate::error::InferenceError;
-    use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
     let (cfg, weights) = tiny_hybrid_fixture();
@@ -624,10 +633,11 @@ fn generate_streaming_with_prefix_cache_rejects_logprobs_request_preserves_warm_
         .token_ids
         .clone();
 
-    let rejected_cfg = GenerateConfig {
-        min_p: 0.0,
-        logprobs: Some(0),
-        ..cross_turn_test_gen_cfg(9, 2)
+    let rejected_cfg = {
+        let mut config = cross_turn_test_gen_cfg(9, 2);
+        config.min_p = 0.0;
+        config.logprobs = Some(0);
+        config
     };
     let result = state.generate_streaming_with_prefix_cache(
         slot_id,
@@ -687,10 +697,11 @@ fn generate_streaming_with_prefix_cache_rejects_active_mtp_request() {
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
     let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
 
-    let gen_cfg = crate::generation::GenerateConfig {
-        min_p: 0.0,
-        enable_mtp: Some(true),
-        ..cross_turn_test_gen_cfg(1, 2)
+    let gen_cfg = {
+        let mut config = cross_turn_test_gen_cfg(1, 2);
+        config.min_p = 0.0;
+        config.enable_mtp = Some(true);
+        config
     };
 
     let result =
@@ -741,7 +752,6 @@ fn generate_streaming_with_prefix_cache_multi_violation_requests_return_the_earl
     let _guard = gpu_test_lock();
 
     use crate::error::InferenceError;
-    use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
     let (cfg, weights) = tiny_hybrid_fixture();
@@ -749,11 +759,12 @@ fn generate_streaming_with_prefix_cache_multi_violation_requests_return_the_earl
 
     // logprobs + enable_mtp both set: logprobs must win (checked first).
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-    let both_capabilities_cfg = GenerateConfig {
-        min_p: 0.0,
-        enable_mtp: Some(true),
-        logprobs: Some(0),
-        ..cross_turn_test_gen_cfg(1, 2)
+    let both_capabilities_cfg = {
+        let mut config = cross_turn_test_gen_cfg(1, 2);
+        config.min_p = 0.0;
+        config.enable_mtp = Some(true);
+        config.logprobs = Some(0);
+        config
     };
     let result = state.generate_streaming_with_prefix_cache(
         slot_id,
@@ -774,10 +785,11 @@ fn generate_streaming_with_prefix_cache_multi_violation_requests_return_the_earl
     // logprobs set + empty prompt: logprobs must win (checked before
     // tokenization discovers the prompt is empty).
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-    let logprobs_and_empty_cfg = GenerateConfig {
-        min_p: 0.0,
-        logprobs: Some(0),
-        ..cross_turn_test_gen_cfg(1, 2)
+    let logprobs_and_empty_cfg = {
+        let mut config = cross_turn_test_gen_cfg(1, 2);
+        config.min_p = 0.0;
+        config.logprobs = Some(0);
+        config
     };
     let result = state.generate_streaming_with_prefix_cache(
         slot_id,
@@ -798,10 +810,11 @@ fn generate_streaming_with_prefix_cache_multi_violation_requests_return_the_earl
     // enable_mtp set + empty prompt: MTP must win (checked before
     // tokenization discovers the prompt is empty).
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-    let mtp_and_empty_cfg = GenerateConfig {
-        min_p: 0.0,
-        enable_mtp: Some(true),
-        ..cross_turn_test_gen_cfg(1, 2)
+    let mtp_and_empty_cfg = {
+        let mut config = cross_turn_test_gen_cfg(1, 2);
+        config.min_p = 0.0;
+        config.enable_mtp = Some(true);
+        config
     };
     let result = state.generate_streaming_with_prefix_cache(
         slot_id,
@@ -979,21 +992,23 @@ fn generate_decode_loop_completed_grammar_is_success() {
             .expect("grammar engine builds over single-char vocab"),
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 2,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 2;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let result = state.generate("a", &tokenizer, &gen_cfg);
@@ -1036,21 +1051,23 @@ fn generate_streaming_decode_loop_completed_grammar_is_success() {
             .expect("grammar engine builds over single-char vocab"),
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 2,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 2;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let mut on_token_calls = 0u32;
@@ -1101,21 +1118,23 @@ fn generate_streaming_with_prefix_cache_decode_loop_completed_grammar_is_success
             .expect("grammar engine builds over single-char vocab"),
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 2,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 2;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let result =
@@ -1386,21 +1405,23 @@ fn generate_decode_loop_fails_closed_on_grammar_dead_end() {
             .expect("grammar engine builds over single-char vocab"),
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 2,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 2;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let result = state.generate("a", &tokenizer, &gen_cfg);
@@ -1441,21 +1462,23 @@ fn generate_streaming_decode_loop_fails_closed_on_grammar_dead_end() {
             .expect("grammar engine builds over single-char vocab"),
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 2,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 2;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let mut on_token_calls = 0u32;
@@ -1507,21 +1530,23 @@ fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_dead
             .expect("grammar engine builds over single-char vocab"),
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 2,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 2;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let result =
@@ -1582,21 +1607,23 @@ fn generate_streaming_with_prefix_cache_budget_forced_close_grammar_rejection_sa
         )
         .expect("grammar engine builds over the thinking vocab"),
     );
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: true,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: Some(1),
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = true;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = Some(1);
+        config.logprobs = None;
+        config
     };
 
     let (cfg, weights) = tiny_hybrid_fixture();

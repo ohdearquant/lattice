@@ -1,17 +1,21 @@
 # Lattice
 
-Pure Rust inference engine for transformer models on Apple Silicon, with a native macOS app.
+Pure Rust inference engine for transformer models on Apple Silicon, with a
+native macOS app.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Crates.io](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)
 [![CI](https://github.com/ohdearquant/lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/lattice/actions)
 
-**[Quick start](#quick-start-cli)** · **[Lattice Studio](#lattice-studio-macos-app)** · **[Benchmarks](#benchmarks)** · **[Roadmap](#roadmap)**
+**[Quick start](#quick-start-cli)** ·
+**[Lattice Studio](#lattice-studio-macos-app)** · **[Benchmarks](#benchmarks)**
+· **[Roadmap](#roadmap)**
 
-No ONNX. No Python. No CUDA. No external ML runtime. Lattice implements the full compute graph
-in Rust: weight loading, tokenization, forward pass, vector operations, quantization, and LoRA
-training. Hand-written Metal shaders accelerate inference on Apple Silicon. SIMD kernels (AVX2
-on x86, NEON on ARM) handle the CPU path.
+No ONNX. No Python. No CUDA. No external ML runtime. Lattice implements the full
+compute graph in Rust: weight loading, tokenization, forward pass, vector
+operations, quantization, and LoRA training. Hand-written Metal shaders
+accelerate inference on Apple Silicon. SIMD kernels (AVX2 on x86, NEON on ARM)
+handle the CPU path.
 
 ---
 
@@ -19,14 +23,16 @@ on x86, NEON on ARM) handle the CPU path.
 
 Lattice is two things in one repo.
 
-**A Rust inference library.** Thirteen crates covering embeddings, generation, quantization,
-LoRA fine-tuning, and optimal transport. Use `lattice-embed` as a library dependency, or run
-the `lattice` binary for interactive chat and an OpenAI-compatible HTTP server.
+**A Rust inference library.** Thirteen crates covering embeddings, generation,
+quantization, LoRA fine-tuning, and optimal transport. Use `lattice-embed` as a
+library dependency, or run the `lattice` binary for interactive chat and an
+OpenAI-compatible HTTP server.
 
-**Lattice Studio: a native macOS app.** A SwiftUI instrument panel that drives the Rust engine
-via CLI subprocesses. Train LoRA adapters with a live loss oscilloscope, quantize models with
-a before/after comparison, run multi-turn chat with persistent GPU model residency, and manage your
-model library from a single window. To build and install it, follow the step-by-step guide in
+**Lattice Studio: a native macOS app.** A SwiftUI instrument panel that drives
+the Rust engine via CLI subprocesses. Train LoRA adapters with a live loss
+oscilloscope, quantize models with a before/after comparison, run multi-turn
+chat with persistent GPU model residency, and manage your model library from a
+single window. To build and install it, follow the step-by-step guide in
 [`apps/macos/INSTALL.md`](apps/macos/INSTALL.md).
 
 ---
@@ -56,62 +62,70 @@ model library from a single window. To build and install it, follow the step-by-
 
 ## Benchmarks
 
-The context-scaling benchmark estimates incremental generation throughput by comparing requested
-output-token budgets with an 8-token baseline. For each budget `N` (64, 128 and 256 by default),
-it reports `(N - 8) / (T(N) - T(8))` tokens/s, where `T(N)` is the median measured duration in
-seconds. The `Context` labels identify requested output-token budgets.
+The context-scaling benchmark estimates incremental generation throughput by
+comparing requested output-token budgets with an 8-token baseline. For each
+budget `N` (64, 128 and 256 by default), it reports `(N - 8) / (T(N) - T(8))`
+tokens/s, where `T(N)` is the median measured duration in seconds. The `Context`
+labels identify requested output-token budgets.
 
-Lattice times `chat_completion()` after model loading, including prompt processing, prefill and
-generation. Subtracting the baseline is intended to cancel common prefill and fixed per-call
-costs. The MLX leg receives an explicit 4-token warmup. The context-scaling Ollama leg uses the
-API's `eval_duration`, which records output-token generation separately from model loading and
-prompt evaluation. This excludes those durations even in a single-run invocation. Older
-context-scaling reports used Ollama's `total_duration`; their Ollama timings and derived slopes
-are not directly comparable with the corrected metric. Regenerate the measurements before
-making that comparison
-([#1060](https://github.com/ohdearquant/lattice/issues/1060)).
-These estimates do not measure end-to-end interactive latency, which also depends on model
-loading, prompt length and other request costs (see "Why throughput falls with context" below).
+Lattice times `chat_completion()` after model loading, including prompt
+processing, prefill and generation. Subtracting the baseline is intended to
+cancel common prefill and fixed per-call costs. The MLX leg receives an explicit
+4-token warmup. The context-scaling Ollama leg uses the API's `eval_duration`,
+which records output-token generation separately from model loading and prompt
+evaluation. This excludes those durations even in a single-run invocation. Older
+context-scaling reports used Ollama's `total_duration`; their Ollama timings and
+derived slopes are not directly comparable with the corrected metric. Regenerate
+the measurements before making that comparison
+([#1060](https://github.com/ohdearquant/lattice/issues/1060)). These estimates
+do not measure end-to-end interactive latency, which also depends on model
+loading, prompt length and other request costs (see "Why throughput falls with
+context" below).
 
-The cross-engine decode table previously published here has been withdrawn. An audit traced its
-Lattice and Ollama columns to an arithmetic bug in a retired reporting script: the slope
-computation truncated an intermediate division to one decimal place, inflating those results by
-up to 19% ([#1060](https://github.com/ohdearquant/lattice/issues/1060)). That shell pipeline has
-since been replaced by `scripts/bench_decode_harness.py`
+The cross-engine decode table previously published here has been withdrawn. An
+audit traced its Lattice and Ollama columns to an arithmetic bug in a retired
+reporting script: the slope computation truncated an intermediate division to
+one decimal place, inflating those results by up to 19%
+([#1060](https://github.com/ohdearquant/lattice/issues/1060)). That shell
+pipeline has since been replaced by `scripts/bench_decode_harness.py`
 ([#938](https://github.com/ohdearquant/lattice/pull/938)). The raw timings in
-`docs/bench_results/context_scaling.tsv` were unaffected by the bug and its slope column has been
-recomputed exactly from them — but the underlying measurements are still a single-session
-snapshot on one machine, so the cross-engine table stays withdrawn until a multi-session baseline
-program (medians with disclosed variance, generated by
-`scripts/bench_decode_adapters_context_scaling.py`) replaces it. Raw measurements remain in
-[`docs/bench_results/`](docs/bench_results/) with provenance annotations; reproduce with
+`docs/bench_results/context_scaling.tsv` were unaffected by the bug and its
+slope column has been recomputed exactly from them — but the underlying
+measurements are still a single-session snapshot on one machine, so the
+cross-engine table stays withdrawn until a multi-session baseline program
+(medians with disclosed variance, generated by
+`scripts/bench_decode_adapters_context_scaling.py`) replaces it. Raw
+measurements remain in [`docs/bench_results/`](docs/bench_results/) with
+provenance annotations; reproduce with
 `uv run --with mlx-lm python3 scripts/bench_decode_harness.py run --profile context_scaling`
-(see "Context scaling" under
-Development below for the full invocation).
+(see "Context scaling" under Development below for the full invocation).
 
 ### Why throughput falls with context
 
-Decode slows as context grows because every generated token attends
-over the entire KV cache:
+Decode slows as context grows because every generated token attends over the
+entire KV cache:
 
-- The grouped-query attention (GQA) layers do work proportional to context length on each token: the
-  full key/value cache is streamed through memory every step. Decode is memory-bandwidth bound, so
-  per-token latency rises linearly with context (`t ≈ intercept + slope * ctx`) and throughput is its
+- The grouped-query attention (GQA) layers do work proportional to context
+  length on each token: the full key/value cache is streamed through memory
+  every step. Decode is memory-bandwidth bound, so per-token latency rises
+  linearly with context (`t ≈ intercept + slope * ctx`) and throughput is its
   reciprocal.
-- The linear-attention (gated-delta) layers are constant-time in context and do not contribute to the
-  slope.
+- The linear-attention (gated-delta) layers are constant-time in context and do
+  not contribute to the slope.
 
-In an interactive chat this compounds with prompt prefill, a separate and larger cost than the
-decode slope and historically the main reason a long chat felt progressively slower. Both serve
-binaries now reuse the previous turn's shared token prefix instead of re-prefilling the whole
-conversation from scratch on every turn ([#462](https://github.com/ohdearquant/lattice/issues/462),
-see [`docs/cross-turn-cache.md`](docs/cross-turn-cache.md)); a request whose history is not a safe
-append onto the retained state still falls back to a full re-prefill.
+In an interactive chat this compounds with prompt prefill, a separate and larger
+cost than the decode slope and historically the main reason a long chat felt
+progressively slower. Both serve binaries now reuse the previous turn's shared
+token prefix instead of re-prefilling the whole conversation from scratch on
+every turn ([#462](https://github.com/ohdearquant/lattice/issues/462), see
+[`docs/cross-turn-cache.md`](docs/cross-turn-cache.md)); a request whose history
+is not a safe append onto the retained state still falls back to a full
+re-prefill.
 
-MLX uses Apple's private MPS/AMX matrix engines. Lattice uses the public Metal compute API,
-the same tier as Ollama. Lattice's edge is
-portability (pure Rust, zero Python, zero framework) plus capabilities neither Ollama nor MLX
-provide for this model family:
+MLX uses Apple's private MPS/AMX matrix engines. Lattice uses the public Metal
+compute API, the same tier as Ollama. Lattice's edge is portability (pure Rust,
+zero Python, zero framework) plus capabilities neither Ollama nor MLX provide
+for this model family:
 
 | Capability                          | Lattice | MLX | Ollama |
 | ----------------------------------- | ------- | --- | ------ |
@@ -119,10 +133,11 @@ provide for this model family:
 | Q4 + LoRA inference                 | yes     | no  | no     |
 | Pure Rust, zero Python or framework | yes     | no  | no     |
 
-PPL benchmark (wikitext-2, from [`docs/bench_results/perplexity.tsv`](docs/bench_results/perplexity.tsv),
-regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8 15.82, q4 18.18
-(2041 tokens, carried from a prior reference run — see the TSV's provenance comments). Reproduce:
-`./scripts/bench_quality.sh`
+PPL benchmark (wikitext-2, from
+[`docs/bench_results/perplexity.tsv`](docs/bench_results/perplexity.tsv),
+regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
+15.82, q4 18.18 (2041 tokens, carried from a prior reference run — see the TSV's
+provenance comments). Reproduce: `./scripts/bench_quality.sh`
 
 ---
 
@@ -138,17 +153,21 @@ regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8
 | [`lattice-grammar`](crates/grammar/)               | Grammar-constrained decoding: JSON Schema and GBNF compilation, byte-level PDA, vocabulary masks; re-exported by `lattice-inference`                                  | [![](https://img.shields.io/crates/v/lattice-grammar.svg)](https://crates.io/crates/lattice-grammar)               |
 | [`lattice-weights`](crates/weights/)               | Weight storage: safetensors, f32/f16/Q3/Q4/Q8 representations and model-directory format detection; re-exported by `lattice-inference`                                | [![](https://img.shields.io/crates/v/lattice-weights.svg)](https://crates.io/crates/lattice-weights)               |
 | [`lattice-quant`](crates/quant/)                   | Quantization primitives: bounded Q4 manifest reading, Hadamard transforms and rotation absorption; re-exported by `lattice-inference`                                 | [![](https://img.shields.io/crates/v/lattice-quant.svg)](https://crates.io/crates/lattice-quant)                   |
-| [`lattice-model-config`](crates/model-config/)     | Model configurations: validated `config.json` parsing for Qwen3.5, Gemma 4, EmbeddingGemma 2 and BitNet; re-exported by `lattice-inference`                           | [![](https://img.shields.io/crates/v/lattice-model-config.svg)](https://crates.io/crates/lattice-model-config)     |
+| [`lattice-arch`](crates/arch/)                     | Model interface: generation types and sampling; validated `config.json` parsing for Qwen3.5, Gemma 4, EmbeddingGemma 2 and BitNet; re-exported by `lattice-inference` | [![](https://img.shields.io/crates/v/lattice-arch.svg)](https://crates.io/crates/lattice-arch)                     |
+| [`lattice-compute`](crates/compute/)               | Host-side compute: RoPE tables, KV caches, prefix reuse and LoRA hooks; re-exported by `lattice-inference`                                                            | [![](https://img.shields.io/crates/v/lattice-compute.svg)](https://crates.io/crates/lattice-compute)               |
+| [`lattice-model-io`](crates/model-io/)             | Model files: cache directory, checksum-verified downloads and environment switches; re-exported by `lattice-inference`                                                | [![](https://img.shields.io/crates/v/lattice-model-io.svg)](https://crates.io/crates/lattice-model-io)             |
 | [`lattice-inference-core`](crates/inference-core/) | Shared base types: `InferenceError`, re-exported by `lattice-inference`                                                                                               | [![](https://img.shields.io/crates/v/lattice-inference-core.svg)](https://crates.io/crates/lattice-inference-core) |
 | [`lattice-metal-runtime`](crates/metal-runtime/)   | Shared Metal buffers, command encoding and pipeline construction; macOS with the optional `metal-gpu` feature                                                         | [![](https://img.shields.io/crates/v/lattice-metal-runtime.svg)](https://crates.io/crates/lattice-metal-runtime)   |
 | [`lattice-serve`](crates/serve/)                   | HTTP server and the `lattice` CLI: OpenAI-compatible routes, model workers, LoRA serving; installed with `cargo install lattice-serve`                                | [![](https://img.shields.io/crates/v/lattice-serve.svg)](https://crates.io/crates/lattice-serve)                   |
 | [`lattice-transport`](crates/transport/)           | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport)           |
 
-Three leaf crates (`fann`, `transport`, `inference-core`) have zero intra-workspace
-dependencies. `tokenizer`, `grammar` and `weights` each depend only on `inference-core`
-at runtime. `model-config` depends on `inference-core` and `weights`; `quant` depends on those two and on `model-config`. `inference` depends on
-all six unconditionally and pulls in `fann` through
-the optional `mixture` or `metal-gpu` features. Each can be used on its own.
+Three leaf crates (`fann`, `transport`, `inference-core`) have zero
+intra-workspace dependencies. `tokenizer`, `grammar` and `weights` each depend
+only on `inference-core` at runtime, as does `model-io`. `arch` depends on `inference-core`
+and `weights`; `quant` depends on those two and on `arch`, and `compute`
+on `inference-core` and `arch`. `inference` depends on all eight
+unconditionally and pulls in `fann` through the optional `mixture` or
+`metal-gpu` features. Each can be used on its own.
 
 ---
 
@@ -189,8 +208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Model weights are downloaded from HuggingFace on first use and cached at `~/.lattice/models`
-(or `$LATTICE_MODEL_CACHE`).
+Model weights are downloaded from HuggingFace on first use and cached at
+`~/.lattice/models` (or `$LATTICE_MODEL_CACHE`).
 
 ### GPU acceleration (macOS)
 
@@ -198,9 +217,9 @@ Model weights are downloaded from HuggingFace on first use and cached at `~/.lat
 lattice-embed = { version = "0.12", features = ["metal-gpu"] }
 ```
 
-`lattice-embed` does not have a `wgpu-gpu` feature; cross-platform WGPU acceleration is a
-`lattice-inference`-level feature (see the Feature Flags table below) and is not currently
-forwarded through `lattice-embed`.
+`lattice-embed` does not have a `wgpu-gpu` feature; cross-platform WGPU
+acceleration is a `lattice-inference`-level feature (see the Feature Flags table
+below) and is not currently forwarded through `lattice-embed`.
 
 ---
 
@@ -210,7 +229,8 @@ forwarded through `lattice-embed`.
 
 Three ways to get `lattice`, in order of convenience:
 
-**1. `cargo install` (from [crates.io](https://crates.io/crates/lattice-serve)):**
+**1. `cargo install` (from
+[crates.io](https://crates.io/crates/lattice-serve)):**
 
 ```bash
 # CPU build (Linux/macOS). BF16/F16 safetensors load in every feature set;
@@ -231,9 +251,9 @@ Releases before 0.16 shipped the CLI in `lattice-inference`
 [GitHub releases](https://github.com/ohdearquant/lattice/releases) ship
 `lattice-<version>-<target>.tar.gz` for `aarch64-apple-darwin` (macOS,
 Metal-enabled), `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`
-(both CPU-only), plus a matching `.sha256` file. Check the release's Assets
-list first: releases published before this workflow landed have no prebuilt
-binaries (use `cargo install` for those versions).
+(both CPU-only), plus a matching `.sha256` file. Check the release's Assets list
+first: releases published before this workflow landed have no prebuilt binaries
+(use `cargo install` for those versions).
 
 ```bash
 VERSION=<version>   # replace with a release whose Assets list includes lattice-* tarballs
@@ -303,31 +323,33 @@ lattice chat --model ~/.lattice/models/qwen3.5-0.8b
 ```
 
 Beyond the unified `lattice` binary, several standalone tools live in
-`crates/inference/src/bin/` for quantization, direct Metal-GPU chat, perplexity scoring, and
-LoRA-mixture benchmarking — see [`docs/cli-tools.md`](docs/cli-tools.md) for verified command
-sequences and flag references.
+`crates/inference/src/bin/` for quantization, direct Metal-GPU chat, perplexity
+scoring, and LoRA-mixture benchmarking — see
+[`docs/cli-tools.md`](docs/cli-tools.md) for verified command sequences and flag
+references.
 
 ### Raspberry Pi / ARM Linux (aarch64)
 
 Lattice builds and runs on 64-bit ARM Linux with no GPU: the CPU path dispatches
-hand-written NEON kernels at runtime. Linux aarch64 is part of CI (`ubuntu-24.04-arm`),
-and the same steps apply to a Raspberry Pi running a 64-bit OS.
+hand-written NEON kernels at runtime. Linux aarch64 is part of CI
+(`ubuntu-24.04-arm`), and the same steps apply to a Raspberry Pi running a
+64-bit OS.
 
 Requirements and tips:
 
-- **64-bit OS required.** Raspberry Pi OS (64-bit) or Ubuntu Server for Pi. Check with
-  `uname -m` — it must say `aarch64`, not `armv7l`.
-- **Rust via rustup** (1.93+): `curl https://sh.rustup.rs -sSf | sh`, then build with
-  `--features f16` exactly as above — without it, BF16/F16 checkpoints fail at load
-  time. Leave `metal-gpu` off — it is macOS-only.
-- **Memory: 8 GB strongly recommended for chat models.** The CPU path converts bf16
-  weights to f32 in RAM, so Qwen3.5-0.8B occupies roughly 3.2 GB steady-state plus KV
-  cache and activations — and the load-time peak is higher still, because the mapped
-  bf16 source and converted f32 tensors coexist during conversion. On a 4 GB board this
-  will swap-thrash or be OOM-killed. Embedding models are much smaller (bge-small is
-  ~130 MB) and run comfortably on 4 GB.
-- **Get a chat model** the same way as on macOS — download from HuggingFace and point
-  `--model` at the directory:
+- **64-bit OS required.** Raspberry Pi OS (64-bit) or Ubuntu Server for Pi.
+  Check with `uname -m` — it must say `aarch64`, not `armv7l`.
+- **Rust via rustup** (1.93+): `curl https://sh.rustup.rs -sSf | sh`, then build
+  with `--features f16` exactly as above — without it, BF16/F16 checkpoints fail
+  at load time. Leave `metal-gpu` off — it is macOS-only.
+- **Memory: 8 GB strongly recommended for chat models.** The CPU path converts
+  bf16 weights to f32 in RAM, so Qwen3.5-0.8B occupies roughly 3.2 GB
+  steady-state plus KV cache and activations — and the load-time peak is higher
+  still, because the mapped bf16 source and converted f32 tensors coexist during
+  conversion. On a 4 GB board this will swap-thrash or be OOM-killed. Embedding
+  models are much smaller (bge-small is ~130 MB) and run comfortably on 4 GB.
+- **Get a chat model** the same way as on macOS — download from HuggingFace and
+  point `--model` at the directory:
 
   ```bash
   pip install -U "huggingface_hub[cli]"
@@ -335,14 +357,15 @@ Requirements and tips:
   ./target/release/lattice chat --model ~/.lattice/models/qwen3.5-0.8b
   ```
 
-- **Compile time:** a release build takes a while on a Pi (expect tens of minutes on a
-  Pi 5). Cross-compiling from a faster machine with target `aarch64-unknown-linux-gnu`
-  works too.
-- **Set expectations:** this is a CPU-only, memory-bandwidth-bound path. Decode speed is
-  far below the Apple Silicon numbers in the benchmark table above — treat a Pi as a
-  functional target for experimenting with a fully self-contained Rust inference stack,
-  not a fast one. We haven't published Pi throughput numbers yet; benchmark reports from
-  real boards are welcome in the issues.
+- **Compile time:** a release build takes a while on a Pi (expect tens of
+  minutes on a Pi 5). Cross-compiling from a faster machine with target
+  `aarch64-unknown-linux-gnu` works too.
+- **Set expectations:** this is a CPU-only, memory-bandwidth-bound path. Decode
+  speed is far below the Apple Silicon numbers in the benchmark table above —
+  treat a Pi as a functional target for experimenting with a fully
+  self-contained Rust inference stack, not a fast one. We haven't published Pi
+  throughput numbers yet; benchmark reports from real boards are welcome in the
+  issues.
 
 ### HTTP API
 
@@ -363,13 +386,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ## Lattice Studio (macOS App)
 
-Lattice Studio is a native SwiftUI app for macOS 14+. It wraps the Rust engine in an
-instrument-panel interface: live loss curves, before/after quantization comparisons,
-multi-turn chat, and a model library manager.
+Lattice Studio is a native SwiftUI app for macOS 14+. It wraps the Rust engine
+in an instrument-panel interface: live loss curves, before/after quantization
+comparisons, multi-turn chat, and a model library manager.
 
-> New to the app? [`apps/macos/INSTALL.md`](apps/macos/INSTALL.md) is a step-by-step
-> install, get-a-model, and first-chat guide. The reference below covers building the
-> bundle and what each screen does.
+> New to the app? [`apps/macos/INSTALL.md`](apps/macos/INSTALL.md) is a
+> step-by-step install, get-a-model, and first-chat guide. The reference below
+> covers building the bundle and what each screen does.
 
 ### Build and package
 
@@ -378,10 +401,10 @@ multi-turn chat, and a model library manager.
 ./apps/macos/scripts/package-app.sh
 ```
 
-This builds the Swift frontend, compiles all ten Rust engine binaries in release mode, and
-assembles a self-contained `Lattice.app` bundle at `apps/macos/dist/`. `Lattice.dmg` and
-`Lattice.zip` are also produced. The packaged app needs no Rust toolchain on the recipient
-machine.
+This builds the Swift frontend, compiles all ten Rust engine binaries in release
+mode, and assembles a self-contained `Lattice.app` bundle at `apps/macos/dist/`.
+`Lattice.dmg` and `Lattice.zip` are also produced. The packaged app needs no
+Rust toolchain on the recipient machine.
 
 ```bash
 # Skip Swift rebuild (use existing build output)
@@ -395,9 +418,9 @@ machine.
 
 Drag `Lattice.app` from the `.dmg` to `/Applications`.
 
-The app is ad-hoc signed. On first launch, right-click and choose "Open" to bypass
-Gatekeeper, then click "Open" in the dialog. macOS remembers the exception for subsequent
-launches. Alternatively:
+The app is ad-hoc signed. On first launch, right-click and choose "Open" to
+bypass Gatekeeper, then click "Open" in the dialog. macOS remembers the
+exception for subsequent launches. Alternatively:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Lattice.app
@@ -405,32 +428,36 @@ xattr -dr com.apple.quarantine /Applications/Lattice.app
 
 ### What is in Lattice Studio
 
-**Models (cmd-1).** A table of all local models and adapters under `~/.lattice/models`, with
-file manifests, config details (18 GatedDeltaNet + 6 GQA layers called out explicitly), and
-Download/Verify/Reveal in Finder actions.
+**Models (cmd-1).** A table of all local models and adapters under
+`~/.lattice/models`, with file manifests, config details (18 GatedDeltaNet + 6
+GQA layers called out explicitly), and Download/Verify/Reveal in Finder actions.
 
-**Train (cmd-2).** LoRA fine-tuning with a live loss oscilloscope. A 56-point hero loss numeral
-ticks digit-by-digit as the run progresses. Scrub the loss curve to freeze all metric readouts
-(lr, grad-norm, tok/s, ETA) to any step. Results stream as line-delimited JSON from the engine.
+**Train (cmd-2).** LoRA fine-tuning with a live loss oscilloscope. A 56-point
+hero loss numeral ticks digit-by-digit as the run progresses. Scrub the loss
+curve to freeze all metric readouts (lr, grad-norm, tok/s, ETA) to any step.
+Results stream as line-delimited JSON from the engine.
 
-**Quantize (cmd-3).** Q4 or QuaRot quantization. A side-by-side comparison shows size,
-bits, and estimated PPL before and after. True-scale bars animate to show the compression
-ratio. A gate pill states the result: PASS, WARN, or FAIL.
+**Quantize (cmd-3).** Q4 or QuaRot quantization. A side-by-side comparison shows
+size, bits, and estimated PPL before and after. True-scale bars animate to show
+the compression ratio. A gate pill states the result: PASS, WARN, or FAIL.
 
-**Chat (cmd-4).** A single streaming transcript replays completed turns into each prompt. The GPU
-path reuses a persistent `chat_metal --serve` process so the selected model stays resident between
-turns; the CPU path launches `generate_lora` once per turn. The shipped Chat screen does not yet
-expose adapter selection or parallel base-vs.-adapter comparison.
+**Chat (cmd-4).** A single streaming transcript replays completed turns into
+each prompt. The GPU path reuses a persistent `chat_metal --serve` process so
+the selected model stays resident between turns; the CPU path launches
+`generate_lora` once per turn. The shipped Chat screen does not yet expose
+adapter selection or parallel base-vs.-adapter comparison.
 
-**Data (cmd-5).** Paste raw text or load files. Preview the derived `{prompt, completion}` pairs
-as a JSONL table, validate token counts (using the same tokenizer the engine uses), and export
-straight into the Train dataset field.
+**Data (cmd-5).** Paste raw text or load files. Preview the derived
+`{prompt, completion}` pairs as a JSONL table, validate token counts (using the
+same tokenizer the engine uses), and export straight into the Train dataset
+field.
 
-**Runs (cmd-6).** Archive of every training and quantization run. Select a row to reopen its
-exact config and view the frozen loss curve.
+**Runs (cmd-6).** Archive of every training and quantization run. Select a row
+to reopen its exact config and view the frozen loss curve.
 
 The command bar (cmd-K) runs everything from a single keyboard shortcut:
-`train qwen3.5 r8` or `quantize quarot` parse into argument chips and fire a run.
+`train qwen3.5 r8` or `quantize quarot` parse into argument chips and fire a
+run.
 
 ---
 
@@ -450,9 +477,9 @@ The command bar (cmd-K) runs everything from a single keyboard shortcut:
 | `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   | 1024  | 2048       | local dir only |
 | `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     | 2560* | 2048       | local dir only |
 
-*Qwen3-Embedding-4B and 0.6B support MRL truncation to any dimension >= 32.
-BGE v1.5 uses CLS pooling. E5 and MiniLM use mean pooling.
-E5 `embed_passage()` applies the `"passage: "` prefix automatically.
+*Qwen3-Embedding-4B and 0.6B support MRL truncation to any dimension >= 32. BGE
+v1.5 uses CLS pooling. E5 and MiniLM use mean pooling. E5 `embed_passage()`
+applies the `"passage: "` prefix automatically.
 
 ### Generation models (local files required)
 
@@ -463,8 +490,9 @@ E5 `embed_passage()` applies the `"passage: "` prefix automatically.
 | `Qwen35Config::qwen36_35b_a3b` | 40 layers, MoE 256 experts top-8. Config and weight loader supported.                                            |
 | `Qwen35Config::qwen36_27b`     | 64 layers, 5120 hidden, dense FFN. Runs in `lattice chat`/`serve` from a native Q4 checkpoint (Metal GPU build). |
 
-The Qwen3.5 architecture uses a hybrid of 18 GatedDeltaNet layers and 6 GQA attention layers.
-Lattice is the only open-source engine that correctly runs this hybrid recurrence at Q4 on Apple Silicon.
+The Qwen3.5 architecture uses a hybrid of 18 GatedDeltaNet layers and 6 GQA
+attention layers. Lattice is the only open-source engine that correctly runs
+this hybrid recurrence at Q4 on Apple Silicon.
 
 ---
 
@@ -497,7 +525,8 @@ let config = ModelConfig::try_new(EmbeddingModel::Qwen3Embedding4B, Some(512))?;
 
 ## Vector Operations
 
-`lattice-embed` exposes SIMD-accelerated vector utilities as a stable public API:
+`lattice-embed` exposes SIMD-accelerated vector utilities as a stable public
+API:
 
 ```rust
 use lattice_embed::utils;
@@ -513,7 +542,8 @@ utils::normalize(&mut vector);  // in-place L2 normalization
 let sims = utils::batch_cosine_similarity(&pairs);
 ```
 
-Measured performance on normalized vectors (internal benchmarks, subject to hardware):
+Measured performance on normalized vectors (internal benchmarks, subject to
+hardware):
 
 | Operation                    | Scalar   | SIMD    |
 | ---------------------------- | -------- | ------- |
@@ -560,14 +590,22 @@ flowchart TD
     Inference --> Grammar[lattice-grammar]
     Inference --> Weights[lattice-weights]
     Inference --> Quant[lattice-quant]
-    Inference --> ModelConfig[lattice-model-config]
+    Inference --> Arch[lattice-arch]
+    Inference --> Compute[lattice-compute]
+    Inference --> ModelIo[lattice-model-io]
+    ModelIo --> Core
+    Compute --> Core
+    Compute --> Arch
+    Compute --> Tokenizer
+    Compute --> Weights
     Grammar --> Core
     Weights --> Core
     Quant --> Core
     Quant --> Weights
-    Quant --> ModelConfig
-    ModelConfig --> Core
-    ModelConfig --> Weights
+    Quant --> Arch
+    Arch --> Core
+    Arch --> Grammar
+    Arch --> Weights
     Inference -.->|mixture or metal-gpu| Fann[lattice-fann]
     Inference -.->|metal-gpu| MetalRuntime[lattice-metal-runtime]
     MetalRuntime --> Core
@@ -578,14 +616,15 @@ flowchart TD
 ```
 
 Arrows point from consumers to dependencies; dashed arrows are feature-gated.
-The diagram shows production dependencies. `lattice-tokenizer` owns tokenization,
-with supported compatibility exports under `lattice-inference::tokenizer`.
-`lattice-inference-core` owns shared base types such as `InferenceError`.
+The diagram shows production dependencies. `lattice-tokenizer` owns
+tokenization, with supported compatibility exports under
+`lattice-inference::tokenizer`. `lattice-inference-core` owns shared base types
+such as `InferenceError`.
 
-Inference uses CPU kernels (AVX2/NEON) by default. Metal on macOS (`metal-gpu`) and
-WGPU for cross-platform acceleration (`wgpu-gpu`) are opt-in backends. `lattice-tune`
-builds without inference by default; its inference integration requires
-`inference-hook` or `train-backward`.
+Inference uses CPU kernels (AVX2/NEON) by default. Metal on macOS (`metal-gpu`)
+and WGPU for cross-platform acceleration (`wgpu-gpu`) are opt-in backends.
+`lattice-tune` builds without inference by default; its inference integration
+requires `inference-hook` or `train-backward`.
 
 ---
 
@@ -609,8 +648,8 @@ cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_decode
 uv run --with mlx-lm python3 scripts/bench_decode_harness.py run --profile context_scaling --allow-missing-engine
 ```
 
-Performance depends on hardware, model size, batch size, and sequence length. Run benchmarks
-on your target hardware for representative numbers.
+Performance depends on hardware, model size, batch size, and sequence length.
+Run benchmarks on your target hardware for representative numbers.
 
 ---
 
@@ -618,11 +657,12 @@ on your target hardware for representative numbers.
 
 Three capability lanes are next for the engine:
 
-- **Vision tensors**: image input through the pure-Rust graph, from patch embedding through a
-  vision encoder and projector into the language model.
-- **Audio tensors**: on-device speech, starting with a mel-spectrogram frontend and audio
-  encoder for speech input; speech output follows.
-- **Gemma 4 model family**: broaden the engine beyond Qwen with a second model family.
+- **Vision tensors**: image input through the pure-Rust graph, from patch
+  embedding through a vision encoder and projector into the language model.
+- **Audio tensors**: on-device speech, starting with a mel-spectrogram frontend
+  and audio encoder for speech input; speech output follows.
+- **Gemma 4 model family**: broaden the engine beyond Qwen with a second model
+  family.
 
 Tracking issues with first-milestone slices: see the
 [issue tracker](https://github.com/ohdearquant/lattice/issues).
@@ -631,25 +671,29 @@ Tracking issues with first-milestone slices: see the
 
 ## Documentation
 
-- [Architecture](docs/architecture.md): crate dependency graph, design decisions, stability tiers
-- [Models](docs/models.md): full model support matrix, attention variants, inference features
+- [Architecture](docs/architecture.md): crate dependency graph, design
+  decisions, stability tiers
+- [Models](docs/models.md): full model support matrix, attention variants,
+  inference features
 - [Getting started](docs/getting-started.md): step-by-step setup guide
 - [Examples](docs/examples.md): code samples for common tasks
-- [CLI tool walkthroughs](docs/cli-tools.md): verified command sequences for `quantize_q4`,
-  `chat_metal`'s full flag surface, `ppl_metal`, and `bench_lora_mixture`
-- [Capability matrix](docs/capability-matrix.md): `lattice` CLI vs `lattice_serve` endpoint/field parity
+- [CLI tool walkthroughs](docs/cli-tools.md): verified command sequences for
+  `quantize_q4`, `chat_metal`'s full flag surface, `ppl_metal`, and
+  `bench_lora_mixture`
+- [Capability matrix](docs/capability-matrix.md): `lattice` CLI vs
+  `lattice_serve` endpoint/field parity
 - ADR directory: `docs/adr/`
 
 ---
 
 ## Development checks
 
-`make lint-docs` checks tracked Markdown with Deno and runs the capability-fixture,
-path and source-marker checks. The source-marker check requires ripgrep (`rg`) and
-fails rather than skipping when it is absent, so it never reports a tree it did not
-scan. Without Deno, the default command still runs the other checks
-and names the skipped Markdown checks in its final line. `--format` and
-`--markdown-only` always require Deno.
+`make lint-docs` checks tracked Markdown with Deno and runs the
+capability-fixture, path and source-marker checks. The source-marker check
+requires ripgrep (`rg`) and fails rather than skipping when it is absent, so it
+never reports a tree it did not scan. Without Deno, the default command still
+runs the other checks and names the skipped Markdown checks in its final line.
+`--format` and `--markdown-only` always require Deno.
 
 The CI job that installs Deno requires its presence. Other verification machines
 provisioned with Deno should opt in too:
@@ -664,18 +708,20 @@ variable when the same requirement should apply to `make ci` or Git hooks.
 
 ## Publishing
 
-[`scripts/publish.sh`](scripts/publish.sh) publishes dependencies before dependents:
+[`scripts/publish.sh`](scripts/publish.sh) publishes dependencies before
+dependents:
 
 1. `fann`, `transport`, and `inference-core` (leaves).
-2. `tokenizer`, `grammar`, `weights`, and `metal-runtime`.
-3. `model-config`.
-4. `quant`.
+2. `tokenizer`, `grammar`, `weights`, `metal-runtime`, and `model-io`.
+3. `arch`.
+4. `quant` and `compute`.
 5. `inference`.
 6. `embed`, `tune` and `serve`.
 
-The script waits 30 seconds between tiers for registry indexing. Its dry-run mode
-checks package sizes for all thirteen crates, then runs `cargo publish --dry-run` for
-the leaf tier only; later tiers require this release's dependencies on crates.io.
+The script waits 30 seconds between tiers for registry indexing. Its dry-run
+mode checks package sizes for all fifteen crates, then runs
+`cargo publish --dry-run` for the leaf tier only; later tiers require this
+release's dependencies on crates.io.
 
 ```bash
 make publish
@@ -685,10 +731,12 @@ make publish
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
-this work shall be dual-licensed as above, without any additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work shall be dual-licensed as above, without any
+additional terms or conditions.
 
 Built by [Ocean (HaiyangLi)](https://github.com/ohdearquant). Powers
 [khive](https://khive.ai), a cognitive infrastructure for AI agents.

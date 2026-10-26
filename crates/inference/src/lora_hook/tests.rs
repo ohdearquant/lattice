@@ -1,5 +1,4 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn qwen35_projection_shape_covers_full_attention_modules() {
@@ -180,74 +179,75 @@ fn qwen35_projection_shape_rejects_unknown_and_out_of_range_targets() {
     );
 }
 
-struct RowSensitiveHook {
-    calls: AtomicUsize,
-}
-
-impl LoraHook for RowSensitiveHook {
-    fn apply(&self, _layer_idx: usize, _module: &str, x: &[f32], output: &mut [f32]) {
-        assert_eq!(x.len(), 2);
-        assert_eq!(output.len(), 3);
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        output.fill(x[0]);
-    }
-}
-
 #[test]
-fn applies_lora_to_each_flattened_token_row() {
-    let hook = RowSensitiveHook {
-        calls: AtomicUsize::new(0),
-    };
-    let input = [1.0, 10.0, 2.0, 20.0, 3.0, 30.0];
-    let mut output = [0.0; 9];
-
-    apply_lora_rows(&hook, 0, "projection", &input, &mut output, 2, 3);
-
-    assert_eq!(hook.calls.load(Ordering::Relaxed), 3);
-    assert_eq!(output, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0]);
-}
-
-struct InactiveHook {
-    calls: AtomicUsize,
-}
-
-impl LoraHook for InactiveHook {
-    fn apply(&self, _layer_idx: usize, _module: &str, _x: &[f32], _output: &mut [f32]) {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn is_active(&self, _layer_idx: usize, _module: &str) -> bool {
-        false
-    }
-}
-
-/// A hook that reports `is_active == false` for a projection must never
-/// have `apply` dispatched for any row of that projection: `apply_lora_rows`
-/// checks activity once, before the per-row loop, not per row.
-#[test]
-fn skips_the_per_row_loop_entirely_when_the_hook_is_inactive() {
-    let hook = InactiveHook {
-        calls: AtomicUsize::new(0),
-    };
-    let input = [1.0, 10.0, 2.0, 20.0, 3.0, 30.0];
-    let mut output = [7.0; 9];
-
-    apply_lora_rows(&hook, 0, "projection", &input, &mut output, 2, 3);
-
-    assert_eq!(
-        hook.calls.load(Ordering::Relaxed),
-        0,
-        "apply must not be called for any row when is_active is false"
+fn row_helper_is_the_same_function_item() {
+    fn same_function<F>(_: F, _: F) {}
+    same_function(
+        super::apply_lora_rows,
+        lattice_compute::lora_hook::apply_lora_rows,
     );
-    assert_eq!(output, [7.0; 9], "output must be untouched");
 }
 
-/// `NoopLoraHook` (the default when no adapter is loaded) must report
-/// itself inactive for every projection, so the default (no-adapter)
-/// path stays off the per-row virtual-dispatch cost.
 #[test]
-fn noop_hook_reports_inactive_for_any_projection() {
-    let hook = NoopLoraHook;
-    assert!(!hook.is_active(0, "query"));
-    assert!(!hook.is_active(41, "ffn_output"));
+fn qwen_geometry_matches_projection_helper_for_both_layer_kinds_and_errors() {
+    let modules = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_b",
+        "in_proj_a",
+        "out_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "query",
+        "unknown",
+    ];
+    for config in [Qwen35Config::qwen35_0_8b(), Qwen35Config::qwen36_35b_a3b()] {
+        let geometry = Qwen35LoraGeometry::new(&config);
+        assert_eq!(geometry.num_layers(), config.num_hidden_layers);
+        let full = (0..config.num_hidden_layers)
+            .find(|&layer| config.is_full_attention(layer))
+            .unwrap();
+        let linear = (0..config.num_hidden_layers)
+            .find(|&layer| !config.is_full_attention(layer))
+            .unwrap();
+        for layer in [full, linear, config.num_hidden_layers] {
+            for module in modules {
+                assert_eq!(
+                    geometry.projection_shape(layer, module),
+                    qwen35_projection_shape(&config, layer, module),
+                    "layer {layer}, module {module}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bert_geometry_preserves_projection_direction_and_rejects_invalid_targets() {
+    let geometry = BertLoraGeometry::new(2, 7, 19);
+    assert_eq!(geometry.num_layers(), 2);
+    for layer in 0..geometry.num_layers() {
+        for (module, d_in, d_out) in [
+            ("query", 7, 7),
+            ("key", 7, 7),
+            ("value", 7, 7),
+            ("attn_output", 7, 7),
+            ("ffn_intermediate", 7, 19),
+            ("ffn_output", 19, 7),
+        ] {
+            assert_eq!(
+                geometry.projection_shape(layer, module),
+                Ok(LoraProjectionShape { d_in, d_out })
+            );
+        }
+    }
+    let unknown = geometry.projection_shape(1, "q_proj").unwrap_err();
+    assert!(unknown.contains("q_proj") && unknown.contains("layer 1"));
+    let out_of_range = geometry.projection_shape(2, "query").unwrap_err();
+    assert!(out_of_range.contains("query") && out_of_range.contains("layer 2"));
 }

@@ -60,9 +60,10 @@ fn test_partial_rope_only_rotates_first_quarter() {
 #[test]
 fn test_sample_greedy() {
     let logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
-    let cfg = crate::generation::GenerateConfig {
-        temperature: 0.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.temperature = 0.0;
+        config
     };
     let mut rng = 1u64;
     let token = sample_token(&logits, &cfg, &[], &mut rng);
@@ -73,10 +74,11 @@ fn test_sample_greedy() {
 fn test_sample_repetition_penalty() {
     // Token 3 has highest logit but gets penalized
     let logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
-    let cfg = crate::generation::GenerateConfig {
-        temperature: 0.0,
-        repetition_penalty: 100.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.temperature = 0.0;
+        config.repetition_penalty = 100.0;
+        config
     };
     let mut rng = 1u64;
     let token = sample_token(&logits, &cfg, &[3], &mut rng);
@@ -93,10 +95,11 @@ fn test_repetition_penalty_applied_once_per_repeated_id() {
     // matching HF and the Metal `CandidateSet` path — not once per occurrence
     // (which compounds to penalty^N and over-suppresses as the sequence grows).
     let logits = vec![0.0, 10.0, 3.0];
-    let cfg = crate::generation::GenerateConfig {
-        temperature: 0.0,
-        repetition_penalty: 2.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.temperature = 0.0;
+        config.repetition_penalty = 2.0;
+        config
     };
     let mut rng = 1u64;
     // Token 1 appears TWICE in the history. Penalized once: 10/2 = 5 (beats token 2's 3).
@@ -116,12 +119,13 @@ fn test_sample_nonfinite_temperature_is_greedy() {
     // forces the categorical path that would otherwise mis-sample.
     let logits = vec![0.0, 100.0, 99.0];
     for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        let cfg = crate::generation::GenerateConfig {
-            temperature: bad,
-            top_k: 2,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
+        let cfg = {
+            let mut config = crate::generation::GenerateConfig::default();
+            config.temperature = bad;
+            config.top_k = 2;
+            config.top_p = 1.0;
+            config.repetition_penalty = 1.0;
+            config
         };
         let mut rng = 7u64;
         let token = sample_token(&logits, &cfg, &[], &mut rng);
@@ -393,10 +397,11 @@ fn test_qwen36_greedy_one_token_smoke() {
         .expect("set LATTICE_QWEN36_MODEL_DIR to a Qwen3.6 checkpoint directory");
     let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
         .expect("Qwen3.6 MoE model should load successfully");
-    let cfg = crate::generation::GenerateConfig {
-        max_new_tokens: 1,
-        temperature: 0.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config
     };
     let out = model.generate("Hello", &cfg).expect("generate succeeds");
     assert_eq!(
@@ -418,7 +423,9 @@ fn test_qwen36_greedy_one_token_smoke() {
 // ---------------------------------------------------------------------------
 mod lora_serving {
     use super::super::*;
-    use crate::attention::gdn::{GatedDeltaNetState, GatedDeltaNetWeights};
+    use crate::attention::gdn::{
+        GatedDeltaNetState, GatedDeltaNetWeights, require_qwen35_gdn_geometry,
+    };
     use crate::lora_hook::{LoraHook, NoopLoraHook};
     use crate::model::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
     use crate::rope::RopeTable;
@@ -601,7 +608,7 @@ mod lora_serving {
     /// Allocate the per-call mutable state `forward_step` needs.
     fn fresh_state(cfg: &Qwen35Config) -> (Vec<GatedDeltaNetState>, KvCache, ForwardScratch) {
         let gdn = (0..cfg.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(cfg)))
             .collect();
         let kv = KvCache::new(cfg.num_full_attention_layers());
         (gdn, kv, ForwardScratch::new())
@@ -783,6 +790,8 @@ mod lora_serving {
                  rejected this hook via validate_against before installing it"
             );
         }
+        // Keep the legacy-only validation compatibility witness.
+        #[allow(deprecated)]
         fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
             Err("synthetic shape mismatch".to_string())
         }
@@ -882,9 +891,10 @@ mod lora_serving {
         // forward pass, so a synthetic model is sufficient to exercise it.
         let cfg = test_config();
         let model = build_model(cfg.clone(), 0xBEEF_F00D);
-        let gen_cfg = crate::generation::GenerateConfig {
-            max_new_tokens: 0,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = crate::generation::GenerateConfig::default();
+            config.max_new_tokens = 0;
+            config
         };
         let out = model
             .generate("abc", &gen_cfg)
@@ -907,9 +917,10 @@ mod lora_serving {
         let cfg = test_config();
         let model = build_model(cfg, 0xBEEF_CAFE);
         let max_context = model.max_context();
-        let gen_cfg = crate::generation::GenerateConfig {
-            max_new_tokens: max_context + 16,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = crate::generation::GenerateConfig::default();
+            config.max_new_tokens = max_context + 16;
+            config
         };
         let err = model
             .generate("abc", &gen_cfg)
@@ -929,9 +940,10 @@ mod lora_serving {
         let cfg = test_config();
         let model = build_model(cfg, 0xBEEF_CAFD);
         let max_context = model.max_context();
-        let gen_cfg = crate::generation::GenerateConfig {
-            max_new_tokens: max_context + 16,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = crate::generation::GenerateConfig::default();
+            config.max_new_tokens = max_context + 16;
+            config
         };
         let mut emitted = 0usize;
         let err = model
@@ -995,4 +1007,79 @@ fn from_safetensors_missing_config_json_is_hard_error() {
         "error must name the missing config.json, not a guessed preset: {msg}"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+mod lora_geometry_validation {
+    use crate::lora_hook::{LoraHook, LoraTargetGeometry};
+    use crate::model::qwen35_config::Qwen35Config;
+    use std::sync::{Arc, Mutex};
+
+    struct PreviousHook;
+    impl LoraHook for PreviousHook {
+        fn apply(&self, _layer: usize, _module: &str, _input: &[f32], output: &mut [f32]) {
+            output.fill(17.0);
+        }
+    }
+
+    struct RejectingHook {
+        reject_old: bool,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+    impl LoraHook for RejectingHook {
+        fn apply(&self, _layer: usize, _module: &str, _input: &[f32], _output: &mut [f32]) {
+            panic!("a rejected hook must not replace the previous hook");
+        }
+        // Keep the legacy-only validation compatibility witness.
+        #[allow(deprecated)]
+        fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
+            self.calls.lock().unwrap().push("old");
+            if self.reject_old {
+                Err("legacy rejection".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        fn validate_geometry(&self, _geometry: &dyn LoraTargetGeometry) -> Result<(), String> {
+            self.calls.lock().unwrap().push("new");
+            if self.reject_old {
+                Ok(())
+            } else {
+                Err("neutral rejection".to_string())
+            }
+        }
+    }
+
+    fn assert_rejection_preserves_previous_hook(reject_old: bool) {
+        let mut model = super::super::test_support::tiny_zero_model_with_context(32);
+        model.set_lora(Box::new(PreviousHook)).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let error = model
+            .set_lora(Box::new(RejectingHook {
+                reject_old,
+                calls: Arc::clone(&calls),
+            }))
+            .unwrap_err();
+        assert!(matches!(error, crate::InferenceError::InvalidInput(_)));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            if reject_old {
+                vec!["old"]
+            } else {
+                vec!["old", "new"]
+            }
+        );
+        let mut output = [0.0];
+        model.lora.apply(0, "query", &[0.0], &mut output);
+        assert_eq!(output, [17.0]);
+    }
+
+    #[test]
+    fn set_lora_rejects_new_geometry_without_replacing_previous_hook() {
+        assert_rejection_preserves_previous_hook(false);
+    }
+
+    #[test]
+    fn set_lora_preserves_legacy_rejection_before_neutral_validation() {
+        assert_rejection_preserves_previous_hook(true);
+    }
 }

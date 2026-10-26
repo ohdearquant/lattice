@@ -37,7 +37,7 @@ use super::{
     MetadataRequest, PredictionId, PredictionLedger, SelectOutcome, SelectionCandidate,
     SelectionRequest, StepStamp, TokenMetadata,
 };
-use crate::attention::gdn::GatedDeltaNetState;
+use crate::attention::gdn::{GatedDeltaNetState, require_qwen35_gdn_geometry};
 use crate::error::InferenceError;
 use crate::forward::cpu_f16::forward_step_f16;
 use crate::forward::cpu_q8::forward_step_q8_with_scratch;
@@ -62,12 +62,7 @@ pub(crate) enum StandaloneWeights<'w> {
 }
 
 /// The standalone wrappers fail closed on all four optional controls, so none is declared.
-const CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
-    grammar: false,
-    logprobs: false,
-    stop_strings: false,
-    reasoning_budget: false,
-};
+const CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::none();
 
 pub(crate) struct StandaloneCpuSession<'w> {
     weights: StandaloneWeights<'w>,
@@ -106,13 +101,14 @@ fn q8_scratch_max_cols(
 
 impl<'w> StandaloneCpuSession<'w> {
     /// Allocates fresh recurrent state, KV cache and scratch for the planned prompt. The RNG
-    /// state comes from the plan, which already normalized the request's seed.
+    /// state comes from the plan, which already normalized the request's seed. Fails only when
+    /// the process has spent every prediction-ledger identity.
     pub(crate) fn new(
         weights: StandaloneWeights<'w>,
         cfg: &'w Qwen35Config,
         rope: &'w RopeTable,
         plan: GenerationPlan,
-    ) -> Self {
+    ) -> Result<Self, InferenceError> {
         let GenerationPlan {
             rng_state,
             prompt_ids,
@@ -136,8 +132,9 @@ impl<'w> StandaloneCpuSession<'w> {
             }
         }
 
+        let gdn_geometry = require_qwen35_gdn_geometry(cfg);
         let gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
-            .map(|_| GatedDeltaNetState::new(cfg))
+            .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();
         let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
         let mut scratch = ForwardScratch::new();
@@ -147,7 +144,7 @@ impl<'w> StandaloneCpuSession<'w> {
             scratch.ensure_capacity(cfg, required_capacity);
         }
 
-        Self {
+        Ok(Self {
             weights,
             cfg,
             rope,
@@ -158,9 +155,9 @@ impl<'w> StandaloneCpuSession<'w> {
             prompt_ids,
             prompt_len,
             rng_state,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new()?,
             prefilled: false,
-        }
+        })
     }
 
     fn forward(&mut self, token_id: u32, position: usize) -> Result<(), InferenceError> {
@@ -240,10 +237,7 @@ impl DecoderSession for StandaloneCpuSession<'_> {
         }
         self.kv_cache.seq_len = self.prompt_len;
 
-        Ok(StepStamp {
-            evaluated_len: self.kv_cache.seq_len,
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.kv_cache.seq_len, None))
     }
 
     /// Consumes the accepted token's prediction before the forward pass, so a stale, foreign
@@ -263,10 +257,7 @@ impl DecoderSession for StandaloneCpuSession<'_> {
         self.forward(accepted.final_id, pos)?;
         self.kv_cache.seq_len += 1;
 
-        Ok(StepStamp {
-            evaluated_len: self.kv_cache.seq_len,
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.kv_cache.seq_len, None))
     }
 
     fn select(&mut self, request: &SelectionRequest<'_>) -> Result<SelectOutcome, InferenceError> {
@@ -302,12 +293,12 @@ impl DecoderSession for StandaloneCpuSession<'_> {
             request.history,
             &mut self.rng_state,
         );
-        let prediction = self.ledger.open();
+        let prediction = self.ledger.open()?;
 
-        Ok(SelectOutcome::Candidate(SelectionCandidate {
+        Ok(SelectOutcome::Candidate(SelectionCandidate::new(
             candidate_id,
             prediction,
-        }))
+        )))
     }
 
     fn metadata(
@@ -353,11 +344,11 @@ pub(crate) fn generate_with_trace(
     let prompt_ids = plan.prompt_ids.clone();
     let prompt_len = plan.prompt_len;
     if let StandaloneWeights::Q8(model) = weights {
-        // Validate the scratch sizing before the infallible constructor, which would
-        // otherwise turn an overflowing config into the panic inside `new`.
+        // Validate the scratch sizing before the constructor, which would otherwise turn
+        // an overflowing config into the panic inside `new`.
         q8_scratch_max_cols(cfg, model)?;
     }
-    let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan);
+    let mut session = StandaloneCpuSession::new(weights, cfg, rope, plan)?;
 
     let never_cancel = || false;
     let mut throwaway_text = String::new();

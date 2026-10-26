@@ -412,6 +412,46 @@ impl LoraAdapter {
 
 #[cfg(feature = "inference-hook")]
 impl LoraAdapter {
+    /// Validate adapter dimensions against the target model's projection geometry.
+    ///
+    /// Call before installing an adapter or starting hooked scoring. Returns the
+    /// first invalid layer, module, or input/output dimension mismatch. Repeated
+    /// calls only read the adapter and geometry.
+    ///
+    /// Rank is deliberately unbounded relative to the projection widths: an
+    /// over-complete factorization is redundant but valid, including adapters
+    /// produced by blending source ranks. `Self::new` already checks the exact
+    /// rank-dependent buffer lengths used by `apply_lora`.
+    pub fn validate_geometry(
+        &self,
+        geometry: &dyn lattice_inference::lora_hook::LoraTargetGeometry,
+    ) -> crate::error::Result<()> {
+        self.config().validate()?;
+        for ((layer_idx, module), layer) in self.layers() {
+            if *layer_idx >= geometry.num_layers() {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA layer index {layer_idx} >= model num_layers {} (module: {module})",
+                    geometry.num_layers()
+                )));
+            }
+            let expected = geometry
+                .projection_shape(*layer_idx, module)
+                .map_err(|error| {
+                    crate::error::TuneError::Validation(format!(
+                        "LoRA module '{module}' (layer {layer_idx}): {error}"
+                    ))
+                })?;
+            if layer.d_in != expected.d_in || layer.d_out != expected.d_out {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA adapter dims mismatch for layer {layer_idx} module '{module}': \
+                     adapter has (d_in={}, d_out={}) but model expects (d_in={}, d_out={})",
+                    layer.d_in, layer.d_out, expected.d_in, expected.d_out
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate adapter dimensions against a Qwen3.5 model configuration.
     ///
     /// Returns the first invalid layer, module, or projection-shape mismatch.
@@ -539,6 +579,15 @@ impl lattice_inference::lora_hook::LoraHook for LoraAdapter {
         LoraAdapter::apply(self, layer_idx, module, x, output);
     }
 
+    fn validate_geometry(
+        &self,
+        geometry: &dyn lattice_inference::lora_hook::LoraTargetGeometry,
+    ) -> Result<(), String> {
+        LoraAdapter::validate_geometry(self, geometry).map_err(|e| e.to_string())
+    }
+
+    // Preserve validation for callers using the compatibility method through 0.15.0.
+    #[allow(deprecated)]
     fn validate_against(
         &self,
         config: &lattice_inference::model::qwen35_config::Qwen35Config,
@@ -546,6 +595,8 @@ impl lattice_inference::lora_hook::LoraHook for LoraAdapter {
         LoraAdapter::validate_against(self, config).map_err(|e| e.to_string())
     }
 
+    // Preserve validation for callers using the compatibility method through 0.15.0.
+    #[allow(deprecated)]
     fn validate_against_bert(
         &self,
         num_hidden_layers: usize,

@@ -60,12 +60,12 @@ f16 = ["lattice-weights/f16"]
 # be present whenever this feature is — not just under `mixture`.
 metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu"]
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
-bench-internals = ["lattice-grammar/bench-internals"]
+bench-internals = ["lattice-compute/bench-internals", "lattice-grammar/bench-internals"]
 # Stock `gemm` for multi-row `matmul_bt` on Linux x86_64 (ADR-099 F1, step 1). Off by default.
-x86-gemm = ["dep:gemm"]
+x86-gemm = ["lattice-compute/x86-gemm"]
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
 backfill = ["dep:rusqlite", "f16"]
-download = ["dep:ureq"]
+download = ["lattice-model-io/download"]
 train-backward = []
 # AdapterRouter gate: enables the lattice-fann backed routing module.
 # generate_with_lora_mixture does NOT require this feature — it is always
@@ -94,17 +94,14 @@ test-utils = []
 [dependencies]
 half.workspace = true
 memmap2 = "0.9"
-indexmap = "2"
-rustc-hash = "2"
+indexmap.workspace = true
+rustc-hash.workspace = true
 rayon = { workspace = true }
-gemm = { version = "=0.18.2", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
 thiserror.workspace = true
 tracing = { workspace = true, features = ["default"] }
-# `ureq` (the `download` feature's HTTP client) is declared in the non-wasm
-# `[target]` table below, not here -- see the rationale there.
 sha2.workspace = true
 rusqlite = { workspace = true, optional = true }
 metal = { version = "0.33", optional = true }
@@ -115,18 +112,20 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+lattice-compute = { version = "0.15.0", path = "../compute" }
 lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
 lattice-grammar = { version = "0.15.0", path = "../grammar" }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 lattice-metal-runtime = { version = "0.15.0", path = "../metal-runtime", optional = true }
-lattice-model-config = { version = "0.15.0", path = "../model-config" }
+lattice-arch = { version = "0.15.0", path = "../arch" }
+lattice-model-io = { version = "0.15.0", path = "../model-io", default-features = false }
 lattice-quant = { version = "0.15.0", path = "../quant" }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
 
-# Unix-only uses: `router_state/storage.rs` opens router state with `O_NOFOLLOW`/`O_NONBLOCK`,
-# and `measurement.rs` probes the bench supervisor with `kill(pid, 0)` and `futimes`. The
-# weight-loading uses (`F_GETPATH`, the trust-boundary open flags) moved with lattice-weights.
+# Unix-only uses: `router_state/storage.rs` opens router state with `O_NOFOLLOW`/`O_NONBLOCK`.
+# The weight-loading uses (`F_GETPATH`, the trust-boundary open flags) moved with lattice-weights,
+# and the GPU test lock's `kill(pid, 0)` and `futimes` with lattice-metal-runtime.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -134,14 +133,6 @@ libc = "0.2"
 name = "backfill_qwen3"
 path = "src/bin/backfill_qwen3.rs"
 required-features = ["backfill"]
-
-[[bin]]
-name = "quantize_q4"
-path = "src/bin/quantize_q4.rs"
-
-[[bin]]
-name = "moe_admission_sim"
-path = "src/bin/moe_admission_sim.rs"
 
 [[bin]]
 name = "chat_metal"
@@ -311,18 +302,8 @@ required-features = ["f16", "metal-gpu"]
 name = "bench_gdn_state"
 required-features = ["f16", "metal-gpu", "gdn-state-counters"]
 
-# `download` (ureq -> rustls -> ring) is gated to non-wasm targets. ring does not
-# build for wasm32-unknown-unknown, and its build script does not cross-compile to
-# aarch64-unknown-linux-gnu under a zig toolchain. Declaring `ureq` here rather than
-# as an unconditional optional dependency makes the `download` feature a no-op on
-# wasm: a consumer that forwards `lattice-inference/download` on a wasm build then
-# resolves download-free instead of failing to compile ureq. The `download`-gated
-# code in download.rs is correspondingly `not(target_arch = "wasm32")`-gated, so on
-# wasm the "downloads unavailable" path is what compiles. See issue #1095.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ureq = { version = "3", optional = true }
-
 [dev-dependencies]
+lattice-model-io = { version = "0.15.0", path = "../model-io", default-features = false, features = ["test-utils"] }
 lattice-weights = { version = "0.15.0", path = "../weights", features = ["test-utils"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
