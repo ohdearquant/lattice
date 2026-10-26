@@ -37,9 +37,17 @@ use crate::model::qwen35_config::VisionModelConfig;
 
 pub(crate) struct Qwen35VitMetalOutput {
     pub(crate) hidden_states: Vec<f32>,
-    #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal-gpu",
+        any(test, feature = "serving-support")
+    ))]
     pub(crate) metal_dispatches: usize,
-    #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+    #[cfg(all(
+        target_os = "macos",
+        feature = "metal-gpu",
+        any(test, feature = "serving-support")
+    ))]
     pub(crate) gemm_calls: usize,
 }
 
@@ -70,7 +78,7 @@ mod gpu {
     /// feature (see `Cargo.toml`), so the normal production `metal-gpu` build
     /// carries neither the storage nor the `fetch_add` at each dispatch site
     /// — unlike the opt-in-flag `PathProofCounters` pattern in
-    /// `forward/metal_qwen35.rs` (issue #239), which stays compiled in and
+    /// `forward/metal_qwen35/inner/diagnostics.rs` (issue #239), which stays compiled in and
     /// gates the atomic op behind a runtime check instead. Read via
     /// [`metal_dispatch_count`] / zeroed via [`reset_metal_dispatch_count`];
     /// see `tests/vision_s3b_vit_metal_gate_test.rs`.
@@ -467,9 +475,9 @@ mod gpu {
         }
         Ok(Some(Qwen35VitMetalOutput {
             hidden_states,
-            #[cfg(feature = "serve")]
+            #[cfg(any(test, feature = "serving-support"))]
             metal_dispatches: dispatch_stats.metal_dispatches,
-            #[cfg(feature = "serve")]
+            #[cfg(any(test, feature = "serving-support"))]
             gemm_calls: dispatch_stats.gemm_calls,
         }))
     }

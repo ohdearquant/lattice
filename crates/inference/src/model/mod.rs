@@ -1,7 +1,7 @@
 //! Model module index for BERT, BitNet config, cross-encoder, Qwen, Qwen3.5, and Qwen3.5 config, with BERT/CrossEncoder/Qwen/Qwen3.5 type re-exports.
 pub mod bert;
 pub mod bitnet_config;
-pub(crate) mod config_file;
+pub(crate) use lattice_weights::bounded_config as config_file;
 pub mod cross_encoder;
 pub mod embeddinggemma2;
 pub mod embeddinggemma2_config;
@@ -20,8 +20,6 @@ pub mod paddleocr_vl;
 pub mod qwen;
 pub mod qwen35;
 pub mod qwen35_config;
-#[cfg(feature = "serve")]
-pub(crate) mod serving_runtime;
 
 // Re-export everything from bert (was top-level `model` module)
 pub use self::bert::*;

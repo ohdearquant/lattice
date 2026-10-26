@@ -3,9 +3,8 @@
 //! Assembles the already-merged stages: config/loader preflight (#996),
 //! text math kernels with per-op HF goldens (#999, [`super::gemma4_ops`]),
 //! and the donor-slot shared-KV cache (#1002, [`super::gemma4_cache`]).
-//! Single-token-at-a-time forward (`forward_step`), called in a loop for
-//! both prompt prefill and greedy decode -- the same shape as
-//! `qwen35::forward::forward_step`. This is CPU-only, f32 throughout, no
+//! Bounded batched prompt prefill and single-token decode (`forward_step`).
+//! Short prompts retain the sequential path. This is CPU-only, f32 throughout, no
 //! Metal wiring (ADR-082's stage ladder gates Metal on CPU parity landing
 //! first).
 //!
@@ -17,6 +16,11 @@
 //! unconditionally, verified directly against the pinned reference source
 //! rather than assumed) -- a materially different convention from this
 //! crate's Qwen3.5 GQA attention, so that kernel is not reused here.
+
+#[path = "gemma4_prefill.rs"]
+mod prefill;
+
+const PREFILL_CHUNK_TOKENS: usize = 64;
 
 use super::gemma4_cache::Gemma4KvCache;
 use super::gemma4_config::{Gemma4Config, resolve_stop_token_ids};
@@ -689,11 +693,76 @@ impl Gemma4Model {
         Ok(identity)
     }
 
+    /// Evaluate prompt chunks, retaining scalar cancellation precedence for invalid inputs.
+    pub(crate) fn prefill_prompt(
+        &self,
+        prompt_ids: &[u32],
+        position: &mut usize,
+        cache: &mut Gemma4KvCache,
+        scratch: &mut Gemma4Scratch,
+        cancel: &dyn Cancellation,
+    ) -> Result<(), InferenceError> {
+        if cancel.is_cancelled() {
+            return Err(InferenceError::Inference("cancelled before prefill".into()));
+        }
+        // Invalid IDs keep the sequential prefix/error and cancellation precedence.
+        if prompt_ids.len() < PREFILL_CHUNK_TOKENS
+            || prompt_ids
+                .iter()
+                .any(|&id| id as usize >= self.config.vocab_size)
+        {
+            for (i, &token_id) in prompt_ids.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    return Err(InferenceError::Inference("cancelled during prefill".into()));
+                }
+                self.forward_step_impl(
+                    token_id,
+                    *position,
+                    cache,
+                    scratch,
+                    &[],
+                    i + 1 == prompt_ids.len(),
+                )?;
+                *position += 1;
+            }
+            return Ok(());
+        }
+
+        let end = position.checked_add(prompt_ids.len()).ok_or_else(|| {
+            InferenceError::InvalidInput("gemma4 prefill: absolute position overflow".into())
+        })?;
+        let mut batch = prefill::Gemma4PrefillScratch::default();
+        for tokens in prompt_ids.chunks(PREFILL_CHUNK_TOKENS) {
+            if cancel.is_cancelled() {
+                return Err(InferenceError::Inference("cancelled during prefill".into()));
+            }
+            let next = position.checked_add(tokens.len()).ok_or_else(|| {
+                InferenceError::InvalidInput("gemma4 prefill: absolute position overflow".into())
+            })?;
+            if !prefill::forward_chunk(
+                self,
+                tokens,
+                *position,
+                cache,
+                &mut batch,
+                scratch,
+                next == end,
+                cancel,
+            )? {
+                return Err(InferenceError::Inference("cancelled during prefill".into()));
+            }
+            cache.finish_prefill_chunk();
+            *position = next;
+        }
+        Ok(())
+    }
+
     /// **Unstable**: greedy-decode `max_new_tokens` continuation tokens for
     /// `prompt_ids` (already tokenized, BOS included by the caller). Prefill
-    /// runs each prompt token through `Self::forward_step_impl` and projects
-    /// vocabulary logits only at the last prompt token; decode then runs
-    /// through the single-token `Self::forward_step` loop.
+    /// runs through `Self::prefill_prompt` (bounded prompt chunks, or one token
+    /// at a time for a short prompt or one with an out-of-vocabulary id) and
+    /// projects vocabulary logits only at the last prompt token; decode then
+    /// runs through the single-token `Self::forward_step` loop.
     ///
     /// # Errors
     /// Propagates the per-token forward pass errors from both loops: an
@@ -712,17 +781,9 @@ impl Gemma4Model {
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut position = 0usize;
 
-        for (i, &tok) in prompt_ids.iter().enumerate() {
-            self.forward_step_impl(
-                tok,
-                position,
-                &mut cache,
-                &mut scratch,
-                &[],
-                i + 1 == prompt_ids.len(),
-            )?;
-            position += 1;
-        }
+        self.prefill_prompt(prompt_ids, &mut position, &mut cache, &mut scratch, &|| {
+            false
+        })?;
 
         for _ in 0..max_new_tokens {
             let next = argmax(&scratch.logits[..self.config.vocab_size]);
@@ -1251,9 +1312,11 @@ pub(crate) fn tiny_nonzero_model() -> Gemma4Model {
 /// single-layer zero-weight model, whose embedding tables grow with the
 /// vocabulary. A test that feeds it prompts rendered and tokenized with the
 /// committed tokenizer needs a vocabulary at least as large as that
-/// tokenizer's.
-#[cfg(test)]
-pub(crate) fn tiny_zero_model_with_vocab(vocab_size: usize) -> Gemma4Model {
+/// tokenizer's. Exported under `test-utils` for `lattice-serve`'s tests; not
+/// part of the supported API.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn tiny_zero_model_with_vocab(vocab_size: usize) -> Gemma4Model {
     use super::gemma4_config::Gemma4LayerType;
     use super::gemma4_weights::{Gemma4LayerWeights, per_layer_embeddings_from_bits};
 
@@ -1609,10 +1672,11 @@ mod tests {
             vec![b"a".to_vec()],
         )
         .expect("trivial one-token grammar must compile");
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 1,
-            grammar: Some(std::sync::Arc::new(grammar)),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 1;
+            config.grammar = Some(std::sync::Arc::new(grammar));
+            config
         };
         let err = model
             .generate(&[2, 3], &gen_cfg)
@@ -1633,10 +1697,11 @@ mod tests {
     #[test]
     fn generate_refuses_logprobs_request() {
         let model = tiny_zero_model();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 1,
-            logprobs: Some(0),
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 1;
+            config.logprobs = Some(0);
+            config
         };
         let err = model
             .generate(&[2, 3], &gen_cfg)
@@ -1657,10 +1722,11 @@ mod tests {
     #[test]
     fn generate_refuses_stop_strings_request() {
         let model = tiny_zero_model();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 1,
-            stop_strings: vec!["x".to_string()],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 1;
+            config.stop_strings = vec!["x".to_string()];
+            config
         };
         let err = model
             .generate(&[2, 3], &gen_cfg)
@@ -1685,11 +1751,12 @@ mod tests {
     #[test]
     fn generate_refuses_reasoning_budget_request() {
         let model = tiny_zero_model();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 1,
-            reasoning_budget: Some(4),
-            enable_thinking: true,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 1;
+            config.reasoning_budget = Some(4);
+            config.enable_thinking = true;
+            config
         };
         let err = model
             .generate(&[2, 3], &gen_cfg)
@@ -1711,12 +1778,13 @@ mod tests {
     #[test]
     fn generate_succeeds_with_no_capability_gated_fields_set() {
         let model = tiny_zero_model();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 2,
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            stop_token_ids: vec![],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 2;
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config.stop_token_ids = vec![];
+            config
         };
         let output = model
             .generate(&[2, 3], &gen_cfg)
@@ -1735,12 +1803,13 @@ mod tests {
     #[test]
     fn generate_stops_at_max_new_tokens_budget() {
         let model = tiny_zero_model();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 3,
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            stop_token_ids: vec![],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 3;
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config.stop_token_ids = vec![];
+            config
         };
         let output = model
             .generate(&[2, 3], &gen_cfg)
@@ -1762,12 +1831,13 @@ mod tests {
     #[test]
     fn generate_stops_on_configured_stop_token_id() {
         let model = tiny_zero_model();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 5,
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            stop_token_ids: vec![0],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 5;
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config.stop_token_ids = vec![0];
+            config
         };
         let output = model
             .generate(&[2, 3], &gen_cfg)
@@ -1796,12 +1866,13 @@ mod tests {
         // (bypassing `resolve_stop_token_ids`, which this test does not exercise) isolates the
         // extension `generate_via_driver`/`generate_streaming_via_driver` must apply.
         model.stop_token_ids = vec![0];
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 5,
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            stop_token_ids: vec![],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 5;
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config.stop_token_ids = vec![];
+            config
         };
         let output = model
             .generate(&[2, 3], &gen_cfg)
@@ -1822,12 +1893,13 @@ mod tests {
         // own extension of the model-level stop ids into the driver call.
         let mut model = tiny_zero_model();
         model.stop_token_ids = vec![0];
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 5,
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            stop_token_ids: vec![],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 5;
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config.stop_token_ids = vec![];
+            config
         };
         let output = model
             .generate_streaming_with_cancel(&[2, 3], &gen_cfg, |_delta| true, || false)
@@ -1841,11 +1913,12 @@ mod tests {
     #[test]
     fn generate_streaming_interrupts_during_gemma_prefill_without_output() {
         let model = tiny_zero_model();
-        let config = GenerateConfig {
-            max_new_tokens: 2,
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
+        let config = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 2;
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config
         };
         let polls = std::cell::Cell::new(0);
         let mut emitted = 0;
@@ -1879,12 +1952,13 @@ mod tests {
     fn generate_refuses_when_prompt_plus_decode_cap_exceeds_context_window() {
         let model = tiny_zero_model(); // max_position_embeddings: 1024
         let prompt_ids = [2u32, 3u32];
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: usize::MAX,
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            stop_token_ids: vec![],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = usize::MAX;
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config.stop_token_ids = vec![];
+            config
         };
         let err = model.generate(&prompt_ids, &gen_cfg).expect_err(
             "prompt_len + effective decode cap exceeding the context window must be refused",
@@ -1907,12 +1981,13 @@ mod tests {
     fn generate_streaming_refuses_when_prompt_plus_decode_cap_exceeds_context_window() {
         let model = tiny_zero_model();
         let prompt_ids = [2u32, 3u32];
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: usize::MAX,
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            stop_token_ids: vec![],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = usize::MAX;
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config.stop_token_ids = vec![];
+            config
         };
         let mut on_token_calls = 0usize;
         let err = model
@@ -2030,12 +2105,13 @@ mod tests {
 
         // See `Gemma4Model::generate`'s own doc comment on why
         // `stop_token_ids` must be cleared explicitly.
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 3,
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            stop_token_ids: vec![],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 3;
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config.stop_token_ids = vec![];
+            config
         };
         let (output, trace) = model
             .generate_with_trace(&golden.input_ids, &gen_cfg)
@@ -2101,12 +2177,13 @@ mod tests {
     fn generate_with_trace_drives_the_session_in_the_exact_select_decode_count() {
         let model = tiny_zero_model();
         let prompt_ids = [2u32, 3u32];
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 3,
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            stop_token_ids: vec![],
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.max_new_tokens = 3;
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config.stop_token_ids = vec![];
+            config
         };
         let (output, trace) = model
             .generate_with_trace(&prompt_ids, &gen_cfg)

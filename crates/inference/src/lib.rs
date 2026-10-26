@@ -38,7 +38,8 @@ pub mod forward;
 /// safetensors load path and forward-pass dispatch; see [`weights`], [`tokenizer`], and [`forward`].
 pub mod model;
 /// Canonical model-directory format detector (`ModelFormat`/`detect_format`) shared by
-/// the `lattice`, `lattice_serve`, and `chat_metal` binaries (ADR-080 amendment, #829).
+/// the `chat_metal` binary and the `lattice` and `lattice_serve` binaries of `lattice-serve`
+/// (ADR-080 amendment, #829).
 /// **Unstable, internal-binaries-only** -- see the module's own doc comment.
 pub mod model_format;
 /// Tokenizer implementations (`WordPiece`, `SentencePiece`, byte-level BPE) behind the
@@ -51,11 +52,25 @@ pub mod vision;
 /// and [`forward`].
 pub mod weights;
 
+/// Negative-scale Q4 fixture shared by every Q4 consumer's sign test.
+///
+/// Every block has a negative scale, so a consumer that drops the sign, clamps the
+/// scale at zero or otherwise reads the scale's sign computes different weights. Each
+/// consumer test runs the fixture, the same blocks with `|scale|`, and the same blocks
+/// with a zero scale: the first must match the f64 reference, and the other two, which
+/// are exactly what a sign-dropping or zero-clamping consumer would compute on the
+/// fixture, must miss it by more than ten times the tolerance.
+#[cfg(test)]
+mod signed_scale_fixture;
+
 // Standalone modules
 /// Continuous batching and scheduler support for multi-sequence inference. See [`kv_cache`]
 /// and [`model`].
 pub mod batch;
-pub(crate) mod bounded_read;
+#[cfg(test)]
+mod bounded_config;
+#[cfg(test)]
+mod bounded_read;
 /// Registered held-out evidence for router candidate admission.
 #[cfg(feature = "router-learning")]
 pub mod router_admission;
@@ -89,8 +104,14 @@ pub use decoder::bench_support as decoder_bench_support;
 pub mod bert_pooling_fixture;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
+/// The text encoder contract and its adapters for the BERT-family, Qwen3 and EmbeddingGemma 2
+/// embedding models. See [`encoder::Encoder`].
+pub mod encoder;
 /// Crate error taxonomy; see [`InferenceError`].
 pub mod error;
+/// The family contract: static descriptors naming each family's loaders, a registry built from
+/// them, and the Qwen3.5 CPU decoder they load. See [`family::registry`].
+pub mod family;
 /// Time-series forecasting: context preparation and native forecasting models. See
 /// [`forecast::Reverso`].
 pub mod forecast;
@@ -106,7 +127,7 @@ pub mod kv_cache;
 /// Metal engine takes out. Every item in it is Metal-only, so the module itself is
 /// gated rather than left as an empty shell on other builds; it also reaches
 /// `lattice-fann` for the shared effective-scale helper, and that dependency exists
-/// only under `metal-gpu` (or `mixture`). See [`lora_hook`] and [`serve`].
+/// only under `metal-gpu` (or `mixture`). See [`lora_hook`]; `lattice-serve` is its serving caller.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub mod lora_file;
 /// LoRA adapter hook called from inference forward paths. See [`model`] and [`forward`].
@@ -150,48 +171,11 @@ pub mod qwen35_checkpoint_fixture;
 pub mod rope;
 /// Sampling configuration and token selection helpers. See [`model`] and [`speculative`].
 pub mod sampling;
-/// Shared HTTP serving contract (error envelope, `finish_reason`, `max_tokens`
-/// zero-rejection, `/v1/models` body) consumed by both the `lattice` unified
-/// server and the `lattice_serve` daemon binaries (ADR-080 cluster C2).
-/// Requires the `serve` feature (axum/tokio/futures).
-#[cfg(feature = "serve")]
-pub mod serve;
-/// CPU serving runtimes for `lattice serve`: Gemma 4 E2B text and the traced
-/// Qwen3.5 CPU entries. Not a stable API.
-#[cfg(feature = "serve")]
+/// Unsupported, version-coupled interface for `lattice-serve` (ADR-103
+/// Amendment 4); not public API.
+#[cfg(feature = "serving-support")]
 #[doc(hidden)]
-pub mod serving_cpu;
-/// Shared request-local execution host for CPU-backed `lattice serve` routes.
-/// Not a stable API.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_cpu_host;
-/// Pooled embedding service interfaces used by serving entry points.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_embeddings;
-/// Builds the serving worker's runtime and request preparation for a loaded
-/// model. Not a stable API.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_factory;
-/// Shared request facade for the HTTP serving binaries. Not a stable API.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_host;
-#[cfg(feature = "serve")]
-mod serving_preparation;
-/// Selects serving providers from bounded checkpoint metadata.
-/// Requires the `serve` feature.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_provider;
-#[cfg(feature = "serve")]
-pub(crate) mod serving_runtime_contract;
-/// Dedicated-thread host for thread-affine serving runtimes. Not a stable API.
-#[cfg(feature = "serve")]
-#[doc(hidden)]
-pub mod serving_worker;
+pub mod serving_support;
 /// N-gram prompt lookup speculative decoding. See [`sampling`] and [`model`].
 pub mod speculative;
 /// Generation stop reason taxonomy; see [`StopReason`] and [`model`].
@@ -218,20 +202,9 @@ mod test_support;
 #[cfg(feature = "train-backward")]
 pub mod backward;
 
-use std::path::PathBuf;
-
-/// Default model cache directory.
-pub(crate) fn default_cache_dir() -> Result<PathBuf, error::InferenceError> {
-    if let Ok(path) = std::env::var("LATTICE_MODEL_CACHE") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = std::env::var("HOME").map_err(|_| {
-        error::InferenceError::ModelNotFound(
-            "unable to determine cache directory; HOME and LATTICE_MODEL_CACHE are unset".into(),
-        )
-    })?;
-    Ok(PathBuf::from(home).join(".lattice").join("models"))
-}
+/// Model cache directory and by-value environment switches, from `lattice-model-io` (ADR-103
+/// Amendment 20); the crate-local paths stay for this crate's callers.
+pub(crate) use lattice_model_io::{default_cache_dir, env_switch_enabled};
 
 // Re-exports for public API backward compatibility
 /// Root error type for inference, tokenizer, model loading, and runtime failures. See [`error`].
@@ -244,16 +217,21 @@ pub use crate::forward::cpu::BertCpuKernelPolicy;
 pub use crate::forward::cpu::BertCpuKernelProfile;
 /// Sampling and stop configuration for a generation request. Canonical path under ADR-092;
 /// `model::qwen35_config::GenerateConfig` remains as a deprecated alias. See [`generation`].
+#[doc(no_inline)]
 pub use crate::generation::GenerateConfig;
 /// Result of a generation request: text, token ids, counts and stop reason. Canonical path
 /// under ADR-092. See [`generation`] and [`StopReason`].
+#[doc(no_inline)]
 pub use crate::generation::GenerateOutput;
 /// Per-token log-probability data for one generated token. See [`GenerateConfig::logprobs`].
+#[doc(no_inline)]
 pub use crate::generation::TokenLogprob;
 /// One alternative token and its log-probability at a single step. See [`TokenLogprob`].
+#[doc(no_inline)]
 pub use crate::generation::TopLogprob;
 /// Grammar-constrained decoding engine, reachable from the root because
 /// [`GenerateConfig::grammar`] carries one. See [`grammar`].
+#[doc(no_inline)]
 pub use crate::grammar::GrammarEngine;
 /// BERT encoder configuration. See [`BertModel`] and [`model`].
 pub use crate::model::BertConfig;
@@ -272,9 +250,11 @@ pub use crate::model::QwenConfig;
 /// [`Tokenizer`], and [`weights`].
 pub use crate::model::QwenModel;
 /// BERT pooling strategy selector (mean or CLS). See [`pool`] and [`BertModel`].
+#[doc(no_inline)]
 pub use crate::pool::BertPooling;
 /// Reason a generation request stopped (e.g. EOS, max tokens). See [`stop_reason`] and
 /// [`model`].
+#[doc(no_inline)]
 pub use crate::stop_reason::StopReason;
 /// Byte-level BPE tokenizer used by Qwen-family models. See [`Tokenizer`] and [`TokenizedInput`].
 pub use crate::tokenizer::BpeTokenizer;
@@ -309,71 +289,3 @@ pub use crate::tokenizer::{
     audio_marker_expansion_tokens_from_samples, image_marker_expansion_tokens,
     total_audio_marker_expansion_tokens,
 };
-
-/// Reads a boolean engine switch from the environment, by VALUE.
-///
-/// These switches used to be selected by presence alone, so `LATTICE_MTP_BATCH=0`
-/// turned the batch verifier on while every document and comment spells the flag
-/// `=1`. An operator writing `=0` to mean "run the default arm" measured the
-/// non-default arm twice and saw a clean-looking negative.
-///
-/// A value spelling "off" now disables the switch: empty, `0`, `false`, `no` or
-/// `off`, in any case, with surrounding whitespace ignored. Every other value
-/// enables it, so `=1`, `=true` and `=yes` all keep working, and so does any value
-/// a caller was already passing to mean "on". An absent variable is off, and a
-/// value that is not valid Unicode cannot be one of the off spellings, so it
-/// enables, which is what presence-checking did.
-///
-/// One `var_os` lookup and a few ASCII comparisons against short literals: no
-/// allocation, because one of these sits inside a per-round decode loop.
-///
-/// Not gated to the Metal build: the offline-download gate (`download.rs`) and the
-/// CPU-fallback switch (`model/qwen.rs`) call this from code paths that compile on
-/// every platform and feature set, so it has to be available everywhere too.
-pub(crate) fn env_switch_enabled(name: &str) -> bool {
-    match std::env::var_os(name) {
-        None => false,
-        Some(raw) => match raw.to_str() {
-            Some(text) => switch_value_enabled(Some(text)),
-            None => true,
-        },
-    }
-}
-
-/// The value half of [`env_switch_enabled`], separated so it is testable without
-/// mutating the process environment, which no test can do without racing every
-/// other test in the binary.
-pub(crate) fn switch_value_enabled(value: Option<&str>) -> bool {
-    const OFF: [&str; 4] = ["0", "false", "no", "off"];
-    match value {
-        None => false,
-        Some(raw) => {
-            let text = raw.trim();
-            !(text.is_empty() || OFF.iter().any(|off| text.eq_ignore_ascii_case(off)))
-        }
-    }
-}
-
-#[cfg(test)]
-mod env_switch_tests {
-    use super::switch_value_enabled;
-
-    #[test]
-    fn absent_is_off() {
-        assert!(!switch_value_enabled(None));
-    }
-
-    #[test]
-    fn documented_on_spellings_enable() {
-        for raw in ["1", "true", "TRUE", "yes", "on", " 1 ", "2", "batch"] {
-            assert!(switch_value_enabled(Some(raw)), "{raw:?} should enable");
-        }
-    }
-
-    #[test]
-    fn off_spellings_disable_which_presence_checking_could_not() {
-        for raw in ["0", "false", "FALSE", "no", "off", "", "  ", " 0 "] {
-            assert!(!switch_value_enabled(Some(raw)), "{raw:?} should disable");
-        }
-    }
-}

@@ -1,12 +1,9 @@
 //! `GemmaCpuSession`: the Gemma 4 E2B text CPU concrete [`super::DecoderSession`]
 //! (ADR-090 row R04), the Gemma sibling of [`super::qwen_cpu::QwenCpuSession`].
 //!
-//! Wraps `Gemma4Model`'s per-token `forward_step`
-//! (`crates/inference/src/model/gemma4_model.rs`) behind the object-safe session
-//! boundary D1 introduces. Unlike Qwen, Gemma has no batched-prefill fallback
-//! ladder to reproduce: sequential prefill via `forward_step` is explicitly
-//! permitted for this row (ADR-090 D2, "current Gemma text prefill may remain
-//! sequential").
+//! Wraps `Gemma4Model`'s bounded prompt prefill and per-token `forward_step`
+//! behind the object-safe session boundary D1 introduces. Short or invalid-ID
+//! prompts retain sequential prefill; eligible prompts commit complete chunks.
 //!
 //! **Owned state**: a fresh [`Gemma4KvCache`] and [`Gemma4Scratch`] per request
 //! (mirroring what [`Gemma4Model::generate_greedy_with_probe`] itself allocates
@@ -57,12 +54,7 @@ use crate::sampling::compute_step_logprobs;
 /// (proven end to end in `model::gemma4_model`'s test module, one test per
 /// capability, through the crate's public `Gemma4Model::generate` entry
 /// point).
-const CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities {
-    grammar: false,
-    logprobs: false,
-    stop_strings: false,
-    reasoning_budget: false,
-};
+const CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::none();
 
 /// Gemma 4 E2B text CPU concrete [`DecoderSession`]. See the module doc
 /// comment for what it owns and why.
@@ -110,7 +102,7 @@ impl<'model> GemmaCpuSession<'model> {
             position: 0,
             rng_state: initial_rng_state(seed),
             temperature,
-            ledger: PredictionLedger::new(),
+            ledger: PredictionLedger::new()?,
         })
     }
 }
@@ -120,44 +112,27 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         &CAPABILITIES
     }
 
-    /// Sequential prefill over `self.prompt_ids` via
-    /// `Gemma4Model::forward_step_impl`, one token at a time (ADR-090 D2
-    /// explicitly permits this for Gemma; there is no batched-prefill fallback
-    /// ladder to reproduce here, unlike `QwenCpuSession::prefill`). Each token
-    /// runs with `emit_logits = false` except the last, so the vocabulary
-    /// projection is deferred to the final prompt position and
-    /// `self.scratch.logits` is untouched at every earlier position. Advances
-    /// `self.position` by one per token. Does not sample: the last position's
-    /// logits are left in `self.scratch.logits` for the first `select` to
-    /// read, exactly like `Gemma4Model::generate_greedy`'s own prefill loop.
-    /// `prediction: None` in the returned `StepStamp` reflects that nothing
-    /// has been opened in the ledger yet.
+    /// Prefill over `self.prompt_ids` through `Gemma4Model::prefill_prompt`:
+    /// a prompt of at least its chunk size whose ids are all in the vocabulary
+    /// runs in bounded chunks, any other prompt one token at a time through
+    /// `Gemma4Model::forward_step_impl`. Either way the vocabulary projection
+    /// runs only for the last prompt token, so `self.scratch.logits` is
+    /// untouched until then, and `self.position` advances only past complete
+    /// tokens or chunks. Does not sample: the last position's logits are left
+    /// in `self.scratch.logits` for the first `select` to read, exactly like
+    /// `Gemma4Model::generate_greedy`'s own prefill. `prediction: None` in the
+    /// returned `StepStamp` reflects that nothing has been opened in the
+    /// ledger yet.
     fn prefill(&mut self, cancel: &dyn Cancellation) -> Result<StepStamp, InferenceError> {
-        if cancel.is_cancelled() {
-            return Err(InferenceError::Inference("cancelled before prefill".into()));
-        }
+        self.model.prefill_prompt(
+            &self.prompt_ids,
+            &mut self.position,
+            &mut self.cache,
+            &mut self.scratch,
+            cancel,
+        )?;
 
-        let prompt_len = self.prompt_ids.len();
-        for i in 0..prompt_len {
-            if cancel.is_cancelled() {
-                return Err(InferenceError::Inference("cancelled during prefill".into()));
-            }
-            let token_id = self.prompt_ids[i];
-            self.model.forward_step_impl(
-                token_id,
-                self.position,
-                &mut self.cache,
-                &mut self.scratch,
-                &[],
-                i + 1 == prompt_len,
-            )?;
-            self.position += 1;
-        }
-
-        Ok(StepStamp {
-            evaluated_len: self.position,
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.position, None))
     }
 
     fn prefill_interruptible(
@@ -202,10 +177,7 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         )?;
         self.position += 1;
 
-        Ok(StepStamp {
-            evaluated_len: self.position,
-            prediction: None,
-        })
+        Ok(StepStamp::new(self.position, None))
     }
 
     /// Masks the logits `prefill`/`decode` most recently left in
@@ -235,12 +207,12 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
             request.history,
             &mut self.rng_state,
         );
-        let prediction = self.ledger.open();
+        let prediction = self.ledger.open()?;
 
-        Ok(SelectOutcome::Candidate(SelectionCandidate {
+        Ok(SelectOutcome::Candidate(SelectionCandidate::new(
             candidate_id,
             prediction,
-        }))
+        )))
     }
 
     /// Scores `final_token` against the prediction's logits via
@@ -254,12 +226,16 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         final_token: u32,
         request: &MetadataRequest,
     ) -> Result<TokenMetadata, InferenceError> {
+        let Some(top_n) = request.top_logprobs else {
+            return Err(InferenceError::InvalidInput(
+                "metadata capture is disabled in this request".into(),
+            ));
+        };
         if !self.ledger.is_live(prediction) {
             return Err(PredictionError::Stale.into());
         }
 
         let vocab_size = self.model.config.vocab_size;
-        let top_n = request.top_logprobs.unwrap_or(0);
         let (final_logprob, top) = compute_step_logprobs(
             &self.scratch.logits[..vocab_size],
             final_token,
@@ -267,12 +243,12 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
             top_n,
         );
 
-        Ok(TokenMetadata {
+        Ok(TokenMetadata::new(
             prediction,
-            final_token_id: final_token,
+            final_token,
             final_logprob,
             top,
-        })
+        ))
     }
 
     fn finish(&mut self, _disposition: FinishDisposition) -> Result<(), InferenceError> {
@@ -280,6 +256,10 @@ impl<'model> DecoderSession for GemmaCpuSession<'model> {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "f16"))]
+#[path = "gemma_cpu_bench.rs"]
+mod prefill_bench;
 
 #[cfg(test)]
 mod tests {
@@ -299,21 +279,18 @@ mod tests {
     fn finish_invalidates_the_prediction_for_every_disposition() {
         let model = tiny_zero_model();
         let prompt_ids = vec![2, 3];
-        let config = GenerateConfig {
-            temperature: 0.0,
-            max_new_tokens: 2,
-            ..Default::default()
+        let config = {
+            let mut config = GenerateConfig::default();
+            config.temperature = 0.0;
+            config.max_new_tokens = 2;
+            config
         };
         for disposition in [FinishDisposition::Reusable, FinishDisposition::Poisoned] {
             let mut session = GemmaCpuSession::new(&model, prompt_ids.clone(), 0.0, Some(7), 16)
                 .expect("session");
             session.prefill(&cancel_false()).expect("prefill");
             let outcome = session
-                .select(&SelectionRequest {
-                    config: &config,
-                    history: &prompt_ids,
-                    grammar_mask: None,
-                })
+                .select(&SelectionRequest::new(&config, &prompt_ids))
                 .expect("selection");
             let SelectOutcome::Candidate(candidate) = outcome else {
                 panic!("unconstrained selection must yield a candidate")
@@ -350,15 +327,7 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn declared_capabilities_are_honestly_all_false() {
-        assert_eq!(
-            CAPABILITIES,
-            ExecutionCapabilities {
-                grammar: false,
-                logprobs: false,
-                stop_strings: false,
-                reasoning_budget: false,
-            }
-        );
+        assert_eq!(CAPABILITIES, ExecutionCapabilities::none());
     }
 
     // -----------------------------------------------------------------
@@ -389,31 +358,39 @@ mod tests {
         );
 
         let history = prompt_ids.clone();
-        let gen_cfg = GenerateConfig {
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config
         };
-        let request = SelectionRequest {
-            config: &gen_cfg,
-            history: &history,
-            grammar_mask: None,
-        };
+        let request = SelectionRequest::new(&gen_cfg, &history);
         let candidate = match session
             .select(&request)
             .expect("select over freshly prefilled logits must succeed")
         {
             SelectOutcome::Candidate(c) => c,
             SelectOutcome::GrammarExhausted => panic!("no grammar set on this session"),
+            _ => unreachable!("a select outcome this test does not model"),
         };
         // All-zero weights -> every logit is exactly 0.0 -> greedy sampling
         // (temperature 0.0) picks the first (lowest-id) token deterministically.
         assert_eq!(candidate.candidate_id, 0);
         assert!(session.ledger.is_live(candidate.prediction));
 
-        let meta_request = MetadataRequest {
-            top_logprobs: Some(2),
-        };
+        // A disabled request is refused and leaves the prediction live.
+        let disabled = session.metadata(
+            candidate.prediction,
+            candidate.candidate_id,
+            &MetadataRequest::disabled(),
+        );
+        assert!(
+            matches!(&disabled, Err(InferenceError::InvalidInput(message)) if message.contains("disabled")),
+            "{disabled:?}"
+        );
+        assert!(session.ledger.is_live(candidate.prediction));
+
+        let meta_request = MetadataRequest::with_top_logprobs(2);
         let metadata = session
             .metadata(candidate.prediction, candidate.candidate_id, &meta_request)
             .expect("metadata over a live prediction must succeed");
@@ -431,10 +408,7 @@ mod tests {
         // metadata does not consume: still live after scoring.
         assert!(session.ledger.is_live(candidate.prediction));
 
-        let accepted = AcceptedToken {
-            final_id: metadata.final_token_id,
-            prediction: candidate.prediction,
-        };
+        let accepted = AcceptedToken::new(metadata.final_token_id, candidate.prediction);
         let stamp2 = session
             .decode(&accepted, &cancel)
             .expect("decode of the freshly opened prediction must succeed");
@@ -586,26 +560,21 @@ mod tests {
             .prefill(&cancel_false())
             .expect("prefill must succeed");
 
-        let gen_cfg = GenerateConfig {
-            temperature: 0.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = GenerateConfig::default();
+            config.temperature = 0.0;
+            config.repetition_penalty = 1.0;
+            config
         };
-        let request = SelectionRequest {
-            config: &gen_cfg,
-            history: &prompt_ids,
-            grammar_mask: None,
-        };
+        let request = SelectionRequest::new(&gen_cfg, &prompt_ids);
         let candidate = match session.select(&request).expect("select must succeed") {
             SelectOutcome::Candidate(c) => c,
             SelectOutcome::GrammarExhausted => panic!("no grammar set on this session"),
+            _ => unreachable!("a select outcome this test does not model"),
         };
         assert!(session.ledger.is_live(candidate.prediction)); // control: live before
 
-        let accepted = AcceptedToken {
-            final_id: candidate.candidate_id,
-            prediction: candidate.prediction,
-        };
+        let accepted = AcceptedToken::new(candidate.candidate_id, candidate.prediction);
         let cancelled = session.decode(&accepted, &cancel_true());
         assert!(cancelled.is_err(), "a cancelled decode must not succeed");
         assert!(
@@ -620,6 +589,160 @@ mod tests {
             !session.ledger.is_live(candidate.prediction),
             "finish(Poisoned) must invalidate whatever prediction was live"
         );
+    }
+
+    mod batch_prefill_controls {
+        use super::*;
+        use std::cell::Cell;
+
+        fn prompt(len: usize) -> Vec<u32> {
+            (0..len).map(|i| 2 + (i % 13) as u32).collect()
+        }
+
+        fn close(actual: &[f32], expected: &[f32]) {
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&a, &b)) in actual.iter().zip(expected).enumerate() {
+                assert!(a.is_finite() && b.is_finite(), "nonfinite at {index}");
+                assert!(
+                    (a - b).abs() <= 5e-5 + 5e-5 * a.abs().max(b.abs()),
+                    "value {index}: {a} != {b}"
+                );
+            }
+        }
+
+        #[test]
+        fn long_session_matches_scalar_prefill_and_two_selections() {
+            let model = tiny_nonzero_model();
+            let config = {
+                let mut config = GenerateConfig::default();
+                config.temperature = 0.0;
+                config.repetition_penalty = 1.0;
+                config
+            };
+            for len in [63, 64, 65, 127, 128, 129] {
+                let ids = prompt(len);
+                let mut actual =
+                    GemmaCpuSession::new(&model, ids.clone(), 0.0, Some(7), len + 2).unwrap();
+                let mut expected =
+                    GemmaCpuSession::new(&model, ids.clone(), 0.0, Some(7), len + 2).unwrap();
+                for (position, &token) in ids.iter().enumerate() {
+                    model
+                        .forward_step(
+                            token,
+                            position,
+                            &mut expected.cache,
+                            &mut expected.scratch,
+                            &[],
+                        )
+                        .unwrap();
+                    expected.position += 1;
+                }
+                actual.scratch.logits.fill(f32::NAN);
+                let stamp = actual.prefill(&|| false).unwrap();
+                assert_eq!(stamp.evaluated_len, len);
+                assert_eq!(stamp.prediction, None);
+                let mut history = ids;
+                for step in 0..=2 {
+                    assert_eq!(actual.position, len + step);
+                    assert_eq!(actual.position, expected.position);
+                    close(&actual.scratch.logits, &expected.scratch.logits);
+                    close(
+                        actual.cache.k_view(0).unwrap(),
+                        expected.cache.k_view(0).unwrap(),
+                    );
+                    close(
+                        actual.cache.v_view(0).unwrap(),
+                        expected.cache.v_view(0).unwrap(),
+                    );
+                    if step == 2 {
+                        break;
+                    }
+                    let request = SelectionRequest::new(&config, &history);
+                    let SelectOutcome::Candidate(a) = actual.select(&request).unwrap() else {
+                        panic!("unconstrained selection");
+                    };
+                    let SelectOutcome::Candidate(b) = expected.select(&request).unwrap() else {
+                        panic!("unconstrained selection");
+                    };
+                    assert_eq!(a.candidate_id, b.candidate_id);
+                    actual
+                        .decode(&AcceptedToken::new(a.candidate_id, a.prediction), &|| false)
+                        .unwrap();
+                    expected
+                        .decode(&AcceptedToken::new(b.candidate_id, b.prediction), &|| false)
+                        .unwrap();
+                    history.push(a.candidate_id);
+                }
+            }
+        }
+
+        #[test]
+        fn long_session_enters_batch_before_advancing_position() {
+            let model = tiny_nonzero_model();
+            let mut session = GemmaCpuSession::new(&model, prompt(65), 0.0, Some(7), 67).unwrap();
+            session.scratch.logits.fill(1234.0);
+            let polls = Cell::new(0);
+            let cancel = || {
+                let poll = polls.get();
+                polls.set(poll + 1);
+                poll == 2
+            };
+            assert!(session.prefill_interruptible(&cancel).unwrap().is_none());
+            assert_eq!(polls.get(), 3);
+            assert_eq!(session.position, 0);
+            assert_eq!(session.cache.seq_len(0).unwrap(), 0);
+            assert!(session.scratch.logits.iter().all(|&value| value == 1234.0));
+        }
+
+        #[test]
+        fn long_invalid_tail_keeps_scalar_prefix_and_cancellation_precedence() {
+            let model = tiny_nonzero_model();
+            let mut ids = prompt(129);
+            ids[65] = model.config.vocab_size as u32;
+            for cancel_after in [Some(0), Some(3), Some(65), None] {
+                let mut session =
+                    GemmaCpuSession::new(&model, ids.clone(), 0.0, Some(7), 131).unwrap();
+                session.scratch.logits.fill(1234.0);
+                let polls = Cell::new(0);
+                let cancel = || {
+                    let poll = polls.get();
+                    polls.set(poll + 1);
+                    cancel_after.is_some_and(|completed| poll > completed)
+                };
+                let error = session.prefill(&cancel).unwrap_err();
+                let completed = cancel_after.unwrap_or(65);
+                if cancel_after.is_some() {
+                    assert!(error.to_string().contains("cancelled during prefill"));
+                } else {
+                    assert!(matches!(error, InferenceError::InvalidInput(_)));
+                }
+                assert_eq!(session.position, completed);
+                assert_eq!(session.cache.seq_len(0).unwrap(), completed);
+                assert_eq!(polls.get(), completed + 2);
+                assert!(session.scratch.logits.iter().all(|&value| value == 1234.0));
+                let mut cache = model.new_cache(131).unwrap();
+                let mut scratch = Gemma4Scratch::new(&model.config);
+                for (position, &token) in ids[..completed].iter().enumerate() {
+                    model
+                        .forward_step(token, position, &mut cache, &mut scratch, &[])
+                        .unwrap();
+                }
+                assert_eq!(session.cache.k_view(0).unwrap(), cache.k_view(0).unwrap());
+                assert_eq!(session.cache.v_view(0).unwrap(), cache.v_view(0).unwrap());
+            }
+        }
+
+        #[test]
+        fn public_greedy_uses_batch_and_preserves_probe_continuation() {
+            let model = tiny_nonzero_model();
+            let ids = prompt(129);
+            let actual = model.generate_greedy(&ids, 2, 131).unwrap();
+            let (expected, _, _) = model
+                .generate_greedy_with_probe(&ids, 2, 131, &[0])
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), 2);
+        }
     }
 
     mod driver_lifecycle_regressions {
@@ -747,6 +870,73 @@ mod tests {
                 || panic!("incomplete prefill must not report completion"),
                 || panic!("incomplete prefill must not flush a tail"),
             )
+        }
+
+        mod batch_prefill_controls {
+            use super::*;
+
+            #[test]
+            fn every_batch_cancel_boundary_poisoned_once_without_output() {
+                let model = tiny_nonzero_model();
+                let ids: Vec<u32> = (0..65).map(|i| 2 + (i % 13) as u32).collect();
+                let mut probe =
+                    GemmaCpuSession::new(&model, ids.clone(), 0.0, Some(7), 67).unwrap();
+                let total = Cell::new(0);
+                probe
+                    .prefill(&|| {
+                        total.set(total.get() + 1);
+                        false
+                    })
+                    .unwrap();
+                // Session polls: initial; each chunk entry; kernel/layer/query; publication.
+                // Driver adds its own initial poll before the interruptible adapter.
+                let mut partial_chunk = false;
+                let mut completed_chunk = false;
+                for fail_cleanup in [false, true] {
+                    for cancelled_poll in 1..=total.get() {
+                        let mut session = RecordingGemmaSession::new(&model, vec![2], fail_cleanup);
+                        session.inner =
+                            GemmaCpuSession::new(&model, ids.clone(), 0.0, Some(7), 67).unwrap();
+                        session.inner.scratch.logits.fill(1234.0);
+                        let polls = Cell::new(0);
+                        let cancel = || {
+                            let poll = polls.get();
+                            polls.set(poll + 1);
+                            poll == cancelled_poll
+                        };
+                        let mut text = String::new();
+                        let mut offsets = Vec::new();
+                        let result =
+                            run_prefill_only(&mut session, &ids, &cancel, &mut text, &mut offsets);
+                        if fail_cleanup {
+                            let Err(error) = result else {
+                                panic!("failed cleanup must preserve its error");
+                            };
+                            assert!(error.to_string().contains("synthetic cleanup failure"));
+                        } else {
+                            let result = result.unwrap();
+                            assert_eq!(result.stop_reason, StopReason::Interrupt);
+                            assert!(result.generated_ids.is_empty());
+                            assert!(result.token_logprobs.is_empty());
+                        }
+                        assert!(text.is_empty() && offsets.is_empty());
+                        assert_eq!(polls.get(), cancelled_poll + 1);
+                        assert_eq!(session.finishes, vec![FinishDisposition::Poisoned]);
+                        assert_eq!(session.interruptible_prefill_calls, 1);
+                        assert_eq!(session.plain_prefill_calls, 0);
+                        assert_eq!(session.select_calls, 0);
+                        assert_eq!(session.decode_calls, 0);
+                        assert_eq!(session.metadata_calls, 0);
+                        assert!(session.inner.scratch.logits.iter().all(|&v| v == 1234.0));
+                        assert!(matches!(session.inner.position, 0 | 64));
+                        let cached = session.inner.cache.seq_len(0).unwrap();
+                        partial_chunk |= cached > session.inner.position;
+                        completed_chunk |= session.inner.position == 64;
+                    }
+                }
+                assert!(partial_chunk, "must cancel after an actual donor append");
+                assert!(completed_chunk, "must cancel after one completed chunk");
+            }
         }
 
         #[test]

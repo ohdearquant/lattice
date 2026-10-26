@@ -11,12 +11,10 @@ impl MetalQwen35State {
         enc: &ComputeCommandEncoderRef,
         compact_idx: usize,
         linear_idx: usize,
-        position: usize,
         layer_idx: usize,
         cfg: &Qwen35Config,
         prof: &mut StepProfile,
         profiling: bool,
-        with_mlp: bool,
     ) -> usize {
         let hidden = cfg.hidden_size;
         let (
@@ -299,10 +297,6 @@ impl MetalQwen35State {
             layer_idx,
             "out_proj",
         );
-
-        if with_mlp {
-            self.encode_mlp_block(enc, compact_idx, layer_idx, position, cfg, prof, profiling);
-        }
 
         1 // one GDN GPU dispatch per layer
     }

@@ -13,21 +13,44 @@ lattice-transport   (standalone — optimal transport math, Sinkhorn-Knopp)
        │
        ▼
 lattice-tokenizer   ←── lattice-inference-core   (WordPiece, SentencePiece, BPE tokenizers)
+lattice-grammar     ←── lattice-inference-core   (JSON Schema, GBNF, constrained decoding)
+lattice-weights     ←── lattice-inference-core   (weight storage, model-directory format detection)
+lattice-metal-runtime ←── lattice-inference-core (shared Metal helpers, macOS + `metal-gpu`)
+lattice-compute     ←── lattice-inference-core   (host-side RoPE tables and KV caches)
+lattice-model-io    ←── lattice-inference-core   (model cache, checksum-verified downloads, env switches)
+lattice-arch        ←── lattice-inference-core
+                    ←── lattice-grammar         (generation types, sampling, decode policy)
+                    ←── lattice-weights         (Qwen3.5, Gemma 4, EmbeddingGemma 2, BitNet configs)
+lattice-quant       ←── lattice-inference-core
+                    ←── lattice-weights
+                    ←── lattice-arch            (Q4 manifests, Hadamard rotations, QuaRot conversion)
 lattice-inference   ←── lattice-inference-core
                     ←── lattice-tokenizer
-                    ←── lattice-fann (optional, `mixture` feature)
+                    ←── lattice-grammar
+                    ←── lattice-weights
+                    ←── lattice-quant
+                    ←── lattice-arch
+                    ←── lattice-compute
+                    ←── lattice-model-io
+                    ←── lattice-metal-runtime (optional, `metal-gpu` feature)
+                    ←── lattice-fann (optional, `mixture` or `metal-gpu` feature)
                                      (transformer forward pass, weights)
        │
        ▼
 lattice-embed   ←── lattice-inference   (embedding service, SIMD distance ops)
 lattice-tune    ←── lattice-fann
-                ←── lattice-inference   (training, LoRA, knowledge distillation)
+                ←── lattice-inference (optional, `inference-hook` or `train-backward`)
+                                        (training, LoRA, knowledge distillation)
 ```
 
 The three leaf crates (`inference-core`, `fann`, `transport`) have zero intra-workspace
-dependencies and can be used standalone. `tokenizer` depends only on `inference-core`, and
-`inference` builds on both (plus `fann` under the optional `mixture` feature), re-exporting the
-tokenizer and error types at their original paths. Consumer crates (`embed`, `tune`) compose them.
+dependencies and can be used standalone. `tokenizer`, `grammar`, `weights` and `model-io` each depend
+only on `inference-core` at runtime; grammar uses tokenizer in tests. `arch`
+depends on `inference-core` and `weights`; `quant` depends on those two and on `arch`; `compute` depends on `inference-core`, `tokenizer`, `weights` and `arch`. `inference` depends on all eight unconditionally (plus
+`fann` under the optional `mixture` or `metal-gpu` features), re-exporting tokenizer,
+grammar, weight, model-format, quantization primitive, model configuration, compute, model-file and error items at their original
+paths. `metal-runtime` depends only on `inference-core` internally; the facade enables
+it under `metal-gpu`. Consumer crates (`embed`, `tune`) compose them.
 
 ## Design Philosophy
 
@@ -48,6 +71,77 @@ justifies it.
 
 ## Crate Descriptions
 
+### lattice-metal-runtime
+
+Shared Metal buffer allocation and upload, argument encoding, shader compilation
+and compute pipeline construction. Its API exists only on macOS with the optional
+`metal-gpu` feature. The inference facade keeps this module private; its existing
+device test stays in inference to reuse the one shared GPU measurement lock.
+
+### lattice-grammar
+
+Grammar-constrained decoding: JSON Schema and GBNF compilers, a byte-level pushdown
+automaton, byte trie and vocabulary masks. Its only internal runtime dependency is
+`lattice-inference-core`; `lattice-tokenizer` is a test dependency. The facade retains
+every `lattice_inference::grammar::...` path. Profiling probes use `bench-internals`,
+forwarded by the facade feature of the same name.
+
+### lattice-weights
+
+Weight storage and conversion for f32, f16, Q3, Q4 and Q8, safetensors loading for
+single-file and sharded checkpoints, and model-directory format detection. Its only
+internal runtime dependency is `lattice-inference-core`. The facade retains the
+existing `lattice_inference::weights::...` and `lattice_inference::model_format::...`
+paths. Model loading and forward execution remain in `lattice-inference`.
+
+### lattice-quant
+
+Bounded Q4 checkpoint manifest reading, Walsh-Hadamard transforms, seeded randomized
+and block Hadamard rotations, input/output rotation absorption for weight matrices, and
+the offline QuaRot conversion of Qwen3.5 checkpoints: the rotation plan, RMSNorm fusion,
+LM-head and LoRA handling, the source-tensor reader and the online-rotation artifact
+descriptor, and the equivalence checks. Its internal runtime dependencies are
+`lattice-inference-core`, `lattice-weights` and `lattice-arch`; the Q4 manifest
+reader uses the bounded file reader from weights, and the conversion takes the Qwen3.5
+configuration and tensor names from arch. The facade retains every `lattice_inference::quant::q4_manifest` and
+`lattice_inference::quant::quarot::*` path.
+
+### lattice-arch
+
+The model interface every decoder shares: the generation request and result types
+(`GenerateConfig`, `GenerateOutput`, `TokenLogprob`, `TopLogprob`), the stop-reason
+taxonomy, sampling (`SamplingConfig`, `Sampler`), and the decode policy, stop-string
+matching and reasoning-budget arithmetic each decode loop runs. Until the model families
+move into their own crates it also holds the parsed and validated `config.json` for the
+Qwen3.5 and 3.6 hybrid models, Gemma 4, EmbeddingGemma 2 and BitNet b1.58, with the
+validation bounds those parsers enforce. Its internal runtime dependencies are
+`lattice-inference-core`, `lattice-grammar` (a generation request can carry a grammar) and
+`lattice-weights`; every parser reads through the bounded config reader from weights. The
+facade retains the `lattice_inference::{generation, sampling, stop_reason}` paths, the
+root re-exports of the generation types and `StopReason`, and the
+`lattice_inference::model::{qwen35_config, gemma4_config, embeddinggemma2_config,
+bitnet_config}` paths. The deprecated generation aliases stay in
+`lattice_inference::model::qwen35_config`.
+
+### lattice-compute
+
+Host-side compute for the forward passes. It currently holds the rotary position
+embedding tables (`RopeTable`), flat/paged KV storage and prefix sharing/cross-turn
+reuse planning. Its internal runtime dependency is `lattice-inference-core` for the
+shared error type; CPU kernels, attention, pooling and sampling move here in later
+changes. The facade retains
+the `lattice_inference::rope::RopeTable` path.
+
+### lattice-model-io
+
+Model files below the facade: the model cache directory (`default_cache_dir`, read from
+`LATTICE_MODEL_CACHE`), canonical model names with checksum-verified downloads
+(`download::ensure_model_files`, HTTP client behind the `download` feature, refused when
+`LATTICE_OFFLINE` is set) and the by-value environment switch reader (`env_switch_enabled`).
+Its only internal runtime dependency is `lattice-inference-core`. The facade retains the
+`lattice_inference::download::ensure_model_files` path, and inference's `download` feature
+forwards to this crate's.
+
 ### lattice-inference
 
 The transformer kernel. Stability tier: Experimental (high churn).
@@ -59,7 +153,9 @@ Contains two architecture paths:
 - **Qwen3 (decoder-only)**: causal GQA, RoPE, RMSNorm, SwiGLU FFN, last-token pooling,
   BPE tokenizer. Covers Qwen3-Embedding-0.6B and 4B.
 
-Modules: `model` (configs + loaders), `tokenizer`, `weights` (f32/f16/Q8/Q4), `attention`
+Modules: `model` (configs + loaders), `tokenizer`, `grammar`, `weights` and `model_format`
+(re-exports from their lower-level crates), `quant` (conversion orchestration and primitive
+re-exports), `attention`
 (standard, GQA, Flash, GDN), `forward` (CPU/NEON/Metal/WGPU backends), `pool`, `rope`,
 `kv_cache`, `lora_hook`, `download`, `speculative`, `sampling`.
 
@@ -134,7 +230,11 @@ lattice-embed           ← public API for embedding generation
 lattice-inference        ← transformer forward pass
     │   BERT/BGE encoder path (WordPiece/BPE tokenizers, mean pooling)
     │   Qwen3 decoder path (BPE, GQA, RoPE, SwiGLU, last-token pooling)
-    │   Weight formats: f32, f16, Q8, Q4
+    │   lattice-weights: f32, f16, Q3, Q4, Q8 storage and model-format detection
+    │   lattice-quant: Q4 manifests, Hadamard transforms and rotation absorption
+    │   lattice-arch: model interface (generation, sampling) and validated configurations
+    │   lattice-compute: RoPE tables and KV caches
+    │   lattice-model-io: model cache and checksum-verified downloads
     ▼
 CPU backends             Metal (macOS)    WGPU (cross-platform GPU)
 AVX2 / NEON kernels      Metal MSL kernels WGSL compute shaders

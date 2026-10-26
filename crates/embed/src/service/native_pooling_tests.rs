@@ -1,5 +1,5 @@
 use super::*;
-use lattice_inference::BertPooling;
+use lattice_compute::pool::BertPooling;
 use lattice_inference::bert_pooling_fixture::{DIMENSIONS, INPUTS, write_checkpoint};
 use std::path::Path;
 

@@ -12,6 +12,8 @@ use crate::pool::{l2_normalize, last_token_pool};
 use crate::rope::RopeTable;
 use crate::tokenizer::common::{EmbeddingTokenCounts, TokenizedInput, Tokenizer, load_tokenizer};
 use crate::weights::{QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors};
+#[doc(inline)]
+pub use lattice_arch::qwen_config::QwenConfig;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
@@ -189,54 +191,6 @@ impl ProfileTimings {
     }
 }
 
-/// **Unstable**: Qwen3 embedding model configuration; consumed by `QwenModel` loader.
-#[derive(Debug, Clone)]
-pub struct QwenConfig {
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
-    pub intermediate_size: usize,
-    pub max_position_embeddings: usize,
-    pub rms_norm_eps: f32,
-    pub rope_theta: f64,
-}
-
-impl QwenConfig {
-    /// **Unstable**: hardcoded Qwen3-Embedding-0.6B defaults.
-    pub fn qwen3_embedding_0_6b() -> Self {
-        Self {
-            vocab_size: 151_669,
-            hidden_size: 1024,
-            num_hidden_layers: 28,
-            num_attention_heads: 16,
-            num_key_value_heads: 8,
-            head_dim: 128,
-            intermediate_size: 3072,
-            max_position_embeddings: 32_768,
-            rms_norm_eps: 1e-6,
-            rope_theta: 1_000_000.0,
-        }
-    }
-
-    /// **Unstable**: total Q projection output dimension.
-    pub fn q_dim(&self) -> usize {
-        self.num_attention_heads * self.head_dim
-    }
-
-    /// **Unstable**: total KV projection output dimension.
-    pub fn kv_dim(&self) -> usize {
-        self.num_key_value_heads * self.head_dim
-    }
-
-    /// **Unstable**: GQA group size (Q heads per KV head).
-    pub fn num_groups(&self) -> usize {
-        self.num_attention_heads / self.num_key_value_heads
-    }
-}
-
 /// Per-model inference configuration.
 ///
 /// Loaded from `inference_config.json` in the model directory.
@@ -410,7 +364,7 @@ fn fold_weight_file_into_hasher(
     // function's existing error path, same as any other unreadable shard.
     let path = crate::weights::contained_shard_path(dir, file_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-    let opened = crate::weights::mmap_trust::open_regular_file_no_hang(&path)
+    let opened = lattice_weights::mmap_trust::open_regular_file_no_hang(&path)
         .map_err(std::io::Error::other)?;
     let mut file = std::io::BufReader::new(opened);
     let len = file.get_ref().metadata()?.len();

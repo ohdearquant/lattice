@@ -471,6 +471,41 @@ impl<'ast> Visit<'ast> for RetiredPipeline {
     }
 }
 
+fn read_shader(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("cannot read shader {}: {error}", path.display()))
+}
+
+/// The bytes of the `lattice-metal-runtime` source constant `name`, read through its own
+/// `include_str!` declaration in `crates/metal-runtime/src/msl.rs`.
+fn shared_shader(name: &str) -> String {
+    let owner = Path::new(env!("CARGO_MANIFEST_DIR")).join("../metal-runtime/src/msl.rs");
+    let syntax = syn::parse_file(&read_shader(&owner)).expect("msl.rs must parse");
+    let mut found = Vec::new();
+    for item in &syntax.items {
+        let syn::Item::Const(constant) = item else {
+            continue;
+        };
+        if constant.ident != name {
+            continue;
+        }
+        let Expr::Macro(include) = constant.expr.as_ref() else {
+            panic!("shared shader {name} must be an include_str! of its file");
+        };
+        assert!(include.mac.path.is_ident("include_str"));
+        let relative = syn::parse2::<syn::LitStr>(include.mac.tokens.clone())
+            .expect("shared shader path must be literal");
+        found.push(read_shader(
+            &owner
+                .parent()
+                .expect("msl.rs has a directory")
+                .join(relative.value()),
+        ));
+    }
+    assert_eq!(found.len(), 1, "shared shader {name} must be declared once");
+    found.pop().expect("one shared shader")
+}
+
 fn assembled_shader(population: &GuardPopulation) -> String {
     #[derive(Default)]
     struct Sources<'a>(Vec<&'a syn::ItemConst>);
@@ -492,7 +527,11 @@ fn assembled_shader(population: &GuardPopulation) -> String {
                 panic!("main shader source must have an explicit assembly");
             };
             assert!(
-                mac.mac.path.is_ident("concat"),
+                mac.mac
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "concat_msl"),
                 "main shader assembly must be explicit"
             );
             let fragments = expression_list(mac.mac.tokens.clone(), "shader assembly arguments");
@@ -502,20 +541,35 @@ fn assembled_shader(population: &GuardPopulation) -> String {
             );
             let mut assembly = String::new();
             for fragment in fragments {
-                let Expr::Macro(include) = fragment else {
-                    panic!("shader assembly must name its source fragments");
-                };
-                assert!(include.mac.path.is_ident("include_str"));
-                let relative = syn::parse2::<syn::LitStr>(include.mac.tokens)
-                    .expect("shader fragment path must be literal");
-                let owner = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
-                let path = owner
-                    .parent()
-                    .expect("shader owner has a directory")
-                    .join(relative.value());
-                assembly.push_str(&std::fs::read_to_string(&path).unwrap_or_else(|error| {
-                    panic!("cannot read shader {}: {error}", path.display())
-                }));
+                match fragment {
+                    Expr::Macro(include) => {
+                        assert!(include.mac.path.is_ident("include_str"));
+                        let relative = syn::parse2::<syn::LitStr>(include.mac.tokens)
+                            .expect("shader fragment path must be literal");
+                        let owner = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+                        assembly.push_str(&read_shader(
+                            &owner
+                                .parent()
+                                .expect("shader owner has a directory")
+                                .join(relative.value()),
+                        ));
+                    }
+                    Expr::Path(shared) => {
+                        let name = shared
+                            .path
+                            .segments
+                            .last()
+                            .expect("shared shader fragment has a name")
+                            .ident
+                            .to_string();
+                        assert!(
+                            path_ends(&Expr::Path(shared), &format!("msl::{name}")),
+                            "a shared shader fragment must name a lattice-metal-runtime source"
+                        );
+                        assembly.push_str(&shared_shader(&name));
+                    }
+                    _ => panic!("shader assembly must name its source fragments"),
+                }
             }
             assemblies.push(assembly);
         }
@@ -599,7 +653,8 @@ fn retired_closed_call_chains_stay_deleted() {
         "shared layer helpers must retain one common owner module"
     );
     count(&population, "gqa", "lora", 4);
-    count(&population, "gqa", "mlp", 1);
+    count(&population, "gqa", "mlp", 0);
+    count(&population, "injected", "mlp", 2);
     let block = body(&population, "gqa");
     let projections = calls(&block)
         .methods

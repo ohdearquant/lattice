@@ -15,7 +15,7 @@
 //! Run:
 //!   cargo test -p lattice-embed --test tokenizer_parity_e2e
 
-use lattice_inference::{Tokenizer, load_tokenizer};
+use lattice_tokenizer::{Tokenizer, load_tokenizer};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------

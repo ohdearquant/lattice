@@ -39,6 +39,12 @@ make ci  # fmt + clippy + doc lint + test + release build
 make publish-dry
 ```
 
+`make publish-dry` validates only the three leaf crates (`lattice-fann`,
+`lattice-transport`, `lattice-inference-core`). The twelve dependent crates, including
+`lattice-tokenizer`, `lattice-grammar`, `lattice-weights`, `lattice-metal-runtime`, `lattice-compute`, `lattice-model-io`, `lattice-quant` and `lattice-arch`, need their dependencies
+published first.
+Run `scripts/package-size-check.sh` for all fifteen crates before publishing.
+
 ## Publish
 
 ```sh
@@ -46,7 +52,7 @@ make publish-dry
 git tag -a v{VERSION} -m "v{VERSION}"
 git push origin v{VERSION}
 
-# 6. Publish to crates.io (leaves → tokenizer → inference → embed, tune, with indexing waits)
+# 6. Publish to crates.io (leaves → tokenizer, grammar, weights, metal-runtime, model-io → arch → quant → inference → embed, tune, with indexing waits)
 make publish
 
 # 7. Create the tagged GitHub release as a draft
@@ -65,7 +71,7 @@ state and every remote asset before retrying.
 
 ## Post-release
 
-- [ ] Verify on crates.io: all 5 crates show v{VERSION}
+- [ ] Verify on crates.io: all fifteen crates show v{VERSION}
 - [ ] Smoke test: `cargo add lattice-inference@{VERSION}` in a fresh project
 - [ ] Update getting-started.md if API changed
 - [ ] Close relevant milestone/issues
@@ -84,7 +90,7 @@ gh release create v{NEW_VERSION} --draft --title "v{NEW_VERSION}" --notes-file d
 gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f tag=v{NEW_VERSION}
 
 # Only after the replacement is live and the asset workflow succeeds:
-for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-inference lattice-embed lattice-tune; do
+for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-arch lattice-compute lattice-model-io lattice-inference lattice-embed lattice-tune lattice-serve; do
   cargo yank --version {VERSION} "$c"
 done
 ```

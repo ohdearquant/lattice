@@ -1,5 +1,6 @@
 use super::*;
 use crate::vision::checkpoint::{VisualBlockWeights, VisualMergerWeights};
+#[cfg(feature = "image")]
 use crate::vision::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
 
 fn tiny_cfg() -> VisionModelConfig {
@@ -18,6 +19,7 @@ fn tiny_cfg() -> VisionModelConfig {
     }
 }
 
+#[cfg(feature = "image")]
 fn make_test_png(w: u32, h: u32) -> Vec<u8> {
     use image::RgbImage;
     let mut img = RgbImage::new(w, h);
@@ -89,6 +91,7 @@ fn make_test_weights(cfg: &VisionModelConfig) -> Qwen35VisionWeights {
 /// Below-GPU-dispatch-threshold shapes exercise the CPU-fallback path in
 /// `gemm_bt`/`gemm_nn` on every platform (no Metal device required),
 /// proving the fallback math matches the CPU reference exactly.
+#[cfg(feature = "image")]
 #[test]
 fn metal_forward_matches_cpu_reference_small_shapes() {
     let cfg = tiny_cfg();
@@ -125,6 +128,7 @@ fn metal_forward_matches_cpu_reference_small_shapes() {
     }
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn metal_forward_cancels_after_work_started() {
     let cfg = tiny_cfg();

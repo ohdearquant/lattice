@@ -20,12 +20,13 @@ use crate::error::InferenceError;
 use crate::model::qwen35_config::VisionModelConfig;
 use crate::quant::q4_manifest;
 use crate::weights::f32_weights::{
-    SafetensorsFile, ShardedSafetensors, TensorSource, contained_shard_path,
-    open_manifest_entry_once, parse_index,
+    SafetensorsFile, ShardedSafetensors, TensorSource, contained_shard_path, parse_index,
 };
-use crate::weights::q4_weights::{
-    F16LoadError, dequantize_q4_to_f32, load_f16_tensor_from_open_file,
-    load_f16_tensor_from_open_file_expecting, load_q4_from_open_file,
+use crate::weights::q4_weights::{F16LoadError, dequantize_q4_to_f32};
+use lattice_weights::f32_weights::open_manifest_entry_once;
+use lattice_weights::q4_weights::{
+    load_f16_tensor_from_open_file, load_f16_tensor_from_open_file_expecting,
+    load_q4_from_open_file,
 };
 
 /// Tensor name to its dequantized data paired with the shape it was declared with.
@@ -943,6 +944,10 @@ fn load_from_q4_dir_with_cancel(
                     },
                     F16LoadError::Other(e) => InferenceError::InvalidSafetensors(format!(
                         "failed to load f16 tensor {} from {display_path}: {e}",
+                        entry.name,
+                    )),
+                    other => InferenceError::InvalidSafetensors(format!(
+                        "failed to load f16 tensor {} from {display_path}: {other}",
                         entry.name,
                     )),
                 },

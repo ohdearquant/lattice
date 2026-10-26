@@ -172,6 +172,131 @@ fn qualified_reexport_calls_resolve_the_external_owner() {
 }
 
 #[test]
+fn dependency_paths_resolve_only_through_declared_normal_dependencies() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "src/lib.rs",
+        "pub mod forward; pub mod decoder; pub mod facade;\n",
+    );
+    fixture.write(
+        "src/facade.rs",
+        "pub use external_dep::helper;\npub use dev_only::fixture_helper;\n",
+    );
+    let bridge =
+        |name: &str| format!("{LOCAL}pub fn bridge() {{ use crate::facade::{name}; {name}(); }}\n");
+    fixture.write(ROOT, &bridge("helper"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("a dependency path without a manifest must stay unresolved");
+    assert!(
+        error.contains("unresolved symbol crate::facade::external_dep"),
+        "wrong manifest-less refusal: {error}"
+    );
+
+    fixture.write(
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nexternal-dep = \"1\"\n\n\
+         [dev-dependencies]\ndev-only = \"1\"\n\n\
+         [workspace]\n",
+    );
+    fixture
+        .load()
+        .require_calls(CALLS)
+        .expect("a declared dependency path must resolve outside the crate");
+
+    fixture.write(ROOT, &bridge("fixture_helper"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("a development dependency is not visible to library source");
+    assert!(
+        error.contains("unresolved symbol crate::facade::dev_only"),
+        "wrong development-dependency refusal: {error}"
+    );
+}
+
+#[test]
+fn dependency_paths_resolve_beside_a_glob_of_a_dependency() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nexternal-dep = \"1\"\nglob-dep = \"1\"\n\n\
+         [workspace]\n",
+    );
+    let bridge = |glob: &str, name: &str| {
+        format!("{LOCAL}use {glob}::*;\npub fn bridge() {{ use {name}::helper; helper(); }}\n")
+    };
+    fixture.write(ROOT, &bridge("glob_dep", "external_dep"));
+    fixture
+        .load()
+        .require_calls(CALLS)
+        .expect("a dependency path must resolve beside a glob of another dependency");
+
+    fixture.write(ROOT, &bridge("glob_dep", "missing_dep"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("an undeclared path head must stay unresolved beside a dependency glob");
+    assert!(
+        error.contains("unresolved symbol crate::forward::metal_qwen35::missing_dep"),
+        "wrong undeclared-head refusal: {error}"
+    );
+
+    fixture.write(ROOT, &bridge("missing_dep", "external_dep"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("a glob of an undeclared crate must leave the lookup unresolved");
+    assert!(
+        error.contains("unresolved symbol crate::forward::metal_qwen35::missing_dep"),
+        "wrong undeclared-glob refusal: {error}"
+    );
+}
+
+#[test]
+fn dependency_paths_resolve_through_a_parent_glob_that_does_not_bind_them() {
+    const CHILD: &str = "src/forward/metal_qwen35/buffers.rs";
+    let fixture = Fixture::new();
+    fixture.write(
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nexternal-dep = \"1\"\nglob-dep = \"1\"\n\n\
+         [workspace]\n",
+    );
+    fixture.write(ROOT, &format!("{LOCAL}use glob_dep::*;\nmod buffers;\n"));
+    let child = |body: &str| format!("use super::*;\npub fn bridge() {{ {body} }}\n");
+
+    fixture.write(CHILD, &child("use external_dep::helper; helper();"));
+    fixture
+        .load()
+        .require_calls(CALLS)
+        .expect("a dependency path must resolve through a parent glob that does not bind it");
+
+    fixture.write(CHILD, &child("use missing_dep::helper; helper();"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("an undeclared path head must stay unresolved through the parent glob");
+    assert!(
+        error.contains("unresolved symbol crate::forward::metal_qwen35::buffers::missing_dep"),
+        "wrong undeclared-head refusal: {error}"
+    );
+
+    fixture.write(CHILD, &child("sample();"));
+    let error = fixture
+        .load()
+        .require_calls(CALLS)
+        .expect_err("a name the parent binds must still reach the child through the glob");
+    assert!(
+        error.contains("crate::forward::metal_qwen35::buffers::bridge"),
+        "the parent glob did not supply its own binding: {error}"
+    );
+}
+
+#[test]
 fn relocated_caller_bypass_is_rejected() {
     let fixture = Fixture::new();
     fixture.relocate();
@@ -625,5 +750,324 @@ fn literal_path_modules_are_resolved_and_missing_paths_refuse() {
     assert!(
         error.contains("moved.rs"),
         "missing literal path diagnostic: {error}"
+    );
+}
+
+#[derive(Debug)]
+enum Expect {
+    Owner(&'static str),
+    Refused(&'static [&'static str]),
+}
+
+struct Row {
+    name: &'static str,
+    files: &'static [(&'static str, &'static str)],
+    expect: Expect,
+}
+
+/// Runs every row in a fresh fixture and reports all rows that differ, so one failure
+/// names the rule it breaks instead of stopping at the first. An accepted row has the
+/// sampler owned by the expected file and exactly one recognized call from the caller.
+fn check_rows(rows: &[Row], setup: impl Fn(&Fixture)) {
+    let mut failures = Vec::new();
+    for row in rows {
+        let fixture = Fixture::new();
+        setup(&fixture);
+        for (path, source) in row.files {
+            fixture.write(path, source);
+        }
+        let actual = GuardPopulation::load(fixture.path(), OWNERS).and_then(|population| {
+            population.require_calls(CALLS)?;
+            Ok(population.owner("sampler")?.file.clone())
+        });
+        let matched = match (&row.expect, &actual) {
+            (Expect::Owner(file), Ok(found)) => found == file,
+            (Expect::Refused(parts), Err(error)) => {
+                !parts.is_empty() && parts.iter().all(|part| error.contains(part))
+            }
+            _ => false,
+        };
+        if !matched {
+            failures.push(format!(
+                "{}: expected {:?}, got {actual:?}",
+                row.name, row.expect
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} rows differ:\n{}",
+        failures.len(),
+        rows.len(),
+        failures.join("\n")
+    );
+}
+
+fn sibling_modules(fixture: &Fixture) {
+    fixture.write(
+        "src/forward/mod.rs",
+        "pub mod metal_qwen35; mod shared; mod hop; mod empty; mod left; mod right;\n",
+    );
+    fixture.write(SHARED, "pub fn sample() {}\n");
+    for module in ["hop", "empty", "left", "right"] {
+        fixture.write(&format!("src/forward/{module}.rs"), "");
+    }
+}
+
+const LEFT: &str = "src/forward/left.rs";
+const RIGHT: &str = "src/forward/right.rs";
+
+#[test]
+fn module_name_resolution_follows_the_binding_and_glob_rules() {
+    check_rows(
+        &[
+            Row {
+                name: "a definition binds its own module",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() { sample(); }\n",
+                )],
+                expect: Expect::Owner(ROOT),
+            },
+            Row {
+                name: "a named re-export binds its target",
+                files: &[(
+                    ROOT,
+                    "pub use super::shared::sample;\npub fn generate() { sample(); }\n",
+                )],
+                expect: Expect::Owner(SHARED),
+            },
+            Row {
+                name: "a glob imports what its destination defines",
+                files: &[(
+                    ROOT,
+                    "pub use super::shared::*;\npub fn generate() { sample(); }\n",
+                )],
+                expect: Expect::Owner(SHARED),
+            },
+            Row {
+                name: "a glob imports through its destination's own glob",
+                files: &[
+                    (
+                        ROOT,
+                        "pub use super::hop::*;\npub fn generate() { sample(); }\n",
+                    ),
+                    ("src/forward/hop.rs", "pub use super::shared::*;\n"),
+                ],
+                expect: Expect::Owner(SHARED),
+            },
+            Row {
+                name: "a glob whose destination lacks the name adds nothing",
+                files: &[(
+                    ROOT,
+                    "pub use super::empty::*;\npub use super::shared::*;\n\
+                     pub fn generate() { sample(); }\n",
+                )],
+                expect: Expect::Owner(SHARED),
+            },
+            Row {
+                name: "two globs that both bind the name are ambiguous",
+                files: &[
+                    (
+                        ROOT,
+                        "pub use super::left::*;\npub use super::right::*;\n\
+                         pub fn generate() { sample(); }\n",
+                    ),
+                    (LEFT, "pub fn sample() {}\n"),
+                    (RIGHT, "pub fn sample() {}\n"),
+                ],
+                expect: Expect::Refused(&["ambiguous", "sample"]),
+            },
+            Row {
+                name: "a named import shadows the globs",
+                files: &[
+                    (
+                        ROOT,
+                        "pub use super::left::*;\npub use super::right::*;\n\
+                         pub use super::shared::sample;\npub fn generate() { sample(); }\n",
+                    ),
+                    (LEFT, "pub fn sample() {}\n"),
+                    (RIGHT, "pub fn sample() {}\n"),
+                ],
+                expect: Expect::Owner(SHARED),
+            },
+            Row {
+                name: "a glob cycle that never binds the name refuses",
+                files: &[
+                    (
+                        ROOT,
+                        "pub use super::left::*;\npub fn generate() { sample(); }\n",
+                    ),
+                    (LEFT, "pub use super::right::*;\n"),
+                    (RIGHT, "pub use super::left::*;\n"),
+                ],
+                expect: Expect::Refused(&["cycle", "sample"]),
+            },
+            Row {
+                name: "a glob cycle whose member binds the name resolves to that member",
+                files: &[
+                    (
+                        ROOT,
+                        "pub use super::left::*;\npub fn generate() { sample(); }\n",
+                    ),
+                    (LEFT, "pub use super::right::*;\n"),
+                    (RIGHT, "pub use super::left::*;\npub fn sample() {}\n"),
+                ],
+                expect: Expect::Owner(RIGHT),
+            },
+            Row {
+                name: "a test-only glob is not production",
+                files: &[(
+                    ROOT,
+                    "#[cfg(test)]\npub use super::shared::*;\npub fn generate() { sample(); }\n",
+                )],
+                expect: Expect::Refused(&[
+                    "unresolved symbol crate::forward::metal_qwen35::sample",
+                ]),
+            },
+            Row {
+                name: "a test-only definition does not shadow a production glob",
+                files: &[(
+                    ROOT,
+                    "#[cfg(test)]\npub fn sample() {}\npub use super::shared::*;\n\
+                     pub fn generate() { sample(); }\n",
+                )],
+                expect: Expect::Owner(SHARED),
+            },
+        ],
+        sibling_modules,
+    );
+}
+
+#[test]
+fn call_site_shapes_are_counted_or_refused_by_rule() {
+    check_rows(
+        &[
+            Row {
+                name: "a bare call",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() { sample(); }\n",
+                )],
+                expect: Expect::Owner(ROOT),
+            },
+            Row {
+                name: "a self-qualified call",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() { self::sample(); }\n",
+                )],
+                expect: Expect::Owner(ROOT),
+            },
+            Row {
+                name: "a crate-qualified call",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\n\
+                     pub fn generate() { crate::forward::metal_qwen35::sample(); }\n",
+                )],
+                expect: Expect::Owner(ROOT),
+            },
+            Row {
+                name: "a super-qualified call",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() { super::metal_qwen35::sample(); }\n",
+                )],
+                expect: Expect::Owner(ROOT),
+            },
+            Row {
+                name: "a call through a renamed local import",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() {\n\
+                     use crate::forward::metal_qwen35::sample as chosen;\nchosen();\n}\n",
+                )],
+                expect: Expect::Owner(ROOT),
+            },
+            Row {
+                name: "a call through a local module alias",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() {\n\
+                     use crate::forward::metal_qwen35 as engine;\nengine::sample();\n}\n",
+                )],
+                expect: Expect::Owner(ROOT),
+            },
+            Row {
+                name: "a call through a local glob",
+                files: &[
+                    ("src/forward/mod.rs", "pub mod metal_qwen35; mod caller;\n"),
+                    (
+                        "src/forward/caller.rs",
+                        "pub fn generate() {\nuse super::metal_qwen35::*;\nsample();\n}\n",
+                    ),
+                    (
+                        ROOT,
+                        "pub fn sample() {}\npub use super::caller::generate;\n",
+                    ),
+                ],
+                expect: Expect::Owner(ROOT),
+            },
+            Row {
+                name: "an unrelated path call is not resolved",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() { missing_dep::helper(); sample(); }\n",
+                )],
+                expect: Expect::Owner(ROOT),
+            },
+            Row {
+                name: "a guarded name under an unresolvable prefix refuses",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() { missing_dep::sample(); sample(); }\n",
+                )],
+                expect: Expect::Refused(&[
+                    "unresolved symbol crate::forward::metal_qwen35::missing_dep",
+                ]),
+            },
+            Row {
+                name: "a value alias of the guarded function refuses",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() { let chosen = sample; chosen(); }\n",
+                )],
+                expect: Expect::Refused(&["unsupported value alias"]),
+            },
+            Row {
+                name: "a nested function shadowing the guarded name refuses",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() {\nfn sample() {}\nsample();\n}\n",
+                )],
+                expect: Expect::Refused(&["local binding shadows guarded call"]),
+            },
+            Row {
+                name: "a method call named like the guarded function refuses",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() { let engine = (); engine.sample(); sample(); }\n",
+                )],
+                expect: Expect::Refused(&["unsupported guarded method receiver"]),
+            },
+            Row {
+                name: "a second call changes the count",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() { sample(); sample(); }\n",
+                )],
+                expect: Expect::Refused(&["caller manifest differs"]),
+            },
+            Row {
+                name: "a call written inside a string is not a call",
+                files: &[(
+                    ROOT,
+                    "pub fn sample() {}\npub fn generate() { sample(); let _text = \"sample()\"; }\n",
+                )],
+                expect: Expect::Owner(ROOT),
+            },
+        ],
+        |_| {},
     );
 }

@@ -8,22 +8,25 @@ use std::sync::Arc;
 use std::cell::Cell;
 
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
+    Buffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device,
+    MTLCommandBufferStatus, MTLSize,
 };
 
 use crate::error::InferenceError;
+use crate::forward::metal_runtime::{
+    self, BufferPolicy, ELEMENT_THREADS, UploadCopy, ZeroLengthPolicy, bind, element_dispatch,
+    scalar,
+};
 use crate::model::ernie45::{Ernie45Config, Ernie45LayerWeights, Ernie45Weights, MAX_SEQ_LEN};
 use crate::model::gemma4_ops::{gemma4_rope_cos_sin, gemma4_rope_inv_freq};
 
-const SHADERS: &str = concat!(
-    include_str!("../shaders/rms_reduce.metal"),
-    include_str!("../shaders/flash_attention.metal"),
-    include_str!("../shaders/ernie45_rope.metal"),
+const SHADERS: &str = metal_runtime::concat_msl!(
+    metal_runtime::msl::RMS_REDUCE,
+    metal_runtime::msl::FLASH_ATTENTION,
+    metal_runtime::msl::ERNIE45_ROPE,
     include_str!("../shaders/ernie45_embed.metal"),
     include_str!("../shaders/ernie45_decode.metal")
 );
-const ELEMENT_THREADS: u64 = 256;
 const TILE_Q: u32 = 4;
 const SIMD_WIDTH: u32 = 32;
 
@@ -36,17 +39,7 @@ fn runtime(message: impl Into<String>) -> InferenceError {
 }
 
 fn elements(name: &str, rows: usize, width: usize) -> Result<usize, InferenceError> {
-    let count = rows
-        .checked_mul(width)
-        .ok_or_else(|| invalid(format!("{name} element count overflow")))?;
-    u32::try_from(count).map_err(|_| invalid(format!("{name} exceeds u32 indexing")))?;
-    let bytes = count
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| invalid(format!("{name} byte count overflow")))?;
-    if bytes > isize::MAX as usize {
-        return Err(invalid(format!("{name} exceeds host slice capacity")));
-    }
-    Ok(count)
+    metal_runtime::elements(name, rows, width, invalid)
 }
 
 /// Check all shader geometry and host capacities before acquiring a Metal device.
@@ -193,31 +186,9 @@ impl Pipelines {
             .replace("__FUSED_C_HEAD_DIM__", &cfg.head_dim.to_string())
             .replace("__FUSED_C_HALF_DIM__", &(cfg.head_dim / 2).to_string())
             .replace("__FUSED_C_THREADS__", &(cfg.head_dim / 2).to_string());
-        let options = CompileOptions::new();
-        options.set_fast_math_enabled(false);
-        let library = device
-            .new_library_with_source(&source, &options)
-            .map_err(|error| runtime(format!("shader compilation failed: {error}")))?;
+        let library = metal_runtime::compile_library(device, &source, runtime)?;
         let make = |name: &str, threads: u64| -> Result<ComputePipelineState, InferenceError> {
-            let function = library
-                .get_function(name, None)
-                .map_err(|error| runtime(format!("missing {name} kernel: {error}")))?;
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(|error| runtime(format!("{name} pipeline failed: {error}")))?;
-            if pipeline.max_total_threads_per_threadgroup() < threads {
-                return Err(runtime(format!(
-                    "{name} needs {threads} threads per group, pipeline permits {}",
-                    pipeline.max_total_threads_per_threadgroup()
-                )));
-            }
-            if pipeline.static_threadgroup_memory_length() > device.max_threadgroup_memory_length()
-            {
-                return Err(runtime(format!(
-                    "{name} exceeds threadgroup memory capacity"
-                )));
-            }
-            Ok(pipeline)
+            metal_runtime::make_pipeline(device, &library, name, threads, runtime)
         };
         let attention_threads = u64::from(TILE_Q * SIMD_WIDTH) * groups as u64;
         let limits = device.max_threads_per_threadgroup();
@@ -301,51 +272,18 @@ struct Activations {
     token_ids: Buffer,
 }
 
+const BUFFER_POLICY: BufferPolicy = BufferPolicy {
+    zero_length: ZeroLengthPolicy::Exact,
+    invalid,
+    runtime,
+};
+
 fn allocate(device: &Device, count: usize, label: &str) -> Result<Buffer, InferenceError> {
-    let count = elements(label, count, 1)?;
-    let bytes = (count * size_of::<f32>()) as u64;
-    if bytes > device.max_buffer_length() {
-        return Err(runtime(format!(
-            "{label} exceeds the device buffer capacity"
-        )));
-    }
-    let selector = objc::runtime::Sel::register("newBufferWithLength:options:");
-    // SAFETY: this is the Metal allocation selector with its documented NSUInteger
-    // length/options ABI and nullable object return. A raw pointer preserves nil
-    // until it can be checked, unlike metal-rs's non-null Buffer return type.
-    let raw: *mut metal::MTLBuffer = unsafe {
-        objc::Message::send_message(
-            &**device,
-            selector,
-            (bytes, MTLResourceOptions::StorageModeShared),
-        )
-    }
-    .map_err(|error| runtime(format!("{label} allocation message failed: {error}")))?;
-    if raw.is_null() {
-        return Err(runtime(format!("{label} allocation failed")));
-    }
-    // SAFETY: Metal returned a non-null owned (+1) MTLBuffer. Transferring that
-    // ownership exactly once to Buffer pairs it with metal-rs's release on drop.
-    let buffer = unsafe { <Buffer as metal::foreign_types::ForeignType>::from_ptr(raw) };
-    buffer.set_label(label);
-    if buffer.contents().is_null() || buffer.length() < bytes {
-        return Err(runtime(format!("{label} allocation is not CPU accessible")));
-    }
-    Ok(buffer)
+    metal_runtime::allocate(device, count, label, BUFFER_POLICY)
 }
 
 fn upload(device: &Device, values: &[f32], label: &str) -> Result<Buffer, InferenceError> {
-    let buffer = allocate(device, values.len(), label)?;
-    // SAFETY: allocate created a suitably aligned shared buffer for values.len() f32s.
-    // This new buffer has not been submitted to the GPU and cannot alias the input slice.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            values.as_ptr(),
-            buffer.contents().cast::<f32>(),
-            values.len(),
-        );
-    }
-    Ok(buffer)
+    metal_runtime::upload(device, values, label, BUFFER_POLICY, UploadCopy::Direct)
 }
 
 /// Metal f32 prefill and cached decode with persistent weights and scratch.
@@ -816,7 +754,7 @@ impl MetalErnie45State {
 
     fn attention(&self, enc: &ComputeCommandEncoderRef, rows: u32, q: u32, kv: u32) {
         #[repr(C)]
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, bytemuck::NoUninit)]
         struct Params {
             seq_len: u32,
             q_dim4: u32,
@@ -869,23 +807,4 @@ impl MetalErnie45State {
         #[cfg(all(test, feature = "f16"))]
         self.record(4);
     }
-}
-
-fn bind(enc: &ComputeCommandEncoderRef, index: u64, buffer: &Buffer) {
-    enc.set_buffer(index, Some(buffer), 0);
-}
-
-fn scalar<T: Copy>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
-    enc.set_bytes(
-        index,
-        size_of::<T>() as u64,
-        std::ptr::from_ref(value).cast(),
-    );
-}
-
-fn element_dispatch(enc: &ComputeCommandEncoderRef, count: u32) {
-    enc.dispatch_thread_groups(
-        MTLSize::new(u64::from(count).div_ceil(ELEMENT_THREADS), 1, 1),
-        MTLSize::new(ELEMENT_THREADS, 1, 1),
-    );
 }

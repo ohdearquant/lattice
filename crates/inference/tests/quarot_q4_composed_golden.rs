@@ -1,6 +1,6 @@
 //! QuaRot+Q4 composed-path golden regression gate (issue #320).
 //!
-//! **Purpose**: `crates/inference/src/quant/quarot/forward_equivalence.rs`
+//! **Purpose**: `crates/quant/src/quarot/forward_equivalence.rs`
 //! gates the converter itself (pre-quant f64 vs post-rotation-fusion,
 //! `1e-5` tolerance) but nothing previously exercised the actual runtime
 //! consumer of a QuaRot+Q4 artifact —

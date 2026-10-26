@@ -12,7 +12,7 @@ f16-resident buffers, so fake-quant reproduces the numerics the real
 container would produce without container/kernel changes.
 
 This script does NOT reimplement the Rust Q4 quantizer as a fresh design —
-it replicates crates/inference/src/weights/q4_weights.rs's
+it replicates crates/weights/src/q4_weights.rs's
 `quantize_block_with_mode_len` arithmetic exactly (same block chunking over
 the flattened tensor, same min/max-derived affine scale/bias, same
 abs_max/7 symmetric scale with bias=-8*scale, same f32::round-half-away-
@@ -82,7 +82,7 @@ DEFAULT_MODEL_DIR = Path.home() / ".lattice/models/qwen3.5-0.8b"
 DEFAULT_Q4_DIR = Path.home() / ".lattice/models/qwen3.5-0.8b-q4"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# The real Rust quantizer (crates/inference/src/bin/quantize_q4.rs) only
+# The real Rust quantizer (crates/serve/src/bin/quantize_q4.rs) only
 # ever produces group-32 affine blocks; that is what self-test diffs
 # against. Group-64 and symmetric are Python-only candidate schemes with no
 # on-disk Rust counterpart to bit-compare against.

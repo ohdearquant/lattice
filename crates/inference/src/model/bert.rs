@@ -4,9 +4,8 @@
 //! boxed `dyn Tokenizer`, allowing WordPiece, BPE, and SentencePiece tokenizers
 //! to share a single inference path.
 
-use crate::attention::{
-    AttentionBuffers, multi_head_attention_batched, multi_head_attention_in_place,
-};
+use crate::attention::AttentionBuffers;
+use crate::attention::standard::bert_attention_projections;
 use crate::download::ensure_model_files;
 use crate::error::InferenceError;
 use crate::forward::cpu::{
@@ -70,7 +69,7 @@ mod prepared_bpe_vocab_match;
 /// externally constructible API surface (`crate::weights::TransformerLayerWeights`),
 /// so adding a field there is a breaking change under SemVer (adding a public
 /// field to an all-public struct forces every downstream struct literal to
-/// change). See `crate::attention::standard::multi_head_attention_in_place`'s
+/// change). See `lattice_compute::attention::standard::multi_head_attention_in_place`'s
 /// doc comment and PR #678.
 struct LayerFusedQkv {
     weight: Vec<f32>,
@@ -290,13 +289,53 @@ impl BertModel {
         config_json: &str,
         tokenizer_json: &str,
     ) -> Result<Self, InferenceError> {
+        Self::from_bytes_capped(weights_bytes, config_json, tokenizer_json, None)
+    }
+
+    /// **Unstable**: [`from_bytes`](Self::from_bytes) with the input length cap
+    /// chosen by the caller instead of derived from `config.json`; signature may
+    /// change as the from-bytes loading API matures.
+    ///
+    /// `max_tokens` counts the tokenizer's special tokens. A longer input is
+    /// truncated to `max_tokens` with its closing separator kept, so a caller
+    /// can reproduce another runtime's truncation length exactly. The cap never
+    /// exceeds the position-embedding table or the 2048-token limit `from_bytes`
+    /// applies; a larger value is lowered to them, and
+    /// [`tokenizer().max_seq_len()`](Self::tokenizer) reports the cap in force.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::InvalidInput`] when `max_tokens` is below 2, which
+    /// leaves no room for the opening and closing special tokens, and otherwise
+    /// the same errors as [`from_bytes`](Self::from_bytes).
+    pub fn from_bytes_with_max_tokens(
+        weights_bytes: Vec<u8>,
+        config_json: &str,
+        tokenizer_json: &str,
+        max_tokens: usize,
+    ) -> Result<Self, InferenceError> {
+        if max_tokens < 2 {
+            return Err(InferenceError::InvalidInput(format!(
+                "max_tokens must be at least 2 (the opening and closing special tokens), got {max_tokens}"
+            )));
+        }
+        Self::from_bytes_capped(weights_bytes, config_json, tokenizer_json, Some(max_tokens))
+    }
+
+    fn from_bytes_capped(
+        weights_bytes: Vec<u8>,
+        config_json: &str,
+        tokenizer_json: &str,
+        max_tokens: Option<usize>,
+    ) -> Result<Self, InferenceError> {
         let safetensors = Box::new(SafetensorsFile::from_bytes(weights_bytes)?);
         let config = BertConfig::from_json_str(config_json)?;
         // The tokenizer's own sequence-length cap has no `tokenizer_config.json`
         // to read here (see `tokenizer_from_json_str`'s doc comment), so derive
         // it from the config we already have, mirroring `infer_model_max_seq_len`'s
         // 2048 embedding-workload cap.
-        let max_seq_len = config.max_position_embeddings.min(2048);
+        let config_cap = config.max_position_embeddings.min(2048);
+        let max_seq_len = max_tokens.map_or(config_cap, |cap| cap.min(config_cap));
         let tokenizer = crate::tokenizer::tokenizer_from_json_str(tokenizer_json, max_seq_len)?;
 
         Self::assemble(config, tokenizer, safetensors)
@@ -427,7 +466,7 @@ impl BertModel {
     /// stages (embedding lookup, Q/K/V projection, FFN, output projection) are each
     /// one `matmul_bt`/`layer_norm` call over every real row -- no wasted rows for
     /// padding. Only the O(seq_len^2) attention score/context step loops per
-    /// sequence (see `crate::attention::multi_head_attention_batched`) are run
+    /// sequence (see `lattice_compute::attention::standard::multi_head_attention_batched`) are run
     /// serially, one sequence at a time, over disjoint output slices. The
     /// implementation detail may change without API breakage.
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
@@ -507,15 +546,13 @@ impl BertModel {
     /// Both `encode` and `encode_batch` delegate here so the pooling branch
     /// is in one place.  L2 normalization is applied by the caller.
     fn pool(&self, hidden_states: &[f32], attention_mask: &[u32], seq_len: usize) -> Vec<f32> {
-        match self.pooling {
-            BertPooling::Mean => mean_pool(
-                hidden_states,
-                attention_mask,
-                seq_len,
-                self.config.hidden_size,
-            ),
-            BertPooling::CLS => cls_pool(hidden_states, seq_len, self.config.hidden_size),
-        }
+        pool_hidden_states(
+            self.pooling,
+            hidden_states,
+            attention_mask,
+            seq_len,
+            self.config.hidden_size,
+        )
     }
 
     /// Forward pass for a pre-tokenized input; used by `CrossEncoderModel`.
@@ -653,9 +690,9 @@ impl BertModel {
             let layer = &self.weights.layers[layer_idx];
             let fused = &self.fused_qkv[layer_idx];
 
-            multi_head_attention_in_place(
+            lattice_compute::__internal::multi_head_attention_in_place(
                 &hidden,
-                layer,
+                &bert_attention_projections(layer),
                 &fused.weight,
                 &fused.bias,
                 attention_mask,
@@ -841,9 +878,9 @@ impl BertModel {
             let layer = &self.weights.layers[layer_idx];
             let fused = &self.fused_qkv[layer_idx];
 
-            multi_head_attention_batched(
+            lattice_compute::__internal::multi_head_attention_batched(
                 &hidden,
-                layer,
+                &bert_attention_projections(layer),
                 &fused.weight,
                 &fused.bias,
                 cu_seqlens,
@@ -1312,6 +1349,23 @@ fn infer_num_attention_heads(hidden_size: usize) -> Result<usize, InferenceError
         _ => Err(InferenceError::Inference(format!(
             "unable to infer num_attention_heads for hidden_size {hidden_size}"
         ))),
+    }
+}
+
+/// `BertPooling` is `#[non_exhaustive]` and defined in `lattice-compute`, so this match needs
+/// a wildcard arm and cannot fail to compile on a new variant;
+/// `tests::bert_model_pool_has_an_arm_for_every_pooling_variant` fails instead.
+fn pool_hidden_states(
+    pooling: BertPooling,
+    hidden_states: &[f32],
+    attention_mask: &[u32],
+    seq_len: usize,
+    hidden_size: usize,
+) -> Vec<f32> {
+    match pooling {
+        BertPooling::Mean => mean_pool(hidden_states, attention_mask, seq_len, hidden_size),
+        BertPooling::CLS => cls_pool(hidden_states, seq_len, hidden_size),
+        _ => mean_pool(hidden_states, attention_mask, seq_len, hidden_size),
     }
 }
 

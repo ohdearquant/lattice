@@ -82,12 +82,11 @@ fn minimal_tokenizer() -> BpeTokenizer {
 }
 
 fn stop_gen_cfg() -> GenerateConfig {
-    GenerateConfig {
-        max_new_tokens: 4,
-        stop_token_ids: vec![STOP],
-        temperature: 0.0, // greedy: all-zero logits always yield token 0
-        ..Default::default()
-    }
+    let mut config = GenerateConfig::default();
+    config.max_new_tokens = 4;
+    config.stop_token_ids = vec![STOP];
+    config.temperature = 0.0; // greedy: all-zero logits always yield token 0
+    config
 }
 
 /// The #613 contract: a stop token is EXCLUDED from `token_ids`/`text`.

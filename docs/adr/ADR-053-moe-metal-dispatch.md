@@ -6,6 +6,123 @@
 
 ---
 
+## Amendment (2026-10-24): routing moves to the device on the decode route
+
+**Status of this amendment**: Proposed
+
+### What the shipped decode route does today
+
+The default Metal decode step encodes every layer of a token, MoE layers included, into one
+command buffer and commits and waits on it once, after the final head
+(`forward/metal_qwen35/inner/step.rs`, the default branch of the forward step). Per-layer
+command buffers with a commit and wait each exist only on the profiling path
+(`LATTICE_DECODE_PROFILE`). The 40 commit-and-wait cycles priced under "The dispatch cost
+problem", and the per-layer `commit() + wait_until_completed()` in the component diagram, do not
+describe the shipped default route.
+
+Inside that single buffer, the MoE router runs on the CPU while the layer is being encoded
+(`inner/layers/mod.rs`, the router logits loop and the shared-expert sigmoid). It reads
+`activations.hidden`, but the post-attention norm that writes that buffer is GPU work encoded
+earlier in the same, not yet committed, command buffer, so the CPU sees the previous step's
+values. Correct CPU routing therefore needs the buffer committed and waited on after the norm of
+every MoE layer: one host round trip per MoE layer per token, added to the one token-end wait.
+On an Apple M4, one commit-to-completion round trip carrying a single blit has a median of
+155.2 µs (n = 50,000; issue #2211), about 6.2 ms per token across 40 MoE layers at that median.
+That is an illustration at the median, not a lower bound and not a measured decode saving.
+D3's rationale ("routing on CPU eliminates a GPU→CPU readback") holds only when the router's
+input is host-visible before encoding, which it is not on this route.
+
+### D3′ (supersedes D3 on the Eager decode route)
+
+**Router, top-k selection and the shared-expert gate run on the GPU, inside the token's command
+buffer.** A router kernel reads the current post-attention norm output and computes the expert
+logits, full softmax, ordered top-k and renormalization. It writes K expert ids, K weights and
+the K element offsets into the routed-expert buffers to a preallocated per-layer route buffer. A
+second kernel computes the shared-expert gate scalar (dot product and sigmoid) from the same
+current input. The expert dispatch encodes a fixed K rank iterations whose GEMVs read the
+GPU-written offsets and whose accumulation reads the GPU-written weights, in rank order, so the
+accumulation order is deterministic. No host read of the hidden state or of route data happens
+inside the layer loop; the token-end wait is the only wait.
+
+### Index and offset safety
+
+Device-written ids and offsets are a new memory-safety surface, so these are invariants of the
+router kernel, checked by tests:
+
+- Every written expert id is in `[0, num_experts)` for every input, including NaN and infinite
+  logits and exact ties. Non-finite logits are ordered by a fixed rule (NaN ranks below every
+  finite value; ties go to the lower expert id), so the kernel always writes K valid, distinct
+  ids.
+- Offsets are computed on the device from those ids, in elements, in the same unit as the
+  existing expert GEMV (u32 element offsets, passed as the `moe_expert_gemv` kernel's own
+  `W_elem_offset` argument at buffer(4), `shaders/qwen35.metal` around line 2425, separate from
+  `GemmParams`, which carries only m, n, k, lda, ldb, ldc; the host computes them in
+  `metal_qwen35/inner/layers/mod.rs` around line 613: gate half `e·2·inter·hidden`, up half
+  `+inter·hidden`, down `e·hidden·inter`). At route-buffer
+  construction the host checks that the largest offset plus one expert's extent fits both u32
+  and the bound buffer's length, and refuses to build the device route otherwise. The kernel
+  clamps nothing: an id outside the range is a kernel defect caught by the tests below, never a
+  silently redirected read.
+- Each written weight is finite and the K weights sum to one within f32 rounding.
+
+### Consequences for the other decisions
+
+- **D1's intent holds** (no per-expert or per-encoder submits). The shipped route already goes
+  further than D1 as written: one command buffer per token. D3′ keeps that, and the router and
+  gate kernels are encoded before the expert work with explicit dependencies (barriers or
+  separate encoders), never inferred from host completion.
+- **D2 holds** for the first route: the contiguous expert-major F16 buffers ("Eager" storage)
+  are addressable by any expert id, so GPU-written offsets into them are valid without host
+  involvement. Indirect command buffers are not required.
+- **D4 holds in part.** The shared expert keeps its dedicated buffers. Its stated rationale,
+  overlapping encode time with CPU routing, no longer applies on the device route; the reason to
+  keep it is that the shared expert does not depend on the route. Ordering: the shared-gate
+  kernel writes its scalar before the shared-expert output is scaled by it, and both precede the
+  accumulation into the layer output.
+- **The Cached Q4 storage route is not covered by D3′.** It admits experts into a bounded cache
+  on the host when they are selected. Moving selection to the GPU there needs a device-side miss
+  path (a correct packed-Q4 expert kernel for experts not in the cache, and per-token frozen
+  cache-slot ownership so no in-flight reader's slot is overwritten). That design is a separate
+  amendment before its implementation. Until then the Cached route keeps the synchronized CPU
+  router, and is labelled as such wherever its decode time is reported.
+- **The routing trace** is published from the route buffer after the token-end wait, with the
+  original layer index, token position, rank order and normalized weights. Previous-token routes
+  may inform cache residency hints; they never substitute for the current token's route.
+- **The synchronized CPU router stays as a labelled fallback** for storage or devices the device
+  route does not support. A run on the fallback is not a measurement of the device route.
+
+Superseded on the Eager decode route, still in force for Cached Q4 and the CPU fallback: D3, the
+Scope v1 "CPU router" bullet, the router lines of the component diagram, R4's "run the CPU NEON
+kernel ... avoiding a separate GPU router kernel", and the "GPU router" row under Alternatives
+(its rejection assumed a readback before encoding, which D3′ avoids). Each carries a note in
+place.
+
+### Acceptance for D3′ (registered before implementation merges)
+
+1. The routing freshness test (the selected experts match the analytic choice from the current
+   layer's norm output) passes on the device route, with a marker that fails the test if the
+   synchronized CPU router ran instead.
+2. A shared-expert witness with nonzero shared-expert output fails when the shared gate reads a
+   stale input and passes on the device route. (The existing freshness fixture zeroes the
+   shared-expert projections, so it cannot detect a stale shared gate.)
+3. Ties, non-finite logits, multi-K selection and pruned layers keep the numerical contract
+   above. A forced router row containing NaN and infinite logits, and a forced out-of-range id
+   written into the route buffer, each fail the test before any expert GEMV reads an offset
+   derived from them.
+4. Decode time per token on a real MoE checkpoint, before and after, on the same machine. D3′
+   covers Eager F16 only, and the target checkpoint does not fit Eager F16 on the machines
+   available now: Qwen3.6-35B-A3B is about 35B parameters, about 70 GB at F16, while the Apple M4
+   machine used for Metal measurements has 16 GB of unified memory, so a real checkpoint there runs
+   the Cached Q4 route, which D3′ does not cover. Item 4 therefore waits for a machine whose
+   unified memory holds the Eager F16 checkpoint with headroom, or for the Cached amendment. The
+   device route merges on items 1 to 3, and no real-checkpoint decode figure for it is published
+   until item 4 runs. The measurement program is prepared now: a raw MoE decode mode in
+   `bench_decode_ab` (token-by-token prefill outside the timer, then N timed single-token forward
+   steps with greedy selection, reported as raw forward time rather than serving throughput),
+   with the correctness-fixed CPU route as the baseline.
+
+---
+
 ## Context
 
 Qwen3.6-35B-A3B (256 routed experts, top-8, 1 shared expert) is the primary MoE target in
@@ -20,6 +137,9 @@ The Metal forward path (`forward/metal_qwen35.rs`) handles the Qwen3.5-2B hybrid
 decode-mode GEMV kernels (`gemv_decode_core` with simdgroup reduction), tiled GEMM for prefill,
 and a GQA flash-attention kernel. **MoE layers are not yet handled** — the Metal path falls back
 to CPU for any `FeedForwardWeights::Moe` variant.
+
+> Amendment (2026-10-24): the shipped default route submits one command buffer per token, not
+> per layer; per-layer buffers exist only on the profiling path. See the amendment above.
 
 ### The dispatch cost problem
 
@@ -41,6 +161,10 @@ Even a reduced framing of 1 command buffer per expert:
 The only viable path is 1 command buffer per layer encoding all expert work as multiple
 compute-command encoders within a single commit. This reduces dispatch overhead to
 40 × 0.127 ms = **5.1 ms/token** regardless of expert count.
+
+> Amendment (2026-10-24): the shipped default route submits one command buffer per token, not
+> per layer; see the amendment above for what the per-layer round trip costs when the CPU router
+> forces one.
 
 ### Expert weight memory for Qwen3.6-35B-A3B
 
@@ -108,11 +232,20 @@ must know which experts are active before encoding any of their compute commands
 command buffer. Routing on CPU eliminates a GPU→CPU readback that would serialize the entire
 dispatch.
 
+_Superseded on the Eager decode route by D3′ (2026-10-24 amendment): routing moves to the device
+and the experts dispatch from a device-written route buffer, so no readback precedes encoding.
+D3 stays in force for Cached Q4 and the CPU fallback._
+
 **D4: Shared expert weight is pinned to a dedicated Metal buffer.**
 The shared expert always activates. Its weights (`gate_proj`, `up_proj`, `down_proj`) are
 allocated as a separate `MTLBuffer` at model-load time, distinct from the routed expert
 buffer. This allows the shared expert GEMV to be the first encoder in every command buffer,
 overlapping encode time with routing on CPU.
+
+_Holds in part after the 2026-10-24 amendment: the dedicated buffer stays, and the shared expert
+still runs independently of the route because it does not depend on the selected ids. The
+overlap with CPU routing no longer applies on the Eager decode route, where routing is on the
+device; the shared gate is computed before its scale is applied, as D3′ describes._
 
 ---
 
@@ -127,7 +260,8 @@ v1 (this ADR):
   `MSL_SOURCE`.
 - CPU router: top-k selection integrated into `metal_moe_ffn_step` before encoding (calling
   existing `compute_router_probs` / `select_top_k` / `renormalize_selected` from `moe.rs` via
-  `pub(crate)` promotion).
+  `pub(crate)` promotion). _Superseded on the Eager decode route by D3′ (amendment above);
+  in force for Cached Q4 and the CPU fallback._
 - Expert coalescing: encode 1 shared + top_k routed expert encoders into 1 command buffer per
   layer.
 - Memory layout: no change to `RoutedExperts` or `SharedExpert` structs. New field
@@ -167,6 +301,10 @@ metal_moe_ffn_step (new)
     │   └── encode expert[selected[top_k-1]]
     └── CommandBuffer::commit() + wait_until_completed()
 ```
+
+> Amendment (2026-10-24): the three CPU router lines are superseded on the Eager decode route by
+> the D3′ router and gate kernels, and the shipped route commits and waits once per token rather
+> than once per layer.
 
 ### Metal buffer layout
 
@@ -233,14 +371,14 @@ match &layer.common.ffn {
 
 ## Alternatives Considered
 
-| Alternative                                                   | Rationale for rejection                                                                                                                                                                                                                                                          |
-| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Per-expert command buffers (naive)                            | 360 dispatches × 0.127 ms = 45.7 ms/token. Mathematically excluded by measured dispatch overhead.                                                                                                                                                                                |
-| MLX backend (call Apple's MPS via MLX Rust bindings)          | MLX is 3× faster than llama.cpp on MoE on Apple Silicon (measured: Ollama/MLX 58→112 tok/s on Qwen3.5-35B-A3B). But adding MLX as a dependency contradicts the pure-Rust, no-ONNX constraint in AGENTS.md. Not an option in v1. Track as v2 option if native Metal gap persists. |
-| GPU router (move top-k softmax to Metal)                      | Eliminates the CPU→GPU branch for expert selection, but requires a GPU→CPU readback of `[num_experts]` logits before command encoding can start. At batch=1 the GEMV cost (~0.05 ms on NEON) does not justify the synchronization. Reconsider if batch>1 becomes the target.     |
-| Pre-gated routing (predict expert activations one step ahead) | DeepSeek-V2/V3 uses this to prefetch expert weights. Effective at hiding memory latency for weight-swapping configurations. Unnecessary when all weights are resident in unified memory. Defer to v2 with expert swapping.                                                       |
-| Expert weight re-layout at load (token-major)                 | Would allow a single fused `[batch, top_k, inter, hidden]` GEMM. Requires a full re-layout of ~15 GiB of weights at load time and a different buffer structure. No benefit at batch=1 (decode). Defer to v2 prefill path.                                                        |
-| Shared expert caching with redundancy elimination             | DeepSeek caches the shared expert output across consecutive tokens when input hasn't changed. Valid optimization but requires state tracking that doesn't exist in the current decode loop. Defer.                                                                               |
+| Alternative                                                                          | Rationale for rejection                                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Per-expert command buffers (naive)                                                   | 360 dispatches × 0.127 ms = 45.7 ms/token. Mathematically excluded by measured dispatch overhead.                                                                                                                                                                                |
+| MLX backend (call Apple's MPS via MLX Rust bindings)                                 | MLX is 3× faster than llama.cpp on MoE on Apple Silicon (measured: Ollama/MLX 58→112 tok/s on Qwen3.5-35B-A3B). But adding MLX as a dependency contradicts the pure-Rust, no-ONNX constraint in AGENTS.md. Not an option in v1. Track as v2 option if native Metal gap persists. |
+| GPU router (move top-k softmax to Metal), adopted as D3′ by the 2026-10-24 amendment | Eliminates the CPU→GPU branch for expert selection, but requires a GPU→CPU readback of `[num_experts]` logits before command encoding can start. At batch=1 the GEMV cost (~0.05 ms on NEON) does not justify the synchronization. Reconsider if batch>1 becomes the target.     |
+| Pre-gated routing (predict expert activations one step ahead)                        | DeepSeek-V2/V3 uses this to prefetch expert weights. Effective at hiding memory latency for weight-swapping configurations. Unnecessary when all weights are resident in unified memory. Defer to v2 with expert swapping.                                                       |
+| Expert weight re-layout at load (token-major)                                        | Would allow a single fused `[batch, top_k, inter, hidden]` GEMM. Requires a full re-layout of ~15 GiB of weights at load time and a different buffer structure. No benefit at batch=1 (decode). Defer to v2 prefill path.                                                        |
+| Shared expert caching with redundancy elimination                                    | DeepSeek caches the shared expert output across consecutive tokens when input hasn't changed. Valid optimization but requires state tracking that doesn't exist in the current decode loop. Defer.                                                                               |
 
 ---
 
@@ -271,6 +409,8 @@ directly. For Metal, the gate weight is also small enough (256 × 2048 × 4 byte
 keep as f32 in its own `MTLBuffer` and run the CPU NEON kernel against the shared-memory pointer,
 avoiding a separate GPU router kernel. Confirm the `contents()` pointer is CPU-readable when
 using `MTLStorageModeShared` — it is, per the existing weight buffer pattern in `metal_qwen35.rs`.
+_Superseded on the Eager decode route by D3′: the router gate weight stays f32 in its own buffer
+but is read by the GPU router kernel. In force for Cached Q4 and the CPU fallback._
 
 ---
 

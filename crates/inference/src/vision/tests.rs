@@ -90,6 +90,7 @@ fn tiny_cfg() -> VisionConfig {
     }
 }
 
+#[cfg(feature = "image")]
 fn make_test_png(w: u32, h: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
     use image::RgbImage;
     let mut img = RgbImage::new(w, h);
@@ -104,6 +105,7 @@ fn make_test_png(w: u32, h: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
     buf
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn vision_encoder_output_shape() {
     let cfg = tiny_cfg();
@@ -119,6 +121,7 @@ fn vision_encoder_output_shape() {
     );
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn vision_encoder_output_finite() {
     let cfg = tiny_cfg();
@@ -139,6 +142,7 @@ fn vision_encoder_bad_image_rejected() {
     assert!(matches!(result.unwrap_err(), VisionError::ImageDecode(_)));
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn multimodal_input_construction_from_vision_output() {
     let cfg = tiny_cfg();

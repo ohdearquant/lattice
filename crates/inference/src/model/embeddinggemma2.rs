@@ -29,7 +29,10 @@ use crate::forward::metal_embeddinggemma2::{MetalEmbeddingGemma2State, VisionTim
 use crate::model::config_file::read_config_json_bounded;
 use crate::tokenizer::common::{EmbeddingTokenCounts, Tokenizer};
 use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
-use crate::weights::{SafetensorsFile, TensorSource};
+#[cfg(test)]
+use crate::weights::SafetensorsFile;
+use crate::weights::TensorSource;
+use lattice_weights::__internal::safetensors_from_open_file;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -634,11 +637,11 @@ impl EmbeddingGemma2Model {
                 dir.display()
             )));
         }
-        let checkpoint = crate::weights::mmap_trust::open_regular_file_no_hang(&weights_path)
+        let checkpoint = lattice_weights::mmap_trust::open_regular_file_no_hang(&weights_path)
             .map_err(InferenceError::InvalidSafetensors)?;
         let vision_file = checkpoint.try_clone().map_err(InferenceError::Io)?;
         let weights = {
-            let mut file = SafetensorsFile::from_open_file(checkpoint, &weights_path)?;
+            let mut file = safetensors_from_open_file(checkpoint, &weights_path)?;
             load_weights(&mut file, &cfg)?
         };
         let text = std::fs::read_to_string(&tokenizer_path).map_err(InferenceError::Io)?;
@@ -680,6 +683,12 @@ impl EmbeddingGemma2Model {
         }
         self.max_tokens = max_tokens;
         Ok(self)
+    }
+
+    /// The longest token sequence [`EmbeddingGemma2Model::tokenize`] produces, beginning and end
+    /// tokens included, or `None` when no limit is set.
+    pub fn max_tokens(&self) -> Option<usize> {
+        self.max_tokens
     }
 
     /// The parsed configuration.
@@ -871,7 +880,7 @@ impl EmbeddingGemma2Model {
         Ok(combined)
     }
 
-    fn check_widths(&self, widths: &[usize]) -> Result<(), InferenceError> {
+    pub(crate) fn check_widths(&self, widths: &[usize]) -> Result<(), InferenceError> {
         for &width in widths {
             if width == 0 || width > self.cfg.embedding_dim {
                 return Err(InferenceError::InvalidInput(format!(

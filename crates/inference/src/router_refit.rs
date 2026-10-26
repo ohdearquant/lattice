@@ -88,7 +88,7 @@ pub struct RefitSource {
 }
 
 impl RefitSource {
-    #[cfg(feature = "serve")]
+    #[cfg(feature = "serving-support")]
     pub(crate) fn from_serving(
         artifact: crate::router_state::RouterArtifact,
         router: AdapterRouter,
@@ -771,5 +771,69 @@ fn validate_route(route: &RouteOutcome) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "serve"))]
+/// Owner-local stand-in for the serving router in this crate's router tests.
+///
+/// It loads the artifact's gate and installs the recorded softmax policy the
+/// way `lattice-serve` installs it with learning enabled, then builds sources
+/// through [`RefitSource::from_serving`]. The serving router's own refusals
+/// and its live behaviour are tested in `lattice-serve`; this exists so the
+/// assertions here about owner-private state need no dependency on it.
+#[cfg(all(test, feature = "serving-support"))]
+pub(crate) mod test_router {
+    use super::{RefitError, RefitSource};
+    use crate::mixture::{AdapterRouter, WeightPolicy};
+    use crate::router_state::RouterArtifact;
+    use lattice_fann::Network;
+
+    pub(crate) struct LiveRouter {
+        artifact: RouterArtifact,
+        router: AdapterRouter,
+        exploration_scale: Option<f64>,
+    }
+
+    impl LiveRouter {
+        /// Panics on a fixture without a loadable gate or a recorded softmax
+        /// policy: those are fixture errors, not behaviour under test.
+        pub(crate) fn new(artifact: RouterArtifact) -> Self {
+            let gate = Network::from_bytes(&artifact.gate_bytes).expect("fixture gate loads");
+            let policy = artifact
+                .provenance
+                .policy()
+                .expect("fixture records a policy")
+                .clone();
+            assert_ne!(policy.kind, "uniform", "fixture records a learned policy");
+            let tau = policy.tau.expect("fixture records a temperature");
+            let mut router = AdapterRouter::new(gate);
+            router.set_tau_floor(policy.tau_floor as f32);
+            router.set_entropy_floor(policy.entropy_floor as f32);
+            router.set_max_consecutive_collapsed(policy.max_consecutive_collapsed as usize);
+            router.set_epsilon(policy.epsilon as f32);
+            router.set_weight_policy(WeightPolicy::Softmax { tau: tau as f32 });
+            Self {
+                artifact,
+                router,
+                exploration_scale: policy.exploration_scale,
+            }
+        }
+
+        pub(crate) fn refit_source(&self) -> Result<RefitSource, RefitError> {
+            RefitSource::from_serving(
+                self.artifact.clone(),
+                self.router.refit_snapshot(),
+                true,
+                self.exploration_scale,
+            )
+        }
+
+        pub(crate) fn artifact(&self) -> &RouterArtifact {
+            &self.artifact
+        }
+
+        pub(crate) fn policy_epoch(&self) -> u64 {
+            self.router.policy_epoch()
+        }
+    }
+}
+
+#[cfg(all(test, feature = "serving-support"))]
 mod tests;

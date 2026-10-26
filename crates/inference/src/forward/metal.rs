@@ -18,9 +18,9 @@ mod inner {
     // fragment ahead of the kernel bodies that call it (Metal requires the
     // callee be visible textually before its call sites in the same
     // translation unit).
-    const MSL_TEMPLATE: &str = concat!(
-        include_str!("shaders/rms_reduce.metal"),
-        include_str!("shaders/flash_attention.metal")
+    const MSL_TEMPLATE: &str = crate::forward::metal_runtime::concat_msl!(
+        crate::forward::metal_runtime::msl::RMS_REDUCE,
+        crate::forward::metal_runtime::msl::FLASH_ATTENTION
     );
 
     // ---------------------------------------------------------------------------

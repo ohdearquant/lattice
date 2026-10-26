@@ -30,8 +30,8 @@ use crate::model::qwen35::{
 use crate::model::qwen35_config::Qwen35Config;
 use crate::rope::RopeTable;
 use crate::tokenizer::bpe::BpeTokenizer;
-use crate::weights::ingress::{IngestedTensor, validate_ingested_tensor};
 use crate::weights::q8_weights::{validate_cfg_len, validate_gdn_shapes};
+use lattice_weights::ingress::{IngestedTensor, validate_ingested_tensor};
 
 /// Source label for NEON full-attention ingress validation errors.
 const Q8_NEON_ATTENTION_SOURCE: &str = "full-attention Q8 NEON quantization";
@@ -228,7 +228,7 @@ fn pack_full_attn_weights(
     // by the original, unwrapped head count.
     let q_dim = cfg.checked_full_q_dim()?;
     let kv_dim = cfg.checked_full_kv_dim()?;
-    let q_proj_rows = crate::model::qwen35_config::checked_double(q_dim, "full_q_dim")?; // Q + gate interleaved
+    let q_proj_rows = lattice_arch::__internal::checked_double(q_dim, "full_q_dim")?; // Q + gate interleaved
 
     validate_cfg_len(
         w.q_norm.len(),

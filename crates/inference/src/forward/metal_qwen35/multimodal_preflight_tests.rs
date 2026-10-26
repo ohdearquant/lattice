@@ -19,9 +19,10 @@ fn generate_multimodal_grammar_guard_rejects_grammar_config() {
     let vocab = vec![b"a".to_vec(), b"b".to_vec()];
     let engine = GrammarEngine::new(&spec, vocab).expect("trivial grammar must compile");
 
-    let cfg_with_grammar = GenerateConfig {
-        grammar: Some(Arc::new(engine)),
-        ..Default::default()
+    let cfg_with_grammar = {
+        let mut config = GenerateConfig::default();
+        config.grammar = Some(Arc::new(engine));
+        config
     };
 
     let result = multimodal_generate_preflight(&cfg_with_grammar);
@@ -48,9 +49,10 @@ fn generate_multimodal_grammar_guard_allows_no_grammar() {
 /// return `Ok(())` → `result.is_err()` below fails, catching the regression.
 #[test]
 fn generate_multimodal_logprobs_guard_rejects_logprobs_config() {
-    let cfg_with_logprobs = GenerateConfig {
-        logprobs: Some(5),
-        ..Default::default()
+    let cfg_with_logprobs = {
+        let mut config = GenerateConfig::default();
+        config.logprobs = Some(5);
+        config
     };
 
     let result = multimodal_generate_preflight(&cfg_with_logprobs);
@@ -79,9 +81,10 @@ fn generate_multimodal_logprobs_guard_allows_no_logprobs() {
 /// → `result.is_err()` below fails, catching the regression.
 #[test]
 fn generate_multimodal_reasoning_budget_guard_rejects_budget_config() {
-    let cfg_with_budget = GenerateConfig {
-        reasoning_budget: Some(32),
-        ..Default::default()
+    let cfg_with_budget = {
+        let mut config = GenerateConfig::default();
+        config.reasoning_budget = Some(32);
+        config
     };
 
     let result = multimodal_generate_preflight(&cfg_with_budget);

@@ -9,6 +9,7 @@ mod layers;
 mod lm_head;
 mod lora;
 mod moe;
+mod moe_device_route;
 mod mtp_hidden_tap;
 mod mtp_verify;
 mod mtp_weight_load;
@@ -109,19 +110,19 @@ fn shared_pipeline_builder_resolves_every_required_pipeline() {
 }
 
 /// #854: guards against a reintroduced manual copy of the RMS-norm
-/// reduction tree across qwen35.metal's seven RMS-norm-family kernels
+/// reduction tree across the seven Qwen3.5 RMS-norm-family kernels
 /// (rms_norm_qwen35, per_head_rms_norm, fused_residual_add_norm,
 /// copy_and_rms_norm, copy_and_rms_norm_batch, fused_residual_add_norm_batch,
 /// per_head_rms_norm_batch). `rms_inv_from_local_sum` must have exactly one
 /// definition (the shared fragment) plus exactly seven call sites in the
-/// assembled qwen35.metal translation unit.
+/// assembled Qwen3.5 translation unit (`MSL_SOURCE`).
 #[test]
 fn qwen35_rms_norm_kernels_use_shared_reduction_helper() {
     let helper_occurrences = MSL_SOURCE.matches("rms_inv_from_local_sum(").count();
     assert_eq!(
         helper_occurrences, 8,
         "expected 1 definition (rms_reduce.metal fragment) + 7 call sites in \
-                 the assembled qwen35.metal, got {helper_occurrences}"
+                 the assembled MSL_SOURCE, got {helper_occurrences}"
     );
     let inline_leftover = MSL_SOURCE.matches("shared[lid] = local_sum;").count();
     assert_eq!(
@@ -133,7 +134,7 @@ fn qwen35_rms_norm_kernels_use_shared_reduction_helper() {
 }
 
 /// #854 numeric parity fixtures (pre-refactor vs. post-refactor) for all
-/// seven qwen35.metal RMS-norm-family kernels. Each kernel's pre-refactor
+/// seven Qwen3.5 RMS-norm-family kernels. Each kernel's pre-refactor
 /// inline reduction tree is frozen verbatim below (renamed with a
 /// `_pre_854_oracle` suffix, bodies otherwise byte-identical to what this
 /// PR replaced) and compiled as an independent oracle library; the live
@@ -760,7 +761,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             .expect("frozen pre-#854 oracle MSL must compile");
         let live_lib = device
             .new_library_with_source(MSL_SOURCE, &opts)
-            .expect("live post-#854 qwen35.metal (MSL_SOURCE) must compile");
+            .expect("live post-#854 MSL_SOURCE must compile");
         let queue = device.new_command_queue();
 
         // Non-multiple-of-256 dims exercise the strided accumulation loop's
@@ -2517,22 +2518,22 @@ fn qwen35_checkpoint_weights_present(model_dir: &std::path::Path) -> bool {
 }
 
 fn cross_turn_test_gen_cfg(seed: u64, max_new_tokens: usize) -> GenerateConfig {
-    GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(seed),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
-    }
+    let mut config = GenerateConfig::default();
+    config.min_p = 0.0;
+    config.max_new_tokens = max_new_tokens;
+    config.temperature = 0.0;
+    config.top_k = 1;
+    config.top_p = 1.0;
+    config.repetition_penalty = 1.0;
+    config.seed = Some(seed);
+    config.stop_token_ids = vec![];
+    config.enable_thinking = false;
+    config.enable_mtp = Some(false);
+    config.grammar = None;
+    config.stop_strings = vec![];
+    config.reasoning_budget = None;
+    config.logprobs = None;
+    config
 }
 
 /// Byte-per-token vocab matching `single_char_vocab_tokenizer`'s id
@@ -2564,20 +2565,22 @@ fn single_char_grammar_cfg(gbnf: &str, max_new_tokens: usize) -> crate::generati
         GrammarEngine::new(&spec, single_char_vocab_bytes())
             .expect("grammar engine builds over single-char vocab"),
     );
-    crate::generation::GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = max_new_tokens;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     }
 }

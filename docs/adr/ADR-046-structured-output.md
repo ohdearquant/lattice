@@ -4,9 +4,9 @@
 **Date**: 2026-05-19
 **Crate**: lattice-inference
 
-## Implementation status as of 2026-06-30
+## Implementation status as of 2026-10-23
 
-The grammar engine and JSON Schema compiler are implemented under `crates/inference/src/grammar/`. The compiler now has fail-closed compile-time caps for array cardinality, schema depth, object property count, trie depth, and precomputed grammar states. The current `lattice_serve` request shape does **not** expose OpenAI `response_format`; its generation config sets `grammar: None`, so serve-side structured output remains unshipped even though the grammar module exists.
+The grammar engine and JSON Schema compiler are implemented under `crates/grammar/src/`. The compiler has fail-closed compile-time caps for array cardinality, schema depth, object property count, trie depth, and precomputed grammar states. `lattice_serve` accepts OpenAI `response_format` of type `json_schema` with `strict: true` on non-streaming requests (#1018): the schema is admitted against the version-0 profile and compiled before any worker job is submitted, and the compiled grammar constrains generation. A streaming request, a missing or false `strict`, and a schema outside the version-0 profile are refused with HTTP 400, as is `response_format` of type `json_object`. The unified `lattice serve` path refuses every `response_format` type other than `text`.
 
 ## Context
 
