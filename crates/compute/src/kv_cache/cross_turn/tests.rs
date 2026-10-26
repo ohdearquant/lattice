@@ -100,7 +100,7 @@ fn plan_for_slot_declines_an_entry_from_another_slot() {
 }
 
 #[test]
-fn plan_for_slot_matches_unchecked_plan_for_the_entrys_own_slot() {
+fn plan_for_slot_matches_unchecked_plan_for_its_own_slot() {
     let e = entry(vec![1, 2, 3, 9], 4, 4);
     let cases: [(&[u32], &[usize], PrefixReuseMode); 2] = [
         (
