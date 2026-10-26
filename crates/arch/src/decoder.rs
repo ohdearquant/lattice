@@ -14,10 +14,9 @@
 //! their constructors, so an implementation outside this crate can return every value the trait
 //! asks for.
 //!
-//! **One request per session.** A session serves one request: [`DecoderSession::finish`] ends its
-//! use through this trait, whatever the disposition. An implementation refuses calls out of
-//! order, a prediction id that is stale, consumed or minted by another session's ledger, and any
-//! call after `finish`, before they change the session's state.
+//! **One request per session.** A session serves one request and [`DecoderSession::finish`] ends
+//! it; the call order and what an implementation must refuse are stated once, on
+//! [`DecoderSession`].
 //!
 //! **Loaded owners.** [`DecoderModel`] is a loaded model that opens sessions: each
 //! [`DecoderModel::session`] borrows the owner and one [`SessionRequest`] for the session's
@@ -610,7 +609,8 @@ where
 /// `finish`. An implementation must refuse, before changing any state, a call out of that
 /// order, a prediction id that is not its ledger's live prediction (stale, consumed, or
 /// minted by another session), and any call after `finish`; [`driver::run`] makes no such
-/// call. Dropping a session without `finish` must still release its resources.
+/// call, and finishes the session once on every path that returns after its preflight. Dropping
+/// a session without `finish` must still release its resources.
 pub trait DecoderSession {
     /// The optional controls this session supports. The driver refuses a request that uses
     /// a control the session does not declare, before any other call.
