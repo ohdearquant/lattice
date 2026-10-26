@@ -11,7 +11,7 @@ use crate::forward::metal::MetalForwardPass;
 use crate::pool::{l2_normalize, last_token_pool};
 use crate::rope::RopeTable;
 use crate::tokenizer::common::{EmbeddingTokenCounts, TokenizedInput, Tokenizer, load_tokenizer};
-use crate::weights::{QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors};
+use crate::weights::{QwenWeights, SafetensorsFile, ShardedSafetensors};
 #[doc(inline)]
 pub use lattice_arch::qwen_config::QwenConfig;
 use sha2::{Digest, Sha256};
@@ -20,6 +20,9 @@ use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
+
+/// **Unstable**: Qwen3 checkpoint assembly over neutral weight storage.
+pub mod weight_loading;
 
 /// Backing storage for Qwen model weights — either a single mmap'd file or
 /// an owned heap allocation for sharded checkpoints.
@@ -34,7 +37,7 @@ enum SafetensorsStorage {
     /// Single `model.safetensors` file — tensors borrow from the mmap.
     Single(Box<SafetensorsFile>),
     /// Sharded checkpoint — tensors borrow from the owned `Vec<f32>` fields.
-    Sharded(Box<ShardedQwenBacking>),
+    Sharded(Box<weight_loading::OwnedQwenWeights>),
 }
 
 /// **Unstable**: per-component timing for profiling forward passes; fields may grow.
@@ -710,121 +713,81 @@ impl QwenModel {
             effective_context_len(&config, &inference_config, tokenizer.max_seq_len())?;
         let gpu_max_seq_len = inference_config.gpu_max_seq_len.min(max_context);
 
-        if model_path.exists() {
-            // --- Single-file path (original behaviour) ---
-            let safetensors = Box::new(SafetensorsFile::open(&model_path)?);
-
-            let weights_tmp = safetensors.load_qwen_weights(
-                config.num_hidden_layers,
-                config.hidden_size,
-                config.num_attention_heads,
-                config.num_key_value_heads,
-                config.head_dim,
-                config.intermediate_size,
-            )?;
-
-            // Try to create Metal GPU forward pass before transmuting weights.
-            // MetalForwardPass copies weights into GPU buffers, so it only borrows temporarily.
-            let metal = if crate::env_switch_enabled("LATTICE_NO_GPU") {
-                tracing::info!("Metal GPU disabled by LATTICE_NO_GPU env var");
-                None
-            } else {
-                match MetalForwardPass::new(&config, &weights_tmp, gpu_max_seq_len) {
-                    Ok(m) => {
-                        tracing::info!(
-                            max_seq_len = gpu_max_seq_len,
-                            "Metal GPU forward pass enabled"
-                        );
-                        Some(Mutex::new(m))
-                    }
-                    Err(e) => {
-                        tracing::debug!("Metal GPU not available, using CPU: {e}");
-                        None
-                    }
-                }
-            };
-
-            // SAFETY: The safetensors backing is stored in `_storage`; `QwenModel::drop`
-            // explicitly drops `weights` before `_storage`, independent of field order.
-            let weights: QwenWeights<'static> = unsafe { std::mem::transmute(weights_tmp) };
-
-            let rope = RopeTable::new(config.head_dim, max_context, config.rope_theta);
-
-            Ok(Self {
-                config,
-                inference_config,
-                tokenizer,
-                rope,
-                output_dim: None,
-                buffers: Mutex::new(ForwardBuffers::new()),
-                cache: Mutex::new(HashMap::with_capacity(1024)),
-                metal,
-                weights: ManuallyDrop::new(weights),
-                _storage: ManuallyDrop::new(SafetensorsStorage::Single(safetensors)),
-            })
+        let storage = if model_path.exists() {
+            SafetensorsStorage::Single(Box::new(SafetensorsFile::open(&model_path)?))
         } else if index_path.exists() {
-            // --- Sharded path ---
             tracing::info!(
                 index = %index_path.display(),
                 "Loading sharded safetensors checkpoint"
             );
             let mut sharded = ShardedSafetensors::open_index(&index_path)?;
-
-            let (backing, weights_tmp) = sharded.load_qwen_weights_owned(
+            SafetensorsStorage::Sharded(Box::new(weight_loading::load_owned_weights(
+                &mut sharded,
                 config.num_hidden_layers,
                 config.hidden_size,
                 config.num_attention_heads,
                 config.num_key_value_heads,
                 config.head_dim,
                 config.intermediate_size,
-            )?;
-
-            // Try Metal GPU. MetalForwardPass copies weights — it only borrows
-            // weights_tmp briefly here, before we hand ownership to the model.
-            let metal = if crate::env_switch_enabled("LATTICE_NO_GPU") {
-                tracing::info!("Metal GPU disabled by LATTICE_NO_GPU env var");
-                None
-            } else {
-                match MetalForwardPass::new(&config, &weights_tmp, gpu_max_seq_len) {
-                    Ok(m) => {
-                        tracing::info!(
-                            max_seq_len = gpu_max_seq_len,
-                            "Metal GPU forward pass enabled"
-                        );
-                        Some(Mutex::new(m))
-                    }
-                    Err(e) => {
-                        tracing::debug!("Metal GPU not available, using CPU: {e}");
-                        None
-                    }
-                }
-            };
-
-            // SAFETY: `weights_tmp` contains slices into `backing`. `backing` is moved
-            // into `_storage`, and `QwenModel::drop` explicitly drops `weights` before
-            // `_storage`, independent of field declaration order.
-            let weights: QwenWeights<'static> = weights_tmp;
-
-            let rope = RopeTable::new(config.head_dim, max_context, config.rope_theta);
-
-            Ok(Self {
-                config,
-                inference_config,
-                tokenizer,
-                rope,
-                output_dim: None,
-                buffers: Mutex::new(ForwardBuffers::new()),
-                cache: Mutex::new(HashMap::with_capacity(1024)),
-                metal,
-                weights: ManuallyDrop::new(weights),
-                _storage: ManuallyDrop::new(SafetensorsStorage::Sharded(backing)),
-            })
+            )?))
         } else {
-            Err(InferenceError::ModelNotFound(format!(
+            return Err(InferenceError::ModelNotFound(format!(
                 "missing model.safetensors or model.safetensors.index.json in {}",
                 dir.display()
-            )))
-        }
+            )));
+        };
+
+        let weights_tmp = match &storage {
+            SafetensorsStorage::Single(source) => weight_loading::load_weights(
+                source,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.intermediate_size,
+            )?,
+            SafetensorsStorage::Sharded(owner) => owner.assemble_borrowed_weights(),
+        };
+
+        let metal = if crate::env_switch_enabled("LATTICE_NO_GPU") {
+            tracing::info!("Metal GPU disabled by LATTICE_NO_GPU env var");
+            None
+        } else {
+            match MetalForwardPass::new(&config, &weights_tmp, gpu_max_seq_len) {
+                Ok(m) => {
+                    tracing::info!(
+                        max_seq_len = gpu_max_seq_len,
+                        "Metal GPU forward pass enabled"
+                    );
+                    Some(Mutex::new(m))
+                }
+                Err(e) => {
+                    tracing::debug!("Metal GPU not available, using CPU: {e}");
+                    None
+                }
+            }
+        };
+
+        // SAFETY: Both storage alternatives own the data borrowed by `weights_tmp`.
+        // Storage is boxed before borrowing and retained in `_storage`; `Drop`
+        // releases `weights` before `_storage`, independent of field order.
+        let weights: QwenWeights<'static> = unsafe { std::mem::transmute(weights_tmp) };
+
+        let rope = RopeTable::new(config.head_dim, max_context, config.rope_theta);
+
+        Ok(Self {
+            config,
+            inference_config,
+            tokenizer,
+            rope,
+            output_dim: None,
+            buffers: Mutex::new(ForwardBuffers::new()),
+            cache: Mutex::new(HashMap::with_capacity(1024)),
+            metal,
+            weights: ManuallyDrop::new(weights),
+            _storage: ManuallyDrop::new(storage),
+        })
     }
 
     /// **Unstable**: load from the default cache, downloading if absent.
