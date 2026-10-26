@@ -40,7 +40,7 @@
 //! Run (release only — the uncached reference loop re-forwards the ~0.9B
 //! decoder over the full sequence per step):
 //! ```bash
-//! cargo test --release -p lattice-inference --features f16 \
+//! cargo test --release -p lattice-model-ernie45 --features f16,image,paddleocr-vl \
 //!     --test paddleocr_vl_e2e_goldens_test -- --nocapture
 //! ```
 
@@ -93,7 +93,7 @@ fn greedy_fixture_decides_every_step_by_more_than_tolerance() {
     }
 
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/paddleocr_vl/e2e/e2e_goldens.json");
+        .join("../../inference/tests/fixtures/paddleocr_vl/e2e/e2e_goldens.json");
     let raw =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let doc: serde_json::Value =
@@ -164,8 +164,8 @@ fn greedy_fixture_decides_every_step_by_more_than_tolerance() {
 #[cfg(all(feature = "f16", feature = "image"))]
 mod gate {
     use crate::gate_types::*;
-    use lattice_inference::model::paddleocr_vl::PaddleOcrVlModel;
-    use lattice_inference::tokenizer::gemma_bpe::GemmaBpeTokenizer;
+    use lattice_model_ernie45::model::paddleocr_vl::PaddleOcrVlModel;
+    use lattice_tokenizer::gemma_bpe::GemmaBpeTokenizer;
     use std::path::PathBuf;
 
     fn model_dir() -> Option<PathBuf> {
@@ -183,7 +183,8 @@ mod gate {
     }
 
     fn fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/paddleocr_vl/e2e")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../inference/tests/fixtures/paddleocr_vl/e2e")
     }
 
     pub fn run() {
@@ -241,7 +242,7 @@ mod gate {
         // tokenizer gate already holds.
         let tokenizer = GemmaBpeTokenizer::from_ernie_tokenizer_json(
             &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/paddleocr_vl/tokenizer/tokenizer.json"),
+                .join("../../inference/tests/fixtures/paddleocr_vl/tokenizer/tokenizer.json"),
         )
         .expect("pinned tokenizer loads");
 

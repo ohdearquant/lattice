@@ -51,7 +51,7 @@ gemma4 = ["dep:lattice-model-gemma4"]
 embeddinggemma2 = ["dep:lattice-model-embeddinggemma2"]
 qwen3 = ["dep:lattice-model-qwen3"]
 ernie45 = ["dep:lattice-model-ernie45"]
-paddleocr-vl = ["ernie45"]
+paddleocr-vl = ["ernie45", "lattice-model-ernie45?/paddleocr-vl"]
 # Unsupported, version-coupled interface for `lattice-serve` (ADR-103
 # Amendment 4): the hidden `serving_support` module and the router items it
 # needs. Off by default; `lattice-serve` depends on this crate with an exact
@@ -59,7 +59,7 @@ paddleocr-vl = ["ernie45"]
 serving-support = ["lattice-model-gemma4?/serving-support"]
 std = ["lattice-model-bert?/std"]
 # Encoded PNG/JPEG input; raw image tensors remain available without decoding.
-image = ["dep:image", "lattice-model-io/image", "lattice-model-embeddinggemma2?/image"]
+image = ["dep:image", "lattice-model-io/image", "lattice-model-embeddinggemma2?/image", "lattice-model-ernie45?/image"]
 f16 = ["lattice-weights/f16", "lattice-model-bert?/f16", "lattice-model-gemma4?/f16", "lattice-model-ernie45?/f16"]
 # lattice-fann supplies the shared LoRA descriptor/blend-validation module
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must

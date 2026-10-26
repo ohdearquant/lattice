@@ -12,7 +12,7 @@
 //!
 //! ```bash
 //! LATTICE_POCR_IMAGE=/path/to/page.png \
-//!   cargo test --release -p lattice-inference --features f16 \
+//!   cargo test --release -p lattice-model-ernie45 --features f16,image,paddleocr-vl \
 //!     --test paddleocr_vl_adhoc_ocr -- --ignored --nocapture
 //! ```
 //!
@@ -30,9 +30,9 @@
 
 use std::path::PathBuf;
 
-use lattice_inference::model::paddleocr_vl::PaddleOcrVlModel;
-use lattice_inference::tokenizer::common::Tokenizer;
-use lattice_inference::tokenizer::gemma_bpe::GemmaBpeTokenizer;
+use lattice_model_ernie45::model::paddleocr_vl::PaddleOcrVlModel;
+use lattice_tokenizer::common::Tokenizer;
+use lattice_tokenizer::gemma_bpe::GemmaBpeTokenizer;
 
 fn model_dir() -> PathBuf {
     match std::env::var_os("LATTICE_POCR_MODEL_DIR") {
@@ -79,7 +79,7 @@ fn ocr_arbitrary_image() {
     // this harness and the gates tokenize identically.
     let tokenizer = GemmaBpeTokenizer::from_ernie_tokenizer_json(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/paddleocr_vl/tokenizer/tokenizer.json"),
+            .join("../../inference/tests/fixtures/paddleocr_vl/tokenizer/tokenizer.json"),
     )
     .expect("pinned tokenizer loads");
 

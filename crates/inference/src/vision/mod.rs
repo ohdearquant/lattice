@@ -1,8 +1,7 @@
 //! Vision encoder module. Three vision paths live here: the real Qwen3.5 path,
 //! the PaddleOCR-VL path, and the inert Qwen3-VL scaffold. PaddleOCR-VL has
-//! its own weights and config, but shares `apply_rope_inplace` and
-//! `multihead_attention_full` from `qwen35_vit`, plus `batch_matvec`, `gelu`,
-//! and `layer_norm` from `vit`, and `gelu_exact` from `qwen35_merger`.
+//! its own weights and config and uses the shared arithmetic helpers in
+//! `lattice_compute::vision`.
 //!
 //! ## The real path: Qwen3.5-0.8B (ADR-069, S1-S3b shipped)
 //!
@@ -80,7 +79,9 @@ pub mod checkpoint;
 pub mod config;
 pub mod merger;
 pub mod multimodal;
+#[cfg(feature = "paddleocr-vl")]
 pub mod paddleocr_preprocess;
+#[cfg(feature = "paddleocr-vl")]
 pub mod paddleocr_vit;
 pub mod pooled_embed;
 pub mod preprocess;
