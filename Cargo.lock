@@ -1683,6 +1683,7 @@ dependencies = [
  "lattice-grammar",
  "lattice-inference-core",
  "lattice-metal-runtime",
+ "lattice-model-bert",
  "lattice-model-embeddinggemma2",
  "lattice-model-io",
  "lattice-quant",
@@ -1727,6 +1728,24 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "lattice-model-bert"
+version = "0.15.0"
+dependencies = [
+ "approx",
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-inference-core",
+ "lattice-model-io",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

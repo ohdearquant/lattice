@@ -179,7 +179,7 @@ impl LoraHook for RejectingGeometryHook {
     }
     fn validate_geometry(
         &self,
-        _geometry: &dyn crate::lora_hook::LoraTargetGeometry,
+        _geometry: &dyn lattice_compute::lora_hook::LoraTargetGeometry,
     ) -> Result<(), String> {
         self.calls.lock().unwrap().push("new");
         if self.reject_old {

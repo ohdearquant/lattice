@@ -58,7 +58,7 @@ tracing = { workspace = true }
 # its own ureq/download stack to non-wasm targets, so a plain `--features wasm`
 # build stays download-free; edge/cross builds drop it with
 # `--no-default-features --features native`. See issue #1095.
-lattice-inference = { version = "0.15.0", path = "../inference", optional = true, default-features = false, features = [
+lattice-inference = { version = "0.15.0", path = "../inference", optional = true, default-features = false, features = ["bert",
     "std",
     "f16",
 ] }
@@ -101,7 +101,7 @@ wasm-bindgen = { version = "=0.2.105", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 
 [dev-dependencies]
-lattice-inference = { version = "0.15.0", path = "../inference", default-features = false, features = ["std", "test-utils"] }
+lattice-inference = { version = "0.15.0", path = "../inference", default-features = false, features = ["bert", "std", "test-utils"] }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { version = "0.5", features = ["async_tokio"] }

@@ -17,8 +17,6 @@ pub mod standard;
 #[cfg(feature = "bench-internals")]
 #[doc(no_inline)]
 pub use self::standard::bench_support;
-#[cfg(test)]
-pub(crate) use self::standard::multi_head_attention_batched_padded_reference;
 #[doc(no_inline)]
 pub use self::standard::{AttentionBuffers, multi_head_attention};
 

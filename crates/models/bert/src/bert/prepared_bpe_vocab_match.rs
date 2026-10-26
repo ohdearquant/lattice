@@ -100,10 +100,10 @@ fn validate_cardinality_with_platform_max(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::bert::prepared_merges_txt::{
+    use crate::bert::prepared_merges_txt::{
         PreparedBertBpeMergesTxtLimits, census_prepared_bert_bpe_merges_txt,
     };
-    use crate::model::bert::prepared_vocab_txt::{
+    use crate::bert::prepared_vocab_txt::{
         PreparedBertVocabTxtLimits, parse_prepared_bert_vocab_txt,
         resolve_prepared_bert_bpe_vocab_txt,
     };

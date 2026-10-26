@@ -12,8 +12,7 @@ pub use lattice_arch::encoder::{
 };
 
 use crate::error::InferenceError;
-use crate::model::{BertModel, QwenModel};
-use crate::pool::BertPooling;
+use crate::model::QwenModel;
 use crate::tokenizer::EmbeddingTokenCounts;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -24,70 +23,10 @@ fn usage(counts: EmbeddingTokenCounts) -> Result<TokenUsage, InferenceError> {
     lattice_arch::__internal::encoder::usage(counts.before_truncation, counts.embedded)
 }
 
-/// A BERT-family model behind [`Encoder`]: mean or first-token pooling as the model is set, L2
-/// normalized, one batched forward pass per call.
-pub struct BertEncoder {
-    model: Arc<BertModel>,
-    capabilities: EncoderCapabilities,
-    identity: EncoderIdentity,
-}
-
-impl BertEncoder {
-    /// Wraps a loaded model. Its pooling is read here, so [`BertModel::set_pooling`] comes first.
-    ///
-    /// # Errors
-    ///
-    /// [`InferenceError::InvalidInput`] for a zero output dimension or a pooling strategy this
-    /// adapter cannot describe.
-    pub fn new(model: Arc<BertModel>) -> Result<Self, InferenceError> {
-        let dimension = output_dimension(model.dimensions(), "the BERT model")?;
-        let pooling = match model.pooling() {
-            BertPooling::Mean => Pooling::Mean,
-            BertPooling::CLS => Pooling::FirstToken,
-            other => {
-                return Err(InferenceError::InvalidInput(format!(
-                    "the BERT encoder adapter does not describe pooling {other:?}"
-                )));
-            }
-        };
-        let limit = model
-            .tokenizer()
-            .max_seq_len()
-            .min(model.config().max_position_embeddings);
-        Ok(Self {
-            capabilities: EncoderCapabilities::text(NonZeroUsize::new(limit)),
-            identity: EncoderIdentity::new(pooling, Normalization::L2, dimension)
-                .with_variant("cpu f32"),
-            model,
-        })
-    }
-}
-
-impl Encoder for BertEncoder {
-    fn capabilities(&self) -> &EncoderCapabilities {
-        &self.capabilities
-    }
-
-    fn output_dimension(&self) -> NonZeroUsize {
-        self.identity.output_dimension()
-    }
-
-    fn identity(&self) -> &EncoderIdentity {
-        &self.identity
-    }
-
-    fn encode_texts(&self, prepared: &[&str]) -> Result<Vec<EncodedText>, InferenceError> {
-        let usages = prepared
-            .iter()
-            .map(|text| usage(self.model.embedding_token_counts(text)))
-            .collect::<Result<Vec<_>, _>>()?;
-        pair(
-            self.model.encode_batch(prepared)?,
-            usages,
-            self.output_dimension(),
-        )
-    }
-}
+/// BERT-family encoder adapter.
+#[cfg(feature = "bert")]
+#[doc(inline)]
+pub use lattice_model_bert::BertEncoder;
 
 /// A Qwen3 embedding model behind [`Encoder`]: last-token pooling, L2 normalized, truncated to
 /// the model's output dimension, one cached forward pass per input.

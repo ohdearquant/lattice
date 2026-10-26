@@ -10,11 +10,7 @@ use crate::lora_hook::LoraHook;
 use crate::weights::TransformerLayerWeights;
 
 #[cfg(test)]
-mod padded_reference;
-#[cfg(test)]
 mod tests;
-#[cfg(test)]
-pub(crate) use self::padded_reference::multi_head_attention_batched_padded_reference;
 
 /// The four attention projections of one BERT layer, as the view `lattice-compute`'s kernels take.
 #[inline]

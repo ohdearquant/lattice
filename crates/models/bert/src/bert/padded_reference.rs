@@ -1,8 +1,8 @@
 //! Test-only padded batched attention reference for the BERT packed-batch parity test.
 
-use crate::forward::cpu::{add_bias, matmul_bt, softmax_attention};
-use crate::lora_hook::{LoraHook, apply_lora_rows};
-use crate::weights::TransformerLayerWeights;
+use lattice_compute::forward::cpu::{add_bias, matmul_bt, softmax_attention};
+use lattice_compute::lora_hook::{LoraHook, apply_lora_rows};
+use lattice_weights::TransformerLayerWeights;
 
 /// Pre-#677 padded batched attention, preserved as a test-only reference.
 ///

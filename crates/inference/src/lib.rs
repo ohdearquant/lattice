@@ -99,9 +99,9 @@ pub(crate) mod decoder;
 #[doc(hidden)]
 pub use decoder::bench_support as decoder_bench_support;
 /// Synthetic checkpoint support for repository regression tests.
-#[cfg(feature = "test-utils")]
+#[cfg(all(feature = "bert", feature = "test-utils"))]
 #[doc(hidden)]
-pub mod bert_pooling_fixture;
+pub use lattice_model_bert::bert_pooling_fixture;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
 /// The text encoder contract and its adapters for the BERT-family, Qwen3 and EmbeddingGemma 2
@@ -159,7 +159,7 @@ pub mod moe_admission;
 /// the CPU and Metal Qwen3.5 scorers. See [`model`] and [`tokenizer`].
 pub mod option_scoring;
 /// Embedding pooling helpers (mean, CLS, last-token) including [`BertPooling`]. Used by
-/// [`model::BertModel`] and [`model::QwenModel`].
+/// `model::BertModel` and [`model::QwenModel`].
 pub mod pool;
 /// ShortGPT-style block influence scoring. See [`model`].
 pub mod pruning;
@@ -191,7 +191,7 @@ pub mod stop_reason;
 mod stop_token_contract;
 
 /// Test-support helper for the thirteen checkpoint-gated unit tests in
-/// [`model::bert`], [`model::qwen`], and `model::qwen35::generation` (a
+/// `model::bert`, [`model::qwen`], and `model::qwen35::generation` (a
 /// private submodule, so not linked) (issue #1664): resolves and panics
 /// naming an unset, relative, or missing
 /// model-directory env var, so an explicitly requested `--ignored` run
@@ -235,11 +235,14 @@ pub use crate::generation::TopLogprob;
 /// [`GenerateConfig::grammar`] carries one. See [`grammar`].
 #[doc(no_inline)]
 pub use crate::grammar::GrammarEngine;
-/// BERT encoder configuration. See [`BertModel`] and [`model`].
+/// BERT encoder configuration. See `BertModel` and [`model`].
+#[cfg(feature = "bert")]
 pub use crate::model::BertConfig;
-/// BERT/BGE encoder model. See [`BertConfig`], [`Tokenizer`], and [`BertPooling`].
+/// BERT/BGE encoder model. See `BertConfig`, [`Tokenizer`], and [`BertPooling`].
+#[cfg(feature = "bert")]
 pub use crate::model::BertModel;
-/// BERT-style cross-encoder/reranker model. See [`BertModel`] and [`model`].
+/// BERT-style cross-encoder/reranker model. See `BertModel` and [`model`].
+#[cfg(feature = "bert")]
 pub use crate::model::CrossEncoderModel;
 /// Per-layer profiling data collected during Qwen embedding inference. See [`ProfileTimings`]
 /// and [`QwenModel`].
@@ -251,7 +254,7 @@ pub use crate::model::QwenConfig;
 /// Qwen embedding model exposing `encode` for producing embeddings. See [`QwenConfig`],
 /// [`Tokenizer`], and [`weights`].
 pub use crate::model::QwenModel;
-/// BERT pooling strategy selector (mean or CLS). See [`pool`] and [`BertModel`].
+/// BERT pooling strategy selector (mean or CLS). See [`pool`] and `BertModel`.
 #[doc(no_inline)]
 pub use crate::pool::BertPooling;
 /// Reason a generation request stopped (e.g. EOS, max tokens). See [`stop_reason`] and
@@ -261,7 +264,7 @@ pub use crate::stop_reason::StopReason;
 /// Byte-level BPE tokenizer used by Qwen-family models. See [`Tokenizer`] and [`TokenizedInput`].
 pub use crate::tokenizer::BpeTokenizer;
 /// Token counts of one embedding input before and after the model's length limit. See
-/// [`BertModel::embedding_token_counts`] and [`QwenModel::embedding_token_counts`].
+/// `BertModel::embedding_token_counts` and [`QwenModel::embedding_token_counts`].
 pub use crate::tokenizer::EmbeddingTokenCounts;
 /// Additive Gemma-family BPE tokenizer (literal-space `Split` + `▁` metaspace normalizer),
 /// explicitly selected — never reached via [`load_tokenizer`]'s model-type sniffing. See
@@ -275,12 +278,12 @@ pub use crate::tokenizer::TokenizedInput;
 /// Object-safe tokenizer trait implemented by every tokenizer in [`tokenizer`]. See
 /// [`load_tokenizer`].
 pub use crate::tokenizer::Tokenizer;
-/// `WordPiece` tokenizer used by BERT-family models. See [`Tokenizer`] and [`BertModel`].
+/// `WordPiece` tokenizer used by BERT-family models. See [`Tokenizer`] and `BertModel`.
 pub use crate::tokenizer::WordPieceTokenizer;
 /// Model-directory tokenizer auto-loader. See [`Tokenizer`] and [`tokenizer`].
 pub use crate::tokenizer::load_tokenizer;
 /// `tokenizer.json`-text tokenizer loader (no filesystem access). See
-/// [`Tokenizer`], [`tokenizer`], and [`BertModel::from_bytes`].
+/// [`Tokenizer`], [`tokenizer`], and `BertModel::from_bytes`.
 pub use crate::tokenizer::tokenizer_from_json_str;
 /// Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17): `<|image|>`/`<|audio|>`
 /// placeholder-to-soft-token-count contract, independent of the in-sequence scatter itself.

@@ -1,7 +1,9 @@
 //! Model module index for BERT, BitNet config, cross-encoder, Qwen, Qwen3.5, and Qwen3.5 config, with BERT/CrossEncoder/Qwen/Qwen3.5 type re-exports.
+#[cfg(feature = "bert")]
 pub mod bert;
 pub mod bitnet_config;
 pub(crate) use lattice_weights::bounded_config as config_file;
+#[cfg(feature = "bert")]
 pub mod cross_encoder;
 #[cfg(feature = "embeddinggemma2")]
 pub mod embeddinggemma2;
@@ -22,8 +24,10 @@ pub mod qwen;
 pub mod qwen35;
 pub mod qwen35_config;
 
-// Re-export everything from bert (was top-level `model` module)
-pub use self::bert::*;
+// Preserve the original owning names and model-level loading module.
+#[cfg(feature = "bert")]
+pub use self::bert::{BertConfig, BertModel, weight_loading};
+#[cfg(feature = "bert")]
 pub use self::cross_encoder::CrossEncoderModel;
 #[cfg(feature = "embeddinggemma2")]
 pub use self::embeddinggemma2::EmbeddingGemma2Model;

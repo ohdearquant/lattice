@@ -1,9 +1,9 @@
 use super::*;
-use crate::model::bert::prepared_facts::{
+use crate::bert::prepared_facts::{
     BertGeometryLimits, BertPoolerMembers, PreparedBertFactError, RawBertConfigFacts,
     analyze_prepared_geometry,
 };
-use crate::model::bert::prepared_sequence_cap::{
+use crate::bert::prepared_sequence_cap::{
     PreparedBertSequenceCapKey, RawPreparedBertSequenceCapCandidate,
 };
 use std::num::NonZeroU64;
