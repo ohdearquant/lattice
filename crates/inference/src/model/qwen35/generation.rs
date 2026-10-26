@@ -646,25 +646,7 @@ fn test_take_first_sample_saw_prefill_end() -> Option<bool> {
     TEST_FIRST_SAMPLE_SAW_PREFILL_END.with(std::cell::Cell::get)
 }
 
-pub(crate) fn initial_rng_state(seed: Option<u64>) -> u64 {
-    match seed {
-        Some(s) => {
-            if s == 0 {
-                1
-            } else {
-                s
-            }
-        }
-        None => {
-            use std::time::SystemTime;
-            let t = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x12345678_9abcdef0);
-            if t == 0 { 1 } else { t }
-        }
-    }
-}
+pub(crate) use lattice_arch::__internal::initial_rng_state;
 
 fn finish_detokenizer(
     detok: &mut IncrementalDetokenizer,
@@ -944,12 +926,7 @@ pub(crate) fn check_mtp_not_requested(gen_cfg: &GenerateConfig) -> Result<(), In
 /// tokenized prompt length every call site already computes before any
 /// state allocation, so this call replaces each site's own inline check
 /// rather than adding a new one alongside it.
-pub(crate) fn check_prompt_not_empty(prompt_len: usize) -> Result<(), InferenceError> {
-    if prompt_len == 0 {
-        return Err(InferenceError::Inference("empty prompt".into()));
-    }
-    Ok(())
-}
+pub(crate) use lattice_arch::__internal::check_prompt_not_empty;
 
 /// Rejects tokenizer output that cannot index the configured embedding table.
 ///
