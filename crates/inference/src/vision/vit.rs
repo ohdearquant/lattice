@@ -19,6 +19,7 @@
 //! Qwen2.5-VL paper (arxiv:2502.13923), Qwen3-VL HF config.
 
 use super::{VisionError, config::VisionConfig};
+pub(crate) use lattice_compute::vision::{batch_matvec, gelu, layer_norm, softmax_inplace};
 
 /// Weights for a single ViT layer's self-attention.
 #[derive(Debug, Clone)]
@@ -110,70 +111,6 @@ pub(crate) fn matvec(a: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32>
     y
 }
 
-/// Batch matrix-vector: A [rows, cols] applied to each column of X [n, cols].
-/// Output is [n, rows].
-pub(crate) fn batch_matvec(a: &[f32], x: &[f32], n: usize, rows: usize, cols: usize) -> Vec<f32> {
-    // Guard the output allocation itself against usize overflow (ADR-080 C4, same rationale
-    // as `matmul()` in forward/cpu/matmul.rs): an unchecked `n * rows` can wrap in release,
-    // producing a too-small allocation that would then pass a subsequent `>=` length check
-    // on the same wrapped value.
-    assert!(
-        n.checked_mul(rows).is_some(),
-        "vit_batch_matvec: output shape overflow: n*rows"
-    );
-    let mut out = vec![0.0f32; n * rows];
-    // Modeled as C = A @ B^T with m=n (batch size), k=cols, n=rows (X is the "a" operand,
-    // A is the "b" operand — [rows, cols], transposed in the multiply — out is the "c"
-    // operand, already safely allocated above). Release-active, overflow-first,
-    // oversized-scratch-allowed, replacing the previous exact-match `assert_eq!` pair.
-    crate::forward::cpu::validate_gemm_bt(
-        x.len(),
-        a.len(),
-        out.len(),
-        n,
-        cols,
-        rows,
-        "vit_batch_matvec",
-    );
-    for i in 0..n {
-        let xi = &x[i * cols..(i + 1) * cols];
-        let yi = &mut out[i * rows..(i + 1) * rows];
-        for r in 0..rows {
-            let row = &a[r * cols..(r + 1) * cols];
-            let mut acc = 0.0f32;
-            for (a_val, x_val) in row.iter().zip(xi.iter()) {
-                acc += a_val * x_val;
-            }
-            yi[r] = acc;
-        }
-    }
-    out
-}
-
-/// LayerNorm: normalize x by (x - mean) / sqrt(var + eps), then scale by weight + bias.
-pub(crate) fn layer_norm(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
-    let n = x.len();
-    assert_eq!(weight.len(), n);
-    assert_eq!(bias.len(), n);
-
-    let mean = x.iter().sum::<f32>() / n as f32;
-    let var = x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32;
-    let inv_std = 1.0 / (var + eps).sqrt();
-
-    for (i, v) in x.iter_mut().enumerate() {
-        *v = (*v - mean) * inv_std * weight[i] + bias[i];
-    }
-}
-
-/// GELU activation (approximation matching PyTorch's tanh approximation).
-///
-/// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-#[inline(always)]
-pub(crate) fn gelu(x: f32) -> f32 {
-    let c = (2.0_f32 / std::f32::consts::PI).sqrt();
-    0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
-}
-
 /// SwiGLU: gate_out * gelu(up_out).
 /// gate and up are each [d_mlp]; returns [d_mlp].
 fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
@@ -181,26 +118,6 @@ fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
         .zip(up.iter())
         .map(|(&g, &u)| gelu(g) * u)
         .collect()
-}
-
-/// Softmax over a slice of logits (in-place).
-///
-/// ADR-080 C1: routes the fail-closed row contract through the shared
-/// row-finalizer (#741). Previously this had NO guard at all — a NaN or
-/// `+inf` logit propagated NaN through the unconditional division into every
-/// element of the row and onward through the rest of the ViT forward pass.
-pub(crate) fn softmax_inplace(x: &mut [f32]) {
-    let (max, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(x);
-    if crate::attention::softmax_row::row_fails_closed_pre_exp(max, any_nan) {
-        x.fill(0.0);
-        return;
-    }
-    let mut sum = 0.0f32;
-    for v in x.iter_mut() {
-        *v = (*v - max).exp();
-        sum += *v;
-    }
-    crate::attention::softmax_row::finalize_row(x, sum);
 }
 
 // ---------------------------------------------------------------------------

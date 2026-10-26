@@ -29,34 +29,7 @@ use super::VisionError;
 use super::checkpoint::VisualMergerWeights;
 use super::vit::layer_norm;
 use crate::model::qwen35_config::VisionModelConfig;
-
-/// Error-function approximation (Abramowitz & Stegun 7.1.26, max absolute
-/// error ~1.5e-7), computed in f64 for headroom above f32 output precision.
-/// `std` has no stable `erf`, and exact (non-tanh-approximated) GELU is the
-/// merger's HF-pinned activation (see module docs), so it is implemented
-/// here rather than reusing [`super::vit::gelu`].
-fn erf(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    const A1: f64 = 0.254829592;
-    const A2: f64 = -0.284496736;
-    const A3: f64 = 1.421413741;
-    const A4: f64 = -1.453152027;
-    const A5: f64 = 1.061405429;
-    const P: f64 = 0.3275911;
-    let t = 1.0 / (1.0 + P * x);
-    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-x * x).exp();
-    sign * y
-}
-
-/// Exact GELU: `0.5 * x * (1 + erf(x / sqrt(2)))` — matches PyTorch's
-/// `nn.GELU()` default (`approximate="none"`), which is what
-/// `Qwen3_5VisionPatchMerger.act_fn` hardcodes.
-#[inline(always)]
-pub(crate) fn gelu_exact(x: f32) -> f32 {
-    let xd = x as f64;
-    (0.5 * xd * (1.0 + erf(xd / std::f64::consts::SQRT_2))) as f32
-}
+pub(crate) use lattice_compute::vision::gelu_exact;
 
 /// Run the real Qwen3.5 patch-merger forward pass over one image's S3a
 /// pre-merger hidden states, producing the post-merger projected visual
