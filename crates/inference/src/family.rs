@@ -1,10 +1,12 @@
 //! The family contract of `lattice-arch` (ADR-103 Amendment 21 item 3) and the descriptors for
 //! the model families this crate loads.
 //!
-//! **Unstable**: [`QWEN35`] offers a Qwen3.5 decoder on the CPU through [`Qwen35CpuDecoder`];
-//! [`BERT`] and [`EMBEDDING_GEMMA2`] offer the CPU encoders of [`crate::encoder`]. [`registry`]
-//! builds a table of all three. The Qwen3 embedding model has no descriptor yet: its loader
-//! chooses the Metal backend itself, so a [`LoadRequest`] cannot fix its backend.
+//! **Unstable**: [`QWEN35`](crate::family::QWEN35) offers a Qwen3.5 decoder on the CPU through
+//! [`Qwen35CpuDecoder`](crate::family::Qwen35CpuDecoder); [`BERT`](crate::family::BERT) and
+//! [`EMBEDDING_GEMMA2`](crate::family::EMBEDDING_GEMMA2) offer the CPU encoders of
+//! [`crate::encoder`]. [`registry`](crate::family::registry) builds a table of all three. The
+//! Qwen3 embedding model has no descriptor yet: its loader chooses the Metal backend itself, so a
+//! [`LoadRequest`](crate::family::LoadRequest) cannot fix its backend.
 
 pub use lattice_arch::decoder::{DecoderModel, SessionRequest, TextDecoder, TextStream};
 pub use lattice_arch::family::{
