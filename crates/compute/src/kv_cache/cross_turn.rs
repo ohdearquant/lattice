@@ -5,7 +5,7 @@
 //! state — it only decides, from token IDs and metadata, whether a cached
 //! prefix can be reused and where the new suffix begins. The Metal-specific
 //! runtime (live KV buffers, GDN snapshots) lives in
-//! `crate::forward::metal_qwen35`.
+//! `lattice_inference::forward::metal_qwen35`.
 //!
 //! See design.md step 4 (ADR: latest-boundary GDN snapshot + live KV logical
 //! reuse for v1). Three reuse modes exist: an exact token prefix that is
