@@ -150,7 +150,7 @@ fn legacy_rotation_methods_preserve_raw_invalid_config_errors() {
         OnlineRotationSpec::r3_full_attention(&cfg, 17, 4)
             .unwrap_err()
             .to_string(),
-        "OnlineRotationSpec::r3_full_attention: config resolved zero full-attention layers — refusing an empty-scope R3 artifact"
+        "Inference error: OnlineRotationSpec::r3_full_attention: config resolved zero full-attention layers — refusing an empty-scope R3 artifact"
     );
     assert_eq!(
         outcome(OnlineRotationSpec::r3_full_attention(&cfg, 17, 4)),
@@ -161,14 +161,14 @@ fn legacy_rotation_methods_preserve_raw_invalid_config_errors() {
         OnlineRotationSpec::r3_full_attention(&cfg, 17, 4)
             .unwrap_err()
             .to_string(),
-        "OnlineRotationSpec: num_attention_heads must be non-zero — BlockHadamard::new refuses a zero-length rotation axis"
+        "Inference error: OnlineRotationSpec: num_attention_heads must be non-zero — BlockHadamard::new refuses a zero-length rotation axis"
     );
     cfg.intermediate_size = 0;
     assert_eq!(
         OnlineRotationSpec::r4_dense_mlp(&cfg, 29, 4)
             .unwrap_err()
             .to_string(),
-        "OnlineRotationSpec: intermediate_size must be non-zero — BlockHadamard::new refuses a zero-length rotation axis"
+        "Inference error: OnlineRotationSpec: intermediate_size must be non-zero — BlockHadamard::new refuses a zero-length rotation axis"
     );
 }
 
@@ -192,7 +192,7 @@ fn legacy_r3_scalar_refusals_precede_full_target_construction() {
         assert_eq!(
             err.to_string(),
             format!(
-                "OnlineRotationSpec::r3_full_attention requires a power-of-two block_size, got {block_size}"
+                "Inference error: OnlineRotationSpec::r3_full_attention requires a power-of-two block_size, got {block_size}"
             )
         );
     }
@@ -200,14 +200,14 @@ fn legacy_r3_scalar_refusals_precede_full_target_construction() {
         without_full_target(|| OnlineRotationSpec::r3_full_attention(&cfg, 17, 8)).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::r3_full_attention: block_size 8 does not divide num_attention_heads 12 — R3's online factor is QuaRot Eq. 9's cross-head Hadamard (H_num_heads ⊗ I_head_dim), so block_size divides the head axis, not head_dim"
+        "Inference error: OnlineRotationSpec::r3_full_attention: block_size 8 does not divide num_attention_heads 12 — R3's online factor is QuaRot Eq. 9's cross-head Hadamard (H_num_heads ⊗ I_head_dim), so block_size divides the head axis, not head_dim"
     );
     cfg.num_attention_heads = 0;
     let err =
         without_full_target(|| OnlineRotationSpec::r3_full_attention(&cfg, 17, 4)).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec: num_attention_heads must be non-zero — BlockHadamard::new refuses a zero-length rotation axis"
+        "Inference error: OnlineRotationSpec: num_attention_heads must be non-zero — BlockHadamard::new refuses a zero-length rotation axis"
     );
 }
 
@@ -238,7 +238,7 @@ fn legacy_r4_builder_and_validator_never_construct_full_target() {
             assert_eq!(
                 err.to_string(),
                 format!(
-                    "OnlineRotationSpec::r4_dense_mlp requires a power-of-two block_size, got {block_size}"
+                    "Inference error: OnlineRotationSpec::r4_dense_mlp requires a power-of-two block_size, got {block_size}"
                 )
             );
         }
@@ -247,7 +247,7 @@ fn legacy_r4_builder_and_validator_never_construct_full_target() {
     let err = without_full_target(|| OnlineRotationSpec::r4_dense_mlp(&moe, 29, 0)).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::r4_dense_mlp: this config is a MoE configuration (loader requires mlp.experts.down_proj, not the dense mlp.down_proj.weight this constructor targets) — MoE R4 targets are not yet modeled"
+        "Inference error: OnlineRotationSpec::r4_dense_mlp: this config is a MoE configuration (loader requires mlp.experts.down_proj, not the dense mlp.down_proj.weight this constructor targets) — MoE R4 targets are not yet modeled"
     );
 }
 
@@ -273,32 +273,32 @@ fn legacy_spec_structural_refusals_precede_full_target_construction() {
     let err = without_full_target(|| spec.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::validate: AttentionOutputR3 requires side=InputSide (the only orientation proven correct by the R3/R4 reference test), got OutputSide"
+        "Inference error: OnlineRotationSpec::validate: AttentionOutputR3 requires side=InputSide (the only orientation proven correct by the R3/R4 reference test), got OutputSide"
     );
     spec.side = AbsorptionSide::InputSide;
     let err = without_full_target(|| spec.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::validate: AttentionOutputR3 requires a power-of-two block_size, got 3"
+        "Inference error: OnlineRotationSpec::validate: AttentionOutputR3 requires a power-of-two block_size, got 3"
     );
     spec.block_size = 4;
     let err = without_full_target(|| spec.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::validate: AttentionOutputR3 (R3) requires an explicit non-empty layer_scope (full-attention layers only) — layer_scope=None is invalid for R3"
+        "Inference error: OnlineRotationSpec::validate: AttentionOutputR3 (R3) requires an explicit non-empty layer_scope (full-attention layers only) — layer_scope=None is invalid for R3"
     );
     spec.layer_scope = Some(vec![]);
     let err = without_full_target(|| spec.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::validate: AttentionOutputR3 (R3) layer_scope must not be empty"
+        "Inference error: OnlineRotationSpec::validate: AttentionOutputR3 (R3) layer_scope must not be empty"
     );
     spec.layer_scope = Some((0..=OnlineRotationSpec::MAX_LAYER_SCOPE_ENTRIES).collect());
     let err = without_full_target(|| spec.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
         format!(
-            "OnlineRotationSpec::validate: R3 layer_scope declares {} entries, exceeding the maximum of {} — a spec this large is rejected before the per-layer membership check to keep validation cost bounded regardless of input",
+            "Inference error: OnlineRotationSpec::validate: R3 layer_scope declares {} entries, exceeding the maximum of {} — a spec this large is rejected before the per-layer membership check to keep validation cost bounded regardless of input",
             OnlineRotationSpec::MAX_LAYER_SCOPE_ENTRIES + 1,
             OnlineRotationSpec::MAX_LAYER_SCOPE_ENTRIES
         )
@@ -309,7 +309,7 @@ fn legacy_spec_structural_refusals_precede_full_target_construction() {
         assert_eq!(
             err.to_string(),
             format!(
-                "OnlineRotationSpec::validate: R3 layer_scope {layers:?} must be strictly sorted ascending with no duplicates — found {} at or after {}",
+                "Inference error: OnlineRotationSpec::validate: R3 layer_scope {layers:?} must be strictly sorted ascending with no duplicates — found {} at or after {}",
                 layers[1], layers[0]
             )
         );
@@ -327,14 +327,14 @@ fn legacy_spec_dimension_and_membership_refusals_precede_full_target_constructio
     let err = without_full_target(|| spec.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::validate: R3 block_size 8 does not divide cfg.num_attention_heads 12"
+        "Inference error: OnlineRotationSpec::validate: R3 block_size 8 does not divide cfg.num_attention_heads 12"
     );
     cfg.num_attention_heads = 0;
     spec.block_size = 4;
     let err = without_full_target(|| spec.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec: num_attention_heads must be non-zero — BlockHadamard::new refuses a zero-length rotation axis"
+        "Inference error: OnlineRotationSpec: num_attention_heads must be non-zero — BlockHadamard::new refuses a zero-length rotation axis"
     );
     cfg.num_attention_heads = 8;
     for idx in [0, 64] {
@@ -343,7 +343,7 @@ fn legacy_spec_dimension_and_membership_refusals_precede_full_target_constructio
         assert_eq!(
             err.to_string(),
             format!(
-                "OnlineRotationSpec::validate: R3 layer_scope includes layer {idx}, which is not a valid full-attention layer for this config"
+                "Inference error: OnlineRotationSpec::validate: R3 layer_scope includes layer {idx}, which is not a valid full-attention layer for this config"
             )
         );
     }
@@ -364,7 +364,7 @@ fn legacy_r3_materializes_full_target_after_valid_membership() {
     assert_eq!(full_target_factory_calls(), before + 3);
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::validate: R3 layer_scope [3] does not cover all of this config's full-attention layers [3, 7, 11, 15, 19, 23] — missing layer(s) [7, 11, 15, 19, 23]"
+        "Inference error: OnlineRotationSpec::validate: R3 layer_scope [3] does not cover all of this config's full-attention layers [3, 7, 11, 15, 19, 23] — missing layer(s) [7, 11, 15, 19, 23]"
     );
 }
 
@@ -386,7 +386,7 @@ fn legacy_residual_descriptor_ignores_configuration_without_full_target_construc
     let err = without_full_target(|| descriptor.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineArtifactDescriptor: a V0Residual artifact must not carry online rotation metadata — a v0 residual artifact is never interpreted as online-capable"
+        "Inference error: OnlineArtifactDescriptor: a V0Residual artifact must not carry online rotation metadata — a v0 residual artifact is never interpreted as online-capable"
     );
     descriptor.online_rotations.clear();
     descriptor
@@ -395,7 +395,7 @@ fn legacy_residual_descriptor_ignores_configuration_without_full_target_construc
     let err = without_full_target(|| descriptor.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineArtifactDescriptor: a V0Residual artifact must not declare any asymmetric_tensor_names — the V0 contract is symmetric-only Q4 with no R3/R4 metadata"
+        "Inference error: OnlineArtifactDescriptor: a V0Residual artifact must not declare any asymmetric_tensor_names — the V0 contract is symmetric-only Q4 with no R3/R4 metadata"
     );
 }
 
@@ -414,7 +414,7 @@ fn legacy_online_descriptor_preserves_spec_order_and_scalar_only_layout() {
     let err = without_full_target(|| descriptor.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineArtifactDescriptor: a V1Online artifact must declare at least one R3/R4 online rotation"
+        "Inference error: OnlineArtifactDescriptor: a V1Online artifact must declare at least one R3/R4 online rotation"
     );
     let mut bad_spec = raw_r3_spec();
     bad_spec.side = AbsorptionSide::OutputSide;
@@ -422,7 +422,7 @@ fn legacy_online_descriptor_preserves_spec_order_and_scalar_only_layout() {
     let err = without_full_target(|| descriptor.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::validate: AttentionOutputR3 requires side=InputSide (the only orientation proven correct by the R3/R4 reference test), got OutputSide"
+        "Inference error: OnlineRotationSpec::validate: AttentionOutputR3 requires side=InputSide (the only orientation proven correct by the R3/R4 reference test), got OutputSide"
     );
     descriptor.online_rotations = vec![OnlineRotationSpec {
         id: RotationId::MlpDownR4,
@@ -454,13 +454,13 @@ fn legacy_descriptor_entry_caps_precede_spec_or_layout_work() {
     let err = without_full_target(|| descriptor.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineArtifactDescriptor: online_rotations declares 4097 entries, exceeding the maximum of 4096 — a descriptor this large is rejected before validation to keep work bounded over untrusted input"
+        "Inference error: OnlineArtifactDescriptor: online_rotations declares 4097 entries, exceeding the maximum of 4096 — a descriptor this large is rejected before validation to keep work bounded over untrusted input"
     );
     descriptor.online_rotations = vec![spec];
     descriptor.asymmetric_tensor_names = vec![String::new(); 4097];
     let err = without_full_target(|| descriptor.validate(Some(&cfg))).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineArtifactDescriptor: asymmetric_tensor_names declares 4097 entries, exceeding the maximum of 4096 — a descriptor this large is rejected before validation to keep work bounded over untrusted input"
+        "Inference error: OnlineArtifactDescriptor: asymmetric_tensor_names declares 4097 entries, exceeding the maximum of 4096 — a descriptor this large is rejected before validation to keep work bounded over untrusted input"
     );
 }

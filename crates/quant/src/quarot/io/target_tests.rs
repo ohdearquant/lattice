@@ -111,7 +111,7 @@ fn descriptor_validation_requires_complete_target_full_attention_set() {
     let err = descriptor.validate_target(Some(&target())).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::validate: R3 layer_scope [0] does not cover all of this config's full-attention layers [0, 2] — missing layer(s) [2]"
+        "Inference error: OnlineRotationSpec::validate: R3 layer_scope [0] does not cover all of this config's full-attention layers [0, 2] — missing layer(s) [2]"
     );
 }
 

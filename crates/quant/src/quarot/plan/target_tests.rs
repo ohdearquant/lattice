@@ -68,7 +68,7 @@ fn attention_output_r3_refuses_recurrent_target() {
     let err = OnlineRotationSpec::attention_output_r3(&target, 31, 4).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "OnlineRotationSpec::r3_full_attention: config resolved zero full-attention layers — refusing an empty-scope R3 artifact"
+        "Inference error: OnlineRotationSpec::r3_full_attention: config resolved zero full-attention layers — refusing an empty-scope R3 artifact"
     );
 }
 
@@ -81,7 +81,7 @@ fn attention_output_r3_refuses_invalid_blocks_on_numeric_target() {
                 .unwrap_err()
                 .to_string(),
             format!(
-                "OnlineRotationSpec::r3_full_attention requires a power-of-two block_size, got {block_size}"
+                "Inference error: OnlineRotationSpec::r3_full_attention requires a power-of-two block_size, got {block_size}"
             )
         );
     }
@@ -89,7 +89,7 @@ fn attention_output_r3_refuses_invalid_blocks_on_numeric_target() {
         OnlineRotationSpec::attention_output_r3(&target, 31, 8)
             .unwrap_err()
             .to_string(),
-        "OnlineRotationSpec::r3_full_attention: block_size 8 does not divide num_attention_heads 12 — R3's online factor is QuaRot Eq. 9's cross-head Hadamard (H_num_heads ⊗ I_head_dim), so block_size divides the head axis, not head_dim"
+        "Inference error: OnlineRotationSpec::r3_full_attention: block_size 8 does not divide num_attention_heads 12 — R3's online factor is QuaRot Eq. 9's cross-head Hadamard (H_num_heads ⊗ I_head_dim), so block_size divides the head axis, not head_dim"
     );
 }
 
@@ -116,7 +116,7 @@ fn mlp_down_r4_preserves_dense_recipe_and_rejects_invalid_blocks() {
                 .unwrap_err()
                 .to_string(),
             format!(
-                "OnlineRotationSpec::r4_dense_mlp requires a power-of-two block_size, got {block_size}"
+                "Inference error: OnlineRotationSpec::r4_dense_mlp requires a power-of-two block_size, got {block_size}"
             )
         );
     }
@@ -124,7 +124,7 @@ fn mlp_down_r4_preserves_dense_recipe_and_rejects_invalid_blocks() {
         OnlineRotationSpec::mlp_down_r4(&invalid_target, 43, 16)
             .unwrap_err()
             .to_string(),
-        "OnlineRotationSpec::r4_dense_mlp: block_size 16 does not divide intermediate_size 24"
+        "Inference error: OnlineRotationSpec::r4_dense_mlp: block_size 16 does not divide intermediate_size 24"
     );
 }
 
@@ -157,6 +157,6 @@ fn validate_target_refuses_missing_full_attention_layer() {
     assert!(spec.validate_target(None).is_ok());
     assert_eq!(
         spec.validate_target(Some(&target)).unwrap_err().to_string(),
-        "OnlineRotationSpec::validate: R3 layer_scope [1] does not cover all of this config's full-attention layers [1, 4] — missing layer(s) [4]"
+        "Inference error: OnlineRotationSpec::validate: R3 layer_scope [1] does not cover all of this config's full-attention layers [1, 4] — missing layer(s) [4]"
     );
 }
