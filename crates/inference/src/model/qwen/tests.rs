@@ -1135,21 +1135,16 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
         norm_weight: crate::weights::Tensor1D { data: &[], len: 0 },
         layers: Vec::new(),
     };
-    let storage = ShardedQwenBacking {
-        embed_tokens: Vec::new(),
-        norm_weight: Vec::new(),
-        q_proj: Vec::new(),
-        k_proj: Vec::new(),
-        v_proj: Vec::new(),
-        o_proj: Vec::new(),
-        q_norm: Vec::new(),
-        k_norm: Vec::new(),
-        input_ln: Vec::new(),
-        gate_proj: Vec::new(),
-        up_proj: Vec::new(),
-        down_proj: Vec::new(),
-        post_ln: Vec::new(),
-    };
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut header = br#"{"unused":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+    std::fs::write(file.path(), bytes).unwrap();
+    let storage = SafetensorsFile::open(file.path()).unwrap();
     QwenModel {
         config,
         inference_config,
@@ -1160,7 +1155,7 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
         cache: Mutex::new(HashMap::new()),
         metal: None,
         weights: ManuallyDrop::new(weights),
-        _storage: ManuallyDrop::new(SafetensorsStorage::Sharded(Box::new(storage))),
+        _storage: ManuallyDrop::new(SafetensorsStorage::Single(Box::new(storage))),
     }
 }
 

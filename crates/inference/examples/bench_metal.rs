@@ -60,16 +60,16 @@ fn run_bench() {
     let t0 = Instant::now();
     let safetensors =
         lattice_inference::weights::SafetensorsFile::open(&dir.join("model.safetensors")).unwrap();
-    let mmap_weights = safetensors
-        .load_qwen_weights(
-            cpu_cfg.num_hidden_layers,
-            cpu_cfg.hidden_size,
-            cpu_cfg.num_attention_heads,
-            cpu_cfg.num_key_value_heads,
-            cpu_cfg.head_dim,
-            cpu_cfg.intermediate_size,
-        )
-        .unwrap();
+    let mmap_weights = lattice_inference::model::qwen::weight_loading::load_weights(
+        &safetensors,
+        cpu_cfg.num_hidden_layers,
+        cpu_cfg.hidden_size,
+        cpu_cfg.num_attention_heads,
+        cpu_cfg.num_key_value_heads,
+        cpu_cfg.head_dim,
+        cpu_cfg.intermediate_size,
+    )
+    .unwrap();
     let weight_load_ms = t0.elapsed().as_millis();
     println!("  Weights loaded in {weight_load_ms}ms\n");
 
