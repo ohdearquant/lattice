@@ -1,13 +1,13 @@
-use super::SafetensorsFile;
+use super::{SafetensorsFile, load_weights};
 use lattice_inference_core::InferenceError;
 
-use crate::test_fixtures::bert_namespace as fixture;
+use lattice_weights::test_fixtures::bert_namespace as fixture;
 
 use fixture::{HIDDEN, LAYERS, Tensor, checkpoint, rename, safetensors_bytes};
 
 fn assert_mixed(tensors: &[Tensor]) {
     let file = SafetensorsFile::from_bytes(safetensors_bytes(tensors)).unwrap();
-    let error = file.load_bert_weights(LAYERS, HIDDEN).unwrap_err();
+    let error = load_weights(&file, LAYERS, HIDDEN).unwrap_err();
     assert!(
         matches!(&error, InferenceError::InvalidSafetensors(message)
             if message.contains("mixed BERT encoder namespaces")),
@@ -87,7 +87,7 @@ fn bert_namespace_partial_checkpoint_reports_qualified_missing_tensor() {
             let missing = format!("{prefix}{suffix}");
             tensors.retain(|tensor| tensor.name != missing);
             let file = SafetensorsFile::from_bytes(safetensors_bytes(&tensors)).unwrap();
-            let error = file.load_bert_weights(LAYERS, HIDDEN).unwrap_err();
+            let error = load_weights(&file, LAYERS, HIDDEN).unwrap_err();
             assert!(
                 matches!(&error, InferenceError::MissingTensor(name) if name == &missing),
                 "missing {missing}: {error:?}",

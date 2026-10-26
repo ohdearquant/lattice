@@ -56,7 +56,10 @@ impl CrossEncoderModel {
         }
 
         let safetensors = SafetensorsFile::open(&dir.join("model.safetensors"))?;
-        let classifier = safetensors.load_cross_encoder_weights(bert.config().hidden_size)?;
+        let classifier = crate::model::bert::weight_loading::load_classifier_weights(
+            &safetensors,
+            bert.config().hidden_size,
+        )?;
 
         Ok(Self { bert, classifier })
     }
