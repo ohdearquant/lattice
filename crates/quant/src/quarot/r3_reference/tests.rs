@@ -421,7 +421,7 @@ fn r3_orientation_enumeration_finds_exactly_one_reparameterization() {
 
     // The artifact schema's recorded orientation must agree with the
     // enumeration result.
-    let cfg = lattice_model_config::qwen35_config::Qwen35Config::qwen35_0_8b();
+    let cfg = lattice_arch::qwen35_config::Qwen35Config::qwen35_0_8b();
     let spec = OnlineRotationSpec::r3_full_attention(&cfg, 1, NUM_Q_HEADS).unwrap();
     assert_eq!(
         spec.side,

@@ -64,7 +64,7 @@ lattice-inference = { version = "0.15.0", path = "../inference", optional = true
 ] }
 lattice-compute = { version = "0.15.0", path = "../compute", optional = true }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core", optional = true }
-lattice-model-config = { version = "0.15.0", path = "../model-config", optional = true }
+lattice-arch = { version = "0.15.0", path = "../arch", optional = true }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer", optional = true }
 lattice-weights = { version = "0.15.0", path = "../weights", optional = true, features = ["f16"] }
 
@@ -122,7 +122,7 @@ native = [
     "dep:lattice-inference",
     "dep:lattice-compute",
     "dep:lattice-inference-core",
-    "dep:lattice-model-config",
+    "dep:lattice-arch",
     "dep:lattice-tokenizer",
     "dep:lattice-weights",
 ]

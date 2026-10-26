@@ -13,7 +13,7 @@ use crate::rope::RopeTable;
 use crate::tokenizer::common::{EmbeddingTokenCounts, TokenizedInput, Tokenizer, load_tokenizer};
 use crate::weights::{QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors};
 #[doc(inline)]
-pub use lattice_model_config::qwen_config::QwenConfig;
+pub use lattice_arch::qwen_config::QwenConfig;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;

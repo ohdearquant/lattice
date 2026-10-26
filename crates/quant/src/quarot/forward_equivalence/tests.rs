@@ -4,7 +4,7 @@ use crate::quarot::lm_head::{materialize_lm_head_for_qwen35, qwen35_final_norm_f
 use crate::quarot::pipeline::{absorb_rotations, fuse_rmsnorms};
 use crate::quarot::plan::RotationPlan;
 use crate::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use lattice_model_config::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
+use lattice_arch::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
 
 /// Tiny Qwen3.5 config tuned for tractable probe tests:
 /// - `hidden_size = 8` (power of 2 for Hadamard)

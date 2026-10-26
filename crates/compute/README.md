@@ -14,6 +14,6 @@ Sampling moves here in a later release.
 `lattice-inference` re-exports the supported items at their original paths.
 
 The crate depends on `lattice-inference-core` for the shared error type and on
-`lattice-model-config` for the Qwen3.5 geometry used by the LoRA hook contract. Option
+`lattice-arch` for the Qwen3.5 geometry used by the LoRA hook contract. Option
 scoring adds a dependency on `lattice-tokenizer` for the `Tokenizer` trait, and the CPU
 F16 matmul one on `lattice-weights` for the F16 storage type.

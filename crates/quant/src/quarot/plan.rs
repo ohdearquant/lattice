@@ -134,7 +134,7 @@
 //!
 //! Loader-side helpers available to the converter:
 //!
-//! - [`lattice_model_config::qwen35_tensors::qwen_required_tensor_names`] returns the
+//! - [`lattice_arch::qwen35_tensors::qwen_required_tensor_names`] returns the
 //!   per-config expected tensor list (per-layer, per-architecture
 //!   variant). Step 3b promoted this out of `#[cfg(test)]`. Step 3c
 //!   uses it to validate that every required tensor in the input
@@ -168,8 +168,8 @@ use crate::quarot::rotation::{
     absorb_input_rotation, absorb_input_rotation_f64, absorb_output_rotation,
     absorb_output_rotation_f64,
 };
-use lattice_model_config::qwen_config::QwenConfig;
-use lattice_model_config::qwen35_config::Qwen35Config;
+use lattice_arch::qwen_config::QwenConfig;
+use lattice_arch::qwen35_config::Qwen35Config;
 
 /// Which side of a linear layer's weight matrix gets the rotation absorbed.
 ///
@@ -803,7 +803,7 @@ impl RotationPlan {
     /// fusion + neutralization (input/post/final), `tie_word_embeddings=false`
     /// config flip, fused `lm_head` materialization, per-layer coverage
     /// against `qwen_required_tensor_names` (exposed in step 3b via
-    /// [`lattice_model_config::qwen35_tensors::qwen_required_tensor_names`]), and
+    /// [`lattice_arch::qwen35_tensors::qwen_required_tensor_names`]), and
     /// LoRA-runtime incompatibility marker. Step 3c/3d's `quantize_quarot`
     /// binary owns all of these.
     pub fn qwen35_residual_stream_linear_layers() -> Self {
@@ -956,7 +956,7 @@ impl RotationPlan {
     /// `tie_word_embeddings` flip, etc. — see module §Known gaps).
     ///
     /// Per-layer coverage requires the loader's config-derived expected
-    /// name list at [`lattice_model_config::qwen35_tensors::qwen_required_tensor_names`].
+    /// name list at [`lattice_arch::qwen35_tensors::qwen_required_tensor_names`].
     /// Step 3b promoted that re-export out of `#[cfg(test)]` so the
     /// conversion binary can call it; step 3c performs the actual
     /// per-layer cross-check.
@@ -1123,7 +1123,7 @@ pub fn apply_tensor_rotation_f64(
 
 /// Required tensor names for a plain Qwen3 model with the given `cfg`.
 ///
-/// Analogous to [`lattice_model_config::qwen35_tensors::qwen_required_tensor_names`] for
+/// Analogous to [`lattice_arch::qwen35_tensors::qwen_required_tensor_names`] for
 /// Qwen3.5. Plain Qwen3 uses `layers.{i}.*` names directly — no
 /// `model.language_model.*` prefix — and has no GDN `linear_attn.*` tensors.
 ///

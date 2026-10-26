@@ -1,6 +1,6 @@
 use super::*;
 use crate::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use lattice_model_config::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_weights::q4_weights::{dequantize_q4_to_f32, quantize_f64_to_q4};
 use lattice_weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
 
@@ -332,7 +332,7 @@ fn qwen35_fusion_plan_targets_resolve_within_required_tensor_set() {
     // between the fusion plan and the loader's required-name helper.
     let cfg = Qwen35Config::qwen35_0_8b();
     let required: std::collections::HashSet<String> =
-        lattice_model_config::qwen35_tensors::qwen_required_tensor_names(&cfg)
+        lattice_arch::qwen35_tensors::qwen_required_tensor_names(&cfg)
             .into_iter()
             .collect();
     let plan = qwen35_per_layer_fusion_plan(&cfg).unwrap();

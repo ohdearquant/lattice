@@ -28,7 +28,7 @@ extract_re() {  # $1 = anchor substring unique to the wanted line
     | sed -E "s/^ *if grep -E '//; s/' <<<.*$//"
 }
 
-ENGINE_RE="$(extract_re 'crates/(inference|inference-core|metal-runtime|serve|tokenizer|grammar|weights|quant|model-config|compute|model-io|embed)/')"
+ENGINE_RE="$(extract_re 'crates/(inference|inference-core|metal-runtime|serve|tokenizer|grammar|weights|quant|arch|compute|model-io|embed)/')"
 TUNE_RE="$(extract_re 'crates/tune/')"
 
 # FAIL CLOSED ON EMPTY. An extraction that resolved nothing would make every
@@ -114,11 +114,11 @@ check "quant manifest -> engine" true \
 check "quant README alone -> engine" false \
   "$(classify "$ENGINE_RE" <<<'crates/quant/README.md')"
 check "model config source -> engine" true \
-  "$(classify "$ENGINE_RE" <<<'crates/model-config/src/qwen35_config.rs')"
+  "$(classify "$ENGINE_RE" <<<'crates/arch/src/qwen35_config.rs')"
 check "model config manifest -> engine" true \
-  "$(classify "$ENGINE_RE" <<<'crates/model-config/Cargo.toml')"
+  "$(classify "$ENGINE_RE" <<<'crates/arch/Cargo.toml')"
 check "model config README alone -> engine" false \
-  "$(classify "$ENGINE_RE" <<<'crates/model-config/README.md')"
+  "$(classify "$ENGINE_RE" <<<'crates/arch/README.md')"
 check "compute source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/compute/src/rope.rs')"
 check "compute manifest -> engine" true \

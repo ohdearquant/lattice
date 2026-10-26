@@ -120,6 +120,4 @@ pub use generation::RawGenEvent;
 /// rotation rules against an actual safetensors file. Originally
 /// `#[cfg(test)]`-only; promoted in step 3b.
 #[doc(inline)]
-pub use lattice_model_config::qwen35_tensors::{
-    qwen_layer_tensor_prefix, qwen_required_tensor_names,
-};
+pub use lattice_arch::qwen35_tensors::{qwen_layer_tensor_prefix, qwen_required_tensor_names};

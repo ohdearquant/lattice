@@ -49,7 +49,7 @@
 //! when `R` is itself diagonal, which Hadamard rotations are not).
 
 use crate::error::InferenceError;
-use lattice_model_config::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_config::Qwen35Config;
 
 /// Description of one fusion site: a `*_layernorm.weight` tensor whose
 /// `(1 + gamma)` must be folded into one or more downstream linear weight

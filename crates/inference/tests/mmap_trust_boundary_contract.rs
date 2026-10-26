@@ -225,7 +225,7 @@ fn only_the_mmap_trust_boundary_names_a_construction_api() {
         "lattice-grammar",
         "lattice-weights",
         "lattice-quant",
-        "lattice-model-config",
+        "lattice-arch",
         "lattice-compute",
         "lattice-model-io",
     ] {

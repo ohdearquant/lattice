@@ -20,15 +20,15 @@ lattice-tokenizer, lattice-grammar, lattice-weights, lattice-metal-runtime, latt
                                 (depend on lattice-inference-core)
         │
         ▼  (wait for crates.io indexing)
-lattice-model-config            (depends on lattice-inference-core and lattice-weights)
+lattice-arch            (depends on lattice-inference-core and lattice-weights)
         │
         ▼  (wait for crates.io indexing)
-lattice-quant, lattice-compute  (depend on lattice-inference-core, lattice-weights and lattice-model-config;
+lattice-quant, lattice-compute  (depend on lattice-inference-core, lattice-weights and lattice-arch;
                                  lattice-compute also on lattice-tokenizer)
         │
         ▼  (wait for crates.io indexing)
 lattice-inference               (depends on lattice-inference-core, lattice-tokenizer, lattice-grammar,
-                                 lattice-weights, lattice-quant, lattice-model-config, lattice-compute, lattice-model-io; optional lattice-metal-runtime via `metal-gpu`,
+                                 lattice-weights, lattice-quant, lattice-arch, lattice-compute, lattice-model-io; optional lattice-metal-runtime via `metal-gpu`,
                                  optional lattice-fann via `mixture` or `metal-gpu`)
         │
         ▼  (wait for crates.io indexing)
@@ -66,7 +66,7 @@ scripts/package-size-check.sh
 `make publish-dry` only validates the leaf tier (`lattice-fann`, `lattice-transport`,
 `lattice-inference-core`) — Cargo cannot dry-run a crate whose internal path dependencies are not
 yet live on the registry, so `lattice-tokenizer`, `lattice-grammar`, `lattice-weights`,
-`lattice-metal-runtime`, `lattice-compute`, `lattice-model-io`, `lattice-quant`, `lattice-model-config`, `lattice-inference`, `lattice-embed`, `lattice-tune`, and `lattice-serve` are not covered by the dry run.
+`lattice-metal-runtime`, `lattice-compute`, `lattice-model-io`, `lattice-quant`, `lattice-arch`, `lattice-inference`, `lattice-embed`, `lattice-tune`, and `lattice-serve` are not covered by the dry run.
 
 ### Package size
 
@@ -127,7 +127,7 @@ cargo publish -p lattice-model-io
 
 sleep 30   # wait for crates.io indexing
 
-cargo publish -p lattice-model-config
+cargo publish -p lattice-arch
 
 sleep 30   # wait for crates.io indexing
 
@@ -164,7 +164,7 @@ state and every remote asset before retrying.
 
 - [ ] Verify on crates.io: all fifteen crates (`lattice-fann`, `lattice-transport`,
       `lattice-inference-core`, `lattice-tokenizer`, `lattice-grammar`, `lattice-weights`,
-      `lattice-metal-runtime`, `lattice-quant`, `lattice-model-config`, `lattice-compute`, `lattice-model-io`, `lattice-inference`, `lattice-embed`, `lattice-tune`, `lattice-serve`) show `v{VERSION}`.
+      `lattice-metal-runtime`, `lattice-quant`, `lattice-arch`, `lattice-compute`, `lattice-model-io`, `lattice-inference`, `lattice-embed`, `lattice-tune`, `lattice-serve`) show `v{VERSION}`.
 - [ ] Smoke test: `cargo add lattice-inference@{VERSION}` in a fresh project.
 - [ ] Update `docs/getting-started.md` only if the public API changed.
 - [ ] Close the relevant milestone/issues.
@@ -192,7 +192,7 @@ gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f ta
 
 # 4. Only after the replacement is live on crates.io and its GitHub asset workflow succeeds,
 #    yank the broken version from every published crate:
-for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-model-config lattice-compute lattice-model-io lattice-inference lattice-embed lattice-tune lattice-serve; do
+for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-arch lattice-compute lattice-model-io lattice-inference lattice-embed lattice-tune lattice-serve; do
   cargo yank --version {BROKEN_VERSION} "$c"
 done
 

@@ -1,4 +1,4 @@
-# lattice-model-config
+# lattice-arch
 
 Model configurations for Lattice inference. Each parser reads a checkpoint's `config.json`
 through a bounded reader, requires every forward-relevant field, and rejects values outside

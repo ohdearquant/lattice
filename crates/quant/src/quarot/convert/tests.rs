@@ -2,7 +2,7 @@ use super::*;
 use crate::quarot::lm_head::{
     QWEN35_EMBED_TOKENS_NAME, QWEN35_FINAL_NORM_NAME, QWEN35_LM_HEAD_NAME,
 };
-use lattice_model_config::qwen35_config::{LayerType, compute_layer_types};
+use lattice_arch::qwen35_config::{LayerType, compute_layer_types};
 use lattice_weights::q4_weights::q4_f32_to_f16;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -2105,7 +2105,7 @@ fn quantize_index_online_field_round_trips_through_json() {
         .map(|i| {
             format!(
                 "{}.self_attn.o_proj.weight",
-                lattice_model_config::qwen35_tensors::qwen_layer_tensor_prefix(i)
+                lattice_arch::qwen35_tensors::qwen_layer_tensor_prefix(i)
             )
         })
         .collect();
@@ -2145,7 +2145,7 @@ fn quantize_index_v1_online_manifest_is_rejected_at_load_not_silently_accepted()
         .map(|i| {
             format!(
                 "{}.self_attn.o_proj.weight",
-                lattice_model_config::qwen35_tensors::qwen_layer_tensor_prefix(i)
+                lattice_arch::qwen35_tensors::qwen_layer_tensor_prefix(i)
             )
         })
         .collect();

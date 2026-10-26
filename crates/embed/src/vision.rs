@@ -26,6 +26,7 @@
 //! [`VisionEmbeddingModel::new`] directly.
 
 use crate::error::{EmbedError, Result};
+use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_inference::vision::checkpoint::{
     Qwen35VisionWeights, load_qwen35_vision_weights_from_safetensors,
     open_qwen35_single_decoder_safetensors,
@@ -34,7 +35,6 @@ use lattice_inference::vision::qwen35_vit::preprocess_qwen35_image;
 use lattice_inference::vision::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 use lattice_inference::weights::f16_weights::load_f16_weights;
 use lattice_inference_core::InferenceError;
-use lattice_model_config::qwen35_config::Qwen35Config;
 use lattice_tokenizer::bpe::BpeTokenizer;
 use lattice_tokenizer::common::Tokenizer as _;
 use lattice_weights::f16_weights::F16ModelWeights;
