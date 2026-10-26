@@ -168,7 +168,7 @@ impl PerLayerEmbeddings {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn synthetic_safetensors_bytes(tensors: &[(&str, &str, &[usize], &[u8])]) -> Vec<u8> {
     let mut entries = Vec::new();
     let mut payload = Vec::new();
@@ -190,7 +190,7 @@ pub(crate) fn synthetic_safetensors_bytes(tensors: &[(&str, &str, &[usize], &[u8
     out
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn per_layer_embeddings_from_bits(
     rows: usize,
     row_len: usize,

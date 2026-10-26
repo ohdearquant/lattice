@@ -63,21 +63,23 @@ fn metal_generate_plain_excludes_stop_token() {
     let tokenizer = single_char_vocab_tokenizer();
     let (cfg, weights) = tiny_hybrid_fixture();
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: (0..cfg.vocab_size as u32).collect(),
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = (0..cfg.vocab_size as u32).collect();
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let out = state
@@ -103,21 +105,23 @@ fn metal_generate_mtp_excludes_stop_token() {
         "synthetic MTP fixture must populate session.mtp so generate() \
                  actually takes the MTP branch, not silently fall back"
     );
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: (0..cfg.vocab_size as u32).collect(),
-        enable_thinking: false,
-        enable_mtp: Some(true),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = (0..cfg.vocab_size as u32).collect();
+        config.enable_thinking = false;
+        config.enable_mtp = Some(true);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let out = state
@@ -135,21 +139,23 @@ fn metal_generate_self_spec_excludes_stop_token() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: (0..32u32).collect(),
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = (0..32u32).collect();
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let out = with_self_spec_env(|| {
@@ -177,21 +183,23 @@ fn metal_generate_streaming_excludes_stop_token() {
     let tokenizer = single_char_vocab_tokenizer();
     let (cfg, weights) = tiny_hybrid_fixture();
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: (0..cfg.vocab_size as u32).collect(),
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = (0..cfg.vocab_size as u32).collect();
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let mut deltas: Vec<String> = vec![];
@@ -220,21 +228,23 @@ fn metal_generate_streaming_with_prefix_cache_excludes_stop_token() {
     let tokenizer = single_char_vocab_tokenizer();
     let (cfg, weights) = tiny_hybrid_fixture();
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: (0..cfg.vocab_size as u32).collect(),
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = (0..cfg.vocab_size as u32).collect();
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let slot = crate::kv_cache::CrossTurnSlotId::new(1);
@@ -275,21 +285,23 @@ fn metal_generate_multimodal_excludes_stop_token() {
         text_tokens: vec![1u32],
     };
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: (0..cfg.vocab_size as u32).collect(),
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = (0..cfg.vocab_size as u32).collect();
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let out = state
@@ -327,21 +339,23 @@ fn generate_greedy_self_spec_output_token_count_within_budget() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = minimal_bpe_tokenizer();
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 8,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 8;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let out = with_self_spec_env(|| {
@@ -651,22 +665,22 @@ fn embed_tokens_reports_moe_prefill_rejection_without_panicking() {
 /// `assert_moe_prefill_rejected` would see the wrong error variant and fail
 /// rather than pass on the wrong evidence.
 fn moe_rejection_gen_cfg() -> crate::generation::GenerateConfig {
-    crate::generation::GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
-    }
+    let mut config = crate::generation::GenerateConfig::default();
+    config.min_p = 0.0;
+    config.max_new_tokens = 4;
+    config.temperature = 0.0;
+    config.top_k = 1;
+    config.top_p = 1.0;
+    config.repetition_penalty = 1.0;
+    config.seed = Some(42);
+    config.stop_token_ids = vec![];
+    config.enable_thinking = false;
+    config.enable_mtp = Some(false);
+    config.grammar = None;
+    config.stop_strings = vec![];
+    config.reasoning_budget = None;
+    config.logprobs = None;
+    config
 }
 
 /// A vocab with two multibyte (CJK) single-token entries plus the same
@@ -730,21 +744,23 @@ fn metal_generate_plain_honors_stop_string_mid_generation() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let base_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 6,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let base_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 6;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (cfg, weights) = tiny_hybrid_fixture();
@@ -806,21 +822,23 @@ fn metal_generate_streaming_honors_stop_string_and_excludes_stop_text() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let base_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 6,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let base_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 6;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (cfg, weights) = tiny_hybrid_fixture();
@@ -885,21 +903,23 @@ fn metal_generate_plain_honors_multibyte_stop_string() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = multibyte_vocab_tokenizer();
-    let base_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 6,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(7),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let base_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 6;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(7);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (cfg, weights) = tiny_hybrid_fixture();
@@ -963,21 +983,23 @@ fn metal_generate_streaming_honors_stop_string_spanning_token_boundary() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let base_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 8,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let base_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 8;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (cfg, weights) = tiny_hybrid_fixture();
@@ -1055,21 +1077,23 @@ fn metal_generate_plain_runs_to_max_tokens_when_stop_string_absent() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let base_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 6,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let base_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 6;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (cfg, weights) = tiny_hybrid_fixture();
@@ -1147,21 +1171,23 @@ fn metal_generate_streaming_with_prefix_cache_honors_stop_string_and_clears_cach
     use crate::kv_cache::PrefixReuseMode;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let base_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 6,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let base_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 6;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (cfg, weights) = tiny_hybrid_fixture();
@@ -1244,21 +1270,23 @@ fn metal_generate_multimodal_honors_stop_string() {
         text_tokens: vec![1u32],
     };
 
-    let base_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 6,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let base_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 6;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let baseline = {
@@ -1621,21 +1649,23 @@ fn stop_reason_interrupt_on_stream_callback_false() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 8,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 8;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -1691,21 +1721,23 @@ fn stop_reason_interrupt_when_cancelled_before_prefill_starts() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 8,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        logprobs: None,
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 8;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.logprobs = None;
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config
     };
 
     let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -1774,21 +1806,23 @@ fn stop_reason_interrupt_when_should_cancel_alone_stops_mid_decode() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 8,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        logprobs: None,
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 8;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.logprobs = None;
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config
     };
 
     let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -1860,21 +1894,23 @@ fn metal_generate_zero_budget_reports_length() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 0,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 0;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -1932,21 +1968,23 @@ fn metal_generate_plain_rejects_empty_prompt() {
     let tokenizer = single_char_vocab_tokenizer();
     let (cfg, weights) = tiny_hybrid_fixture();
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: true,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = true;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let result = state.generate("", &tokenizer, &gen_cfg);
@@ -1980,21 +2018,23 @@ fn metal_generate_plain_rejects_reasoning_budget_config() {
     let tokenizer = single_char_vocab_tokenizer();
     let (cfg, weights) = tiny_hybrid_fixture();
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: true,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: Some(2),
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = true;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = Some(2);
+        config.logprobs = None;
+        config
     };
 
     let result = state.generate("a", &tokenizer, &gen_cfg);
@@ -2028,21 +2068,23 @@ fn metal_generate_plain_rejects_logprobs_config() {
     let tokenizer = single_char_vocab_tokenizer();
     let (cfg, weights) = tiny_hybrid_fixture();
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: true,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: Some(0),
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = true;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = Some(0);
+        config
     };
 
     let result = state.generate("a", &tokenizer, &gen_cfg);
@@ -2084,21 +2126,23 @@ fn metal_generate_streaming_rejects_empty_prompt() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -2141,21 +2185,23 @@ fn metal_generate_streaming_zero_budget_reports_length() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 0,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 0;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -2207,21 +2253,23 @@ fn streaming_text_accumulates_every_loop_delta_not_only_prefill() {
     use crate::generation::GenerateConfig;
 
     let tokenizer = single_char_vocab_tokenizer();
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 5,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 5;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -2275,21 +2323,23 @@ fn metal_generate_streaming_at_exact_kv_capacity_runs_to_the_token_cap() {
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, CAPACITY).expect("tiny hybrid fixture");
     assert_eq!(state.max_context(), CAPACITY);
-    let gen_cfg = |max_new_tokens| GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = |max_new_tokens| {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = max_new_tokens;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     // The one-character prompt is one token.
@@ -2335,21 +2385,23 @@ fn metal_generate_at_exact_kv_capacity_runs_to_the_token_cap() {
     let (mut cfg, weights) = tiny_hybrid_fixture();
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, CAPACITY).expect("tiny hybrid fixture");
-    let gen_cfg = |max_new_tokens, temperature, top_k| GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens,
-        temperature,
-        top_k,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = |max_new_tokens, temperature, top_k| {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = max_new_tokens;
+        config.temperature = temperature;
+        config.top_k = top_k;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     // Greedy (argmax readback) and sampled (dense readback) requests.
@@ -2395,21 +2447,23 @@ fn metal_generate_greedy_reads_back_one_argmax_id_per_decode_step() {
     cfg.eos_token_id = u32::MAX;
     let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
     state.path_proof_enabled = true;
-    let gen_cfg = |repetition_penalty| GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: MAX_NEW_TOKENS,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = |repetition_penalty| {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = MAX_NEW_TOKENS;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = repetition_penalty;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let full_rows = |state: &mut MetalQwen35State, repetition_penalty| {
@@ -2483,21 +2537,23 @@ fn self_spec_slot0_holds_pre_draft_state_after_round() {
     use crate::speculative::MtpTargetVerifier;
 
     let tokenizer = minimal_bpe_tokenizer();
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(7),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(7);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let mut state = with_self_spec_env(|| {

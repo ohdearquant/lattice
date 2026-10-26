@@ -31,7 +31,7 @@ use std::cell::Cell;
 // Phase-gated counting allocator. Global allocators are per-binary and can
 // only be registered by the final artifact, so this bench defines its own
 // rather than sharing the library-internal tracking module in
-// `src/quant/quarot/forward_equivalence.rs` -- the phase-marker shape below
+// `crates/quant/src/quarot/forward_equivalence.rs` -- the phase-marker shape below
 // follows that module's `pre_admission_allocation_tracking` pattern.
 // ---------------------------------------------------------------------------
 

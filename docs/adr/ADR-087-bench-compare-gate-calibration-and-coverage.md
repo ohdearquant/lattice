@@ -466,12 +466,12 @@ A/A null re-run before the new member gates anything.
   `scripts/lib/bench-compare-impl.sh:413` with no parameter expansion, so widening the embed
   side is a code change and not a configuration change.
 - **`lattice-fann` is a widen case, not a narrow case.** An earlier characterization of fann as
-  code the instrument cannot compile is wrong. `crates/fann/Cargo.toml` declares a bench target
+  code the instrument cannot compile is wrong. `crates/fann/Cargo.toml` declares an example target
   `router_online` with `required-features = ["online-router"]`, and
-  `crates/fann/benches/router_online.rs` imports `lattice_fann::training` and
+  `crates/fann/examples/router_online.rs` imports `lattice_fann::training` and
   `lattice_fann::{Activation, Network, NetworkBuilder}`. The instrument can reach fann. The
   default target set does not include it, and the feature is not on by default. Removing fann
-  from the trigger set would discard a bench that exists.
+  from the trigger set would discard a measurement target that exists.
 - **Narrow the trigger only where no bench target reaches the code at all.** That set is
   established per path by the same derivation used here, not by inspection.
 

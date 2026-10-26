@@ -27,7 +27,9 @@ use super::VisionError;
 use super::checkpoint::Qwen35VisionWeights;
 use super::vit::{batch_matvec, gelu, layer_norm, softmax_inplace};
 use crate::model::qwen35_config::VisionModelConfig;
+#[cfg(feature = "image")]
 use image::ImageReader;
+#[cfg(feature = "image")]
 use std::io::Cursor;
 
 /// Per-channel rescale-then-normalize constants for the real Qwen3.5-0.8B
@@ -37,21 +39,31 @@ use std::io::Cursor;
 /// `preprocessor_config.json` via the differential script referenced above.
 /// NOT the ImageNet statistics `preprocess.rs` uses for the unrelated
 /// ADR-049 7B scaffold.
+#[cfg(feature = "image")]
 const QWEN35_IMAGE_MEAN: f32 = 0.5;
+#[cfg(feature = "image")]
 const QWEN35_IMAGE_STD: f32 = 0.5;
+#[cfg(feature = "image")]
 const MAX_IMAGE_DIMENSION_PIXELS: u32 = 2048;
+#[cfg(feature = "image")]
 const MAX_SERVE_VISION_PATCHES: usize = 256;
+#[cfg(feature = "image")]
 const MAX_SERVE_PREPROCESSED_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(feature = "image")]
 const SERVE_VISION_MAX_PATCHES_ENV: &str = "LATTICE_VISION_MAX_PATCHES";
 /// The embeddings route's budget bounds memory rather than latency: the CPU
 /// tower holds one `patches * patches` f32 score buffer per head, 64 MiB at
 /// this default (a 1024x1024 image with 16 px patches).
+#[cfg(feature = "image")]
 const MAX_SERVE_EMBED_VISION_PATCHES: usize = 4096;
+#[cfg(feature = "image")]
 const MAX_SERVE_EMBED_PREPROCESSED_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(feature = "image")]
 const SERVE_EMBED_VISION_MAX_PATCHES_ENV: &str = "LATTICE_EMBED_VISION_MAX_PATCHES";
 
 /// Limits a serving entry point applies from the image header, before any
 /// pixel data is decoded.
+#[cfg(feature = "image")]
 #[derive(Debug, Clone, Copy)]
 struct ServeImageBudget {
     max_patches: usize,
@@ -64,6 +76,7 @@ struct ServeImageBudget {
 /// isn't a positive integer — unset, empty, malformed, zero, or negative.
 /// Takes the raw value rather than reading the environment itself so tests
 /// can exercise every fallback case without mutating real process state.
+#[cfg(feature = "image")]
 fn resolve_serve_max_patches(raw_override: Option<&str>) -> usize {
     resolve_max_patches(raw_override, MAX_SERVE_VISION_PATCHES)
 }
@@ -71,10 +84,12 @@ fn resolve_serve_max_patches(raw_override: Option<&str>) -> usize {
 /// [`resolve_serve_max_patches`] for the embeddings route's
 /// `LATTICE_EMBED_VISION_MAX_PATCHES` value and its
 /// [`MAX_SERVE_EMBED_VISION_PATCHES`] default.
+#[cfg(feature = "image")]
 fn resolve_serve_embed_max_patches(raw_override: Option<&str>) -> usize {
     resolve_max_patches(raw_override, MAX_SERVE_EMBED_VISION_PATCHES)
 }
 
+#[cfg(feature = "image")]
 fn resolve_max_patches(raw_override: Option<&str>, default: usize) -> usize {
     raw_override
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -112,14 +127,25 @@ impl GridThw {
 ///
 /// # Errors
 ///
-/// [`VisionError::ImageDecode`] if the bytes cannot be decoded.
+/// [`VisionError::ImageDecode`] if the bytes cannot be decoded or the
+/// `image` feature is disabled.
 /// [`VisionError::InvalidConfig`] if the decoded image's dimensions are not
 /// exact multiples of `patch_size * spatial_merge_size`.
 pub fn preprocess_qwen35_image(
     image_bytes: &[u8],
     cfg: &VisionModelConfig,
 ) -> Result<(Vec<f32>, GridThw), VisionError> {
-    preprocess_qwen35_image_inner(image_bytes, cfg, None)
+    #[cfg(feature = "image")]
+    {
+        preprocess_qwen35_image_inner(image_bytes, cfg, None)
+    }
+    #[cfg(not(feature = "image"))]
+    {
+        let _ = (image_bytes, cfg);
+        Err(VisionError::ImageDecode(
+            "image decoding is not compiled in; enable the `image` feature".into(),
+        ))
+    }
 }
 
 /// Decode and preprocess one serving image under a bounded patch budget.
@@ -136,23 +162,33 @@ pub fn preprocess_qwen35_image(
 /// [`VisionError::DimensionsExceeded`] if the declared pixel dimensions,
 /// pre-merge patch grid, or preprocessed buffer size exceed the serving
 /// budgets above. [`VisionError::ImageDecode`] if the bytes are genuinely
-/// malformed (unrecognized format, corrupt data). [`VisionError::InvalidConfig`]
+/// malformed (unrecognized format, corrupt data) or the `image` feature is disabled. [`VisionError::InvalidConfig`]
 /// if the decoded image's dimensions are not exact multiples of
 /// `patch_size * spatial_merge_size` (see [`preprocess_qwen35_image`]).
 pub fn preprocess_qwen35_image_for_serve(
     image_bytes: &[u8],
     cfg: &VisionModelConfig,
 ) -> Result<(Vec<f32>, GridThw), VisionError> {
-    let max_patches =
-        resolve_serve_max_patches(std::env::var(SERVE_VISION_MAX_PATCHES_ENV).ok().as_deref());
-    preprocess_qwen35_image_inner(
-        image_bytes,
-        cfg,
-        Some(ServeImageBudget {
-            max_patches,
-            max_preprocessed_bytes: MAX_SERVE_PREPROCESSED_BYTES,
-        }),
-    )
+    #[cfg(feature = "image")]
+    {
+        let max_patches =
+            resolve_serve_max_patches(std::env::var(SERVE_VISION_MAX_PATCHES_ENV).ok().as_deref());
+        preprocess_qwen35_image_inner(
+            image_bytes,
+            cfg,
+            Some(ServeImageBudget {
+                max_patches,
+                max_preprocessed_bytes: MAX_SERVE_PREPROCESSED_BYTES,
+            }),
+        )
+    }
+    #[cfg(not(feature = "image"))]
+    {
+        let _ = (image_bytes, cfg);
+        Err(VisionError::ImageDecode(
+            "image decoding is not compiled in; enable the `image` feature".into(),
+        ))
+    }
 }
 
 /// Decode and preprocess one image sent to the serving embeddings route.
@@ -169,21 +205,32 @@ pub fn preprocess_qwen35_image_for_embedding_serve(
     image_bytes: &[u8],
     cfg: &VisionModelConfig,
 ) -> Result<(Vec<f32>, GridThw), VisionError> {
-    let max_patches = resolve_serve_embed_max_patches(
-        std::env::var(SERVE_EMBED_VISION_MAX_PATCHES_ENV)
-            .ok()
-            .as_deref(),
-    );
-    preprocess_qwen35_image_inner(
-        image_bytes,
-        cfg,
-        Some(ServeImageBudget {
-            max_patches,
-            max_preprocessed_bytes: MAX_SERVE_EMBED_PREPROCESSED_BYTES,
-        }),
-    )
+    #[cfg(feature = "image")]
+    {
+        let max_patches = resolve_serve_embed_max_patches(
+            std::env::var(SERVE_EMBED_VISION_MAX_PATCHES_ENV)
+                .ok()
+                .as_deref(),
+        );
+        preprocess_qwen35_image_inner(
+            image_bytes,
+            cfg,
+            Some(ServeImageBudget {
+                max_patches,
+                max_preprocessed_bytes: MAX_SERVE_EMBED_PREPROCESSED_BYTES,
+            }),
+        )
+    }
+    #[cfg(not(feature = "image"))]
+    {
+        let _ = (image_bytes, cfg);
+        Err(VisionError::ImageDecode(
+            "image decoding is not compiled in; enable the `image` feature".into(),
+        ))
+    }
 }
 
+#[cfg(feature = "image")]
 fn preprocess_qwen35_image_inner(
     image_bytes: &[u8],
     cfg: &VisionModelConfig,
@@ -332,6 +379,7 @@ fn preprocess_qwen35_image_inner(
     Ok((out, grid))
 }
 
+#[cfg(feature = "image")]
 fn preprocessed_f32_len(num_patches: usize, cfg: &VisionModelConfig) -> Result<usize, VisionError> {
     cfg.in_channels
         .checked_mul(cfg.temporal_patch_size)

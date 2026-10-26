@@ -136,8 +136,8 @@ Defined in `apps/macos/scripts/package-app.sh`:
 
 | Binary            | Crate             | Features                     | Used For                                           |
 | ----------------- | ----------------- | ---------------------------- | -------------------------------------------------- |
-| `quantize_q4`     | lattice-inference | (none)                       | Q4 quantize                                        |
-| `quantize_quarot` | lattice-inference | (none)                       | QuaRot quantize                                    |
+| `quantize_q4`     | lattice-serve     | (none)                       | Q4 quantize                                        |
+| `quantize_quarot` | lattice-serve     | (none)                       | QuaRot quantize                                    |
 | `lattice`         | lattice-inference | (none)                       | main inference binary                              |
 | `qwen35_generate` | lattice-inference | (none)                       | Qwen3.5 generation                                 |
 | `train_grad_full` | lattice-tune      | `train-backward`             | LoRA fine-tune                                     |
@@ -257,8 +257,8 @@ the UI leaves the seed unset. Direct `quantize_quarot` callers must choose and p
 │                                                  │
 │  train_grad_full   (lattice-tune +train-backward)│
 │  generate_lora     (lattice-tune +safetensors)   │
-│  quantize_q4       (lattice-inference)           │
-│  quantize_quarot   (lattice-inference)           │
+│  quantize_q4       (lattice-serve)               │
+│  quantize_quarot   (lattice-serve)               │
 │  lattice           (lattice-inference)           │
 │  qwen35_generate   (lattice-inference)           │
 │  eval_perplexity   (lattice-inference +Metal)    │
@@ -412,7 +412,7 @@ probes or leave as nil until measured). In Swift, the HumanLineParser stays as f
 older binaries. Immediate benefit: `QuantDone.est_ppl_delta` becomes populated; parser is
 no longer regex-fragile; protocol is consistent across all 4 event-emitting bins.
 
-Files: `crates/inference/src/bin/quantize_q4.rs`, `quantize_quarot.rs`, `LatticeEvents.swift`
+Files: `crates/serve/src/bin/quantize_q4.rs`, `quantize_quarot.rs`, `LatticeEvents.swift`
 (minimal change — struct already has the field).
 
 ### P1 — Adapter metadata from config (0.5 day, Swift only)

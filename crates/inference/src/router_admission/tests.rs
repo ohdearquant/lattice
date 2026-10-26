@@ -1,17 +1,17 @@
 use super::*;
 use crate::mixture::Exploration;
+use crate::router_refit::test_router::LiveRouter;
 use crate::router_refit::{RefitBuilder, RefitConfig, RefitVerdict};
 use crate::router_state::{
     RouterArtifact, RouterLineage, RouterPolicy, RouterProvenance, TrainedRepresentation,
 };
-use crate::serve::routing::ServingRouter;
 use lattice_fann::training::RlooConfig;
 use lattice_fann::{Activation, Layer, Network};
 
 const REFERENCE_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 struct Fixture {
-    live: ServingRouter,
+    live: LiveRouter,
     source: RefitSource,
     candidate: RefitCandidate,
     builder: RefitBuilder,
@@ -141,7 +141,7 @@ fn fixture_with(
     maximum: u32,
     epsilon: f64,
 ) -> Fixture {
-    let live = ServingRouter::new(artifact(floor, maximum, epsilon), true).unwrap();
+    let live = LiveRouter::new(artifact(floor, maximum, epsilon));
     let source = live.refit_source().unwrap();
     let mut episodes = EpisodeStore::new(64);
     for (index, id) in ids(&contract, Population::Training, 4).iter().enumerate() {
@@ -511,10 +511,7 @@ fn mismatched_source_and_reference_bindings_are_rejected() {
     let evidence = reference(&fixture, 8, [2.0, 2.0, 2.0]);
     let mut different = artifact(0.0, 1, 0.0);
     different.version += 1;
-    let other_source = ServingRouter::new(different, true)
-        .unwrap()
-        .refit_source()
-        .unwrap();
+    let other_source = LiveRouter::new(different).refit_source().unwrap();
     assert!(
         AdmissionEvaluator::new(&other_source, &fixture.contract, bounds())
             .unwrap()
@@ -839,4 +836,221 @@ fn explicit_evaluation_budget_refuses_without_advancing_history() {
         Err(AdmissionError::EvaluationBudgetExhausted)
     ));
     assert_eq!(evaluator.consecutive_collapsed_rounds(), 1);
+}
+
+#[cfg(all(
+    feature = "serving-support",
+    feature = "f16",
+    target_os = "macos",
+    feature = "metal-gpu"
+))]
+mod reference_embedder_contract {
+    use super::*;
+    use crate::forward::metal_qwen35::{
+        ChatMessage, MetalQwen35State, format_chat_template, reference_scoring_fixture,
+    };
+    use crate::measurement::gpu_test_lock;
+    use crate::tokenizer::bpe::BpeTokenizer;
+    use std::cell::Cell;
+
+    const REPRESENTATION_REFUSAL: &str =
+        "embedder representation differs from registered serving representation";
+
+    struct RecordingEmbedder {
+        identity: String,
+        loader_format: String,
+        prompt_source: String,
+        dimensions: usize,
+        pooling_name: String,
+        pooling_calls: Cell<usize>,
+        embed_calls: Cell<usize>,
+    }
+
+    impl RecordingEmbedder {
+        fn new(source: &RefitSource) -> Self {
+            let representation = source.representation();
+            Self {
+                identity: representation.embedding_model.clone(),
+                loader_format: representation.loader_format.clone(),
+                prompt_source: representation.prompt_source.clone(),
+                dimensions: usize::try_from(representation.input_width).unwrap(),
+                pooling_name: representation.pooling.clone(),
+                pooling_calls: Cell::new(0),
+                embed_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl ReferenceEmbedder for RecordingEmbedder {
+        type Pooling = ();
+
+        fn identity(&self) -> &str {
+            &self.identity
+        }
+
+        fn loader_format(&self) -> &str {
+            &self.loader_format
+        }
+
+        fn prompt_source(&self) -> &str {
+            &self.prompt_source
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        fn max_context(&self) -> usize {
+            128
+        }
+
+        fn parse_pooling(&self, name: &str) -> Result<Self::Pooling, String> {
+            self.pooling_calls.set(self.pooling_calls.get() + 1);
+            if name != self.pooling_name {
+                Err(format!("recording embedder refuses pooling name: {name}"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn embed(&self, _text: &str, _pooling: &Self::Pooling) -> Result<Vec<f32>, String> {
+            self.embed_calls.set(self.embed_calls.get() + 1);
+            Err("unexpected embedding before refusal".into())
+        }
+    }
+
+    fn score_contract(
+        fixture: &Fixture,
+        state: &mut MetalQwen35State,
+        embedder: &RecordingEmbedder,
+    ) -> Result<ReferenceEvidence, ReferenceError> {
+        assert!(!state.has_lora_adapter());
+        assert!(fixture.candidate.matches_source(&fixture.source));
+        let contract_hash = fixture.contract.hash().unwrap();
+        assert_eq!(
+            fixture.candidate.admission_contract_hash(),
+            Some(contract_hash.as_str())
+        );
+        let tokenizer_json = serde_json::json!({
+            "model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": []},
+            "added_tokens": [{"id": 2, "content": "x".repeat(128), "special": true}]
+        });
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(&tokenizer_json.to_string()).unwrap();
+        let examples = [ReferenceExample {
+            user_prompt: "a".into(),
+            completion: "b".into(),
+        }];
+        let bounds = ReferenceBounds {
+            max_examples: 1,
+            max_tokens: 16,
+        };
+        assert!(examples[0].user_prompt.len() + 2 <= embedder.max_context());
+        let rendered = format_chat_template(&[ChatMessage::user(&examples[0].user_prompt)]);
+        let span = lattice_tokenizer::__internal::max_token_byte_span(&tokenizer);
+        assert_eq!(span, 128);
+        let token_bound = (rendered.len() + examples[0].completion.len()).div_ceil(span);
+        assert!(token_bound <= state.max_context());
+        assert!(token_bound <= bounds.max_tokens);
+        score_metal_reference(
+            &fixture.source,
+            &fixture.candidate,
+            &fixture.contract,
+            &examples,
+            bounds,
+            state,
+            &tokenizer,
+            embedder,
+            &[],
+            fixture.source.base_model(),
+        )
+    }
+
+    fn assert_refusal(
+        result: Result<ReferenceEvidence, ReferenceError>,
+        embedder: &RecordingEmbedder,
+        expected: &str,
+        pooling_calls: usize,
+    ) {
+        assert_eq!(
+            embedder.embed_calls.get(),
+            0,
+            "refusal must precede embedding"
+        );
+        match result {
+            Err(ReferenceError::Invalid(message)) => assert_eq!(message, expected),
+            _ => panic!("expected the specific Invalid refusal"),
+        }
+        assert_eq!(embedder.pooling_calls.get(), pooling_calls);
+    }
+
+    #[test]
+    fn reference_embedder_identity_mismatch_before_embedding() {
+        let _gpu = gpu_test_lock();
+        let (cfg, weights) = reference_scoring_fixture();
+        let mut state = MetalQwen35State::new(&weights, &cfg, 8)
+            .expect("representation witness requires a real Metal device");
+        let fixture = fixture();
+        let mut embedder = RecordingEmbedder::new(&fixture.source);
+        embedder.identity.push_str("-different");
+        let result = score_contract(&fixture, &mut state, &embedder);
+        assert_refusal(result, &embedder, REPRESENTATION_REFUSAL, 0);
+    }
+
+    #[test]
+    fn reference_embedder_loader_mismatch_before_embedding() {
+        let _gpu = gpu_test_lock();
+        let (cfg, weights) = reference_scoring_fixture();
+        let mut state = MetalQwen35State::new(&weights, &cfg, 8)
+            .expect("representation witness requires a real Metal device");
+        let fixture = fixture();
+        let mut embedder = RecordingEmbedder::new(&fixture.source);
+        embedder.loader_format.push_str("-different");
+        let result = score_contract(&fixture, &mut state, &embedder);
+        assert_refusal(result, &embedder, REPRESENTATION_REFUSAL, 0);
+    }
+
+    #[test]
+    fn reference_embedder_prompt_source_mismatch_before_embedding() {
+        let _gpu = gpu_test_lock();
+        let (cfg, weights) = reference_scoring_fixture();
+        let mut state = MetalQwen35State::new(&weights, &cfg, 8)
+            .expect("representation witness requires a real Metal device");
+        let fixture = fixture();
+        let mut embedder = RecordingEmbedder::new(&fixture.source);
+        embedder.prompt_source.push_str("-different");
+        let result = score_contract(&fixture, &mut state, &embedder);
+        assert_refusal(result, &embedder, REPRESENTATION_REFUSAL, 0);
+    }
+
+    #[test]
+    fn reference_embedder_width_mismatch_before_embedding() {
+        let _gpu = gpu_test_lock();
+        let (cfg, weights) = reference_scoring_fixture();
+        let mut state = MetalQwen35State::new(&weights, &cfg, 8)
+            .expect("representation witness requires a real Metal device");
+        let fixture = fixture();
+        let mut embedder = RecordingEmbedder::new(&fixture.source);
+        embedder.dimensions += 1;
+        let result = score_contract(&fixture, &mut state, &embedder);
+        assert_refusal(result, &embedder, REPRESENTATION_REFUSAL, 0);
+    }
+
+    #[test]
+    fn reference_embedder_invalid_pooling_before_embedding() {
+        let _gpu = gpu_test_lock();
+        let (cfg, weights) = reference_scoring_fixture();
+        let mut state = MetalQwen35State::new(&weights, &cfg, 8)
+            .expect("representation witness requires a real Metal device");
+        let fixture = fixture();
+        let mut embedder = RecordingEmbedder::new(&fixture.source);
+        assert_eq!(fixture.source.representation().pooling, "mean");
+        embedder.pooling_name = "mean_visual".into();
+        let result = score_contract(&fixture, &mut state, &embedder);
+        assert_refusal(
+            result,
+            &embedder,
+            "recording embedder refuses pooling name: mean",
+            1,
+        );
+    }
 }

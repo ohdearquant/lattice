@@ -31,21 +31,23 @@ fn generate_with_lora_mixture_rejects_empty_inner_slice_without_unloading() {
         "precondition: an adapter must be loaded before the rejected call"
     );
 
-    let gen_cfg = GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens: 4,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: (0..cfg.vocab_size as u32).collect(),
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = 4;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(42);
+        config.stop_token_ids = (0..cfg.vocab_size as u32).collect();
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = None;
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     };
 
     let empty: &[LoraLayerData] = &[];
@@ -278,9 +280,8 @@ fn load_lora_adapter_none_seed_resolves_to_base_seed_not_no_rotation() {
     let mut direct = [layer()];
     {
         use crate::quant::quarot::lora::{LoraLayerMut, rotate_adapter_for_quarot};
-        use crate::quant::quarot::plan::RotationPlan;
 
-        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+        let plan = crate::quant::quarot::plan::qwen35_residual_stream_linear_layers();
         let lora_muts: Vec<LoraLayerMut<'_>> = direct
             .iter_mut()
             .map(|l| LoraLayerMut {

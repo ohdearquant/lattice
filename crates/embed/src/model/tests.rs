@@ -187,7 +187,7 @@ fn test_max_input_tokens() {
 #[cfg(feature = "native")]
 #[test]
 fn test_qwen3_max_input_tokens_matches_loaded_tokenizer_limit() {
-    use lattice_inference::load_tokenizer;
+    use lattice_tokenizer::load_tokenizer;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let write = |name: &str, body: &str| {
@@ -266,7 +266,7 @@ fn test_from_str_invalid() {
 #[cfg(feature = "native")]
 #[test]
 fn test_bge_models_use_cls_pooling() {
-    use lattice_inference::BertPooling;
+    use lattice_compute::pool::BertPooling;
 
     assert_eq!(
         EmbeddingModel::BgeSmallEnV15.bert_pooling(),
@@ -289,7 +289,7 @@ fn test_bge_models_use_cls_pooling() {
 #[cfg(feature = "native")]
 #[test]
 fn test_e5_models_use_mean_pooling() {
-    use lattice_inference::BertPooling;
+    use lattice_compute::pool::BertPooling;
 
     assert_eq!(
         EmbeddingModel::MultilingualE5Small.bert_pooling(),
@@ -307,7 +307,7 @@ fn test_e5_models_use_mean_pooling() {
 #[cfg(feature = "native")]
 #[test]
 fn test_minilm_models_use_mean_pooling() {
-    use lattice_inference::BertPooling;
+    use lattice_compute::pool::BertPooling;
 
     assert_eq!(
         EmbeddingModel::AllMiniLmL6V2.bert_pooling(),
@@ -353,19 +353,19 @@ fn test_bge_and_e5_use_different_pooling() {
     );
 }
 
-/// Guards `lattice_inference::pool::default_bert_pooling_for_model_name`
+/// Guards `lattice_compute::pool::default_bert_pooling_for_model_name`
 /// (the served-directory-name lookup `lattice_serve` uses) against
 /// drifting from `EmbeddingModel::bert_pooling` (this table). The
 /// expectation comes from calling `bert_pooling()` itself, never from
 /// retyping its rule, so a wrong mirror cannot agree with a wrong
 /// expectation.
 ///
-/// This lives in `lattice-embed`, not `lattice-inference`, so both sides
+/// This lives in `lattice-embed`, not `lattice-compute`, so both sides
 /// of the comparison are the same compiled unit: `lattice-embed` already
-/// depends on `lattice-inference` (this crate's own `[dependencies]`,
+/// depends on `lattice-compute` (this crate's own `[dependencies]`,
 /// gated by the `native` feature), so `EmbeddingModel::bert_pooling()`'s
 /// return type and `default_bert_pooling_for_model_name`'s return type
-/// are literally the same `lattice_inference::BertPooling`, comparable
+/// are literally the same `lattice_compute::pool::BertPooling`, comparable
 /// with `==` directly -- no `format!("{:?}")` string workaround needed.
 ///
 /// Enumeration: `EmbeddingModel` has no `EnumIter`/`VariantArray`/
@@ -384,7 +384,7 @@ fn test_bge_and_e5_use_different_pooling() {
 #[cfg(feature = "native")]
 #[test]
 fn default_bert_pooling_for_model_name_matches_embedding_model_bert_pooling_table() {
-    use lattice_inference::pool::default_bert_pooling_for_model_name;
+    use lattice_compute::pool::default_bert_pooling_for_model_name;
 
     fn assert_variants_exhaustively_covered(m: &EmbeddingModel) {
         match m {

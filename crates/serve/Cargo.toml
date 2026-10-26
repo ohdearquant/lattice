@@ -1,0 +1,140 @@
+[package]
+name = "lattice-serve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenAI-compatible HTTP serving and the lattice CLI, built on lattice-inference"
+keywords = ["inference", "llm", "openai", "server", "cli"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+
+[features]
+default = ["download"]
+download = ["lattice-inference/download"]
+f16 = ["lattice-inference/f16"]
+metal-gpu = ["lattice-inference/metal-gpu", "dep:lattice-fann", "dep:metal"]
+mixture = ["lattice-inference/mixture", "dep:lattice-fann"]
+router-learning = ["mixture", "lattice-inference/router-learning"]
+test-utils = ["lattice-inference/test-utils"]
+bench-internals = ["lattice-inference/bench-internals"]
+
+[dependencies]
+# Exact version: `serving-support` is an unsupported interface that changes
+# with the facade, so the two crates release together (ADR-103 Amendment 4).
+lattice-inference = { version = "=0.15.0", path = "../inference", default-features = false, features = ["std", "serving-support", "image"] }
+lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
+lattice-weights = { version = "0.15.0", path = "../weights" }
+lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+rayon = { workspace = true }
+indexmap = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+clap = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+mime = { workspace = true }
+# Distinguishes a request-body length-limit rejection (`LengthLimitError`)
+# from any other body-buffering failure in the `serve` HTTP handlers.
+# Already an axum 0.8 transitive dependency at the same version; this makes
+# it a direct dependency so production handler code can downcast against it.
+http-body-util = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+metal = { version = "0.33", optional = true }
+
+[dev-dependencies]
+lattice-inference = { version = "=0.15.0", path = "../inference", default-features = false, features = ["std", "serving-support", "image", "test-utils"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+# HTTP client for the end-to-end tests and the HTTP serving bench example.
+ureq = "3"
+
+[[bin]]
+name = "lattice"
+path = "src/bin/lattice/main.rs"
+
+[[bin]]
+name = "lattice_serve"
+path = "src/bin/lattice_serve/main.rs"
+required-features = ["f16", "metal-gpu"]
+
+[[bin]]
+name = "quantize_q4"
+path = "src/bin/quantize_q4.rs"
+
+[[bin]]
+name = "quantize_quarot"
+path = "src/bin/quantize_quarot.rs"
+
+[[bin]]
+name = "moe_admission_sim"
+path = "src/bin/moe_admission_sim.rs"
+
+[[test]]
+name = "vision_serve_e2e_test"
+required-features = ["download", "f16", "metal-gpu"]
+
+[[test]]
+name = "serve_lora_e2e_test"
+required-features = ["download", "f16", "metal-gpu"]
+
+# ADR-090 R09: spawns the standalone `lattice_serve` binary, which is built only
+# under these features.
+[[test]]
+name = "serve_standalone_route"
+required-features = ["f16", "metal-gpu"]
+
+[[test]]
+name = "serve_startup_golden"
+required-features = ["f16", "metal-gpu"]
+
+# Request, prompt and answer layer for the system-one wire format (no model, no
+# route); runs under the default features. Its checkpoint-tokenizer tests
+# skip with a printed reason when `LATTICE_DECIDER_DIR` is unset, and
+# `LATTICE_DECIDER_GATE_ENFORCE=1` turns that skip into a failure.
+[[test]]
+name = "systemone_decider_0_8b"
+
+# The serving checkpoint targets stay out of `cargo test`'s default target set
+# and run only when selected with `--test <name>`. Set
+# `LATTICE_SERVE_CHARACTERIZATION_GATE_ENFORCE=1` to fail when a checkpoint is
+# missing. The path variables are `LATTICE_SERVE_STANDALONE_QWEN_DIR`,
+# `LATTICE_SERVE_STANDALONE_GEMMA_DIR`, and
+# `LATTICE_SERVE_CHARACTERIZATION_QWEN_Q4_DIR`. Their default checkpoint names
+# are `qwen3.5-0.8b`, `gemma-4-e2b-it`, and `qwen3.5-0.8b-q4`, respectively.
+[[test]]
+name = "serve_request_refusals"
+test = false
+required-features = ["f16", "metal-gpu"]
+
+[[test]]
+name = "serve_worker_live"
+test = false
+required-features = ["f16", "metal-gpu"]
+
+# These targets load real checkpoints, which take minutes each on the CPU.
+[[test]]
+name = "serve_cpu_isolation"
+test = false
+
+# The Metal routes additionally need f16, metal-gpu and bench-internals;
+# without them those routes print SKIP and exit non-zero.
+[[example]]
+name = "bench_serve_prepare"
+
+# HTTP-level serving measurement: spawns the built `lattice` binary. `test = true`
+# runs its model-free refusal controls under a plain `cargo test`.
+[[example]]
+name = "bench_serve_http"
+required-features = ["download"]
+test = true

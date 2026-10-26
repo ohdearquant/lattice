@@ -2,7 +2,7 @@
 """Render a fixed chat-message matrix through the Gemma 4 E2B chat template.
 
 Differential fixture for the Gemma prompt adapter in
-`crates/inference/src/serve/prompt_adapter.rs`. The expected prompt strings
+`crates/serve/src/serve/prompt_adapter.rs`. The expected prompt strings
 are produced here, by the checkpoint's own `chat_template.jinja` under the
 same Jinja environment Hugging Face `transformers` uses for
 `apply_chat_template` (`ImmutableSandboxedEnvironment(trim_blocks=True,

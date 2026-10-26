@@ -2,18 +2,14 @@ use super::*;
 
 #[test]
 fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packages = scanned_packages();
     let mut actual = BTreeSet::new();
     let reviewed = TARGETS_WITH_RECOGNIZED_METAL_MARKERS
         .iter()
-        .filter(|path| path.starts_with("benches/"))
-        .map(|path| (*path).to_string())
+        .filter(|(_, path)| path.starts_with("benches/"))
+        .map(|(package, path)| package_path_key(package, path))
         .collect::<BTreeSet<_>>();
-    let covered = BENCH_HARNESSES
-        .iter()
-        .map(|contract| contract.path)
-        .map(str::to_string)
-        .collect();
+    let covered = BENCH_HARNESSES.iter().map(BenchHarness::key).collect();
     validate_bench_harness_inventory(&reviewed, &covered)
         .unwrap_or_else(|reason| panic!("{reason}"));
     assert!(
@@ -25,7 +21,7 @@ fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint(
     assert_eq!(
         BENCH_HARNESSES
             .iter()
-            .map(|contract| contract.path)
+            .map(BenchHarness::key)
             .collect::<BTreeSet<_>>()
             .len(),
         BENCH_HARNESSES.len(),
@@ -34,60 +30,64 @@ fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint(
     let mut state_actual = BTreeSet::new();
     let mut violations = Vec::new();
 
-    for path in cargo_target_roots(manifest_dir, &["bench", "example", "bin"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        let sources = parsed_module_closure(manifest_dir, &path, false)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-        if let Some(contract) = BENCH_HARNESSES
-            .iter()
-            .find(|contract| contract.path == relative)
+    for package in &packages {
+        for path in package
+            .target_roots(&["bench", "example", "bin"])
+            .unwrap_or_else(|reason| panic!("{reason}"))
         {
-            state_actual.insert(relative.clone());
-            if let Err(reason) = validate_bench_harness_sources(&sources, contract) {
-                violations.push(format!("{relative}: {reason}"));
+            let local = package
+                .relative(&path)
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            let relative = package.key(&local);
+            let sources = parsed_package_module_closure(package, &path, false)
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            if let Some(contract) = BENCH_HARNESSES
+                .iter()
+                .find(|contract| contract.package == package.identity && contract.path == local)
+            {
+                state_actual.insert(relative.clone());
+                if let Err(reason) = validate_bench_harness_sources(&sources, contract) {
+                    violations.push(format!("{relative}: {reason}"));
+                }
             }
-        }
-        let mut has_raw_gpu_work = false;
-        for source in &sources {
-            for selector in RAW_GPU_SELECTORS {
-                has_raw_gpu_work |= source
-                    .parsed
-                    .has_selector(*selector)
-                    .unwrap_or_else(|reason| panic!("{reason}"));
+            let mut has_raw_gpu_work = false;
+            for source in &sources {
+                for selector in RAW_GPU_SELECTORS {
+                    has_raw_gpu_work |= source
+                        .parsed
+                        .has_selector(*selector)
+                        .unwrap_or_else(|reason| panic!("{reason}"));
+                }
             }
-        }
-        if !has_raw_gpu_work {
-            continue;
-        }
-        actual.insert(relative.clone());
+            if !has_raw_gpu_work {
+                continue;
+            }
+            actual.insert(relative.clone());
 
-        let protected_entrypoint = RAW_HARNESS_ENTRYPOINTS
-            .iter()
-            .find_map(|(path, marker)| (*path == relative).then_some(*marker))
-            .unwrap_or_else(|| panic!("raw Metal harness {relative} is not classified"));
-        let root = sources
-            .iter()
-            .find(|source| source.relative == relative)
-            .unwrap_or_else(|| panic!("target root {relative} was not parsed"));
-        root.parsed
-            .validate_selector(
-                0..root.parsed.tokens.len(),
-                protected_entrypoint,
-                SHARED_LOCK_SELECTOR,
-                GuardRequirement::Lexical,
-            )
-            .unwrap_or_else(|reason| panic!("{reason}"));
+            let protected_entrypoint = RAW_HARNESS_ENTRYPOINTS
+                .iter()
+                .find_map(|(owner, path, marker)| {
+                    (*owner == package.identity && *path == local).then_some(*marker)
+                })
+                .unwrap_or_else(|| panic!("raw Metal harness {relative} is not classified"));
+            let root = sources
+                .iter()
+                .find(|source| source.key() == relative)
+                .unwrap_or_else(|| panic!("target root {relative} was not parsed"));
+            root.parsed
+                .validate_selector(
+                    0..root.parsed.tokens.len(),
+                    protected_entrypoint,
+                    SHARED_LOCK_SELECTOR,
+                    GuardRequirement::Lexical,
+                )
+                .unwrap_or_else(|reason| panic!("{reason}"));
+        }
     }
 
     let expected = RAW_HARNESS_ENTRYPOINTS
         .iter()
-        .map(|(path, _)| (*path).to_string())
+        .map(|(package, path, _)| package_path_key(package, path))
         .collect::<BTreeSet<_>>();
     assert_eq!(
         actual, expected,
@@ -95,10 +95,7 @@ fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint(
     );
     assert_eq!(
         state_actual,
-        BENCH_HARNESSES
-            .iter()
-            .map(|contract| contract.path.to_string())
-            .collect(),
+        BENCH_HARNESSES.iter().map(BenchHarness::key).collect(),
         "state harness ownership records must name current Cargo targets"
     );
     assert!(
@@ -109,6 +106,7 @@ fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint(
 }
 
 const STATE_HARNESS_FIXTURE: BenchHarness = BenchHarness {
+    package: ".",
     path: "fixtures/state_harness.rs",
     registered: &["bench_locked"],
     calls: &[
@@ -235,6 +233,7 @@ fn state_harness_rejects_guard_decoys_and_nested_reacquisition() {
 #[test]
 fn state_harness_accepts_completed_results_but_rejects_setup_scope_escape() {
     let contract = BenchHarness {
+        package: ".",
         path: "fixtures/complete_operation.rs",
         registered: &["run"],
         calls: &[],
@@ -300,6 +299,7 @@ fn state_harness_inventory_rejects_omitted_stale_and_new_paths() {
 }
 
 const MULTI_ARM_HARNESS_FIXTURE: BenchHarness = BenchHarness {
+    package: ".",
     path: "fixtures/whole_target_list.rs",
     registered: &["bench_locked"],
     calls: &[
@@ -472,33 +472,36 @@ fn benchmark_arm_arguments_cannot_hide_control_flow_or_replace_parameters() {
 /// protected identifiers appear only after macro expansion or name resolution.
 #[test]
 fn cargo_target_lexical_metal_marker_inventory_is_explicit() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packages = scanned_packages();
     let mut discovered = BTreeSet::new();
     let mut all_targets = BTreeSet::new();
-    for path in cargo_target_roots(manifest_dir, &["bench", "example", "bin"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        all_targets.insert(relative.clone());
-        let sources = parsed_module_closure(manifest_dir, &path, false)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-        if sources.iter().any(|source| {
-            source
-                .parsed
-                .has_top_level_metal_marker()
-                .unwrap_or_else(|reason| panic!("{reason}"))
-        }) {
-            discovered.insert(relative);
+    for package in &packages {
+        for path in package
+            .target_roots(&["bench", "example", "bin"])
+            .unwrap_or_else(|reason| panic!("{reason}"))
+        {
+            let relative = package.key(
+                &package
+                    .relative(&path)
+                    .unwrap_or_else(|reason| panic!("{reason}")),
+            );
+            all_targets.insert(relative.clone());
+            let sources = parsed_package_module_closure(package, &path, false)
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            if sources.iter().any(|source| {
+                source
+                    .parsed
+                    .has_top_level_metal_marker()
+                    .unwrap_or_else(|reason| panic!("{reason}"))
+            }) {
+                discovered.insert(relative);
+            }
         }
     }
 
     let reviewed = TARGETS_WITH_RECOGNIZED_METAL_MARKERS
         .iter()
-        .map(|path| (*path).to_string())
+        .map(|(package, path)| package_path_key(package, path))
         .collect::<BTreeSet<_>>();
     assert_eq!(
         discovered, reviewed,
@@ -507,7 +510,7 @@ fn cargo_target_lexical_metal_marker_inventory_is_explicit() {
     );
     let reviewed_non_metal = TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS
         .iter()
-        .map(|path| (*path).to_string())
+        .map(|(package, path)| package_path_key(package, path))
         .collect::<BTreeSet<_>>();
     assert!(
         reviewed.is_disjoint(&reviewed_non_metal),
@@ -526,11 +529,13 @@ fn cargo_target_lexical_metal_marker_inventory_is_explicit() {
 
 #[test]
 fn alternate_and_helper_mediated_entrypoints_hold_the_shared_lock() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for (relative, entrypoint) in ADDITIONAL_GUARDED_ENTRYPOINTS {
-        let source = std::fs::read_to_string(manifest_dir.join(relative))
-            .expect("read guarded Metal entrypoint");
-        let parsed = StructuredSource::parse(relative, &source, false)
+    let packages = scanned_packages();
+    for (owner, relative, entrypoint) in ADDITIONAL_GUARDED_ENTRYPOINTS {
+        let package = measurement_lock_helpers::require_package(&packages, owner);
+        let key = package.key(relative);
+        let source = std::fs::read_to_string(package.manifest_dir.join(relative))
+            .unwrap_or_else(|reason| panic!("{key}: {reason}"));
+        let parsed = StructuredSource::parse(&key, &source, false)
             .unwrap_or_else(|reason| panic!("{reason}"));
         parsed
             .validate_selector(
@@ -552,15 +557,15 @@ fn alternate_and_helper_mediated_entrypoints_hold_the_shared_lock() {
 /// list, asserted equal to the lexical scan below.
 #[test]
 fn state_driven_metal_measurement_targets_use_live_lock_bindings() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packages = scanned_packages();
     let already_owned = RAW_HARNESS_ENTRYPOINTS
         .iter()
         .chain(ADDITIONAL_GUARDED_ENTRYPOINTS)
-        .map(|(path, _)| (*path).to_string())
+        .map(|(package, path, _)| package_path_key(package, path))
         .collect::<BTreeSet<_>>();
     let expected = TARGETS_WITH_STATE_DRIVEN_WORK
         .iter()
-        .map(|path| (*path).to_string())
+        .map(|(package, path)| package_path_key(package, path))
         .collect::<BTreeSet<_>>();
     assert!(
         expected.is_disjoint(&already_owned),
@@ -575,91 +580,93 @@ fn state_driven_metal_measurement_targets_use_live_lock_bindings() {
 
     let mut actual = BTreeSet::new();
     let mut violations = Vec::new();
-    for path in cargo_target_roots(manifest_dir, &["example", "bin"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        if already_owned.contains(&relative) {
-            continue;
-        }
-        let sources = parsed_module_closure(manifest_dir, &path, false)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-
-        let mut has_state_work = false;
-        for source in &sources {
-            for selector in STATE_WORK_SELECTORS {
-                has_state_work |= source
-                    .parsed
-                    .has_selector(*selector)
-                    .unwrap_or_else(|reason| panic!("{reason}"));
+    for package in &packages {
+        for path in package
+            .target_roots(&["example", "bin"])
+            .unwrap_or_else(|reason| panic!("{reason}"))
+        {
+            let local = package
+                .relative(&path)
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            let relative = package.key(&local);
+            if already_owned.contains(&relative) {
+                continue;
             }
-        }
-        if !has_state_work {
-            continue;
-        }
-        actual.insert(relative.clone());
+            let sources = parsed_package_module_closure(package, &path, false)
+                .unwrap_or_else(|reason| panic!("{reason}"));
 
-        let helper_names = STATE_WORK_HELPER_ENTRYPOINTS
-            .iter()
-            .filter(|(path, _)| *path == relative)
-            .map(|(_, selector)| *selector)
-            .collect::<Vec<_>>();
-
-        for source in &sources {
-            let all_sites = STATE_WORK_SELECTORS
-                .iter()
-                .flat_map(|selector| {
-                    source
+            let mut has_state_work = false;
+            for source in &sources {
+                for selector in STATE_WORK_SELECTORS {
+                    has_state_work |= source
                         .parsed
-                        .call_sites(0..source.parsed.tokens.len(), *selector, true)
-                        .unwrap_or_else(|reason| panic!("{reason}"))
-                })
-                .collect::<Vec<_>>();
-
-            let mut direct_sites = Vec::new();
-            let mut mediating_helpers = BTreeSet::new();
-            for site in all_sites {
-                let owner = source.parsed.enclosing_function_path(site);
-                match helper_names
-                    .iter()
-                    .find(|selector| selector.final_name() == owner)
-                {
-                    Some(_) => {
-                        mediating_helpers.insert(owner);
-                    }
-                    None => direct_sites.push(site),
+                        .has_selector(*selector)
+                        .unwrap_or_else(|reason| panic!("{reason}"));
                 }
             }
-
-            if !direct_sites.is_empty()
-                && let Err(reason) = source.parsed.validate_work_sites(
-                    &direct_sites,
-                    SHARED_LOCK_SELECTOR,
-                    GuardRequirement::Lexical,
-                )
-            {
-                violations.push(format!("{relative} ({}): {reason}", source.relative));
+            if !has_state_work {
+                continue;
             }
-            for helper_name in mediating_helpers {
-                let selector = *helper_names
+            actual.insert(relative.clone());
+
+            let helper_names = STATE_WORK_HELPER_ENTRYPOINTS
+                .iter()
+                .filter(|(owner, path, _)| *owner == package.identity && *path == local)
+                .map(|(_, _, selector)| *selector)
+                .collect::<Vec<_>>();
+
+            for source in &sources {
+                let all_sites = STATE_WORK_SELECTORS
                     .iter()
-                    .find(|selector| selector.final_name() == helper_name)
-                    .expect("helper name resolved from helper_names");
-                if let Err(reason) = source.parsed.validate_selector(
-                    0..source.parsed.tokens.len(),
-                    selector,
-                    SHARED_LOCK_SELECTOR,
-                    GuardRequirement::Lexical,
-                ) {
-                    violations.push(format!(
-                        "{relative} ({}): helper `{helper_name}` mediating STATE_WORK_SELECTORS \
-                         work: {reason}",
-                        source.relative
-                    ));
+                    .flat_map(|selector| {
+                        source
+                            .parsed
+                            .call_sites(0..source.parsed.tokens.len(), *selector, true)
+                            .unwrap_or_else(|reason| panic!("{reason}"))
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut direct_sites = Vec::new();
+                let mut mediating_helpers = BTreeSet::new();
+                for site in all_sites {
+                    let owner = source.parsed.enclosing_function_path(site);
+                    match helper_names
+                        .iter()
+                        .find(|selector| selector.final_name() == owner)
+                    {
+                        Some(_) => {
+                            mediating_helpers.insert(owner);
+                        }
+                        None => direct_sites.push(site),
+                    }
+                }
+
+                if !direct_sites.is_empty()
+                    && let Err(reason) = source.parsed.validate_work_sites(
+                        &direct_sites,
+                        SHARED_LOCK_SELECTOR,
+                        GuardRequirement::Lexical,
+                    )
+                {
+                    violations.push(format!("{relative} ({}): {reason}", source.key()));
+                }
+                for helper_name in mediating_helpers {
+                    let selector = *helper_names
+                        .iter()
+                        .find(|selector| selector.final_name() == helper_name)
+                        .expect("helper name resolved from helper_names");
+                    if let Err(reason) = source.parsed.validate_selector(
+                        0..source.parsed.tokens.len(),
+                        selector,
+                        SHARED_LOCK_SELECTOR,
+                        GuardRequirement::Lexical,
+                    ) {
+                        violations.push(format!(
+                            "{relative} ({}): helper `{helper_name}` mediating STATE_WORK_SELECTORS \
+                             work: {reason}",
+                            source.key()
+                        ));
+                    }
                 }
             }
         }

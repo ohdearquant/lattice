@@ -1,5 +1,56 @@
 use super::*;
 
+#[cfg(not(feature = "image"))]
+#[test]
+fn image_decoders_require_image_feature() {
+    use crate::error::InferenceError;
+    use crate::model::embeddinggemma2_image::EmbeddingGemma2Rgb8Image;
+    use crate::vision::preprocess::{PreprocessConfig, preprocess};
+
+    let bytes = b"\x89PNG\r\n\x1a\n";
+    let cfg = tiny_cfg();
+    let expected = "image decoding is not compiled in; enable the `image` feature";
+    let errors = [
+        preprocess(bytes, &PreprocessConfig::qwen3_vl()).unwrap_err(),
+        preprocess_qwen35_image(bytes, &cfg).unwrap_err(),
+        preprocess_qwen35_image_for_serve(bytes, &cfg).unwrap_err(),
+        preprocess_qwen35_image_for_embedding_serve(bytes, &cfg).unwrap_err(),
+    ];
+    for error in errors {
+        assert!(matches!(error, VisionError::ImageDecode(message) if message == expected));
+    }
+    assert!(matches!(
+        EmbeddingGemma2Rgb8Image::from_encoded(bytes),
+        Err(InferenceError::InvalidInput(message))
+            if message == format!("EmbeddingGemma 2 image: {expected}")
+    ));
+    let mut zero_patch = PreprocessConfig::qwen3_vl();
+    zero_patch.patch_size = 0;
+    assert!(matches!(
+        preprocess(bytes, &zero_patch),
+        Err(VisionError::InvalidConfig(_))
+    ));
+}
+
+#[test]
+fn preprocess_refuses_an_invalid_config_before_decoding() {
+    use crate::vision::preprocess::{PreprocessConfig, preprocess};
+
+    let not_an_image = b"not an image";
+    let mut zero_patch = PreprocessConfig::qwen3_vl();
+    zero_patch.patch_size = 0;
+    let mut indivisible = PreprocessConfig::qwen3_vl();
+    indivisible.image_size = indivisible.patch_size * 3 + 1;
+    let mut zero_std = PreprocessConfig::qwen3_vl();
+    zero_std.std[1] = 0.0;
+    for cfg in [zero_patch, indivisible, zero_std] {
+        assert!(matches!(
+            preprocess(not_an_image, &cfg),
+            Err(VisionError::InvalidConfig(_))
+        ));
+    }
+}
+
 fn tiny_cfg() -> VisionModelConfig {
     VisionModelConfig {
         depth: 1,
@@ -18,6 +69,7 @@ fn tiny_cfg() -> VisionModelConfig {
 
 /// The chat route's budget with an explicit patch count, so a test does not
 /// read `LATTICE_VISION_MAX_PATCHES` from the process environment.
+#[cfg(feature = "image")]
 fn chat_budget(max_patches: usize) -> Option<ServeImageBudget> {
     Some(ServeImageBudget {
         max_patches,
@@ -27,6 +79,7 @@ fn chat_budget(max_patches: usize) -> Option<ServeImageBudget> {
 
 /// The embeddings route's default budget, without reading
 /// `LATTICE_EMBED_VISION_MAX_PATCHES` from the process environment.
+#[cfg(feature = "image")]
 fn embed_budget() -> Option<ServeImageBudget> {
     Some(ServeImageBudget {
         max_patches: MAX_SERVE_EMBED_VISION_PATCHES,
@@ -34,6 +87,7 @@ fn embed_budget() -> Option<ServeImageBudget> {
     })
 }
 
+#[cfg(feature = "image")]
 fn make_test_png(w: u32, h: u32) -> Vec<u8> {
     use image::RgbImage;
     let mut img = RgbImage::new(w, h);
@@ -49,6 +103,7 @@ fn make_test_png(w: u32, h: u32) -> Vec<u8> {
     buf
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn preprocess_rejects_misaligned_image() {
     let cfg = tiny_cfg(); // factor = patch_size(2) * merge(2) = 4
@@ -57,6 +112,7 @@ fn preprocess_rejects_misaligned_image() {
     assert!(matches!(err, VisionError::InvalidConfig(_)));
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn preprocess_produces_expected_shape_and_grid() {
     let cfg = tiny_cfg();
@@ -68,6 +124,7 @@ fn preprocess_produces_expected_shape_and_grid() {
     assert!(patches.iter().all(|v| v.is_finite()));
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn serving_preprocess_enforces_patch_budget_without_narrowing_embedding_path() {
     // Exercises the default budget via `preprocess_qwen35_image_inner`
@@ -96,6 +153,7 @@ fn serving_preprocess_enforces_patch_budget_without_narrowing_embedding_path() {
     );
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn serving_preprocess_rejects_declared_pixel_dimensions_over_the_hard_cap() {
     // A thin (1px tall) image keeps the PNG fixture tiny while still
@@ -110,6 +168,7 @@ fn serving_preprocess_rejects_declared_pixel_dimensions_over_the_hard_cap() {
     );
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn resolve_serve_max_patches_falls_back_to_default_for_every_invalid_shape() {
     assert_eq!(resolve_serve_max_patches(None), MAX_SERVE_VISION_PATCHES);
@@ -131,12 +190,14 @@ fn resolve_serve_max_patches_falls_back_to_default_for_every_invalid_shape() {
     );
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn resolve_serve_max_patches_honors_a_positive_override() {
     assert_eq!(resolve_serve_max_patches(Some("64")), 64);
     assert_eq!(resolve_serve_max_patches(Some(" 64 ")), 64);
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn serving_preprocess_inner_honors_a_lower_override_below_the_default_boundary() {
     let cfg = tiny_cfg();
@@ -148,6 +209,7 @@ fn serving_preprocess_inner_honors_a_lower_override_below_the_default_boundary()
     );
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn serving_preprocess_caps_output_allocation_for_pathological_config() {
     let mut cfg = tiny_cfg();
@@ -161,6 +223,7 @@ fn serving_preprocess_caps_output_allocation_for_pathological_config() {
     );
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn embedding_serve_preprocess_enforces_its_own_patch_budget() {
     let cfg = tiny_cfg();
@@ -180,6 +243,7 @@ fn embedding_serve_preprocess_enforces_its_own_patch_budget() {
     );
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn embedding_serve_preprocess_rejects_declared_pixel_dimensions_over_the_hard_cap() {
     // Width 2052 is a multiple of patch_size * spatial_merge_size, so only the
@@ -196,6 +260,7 @@ fn embedding_serve_preprocess_rejects_declared_pixel_dimensions_over_the_hard_ca
     );
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn embedding_serve_preprocess_caps_output_allocation() {
     let mut cfg = tiny_cfg();
@@ -227,6 +292,7 @@ fn embedding_serve_preprocess_caps_output_allocation() {
     assert_eq!(pixels.len() * std::mem::size_of::<f32>(), 24 * 1024 * 1024);
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn resolve_serve_embed_max_patches_falls_back_and_honors_overrides() {
     assert_eq!(
@@ -300,6 +366,7 @@ fn make_test_weights(cfg: &VisionModelConfig) -> Qwen35VisionWeights {
     }
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn vit_forward_output_shape_and_finite() {
     let cfg = tiny_cfg();
@@ -322,6 +389,7 @@ fn vit_forward_rejects_pixel_length_mismatch() {
     assert!(matches!(err, VisionError::ShapeMismatch { .. }));
 }
 
+#[cfg(feature = "image")]
 #[test]
 fn vit_forward_is_deterministic() {
     let cfg = tiny_cfg();
@@ -338,6 +406,7 @@ fn vit_forward_is_deterministic() {
 /// forward pass is actually sensitive to the weights it's handed (the
 /// same mutation-sensitivity property the committed golden gate in
 /// `tests/vision_s3_vit_forward_test.rs` relies on).
+#[cfg(feature = "image")]
 #[test]
 fn vit_forward_is_sensitive_to_weight_mutation() {
     let cfg = tiny_cfg();

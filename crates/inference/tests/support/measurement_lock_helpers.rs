@@ -1,10 +1,10 @@
 use super::*;
 
-const MEASUREMENT_WORKER_SOURCE: &str = "src/serving_worker.rs";
-const MEASUREMENT_WORKER_COMPAT_SOURCE: &str = "src/serve/metal_worker.rs";
-const MEASUREMENT_WORKER_CALLER: &str = "examples/bench_serve_prepare.rs";
+const MEASUREMENT_WORKER_SOURCE: (&str, &str) = ("../serve", "src/serving_worker.rs");
+const MEASUREMENT_WORKER_COMPAT_SOURCE: (&str, &str) = ("../serve", "src/serve/metal_worker.rs");
+const MEASUREMENT_WORKER_CALLER: (&str, &str) = ("../serve", "examples/bench_serve_prepare.rs");
 const MEASUREMENT_WORKER_ENTRY: &str =
-    "lattice_inference::serve::metal_worker::bench_support::spawn_with_measurement_lock";
+    "lattice_serve::serve::metal_worker::bench_support::spawn_with_measurement_lock";
 
 const WORKER_LOCK_FIXTURE: &str = r#"
 #[cfg(feature = "bench-internals")]
@@ -13,7 +13,7 @@ mod bench_support {
         let worker = crate::serving_worker::AffineWorker::spawn_with_guard(
             factory, max_pending, residency_limits,
             move || {
-                let gpu_guard = crate::measurement::gpu_test_lock();
+                let gpu_guard = lattice_inference::measurement::gpu_test_lock();
                 let _ = started_tx.send(started);
                 gpu_guard
             },
@@ -41,7 +41,7 @@ impl AffineWorker {
 
 const WORKER_CALLER_FIXTURE: &str = r#"
 fn run_metal() {
-    let worker = lattice_inference::serve::metal_worker::bench_support::spawn_with_measurement_lock(
+    let worker = lattice_serve::serve::metal_worker::bench_support::spawn_with_measurement_lock(
         ServingFactory::qwen_metal(move || {
             let state = match format {
                 Format::Safetensors => MetalQwen35State::new(weights, config, context),
@@ -53,12 +53,33 @@ fn run_metal() {
 }
 "#;
 
+pub(super) fn require_package<'a>(
+    packages: &'a [ScannedPackage],
+    identity: &str,
+) -> &'a ScannedPackage {
+    let mut matching = packages
+        .iter()
+        .filter(|package| package.identity == identity);
+    let package = matching
+        .next()
+        .unwrap_or_else(|| panic!("unlisted scanned package {identity}"));
+    assert!(
+        matching.next().is_none(),
+        "duplicate scanned package {identity}"
+    );
+    package
+}
+
+fn read_scanned_source(packages: &[ScannedPackage], path: (&str, &str)) -> String {
+    let package = require_package(packages, path.0);
+    std::fs::read_to_string(package.manifest_dir.join(path.1))
+        .unwrap_or_else(|reason| panic!("{}: {reason}", package.key(path.1)))
+}
+
 fn combined_measurement_worker_source() -> String {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let worker = std::fs::read_to_string(root.join(MEASUREMENT_WORKER_SOURCE))
-        .expect("read serving worker source");
-    let compatibility = std::fs::read_to_string(root.join(MEASUREMENT_WORKER_COMPAT_SOURCE))
-        .expect("read worker compatibility source");
+    let packages = scanned_packages();
+    let worker = read_scanned_source(&packages, MEASUREMENT_WORKER_SOURCE);
+    let compatibility = read_scanned_source(&packages, MEASUREMENT_WORKER_COMPAT_SOURCE);
     // Inner doc comments are valid only at the top of a file, so the second
     // file's module docs are dropped before the two are parsed as one.
     let compatibility: String = compatibility
@@ -71,10 +92,9 @@ fn combined_measurement_worker_source() -> String {
 
 #[test]
 fn measurement_worker_lock_covers_factory_and_runtime() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packages = scanned_packages();
     let worker = combined_measurement_worker_source();
-    let caller = std::fs::read_to_string(root.join(MEASUREMENT_WORKER_CALLER))
-        .expect("read measurement worker caller");
+    let caller = read_scanned_source(&packages, MEASUREMENT_WORKER_CALLER);
     validate_measurement_worker(&worker).expect("measurement worker must retain its shared lock");
     validate_measurement_worker_caller(&caller)
         .expect("exempt constructors must execute through the measurement worker");
@@ -112,7 +132,7 @@ fn reject_worker_fixture_mutations(mutations: &[(&str, &str)]) {
 #[test]
 fn measurement_worker_chain_rejects_acquisition_mutations() {
     reject_worker_fixture_mutations(&[
-        ("crate::measurement::gpu_test_lock()", "()"),
+        ("lattice_inference::measurement::gpu_test_lock()", "()"),
         ("let gpu_guard =", "let _ ="),
         ("                gpu_guard\n", "                ()\n"),
         (
@@ -121,12 +141,12 @@ fn measurement_worker_chain_rejects_acquisition_mutations() {
         ),
         ("let gpu_guard =", "#[cfg(test)] let gpu_guard ="),
         (
-            "crate::measurement::gpu_test_lock()",
-            "(|| crate::measurement::gpu_test_lock())()",
+            "lattice_inference::measurement::gpu_test_lock()",
+            "(|| lattice_inference::measurement::gpu_test_lock())()",
         ),
         (
-            "crate::measurement::gpu_test_lock()",
-            "acquire!(crate::measurement::gpu_test_lock())",
+            "lattice_inference::measurement::gpu_test_lock()",
+            "acquire!(lattice_inference::measurement::gpu_test_lock())",
         ),
         ("#[cfg(feature = \"bench-internals\")]", "#[cfg(test)]"),
     ]);
@@ -225,7 +245,12 @@ fn measurement_worker_contract_rejects_real_source_lock_removal() {
     use syn::spanned::Spanned;
     let source = combined_measurement_worker_source();
     validate_measurement_worker(&source).expect("unmodified worker must satisfy the contract");
-    let parsed = StructuredSource::parse(MEASUREMENT_WORKER_SOURCE, &source, false).unwrap();
+    let parsed = StructuredSource::parse(
+        &package_path_key(MEASUREMENT_WORKER_SOURCE.0, MEASUREMENT_WORKER_SOURCE.1),
+        &source,
+        false,
+    )
+    .unwrap();
     let syntax = syn::parse_file(&source).unwrap();
     let entry = worker_function(
         &parsed,
@@ -257,7 +282,12 @@ fn measurement_worker_contract_rejects_real_source_early_drop() {
     use syn::spanned::Spanned;
     let source = combined_measurement_worker_source();
     validate_measurement_worker(&source).expect("unmodified worker must satisfy the contract");
-    let parsed = StructuredSource::parse(MEASUREMENT_WORKER_SOURCE, &source, false).unwrap();
+    let parsed = StructuredSource::parse(
+        &package_path_key(MEASUREMENT_WORKER_SOURCE.0, MEASUREMENT_WORKER_SOURCE.1),
+        &source,
+        false,
+    )
+    .unwrap();
     let syntax = syn::parse_file(&source).unwrap();
     let guarded = worker_function(&parsed, &syntax, "run_guarded_worker").unwrap();
     let syn::Stmt::Local(local) = &guarded.stmts[0] else {
@@ -279,7 +309,12 @@ fn measurement_worker_contract_rejects_real_source_caller_thread_execution() {
     use syn::spanned::Spanned;
     let source = combined_measurement_worker_source();
     validate_measurement_worker(&source).expect("unmodified worker must satisfy the contract");
-    let parsed = StructuredSource::parse(MEASUREMENT_WORKER_SOURCE, &source, false).unwrap();
+    let parsed = StructuredSource::parse(
+        &package_path_key(MEASUREMENT_WORKER_SOURCE.0, MEASUREMENT_WORKER_SOURCE.1),
+        &source,
+        false,
+    )
+    .unwrap();
     let syntax = syn::parse_file(&source).unwrap();
     let worker = worker_function(&parsed, &syntax, "AffineWorker::spawn_with_guard").unwrap();
     let spawn = worker_top_call(worker, "std::thread::spawn").unwrap();
@@ -482,7 +517,11 @@ fn worker_name_usage(
 }
 
 fn validate_measurement_worker(source: &str) -> Result<(), String> {
-    let parsed = StructuredSource::parse(MEASUREMENT_WORKER_SOURCE, source, false)?;
+    let parsed = StructuredSource::parse(
+        &package_path_key(MEASUREMENT_WORKER_SOURCE.0, MEASUREMENT_WORKER_SOURCE.1),
+        source,
+        false,
+    )?;
     let syntax = syn::parse_file(source).map_err(|reason| reason.to_string())?;
     let entry = worker_function(
         &parsed,
@@ -516,7 +555,7 @@ fn validate_measurement_worker(source: &str) -> Result<(), String> {
     if init.diverge.is_some()
         || !matches!(&*init.expr, syn::Expr::Call(call)
             if call.attrs.is_empty() && call.args.is_empty()
-                && worker_path(&call.func, "crate::measurement::gpu_test_lock"))
+                && worker_path(&call.func, "lattice_inference::measurement::gpu_test_lock"))
         || !matches!(acquisition.stmts.last(), Some(syn::Stmt::Expr(expression, None))
             if worker_path(expression, &guard))
     {
@@ -579,7 +618,11 @@ fn validate_measurement_worker(source: &str) -> Result<(), String> {
 }
 
 fn validate_measurement_worker_caller(source: &str) -> Result<(), String> {
-    let parsed = StructuredSource::parse(MEASUREMENT_WORKER_CALLER, source, false)?;
+    let parsed = StructuredSource::parse(
+        &package_path_key(MEASUREMENT_WORKER_CALLER.0, MEASUREMENT_WORKER_CALLER.1),
+        source,
+        false,
+    )?;
     let syntax = syn::parse_file(source).map_err(|reason| reason.to_string())?;
     let caller = worker_function(&parsed, &syntax, "run_metal")?;
     let spawn = worker_top_call(caller, MEASUREMENT_WORKER_ENTRY)?;
@@ -639,12 +682,16 @@ fn validate_measurement_worker_caller(source: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn assert_helper_mediated_test_holds_function_lifetime_lock(relative: &str, function_name: &str) {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = std::fs::read_to_string(manifest_dir.join(relative))
-        .expect("read helper-mediated Metal tests");
-    let parsed = StructuredSource::parse(relative, &source, true)
-        .unwrap_or_else(|reason| panic!("{reason}"));
+fn assert_helper_mediated_test_holds_function_lifetime_lock(
+    package: &str,
+    relative: &str,
+    function_name: &str,
+) {
+    let packages = scanned_packages();
+    let source = read_scanned_source(&packages, (package, relative));
+    let key = package_path_key(package, relative);
+    let parsed =
+        StructuredSource::parse(&key, &source, true).unwrap_or_else(|reason| panic!("{reason}"));
     let function = parsed
         .test_functions()
         .unwrap_or_else(|reason| panic!("{reason}"))
@@ -660,12 +707,13 @@ fn assert_helper_mediated_test_holds_function_lifetime_lock(relative: &str, func
                 closing_brace: function.body.end,
             },
         )
-        .unwrap_or_else(|reason| panic!("{relative}::{function_name}: {reason}"));
+        .unwrap_or_else(|reason| panic!("{key}::{function_name}: {reason}"));
 }
 
 #[test]
 fn mtp_draft_logit_equivalence_test_holds_a_function_lifetime_lock() {
     assert_helper_mediated_test_holds_function_lifetime_lock(
+        ".",
         "src/forward/metal_qwen35/inner/tests/decode_attention.rs",
         "mtp_draft_logit_equivalence_with_quarot_counter_rotation",
     );
@@ -674,6 +722,7 @@ fn mtp_draft_logit_equivalence_test_holds_a_function_lifetime_lock() {
 #[test]
 fn metal_engine_session_isolation_test_holds_a_function_lifetime_lock() {
     assert_helper_mediated_test_holds_function_lifetime_lock(
+        ".",
         "src/forward/metal_qwen35/inner/tests/mtp_verify.rs",
         "test_metal_qwen35_engine_session_isolation",
     );
@@ -685,31 +734,48 @@ fn metal_engine_session_isolation_test_holds_a_function_lifetime_lock() {
 /// of a binary into the library would leave the construction inventory. Each
 /// row adds the module as an extra root of that binary's scan; the binary's
 /// own source stays scanned.
-const BIN_LIBRARY_LOADER_ROOTS: &[(&str, &str, &str)] = &[
+const BIN_LIBRARY_LOADER_ROOTS: &[(&str, &str, &str, &str)] = &[
     (
+        "../serve",
         "bin",
         "lattice",
         "src/serving_provider/providers/qwen/lattice_worker.rs",
     ),
     (
+        "../serve",
         "bin",
         "lattice_serve",
         "src/serving_provider/providers/qwen/worker.rs",
     ),
 ];
 
+#[test]
+fn fixed_measurement_sources_name_scanned_packages() {
+    let packages = scanned_packages();
+    for (owner, _) in [
+        MEASUREMENT_WORKER_SOURCE,
+        MEASUREMENT_WORKER_COMPAT_SOURCE,
+        MEASUREMENT_WORKER_CALLER,
+    ] {
+        require_package(&packages, owner);
+    }
+    for (owner, _, _, _) in BIN_LIBRARY_LOADER_ROOTS {
+        require_package(&packages, owner);
+    }
+}
+
 /// The parsed sources the construction scan reads for one Cargo target.
 pub(super) fn construction_scan_sources(
-    manifest_dir: &Path,
+    package: &ScannedPackage,
     target: &CargoTargetRoot,
 ) -> Vec<ParsedModuleSource> {
     let test_cfg = matches!(target.kind.as_str(), "test" | "lib");
-    let mut sources = parsed_module_closure(manifest_dir, &target.path, test_cfg)
+    let mut sources = parsed_package_module_closure(package, &target.path, test_cfg)
         .unwrap_or_else(|reason| panic!("{reason}"));
-    for (kind, name, root) in BIN_LIBRARY_LOADER_ROOTS {
-        if target.kind == *kind && target.name == *name {
+    for (owner, kind, name, root) in BIN_LIBRARY_LOADER_ROOTS {
+        if package.identity == *owner && target.kind == *kind && target.name == *name {
             sources.extend(
-                parsed_module_closure(manifest_dir, Path::new(root), false)
+                parsed_package_module_closure(package, &package.manifest_dir.join(root), false)
                     .unwrap_or_else(|reason| panic!("{reason}")),
             );
         }

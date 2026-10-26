@@ -60,9 +60,10 @@ fn test_partial_rope_only_rotates_first_quarter() {
 #[test]
 fn test_sample_greedy() {
     let logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
-    let cfg = crate::generation::GenerateConfig {
-        temperature: 0.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.temperature = 0.0;
+        config
     };
     let mut rng = 1u64;
     let token = sample_token(&logits, &cfg, &[], &mut rng);
@@ -73,10 +74,11 @@ fn test_sample_greedy() {
 fn test_sample_repetition_penalty() {
     // Token 3 has highest logit but gets penalized
     let logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
-    let cfg = crate::generation::GenerateConfig {
-        temperature: 0.0,
-        repetition_penalty: 100.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.temperature = 0.0;
+        config.repetition_penalty = 100.0;
+        config
     };
     let mut rng = 1u64;
     let token = sample_token(&logits, &cfg, &[3], &mut rng);
@@ -93,10 +95,11 @@ fn test_repetition_penalty_applied_once_per_repeated_id() {
     // matching HF and the Metal `CandidateSet` path — not once per occurrence
     // (which compounds to penalty^N and over-suppresses as the sequence grows).
     let logits = vec![0.0, 10.0, 3.0];
-    let cfg = crate::generation::GenerateConfig {
-        temperature: 0.0,
-        repetition_penalty: 2.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.temperature = 0.0;
+        config.repetition_penalty = 2.0;
+        config
     };
     let mut rng = 1u64;
     // Token 1 appears TWICE in the history. Penalized once: 10/2 = 5 (beats token 2's 3).
@@ -116,12 +119,13 @@ fn test_sample_nonfinite_temperature_is_greedy() {
     // forces the categorical path that would otherwise mis-sample.
     let logits = vec![0.0, 100.0, 99.0];
     for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        let cfg = crate::generation::GenerateConfig {
-            temperature: bad,
-            top_k: 2,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            ..Default::default()
+        let cfg = {
+            let mut config = crate::generation::GenerateConfig::default();
+            config.temperature = bad;
+            config.top_k = 2;
+            config.top_p = 1.0;
+            config.repetition_penalty = 1.0;
+            config
         };
         let mut rng = 7u64;
         let token = sample_token(&logits, &cfg, &[], &mut rng);
@@ -393,10 +397,11 @@ fn test_qwen36_greedy_one_token_smoke() {
         .expect("set LATTICE_QWEN36_MODEL_DIR to a Qwen3.6 checkpoint directory");
     let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
         .expect("Qwen3.6 MoE model should load successfully");
-    let cfg = crate::generation::GenerateConfig {
-        max_new_tokens: 1,
-        temperature: 0.0,
-        ..Default::default()
+    let cfg = {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.max_new_tokens = 1;
+        config.temperature = 0.0;
+        config
     };
     let out = model.generate("Hello", &cfg).expect("generate succeeds");
     assert_eq!(
@@ -882,9 +887,10 @@ mod lora_serving {
         // forward pass, so a synthetic model is sufficient to exercise it.
         let cfg = test_config();
         let model = build_model(cfg.clone(), 0xBEEF_F00D);
-        let gen_cfg = crate::generation::GenerateConfig {
-            max_new_tokens: 0,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = crate::generation::GenerateConfig::default();
+            config.max_new_tokens = 0;
+            config
         };
         let out = model
             .generate("abc", &gen_cfg)
@@ -907,9 +913,10 @@ mod lora_serving {
         let cfg = test_config();
         let model = build_model(cfg, 0xBEEF_CAFE);
         let max_context = model.max_context();
-        let gen_cfg = crate::generation::GenerateConfig {
-            max_new_tokens: max_context + 16,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = crate::generation::GenerateConfig::default();
+            config.max_new_tokens = max_context + 16;
+            config
         };
         let err = model
             .generate("abc", &gen_cfg)
@@ -929,9 +936,10 @@ mod lora_serving {
         let cfg = test_config();
         let model = build_model(cfg, 0xBEEF_CAFD);
         let max_context = model.max_context();
-        let gen_cfg = crate::generation::GenerateConfig {
-            max_new_tokens: max_context + 16,
-            ..Default::default()
+        let gen_cfg = {
+            let mut config = crate::generation::GenerateConfig::default();
+            config.max_new_tokens = max_context + 16;
+            config
         };
         let mut emitted = 0usize;
         let err = model

@@ -220,30 +220,24 @@ fn sample(model: &Gemma4Model, ids: &[u32]) -> Sample {
     assert_eq!(stamp.evaluated_len, ids.len());
     assert_eq!(stamp.prediction, None);
     let mut phases = vec![evidence(&session)];
-    let config = GenerateConfig {
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        max_new_tokens: DECODE_STEPS,
-        ..Default::default()
+    let config = {
+        let mut config = GenerateConfig::default();
+        config.temperature = 0.0;
+        config.repetition_penalty = 1.0;
+        config.max_new_tokens = DECODE_STEPS;
+        config
     };
     let mut history = ids.to_vec();
     let mut selected = [0; DECODE_STEPS];
     let mut decode = [Duration::ZERO; DECODE_STEPS];
     for index in 0..DECODE_STEPS {
         let outcome = session
-            .select(&SelectionRequest {
-                config: &config,
-                history: &history,
-                grammar_mask: None,
-            })
+            .select(&SelectionRequest::new(&config, &history))
             .expect("greedy session selection");
         let SelectOutcome::Candidate(candidate) = outcome else {
             panic!("unconstrained selection must produce a candidate")
         };
-        let accepted = AcceptedToken {
-            final_id: candidate.candidate_id,
-            prediction: candidate.prediction,
-        };
+        let accepted = AcceptedToken::new(candidate.candidate_id, candidate.prediction);
         selected[index] = accepted.final_id;
         history.push(accepted.final_id);
         let start = Instant::now();

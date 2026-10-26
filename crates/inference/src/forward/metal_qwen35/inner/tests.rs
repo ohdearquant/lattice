@@ -9,6 +9,7 @@ mod layers;
 mod lm_head;
 mod lora;
 mod moe;
+mod moe_device_route;
 mod mtp_hidden_tap;
 mod mtp_verify;
 mod mtp_weight_load;
@@ -2517,22 +2518,22 @@ fn qwen35_checkpoint_weights_present(model_dir: &std::path::Path) -> bool {
 }
 
 fn cross_turn_test_gen_cfg(seed: u64, max_new_tokens: usize) -> GenerateConfig {
-    GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(seed),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
-    }
+    let mut config = GenerateConfig::default();
+    config.min_p = 0.0;
+    config.max_new_tokens = max_new_tokens;
+    config.temperature = 0.0;
+    config.top_k = 1;
+    config.top_p = 1.0;
+    config.repetition_penalty = 1.0;
+    config.seed = Some(seed);
+    config.stop_token_ids = vec![];
+    config.enable_thinking = false;
+    config.enable_mtp = Some(false);
+    config.grammar = None;
+    config.stop_strings = vec![];
+    config.reasoning_budget = None;
+    config.logprobs = None;
+    config
 }
 
 /// Byte-per-token vocab matching `single_char_vocab_tokenizer`'s id
@@ -2564,20 +2565,22 @@ fn single_char_grammar_cfg(gbnf: &str, max_new_tokens: usize) -> crate::generati
         GrammarEngine::new(&spec, single_char_vocab_bytes())
             .expect("grammar engine builds over single-char vocab"),
     );
-    crate::generation::GenerateConfig {
-        min_p: 0.0,
-        max_new_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(engine),
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    {
+        let mut config = crate::generation::GenerateConfig::default();
+        config.min_p = 0.0;
+        config.max_new_tokens = max_new_tokens;
+        config.temperature = 0.0;
+        config.top_k = 1;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.seed = Some(1);
+        config.stop_token_ids = vec![];
+        config.enable_thinking = false;
+        config.enable_mtp = Some(false);
+        config.grammar = Some(engine);
+        config.stop_strings = vec![];
+        config.reasoning_budget = None;
+        config.logprobs = None;
+        config
     }
 }

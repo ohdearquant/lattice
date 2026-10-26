@@ -12,7 +12,7 @@ gpu_admission_ownership = "supervisor retains both original locks continuously; 
 gpu_handoff_child = "a script with supervision gpu-handoff-child is not supervised itself: it delegates each launch of a declared binary to scripts/bench-command.sh --gpu-handoff, which is then the outermost supervisor; any other GPU pass it makes (MLX, which never takes the GPU lock) runs as its own plain scripts/bench-command.sh launch, without --gpu-handoff, so both machine locks are held around it, one launch at a time and never overlapping a handoff run; only argument handling, output parsing, analysis and report writing run outside the locks; a +quiet suffix means every one of those launches also passes --durable for the before/after ambient-idle checks, and the measured-phase quiet certification of the handoff runs in either case; tests/test_bench_measurement_supervision.py checks from source that MLX is reachable only through such a plain launch"
 decode_group_child = "decode coordinators send every lattice observation through the admitted GPU handoff command and run each MLX or Ollama profile group as one ordered plain durable child; the source check verifies the shared lattice argv, worker dispatch, and MLX import boundary; Ollama generation and unload/check execute under both locks against an external loopback server"
 gpu_admission_residual = "cooperative reviewed targets; admitted stdin is an unlock capability and can be inherited by future descendants; no hostile same-user authentication, historical continuity, pathname replacement resistance or crash-time GPU quiescence proof"
-rust_inventory_grammar = "crates/*/benches/*.rs; crates/inference/examples/*.rs; crates/inference/src/bin/*.rs; README.md"
+rust_inventory_grammar = "crates/*/benches/*.rs; crates/inference/examples/*.rs; crates/inference/src/bin/*.rs; crates/serve/examples/*.rs; crates/serve/src/bin/*.rs; README.md; crates/fann/examples/router_online.rs"
 rust_inventory_limitation = "does not discover Rust tests, except the one tracked entry point below"
 # Confirmed measurement entry points outside the declared grammar. Unlike the
 # grammar above, Rust test targets are not globbed wholesale (most are
@@ -28,14 +28,14 @@ confirmed_outside_rust_inventory = ["crates/tune/tests/bench_backward_737.rs"]
 [[excluded_surface]]
 family = "cargo-benchmark-sources"
 tracking_issue = "#1273"
-reason = "Direct Cargo benchmark targets are outside this local script supervisor."
+reason = "Direct Cargo benchmark targets and the router_online example are outside this local script supervisor."
 paths = [
     "crates/embed/benches/embeddings.rs",
     "crates/embed/benches/simd.rs",
     "crates/embed/benches/simd_bench.rs",
     "crates/embed/benches/simd_opt_bench.rs",
     "crates/embed/benches/simsimd_comparison.rs",
-    "crates/fann/benches/router_online.rs",
+    "crates/fann/examples/router_online.rs",
     "crates/inference/benches/attention_dispatch_bench.rs",
     "crates/inference/benches/attn_opt_bench.rs",
     "crates/inference/benches/backward_stage0.rs",
@@ -90,8 +90,8 @@ paths = [
     "crates/inference/examples/bench_q4_prefill.rs",
     "crates/inference/examples/bench_q8_prefill.rs",
     "crates/inference/examples/bench_quality.rs",
-    "crates/inference/examples/bench_serve_http.rs",
-    "crates/inference/examples/bench_serve_prepare.rs",
+    "crates/serve/examples/bench_serve_http.rs",
+    "crates/serve/examples/bench_serve_prepare.rs",
     "crates/inference/examples/bench_simdgroup.rs",
     "crates/inference/examples/bench_stability.rs",
     "crates/inference/examples/bench_suite.rs",
@@ -172,39 +172,39 @@ path = "crates/inference/src/bin/chat_metal.rs"
 reason = "Long-running interactive product process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/main.rs"
+path = "crates/serve/src/bin/lattice/main.rs"
 reason = "Product CLI for interactive chat, one-shot responses, serving and model inspection; it emits no timed measurements (see metal_measurement_lock_contract.rs product-process exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/chat.rs"
+path = "crates/serve/src/bin/lattice/chat.rs"
 reason = "`lattice chat` product subcommand for interactive or one-shot generation; response text and token counts are not timed measurements (see metal_measurement_lock_contract.rs product-process exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/serve.rs"
+path = "crates/serve/src/bin/lattice/serve.rs"
 reason = "`lattice serve` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/serve_cpu_panic_tests.rs"
+path = "crates/serve/src/bin/lattice/serve_cpu_panic_tests.rs"
 reason = "Test-only CPU generation panic, HTTP/SSE and admission correctness controls using a synthetic generator; timeout deadlines bound hangs and do not produce timing measurements. No Criterion or Metal dispatch; included only under cfg(test) and test-utils."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/doctor.rs"
+path = "crates/serve/src/bin/lattice/doctor.rs"
 reason = "`lattice doctor` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/forecast.rs"
+path = "crates/serve/src/bin/lattice/forecast.rs"
 reason = "`lattice forecast` product subcommand: reads series as JSON lines, writes point forecasts, and exits. Forecast values only; no timing, no Criterion, no Metal dispatch."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/prune_score.rs"
+path = "crates/serve/src/bin/lattice/prune_score.rs"
 reason = "`lattice prune-score` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/router.rs"
+path = "crates/serve/src/bin/lattice/router.rs"
 reason = "`lattice router` subcommand module of the product CLI; `router init` provisions a router state directory once and exits, loading the embedding model only to measure the gate's input width through the serving path's own loader. No timing, no Criterion, no Metal dispatch."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice_serve/main.rs"
+path = "crates/serve/src/bin/lattice_serve/main.rs"
 reason = "Long-running server process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
@@ -212,15 +212,15 @@ path = "crates/inference/src/bin/dump_quarot_q4_golden.rs"
 reason = "Golden/correctness dump utility, not a timed benchmark."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/moe_admission_sim.rs"
+path = "crates/serve/src/bin/moe_admission_sim.rs"
 reason = "Admission simulation utility, not a Metal measurement harness."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/quantize_q4.rs"
+path = "crates/serve/src/bin/quantize_q4.rs"
 reason = "Weight-conversion tool; any elapsed-time logging is progress reporting, not a benchmark."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/quantize_quarot.rs"
+path = "crates/serve/src/bin/quantize_quarot.rs"
 reason = "Weight-conversion tool; any elapsed-time logging is progress reporting, not a benchmark."
 
 [[non_measurement_surface]]
@@ -343,6 +343,11 @@ supervision = "both-locks+quiet"
 path = "scripts/compare_logits.py"
 role = "measurement"
 supervision = "gpu-handoff-child"
+
+[[entry]]
+path = "scripts/crate-readme.py"
+role = "consumer"
+supervision = "none"
 
 [[entry]]
 path = "scripts/e2e-parity-local.sh"

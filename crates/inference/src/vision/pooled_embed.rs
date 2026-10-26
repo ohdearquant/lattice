@@ -88,7 +88,7 @@ pub fn embed_image_from_bytes_f16(
 /// Metal-dispatching sibling of [`embed_image_from_bytes_f16`]: runs the ViT
 /// forward pass on the Metal GPU ([`qwen35_vit_forward_metal`]) instead of
 /// the CPU, mirroring the serving path's CPU/Metal split
-/// (`crate::serving_provider::providers::qwen::vision::build_vision_request`
+/// (`lattice-serve`'s `serving_provider::providers::qwen::vision::build_vision_request`
 /// dispatches
 /// `qwen35_vit_forward_metal_with_cancel` then the CPU
 /// `qwen35_merger_forward`). The merger and the decoder-side pooling both
@@ -275,5 +275,5 @@ fn pool_from_pre_merger_hidden_states(
     embed_image_f16(weights, cfg, &request, pooling)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "image"))]
 mod tests;

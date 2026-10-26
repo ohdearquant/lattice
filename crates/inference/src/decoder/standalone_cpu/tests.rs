@@ -43,11 +43,12 @@ fn tokenizer() -> BpeTokenizer {
 }
 
 fn plan(cfg: &Qwen35Config, rope: &RopeTable, max_new_tokens: usize) -> GenerationPlan {
-    let gen_cfg = GenerateConfig {
-        max_new_tokens,
-        temperature: 0.0,
-        seed: Some(7),
-        ..Default::default()
+    let gen_cfg = {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = max_new_tokens;
+        config.temperature = 0.0;
+        config.seed = Some(7);
+        config
     };
     match prepare_generation(
         &tokenizer(),
@@ -73,7 +74,8 @@ fn with_each_hollow_session(check: impl Fn(&str, StandaloneCpuSession<'_>)) {
         ("q8", StandaloneWeights::Q8(&q8)),
         ("q8_neon", StandaloneWeights::Q8Neon(&neon)),
     ] {
-        let session = StandaloneCpuSession::new(weights, &cfg, &rope, plan(&cfg, &rope, 8));
+        let session = StandaloneCpuSession::new(weights, &cfg, &rope, plan(&cfg, &rope, 8))
+            .expect("an unspent ledger identity");
         check(name, session);
     }
 }
@@ -102,33 +104,37 @@ fn driver_refuses_every_unsupported_control_on_the_standalone_profile() {
     let controls: Vec<(&str, GenerateConfig, &str)> = vec![
         (
             "grammar",
-            GenerateConfig {
-                grammar: Some(Arc::new(engine)),
-                ..GenerateConfig::default()
+            {
+                let mut config = GenerateConfig::default();
+                config.grammar = Some(Arc::new(engine));
+                config
             },
             "session does not declare grammar support but gen_cfg.grammar is set",
         ),
         (
             "logprobs",
-            GenerateConfig {
-                logprobs: Some(0),
-                ..GenerateConfig::default()
+            {
+                let mut config = GenerateConfig::default();
+                config.logprobs = Some(0);
+                config
             },
             "session does not declare logprobs support but gen_cfg.logprobs is set",
         ),
         (
             "stop_strings",
-            GenerateConfig {
-                stop_strings: vec!["</s>".to_string()],
-                ..GenerateConfig::default()
+            {
+                let mut config = GenerateConfig::default();
+                config.stop_strings = vec!["</s>".to_string()];
+                config
             },
             "session does not declare stop_strings support but gen_cfg.stop_strings is set",
         ),
         (
             "reasoning_budget",
-            GenerateConfig {
-                reasoning_budget: Some(16),
-                ..GenerateConfig::default()
+            {
+                let mut config = GenerateConfig::default();
+                config.reasoning_budget = Some(16);
+                config
             },
             "session does not declare reasoning_budget support but \
                  gen_cfg.reasoning_budget is set",
@@ -181,7 +187,8 @@ fn neon_session_reserves_kv_for_prompt_plus_budget() {
         "the fixture has no full-attention layer, so there is no cache to reserve"
     );
 
-    let session = StandaloneCpuSession::new(StandaloneWeights::Q8Neon(&neon), &cfg, &rope, plan);
+    let session = StandaloneCpuSession::new(StandaloneWeights::Q8Neon(&neon), &cfg, &rope, plan)
+        .expect("an unspent ledger identity");
 
     let wanted = required * cfg.full_kv_dim();
     for (layer, (k, v)) in session
@@ -217,7 +224,8 @@ fn q8_session_does_not_prereserve_kv() {
         &cfg,
         &rope,
         plan(&cfg, &rope, 8),
-    );
+    )
+    .expect("an unspent ledger identity");
 
     assert!(session.kv_cache.k.iter().all(|k| k.capacity() == 0));
     assert!(session.kv_cache.v.iter().all(|v| v.capacity() == 0));
@@ -241,7 +249,8 @@ fn f16_session_does_not_prereserve_kv() {
         &cfg,
         &rope,
         plan(&cfg, &rope, 8),
-    );
+    )
+    .expect("an unspent ledger identity");
 
     assert!(session.kv_cache.k.iter().all(|k| k.capacity() == 0));
     assert!(session.kv_cache.v.iter().all(|v| v.capacity() == 0));

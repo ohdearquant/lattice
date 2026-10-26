@@ -24,10 +24,10 @@ mod vision;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use vision::VisionTimings;
 
-const COMMON_SHADERS: &str = concat!(
-    include_str!("../shaders/rms_reduce.metal"),
-    include_str!("../shaders/flash_attention.metal"),
-    include_str!("../shaders/ernie45_rope.metal"),
+const COMMON_SHADERS: &str = metal_runtime::concat_msl!(
+    metal_runtime::msl::RMS_REDUCE,
+    metal_runtime::msl::FLASH_ATTENTION,
+    metal_runtime::msl::ERNIE45_ROPE,
     include_str!("../shaders/embeddinggemma2.metal"),
 );
 const ATTENTION_SHADER: &str = include_str!("../shaders/embeddinggemma2_attention.metal");
@@ -503,7 +503,7 @@ fn read_f32(buffer: &Buffer, count: usize) -> Result<Vec<f32>, InferenceError> {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct AttentionParams {
     seq_len: u32,
     heads: u32,

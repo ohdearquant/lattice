@@ -1501,3 +1501,69 @@ fn text_only_parts_never_load_vision_weights() {
     assert!(encoding.image_stages.is_empty());
     assert_eq!(encoding.counts.valid_patches, 0);
 }
+
+#[test]
+fn encoder_adapter_embeds_the_ids_it_counts_in_input_order() {
+    use crate::encoder::{EmbeddingGemma2Encoder, Encoder, Normalization, Pooling};
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    const WIDTH: usize = 4;
+    const LIMIT: usize = 4;
+    let limited = |fx: Fixture| fx.model.with_max_tokens(Some(LIMIT)).unwrap();
+    let model = Arc::new(limited(fixture_with_tokenizer()));
+    let reference = limited(fixture_with_tokenizer());
+    let encoder = EmbeddingGemma2Encoder::new(Arc::clone(&model), Some(WIDTH)).unwrap();
+    assert_eq!(encoder.output_dimension().get(), WIDTH);
+    assert_eq!(encoder.identity().output_dimension().get(), WIDTH);
+    assert_eq!(encoder.identity().pooling(), Pooling::Mean);
+    assert_eq!(encoder.identity().normalization(), Normalization::L2);
+    assert!(!encoder.identity().has_pinned_provenance());
+    assert_eq!(
+        encoder
+            .capabilities()
+            .max_input_tokens()
+            .map(NonZeroUsize::get),
+        Some(LIMIT)
+    );
+
+    let inputs = ["a b c a b c", "c", "a b"];
+    let outputs = encoder.encode_texts(&inputs).unwrap();
+    assert_eq!(outputs.len(), inputs.len());
+    for (text, output) in inputs.iter().zip(&outputs) {
+        let (_, counts) = reference.tokenize_with_counts(text).unwrap();
+        assert_eq!(
+            output.vector(),
+            reference.encode(text, Some(WIDTH)).unwrap().as_slice()
+        );
+        assert_eq!(
+            (
+                output.usage().before_truncation(),
+                output.usage().embedded()
+            ),
+            (counts.before_truncation, counts.embedded)
+        );
+    }
+    assert!(outputs[0].usage().truncated() > 0, "the first input is cut");
+    assert_eq!(outputs[1].usage().truncated(), 0);
+
+    let unlimited = fixture_with_tokenizer()
+        .model
+        .with_max_tokens(None)
+        .unwrap();
+    let native = EmbeddingGemma2Encoder::new(Arc::new(unlimited), None).unwrap();
+    assert_eq!(native.capabilities().max_input_tokens(), None);
+    assert_eq!(native.output_dimension().get(), tiny_cfg().embedding_dim);
+
+    for refused in [0, tiny_cfg().embedding_dim + 1] {
+        assert!(matches!(
+            EmbeddingGemma2Encoder::new(Arc::clone(&model), Some(refused)),
+            Err(InferenceError::InvalidInput(_))
+        ));
+    }
+    let untokenized = EmbeddingGemma2Encoder::new(Arc::new(fixture().model), None).unwrap();
+    assert!(matches!(
+        untokenized.encode_texts(&["a", "c"]),
+        Err(InferenceError::Tokenizer(_))
+    ));
+}

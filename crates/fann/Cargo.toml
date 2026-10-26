@@ -47,7 +47,7 @@ futures = { version = "0.3", optional = true }
 [[example]]
 name = "fann_xor"
 
-[[bench]]
+[[example]]
 name = "router_online"
 harness = false
 required-features = ["online-router"]
