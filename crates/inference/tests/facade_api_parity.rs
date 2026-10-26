@@ -2468,6 +2468,9 @@ mod embeddinggemma2_parity {
 
 #[test]
 fn vision_errors_keep_the_same_identity() {
+    let _: fn(
+        lattice_inference::vision::MultimodalInput,
+    ) -> lattice_model_io::multimodal::MultimodalInput = |input| input;
     let _: fn(lattice_inference::vision::VisionError) -> lattice_model_io::image::VisionError =
         |error| error;
     let _: fn(lattice_model_io::image::VisionError) -> lattice_inference::vision::VisionError =
