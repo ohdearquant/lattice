@@ -738,8 +738,8 @@ the family crates names a model; items 2 and 6 say how and in which release that
      requirement on every encoder.
 4. **D1, D4 and the release split.** Free functions and moved owning types keep their public paths by named
    re-export (D1). Items whose published signature names a model type, or whose name and contract belong to one family
-   while their owner stays in a lower crate, cannot keep an identical signature once that type leaves the lower crate,
-   and D4's internal bridges are never re-exported, so no facade wrapper preserves them:
+   while their owner stays in a lower crate, cannot keep their signature or their name once the family leaves the
+   lower crate, and D4's internal bridges are never re-exported, so no facade wrapper preserves them:
    `GatedDeltaNetState::new`, `LoraHook::validate_against` and `validate_against_bert`, the four `SafetensorsFile` and
    `ShardedSafetensors` loaders, and the `quarot` plan and descriptor methods whose owners stay in `lattice-quant`.
    0.15.0 adds the neutral replacements beside them, moves every other caller in the workspace to the replacements,
@@ -758,13 +758,15 @@ the family crates names a model; items 2 and 6 say how and in which release that
    path, that is listed as an intentional change. `lattice-arch` states its own minimal feature set.
 6. **D9.** Order: (1) the ledger of item 2; (2) the rename and the interface of item 3, with the family configurations
    still in `lattice-arch`, which its crate documentation states; (3) the neutral inputs and deprecations of item 4;
-   (4) BERT and the cross-encoder; (5) Qwen3 on CPU and EmbeddingGemma2, after which `lattice-embed` depends on
+   (4) BERT and the cross-encoder; (5) Qwen3 on CPU and EmbeddingGemma2, and the CPU f16 path of the Qwen3.5 vision
+   encoder into the Qwen3.5 family crate, after which `lattice-embed` with its default features depends on
    `lattice-arch`, `lattice-compute` and those family crates instead of the facade; (6) Qwen3.5 including its Metal
-   forward, after ADR-102 has moved the shared Metal engine out of `forward/metal_qwen35`, then Gemma 4, ERNIE 4.5 and
-   PaddleOCR-VL, each family's Metal code behind its `metal-gpu` feature; (7) in 0.16.0, the deprecated items of item 4
-   are removed, and the configurations, weight bundles and model policy leave `lattice-arch` and the lower crates for
-   their families. Until (7), the lower crates still name models through the deprecated items; that is the transition,
-   not the target.
+   forward and the vision encoder's Metal variant, after ADR-102 has moved the shared Metal engine out of
+   `forward/metal_qwen35`, then Gemma 4, ERNIE 4.5 and PaddleOCR-VL, each family's Metal code behind its `metal-gpu`
+   feature; (7) in 0.16.0, the deprecated items of item 4 are removed, and the configurations, weight bundles and model
+   policy leave `lattice-arch` and the lower crates for their families. Until (7), the lower crates still name models
+   through the deprecated items; that is the transition, not the target. Step (5)'s acceptance:
+   `cargo tree -p lattice-embed -e normal` shows no `lattice-inference v` node.
 7. **Acceptance.** `lattice-arch` depends on no family crate and not on `lattice-compute`. After each family step,
    `cargo tree -i <family crate> --workspace -e normal` lists only the facade, `lattice-embed`, `lattice-serve` and
    `lattice-tune` through the facade, and no family crate depends on another; the graph is read for each feature arm the
