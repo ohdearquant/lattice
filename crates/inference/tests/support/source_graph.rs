@@ -24,7 +24,7 @@ pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &[
     ".",
     "../serve",
     "../models/embeddinggemma2",
-    "../models/qwen3",
+    "../models/qwen3-embedding",
     "../models/gemma4",
     "../models/ernie45",
     "../models/qwen35",

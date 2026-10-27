@@ -512,7 +512,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
 ];
 const IN_CRATE_COMMAND_BUFFER_TESTS: &[(&str, &str)] = &[
     (
-        "../models/qwen3",
+        "../models/qwen3-embedding",
         "src/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
     ),
     (
@@ -2934,7 +2934,7 @@ fn prior_lock_owners_and_existing_bench_use_the_shared_module() {
     let packages = scanned_packages();
     let callers = [
         (
-            "../models/qwen3",
+            "../models/qwen3-embedding",
             "src/metal.rs",
             "use lattice_metal_runtime::measurement::gpu_test_lock;",
         ),

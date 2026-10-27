@@ -294,7 +294,7 @@ fn scanned_package_membership_requires_embeddinggemma2_and_rejects_extra_package
 #[test]
 fn qwen_family_membership_and_construction_guards_are_required() {
     let mut fixture = PackageFixture::new("fn main() {}", "fn main() {}");
-    let family = fixture.inference.join("../models/qwen3");
+    let family = fixture.inference.join("../models/qwen3-embedding");
     std::fs::create_dir_all(family.join("src")).unwrap();
     std::fs::write(
         family.join("Cargo.toml"),
@@ -307,7 +307,7 @@ fn qwen_family_membership_and_construction_guards_are_required() {
     let members = std::fs::read_to_string(&workspace).unwrap();
     std::fs::write(
         &workspace,
-        members.replace("\"grammar\"]", "\"grammar\", \"models/qwen3\"]"),
+        members.replace("\"grammar\"]", "\"grammar\", \"models/qwen3-embedding\"]"),
     )
     .unwrap();
     fixture.metadata["packages"]
@@ -333,19 +333,22 @@ fn qwen_family_membership_and_construction_guards_are_required() {
     );
     validate_scanned_package_membership(
         &fixture.inference,
-        &[".", "../serve", "../models/qwen3"],
+        &[".", "../serve", "../models/qwen3-embedding"],
         &fixture.metadata,
     )
     .unwrap();
-    fixture.packages =
-        scanned_packages_at(&fixture.inference, &[".", "../serve", "../models/qwen3"]).unwrap();
+    fixture.packages = scanned_packages_at(
+        &fixture.inference,
+        &[".", "../serve", "../models/qwen3-embedding"],
+    )
+    .unwrap();
     let inventory = measurement_lock_construction::scan_constructions(&fixture.packages, &[]);
     assert_eq!(inventory.discovered.len(), 1);
     assert!(
         inventory
             .discovered
             .iter()
-            .all(|site| site.starts_with("../models/qwen3:")
+            .all(|site| site.starts_with("../models/qwen3-embedding:")
                 && site.contains("src/lib.rs::tests::checkpoint::QwenModel::from_directory()#1"))
     );
     assert_eq!(inventory.discovered, inventory.classified);
