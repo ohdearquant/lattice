@@ -713,7 +713,7 @@ fn assert_helper_mediated_test_holds_function_lifetime_lock(
 #[test]
 fn mtp_draft_logit_equivalence_test_holds_a_function_lifetime_lock() {
     assert_helper_mediated_test_holds_function_lifetime_lock(
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/decode_attention.rs",
         "mtp_draft_logit_equivalence_with_quarot_counter_rotation",
     );
@@ -722,7 +722,7 @@ fn mtp_draft_logit_equivalence_test_holds_a_function_lifetime_lock() {
 #[test]
 fn metal_engine_session_isolation_test_holds_a_function_lifetime_lock() {
     assert_helper_mediated_test_holds_function_lifetime_lock(
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/mtp_verify.rs",
         "test_metal_qwen35_engine_session_isolation",
     );

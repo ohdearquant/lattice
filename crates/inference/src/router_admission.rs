@@ -10,6 +10,7 @@ mod reference;
 mod statistics;
 
 #[cfg(all(
+    feature = "qwen35",
     feature = "serving-support",
     feature = "f16",
     target_os = "macos",

@@ -4,9 +4,11 @@
 //! re-exports are named rather than globbed so the facade never widens the supported API.
 
 pub mod f16_weights {
-    pub use crate::model::qwen35::f16_loading::load_f16_weights;
     #[doc(inline)]
     pub use lattice_compute::forward::cpu::f16_matmul::matmul_bt_f16;
+    #[cfg(feature = "qwen35")]
+    #[doc(inline)]
+    pub use lattice_model_qwen35::weights::f16_weights::load_f16_weights;
     #[doc(inline)]
     pub use lattice_weights::f16_weights::{
         F16, F16AttentionWeights, F16CommonLayerWeights, F16FeedForwardWeights,
@@ -47,14 +49,11 @@ pub mod q4_weights {
 }
 
 pub mod q8_weights {
-    pub use crate::forward::cpu::q8_matmul::matmul_bt_q8;
-    pub(crate) use crate::forward::cpu::q8_matmul::{Q8MatmulScratch, matmul_bt_q8_with_scratch};
-    pub use crate::model::qwen35::q8_conversion::{
+    #[cfg(feature = "qwen35")]
+    #[doc(inline)]
+    pub use lattice_model_qwen35::weights::q8_weights::{
         Q8AttentionWeights, Q8CommonLayerWeights, Q8FullAttentionLayerWeights,
-        Q8GatedDeltaNetWeights, Q8ModelWeights, memory_report, quantize_gdn_weights,
-    };
-    pub(crate) use crate::model::qwen35::q8_conversion::{
-        quantize_model_weights, validate_cfg_len, validate_gdn_shapes,
+        Q8GatedDeltaNetWeights, Q8ModelWeights, matmul_bt_q8, memory_report, quantize_gdn_weights,
     };
     #[doc(inline)]
     pub use lattice_weights::q8_weights::{Q8Matrix, quantize_matrix};

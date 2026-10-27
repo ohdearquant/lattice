@@ -21,6 +21,7 @@ members = [
     "crates/models/qwen3",
     "crates/models/gemma4",
     "crates/models/ernie45",
+    "crates/models/qwen35",
 ]
 
 [workspace.package]
@@ -37,6 +38,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ohdearquant/lattice"
 
 [workspace.dependencies]
+lattice-fann = { version = "0.15.0", path = "crates/fann" }
+lattice-quant = { version = "0.15.0", path = "crates/quant" }
+lattice-model-qwen35 = { version = "0.15.0", path = "crates/models/qwen35" }
 # Half-precision floats
 half = { version = "2", features = ["std"] }
 
@@ -78,6 +82,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # Safe serialization
 safetensors = "0.5"
+memmap2 = "0.9"
 bytemuck = { version = "1.14", features = ["derive"] }
 
 # Arc swap

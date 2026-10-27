@@ -52,17 +52,6 @@ pub mod vision;
 /// and [`forward`].
 pub mod weights;
 
-/// Negative-scale Q4 fixture shared by every Q4 consumer's sign test.
-///
-/// Every block has a negative scale, so a consumer that drops the sign, clamps the
-/// scale at zero or otherwise reads the scale's sign computes different weights. Each
-/// consumer test runs the fixture, the same blocks with `|scale|`, and the same blocks
-/// with a zero scale: the first must match the f64 reference, and the other two, which
-/// are exactly what a sign-dropping or zero-clamping consumer would compute on the
-/// fixture, must miss it by more than ten times the tolerance.
-#[cfg(test)]
-mod signed_scale_fixture;
-
 // Standalone modules
 /// Continuous batching and scheduler support for multi-sequence inference. See [`kv_cache`]
 /// and [`model`].
@@ -95,7 +84,7 @@ pub mod router_state;
 pub(crate) mod decoder;
 /// Measurement-only seams for the per-token allocation instrument (ADR-090 D7, row R01).
 /// Compiled only with `bench-internals`; not part of the supported API.
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "qwen35", feature = "bench-internals"))]
 #[doc(hidden)]
 pub use decoder::bench_support as decoder_bench_support;
 /// Synthetic checkpoint support for repository regression tests.
@@ -128,7 +117,7 @@ pub mod kv_cache;
 /// gated rather than left as an empty shell on other builds; it also reaches
 /// `lattice-fann` for the shared effective-scale helper, and that dependency exists
 /// only under `metal-gpu` (or `mixture`). See [`lora_hook`]; `lattice-serve` is its serving caller.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[cfg(all(feature = "qwen35", target_os = "macos", feature = "metal-gpu"))]
 pub mod lora_file;
 /// LoRA adapter hook called from inference forward paths. See [`model`] and [`forward`].
 pub mod lora_hook;
@@ -153,6 +142,7 @@ pub mod mixture;
 /// shipped LRU policy plus challenger policies (ARC, sequence-local
 /// frequency admission) to measure hit-rate deltas before any engine
 /// eviction-policy change. See [`moe_admission`]'s module doc comment.
+#[cfg(feature = "qwen35")]
 pub mod moe_admission;
 /// Option-letter scoring: one prefill, with the answer read from the next-token logits at
 /// the option letters. Holds [`option_scoring::OptionScores`] and the letter helpers shared by
@@ -168,10 +158,12 @@ pub mod quant;
 /// Synthetic Qwen3.5 checkpoint support for repository regression tests.
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
-pub mod qwen35_checkpoint_fixture;
+#[cfg(feature = "qwen35")]
+#[doc(inline)]
+pub use lattice_model_qwen35::qwen35_checkpoint_fixture;
 /// Rotary position embedding tables and application helpers. See [`model`] and [`forward`].
 pub mod rope;
-/// Sampling configuration and token selection helpers. See [`model`] and [`speculative`].
+/// Sampling configuration and token selection helpers. See [`model`] and `speculative`.
 pub mod sampling;
 /// Unsupported, version-coupled interface for `lattice-serve` (ADR-103
 /// Amendment 4); not public API.
@@ -179,16 +171,10 @@ pub mod sampling;
 #[doc(hidden)]
 pub mod serving_support;
 /// N-gram prompt lookup speculative decoding. See [`sampling`] and [`model`].
+#[cfg(feature = "qwen35")]
 pub mod speculative;
 /// Generation stop reason taxonomy; see [`StopReason`] and [`model`].
 pub mod stop_reason;
-
-/// Cross-path sweep (#613): every CPU-family `generate*` entry point agrees on
-/// the stop-token contract (excluded from `token_ids`/`text`). The Metal-family
-/// entry points are covered in `forward::metal_qwen35`'s own test module; see
-/// this module's doc comment for the full manifest and rationale.
-#[cfg(test)]
-mod stop_token_contract;
 
 /// Test-support helper for the thirteen checkpoint-gated unit tests in
 /// `model::bert`, [`model::qwen`], and `model::qwen35::generation` (a
@@ -203,11 +189,6 @@ mod test_support;
 /// [`model`]. Requires the `train-backward` feature.
 #[cfg(feature = "train-backward")]
 pub mod backward;
-
-/// By-value environment switches, from `lattice-model-io` (ADR-103 Amendment 20); the
-/// crate-local path stays for this crate's Metal Qwen3.5 callers and their tests.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-pub(crate) use lattice_model_io::env_switch_enabled;
 
 // Re-exports for public API backward compatibility
 /// Root error type for inference, tokenizer, model loading, and runtime failures. See [`error`].

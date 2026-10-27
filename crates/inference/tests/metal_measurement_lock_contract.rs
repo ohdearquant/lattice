@@ -516,59 +516,59 @@ const IN_CRATE_COMMAND_BUFFER_TESTS: &[(&str, &str)] = &[
         "src/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests.rs::test_gemv_decode_numerical",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/decode_attention.rs::test_gpu_argmax_parity_k1",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/gdn_chunked_scan.rs::decode_attention_reference_fails_closed_on_nan_q",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_differential_fails_closed_on_nan_scale",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::lora_gemv_kernel_matches_cpu_reference",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::load_adapter_and_dispatch_lora_if_active",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/lora.rs::lora_rows_dispatch_matches_cpu_reference_across_rows_ranks_and_strides",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::gemv_q4_decode_honours_negative_scales",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::lm_head_block_topk_q4_honours_negative_scales",
     ),
 ];
@@ -2939,9 +2939,9 @@ fn prior_lock_owners_and_existing_bench_use_the_shared_module() {
             "use lattice_metal_runtime::measurement::gpu_test_lock;",
         ),
         (
-            ".",
+            "../models/qwen35",
             "src/forward/metal_qwen35/inner/tests.rs",
-            "use crate::measurement::gpu_test_lock;",
+            "use lattice_metal_runtime::measurement::gpu_test_lock;",
         ),
         (
             ".",

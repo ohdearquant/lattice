@@ -231,8 +231,11 @@ const RETIRED: &[&str] = &[
 ];
 
 fn population() -> GuardPopulation {
-    GuardPopulation::load(Path::new(env!("CARGO_MANIFEST_DIR")), OWNERS)
-        .expect("guarded owners and production sources must reconcile")
+    GuardPopulation::load(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../models/qwen35"),
+        OWNERS,
+    )
+    .expect("guarded owners and production sources must reconcile")
 }
 
 fn body(population: &GuardPopulation, id: &str) -> syn::Block {
@@ -546,7 +549,9 @@ fn assembled_shader(population: &GuardPopulation) -> String {
                         assert!(include.mac.path.is_ident("include_str"));
                         let relative = syn::parse2::<syn::LitStr>(include.mac.tokens)
                             .expect("shader fragment path must be literal");
-                        let owner = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+                        let owner = Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("../models/qwen35")
+                            .join(file);
                         assembly.push_str(&read_shader(
                             &owner
                                 .parent()

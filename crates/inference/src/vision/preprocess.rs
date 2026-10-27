@@ -173,3 +173,23 @@ pub fn preprocess(image_bytes: &[u8], cfg: &PreprocessConfig) -> Result<ImageTen
 
 #[cfg(all(test, feature = "image"))]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn preprocess_refuses_an_invalid_config_before_decoding() {
+    use crate::vision::preprocess::{PreprocessConfig, preprocess};
+
+    let not_an_image = b"not an image";
+    let mut zero_patch = PreprocessConfig::qwen3_vl();
+    zero_patch.patch_size = 0;
+    let mut indivisible = PreprocessConfig::qwen3_vl();
+    indivisible.image_size = indivisible.patch_size * 3 + 1;
+    let mut zero_std = PreprocessConfig::qwen3_vl();
+    zero_std.std[1] = 0.0;
+    for cfg in [zero_patch, indivisible, zero_std] {
+        assert!(matches!(
+            preprocess(not_an_image, &cfg),
+            Err(VisionError::InvalidConfig(_))
+        ));
+    }
+}

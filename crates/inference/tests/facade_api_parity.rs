@@ -1397,8 +1397,10 @@ mod model_config_parity {
         );
     }
 
+    #[cfg(feature = "qwen35")]
     fn same_fn<F>(_: F, _: F) {}
 
+    #[cfg(feature = "qwen35")]
     #[test]
     fn model_config_functions_are_the_same_function_at_both_paths() {
         same_fn(
@@ -1709,6 +1711,7 @@ mod lora_hook_parity {
             facade::gdn_lora_module_is_servable,
             extracted::gdn_lora_module_is_servable,
         );
+        #[cfg(feature = "qwen35")]
         let _: fn(
             &lattice_inference::model::qwen35_config::Qwen35Config,
             usize,
@@ -2157,8 +2160,10 @@ mod gdn_parity {
     #[test]
     #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
     fn gdn_configuration_steps_keep_their_facade_signatures() {
+        #[cfg(feature = "qwen35")]
         use lattice_inference::model::qwen35_config::Qwen35Config;
 
+        #[cfg(feature = "qwen35")]
         let _: fn(
             &[f32],
             &mut facade::gdn::GatedDeltaNetState,
@@ -2167,6 +2172,7 @@ mod gdn_parity {
             &mut facade::gdn::GatedDeltaNetScratch,
             &mut [f32],
         ) = facade::gdn::gated_delta_net_step;
+        #[cfg(feature = "qwen35")]
         let _: fn(
             &[f32],
             &mut facade::gdn::GatedDeltaNetState,
@@ -2644,4 +2650,145 @@ fn ernie45_items_keep_family_identity() {
     assert_eq!(cache.kv_dim(), 4);
     assert_eq!(cache.capacity(), 5);
     assert!(cache.is_empty());
+}
+
+fn same_qwen35_item<T>(_: T, _: T) {}
+
+#[test]
+fn qwen35_grid_keeps_neutral_identity() {
+    let neutral = lattice_arch::multimodal::GridThw { t: 2, h: 3, w: 4 };
+    let facade: lattice_inference::vision::qwen35_vit::GridThw = neutral;
+    same_qwen35_item(neutral, facade);
+    assert_eq!(facade.num_patches(), 24);
+}
+
+#[cfg(feature = "qwen35")]
+#[test]
+fn qwen35_cpu_items_keep_family_identity() {
+    use lattice_inference::vision::{
+        checkpoint as facade_weights, qwen35_merger as facade_merger, qwen35_vit as facade_vit,
+    };
+    use lattice_model_qwen35::vision::{
+        checkpoint as family_weights, qwen35_merger as family_merger, qwen35_vit as family_vit,
+    };
+    same_qwen35_item(
+        None::<facade_weights::Qwen35VisionWeights>,
+        None::<family_weights::Qwen35VisionWeights>,
+    );
+    same_qwen35_item(
+        None::<facade_weights::VisualBlockWeights>,
+        None::<family_weights::VisualBlockWeights>,
+    );
+    same_qwen35_item(
+        None::<facade_weights::VisualMergerWeights>,
+        None::<family_weights::VisualMergerWeights>,
+    );
+    same_qwen35_item(None::<facade_vit::GridThw>, None::<family_vit::GridThw>);
+    same_qwen35_item(
+        facade_weights::load_qwen35_vision_weights,
+        family_weights::load_qwen35_vision_weights,
+    );
+    same_qwen35_item(
+        facade_weights::load_qwen35_vision_weights_from_safetensors,
+        family_weights::load_qwen35_vision_weights_from_safetensors,
+    );
+    same_qwen35_item(
+        facade_weights::validate_qwen35_vision_weight_inventory,
+        family_weights::validate_qwen35_vision_weight_inventory,
+    );
+    same_qwen35_item(
+        facade_weights::resolve_qwen35_single_decoder_safetensors,
+        family_weights::resolve_qwen35_single_decoder_safetensors,
+    );
+    same_qwen35_item(
+        facade_weights::open_qwen35_single_decoder_safetensors,
+        family_weights::open_qwen35_single_decoder_safetensors,
+    );
+    same_qwen35_item(
+        facade_vit::preprocess_qwen35_image,
+        family_vit::preprocess_qwen35_image,
+    );
+    same_qwen35_item(
+        facade_vit::preprocess_qwen35_image_for_serve,
+        family_vit::preprocess_qwen35_image_for_serve,
+    );
+    same_qwen35_item(
+        facade_vit::preprocess_qwen35_image_for_embedding_serve,
+        family_vit::preprocess_qwen35_image_for_embedding_serve,
+    );
+    same_qwen35_item(
+        facade_vit::qwen35_vit_forward,
+        family_vit::qwen35_vit_forward,
+    );
+    same_qwen35_item(
+        facade_merger::qwen35_merger_forward,
+        family_merger::qwen35_merger_forward,
+    );
+}
+
+#[cfg(feature = "qwen35")]
+#[test]
+#[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+fn qwen35_supplied_rows_keep_the_family_contract() {
+    use lattice_inference::vision::multimodal::Qwen35VisionRequest;
+    use lattice_inference::vision::qwen35_vit::GridThw;
+    let request = Qwen35VisionRequest {
+        input_ids: vec![9],
+        image_grids: vec![GridThw { t: 1, h: 2, w: 2 }],
+        post_merger_rows: vec![0.25, -0.75],
+        image_token_id: 9,
+        spatial_merge_size: 2,
+        decoder_hidden_size: 2,
+    };
+    request
+        .validate()
+        .expect("external visual rows remain valid with the owning family");
+    let _: fn(
+        &lattice_inference::weights::f16_weights::F16ModelWeights,
+        &lattice_inference::model::qwen35_config::Qwen35Config,
+        &Qwen35VisionRequest,
+    ) -> Result<Vec<f32>, lattice_inference::error::InferenceError> =
+        lattice_inference::forward::cpu_f16::prefill_hidden_states_f16;
+    let _: fn(
+        &lattice_inference::weights::f16_weights::F16ModelWeights,
+        &lattice_inference::model::qwen35_config::Qwen35Config,
+        &lattice_inference::tokenizer::bpe::BpeTokenizer,
+        &str,
+        lattice_inference::forward::cpu_f16::PoolingStrategy,
+    ) -> Result<Vec<f32>, lattice_inference::error::InferenceError> =
+        lattice_inference::forward::cpu_f16::embed_text_vlm_f16;
+}
+
+#[cfg(feature = "qwen35")]
+#[test]
+#[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+fn qwen35_model_backend_and_cpu_paths_keep_family_identity() {
+    use lattice_inference::{forward, model};
+    use lattice_model_qwen35 as family;
+    use std::marker::PhantomData;
+    let _: PhantomData<family::model::qwen35::Qwen35Model> = PhantomData::<model::Qwen35Model>;
+    let _: PhantomData<family::model::qwen35::ModelWeights> =
+        PhantomData::<model::qwen35::ModelWeights>;
+    let _: PhantomData<family::family::Qwen35CpuDecoder> =
+        PhantomData::<lattice_inference::family::Qwen35CpuDecoder>;
+    let _: PhantomData<family::forward::metal_qwen35::MetalQwen35State> =
+        PhantomData::<forward::metal_qwen35::MetalQwen35State>;
+    let _: PhantomData<family::forward::metal_qwen35::ChatMessage> =
+        PhantomData::<forward::metal_qwen35::ChatMessage>;
+    let _: PhantomData<family::forward::metal_qwen35::ChatRole> =
+        PhantomData::<forward::metal_qwen35::ChatRole>;
+    let _: PhantomData<family::vision::multimodal::Qwen35VisionRequest> =
+        PhantomData::<lattice_inference::vision::multimodal::Qwen35VisionRequest>;
+    let _: PhantomData<family::forward::cpu_f16::PoolingStrategy> =
+        PhantomData::<forward::cpu_f16::PoolingStrategy>;
+    let old: fn(&[forward::metal_qwen35::ChatMessage]) -> String =
+        forward::metal_qwen35::format_chat_template;
+    let new: fn(&[family::forward::metal_qwen35::ChatMessage]) -> String =
+        family::forward::metal_qwen35::format_chat_template;
+    assert!(std::ptr::fn_addr_eq(old, new));
+    let old: fn(&[f32], &[f32], &mut [f32], usize, usize, usize) -> bool =
+        forward::metal_gemm::metal_matmul;
+    let new: fn(&[f32], &[f32], &mut [f32], usize, usize, usize) -> bool =
+        family::forward::metal_gemm::metal_matmul;
+    assert!(std::ptr::fn_addr_eq(old, new));
 }
