@@ -6,12 +6,6 @@ generic, query, or document/passage semantic role. Native builds provide two imp
 `NativeEmbeddingService`, which owns a lazily loaded local model, and
 `CachedEmbeddingService`, which wraps any service with a process-local LRU.
 
-Native builds also expose the first dormant contracts for proposed ADR-088:
-`CheckpointAttestor`, `AttestationAlgorithm`, `SupplementaryAttestationEvidence`, and
-`NativeResourceBudget`. These values bound a future sealed-preparation protocol, but this slice
-does not expose a preparer or a prepared service and does not change either existing
-implementation's load or encode path.
-
 The trait is the stable integration surface. Constructors and cache-management APIs on the
 native implementations are marked unstable and may change independently of the trait.
 
@@ -326,8 +320,6 @@ native embedding call.
 | `DimensionMismatch`      | An operation received vectors of different expected and actual dimensions           | Keep model/config/index namespaces consistent                                    |
 | `UnsupportedModel`       | The selected service cannot provide that model                                      | Select a capable service or model                                                |
 | `Unsupported`            | The service does not implement the requested operation (a default trait method)     | Choose a service that implements it, or fall back to the methods it does provide |
-| `AttestationReportSize`  | A caller attestor returned fewer than 1 or more than 4,096 report bytes             | Fix or reconfigure the attestor; do not retry the same output unchanged          |
-| `ResourceBudgetOverflow` | Retained and transient-work pool ceilings cannot be summed in `u64`                 | Reduce one or both explicit resource ceilings                                    |
 | `Internal`               | An invariant failed, such as a missing single-item result                           | Treat as a bug report; do not synthesize a vector                                |
 | `TierMismatch`           | Prepared SIMD quantization data used a different tier than the operation expects    | Reprepare/query with matching quantization metadata                              |
 
