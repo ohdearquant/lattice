@@ -858,3 +858,161 @@ fn try_with_prefix_cache_oversized_prefix_geometry_returns_invalid_input() {
         "expected InvalidInput on oversized prefix geometry, got {r:?}"
     );
 }
+
+fn small_identity_cache() -> (PagedKVCacheConfig, Arc<Mutex<PrefixPageCache>>) {
+    let config = PagedKVCacheConfig {
+        page_size: 2,
+        max_pages: 2,
+        num_layers: 1,
+        num_kv_heads: 1,
+        head_dim: 1,
+        eviction: EvictionPolicy::None,
+    };
+    let prefix_cache = Arc::new(Mutex::new(PrefixPageCache::new(PrefixPageCacheConfig {
+        capacity: 2,
+        prefix_page_size: 2,
+        num_layers: 1,
+        num_kv_heads: 1,
+        head_dim: 1,
+    })));
+    (config, prefix_cache)
+}
+
+#[test]
+fn prefix_identity_mismatch_leaves_destination_storage_unchanged() {
+    let (config, prefix_cache) = small_identity_cache();
+    let tokens_a = [1, 2];
+    let tokens_b = [7, 8];
+    let mut source =
+        PagedKVCache::with_prefix_cache(config.clone(), Some(Arc::clone(&prefix_cache)));
+    for (k, v) in [(10.0, 110.0), (20.0, 120.0)] {
+        source.append_kv_layer(0, &[k], &[v]);
+        source.advance();
+    }
+    assert_eq!(
+        source
+            .promote_to_prefix(AdapterId::BASE, &tokens_a)
+            .expect("promotion"),
+        Some(1)
+    );
+    {
+        let mut guard = prefix_cache.lock().expect("prefix mutex");
+        // Keep promoted A identity/pages but select them with B's ordinary key.
+        guard.rekey_candidate_for_test(
+            PrefixKey::from_token_ids(AdapterId::BASE, &tokens_a),
+            PrefixKey::from_token_ids(AdapterId::BASE, &tokens_b),
+        );
+        let candidate = guard
+            .lookup(&PrefixKey::from_token_ids(AdapterId::BASE, &tokens_b))
+            .expect("candidate selected");
+        assert_eq!(candidate.prefix_len, tokens_b.len());
+        assert_eq!(candidate.prefix_page_size, 2);
+        assert_eq!(candidate.pages.len(), 1);
+        assert_eq!(candidate.pages[0].as_slice(), &[10.0, 20.0, 110.0, 120.0]);
+    }
+    let mut target = PagedKVCache::with_prefix_cache(config, Some(prefix_cache));
+    match &mut target.pool {
+        PagedPagePool::F32(pool) => pool.data.fill(-7.0),
+        PagedPagePool::Q8(_) => panic!("fixture must use F32"),
+    }
+
+    let error = target
+        .restore_prefix(AdapterId::BASE, &tokens_b)
+        .expect_err("identity refusal");
+
+    assert!(matches!(error, InferenceError::PrefixCache(ref message)
+        if message == "prefix token identity mismatch"));
+    assert_eq!(target.seq_len(), 0);
+    assert_eq!(target.num_pages(), 0);
+    assert_eq!(target.free_pages(), 2);
+    assert!(target.table.entries.is_empty());
+    assert_eq!(target.table.seq_len, 0);
+    assert_eq!(target.table.page_size, 2);
+    assert!(target.lru_order.is_empty());
+    match &target.pool {
+        PagedPagePool::F32(pool) => {
+            assert_eq!(pool.data, vec![-7.0; 8]);
+            assert_eq!(pool.free_list, vec![1, 0]);
+        }
+        PagedPagePool::Q8(_) => panic!("fixture must use F32"),
+    }
+}
+
+#[test]
+fn promoted_prefix_identity_restores_literal_kv_values() {
+    let (config, prefix_cache) = small_identity_cache();
+    let tokens = [1, 2];
+    let mut source =
+        PagedKVCache::with_prefix_cache(config.clone(), Some(Arc::clone(&prefix_cache)));
+    source.append_kv_layer(0, &[10.0], &[110.0]);
+    source.advance();
+    source.append_kv_layer(0, &[20.0], &[120.0]);
+    source.advance();
+    assert_eq!(
+        source
+            .promote_to_prefix(AdapterId::BASE, &tokens)
+            .expect("promotion"),
+        Some(1)
+    );
+    let mut target = PagedKVCache::with_prefix_cache(config, Some(prefix_cache));
+    assert_eq!(
+        target
+            .restore_prefix(AdapterId::new(42), &tokens)
+            .expect("different adapter misses"),
+        None
+    );
+    assert_eq!(target.seq_len(), 0);
+    assert_eq!(target.free_pages(), 2);
+
+    assert_eq!(
+        target
+            .restore_prefix(AdapterId::BASE, &tokens)
+            .expect("verified hit"),
+        Some(2)
+    );
+
+    assert_eq!(target.seq_len(), 2);
+    assert_eq!(target.num_pages(), 1);
+    assert_eq!(target.free_pages(), 1);
+    let mut k = [0.0; 2];
+    let mut v = [0.0; 2];
+    target.gather_k(0, &mut k);
+    target.gather_v(0, &mut v);
+    assert_eq!(k, [10.0, 20.0]);
+    assert_eq!(v, [110.0, 120.0]);
+}
+
+#[test]
+fn legacy_prefix_entry_is_a_miss_before_destination_allocation() {
+    let (config, prefix_cache) = small_identity_cache();
+    let tokens = [1, 2];
+    prefix_cache.lock().expect("prefix mutex").insert(
+        PrefixKey::from_token_ids(AdapterId::BASE, &tokens),
+        2,
+        vec![SharedPageRef::from_vec(vec![10.0, 20.0, 110.0, 120.0])],
+    );
+    let mut target = PagedKVCache::with_prefix_cache(config, Some(prefix_cache));
+    match &mut target.pool {
+        PagedPagePool::F32(pool) => pool.data.fill(-7.0),
+        PagedPagePool::Q8(_) => panic!("fixture must use F32"),
+    }
+
+    assert_eq!(
+        target
+            .restore_prefix(AdapterId::BASE, &tokens)
+            .expect("unverified miss"),
+        None
+    );
+
+    assert_eq!(target.seq_len(), 0);
+    assert!(target.table.entries.is_empty());
+    assert!(target.lru_order.is_empty());
+    assert_eq!(target.free_pages(), 2);
+    match &target.pool {
+        PagedPagePool::F32(pool) => {
+            assert_eq!(pool.data, vec![-7.0; 8]);
+            assert_eq!(pool.free_list, vec![1, 0]);
+        }
+        PagedPagePool::Q8(_) => panic!("fixture must use F32"),
+    }
+}
