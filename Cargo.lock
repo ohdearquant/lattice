@@ -1619,7 +1619,7 @@ dependencies = [
  "lattice-inference-core",
  "lattice-model-bert",
  "lattice-model-embeddinggemma2",
- "lattice-model-qwen3",
+ "lattice-model-qwen3-embedding",
  "lattice-model-qwen35",
  "lattice-tokenizer",
  "lattice-transport",
@@ -1703,7 +1703,7 @@ dependencies = [
  "lattice-model-ernie45",
  "lattice-model-gemma4",
  "lattice-model-io",
- "lattice-model-qwen3",
+ "lattice-model-qwen3-embedding",
  "lattice-model-qwen35",
  "lattice-quant",
  "lattice-router",
@@ -1839,7 +1839,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lattice-model-qwen3"
+name = "lattice-model-qwen3-embedding"
 version = "0.15.0"
 dependencies = [
  "lattice-arch",
