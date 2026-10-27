@@ -704,11 +704,11 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area        | Files | Code   | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ------ | ------- | ----- | ----- | ----------- | -------- |
-| `src/`      | 387   | 161987 | 31435   | 14178 | 2407  | 1281        | 235      |
-| `tests/`    | 92    | 30282  | 3472    | 2218  | 498   | 86          | 17       |
+| `src/`      | 387   | 161988 | 31435   | 14178 | 2407  | 1281        | 235      |
+| `tests/`    | 92    | 30286  | 3472    | 2218  | 498   | 86          | 17       |
 | `benches/`  | 27    | 10323  | 1353    | 1082  | 0     | 1           | 28       |
 | `examples/` | 35    | 8381   | 1041    | 958   | 14    | 0           | 26       |
-| total       | 541   | 210973 | 37301   | 18436 | 2919  | 1368        | 306      |
+| total       | 541   | 210978 | 37301   | 18436 | 2919  | 1368        | 306      |
 
 Other tracked files (the README excluded):
 
@@ -875,31 +875,31 @@ ADRs under `docs/adr/` that name `lattice-inference` or `crates/inference/`:
 
 The newest Criterion point estimates `bench-update.yml` stored on the `perf-baselines` branch, from the `elementwise_cpu_bench` target. They come from GitHub-hosted runners and serve as trend data between commits, not as a performance claim; a claim needs a paired A/B (`make bench-compare`).
 
-- `aarch64-linux`: commit `9487ae701021`, recorded 2026-10-26T14:29:30+00:00
-- `x86_64-linux`: commit `9487ae701021`, recorded 2026-10-26T14:30:15+00:00
+- `aarch64-linux`: commit `33aaa9a80a49`, recorded 2026-10-26T23:09:34+00:00
+- `x86_64-linux`: commit `33aaa9a80a49`, recorded 2026-10-26T23:11:50+00:00
 
 <details>
 <summary>17 benchmarks</summary>
 
 | Benchmark                                          | `aarch64-linux` | `x86_64-linux` |
 | -------------------------------------------------- | --------------- | -------------- |
-| `add_bias_gelu/4096`                               | 6.36 µs         | 2.57 µs        |
-| `add_bias_gelu/896`                                | 1.40 µs         | 551.3 ns       |
-| `elementwise_mul/4096`                             | 377.1 ns        | 266.6 ns       |
-| `gelu/4096`                                        | 6.12 µs         | 2.36 µs        |
-| `gelu/896`                                         | 1.34 µs         | 504.0 ns       |
-| `layer_norm/4096`                                  | 1.27 µs         | 694.1 ns       |
-| `layer_norm/896`                                   | 288.4 ns        | 156.7 ns       |
-| `residual_add_layer_norm/fused/hidden384_seq128`   | 21.74 µs        | 11.84 µs       |
-| `residual_add_layer_norm/fused/hidden768_seq128`   | 43.50 µs        | 21.05 µs       |
-| `residual_add_layer_norm/unfused/hidden384_seq128` | 62.06 µs        | 57.50 µs       |
-| `residual_add_layer_norm/unfused/hidden768_seq128` | 123.20 µs       | 105.29 µs      |
-| `rms_norm/4096`                                    | 573.7 ns        | 755.1 ns       |
-| `rms_norm/896`                                     | 136.3 ns        | 207.4 ns       |
-| `silu_inplace/4096`                                | 4.91 µs         | 11.10 µs       |
-| `silu_inplace/896`                                 | 1.08 µs         | 2.48 µs        |
-| `softmax_attention/128`                            | 20.80 µs        | 9.73 µs        |
-| `softmax_attention/512`                            | 326.58 µs       | 144.25 µs      |
+| `add_bias_gelu/4096`                               | 6.37 µs         | 2.81 µs        |
+| `add_bias_gelu/896`                                | 1.40 µs         | 617.8 ns       |
+| `elementwise_mul/4096`                             | 378.1 ns        | 321.3 ns       |
+| `gelu/4096`                                        | 6.12 µs         | 2.59 µs        |
+| `gelu/896`                                         | 1.34 µs         | 562.7 ns       |
+| `layer_norm/4096`                                  | 1.27 µs         | 739.8 ns       |
+| `layer_norm/896`                                   | 288.6 ns        | 165.0 ns       |
+| `residual_add_layer_norm/fused/hidden384_seq128`   | 21.67 µs        | 14.01 µs       |
+| `residual_add_layer_norm/fused/hidden768_seq128`   | 43.37 µs        | 23.96 µs       |
+| `residual_add_layer_norm/unfused/hidden384_seq128` | 59.03 µs        | 57.68 µs       |
+| `residual_add_layer_norm/unfused/hidden768_seq128` | 117.47 µs       | 113.05 µs      |
+| `rms_norm/4096`                                    | 573.6 ns        | 790.9 ns       |
+| `rms_norm/896`                                     | 136.7 ns        | 210.1 ns       |
+| `silu_inplace/4096`                                | 4.91 µs         | 12.46 µs       |
+| `silu_inplace/896`                                 | 1.08 µs         | 2.71 µs        |
+| `softmax_attention/128`                            | 20.76 µs        | 10.48 µs       |
+| `softmax_attention/512`                            | 325.60 µs       | 160.60 µs      |
 
 </details>
 
