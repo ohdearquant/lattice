@@ -164,6 +164,7 @@ required-features = ["f16", "metal-gpu", "qwen35"]
 [[test]]
 name = "cpu_pre_migration_greedy_golden"
 test = false
+required-features = ["qwen35"]
 
 # ADR-090 R03 row D, the allocation half of the pair evidence. Excluded for two
 # independent reasons, either sufficient. It declares a `#[global_allocator]`,
@@ -184,15 +185,12 @@ test = false
 # `--all-targets` COMPILES a `test = false` target without ever RUNNING it. The
 # module boundary, rather than a `--skip` of the measurement, is what keeps a
 # checkpoint-needing test added later from being dragged into that CI step.
-required-features = ["qwen35"]
-
 [[test]]
 name = "decoder_allocation_arm"
 test = false
-
-# The shared benchmark allocator needs a standalone, single-threaded control process.
 required-features = ["qwen35"]
 
+# The shared benchmark allocator needs a standalone, single-threaded control process.
 [[test]]
 name = "inference_perf_allocation_gate"
 harness = false
