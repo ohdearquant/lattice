@@ -5,7 +5,7 @@
 //! apply. This module runs synchronously. See `docs/design.md` for the WebAssembly boundary.
 
 use lattice_compute::pool::BertPooling;
-use lattice_inference::BertModel;
+use lattice_model_bert::BertModel;
 use wasm_bindgen::prelude::*;
 
 /// Installs console-backed panic diagnostics for browser embeddings.
