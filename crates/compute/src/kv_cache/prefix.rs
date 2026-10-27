@@ -233,7 +233,7 @@ impl PrefixPageCache {
     /// data into a live `PagePool`.
     pub fn lookup(&mut self, key: &PrefixKey) -> Option<PrefixEntry> {
         let last_used = self.next_clock();
-        let mut entry = self.entries.swap_remove(key)?;
+        let mut entry = self.entries.shift_remove(key)?;
         entry.entry.last_used = last_used;
         let cloned = entry.entry.clone();
         self.entries.insert(*key, entry);
@@ -323,7 +323,7 @@ impl PrefixPageCache {
         self.validate_entry(&stored.entry);
         let last_used = self.next_clock();
         stored.entry.last_used = last_used;
-        let replaced = self.entries.swap_remove(&key);
+        let replaced = self.entries.shift_remove(&key);
         self.entries.insert(key, stored);
         self.evict_until_within_capacity();
         replaced.map(|stored| stored.entry)
