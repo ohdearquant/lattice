@@ -1802,10 +1802,36 @@ fn forward_reference(text: &str) -> &'static ForwardReference {
         .unwrap()
 }
 
-fn assert_forward_bits(actual: &[f32], expected: &[u32]) {
+// The references were captured on aarch64 macOS. Other targets use different matmul kernels that
+// round differently (a few ULP on Linux aarch64), so a reference comparison allows a small ULP
+// distance; agreement between entry points on one target is checked exactly by `assert_same_bits`.
+const REFERENCE_MAX_ULP: u32 = 64;
+const REFERENCE_ABS_FLOOR: f32 = 1e-6;
+
+fn assert_matches_reference(actual: &[f32], expected: &[u32]) {
     assert_eq!(actual.len(), expected.len());
     for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-        assert_eq!(actual.to_bits(), *expected, "element {index}");
+        let expected = f32::from_bits(*expected);
+        assert!(
+            actual.is_finite(),
+            "element {index} is not finite: {actual}"
+        );
+        if (actual - expected).abs() <= REFERENCE_ABS_FLOOR {
+            continue;
+        }
+        let same_sign = actual.is_sign_negative() == expected.is_sign_negative();
+        let ulps = actual.to_bits().abs_diff(expected.to_bits());
+        assert!(
+            same_sign && ulps <= REFERENCE_MAX_ULP,
+            "element {index}: {actual} vs reference {expected} ({ulps} ULP apart)"
+        );
+    }
+}
+
+fn assert_same_bits(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(actual.to_bits(), expected.to_bits(), "element {index}");
     }
 }
 
@@ -1819,14 +1845,14 @@ fn ordinary_forward_matches_base_bits() {
         let expected = forward_reference(text);
         assert_eq!(ids.as_slice(), expected.ids);
         assert_eq!(seq_len, expected.seq_len);
-        assert_forward_bits(&model.forward(&ids, seq_len), expected.final_hidden);
-        assert_forward_bits(&model.encode(text).unwrap(), expected.pooled);
+        assert_matches_reference(&model.forward(&ids, seq_len), expected.final_hidden);
+        assert_matches_reference(&model.encode(text).unwrap(), expected.pooled);
         expected_batch.push(expected.pooled);
     }
     let actual_batch = model.encode_batch(&inputs).unwrap();
     assert_eq!(actual_batch.len(), expected_batch.len());
     for (actual, expected) in actual_batch.iter().zip(&expected_batch) {
-        assert_forward_bits(actual, expected);
+        assert_matches_reference(actual, expected);
     }
 }
 
@@ -1842,14 +1868,15 @@ fn all_layer_forward_matches_base_ordinary_trace_bits() {
         assert_eq!(actual_trace.len(), 2);
         assert_eq!(actual_trace.len(), expected.prenorm_hidden.len());
         for (actual, expected) in actual_trace.iter().zip(&expected.prenorm_hidden) {
-            assert_forward_bits(actual, expected);
+            assert_matches_reference(actual, expected);
         }
         let encoded = model.encode_all_layers(text).unwrap();
         assert_eq!(encoded.len(), expected.layer_embeddings.len());
         for (actual, expected) in encoded.iter().zip(&expected.layer_embeddings) {
-            assert_forward_bits(actual, expected);
+            assert_matches_reference(actual, expected);
         }
-        assert_forward_bits(encoded.last().unwrap(), expected.pooled);
+        assert_matches_reference(encoded.last().unwrap(), expected.pooled);
+        assert_same_bits(encoded.last().unwrap(), &model.encode(text).unwrap());
     }
 }
 
@@ -1863,10 +1890,12 @@ fn profiled_forward_matches_base_ordinary_bits() {
         assert_eq!(seq_len, expected.seq_len);
         let (hidden, layers) =
             model.forward_profiled(&ids, seq_len, &mut ProfileTimings::default());
-        assert_forward_bits(&hidden, expected.final_hidden);
+        assert_matches_reference(&hidden, expected.final_hidden);
+        assert_same_bits(&hidden, &model.forward(&ids, seq_len));
         assert_eq!(layers.len(), 2);
         let (encoded, timings) = model.encode_profiled(text).unwrap();
-        assert_forward_bits(&encoded, expected.pooled);
+        assert_matches_reference(&encoded, expected.pooled);
+        assert_same_bits(&encoded, &model.encode(text).unwrap());
         assert_eq!(timings.layers.len(), 2);
     }
 }
@@ -1897,7 +1926,8 @@ fn profiled_short_prefill_ignores_retained_buffer_tails() {
         assert_eq!(seq_len, expected.seq_len);
         let (actual, layers) =
             model.forward_profiled(&ids, seq_len, &mut ProfileTimings::default());
-        assert_forward_bits(&actual, expected.final_hidden);
+        assert_matches_reference(&actual, expected.final_hidden);
+        assert_same_bits(&actual, &build_forward_test_model().forward(&ids, seq_len));
         assert_eq!(layers.len(), 2);
     }
 }
