@@ -1599,6 +1599,7 @@ mod compute_parity {
     }
 
     #[test]
+    #[allow(deprecated)] // `plan_prefix_reuse` is deprecated; its re-export must still name the same item
     fn prefix_cache_functions_are_the_same_items_at_both_paths() {
         same_function(
             lattice_inference::kv_cache::longest_common_token_prefix,
