@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::statistics::AdmissionContract;
-use crate::router_refit::{RefitCandidate, RefitSource};
+use crate::refit::{RefitCandidate, RefitSource};
 
 /// One operator-provided single-user prompt and its teacher-forced completion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,12 +372,12 @@ mod scoring {
     ))]
     pub(super) mod metal {
         use super::*;
-        use crate::forward::metal_qwen35::{
+        use lattice_fann::lora::LoraDescriptor;
+        use lattice_model_qwen35::forward::metal_qwen35::{
             ChatMessage, LoraLayerData, MetalQwen35State, blend_lora_layer_data,
             format_chat_template,
         };
-        use crate::tokenizer::{Tokenizer, bpe::BpeTokenizer};
-        use lattice_fann::lora::LoraDescriptor;
+        use lattice_tokenizer::{Tokenizer, bpe::BpeTokenizer};
         use std::collections::HashSet;
 
         /// The routing embedder the scorer drives, bound to the identity the
@@ -440,14 +440,14 @@ mod scoring {
             source: &RefitSource,
             adapters: &[ReferenceAdapter<'_>],
         ) -> Result<Vec<ReferencePayloadSummary>, ReferenceError> {
-            use crate::quant::quarot::plan::AbsorptionSide;
+            use lattice_quant::quarot::plan::AbsorptionSide;
             let cfg = lattice_model_qwen35::__internal::engine_config(state);
             if adapters.len() != source.adapter_names().len() || adapters.is_empty() {
                 return Err(invalid(
                     "payload set differs from the trained adapter schema",
                 ));
             }
-            let plan = crate::quant::quarot::plan::qwen35_residual_stream_linear_layers();
+            let plan = lattice_quant::quarot::plan::qwen35_residual_stream_linear_layers();
             let mut summaries = Vec::new();
             for (adapter, name) in adapters.iter().zip(source.adapter_names()) {
                 if adapter.name != name || adapter.layers.is_empty() || adapter.descriptor.rank == 0
@@ -512,12 +512,12 @@ mod scoring {
                     {
                         return Err(invalid("invalid or duplicate adapter projection"));
                     }
-                    if crate::lora_hook::GDN_LORA_MODULES.contains(&layer.module.as_str())
-                        && !crate::lora_hook::gdn_lora_module_is_servable(&layer.module)
+                    if lattice_compute::lora_hook::GDN_LORA_MODULES.contains(&layer.module.as_str())
+                        && !lattice_compute::lora_hook::gdn_lora_module_is_servable(&layer.module)
                     {
                         return Err(invalid("adapter projection is unsupported by Metal"));
                     }
-                    let shape = crate::lora_hook::qwen35_projection_shape(
+                    let shape = lattice_model_qwen35::lora_hook::qwen35_projection_shape(
                         cfg,
                         layer.layer_idx,
                         &layer.module,
@@ -670,6 +670,7 @@ mod scoring {
         /// they are not cryptographic attestations of checkpoint bytes. Every payload
         /// bit is hashed. The state is reset and unloaded on success or any fallible
         /// scoring exit. An already loaded adapter is refused without mutation.
+        #[allow(clippy::too_many_arguments)]
         pub fn score_metal_reference<E: ReferenceEmbedder>(
             source: &RefitSource,
             candidate: &RefitCandidate,
@@ -862,7 +863,7 @@ mod scoring {
         #[cfg(test)]
         mod tests {
             use super::*;
-            use crate::measurement::gpu_test_lock;
+            use lattice_metal_runtime::measurement::gpu_test_lock;
 
             #[test]
             fn reference_scoring_metal_blend_changes_nll_and_cleans_up() {
@@ -1033,7 +1034,7 @@ mod scoring {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::tokenizer::bpe::BpeTokenizer;
+        use lattice_tokenizer::bpe::BpeTokenizer;
         struct Fake {
             rows: std::collections::VecDeque<Result<Vec<f32>, ReferenceError>>,
             calls: Vec<(Vec<u32>, Option<usize>)>,

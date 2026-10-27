@@ -22,6 +22,7 @@ members = [
     "crates/models/gemma4",
     "crates/models/ernie45",
     "crates/models/qwen35",
+    "crates/router",
 ]
 
 [workspace.package]

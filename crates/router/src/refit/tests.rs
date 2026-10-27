@@ -1,6 +1,6 @@
 use super::*;
-use crate::router_refit::test_router::LiveRouter;
-use crate::router_state::{RouterArtifact, RouterLineage, RouterProvenance};
+use crate::refit::test_router::LiveRouter;
+use crate::state::{RouterArtifact, RouterLineage, RouterProvenance};
 use lattice_fann::{Activation, Layer};
 
 fn artifact() -> RouterArtifact {

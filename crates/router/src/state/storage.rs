@@ -549,9 +549,9 @@ fn publish_recorded_locked(
 #[cfg(any(feature = "mixture", feature = "metal-gpu"))]
 pub(crate) fn publish_bootstrap(
     dir: &Path,
-    spec: &crate::router_init::BootstrapSpec,
-) -> Result<PathBuf, crate::router_init::RouterInitError> {
-    use crate::router_init::{RouterInitError, bootstrap_artifact};
+    spec: &crate::init::BootstrapSpec,
+) -> Result<PathBuf, crate::init::RouterInitError> {
+    use crate::init::{RouterInitError, bootstrap_artifact};
     let artifact = bootstrap_artifact(spec)?;
     let _lock = writer_lock(dir)?;
     let present = versions(dir)?;

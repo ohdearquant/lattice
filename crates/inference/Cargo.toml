@@ -45,7 +45,7 @@ bins = [
 ]
 
 [features]
-qwen35 = ["dep:lattice-model-qwen35"]
+qwen35 = ["dep:lattice-model-qwen35", "lattice-router/qwen35"]
 default = ["std", "download", "image", "bert", "embeddinggemma2", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "qwen35"]
 bert = ["dep:lattice-model-bert"]
 gemma4 = ["dep:lattice-model-gemma4"]
@@ -57,15 +57,15 @@ paddleocr-vl = ["ernie45", "lattice-model-ernie45?/paddleocr-vl"]
 # Amendment 4): the hidden `serving_support` module and the router items it
 # needs. Off by default; `lattice-serve` depends on this crate with an exact
 # version and enables it. Not part of the public API.
-serving-support = ["lattice-model-gemma4?/serving-support", "lattice-model-qwen35?/serving-support"]
+serving-support = ["lattice-model-gemma4?/serving-support", "lattice-model-qwen35?/serving-support", "lattice-router/serving-support"]
 std = ["lattice-model-bert?/std"]
 # Encoded PNG/JPEG input; raw image tensors remain available without decoding.
 image = ["dep:image", "lattice-model-io/image", "lattice-model-embeddinggemma2?/image", "lattice-model-ernie45?/image", "lattice-model-qwen35?/image"]
-f16 = ["lattice-weights/f16", "lattice-model-bert?/f16", "lattice-model-gemma4?/f16", "lattice-model-ernie45?/f16", "lattice-model-qwen35?/f16"]
+f16 = ["lattice-weights/f16", "lattice-router/f16", "lattice-model-bert?/f16", "lattice-model-gemma4?/f16", "lattice-model-ernie45?/f16", "lattice-model-qwen35?/f16"]
 # lattice-fann supplies the shared LoRA descriptor/blend-validation module
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
 # be present whenever this feature is — not just under `mixture`.
-metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu", "lattice-model-embeddinggemma2?/metal-gpu", "lattice-model-qwen3?/metal-gpu", "lattice-model-ernie45?/metal-gpu", "lattice-model-qwen35?/metal-gpu"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu", "lattice-model-embeddinggemma2?/metal-gpu", "lattice-model-qwen3?/metal-gpu", "lattice-model-ernie45?/metal-gpu", "lattice-model-qwen35?/metal-gpu", "lattice-router/metal-gpu"]
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 bench-internals = ["lattice-compute/bench-internals", "lattice-grammar/bench-internals", "lattice-model-qwen35?/bench-internals"]
 # Stock `gemm` for multi-row `matmul_bt` on Linux x86_64 (ADR-099 F1, step 1). Off by default.
@@ -79,9 +79,9 @@ train-backward = ["lattice-model-qwen35?/train-backward"]
 # available under `metal-gpu`. blend_lora_layer_data now depends on
 # lattice-fann too (issue #615), but that dep is already pulled in by
 # `metal-gpu` itself, so this feature only adds the routing module.
-mixture = ["dep:lattice-fann"]
+mixture = ["dep:lattice-fann", "lattice-router/mixture"]
 # Enables the bounded router trainer for qualification; serving remains opt-in.
-router-learning = ["mixture", "lattice-fann/online-router", "lattice-model-qwen35?/router-learning"]
+router-learning = ["mixture", "lattice-fann/online-router", "lattice-model-qwen35?/router-learning", "lattice-router/router-learning"]
 # GDN state-traffic byte counters (issue #422, measure-first for ADR-058).
 # Opt-in only: the default decode path stays byte-identical when this is off.
 gdn-state-counters = ["lattice-model-qwen35?/gdn-state-counters"]
@@ -133,14 +133,10 @@ lattice-model-io = { version = "0.15.0", path = "../model-io", default-features 
 lattice-model-embeddinggemma2 = { workspace = true, optional = true }
 lattice-model-ernie45 = { workspace = true, optional = true }
 lattice-quant = { version = "0.15.0", path = "../quant" }
+lattice-router = { version = "0.15.0", path = "../router" }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
 
-# Unix-only uses: `router_state/storage.rs` opens router state with `O_NOFOLLOW`/`O_NONBLOCK`.
-# The weight-loading uses (`F_GETPATH`, the trust-boundary open flags) moved with lattice-weights,
-# and the GPU test lock's `kill(pid, 0)` and `futimes` with lattice-metal-runtime.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [[bin]]
 name = "backfill_qwen3"
@@ -333,6 +329,10 @@ proptest = { workspace = true }
 syn.workspace = true
 tempfile = { workspace = true }
 naga.workspace = true
+
+# The bounded-read tests (`src/bounded_read.rs`, test-only) make a FIFO with `mkfifo`.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 
 

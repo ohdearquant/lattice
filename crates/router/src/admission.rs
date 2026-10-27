@@ -28,11 +28,11 @@ use std::collections::HashSet;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::episode::{EpisodeSignal, EpisodeStore, RouterEpisode};
 use crate::mixture::{
     AdapterRouter, Exploration, RefitOutcome, RouteOutcome, seed_from_completion_id,
 };
-use crate::router_episode::{EpisodeSignal, EpisodeStore, RouterEpisode};
-use crate::router_refit::{RefitCandidate, RefitSource};
+use crate::refit::{RefitCandidate, RefitSource};
 use statistics::{ImportanceEstimate, WeightedEvent};
 
 /// A failed evaluation never supplies a positive admission record.
@@ -86,7 +86,7 @@ pub struct AdmissionRecord {
     contract_hash: String,
     contract: AdmissionContract,
     maximum_evaluations: usize,
-    policy: crate::router_state::RouterPolicy,
+    policy: crate::state::RouterPolicy,
     parent_artifact_hash: String,
     parent_epoch: u64,
     candidate_gate_hash: String,
@@ -237,6 +237,7 @@ pub fn parse_contract(bytes: Option<&[u8]>) -> Result<AdmissionContract, Admissi
     Ok(contract)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_candidate(
     source: &RefitSource,
     candidate: &RefitCandidate,

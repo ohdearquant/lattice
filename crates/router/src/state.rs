@@ -1123,7 +1123,7 @@ fn read_head_unlocked(dir: &Path) -> Result<Option<HeadRecord>, RouterArtifactEr
 
 /// Former direct head writer. Caller-supplied format-5 artifacts are refused.
 ///
-/// Use `crate::router_init::init_directory` (with a gate backend enabled) to
+/// Use `crate::init::init_directory` (with a gate backend enabled) to
 /// construct and durably commit a bootstrap into a fresh directory. Learned
 /// admission has no production entry point yet. Format 4 never has a head.
 #[deprecated(note = "use router_init::init_directory for fresh bootstrap publication")]

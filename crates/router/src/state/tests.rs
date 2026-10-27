@@ -438,7 +438,7 @@ fn the_exploration_scale_is_inside_the_version_hash() {
 /// also refuses, so the two arms agree -- or any scale at all.
 #[test]
 fn a_bootstrap_policy_records_no_exploration_scale() {
-    let bootstrap = crate::router_init::bootstrap_policy(None, None);
+    let bootstrap = crate::init::bootstrap_policy(None, None);
     assert_eq!(bootstrap.exploration_scale, None);
     bootstrap
         .validate()
