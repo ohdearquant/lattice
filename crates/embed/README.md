@@ -267,7 +267,7 @@ The tracked files under `src/`; each Rust file shows the first sentence of its `
   - `cached/`
     - `tests.rs`
   - `mod.rs`: Async embedding-service contract and native implementations.
-  - `native.rs`: Native, pure-Rust embedding service backed by `lattice-inference`.
+  - `native.rs`: Native, pure-Rust embedding service backed by the lattice model-family crates.
   - `native_pooling_tests.rs`
   - `prepared.rs`: Sealed native embedding attestation contracts.
   - `prepared/`
@@ -328,11 +328,11 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area        | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
-| `src/`      | 49    | 17637 | 2517    | 2421  | 418   | 303         | 119      |
+| `src/`      | 49    | 17640 | 2517    | 2421  | 418   | 303         | 119      |
 | `tests/`    | 16    | 2896  | 498     | 487   | 111   | 0           | 1        |
 | `benches/`  | 5     | 1616  | 286     | 366   | 0     | 0           | 0        |
 | `examples/` | 4     | 342   | 79      | 64    | 0     | 0           | 0        |
-| total       | 74    | 22491 | 3380    | 3338  | 529   | 303         | 120      |
+| total       | 74    | 22494 | 3380    | 3338  | 529   | 303         | 120      |
 
 Other tracked files (the README excluded):
 
@@ -341,7 +341,7 @@ Other tracked files (the README excluded):
 | `.json`   | 10    | 455.4 KiB |
 | `.md`     | 11    | 169.4 KiB |
 | `.mjs`    | 2     | 25.1 KiB  |
-| `.toml`   | 2     | 10.5 KiB  |
+| `.toml`   | 2     | 11.9 KiB  |
 | `.txt`    | 1     | 386 B     |
 
 <!-- generated:stats:end -->
@@ -371,13 +371,13 @@ Other tracked files (the README excluded):
 Default set: `download`, `image`, `native`. Each description is the first sentence of the comment above the feature in `Cargo.toml`.
 
 - `avx512`: Deprecated no-op: the AVX-512 VNNI int8 kernel this used to gate is now compiled unconditionally on x86_64 (runtime-dispatched via `SimdConfig::avx512vnni_enabled`, same pattern as the ungated f32 AVX-512F kernel in dot_product.rs) and no longer needs an opt-in Cargo feature. Enables nothing.
-- `download` (default): First-use model downloads for the native `embed` binary (its `--download-only` flag and the implicit fetch inside `BertModel::from_pretrained`). Enables `native`, `lattice-inference/download`.
-- `image` (default): Enables `native`, `lattice-inference/image`.
+- `download` (default): First-use model downloads for the native `embed` binary (its `--download-only` flag and the implicit fetch inside `BertModel::from_pretrained`). Enables `native`, `lattice-model-bert/download`, `lattice-model-qwen3-embedding/download`.
+- `image` (default): Feature forwards. Enables `native`, `lattice-model-qwen35/image`, `lattice-model-embeddinggemma2/image`.
 - `local`: Deprecated no-op: gated a bench module for a service removed long ago, but the feature is part of the published 0.4.x surface (removing it would break manifests that list it). Enables nothing.
-- `metal-gpu`: Enables `lattice-inference/metal-gpu`.
-- `native` (default): Enables `dep:lattice-inference`, `dep:lattice-compute`, `dep:lattice-inference-core`, `dep:lattice-arch`, `dep:lattice-tokenizer`, `dep:lattice-weights`.
+- `metal-gpu`: Enables `lattice-model-qwen3-embedding/metal-gpu`, `lattice-model-qwen35/metal-gpu`, `lattice-model-embeddinggemma2/metal-gpu`.
+- `native` (default): Enables `dep:lattice-model-bert`, `dep:lattice-model-qwen3-embedding`, `dep:lattice-model-qwen35`, `dep:lattice-model-embeddinggemma2`, `dep:lattice-compute`, `dep:lattice-inference-core`, `dep:lattice-arch`, `dep:lattice-tokenizer`, `dep:lattice-weights`.
 - `wasm`: wasm-bindgen JS bindings (`LatticeEmbedder`) for building a browser-loadable `.wasm` module. Enables `native`, `dep:wasm-bindgen`, `dep:console_error_panic_hook`.
-- `x86-gemm`: Enables `lattice-inference/x86-gemm`.
+- `x86-gemm`: Enables `lattice-compute/x86-gemm`, `lattice-model-bert/x86-gemm`, `lattice-model-qwen3-embedding/x86-gemm`.
 
 <!-- generated:features:end -->
 
@@ -385,8 +385,8 @@ Default set: `download`, `image`, `native`. Each description is the first senten
 
 ### Workspace dependencies
 
-- Depends on: `lattice-arch` (optional, enabled by `native`), `lattice-compute` (optional, enabled by `native`), `lattice-inference` (optional, enabled by `download`, `image`, `metal-gpu`, `native`, `x86-gemm`; no default features; features `std`, `f16`), `lattice-inference-core` (optional, enabled by `native`), `lattice-tokenizer` (optional, enabled by `native`), `lattice-weights` (optional, enabled by `native`; features `f16`)
-- Dev-depends on: `lattice-inference` (no default features; features `std`, `test-utils`), `lattice-tokenizer`, `lattice-transport`
+- Depends on: `lattice-arch` (optional, enabled by `native`), `lattice-compute` (optional, enabled by `native`, `x86-gemm`), `lattice-inference-core` (optional, enabled by `native`), `lattice-tokenizer` (optional, enabled by `native`), `lattice-weights` (optional, enabled by `native`; features `f16`)
+- Dev-depends on: `lattice-inference` (no default features; features `bert`, `qwen3`, `std`, `test-utils`, `qwen35`), `lattice-tokenizer`, `lattice-transport`
 - Used by: no other crate in this workspace
 
 <!-- generated:dependencies:end -->
@@ -434,269 +434,269 @@ ADRs under `docs/adr/` that name `lattice-embed` or `crates/embed/`:
 
 The newest Criterion point estimates `bench-update.yml` stored on the `perf-baselines` branch, from the `simd` target. They come from GitHub-hosted runners and serve as trend data between commits, not as a performance claim; a claim needs a paired A/B (`make bench-compare`).
 
-- `aarch64-linux`: commit `9487ae701021`, recorded 2026-10-26T14:29:30+00:00
-- `x86_64-linux`: commit `9487ae701021`, recorded 2026-10-26T14:30:15+00:00
+- `aarch64-linux`: commit `825a4d3cc9b2`, recorded 2026-10-27T23:08:54+00:00
+- `x86_64-linux`: commit `825a4d3cc9b2`, recorded 2026-10-27T23:08:02+00:00
 
 <details>
 <summary>255 benchmarks</summary>
 
 | Benchmark                                                         | `aarch64-linux` | `x86_64-linux` |
 | ----------------------------------------------------------------- | --------------- | -------------- |
-| `binary_cosine_distance/binary/1024`                              | 10.9 ns         | 97.4 ns        |
-| `binary_cosine_distance/binary/1536`                              | 15.7 ns         | 140.7 ns       |
-| `binary_cosine_distance/binary/384`                               | 5.5 ns          | 43.8 ns        |
-| `binary_cosine_distance/binary/768`                               | 9.2 ns          | 74.7 ns        |
-| `binary_cosine_distance/float32_simd/1024`                        | 129.2 ns        | 69.9 ns        |
-| `binary_cosine_distance/float32_simd/1536`                        | 186.7 ns        | 103.2 ns       |
-| `binary_cosine_distance/float32_simd/384`                         | 59.7 ns         | 39.7 ns        |
-| `binary_cosine_distance/float32_simd/768`                         | 101.1 ns        | 55.2 ns        |
-| `cached_embedding_delegate/native_wrong_model_disabled_64x4096`   | 233.8 ns        | 206.0 ns       |
-| `int4_cosine_distance/float32_simd/1024`                          | 129.1 ns        | 74.9 ns        |
-| `int4_cosine_distance/float32_simd/1536`                          | 186.8 ns        | 101.1 ns       |
-| `int4_cosine_distance/float32_simd/384`                           | 59.8 ns         | 40.6 ns        |
-| `int4_cosine_distance/float32_simd/768`                           | 101.1 ns        | 66.7 ns        |
-| `int4_cosine_distance/int4/1024`                                  | 124.1 ns        | 283.4 ns       |
-| `int4_cosine_distance/int4/1536`                                  | 181.2 ns        | 407.7 ns       |
-| `int4_cosine_distance/int4/384`                                   | 53.3 ns         | 115.6 ns       |
-| `int4_cosine_distance/int4/768`                                   | 96.3 ns         | 217.2 ns       |
-| `int8_batch_cosine/float32_simd/10`                               | 573.5 ns        | 340.1 ns       |
-| `int8_batch_cosine/float32_simd/100`                              | 6.87 µs         | 3.64 µs        |
-| `int8_batch_cosine/float32_simd/1000`                             | 86.06 µs        | 49.23 µs       |
-| `int8_batch_cosine/int8_loop/10`                                  | 162.8 ns        | 159.6 ns       |
-| `int8_batch_cosine/int8_loop/100`                                 | 1.72 µs         | 1.59 µs        |
-| `int8_batch_cosine/int8_loop/1000`                                | 20.59 µs        | 16.99 µs       |
-| `int8_prepared_dot_product/per_call/1024`                         | 2.45 µs         | 1.64 µs        |
-| `int8_prepared_dot_product/per_call/127`                          | 360.2 ns        | 267.9 ns       |
-| `int8_prepared_dot_product/per_call/128`                          | 337.7 ns        | 251.0 ns       |
-| `int8_prepared_dot_product/per_call/129`                          | 344.2 ns        | 247.8 ns       |
-| `int8_prepared_dot_product/per_call/384`                          | 960.1 ns        | 641.9 ns       |
-| `int8_prepared_dot_product/per_call/768`                          | 1.85 µs         | 1.22 µs        |
-| `int8_prepared_dot_product/prepared/1024`                         | 30.9 ns         | 25.5 ns        |
-| `int8_prepared_dot_product/prepared/127`                          | 12.5 ns         | 15.7 ns        |
-| `int8_prepared_dot_product/prepared/128`                          | 8.6 ns          | 11.2 ns        |
-| `int8_prepared_dot_product/prepared/129`                          | 9.1 ns          | 11.8 ns        |
-| `int8_prepared_dot_product/prepared/384`                          | 14.3 ns         | 15.7 ns        |
-| `int8_prepared_dot_product/prepared/768`                          | 24.7 ns         | 20.9 ns        |
-| `int8_quantization/quantize/1024`                                 | 2.41 µs         | 1.61 µs        |
-| `int8_quantization/quantize/1536`                                 | 3.60 µs         | 2.43 µs        |
-| `int8_quantization/quantize/384`                                  | 935.2 ns        | 629.5 ns       |
-| `int8_quantization/quantize/768`                                  | 1.83 µs         | 1.20 µs        |
-| `int8_raw_dot_product/dot_product_i8/1024`                        | 30.4 ns         | 26.2 ns        |
-| `int8_raw_dot_product/dot_product_i8/127`                         | 12.0 ns         | 14.6 ns        |
-| `int8_raw_dot_product/dot_product_i8/128`                         | 8.1 ns          | 11.0 ns        |
-| `int8_raw_dot_product/dot_product_i8/129`                         | 8.5 ns          | 11.6 ns        |
-| `int8_raw_dot_product/dot_product_i8/384`                         | 14.0 ns         | 16.3 ns        |
-| `int8_raw_dot_product/dot_product_i8/768`                         | 24.1 ns         | 19.3 ns        |
-| `int8_raw_dot_product/dot_product_i8_raw/1024`                    | 28.0 ns         | 23.3 ns        |
-| `int8_raw_dot_product/dot_product_i8_raw/127`                     | 10.1 ns         | 13.4 ns        |
-| `int8_raw_dot_product/dot_product_i8_raw/128`                     | 6.4 ns          | 9.7 ns         |
-| `int8_raw_dot_product/dot_product_i8_raw/129`                     | 7.1 ns          | 9.5 ns         |
-| `int8_raw_dot_product/dot_product_i8_raw/384`                     | 12.4 ns         | 15.0 ns        |
-| `int8_raw_dot_product/dot_product_i8_raw/768`                     | 21.9 ns         | 17.8 ns        |
-| `int8_vs_float32_cosine/float32_simd/1024`                        | 129.6 ns        | 77.2 ns        |
-| `int8_vs_float32_cosine/float32_simd/1536`                        | 185.8 ns        | 96.5 ns        |
-| `int8_vs_float32_cosine/float32_simd/384`                         | 58.9 ns         | 41.5 ns        |
-| `int8_vs_float32_cosine/float32_simd/768`                         | 100.3 ns        | 59.4 ns        |
-| `int8_vs_float32_cosine/int8/1024`                                | 33.1 ns         | 23.1 ns        |
-| `int8_vs_float32_cosine/int8/1536`                                | 45.9 ns         | 36.9 ns        |
-| `int8_vs_float32_cosine/int8/384`                                 | 15.7 ns         | 17.0 ns        |
-| `int8_vs_float32_cosine/int8/768`                                 | 27.0 ns         | 19.3 ns        |
-| `memory_size/search_1000_float32`                                 | 57.25 µs        | 37.60 µs       |
-| `memory_size/search_1000_int8`                                    | 14.93 µs        | 16.45 µs       |
-| `simd_batch_cosine/scalar_loop/10`                                | 6.38 µs         | 9.48 µs        |
-| `simd_batch_cosine/scalar_loop/100`                               | 63.90 µs        | 95.89 µs       |
-| `simd_batch_cosine/scalar_loop/1000`                              | 645.07 µs       | 968.85 µs      |
-| `simd_batch_cosine/simd_batch/10`                                 | 575.8 ns        | 371.3 ns       |
-| `simd_batch_cosine/simd_batch/100`                                | 6.92 µs         | 4.10 µs        |
-| `simd_batch_cosine/simd_batch/1000`                               | 86.06 µs        | 53.22 µs       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_1000c`    | 145.57 µs       | 71.79 µs       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_16c`      | 2.09 µs         | 1.09 µs        |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_256c`     | 35.27 µs        | 18.38 µs       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_4c`       | 522.2 ns        | 277.9 ns       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c`      | 8.27 µs         | 4.33 µs        |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_1000c`     | 58.70 µs        | 34.43 µs       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_16c`       | 922.3 ns        | 531.1 ns       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_256c`      | 15.28 µs        | 8.47 µs        |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_4c`        | 237.7 ns        | 142.9 ns       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_64c`       | 3.73 µs         | 2.13 µs        |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_1000c`     | 106.99 µs       | 52.16 µs       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_16c`       | 1.62 µs         | 800.9 ns       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_256c`      | 28.31 µs        | 13.43 µs       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_4c`        | 407.8 ns        | 206.4 ns       |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_64c`       | 6.46 µs         | 3.17 µs        |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_1000c`   | 146.65 µs       | 69.17 µs       |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_16c`     | 2.09 µs         | 1.07 µs        |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_256c`    | 35.22 µs        | 17.70 µs       |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_4c`      | 519.5 ns        | 270.8 ns       |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_64c`     | 8.24 µs         | 4.23 µs        |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_1000c`    | 57.61 µs        | 31.88 µs       |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_16c`      | 916.0 ns        | 512.6 ns       |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_256c`     | 15.24 µs        | 7.87 µs        |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_4c`       | 235.5 ns        | 134.6 ns       |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_64c`      | 3.70 µs         | 1.98 µs        |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_1000c`    | 107.25 µs       | 50.65 µs       |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_16c`      | 1.61 µs         | 784.4 ns       |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_256c`     | 28.52 µs        | 13.01 µs       |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_4c`       | 405.1 ns        | 203.6 ns       |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_64c`      | 6.43 µs         | 3.10 µs        |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_1000c` | 145.31 µs       | 67.14 µs       |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_16c`   | 2.08 µs         | 1.04 µs        |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_256c`  | 35.59 µs        | 17.09 µs       |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_4c`    | 519.8 ns        | 284.7 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_64c`   | 8.23 µs         | 4.07 µs        |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_1000c`  | 58.10 µs        | 39.63 µs       |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_16c`    | 920.5 ns        | 585.6 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_256c`   | 15.35 µs        | 9.34 µs        |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_4c`     | 237.5 ns        | 153.4 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_64c`    | 3.69 µs         | 2.43 µs        |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_1000c`  | 106.28 µs       | 62.45 µs       |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_16c`    | 1.60 µs         | 944.9 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_256c`   | 28.20 µs        | 15.66 µs       |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_4c`     | 405.8 ns        | 245.9 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_64c`    | 6.40 µs         | 3.78 µs        |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_1000c`    | 96.04 µs        | 58.20 µs       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_16c`      | 1.37 µs         | 869.7 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_256c`     | 26.52 µs        | 14.88 µs       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_4c`       | 297.5 ns        | 234.5 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_64c`      | 6.17 µs         | 3.39 µs        |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_1000c`     | 37.98 µs        | 32.18 µs       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_16c`       | 500.7 ns        | 470.2 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_256c`      | 10.31 µs        | 7.48 µs        |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_4c`        | 132.6 ns        | 131.0 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_64c`       | 2.42 µs         | 1.92 µs        |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_1000c`     | 72.58 µs        | 56.85 µs       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_16c`       | 965.5 ns        | 883.7 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_256c`      | 21.39 µs        | 14.32 µs       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_4c`        | 232.3 ns        | 214.8 ns       |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_64c`       | 4.60 µs         | 3.40 µs        |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_1000c`       | 145.49 µs       | 65.56 µs       |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_16c`         | 2.07 µs         | 1.02 µs        |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_256c`        | 35.47 µs        | 16.63 µs       |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_4c`          | 516.6 ns        | 270.5 ns       |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_64c`         | 8.19 µs         | 3.99 µs        |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_1000c`        | 57.61 µs        | 37.00 µs       |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_16c`          | 914.9 ns        | 540.3 ns       |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_256c`         | 15.22 µs        | 8.85 µs        |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_4c`           | 235.3 ns        | 144.1 ns       |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_64c`          | 3.66 µs         | 2.25 µs        |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_1000c`        | 106.72 µs       | 59.92 µs       |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_16c`          | 1.60 µs         | 905.3 ns       |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_256c`         | 28.53 µs        | 14.93 µs       |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_4c`           | 403.7 ns        | 240.5 ns       |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_64c`          | 6.37 µs         | 3.68 µs        |
-| `simd_batch_dot_product/scalar_loop/10`                           | 2.14 µs         | 3.04 µs        |
-| `simd_batch_dot_product/scalar_loop/100`                          | 21.36 µs        | 31.33 µs       |
-| `simd_batch_dot_product/scalar_loop/1000`                         | 218.29 µs       | 316.20 µs      |
-| `simd_batch_dot_product/simd_batch/10`                            | 333.7 ns        | 260.7 ns       |
-| `simd_batch_dot_product/simd_batch/100`                           | 5.71 µs         | 3.26 µs        |
-| `simd_batch_dot_product/simd_batch/1000`                          | 88.32 µs        | 43.76 µs       |
-| `simd_cosine_similarity/scalar/1024`                              | 1.78 µs         | 2.74 µs        |
-| `simd_cosine_similarity/scalar/1536`                              | 2.69 µs         | 4.06 µs        |
-| `simd_cosine_similarity/scalar/384`                               | 647.8 ns        | 933.0 ns       |
-| `simd_cosine_similarity/scalar/768`                               | 1.33 µs         | 1.97 µs        |
-| `simd_cosine_similarity/simd/1024`                                | 129.6 ns        | 75.5 ns        |
-| `simd_cosine_similarity/simd/1536`                                | 186.0 ns        | 106.8 ns       |
-| `simd_cosine_similarity/simd/384`                                 | 58.7 ns         | 40.0 ns        |
-| `simd_cosine_similarity/simd/768`                                 | 101.2 ns        | 62.8 ns        |
-| `simd_dot_product/scalar/1024`                                    | 593.1 ns        | 882.5 ns       |
-| `simd_dot_product/scalar/1536`                                    | 892.3 ns        | 1.39 µs        |
-| `simd_dot_product/scalar/384`                                     | 213.2 ns        | 319.3 ns       |
-| `simd_dot_product/scalar/768`                                     | 439.6 ns        | 646.6 ns       |
-| `simd_dot_product/simd/1024`                                      | 73.4 ns         | 48.6 ns        |
-| `simd_dot_product/simd/1536`                                      | 106.8 ns        | 84.1 ns        |
-| `simd_dot_product/simd/384`                                       | 31.5 ns         | 21.5 ns        |
-| `simd_dot_product/simd/768`                                       | 55.4 ns         | 35.9 ns        |
-| `simd_euclidean_distance/scalar/1024`                             | 595.5 ns        | 871.5 ns       |
-| `simd_euclidean_distance/scalar/1536`                             | 895.9 ns        | 1.29 µs        |
-| `simd_euclidean_distance/scalar/384`                              | 216.8 ns        | 319.7 ns       |
-| `simd_euclidean_distance/scalar/768`                              | 443.4 ns        | 638.2 ns       |
-| `simd_euclidean_distance/simd/1024`                               | 116.5 ns        | 65.5 ns        |
-| `simd_euclidean_distance/simd/1536`                               | 170.9 ns        | 87.3 ns        |
-| `simd_euclidean_distance/simd/384`                                | 49.1 ns         | 32.1 ns        |
-| `simd_euclidean_distance/simd/768`                                | 89.7 ns         | 45.5 ns        |
-| `simd_manhattan_distance/scalar/1024`                             | 592.2 ns        | 880.3 ns       |
-| `simd_manhattan_distance/scalar/1536`                             | 891.4 ns        | 1.36 µs        |
-| `simd_manhattan_distance/scalar/384`                              | 212.5 ns        | 309.0 ns       |
-| `simd_manhattan_distance/scalar/768`                              | 438.7 ns        | 644.4 ns       |
-| `simd_manhattan_distance/simd/1024`                               | 88.1 ns         | 55.2 ns        |
-| `simd_manhattan_distance/simd/1536`                               | 127.3 ns        | 87.8 ns        |
-| `simd_manhattan_distance/simd/384`                                | 36.7 ns         | 26.4 ns        |
-| `simd_manhattan_distance/simd/768`                                | 66.6 ns         | 47.6 ns        |
-| `simd_normalize/scalar/1024`                                      | 688.4 ns        | 1.04 µs        |
-| `simd_normalize/scalar/1536`                                      | 1.03 µs         | 1.53 µs        |
-| `simd_normalize/scalar/384`                                       | 266.4 ns        | 396.9 ns       |
-| `simd_normalize/scalar/768`                                       | 519.6 ns        | 781.8 ns       |
-| `simd_normalize/simd/1024`                                        | 158.4 ns        | 149.0 ns       |
-| `simd_normalize/simd/1536`                                        | 231.0 ns        | 208.5 ns       |
-| `simd_normalize/simd/384`                                         | 74.5 ns         | 71.9 ns        |
-| `simd_normalize/simd/768`                                         | 126.5 ns        | 115.6 ns       |
-| `simd_normalized_cosine_fast_path/cosine_full/1024`               | 128.8 ns        | 74.1 ns        |
-| `simd_normalized_cosine_fast_path/cosine_full/384`                | 58.8 ns         | 38.4 ns        |
-| `simd_normalized_cosine_fast_path/cosine_full/768`                | 100.0 ns        | 57.8 ns        |
-| `simd_normalized_cosine_fast_path/dot_product/1024`               | 69.9 ns         | 55.2 ns        |
-| `simd_normalized_cosine_fast_path/dot_product/384`                | 31.5 ns         | 22.3 ns        |
-| `simd_normalized_cosine_fast_path/dot_product/768`                | 55.5 ns         | 42.5 ns        |
-| `simd_prepared_query_normalized_cosine/dot_product_loop/1024`     | 95.83 µs        | 63.57 µs       |
-| `simd_prepared_query_normalized_cosine/dot_product_loop/384`      | 40.05 µs        | 31.67 µs       |
-| `simd_prepared_query_normalized_cosine/dot_product_loop/768`      | 72.50 µs        | 53.76 µs       |
-| `simd_prepared_query_normalized_cosine/prepared_full_cosine/1024` | 146.35 µs       | 80.29 µs       |
-| `simd_prepared_query_normalized_cosine/prepared_full_cosine/384`  | 60.69 µs        | 41.54 µs       |
-| `simd_prepared_query_normalized_cosine/prepared_full_cosine/768`  | 107.70 µs       | 59.26 µs       |
-| `simd_prepared_query_normalized_cosine/prepared_meta_unit/1024`   | 147.40 µs       | 82.02 µs       |
-| `simd_prepared_query_normalized_cosine/prepared_meta_unit/384`    | 60.79 µs        | 38.68 µs       |
-| `simd_prepared_query_normalized_cosine/prepared_meta_unit/768`    | 108.68 µs       | 61.12 µs       |
-| `simd_query_batch_dot_product/pair_loop/128d_16c`                 | 221.1 ns        | 207.6 ns       |
-| `simd_query_batch_dot_product/pair_loop/128d_256c`                | 3.94 µs         | 3.05 µs        |
-| `simd_query_batch_dot_product/pair_loop/128d_4c`                  | 66.8 ns         | 68.2 ns        |
-| `simd_query_batch_dot_product/pair_loop/128d_64c`                 | 866.4 ns        | 789.6 ns       |
-| `simd_query_batch_dot_product/pair_loop/384d_16c`                 | 502.1 ns        | 416.5 ns       |
-| `simd_query_batch_dot_product/pair_loop/384d_256c`                | 10.06 µs        | 6.91 µs        |
-| `simd_query_batch_dot_product/pair_loop/384d_4c`                  | 133.9 ns        | 114.3 ns       |
-| `simd_query_batch_dot_product/pair_loop/384d_64c`                 | 2.42 µs         | 1.68 µs        |
-| `simd_query_batch_dot_product/pair_loop/768d_16c`                 | 957.5 ns        | 869.3 ns       |
-| `simd_query_batch_dot_product/pair_loop/768d_256c`                | 21.52 µs        | 14.19 µs       |
-| `simd_query_batch_dot_product/pair_loop/768d_4c`                  | 231.8 ns        | 226.5 ns       |
-| `simd_query_batch_dot_product/pair_loop/768d_64c`                 | 4.59 µs         | 3.41 µs        |
-| `simd_query_batch_dot_product/simd_batch/128d_16c`                | 136.6 ns        | 115.5 ns       |
-| `simd_query_batch_dot_product/simd_batch/128d_256c`               | 3.04 µs         | 1.83 µs        |
-| `simd_query_batch_dot_product/simd_batch/128d_4c`                 | 45.9 ns         | 40.0 ns        |
-| `simd_query_batch_dot_product/simd_batch/128d_64c`                | 534.2 ns        | 428.1 ns       |
-| `simd_query_batch_dot_product/simd_batch/384d_16c`                | 325.8 ns        | 226.5 ns       |
-| `simd_query_batch_dot_product/simd_batch/384d_256c`               | 9.11 µs         | 4.25 µs        |
-| `simd_query_batch_dot_product/simd_batch/384d_4c`                 | 93.2 ns         | 67.9 ns        |
-| `simd_query_batch_dot_product/simd_batch/384d_64c`                | 2.17 µs         | 1.04 µs        |
-| `simd_query_batch_dot_product/simd_batch/768d_16c`                | 626.5 ns        | 507.1 ns       |
-| `simd_query_batch_dot_product/simd_batch/768d_256c`               | 17.76 µs        | 8.33 µs        |
-| `simd_query_batch_dot_product/simd_batch/768d_4c`                 | 164.0 ns        | 132.6 ns       |
-| `simd_query_batch_dot_product/simd_batch/768d_64c`                | 3.85 µs         | 2.00 µs        |
-| `simd_squared_euclidean_fast_path/euclidean_full/1024`            | 116.7 ns        | 60.4 ns        |
-| `simd_squared_euclidean_fast_path/euclidean_full/384`             | 49.0 ns         | 24.6 ns        |
-| `simd_squared_euclidean_fast_path/euclidean_full/768`             | 89.5 ns         | 48.0 ns        |
-| `simd_squared_euclidean_fast_path/squared_euclidean/1024`         | 113.5 ns        | 57.5 ns        |
-| `simd_squared_euclidean_fast_path/squared_euclidean/384`          | 45.9 ns         | 22.8 ns        |
-| `simd_squared_euclidean_fast_path/squared_euclidean/768`          | 86.4 ns         | 44.3 ns        |
-| `simd_throughput_384/cosine_similarity`                           | 58.3 ns         | 42.8 ns        |
-| `simd_throughput_384/dot_product`                                 | 31.5 ns         | 30.9 ns        |
-| `simd_throughput_384/euclidean_distance`                          | 49.0 ns         | 36.0 ns        |
-| `simd_throughput_384/normalize`                                   | 120.4 ns        | 109.2 ns       |
-| `tier_prepared_batch_sizes/int4_batch_prepared/10`                | 518.4 ns        | 1.05 µs        |
-| `tier_prepared_batch_sizes/int4_batch_prepared/100`               | 5.14 µs         | 10.29 µs       |
-| `tier_prepared_batch_sizes/int4_batch_prepared/1000`              | 50.08 µs        | 102.75 µs      |
-| `tier_prepared_batch_sizes/int4_query_per_call/10`                | 9.37 µs         | 6.29 µs        |
-| `tier_prepared_batch_sizes/int4_query_per_call/100`               | 93.42 µs        | 62.97 µs       |
-| `tier_prepared_batch_sizes/int4_query_per_call/1000`              | 934.33 µs       | 628.65 µs      |
-| `tier_prepared_batch_sizes/int8_batch_prepared/10`                | 168.2 ns        | 188.8 ns       |
-| `tier_prepared_batch_sizes/int8_batch_prepared/100`               | 1.50 µs         | 1.52 µs        |
-| `tier_prepared_batch_sizes/int8_batch_prepared/1000`              | 15.21 µs        | 14.98 µs       |
-| `tier_prepared_batch_sizes/int8_query_per_call/10`                | 9.72 µs         | 5.84 µs        |
-| `tier_prepared_batch_sizes/int8_query_per_call/100`               | 96.74 µs        | 58.69 µs       |
-| `tier_prepared_batch_sizes/int8_query_per_call/1000`              | 968.77 µs       | 583.11 µs      |
-| `tier_prepared_query/binary_query_once_1000`                      | 8.01 µs         | 44.22 µs       |
-| `tier_prepared_query/binary_query_per_call_1000`                  | 1.10 ms         | 447.68 µs      |
-| `tier_prepared_query/int4_query_once_1000`                        | 52.44 µs        | 116.42 µs      |
-| `tier_prepared_query/int4_query_per_call_1000`                    | 946.10 µs       | 695.19 µs      |
-| `tier_prepared_query/int8_query_once_1000`                        | 18.29 µs        | 17.88 µs       |
-| `tier_prepared_query/int8_query_per_call_1000`                    | 947.80 µs       | 591.63 µs      |
+| `binary_cosine_distance/binary/1024`                              | 10.9 ns         | 62.4 ns        |
+| `binary_cosine_distance/binary/1536`                              | 15.7 ns         | 89.3 ns        |
+| `binary_cosine_distance/binary/384`                               | 5.5 ns          | 29.1 ns        |
+| `binary_cosine_distance/binary/768`                               | 9.1 ns          | 49.1 ns        |
+| `binary_cosine_distance/float32_simd/1024`                        | 129.3 ns        | 31.2 ns        |
+| `binary_cosine_distance/float32_simd/1536`                        | 187.0 ns        | 45.0 ns        |
+| `binary_cosine_distance/float32_simd/384`                         | 59.6 ns         | 14.7 ns        |
+| `binary_cosine_distance/float32_simd/768`                         | 101.1 ns        | 24.7 ns        |
+| `cached_embedding_delegate/native_wrong_model_disabled_64x4096`   | 236.8 ns        | 145.2 ns       |
+| `int4_cosine_distance/float32_simd/1024`                          | 129.1 ns        | 31.2 ns        |
+| `int4_cosine_distance/float32_simd/1536`                          | 186.8 ns        | 45.0 ns        |
+| `int4_cosine_distance/float32_simd/384`                           | 59.5 ns         | 14.8 ns        |
+| `int4_cosine_distance/float32_simd/768`                           | 101.1 ns        | 25.2 ns        |
+| `int4_cosine_distance/int4/1024`                                  | 124.1 ns        | 190.5 ns       |
+| `int4_cosine_distance/int4/1536`                                  | 181.6 ns        | 280.1 ns       |
+| `int4_cosine_distance/int4/384`                                   | 53.6 ns         | 75.0 ns        |
+| `int4_cosine_distance/int4/768`                                   | 96.5 ns         | 143.4 ns       |
+| `int8_batch_cosine/float32_simd/10`                               | 574.3 ns        | 143.9 ns       |
+| `int8_batch_cosine/float32_simd/100`                              | 6.92 µs         | 2.29 µs        |
+| `int8_batch_cosine/float32_simd/1000`                             | 87.72 µs        | 32.45 µs       |
+| `int8_batch_cosine/int8_loop/10`                                  | 165.2 ns        | 83.1 ns        |
+| `int8_batch_cosine/int8_loop/100`                                 | 1.72 µs         | 833.6 ns       |
+| `int8_batch_cosine/int8_loop/1000`                                | 20.17 µs        | 8.57 µs        |
+| `int8_prepared_dot_product/per_call/1024`                         | 2.45 µs         | 832.0 ns       |
+| `int8_prepared_dot_product/per_call/127`                          | 357.9 ns        | 139.0 ns       |
+| `int8_prepared_dot_product/per_call/128`                          | 339.0 ns        | 134.2 ns       |
+| `int8_prepared_dot_product/per_call/129`                          | 344.8 ns        | 135.0 ns       |
+| `int8_prepared_dot_product/per_call/384`                          | 939.2 ns        | 332.6 ns       |
+| `int8_prepared_dot_product/per_call/768`                          | 1.85 µs         | 646.8 ns       |
+| `int8_prepared_dot_product/prepared/1024`                         | 31.2 ns         | 14.3 ns        |
+| `int8_prepared_dot_product/prepared/127`                          | 12.2 ns         | 9.5 ns         |
+| `int8_prepared_dot_product/prepared/128`                          | 8.5 ns          | 5.6 ns         |
+| `int8_prepared_dot_product/prepared/129`                          | 9.0 ns          | 5.9 ns         |
+| `int8_prepared_dot_product/prepared/384`                          | 14.7 ns         | 7.7 ns         |
+| `int8_prepared_dot_product/prepared/768`                          | 24.9 ns         | 12.3 ns        |
+| `int8_quantization/quantize/1024`                                 | 2.42 µs         | 824.2 ns       |
+| `int8_quantization/quantize/1536`                                 | 3.60 µs         | 1.23 µs        |
+| `int8_quantization/quantize/384`                                  | 951.3 ns        | 323.8 ns       |
+| `int8_quantization/quantize/768`                                  | 1.84 µs         | 634.1 ns       |
+| `int8_raw_dot_product/dot_product_i8/1024`                        | 30.6 ns         | 14.4 ns        |
+| `int8_raw_dot_product/dot_product_i8/127`                         | 11.7 ns         | 9.2 ns         |
+| `int8_raw_dot_product/dot_product_i8/128`                         | 8.0 ns          | 5.5 ns         |
+| `int8_raw_dot_product/dot_product_i8/129`                         | 8.5 ns          | 5.8 ns         |
+| `int8_raw_dot_product/dot_product_i8/384`                         | 14.4 ns         | 7.3 ns         |
+| `int8_raw_dot_product/dot_product_i8/768`                         | 24.6 ns         | 12.4 ns        |
+| `int8_raw_dot_product/dot_product_i8_raw/1024`                    | 28.1 ns         | 13.1 ns        |
+| `int8_raw_dot_product/dot_product_i8_raw/127`                     | 10.0 ns         | 7.8 ns         |
+| `int8_raw_dot_product/dot_product_i8_raw/128`                     | 6.5 ns          | 4.3 ns         |
+| `int8_raw_dot_product/dot_product_i8_raw/129`                     | 7.2 ns          | 4.5 ns         |
+| `int8_raw_dot_product/dot_product_i8_raw/384`                     | 12.4 ns         | 6.2 ns         |
+| `int8_raw_dot_product/dot_product_i8_raw/768`                     | 21.9 ns         | 10.7 ns        |
+| `int8_vs_float32_cosine/float32_simd/1024`                        | 128.5 ns        | 31.8 ns        |
+| `int8_vs_float32_cosine/float32_simd/1536`                        | 185.4 ns        | 44.9 ns        |
+| `int8_vs_float32_cosine/float32_simd/384`                         | 58.8 ns         | 14.5 ns        |
+| `int8_vs_float32_cosine/float32_simd/768`                         | 99.7 ns         | 24.3 ns        |
+| `int8_vs_float32_cosine/int8/1024`                                | 33.0 ns         | 14.7 ns        |
+| `int8_vs_float32_cosine/int8/1536`                                | 46.4 ns         | 27.3 ns        |
+| `int8_vs_float32_cosine/int8/384`                                 | 16.9 ns         | 8.1 ns         |
+| `int8_vs_float32_cosine/int8/768`                                 | 27.3 ns         | 13.1 ns        |
+| `memory_size/search_1000_float32`                                 | 57.35 µs        | 18.62 µs       |
+| `memory_size/search_1000_int8`                                    | 15.05 µs        | 7.63 µs        |
+| `simd_batch_cosine/scalar_loop/10`                                | 6.39 µs         | 4.34 µs        |
+| `simd_batch_cosine/scalar_loop/100`                               | 63.99 µs        | 43.35 µs       |
+| `simd_batch_cosine/scalar_loop/1000`                              | 647.88 µs       | 435.73 µs      |
+| `simd_batch_cosine/simd_batch/10`                                 | 575.8 ns        | 141.9 ns       |
+| `simd_batch_cosine/simd_batch/100`                                | 6.90 µs         | 2.29 µs        |
+| `simd_batch_cosine/simd_batch/1000`                               | 92.61 µs        | 32.29 µs       |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_1000c`    | 145.82 µs       | 40.21 µs       |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_16c`      | 2.11 µs         | 519.7 ns       |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_256c`     | 36.34 µs        | 9.13 µs        |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_4c`       | 521.1 ns        | 124.8 ns       |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c`      | 8.28 µs         | 1.97 µs        |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_1000c`     | 58.79 µs        | 19.00 µs       |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_16c`       | 923.7 ns        | 238.6 ns       |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_256c`      | 14.80 µs        | 4.09 µs        |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_4c`        | 237.6 ns        | 66.6 ns        |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_64c`       | 3.73 µs         | 1.04 µs        |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_1000c`     | 105.73 µs       | 31.32 µs       |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_16c`       | 1.62 µs         | 405.8 ns       |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_256c`      | 29.61 µs        | 6.63 µs        |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_4c`        | 406.6 ns        | 98.5 ns        |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_64c`       | 6.46 µs         | 1.60 µs        |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_1000c`   | 145.43 µs       | 39.37 µs       |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_16c`     | 2.11 µs         | 493.5 ns       |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_256c`    | 36.82 µs        | 8.52 µs        |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_4c`      | 518.4 ns        | 114.5 ns       |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_64c`     | 8.27 µs         | 1.82 µs        |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_1000c`    | 58.17 µs        | 16.34 µs       |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_16c`      | 924.3 ns        | 217.7 ns       |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_256c`     | 14.70 µs        | 3.48 µs        |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_4c`       | 235.6 ns        | 61.5 ns        |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_64c`      | 3.71 µs         | 905.2 ns       |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_1000c`    | 106.18 µs       | 29.89 µs       |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_16c`      | 1.62 µs         | 378.4 ns       |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_256c`     | 29.39 µs        | 6.05 µs        |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_4c`       | 404.8 ns        | 92.7 ns        |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_64c`      | 6.44 µs         | 1.48 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_1000c` | 146.21 µs       | 39.61 µs       |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_16c`   | 2.08 µs         | 499.2 ns       |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_256c`  | 36.84 µs        | 9.32 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_4c`    | 519.5 ns        | 121.9 ns       |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_64c`   | 8.25 µs         | 1.94 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_1000c`  | 58.39 µs        | 19.79 µs       |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_16c`    | 920.1 ns        | 270.7 ns       |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_256c`   | 14.74 µs        | 4.44 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_4c`     | 236.7 ns        | 71.0 ns        |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_64c`    | 3.71 µs         | 1.12 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_1000c`  | 107.34 µs       | 33.22 µs       |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_16c`    | 1.61 µs         | 447.3 ns       |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_256c`   | 29.37 µs        | 7.35 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_4c`     | 405.6 ns        | 113.5 ns       |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_64c`    | 6.41 µs         | 1.76 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_1000c`    | 98.75 µs        | 40.42 µs       |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_16c`      | 1.47 µs         | 469.0 ns       |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_256c`     | 28.26 µs        | 8.85 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_4c`       | 313.0 ns        | 103.3 ns       |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_64c`      | 6.12 µs         | 1.80 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_1000c`     | 38.85 µs        | 18.87 µs       |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_16c`       | 494.9 ns        | 243.8 ns       |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_256c`      | 9.59 µs         | 4.00 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_4c`        | 132.5 ns        | 61.5 ns        |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_64c`       | 2.46 µs         | 1.01 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_1000c`     | 73.87 µs        | 34.35 µs       |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_16c`       | 970.0 ns        | 440.5 ns       |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_256c`      | 22.28 µs        | 7.16 µs        |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_4c`        | 233.8 ns        | 105.3 ns       |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_64c`       | 4.62 µs         | 1.71 µs        |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_1000c`       | 146.13 µs       | 37.60 µs       |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_16c`         | 2.09 µs         | 472.6 ns       |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_256c`        | 37.50 µs        | 8.60 µs        |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_4c`          | 518.4 ns        | 113.4 ns       |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_64c`         | 8.22 µs         | 1.80 µs        |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_1000c`        | 57.82 µs        | 18.23 µs       |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_16c`          | 914.8 ns        | 233.9 ns       |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_256c`         | 14.60 µs        | 3.92 µs        |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_4c`           | 234.8 ns        | 66.3 ns        |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_64c`          | 3.68 µs         | 998.5 ns       |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_1000c`        | 107.55 µs       | 32.64 µs       |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_16c`          | 1.61 µs         | 428.4 ns       |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_256c`         | 29.76 µs        | 7.11 µs        |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_4c`           | 403.8 ns        | 106.2 ns       |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_64c`          | 6.38 µs         | 1.70 µs        |
+| `simd_batch_dot_product/scalar_loop/10`                           | 2.14 µs         | 1.45 µs        |
+| `simd_batch_dot_product/scalar_loop/100`                          | 21.45 µs        | 14.41 µs       |
+| `simd_batch_dot_product/scalar_loop/1000`                         | 220.10 µs       | 145.99 µs      |
+| `simd_batch_dot_product/simd_batch/10`                            | 324.7 ns        | 139.5 ns       |
+| `simd_batch_dot_product/simd_batch/100`                           | 5.70 µs         | 2.23 µs        |
+| `simd_batch_dot_product/simd_batch/1000`                          | 94.56 µs        | 30.88 µs       |
+| `simd_cosine_similarity/scalar/1024`                              | 1.78 µs         | 1.29 µs        |
+| `simd_cosine_similarity/scalar/1536`                              | 2.69 µs         | 1.97 µs        |
+| `simd_cosine_similarity/scalar/384`                               | 647.5 ns        | 433.4 ns       |
+| `simd_cosine_similarity/scalar/768`                               | 1.33 µs         | 945.2 ns       |
+| `simd_cosine_similarity/simd/1024`                                | 129.3 ns        | 31.8 ns        |
+| `simd_cosine_similarity/simd/1536`                                | 185.5 ns        | 45.0 ns        |
+| `simd_cosine_similarity/simd/384`                                 | 58.4 ns         | 13.9 ns        |
+| `simd_cosine_similarity/simd/768`                                 | 100.6 ns        | 24.4 ns        |
+| `simd_dot_product/scalar/1024`                                    | 593.7 ns        | 428.8 ns       |
+| `simd_dot_product/scalar/1536`                                    | 892.4 ns        | 656.2 ns       |
+| `simd_dot_product/scalar/384`                                     | 213.2 ns        | 144.5 ns       |
+| `simd_dot_product/scalar/768`                                     | 439.8 ns        | 315.2 ns       |
+| `simd_dot_product/simd/1024`                                      | 73.5 ns         | 30.4 ns        |
+| `simd_dot_product/simd/1536`                                      | 106.7 ns        | 44.3 ns        |
+| `simd_dot_product/simd/384`                                       | 31.7 ns         | 9.1 ns         |
+| `simd_dot_product/simd/768`                                       | 56.2 ns         | 17.7 ns        |
+| `simd_euclidean_distance/scalar/1024`                             | 595.6 ns        | 433.1 ns       |
+| `simd_euclidean_distance/scalar/1536`                             | 895.8 ns        | 663.2 ns       |
+| `simd_euclidean_distance/scalar/384`                              | 217.3 ns        | 148.7 ns       |
+| `simd_euclidean_distance/scalar/768`                              | 443.3 ns        | 319.5 ns       |
+| `simd_euclidean_distance/simd/1024`                               | 117.1 ns        | 24.9 ns        |
+| `simd_euclidean_distance/simd/1536`                               | 171.3 ns        | 34.0 ns        |
+| `simd_euclidean_distance/simd/384`                                | 49.2 ns         | 12.4 ns        |
+| `simd_euclidean_distance/simd/768`                                | 89.8 ns         | 23.7 ns        |
+| `simd_manhattan_distance/scalar/1024`                             | 591.5 ns        | 433.0 ns       |
+| `simd_manhattan_distance/scalar/1536`                             | 891.6 ns        | 660.7 ns       |
+| `simd_manhattan_distance/scalar/384`                              | 212.8 ns        | 148.6 ns       |
+| `simd_manhattan_distance/scalar/768`                              | 438.9 ns        | 319.2 ns       |
+| `simd_manhattan_distance/simd/1024`                               | 85.0 ns         | 30.3 ns        |
+| `simd_manhattan_distance/simd/1536`                               | 126.5 ns        | 44.7 ns        |
+| `simd_manhattan_distance/simd/384`                                | 36.6 ns         | 12.3 ns        |
+| `simd_manhattan_distance/simd/768`                                | 66.7 ns         | 17.8 ns        |
+| `simd_normalize/scalar/1024`                                      | 693.7 ns        | 509.3 ns       |
+| `simd_normalize/scalar/1536`                                      | 1.03 µs         | 772.8 ns       |
+| `simd_normalize/scalar/384`                                       | 267.5 ns        | 194.4 ns       |
+| `simd_normalize/scalar/768`                                       | 523.2 ns        | 380.8 ns       |
+| `simd_normalize/simd/1024`                                        | 165.0 ns        | 75.5 ns        |
+| `simd_normalize/simd/1536`                                        | 249.3 ns        | 131.9 ns       |
+| `simd_normalize/simd/384`                                         | 78.6 ns         | 27.8 ns        |
+| `simd_normalize/simd/768`                                         | 132.8 ns        | 60.6 ns        |
+| `simd_normalized_cosine_fast_path/cosine_full/1024`               | 128.8 ns        | 31.7 ns        |
+| `simd_normalized_cosine_fast_path/cosine_full/384`                | 58.9 ns         | 14.5 ns        |
+| `simd_normalized_cosine_fast_path/cosine_full/768`                | 99.7 ns         | 24.2 ns        |
+| `simd_normalized_cosine_fast_path/dot_product/1024`               | 73.5 ns         | 29.9 ns        |
+| `simd_normalized_cosine_fast_path/dot_product/384`                | 32.0 ns         | 12.1 ns        |
+| `simd_normalized_cosine_fast_path/dot_product/768`                | 56.5 ns         | 22.8 ns        |
+| `simd_prepared_query_normalized_cosine/dot_product_loop/1024`     | 97.34 µs        | 41.40 µs       |
+| `simd_prepared_query_normalized_cosine/dot_product_loop/384`      | 38.22 µs        | 19.66 µs       |
+| `simd_prepared_query_normalized_cosine/dot_product_loop/768`      | 73.01 µs        | 34.69 µs       |
+| `simd_prepared_query_normalized_cosine/prepared_full_cosine/1024` | 148.09 µs       | 47.05 µs       |
+| `simd_prepared_query_normalized_cosine/prepared_full_cosine/384`  | 60.70 µs        | 20.52 µs       |
+| `simd_prepared_query_normalized_cosine/prepared_full_cosine/768`  | 107.75 µs       | 32.70 µs       |
+| `simd_prepared_query_normalized_cosine/prepared_meta_unit/1024`   | 146.73 µs       | 46.97 µs       |
+| `simd_prepared_query_normalized_cosine/prepared_meta_unit/384`    | 60.80 µs        | 20.66 µs       |
+| `simd_prepared_query_normalized_cosine/prepared_meta_unit/768`    | 108.69 µs       | 37.62 µs       |
+| `simd_query_batch_dot_product/pair_loop/128d_16c`                 | 223.0 ns        | 100.5 ns       |
+| `simd_query_batch_dot_product/pair_loop/128d_256c`                | 3.89 µs         | 1.64 µs        |
+| `simd_query_batch_dot_product/pair_loop/128d_4c`                  | 66.4 ns         | 31.1 ns        |
+| `simd_query_batch_dot_product/pair_loop/128d_64c`                 | 863.1 ns        | 387.9 ns       |
+| `simd_query_batch_dot_product/pair_loop/384d_16c`                 | 483.1 ns        | 240.8 ns       |
+| `simd_query_batch_dot_product/pair_loop/384d_256c`                | 9.56 µs         | 3.99 µs        |
+| `simd_query_batch_dot_product/pair_loop/384d_4c`                  | 132.3 ns        | 61.5 ns        |
+| `simd_query_batch_dot_product/pair_loop/384d_64c`                 | 2.43 µs         | 1.00 µs        |
+| `simd_query_batch_dot_product/pair_loop/768d_16c`                 | 978.2 ns        | 443.8 ns       |
+| `simd_query_batch_dot_product/pair_loop/768d_256c`                | 22.49 µs        | 7.21 µs        |
+| `simd_query_batch_dot_product/pair_loop/768d_4c`                  | 233.8 ns        | 104.6 ns       |
+| `simd_query_batch_dot_product/pair_loop/768d_64c`                 | 4.60 µs         | 1.70 µs        |
+| `simd_query_batch_dot_product/simd_batch/128d_16c`                | 141.9 ns        | 62.5 ns        |
+| `simd_query_batch_dot_product/simd_batch/128d_256c`               | 3.05 µs         | 1.16 µs        |
+| `simd_query_batch_dot_product/simd_batch/128d_4c`                 | 46.4 ns         | 23.0 ns        |
+| `simd_query_batch_dot_product/simd_batch/128d_64c`                | 540.1 ns        | 243.2 ns       |
+| `simd_query_batch_dot_product/simd_batch/384d_16c`                | 326.1 ns        | 153.0 ns       |
+| `simd_query_batch_dot_product/simd_batch/384d_256c`               | 8.38 µs         | 3.04 µs        |
+| `simd_query_batch_dot_product/simd_batch/384d_4c`                 | 93.6 ns         | 44.9 ns        |
+| `simd_query_batch_dot_product/simd_batch/384d_64c`                | 2.14 µs         | 759.3 ns       |
+| `simd_query_batch_dot_product/simd_batch/768d_16c`                | 695.6 ns        | 356.3 ns       |
+| `simd_query_batch_dot_product/simd_batch/768d_256c`               | 18.18 µs        | 6.13 µs        |
+| `simd_query_batch_dot_product/simd_batch/768d_4c`                 | 164.2 ns        | 83.2 ns        |
+| `simd_query_batch_dot_product/simd_batch/768d_64c`                | 3.83 µs         | 1.47 µs        |
+| `simd_squared_euclidean_fast_path/euclidean_full/1024`            | 117.1 ns        | 30.3 ns        |
+| `simd_squared_euclidean_fast_path/euclidean_full/384`             | 48.7 ns         | 12.5 ns        |
+| `simd_squared_euclidean_fast_path/euclidean_full/768`             | 89.9 ns         | 23.1 ns        |
+| `simd_squared_euclidean_fast_path/squared_euclidean/1024`         | 113.9 ns        | 30.2 ns        |
+| `simd_squared_euclidean_fast_path/squared_euclidean/384`          | 45.7 ns         | 12.6 ns        |
+| `simd_squared_euclidean_fast_path/squared_euclidean/768`          | 86.8 ns         | 23.0 ns        |
+| `simd_throughput_384/cosine_similarity`                           | 58.7 ns         | 13.9 ns        |
+| `simd_throughput_384/dot_product`                                 | 31.6 ns         | 9.4 ns         |
+| `simd_throughput_384/euclidean_distance`                          | 49.1 ns         | 10.2 ns        |
+| `simd_throughput_384/normalize`                                   | 127.9 ns        | 80.5 ns        |
+| `tier_prepared_batch_sizes/int4_batch_prepared/10`                | 515.9 ns        | 750.0 ns       |
+| `tier_prepared_batch_sizes/int4_batch_prepared/100`               | 4.99 µs         | 7.33 µs        |
+| `tier_prepared_batch_sizes/int4_batch_prepared/1000`              | 50.16 µs        | 73.00 µs       |
+| `tier_prepared_batch_sizes/int4_query_per_call/10`                | 9.34 µs         | 4.19 µs        |
+| `tier_prepared_batch_sizes/int4_query_per_call/100`               | 93.15 µs        | 40.42 µs       |
+| `tier_prepared_batch_sizes/int4_query_per_call/1000`              | 938.51 µs       | 408.97 µs      |
+| `tier_prepared_batch_sizes/int8_batch_prepared/10`                | 172.7 ns        | 99.6 ns        |
+| `tier_prepared_batch_sizes/int8_batch_prepared/100`               | 1.53 µs         | 803.8 ns       |
+| `tier_prepared_batch_sizes/int8_batch_prepared/1000`              | 15.53 µs        | 7.87 µs        |
+| `tier_prepared_batch_sizes/int8_query_per_call/10`                | 9.75 µs         | 3.68 µs        |
+| `tier_prepared_batch_sizes/int8_query_per_call/100`               | 97.23 µs        | 36.02 µs       |
+| `tier_prepared_batch_sizes/int8_query_per_call/1000`              | 971.88 µs       | 354.84 µs      |
+| `tier_prepared_query/binary_query_once_1000`                      | 8.00 µs         | 28.54 µs       |
+| `tier_prepared_query/binary_query_per_call_1000`                  | 1.09 ms         | 252.54 µs      |
+| `tier_prepared_query/int4_query_once_1000`                        | 51.85 µs        | 74.05 µs       |
+| `tier_prepared_query/int4_query_per_call_1000`                    | 943.54 µs       | 411.62 µs      |
+| `tier_prepared_query/int8_query_once_1000`                        | 18.18 µs        | 9.40 µs        |
+| `tier_prepared_query/int8_query_per_call_1000`                    | 948.13 µs       | 327.56 µs      |
 
 </details>
 
