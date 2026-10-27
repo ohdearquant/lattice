@@ -33,7 +33,8 @@ esac
 #           -> gemma4                 depends on arch, compute, inference-core, tokenizer, weights
 #           -> ernie45                depends on arch, compute, inference-core, tokenizer, weights and optional metal-runtime
 #           -> qwen35                 depends on arch, compute, fann, grammar, inference-core, model-io, quant, tokenizer, weights and optional metal-runtime
-#             -> inference            depends on every model family and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime
+#           -> backward               depends on arch, compute (qwen35 only as a dev-dependency, so it waits for qwen35's index)
+#             -> inference            depends on every model family and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime and optional backward
 #             -> embed                depends on bert, embeddinggemma2, qwen3, qwen35 and lower crates (inference only as a dev-dependency)
 #               -> serve              depends on inference (exact version), tokenizer, weights and fann (via `mixture` or `metal-gpu`)
 #               -> tune               depends on fann, and on inference only through `inference-hook` or `train-backward`
@@ -140,6 +141,11 @@ publish_crate lattice-model-qwen3
 publish_crate lattice-model-gemma4
 publish_crate lattice-model-ernie45
 publish_crate lattice-model-qwen35
+# lattice-backward's tests depend on the lattice-model-qwen35 release just uploaded.
+if [ -z "$FLAG" ]; then
+    echo "Waiting for crates.io indexing..."
+    sleep 30
+fi
 publish_crate lattice-backward
 
 if [ -z "$FLAG" ]; then
