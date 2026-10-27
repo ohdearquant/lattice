@@ -1,4 +1,5 @@
 use super::*;
+use lattice_tokenizer::Tokenizer as _;
 
 // -----------------------------------------------------------------------
 // Cross-turn KV prefix cache: Metal-specific runtime (#462)
@@ -300,18 +301,27 @@ impl MetalQwen35State {
             }
         };
 
+        // Plain history omits the generation prompt's think frame, so the
+        // shared prefix can end just after this turn's assistant opener.
+        let mut opener = String::new();
+        crate::forward::metal_qwen35::push_chat_generation_open(&mut opener);
+        let opener = tokenizer.tokenize(&opener);
+        let turn_checkpoint_at =
+            generation_turn_start(&prompt_ids, &opener.input_ids[..opener.real_length]);
+
         // The session borrows the state for the whole run and tears the
         // sampling route down when it drops, before the commit below.
         let eos_token_id = self.engine.config.eos_token_id;
-        let run = {
+        let (run, turn_checkpoint) = {
             let mut session = QwenMetalSession::over_restored_state(
                 self,
                 gen_plan,
                 plan.suffix_start,
                 gen_cfg,
                 SamplingRouteEnvironment::current(),
-            )?;
-            run_prefix_cache_streaming(
+            )?
+            .with_turn_checkpoint_at(turn_checkpoint_at);
+            let run = run_prefix_cache_streaming(
                 &mut session,
                 gen_cfg,
                 think_close_id,
@@ -320,7 +330,8 @@ impl MetalQwen35State {
                 tokenizer,
                 on_token,
                 should_cancel,
-            )?
+            )?;
+            (run, session.take_turn_checkpoint())
         };
 
         match run.commit {
@@ -347,6 +358,7 @@ impl MetalQwen35State {
                     metadata,
                     represented_token_ids,
                     consumed_entry.take(),
+                    turn_checkpoint.map(|(len, snapshot)| MetalGdnCheckpoint { len, snapshot }),
                 );
             }
         }
@@ -447,5 +459,121 @@ impl MetalQwen35State {
             },
             cache: cached.cache,
         })
+    }
+}
+
+// The next request renders prior assistant content immediately after the opener.
+fn generation_turn_start(prompt_ids: &[u32], opener_ids: &[u32]) -> Option<usize> {
+    if opener_ids.is_empty() || opener_ids.len() > prompt_ids.len() {
+        return None;
+    }
+    prompt_ids
+        .windows(opener_ids.len())
+        .rposition(|window| window == opener_ids)
+        .map(|start| start + opener_ids.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generation_turn_start;
+    use lattice_compute::kv_cache::{
+        AdapterId, CrossTurnPrefixEntry, CrossTurnPrefixMetadata, CrossTurnSlotId, KvPrefixHandle,
+        PrefixReuseMode, plan_prefix_reuse_for_slot,
+    };
+
+    fn metadata() -> CrossTurnPrefixMetadata {
+        CrossTurnPrefixMetadata {
+            model_fingerprint: 1,
+            tokenizer_fingerprint: 2,
+            adapter_id: AdapterId::BASE,
+            vocab_size: 1000,
+            max_cache_len: 4096,
+            kv_f16: false,
+            rope_theta_bits: 0,
+            partial_rotary_factor_bits: None,
+            layer_pattern_hash: 42,
+            chat_template_version: 1,
+        }
+    }
+
+    fn entry(
+        token_ids: Vec<u32>,
+        represented_len: usize,
+        gdn_snapshot_len: usize,
+    ) -> CrossTurnPrefixEntry {
+        CrossTurnPrefixEntry {
+            slot_id: CrossTurnSlotId::DEFAULT,
+            metadata: metadata(),
+            token_ids,
+            represented_len,
+            kv: KvPrefixHandle {
+                represented_len,
+                num_full_attention_layers: 6,
+                kv_dim: 512,
+                max_cache_len: 4096,
+                kv_f16: false,
+            },
+            gdn_snapshot_len,
+        }
+    }
+
+    #[test]
+    fn generation_turn_start_ends_at_the_last_opener() {
+        let opener = [4, 5];
+        assert_eq!(generation_turn_start(&[1, 4, 5, 6, 7], &opener), Some(3));
+        assert_eq!(
+            generation_turn_start(&[1, 4, 5, 8, 9, 4, 5, 6], &opener),
+            Some(7)
+        );
+        assert_eq!(generation_turn_start(&[1, 2, 4, 5], &opener), Some(4));
+        assert_eq!(generation_turn_start(&[1, 4, 6, 5], &opener), None);
+        assert_eq!(generation_turn_start(&[4], &opener), None);
+        assert_eq!(generation_turn_start(&[1, 4, 5], &[]), None);
+    }
+
+    #[test]
+    fn a_checkpoint_at_the_turn_start_replays_a_plain_history_continuation() {
+        let opener = [4, 5];
+        let think = [6, 7];
+        let first_prompt: Vec<u32> = [&[1, 2, 3][..], &opener, &think].concat();
+        let turn_start = generation_turn_start(&first_prompt, &opener).expect("opener present");
+        assert_eq!(turn_start, 5);
+        let answer = [8, 9];
+        let held: Vec<u32> = [&first_prompt[..], &answer].concat();
+        let e = entry(held.clone(), held.len(), held.len());
+        let next_prompt: Vec<u32> = [
+            &[1, 2, 3][..],
+            &opener,
+            &answer,
+            &[10, 1, 2, 11],
+            &opener,
+            &think,
+        ]
+        .concat();
+
+        let plan = plan_prefix_reuse_for_slot(
+            CrossTurnSlotId::DEFAULT,
+            Some(&e),
+            &metadata(),
+            &next_prompt,
+            &[turn_start],
+        );
+        assert_eq!(
+            plan.mode,
+            PrefixReuseMode::ReplayFromCheckpoint {
+                checkpoint_len: turn_start
+            }
+        );
+        assert_eq!(plan.reusable_len, turn_start);
+        assert_eq!(plan.suffix_len, next_prompt.len() - turn_start);
+
+        let plan = plan_prefix_reuse_for_slot(
+            CrossTurnSlotId::DEFAULT,
+            Some(&e),
+            &metadata(),
+            &next_prompt,
+            &[],
+        );
+        assert_eq!(plan.mode, PrefixReuseMode::FullRefill);
     }
 }

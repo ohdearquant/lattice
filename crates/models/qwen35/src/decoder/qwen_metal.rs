@@ -231,6 +231,10 @@ pub(crate) struct QwenMetalSession<'state> {
     prompt_ids: Vec<u32>,
     /// Where the suffix the prefix-cache profile prefills begins; 0 otherwise.
     suffix_start: usize,
+    /// A prompt length inside the suffix at which prefill keeps a turn checkpoint.
+    turn_checkpoint_at: Option<usize>,
+    /// The owned state captured at that exact prompt boundary.
+    turn_checkpoint: Option<(usize, crate::attention::gdn::GdnSnapshot)>,
     rng_state: u64,
     temperature: f32,
     ledger: PredictionLedger,
@@ -388,6 +392,8 @@ impl<'state> QwenMetalSession<'state> {
             mode,
             prompt_ids: plan.prompt_ids,
             suffix_start,
+            turn_checkpoint_at: None,
+            turn_checkpoint: None,
             rng_state: plan.rng_state,
             temperature: gen_cfg.temperature,
             ledger: PredictionLedger::new()?,
@@ -396,6 +402,19 @@ impl<'state> QwenMetalSession<'state> {
             route_engaged,
             thread_bound: PhantomData,
         })
+    }
+
+    /// A boundary inside the suffix keeps a checkpoint for the next chat turn;
+    /// other profiles and boundaries outside the suffix leave prefill whole.
+    pub(crate) fn with_turn_checkpoint_at(mut self, at: Option<usize>) -> Self {
+        self.turn_checkpoint_at = at;
+        self
+    }
+
+    pub(crate) fn take_turn_checkpoint(
+        &mut self,
+    ) -> Option<(usize, crate::attention::gdn::GdnSnapshot)> {
+        self.turn_checkpoint.take()
     }
 
     /// The readback mode fixed at construction.
@@ -437,11 +456,20 @@ impl DecoderSession for QwenMetalSession<'_> {
         }
         self.ledger.reset();
         let logits = if self.profile == MetalEntryProfile::PrefixCacheStreaming {
-            self.state.forward_prefill_from(
-                &self.prompt_ids[self.suffix_start..],
-                self.suffix_start,
-                false,
-            )?
+            let mut start = self.suffix_start;
+            if let Some(at) = self.turn_checkpoint_at
+                && start < at
+                && at < self.prompt_ids.len()
+            {
+                self.state
+                    .forward_prefill_from(&self.prompt_ids[start..at], start, false)?;
+                let snapshot =
+                    crate::speculative::MtpTargetVerifier::snapshot_gdn_states(&*self.state);
+                self.turn_checkpoint = Some((at, snapshot));
+                start = at;
+            }
+            self.state
+                .forward_prefill_from(&self.prompt_ids[start..], start, false)?
         } else {
             self.state.try_forward_prefill(&self.prompt_ids)?
         };
