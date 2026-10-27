@@ -19,7 +19,7 @@ members = [
     "crates/forecast",
     "crates/models/embeddinggemma2",
     "crates/models/bert",
-    "crates/models/qwen3",
+    "crates/models/qwen3-embedding",
     "crates/models/gemma4",
     "crates/models/ernie45",
     "crates/models/qwen35",
@@ -134,7 +134,7 @@ lattice-tokenizer = { version = "0.15.0", path = "crates/tokenizer" }
 lattice-weights = { version = "0.15.0", path = "crates/weights" }
 lattice-model-embeddinggemma2 = { version = "0.15.0", path = "crates/models/embeddinggemma2" }
 lattice-model-bert = { version = "0.15.0", path = "crates/models/bert", default-features = false }
-lattice-model-qwen3 = { version = "0.15.0", path = "crates/models/qwen3", default-features = false }
+lattice-model-qwen3-embedding = { version = "0.15.0", path = "crates/models/qwen3-embedding", default-features = false }
 lattice-model-gemma4 = { version = "0.15.0", path = "crates/models/gemma4", default-features = false }
 lattice-model-ernie45 = { version = "0.15.0", path = "crates/models/ernie45" }
 

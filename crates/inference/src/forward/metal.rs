@@ -2,4 +2,4 @@
 
 #[cfg(feature = "qwen3")]
 #[doc(inline)]
-pub use lattice_model_qwen3::metal::MetalForwardPass;
+pub use lattice_model_qwen3_embedding::metal::MetalForwardPass;

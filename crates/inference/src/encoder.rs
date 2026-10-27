@@ -19,7 +19,7 @@ pub use lattice_model_bert::BertEncoder;
 /// Qwen3 encoder adapter.
 #[cfg(feature = "qwen3")]
 #[doc(inline)]
-pub use lattice_model_qwen3::QwenEncoder;
+pub use lattice_model_qwen3_embedding::QwenEncoder;
 
 #[cfg(feature = "embeddinggemma2")]
 #[doc(inline)]

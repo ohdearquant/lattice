@@ -12,7 +12,7 @@ use lattice_weights::{
 /// the result. Tensor names and validation follow the Qwen3 checkpoint recipe.
 ///
 /// ```
-/// use lattice_model_qwen3::weight_loading::load_weights;
+/// use lattice_model_qwen3_embedding::weight_loading::load_weights;
 /// use lattice_weights::{QwenWeights, SafetensorsFile};
 /// fn borrow(source: &SafetensorsFile) -> QwenWeights<'_> {
 ///     load_weights(source, 0, 2, 2, 1, 1, 3).unwrap()
@@ -20,7 +20,7 @@ use lattice_weights::{
 /// ```
 ///
 /// ```compile_fail
-/// use lattice_model_qwen3::weight_loading::load_weights;
+/// use lattice_model_qwen3_embedding::weight_loading::load_weights;
 /// use lattice_weights::{QwenWeights, SafetensorsFile};
 /// fn escape(source: SafetensorsFile) -> QwenWeights<'static> {
 ///     load_weights(&source, 0, 2, 2, 1, 1, 3).unwrap()
@@ -153,7 +153,7 @@ impl OwnedQwenWeights {
     /// The raw views borrow `self`, independently of any tensor-name string.
     ///
     /// ```
-    /// use lattice_model_qwen3::weight_loading::OwnedQwenWeights;
+    /// use lattice_model_qwen3_embedding::weight_loading::OwnedQwenWeights;
     /// use lattice_weights::QwenWeights;
     /// fn borrow(owner: &OwnedQwenWeights) -> QwenWeights<'_> {
     ///     owner.assemble_borrowed_weights()
@@ -161,7 +161,7 @@ impl OwnedQwenWeights {
     /// ```
     ///
     /// ```compile_fail
-    /// use lattice_model_qwen3::weight_loading::OwnedQwenWeights;
+    /// use lattice_model_qwen3_embedding::weight_loading::OwnedQwenWeights;
     /// use lattice_weights::QwenWeights;
     /// fn escape(owner: OwnedQwenWeights) -> QwenWeights<'static> {
     ///     owner.assemble_borrowed_weights()
@@ -169,7 +169,7 @@ impl OwnedQwenWeights {
     /// ```
     ///
     /// ```
-    /// use lattice_model_qwen3::weight_loading::OwnedQwenWeights;
+    /// use lattice_model_qwen3_embedding::weight_loading::OwnedQwenWeights;
     /// fn move_after_borrow(owner: OwnedQwenWeights) -> OwnedQwenWeights {
     ///     let weights = owner.assemble_borrowed_weights();
     ///     assert_eq!(weights.norm_weight.len, weights.norm_weight.data.len());
@@ -179,7 +179,7 @@ impl OwnedQwenWeights {
     /// ```
     ///
     /// ```compile_fail
-    /// use lattice_model_qwen3::weight_loading::OwnedQwenWeights;
+    /// use lattice_model_qwen3_embedding::weight_loading::OwnedQwenWeights;
     /// fn move_during_borrow(owner: OwnedQwenWeights) -> OwnedQwenWeights {
     ///     let weights = owner.assemble_borrowed_weights();
     ///     let moved = owner;
@@ -189,7 +189,7 @@ impl OwnedQwenWeights {
     /// ```
     ///
     /// ```
-    /// use lattice_model_qwen3::weight_loading::OwnedQwenWeights;
+    /// use lattice_model_qwen3_embedding::weight_loading::OwnedQwenWeights;
     /// fn drop_after_borrow(owner: OwnedQwenWeights) {
     ///     let weights = owner.assemble_borrowed_weights();
     ///     assert_eq!(weights.norm_weight.len, weights.norm_weight.data.len());
@@ -199,7 +199,7 @@ impl OwnedQwenWeights {
     /// ```
     ///
     /// ```compile_fail
-    /// use lattice_model_qwen3::weight_loading::OwnedQwenWeights;
+    /// use lattice_model_qwen3_embedding::weight_loading::OwnedQwenWeights;
     /// fn drop_during_borrow(owner: OwnedQwenWeights) {
     ///     let weights = owner.assemble_borrowed_weights();
     ///     drop(owner);
@@ -317,7 +317,7 @@ impl OwnedQwenWeights {
 /// Each tensor is checked before reading the next tensor in the Qwen3 recipe.
 ///
 /// ```
-/// use lattice_model_qwen3::weight_loading::{load_owned_weights, OwnedQwenWeights};
+/// use lattice_model_qwen3_embedding::weight_loading::{load_owned_weights, OwnedQwenWeights};
 /// use lattice_weights::ShardedSafetensors;
 /// fn load(source: &mut ShardedSafetensors) -> OwnedQwenWeights {
 ///     load_owned_weights(source, 0, 2, 2, 1, 1, 3).unwrap()
