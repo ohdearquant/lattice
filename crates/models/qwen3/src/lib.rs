@@ -451,8 +451,6 @@ fn derive_base_model_rev(dir: &Path) -> Option<String> {
     Some(format!("sha256:{}", &hex[..16]))
 }
 
-/// Pre-allocated buffers for the forward pass, reused across calls.
-/// Buffers grow monotonically — allocate larger if needed, never shrink.
 #[derive(Clone, Copy)]
 enum ForwardStage {
     Embedding,
@@ -556,6 +554,8 @@ impl ForwardObserver for TimingObserver<'_> {
     }
 }
 
+/// Pre-allocated buffers for the forward pass, reused across calls.
+/// Buffers grow monotonically — allocate larger if needed, never shrink.
 struct ForwardBuffers {
     hidden: Vec<f32>,
     residual: Vec<f32>,
