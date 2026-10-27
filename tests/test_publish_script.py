@@ -70,7 +70,7 @@ class PublishScriptArgs(_PublishScriptFixture):
         proc, calls = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 21, calls)
+        self.assertEqual(len(publishes), 22, calls)
         self.assertFalse(any("--dry-run" in c for c in publishes), publishes)
         self.assertEqual(
             [c for c in calls if c.startswith(("cargo ", "sleep "))],
@@ -91,9 +91,10 @@ class PublishScriptArgs(_PublishScriptFixture):
                 "cargo publish -p lattice-quant",
                 "cargo publish -p lattice-compute",
                 "sleep 30",
+                "cargo publish -p lattice-forecast",
                 "cargo publish -p lattice-model-embeddinggemma2",
                 "cargo publish -p lattice-model-bert",
-                "cargo publish -p lattice-model-qwen3",
+                "cargo publish -p lattice-model-qwen3-embedding",
                 "cargo publish -p lattice-model-gemma4",
                 "cargo publish -p lattice-model-ernie45",
                 "cargo publish -p lattice-model-qwen35",
@@ -188,7 +189,7 @@ class PublishScriptRetries(_PublishScriptFixture):
         proc, calls = self._fail("lattice-quant", "429-once")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 22, calls)
+        self.assertEqual(len(publishes), 23, calls)
         self.assertEqual(publishes.count("cargo publish -p lattice-quant"), 2, publishes)
         self.assertEqual(self._sleeps(calls), ["sleep 610"], calls)
         i = calls.index("sleep 610")
@@ -201,7 +202,7 @@ class PublishScriptRetries(_PublishScriptFixture):
         proc, calls = self._fail("lattice-fann", "exists")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 21, calls)
+        self.assertEqual(len(publishes), 22, calls)
         self.assertEqual(self._sleeps(calls), [], calls)
         self.assertIn("lattice-fann: this version is already on the registry; skipping", proc.stdout)
 
