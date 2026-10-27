@@ -23,8 +23,6 @@ pub mod metal_ernie45;
 pub mod metal_gemm;
 #[cfg(feature = "qwen35")]
 pub mod metal_qwen35;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-mod metal_runtime;
 #[cfg(feature = "qwen35")]
 pub mod moe_expert_cache;
 #[cfg(feature = "qwen35")]
