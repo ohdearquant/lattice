@@ -30,5 +30,5 @@ pub(super) fn to_u32(value: usize, name: &str) -> Result<u32> {
 
 #[inline]
 pub(super) fn ceil_div_u32(x: u32, y: u32) -> u32 {
-    (x + y - 1) / y
+    x.div_ceil(y)
 }

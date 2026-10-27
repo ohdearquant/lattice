@@ -89,12 +89,15 @@ pub(super) fn validate_model_config(config: &Qwen3Config) -> Result<()> {
             "model config dimensions must be non-zero".to_string(),
         ));
     }
-    if config.head_dim % 2 != 0 {
+    if !config.head_dim.is_multiple_of(2) {
         return Err(GpuForwardError::InvalidInput(
             "head_dim must be even for RoPE".to_string(),
         ));
     }
-    if config.num_attention_heads % config.num_key_value_heads != 0 {
+    if !config
+        .num_attention_heads
+        .is_multiple_of(config.num_key_value_heads)
+    {
         return Err(GpuForwardError::InvalidInput(
             "num_attention_heads must be divisible by num_key_value_heads".to_string(),
         ));

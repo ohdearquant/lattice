@@ -1,6 +1,8 @@
 //! GPU-vs-CPU tiny-model tests and CPU reference helpers.
 use super::*;
-use crate::attention::softmax_row::{finalize_row, row_fails_closed_pre_exp, row_max_and_any_nan};
+use lattice_compute::attention::softmax_row::{
+    finalize_row, row_fails_closed_pre_exp, row_max_and_any_nan,
+};
 
 #[test]
 fn tiny_model_matches_gpu_and_keeps_static_buffers() {
