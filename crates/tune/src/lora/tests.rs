@@ -872,6 +872,180 @@ mod validate_against_bert_tests {
     }
 
     #[test]
+    fn bert_validation_preserves_exact_errors_and_single_entry_precedence() {
+        for (module, d_in, d_out, layers, expected) in [
+            (
+                "未知投影",
+                HIDDEN_SIZE + 1,
+                HIDDEN_SIZE + 2,
+                0,
+                "LoRA layer index 0 >= BERT num_hidden_layers 0 (module: 未知投影)",
+            ),
+            (
+                "未知投影",
+                HIDDEN_SIZE + 1,
+                HIDDEN_SIZE + 2,
+                NUM_HIDDEN_LAYERS,
+                "LoRA module '未知投影' (layer 0) is not a recognised BERT cross-encoder projection",
+            ),
+            (
+                "query",
+                HIDDEN_SIZE + 1,
+                HIDDEN_SIZE + 2,
+                NUM_HIDDEN_LAYERS,
+                "LoRA adapter dims mismatch for layer 0 module 'query': adapter has (d_in=385, d_out=386) but BERT model expects (d_in=384, d_out=384)",
+            ),
+            (
+                "ffn_intermediate",
+                HIDDEN_SIZE + 1,
+                INTERMEDIATE_SIZE + 1,
+                NUM_HIDDEN_LAYERS,
+                "LoRA adapter dims mismatch for layer 0 module 'ffn_intermediate': adapter has (d_in=385, d_out=1537) but BERT model expects (d_in=384, d_out=1536)",
+            ),
+            (
+                "ffn_output",
+                INTERMEDIATE_SIZE + 1,
+                HIDDEN_SIZE + 1,
+                NUM_HIDDEN_LAYERS,
+                "LoRA adapter dims mismatch for layer 0 module 'ffn_output': adapter has (d_in=1537, d_out=385) but BERT model expects (d_in=1536, d_out=384)",
+            ),
+        ] {
+            let adapter = make_bert_adapter(module, d_in, d_out);
+            let error = adapter
+                .validate_against_bert(layers, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                .expect_err("the single invalid entry must be refused");
+            assert_eq!(error.to_string(), format!("Validation error: {expected}"));
+            match error {
+                crate::error::TuneError::Validation(message) => assert_eq!(message, expected),
+                other => panic!("expected Validation, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bert_validation_preserves_empty_layers_and_target_list_behavior() {
+        for target_modules in [Vec::new(), vec!["未来投影".to_string()]] {
+            let adapter = LoraAdapter::new(
+                LoraConfig {
+                    rank: 4,
+                    alpha: 4.0,
+                    target_modules,
+                    dtype: "f32".to_string(),
+                },
+                HashMap::new(),
+            )
+            .expect("bare construction is model-neutral");
+            assert!(adapter.validate_against_bert(0, 0, 0).is_ok());
+            assert!(
+                adapter
+                    .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                    .is_ok()
+            );
+        }
+        for (module, accepted) in [("query", true), ("未来投影", false)] {
+            let adapter = LoraAdapter::new(
+                LoraConfig {
+                    rank: 1,
+                    alpha: 1.0,
+                    target_modules: Vec::new(),
+                    dtype: "f32".to_string(),
+                },
+                HashMap::from([(
+                    (0, module.to_string()),
+                    LoraLayer {
+                        a: vec![0.0; 3],
+                        b: vec![0.0; 3],
+                        d_in: 3,
+                        d_out: 3,
+                        rank: 1,
+                    },
+                )]),
+            )
+            .expect("empty target list does not replace stored entries");
+            let result = adapter.validate_against_bert(1, 3, 7);
+            if accepted {
+                assert!(result.is_ok());
+            } else {
+                assert!(
+                    matches!(result, Err(crate::error::TuneError::Validation(ref message))
+                    if message == "LoRA module '未来投影' (layer 0) is not a recognised BERT cross-encoder projection")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bert_validation_preserves_matching_zero_width_placeholders() {
+        for (module, hidden, intermediate, d_in, d_out) in [
+            ("query", 0, 19, 0, 0),
+            ("ffn_intermediate", 7, 0, 7, 0),
+            ("ffn_output", 7, 0, 0, 7),
+        ] {
+            let adapter = LoraAdapter::new(
+                LoraConfig {
+                    rank: 4,
+                    alpha: 4.0,
+                    target_modules: vec![module.to_string()],
+                    dtype: "f32".to_string(),
+                },
+                HashMap::from([(
+                    (0, module.to_string()),
+                    LoraLayer {
+                        a: Vec::new(),
+                        b: Vec::new(),
+                        d_in,
+                        d_out,
+                        rank: 4,
+                    },
+                )]),
+            )
+            .expect("fully empty factors are an admitted placeholder");
+
+            assert!(
+                adapter
+                    .validate_against_bert(1, hidden, intermediate)
+                    .is_ok(),
+                "{module}"
+            );
+        }
+    }
+
+    #[test]
+    fn bert_validation_preserves_last_valid_layer_boundary() {
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank: 4,
+                alpha: 4.0,
+                target_modules: vec!["query".to_string()],
+                dtype: "f32".to_string(),
+            },
+            HashMap::from([(
+                (11, "query".to_string()),
+                LoraLayer {
+                    a: vec![0.0; 12],
+                    b: vec![0.0; 12],
+                    d_in: 3,
+                    d_out: 3,
+                    rank: 4,
+                },
+            )]),
+        )
+        .expect("self-consistent over-complete adapter");
+
+        assert!(adapter.validate_against_bert(12, 3, 7).is_ok());
+        let error = adapter
+            .validate_against_bert(11, 3, 7)
+            .expect_err("layer 11 is outside 0..11");
+        match error {
+            crate::error::TuneError::Validation(message) => assert_eq!(
+                message,
+                "LoRA layer index 11 >= BERT num_hidden_layers 11 (module: query)",
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_validate_against_bert_oversized_d_out_rejected() {
         // The original bug: a self-consistent adapter declaring d_out >
         // hidden_size, which `apply_lora` would slice `output[..d_out]`

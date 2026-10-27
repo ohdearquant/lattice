@@ -524,7 +524,10 @@ impl LoraAdapter {
         hidden_size: usize,
         intermediate_size: usize,
     ) -> crate::error::Result<()> {
+        use lattice_inference::lora_hook::{BertLoraGeometry, LoraTargetGeometry};
+
         self.config().validate()?;
+        let geometry = BertLoraGeometry::new(num_hidden_layers, hidden_size, intermediate_size);
         for ((layer_idx, module), layer) in self.layers() {
             if *layer_idx >= num_hidden_layers {
                 return Err(crate::error::TuneError::Validation(format!(
@@ -532,16 +535,15 @@ impl LoraAdapter {
                 )));
             }
 
-            let (expected_d_in, expected_d_out) = match module.as_str() {
-                "query" | "key" | "value" | "attn_output" => (hidden_size, hidden_size),
-                "ffn_intermediate" => (hidden_size, intermediate_size),
-                "ffn_output" => (intermediate_size, hidden_size),
-                m => {
-                    return Err(crate::error::TuneError::Validation(format!(
-                        "LoRA module '{m}' (layer {layer_idx}) is not a recognised BERT cross-encoder projection"
-                    )));
-                }
-            };
+            let expected = geometry
+                .projection_shape(*layer_idx, module)
+                .map_err(|_| {
+                    // Range was checked above; preserve the legacy unknown-module diagnostic.
+                    crate::error::TuneError::Validation(format!(
+                        "LoRA module '{module}' (layer {layer_idx}) is not a recognised BERT cross-encoder projection"
+                    ))
+                })?;
+            let (expected_d_in, expected_d_out) = (expected.d_in, expected.d_out);
 
             if layer.d_in != expected_d_in || layer.d_out != expected_d_out {
                 return Err(crate::error::TuneError::Validation(format!(
