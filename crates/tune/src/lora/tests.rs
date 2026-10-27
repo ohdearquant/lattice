@@ -551,7 +551,7 @@ mod validate_against_tests {
     use super::*;
     use lattice_inference::model::qwen35_config::Qwen35Config;
 
-    fn make_adapter_for_layer(
+    pub(super) fn make_adapter_for_layer(
         layer_idx: usize,
         module: &str,
         d_in: usize,
@@ -760,6 +760,8 @@ mod validate_against_tests {
     /// delegates to the inherent method instead of defaulting to the
     /// trait's no-op `Ok(())`, for both a mismatched and a matching
     /// adapter.
+    // Preserve the legacy trait override contract through 0.15.0.
+    #[allow(deprecated)]
     #[test]
     fn test_lora_hook_trait_validate_against_delegates_to_inherent_method() {
         use lattice_inference::lora_hook::LoraHook;
@@ -844,7 +846,7 @@ mod validate_against_bert_tests {
     const HIDDEN_SIZE: usize = 384;
     const INTERMEDIATE_SIZE: usize = 1536;
 
-    fn make_bert_adapter(module: &str, d_in: usize, d_out: usize) -> LoraAdapter {
+    pub(super) fn make_bert_adapter(module: &str, d_in: usize, d_out: usize) -> LoraAdapter {
         let rank = 4;
         let mut layers = HashMap::new();
         layers.insert(
@@ -867,6 +869,180 @@ mod validate_against_bert_tests {
             layers,
         )
         .expect("valid adapter config")
+    }
+
+    #[test]
+    fn bert_validation_preserves_exact_errors_and_single_entry_precedence() {
+        for (module, d_in, d_out, layers, expected) in [
+            (
+                "未知投影",
+                HIDDEN_SIZE + 1,
+                HIDDEN_SIZE + 2,
+                0,
+                "LoRA layer index 0 >= BERT num_hidden_layers 0 (module: 未知投影)",
+            ),
+            (
+                "未知投影",
+                HIDDEN_SIZE + 1,
+                HIDDEN_SIZE + 2,
+                NUM_HIDDEN_LAYERS,
+                "LoRA module '未知投影' (layer 0) is not a recognised BERT cross-encoder projection",
+            ),
+            (
+                "query",
+                HIDDEN_SIZE + 1,
+                HIDDEN_SIZE + 2,
+                NUM_HIDDEN_LAYERS,
+                "LoRA adapter dims mismatch for layer 0 module 'query': adapter has (d_in=385, d_out=386) but BERT model expects (d_in=384, d_out=384)",
+            ),
+            (
+                "ffn_intermediate",
+                HIDDEN_SIZE + 1,
+                INTERMEDIATE_SIZE + 1,
+                NUM_HIDDEN_LAYERS,
+                "LoRA adapter dims mismatch for layer 0 module 'ffn_intermediate': adapter has (d_in=385, d_out=1537) but BERT model expects (d_in=384, d_out=1536)",
+            ),
+            (
+                "ffn_output",
+                INTERMEDIATE_SIZE + 1,
+                HIDDEN_SIZE + 1,
+                NUM_HIDDEN_LAYERS,
+                "LoRA adapter dims mismatch for layer 0 module 'ffn_output': adapter has (d_in=1537, d_out=385) but BERT model expects (d_in=1536, d_out=384)",
+            ),
+        ] {
+            let adapter = make_bert_adapter(module, d_in, d_out);
+            let error = adapter
+                .validate_against_bert(layers, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                .expect_err("the single invalid entry must be refused");
+            assert_eq!(error.to_string(), format!("Validation error: {expected}"));
+            match error {
+                crate::error::TuneError::Validation(message) => assert_eq!(message, expected),
+                other => panic!("expected Validation, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bert_validation_preserves_empty_layers_and_target_list_behavior() {
+        for target_modules in [Vec::new(), vec!["未来投影".to_string()]] {
+            let adapter = LoraAdapter::new(
+                LoraConfig {
+                    rank: 4,
+                    alpha: 4.0,
+                    target_modules,
+                    dtype: "f32".to_string(),
+                },
+                HashMap::new(),
+            )
+            .expect("bare construction is model-neutral");
+            assert!(adapter.validate_against_bert(0, 0, 0).is_ok());
+            assert!(
+                adapter
+                    .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                    .is_ok()
+            );
+        }
+        for (module, accepted) in [("query", true), ("未来投影", false)] {
+            let adapter = LoraAdapter::new(
+                LoraConfig {
+                    rank: 1,
+                    alpha: 1.0,
+                    target_modules: Vec::new(),
+                    dtype: "f32".to_string(),
+                },
+                HashMap::from([(
+                    (0, module.to_string()),
+                    LoraLayer {
+                        a: vec![0.0; 3],
+                        b: vec![0.0; 3],
+                        d_in: 3,
+                        d_out: 3,
+                        rank: 1,
+                    },
+                )]),
+            )
+            .expect("empty target list does not replace stored entries");
+            let result = adapter.validate_against_bert(1, 3, 7);
+            if accepted {
+                assert!(result.is_ok());
+            } else {
+                assert!(
+                    matches!(result, Err(crate::error::TuneError::Validation(ref message))
+                    if message == "LoRA module '未来投影' (layer 0) is not a recognised BERT cross-encoder projection")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bert_validation_preserves_matching_zero_width_placeholders() {
+        for (module, hidden, intermediate, d_in, d_out) in [
+            ("query", 0, 19, 0, 0),
+            ("ffn_intermediate", 7, 0, 7, 0),
+            ("ffn_output", 7, 0, 0, 7),
+        ] {
+            let adapter = LoraAdapter::new(
+                LoraConfig {
+                    rank: 4,
+                    alpha: 4.0,
+                    target_modules: vec![module.to_string()],
+                    dtype: "f32".to_string(),
+                },
+                HashMap::from([(
+                    (0, module.to_string()),
+                    LoraLayer {
+                        a: Vec::new(),
+                        b: Vec::new(),
+                        d_in,
+                        d_out,
+                        rank: 4,
+                    },
+                )]),
+            )
+            .expect("fully empty factors are an admitted placeholder");
+
+            assert!(
+                adapter
+                    .validate_against_bert(1, hidden, intermediate)
+                    .is_ok(),
+                "{module}"
+            );
+        }
+    }
+
+    #[test]
+    fn bert_validation_preserves_last_valid_layer_boundary() {
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank: 4,
+                alpha: 4.0,
+                target_modules: vec!["query".to_string()],
+                dtype: "f32".to_string(),
+            },
+            HashMap::from([(
+                (11, "query".to_string()),
+                LoraLayer {
+                    a: vec![0.0; 12],
+                    b: vec![0.0; 12],
+                    d_in: 3,
+                    d_out: 3,
+                    rank: 4,
+                },
+            )]),
+        )
+        .expect("self-consistent over-complete adapter");
+
+        assert!(adapter.validate_against_bert(12, 3, 7).is_ok());
+        let error = adapter
+            .validate_against_bert(11, 3, 7)
+            .expect_err("layer 11 is outside 0..11");
+        match error {
+            crate::error::TuneError::Validation(message) => assert_eq!(
+                message,
+                "LoRA layer index 11 >= BERT num_hidden_layers 11 (module: query)",
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 
     #[test]
@@ -937,6 +1113,8 @@ mod validate_against_bert_tests {
         }
     }
 
+    // Preserve the legacy trait override contract through 0.15.0.
+    #[allow(deprecated)]
     #[test]
     fn test_lora_hook_trait_validate_against_bert_delegates_to_inherent_method() {
         use lattice_inference::lora_hook::LoraHook;
@@ -1245,5 +1423,117 @@ mod validate_against_bert_tests {
             !adapter.has_adapter(0, "query"),
             "an empty placeholder layer must not report as active"
         );
+    }
+}
+
+#[cfg(feature = "inference-hook")]
+mod validate_geometry_tests {
+    use super::*;
+    use lattice_inference::lora_hook::{BertLoraGeometry, LoraHook, Qwen35LoraGeometry};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
+
+    #[test]
+    fn neutral_qwen_validation_matches_legacy_cases_through_trait_object() {
+        let config = Qwen35Config::qwen35_0_8b();
+        let geometry = Qwen35LoraGeometry::new(&config);
+        for (layer, module, d_in, d_out, expected) in [
+            (3, "q_proj", 1024, 4096, true),
+            (999, "q_proj", 1024, 4096, false),
+            (3, "query", 1024, 4096, false),
+            (3, "q_proj", 1025, 4096, false),
+            (3, "q_proj", 1024, 4097, false),
+            (0, "q_proj", 1024, 4096, false),
+            (0, "gate_proj", 1024, 3584, true),
+            (0, "in_proj_a", 1024, 16, true),
+        ] {
+            let adapter =
+                super::validate_against_tests::make_adapter_for_layer(layer, module, d_in, d_out);
+            assert_eq!(
+                adapter.validate_against(&config).is_ok(),
+                expected,
+                "legacy {layer}/{module}"
+            );
+            assert_eq!(
+                adapter.validate_geometry(&geometry).is_ok(),
+                expected,
+                "neutral {layer}/{module}"
+            );
+            let hook: &dyn LoraHook = &adapter;
+            assert_eq!(
+                hook.validate_geometry(&geometry).is_ok(),
+                expected,
+                "trait {layer}/{module}"
+            );
+        }
+    }
+
+    #[test]
+    fn neutral_bert_validation_matches_legacy_cases_through_trait_object() {
+        let geometry = BertLoraGeometry::new(12, 384, 1536);
+        for (module, d_in, d_out, expected) in [
+            ("query", 384, 384, true),
+            ("key", 384, 384, true),
+            ("value", 384, 384, true),
+            ("attn_output", 384, 384, true),
+            ("ffn_intermediate", 384, 1536, true),
+            ("ffn_output", 1536, 384, true),
+            ("query", 385, 384, false),
+            ("query", 384, 385, false),
+            ("q_proj", 384, 384, false),
+        ] {
+            let adapter =
+                super::validate_against_bert_tests::make_bert_adapter(module, d_in, d_out);
+            assert_eq!(
+                adapter.validate_against_bert(12, 384, 1536).is_ok(),
+                expected,
+                "legacy {module}"
+            );
+            assert_eq!(
+                adapter.validate_geometry(&geometry).is_ok(),
+                expected,
+                "neutral {module}"
+            );
+            let hook: &dyn LoraHook = &adapter;
+            assert_eq!(
+                hook.validate_geometry(&geometry).is_ok(),
+                expected,
+                "trait {module}"
+            );
+        }
+        let adapter = super::validate_against_bert_tests::make_bert_adapter("query", 384, 384);
+        let empty = BertLoraGeometry::new(0, 384, 1536);
+        assert!(adapter.validate_against_bert(0, 384, 1536).is_err());
+        assert!(adapter.validate_geometry(&empty).is_err());
+        let hook: &dyn LoraHook = &adapter;
+        assert!(hook.validate_geometry(&empty).is_err());
+    }
+
+    #[test]
+    fn neutral_geometry_accepts_over_complete_rank() {
+        let rank = 5;
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["ffn_output".to_string()],
+                dtype: "f32".to_string(),
+            },
+            HashMap::from([(
+                (0, "ffn_output".to_string()),
+                LoraLayer {
+                    a: vec![0.0; rank * 7],
+                    b: vec![0.0; 3 * rank],
+                    d_in: 7,
+                    d_out: 3,
+                    rank,
+                },
+            )]),
+        )
+        .unwrap();
+        let geometry = BertLoraGeometry::new(1, 3, 7);
+        assert!(adapter.validate_against_bert(1, 3, 7).is_ok());
+        assert!(adapter.validate_geometry(&geometry).is_ok());
+        let hook: &dyn LoraHook = &adapter;
+        assert!(hook.validate_geometry(&geometry).is_ok());
     }
 }

@@ -21,6 +21,7 @@
 
 pub mod attention;
 pub mod forward;
+pub mod gemma_ops;
 pub mod gemma_rope;
 pub mod kv_cache;
 pub mod lora_hook;
@@ -29,6 +30,8 @@ pub mod option_scoring;
 pub mod pool;
 pub mod pruning;
 pub mod rope;
+#[doc(hidden)]
+pub mod vision;
 
 /// Cache and attention glue used by the `lattice-inference` facade.
 ///

@@ -2321,9 +2321,10 @@ mod tests {
     // production inference actually use. This test builds a fixture where
     // num_key_heads (2) != num_value_heads (4) and asserts the two forwards
     // agree, LoRA off.
+    #[cfg(feature = "qwen35")]
     #[test]
     fn source_parity_forward_save_vs_fused_asymmetric_heads() {
-        use crate::attention::gdn::GatedDeltaNetState;
+        use crate::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry};
         use crate::attention::gdn_fused::{GatedDeltaNetFusedScratch, gated_delta_net_step_fused};
         use crate::lora_hook::NoopLoraHook;
 
@@ -2382,7 +2383,9 @@ mod tests {
         );
 
         // --- Path B: gated_delta_net_step_fused (shipping inference path), per token ---
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(
+            &qwen35_gdn_geometry(&cfg).expect("the tiny config describes a valid geometry"),
+        );
         let mut scratch = GatedDeltaNetFusedScratch::default();
         let hook = NoopLoraHook;
         let mut outputs_b = vec![0.0f32; seq_len * hidden];

@@ -52,17 +52,6 @@ pub mod vision;
 /// and [`forward`].
 pub mod weights;
 
-/// Negative-scale Q4 fixture shared by every Q4 consumer's sign test.
-///
-/// Every block has a negative scale, so a consumer that drops the sign, clamps the
-/// scale at zero or otherwise reads the scale's sign computes different weights. Each
-/// consumer test runs the fixture, the same blocks with `|scale|`, and the same blocks
-/// with a zero scale: the first must match the f64 reference, and the other two, which
-/// are exactly what a sign-dropping or zero-clamping consumer would compute on the
-/// fixture, must miss it by more than ten times the tolerance.
-#[cfg(test)]
-mod signed_scale_fixture;
-
 // Standalone modules
 /// Continuous batching and scheduler support for multi-sequence inference. See [`kv_cache`]
 /// and [`model`].
@@ -95,13 +84,13 @@ pub mod router_state;
 pub(crate) mod decoder;
 /// Measurement-only seams for the per-token allocation instrument (ADR-090 D7, row R01).
 /// Compiled only with `bench-internals`; not part of the supported API.
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "qwen35", feature = "bench-internals"))]
 #[doc(hidden)]
 pub use decoder::bench_support as decoder_bench_support;
 /// Synthetic checkpoint support for repository regression tests.
-#[cfg(feature = "test-utils")]
+#[cfg(all(feature = "bert", feature = "test-utils"))]
 #[doc(hidden)]
-pub mod bert_pooling_fixture;
+pub use lattice_model_bert::bert_pooling_fixture;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
 /// The text encoder contract and its adapters for the BERT-family, Qwen3 and EmbeddingGemma 2
@@ -128,7 +117,7 @@ pub mod kv_cache;
 /// gated rather than left as an empty shell on other builds; it also reaches
 /// `lattice-fann` for the shared effective-scale helper, and that dependency exists
 /// only under `metal-gpu` (or `mixture`). See [`lora_hook`]; `lattice-serve` is its serving caller.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[cfg(all(feature = "qwen35", target_os = "macos", feature = "metal-gpu"))]
 pub mod lora_file;
 /// LoRA adapter hook called from inference forward paths. See [`model`] and [`forward`].
 pub mod lora_hook;
@@ -139,7 +128,9 @@ pub mod lora_hook;
 /// tests, benches, examples, and binaries as separate crates.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[doc(hidden)]
-pub mod measurement;
+pub mod measurement {
+    pub use lattice_metal_runtime::measurement::gpu_test_lock;
+}
 /// Inference metrics and entropy accumulation. See [`model`].
 pub mod metrics;
 /// Adapter routing and mixture support built on top of [`lora_hook`] and [`sampling`].
@@ -151,13 +142,14 @@ pub mod mixture;
 /// shipped LRU policy plus challenger policies (ARC, sequence-local
 /// frequency admission) to measure hit-rate deltas before any engine
 /// eviction-policy change. See [`moe_admission`]'s module doc comment.
+#[cfg(feature = "qwen35")]
 pub mod moe_admission;
 /// Option-letter scoring: one prefill, with the answer read from the next-token logits at
 /// the option letters. Holds [`option_scoring::OptionScores`] and the letter helpers shared by
 /// the CPU and Metal Qwen3.5 scorers. See [`model`] and [`tokenizer`].
 pub mod option_scoring;
 /// Embedding pooling helpers (mean, CLS, last-token) including [`BertPooling`]. Used by
-/// [`model::BertModel`] and [`model::QwenModel`].
+/// `model::BertModel` and `model::QwenModel`.
 pub mod pool;
 /// ShortGPT-style block influence scoring. See [`model`].
 pub mod pruning;
@@ -166,10 +158,12 @@ pub mod quant;
 /// Synthetic Qwen3.5 checkpoint support for repository regression tests.
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
-pub mod qwen35_checkpoint_fixture;
+#[cfg(feature = "qwen35")]
+#[doc(inline)]
+pub use lattice_model_qwen35::qwen35_checkpoint_fixture;
 /// Rotary position embedding tables and application helpers. See [`model`] and [`forward`].
 pub mod rope;
-/// Sampling configuration and token selection helpers. See [`model`] and [`speculative`].
+/// Sampling configuration and token selection helpers. See [`model`] and `speculative`.
 pub mod sampling;
 /// Unsupported, version-coupled interface for `lattice-serve` (ADR-103
 /// Amendment 4); not public API.
@@ -177,19 +171,13 @@ pub mod sampling;
 #[doc(hidden)]
 pub mod serving_support;
 /// N-gram prompt lookup speculative decoding. See [`sampling`] and [`model`].
+#[cfg(feature = "qwen35")]
 pub mod speculative;
 /// Generation stop reason taxonomy; see [`StopReason`] and [`model`].
 pub mod stop_reason;
 
-/// Cross-path sweep (#613): every CPU-family `generate*` entry point agrees on
-/// the stop-token contract (excluded from `token_ids`/`text`). The Metal-family
-/// entry points are covered in `forward::metal_qwen35`'s own test module; see
-/// this module's doc comment for the full manifest and rationale.
-#[cfg(test)]
-mod stop_token_contract;
-
 /// Test-support helper for the thirteen checkpoint-gated unit tests in
-/// [`model::bert`], [`model::qwen`], and `model::qwen35::generation` (a
+/// `model::bert`, [`model::qwen`], and `model::qwen35::generation` (a
 /// private submodule, so not linked) (issue #1664): resolves and panics
 /// naming an unset, relative, or missing
 /// model-directory env var, so an explicitly requested `--ignored` run
@@ -201,10 +189,6 @@ mod test_support;
 /// [`model`]. Requires the `train-backward` feature.
 #[cfg(feature = "train-backward")]
 pub mod backward;
-
-/// Model cache directory and by-value environment switches, from `lattice-model-io` (ADR-103
-/// Amendment 20); the crate-local paths stay for this crate's callers.
-pub(crate) use lattice_model_io::{default_cache_dir, env_switch_enabled};
 
 // Re-exports for public API backward compatibility
 /// Root error type for inference, tokenizer, model loading, and runtime failures. See [`error`].
@@ -233,23 +217,29 @@ pub use crate::generation::TopLogprob;
 /// [`GenerateConfig::grammar`] carries one. See [`grammar`].
 #[doc(no_inline)]
 pub use crate::grammar::GrammarEngine;
-/// BERT encoder configuration. See [`BertModel`] and [`model`].
+/// BERT encoder configuration. See `BertModel` and [`model`].
+#[cfg(feature = "bert")]
 pub use crate::model::BertConfig;
-/// BERT/BGE encoder model. See [`BertConfig`], [`Tokenizer`], and [`BertPooling`].
+/// BERT/BGE encoder model. See `BertConfig`, [`Tokenizer`], and [`BertPooling`].
+#[cfg(feature = "bert")]
 pub use crate::model::BertModel;
-/// BERT-style cross-encoder/reranker model. See [`BertModel`] and [`model`].
+/// BERT-style cross-encoder/reranker model. See `BertModel` and [`model`].
+#[cfg(feature = "bert")]
 pub use crate::model::CrossEncoderModel;
 /// Per-layer profiling data collected during Qwen embedding inference. See [`ProfileTimings`]
 /// and [`QwenModel`].
+#[cfg(feature = "qwen3")]
 pub use crate::model::LayerTimings;
 /// Aggregate profiling report for Qwen inference. See [`LayerTimings`] and [`QwenModel`].
+#[cfg(feature = "qwen3")]
 pub use crate::model::ProfileTimings;
-/// Qwen embedding model configuration. See [`QwenModel`] and [`weights`].
+/// Qwen embedding model configuration. See `QwenModel` and [`weights`].
 pub use crate::model::QwenConfig;
 /// Qwen embedding model exposing `encode` for producing embeddings. See [`QwenConfig`],
 /// [`Tokenizer`], and [`weights`].
+#[cfg(feature = "qwen3")]
 pub use crate::model::QwenModel;
-/// BERT pooling strategy selector (mean or CLS). See [`pool`] and [`BertModel`].
+/// BERT pooling strategy selector (mean or CLS). See [`pool`] and `BertModel`.
 #[doc(no_inline)]
 pub use crate::pool::BertPooling;
 /// Reason a generation request stopped (e.g. EOS, max tokens). See [`stop_reason`] and
@@ -259,7 +249,7 @@ pub use crate::stop_reason::StopReason;
 /// Byte-level BPE tokenizer used by Qwen-family models. See [`Tokenizer`] and [`TokenizedInput`].
 pub use crate::tokenizer::BpeTokenizer;
 /// Token counts of one embedding input before and after the model's length limit. See
-/// [`BertModel::embedding_token_counts`] and [`QwenModel::embedding_token_counts`].
+/// `BertModel::embedding_token_counts` and `QwenModel::embedding_token_counts`.
 pub use crate::tokenizer::EmbeddingTokenCounts;
 /// Additive Gemma-family BPE tokenizer (literal-space `Split` + `▁` metaspace normalizer),
 /// explicitly selected — never reached via [`load_tokenizer`]'s model-type sniffing. See
@@ -273,12 +263,12 @@ pub use crate::tokenizer::TokenizedInput;
 /// Object-safe tokenizer trait implemented by every tokenizer in [`tokenizer`]. See
 /// [`load_tokenizer`].
 pub use crate::tokenizer::Tokenizer;
-/// `WordPiece` tokenizer used by BERT-family models. See [`Tokenizer`] and [`BertModel`].
+/// `WordPiece` tokenizer used by BERT-family models. See [`Tokenizer`] and `BertModel`.
 pub use crate::tokenizer::WordPieceTokenizer;
 /// Model-directory tokenizer auto-loader. See [`Tokenizer`] and [`tokenizer`].
 pub use crate::tokenizer::load_tokenizer;
 /// `tokenizer.json`-text tokenizer loader (no filesystem access). See
-/// [`Tokenizer`], [`tokenizer`], and [`BertModel::from_bytes`].
+/// [`Tokenizer`], [`tokenizer`], and `BertModel::from_bytes`.
 pub use crate::tokenizer::tokenizer_from_json_str;
 /// Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17): `<|image|>`/`<|audio|>`
 /// placeholder-to-soft-token-count contract, independent of the in-sequence scatter itself.

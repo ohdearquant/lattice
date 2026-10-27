@@ -20,7 +20,15 @@ use syn::{Attribute, ItemFn, Meta, Token};
 #[path = "workspace_metadata.rs"]
 mod workspace_metadata;
 
-pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &[".", "../serve"];
+pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &[
+    ".",
+    "../serve",
+    "../models/embeddinggemma2",
+    "../models/qwen3",
+    "../models/gemma4",
+    "../models/ernie45",
+    "../models/qwen35",
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScannedPackage {
@@ -161,6 +169,14 @@ pub(crate) fn validate_scanned_package_membership(
         let identity = relative_package_dir(&base, directory)?;
         if (name == "lattice-inference") != (identity == ".") {
             return Err("inference package identity does not match the inference directory".into());
+        }
+        if name == "lattice-model-embeddinggemma2"
+            || name == "lattice-model-qwen3"
+            || name == "lattice-model-gemma4"
+            || name == "lattice-model-ernie45"
+            || name == "lattice-model-qwen35"
+        {
+            expected.insert(identity.clone());
         }
         let dependencies = package["dependencies"]
             .as_array()

@@ -21,80 +21,6 @@ use std::io::Cursor;
 
 use super::VisionError;
 
-#[cfg(feature = "image")]
-#[derive(Clone, Copy)]
-struct DecodeLimits {
-    pixels: u64,
-    allocation_bytes: u64,
-}
-
-#[cfg(feature = "image")]
-const EG2_MAX_DECODED_PIXELS: u64 = 8192 * 8192;
-#[cfg(feature = "image")]
-const EG2_MAX_DECODE_ALLOCATION_BYTES: u64 = 512 * 1024 * 1024;
-
-#[cfg(feature = "image")]
-const IMAGE_DECODE_LIMITS: DecodeLimits = DecodeLimits {
-    pixels: EG2_MAX_DECODED_PIXELS,
-    allocation_bytes: EG2_MAX_DECODE_ALLOCATION_BYTES,
-};
-
-/// Decodes PNG or JPEG input after checking the declared pixel count.
-///
-/// Pixel count is checked before pixel decoding, with no per-side cap. The image crate's
-/// decoder allocation limit is additionally applied, but is a best-effort limit.
-#[cfg(feature = "image")]
-pub(crate) fn decode_image_bounded(image_bytes: &[u8]) -> Result<DynamicImage, VisionError> {
-    decode_image_with_limits(image_bytes, IMAGE_DECODE_LIMITS)
-}
-
-#[cfg(feature = "image")]
-fn decode_image_with_limits(
-    image_bytes: &[u8],
-    budget: DecodeLimits,
-) -> Result<DynamicImage, VisionError> {
-    if image_bytes.is_empty() {
-        return Err(VisionError::ImageDecode("encoded image is empty".into()));
-    }
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(budget.allocation_bytes);
-    let mut header = ImageReader::new(Cursor::new(image_bytes))
-        .with_guessed_format()
-        .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
-    if !matches!(
-        header.format(),
-        Some(image::ImageFormat::Png | image::ImageFormat::Jpeg)
-    ) {
-        return Err(VisionError::ImageDecode(
-            "only PNG and JPEG images are supported".into(),
-        ));
-    }
-    header.limits(limits.clone());
-    let (width, height) = header.into_dimensions().map_err(|e| {
-        VisionError::ImageDecode(format!(
-            "dimension read failed under allocation limit {} bytes: {e}",
-            budget.allocation_bytes
-        ))
-    })?;
-    let pixels = u64::from(width) * u64::from(height);
-    if width == 0 || height == 0 || pixels > budget.pixels {
-        return Err(VisionError::DimensionsExceeded(format!(
-            "declared image {width}x{height} has {pixels} pixels; pixel limit is {}",
-            budget.pixels
-        )));
-    }
-    let mut reader = ImageReader::new(Cursor::new(image_bytes))
-        .with_guessed_format()
-        .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
-    reader.limits(limits);
-    reader.decode().map_err(|e| {
-        VisionError::ImageDecode(format!(
-            "decode of image {width}x{height} failed under allocation limit {} bytes: {e}",
-            budget.allocation_bytes
-        ))
-    })
-}
-
 /// Per-channel normalization constants for Qwen3-VL.
 ///
 /// Source: `Qwen/Qwen3-VL-7B-Instruct` processor_config.json,
@@ -247,3 +173,23 @@ pub fn preprocess(image_bytes: &[u8], cfg: &PreprocessConfig) -> Result<ImageTen
 
 #[cfg(all(test, feature = "image"))]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn preprocess_refuses_an_invalid_config_before_decoding() {
+    use crate::vision::preprocess::{PreprocessConfig, preprocess};
+
+    let not_an_image = b"not an image";
+    let mut zero_patch = PreprocessConfig::qwen3_vl();
+    zero_patch.patch_size = 0;
+    let mut indivisible = PreprocessConfig::qwen3_vl();
+    indivisible.image_size = indivisible.patch_size * 3 + 1;
+    let mut zero_std = PreprocessConfig::qwen3_vl();
+    zero_std.std[1] = 0.0;
+    for cfg in [zero_patch, indivisible, zero_std] {
+        assert!(matches!(
+            preprocess(not_an_image, &cfg),
+            Err(VisionError::InvalidConfig(_))
+        ));
+    }
+}

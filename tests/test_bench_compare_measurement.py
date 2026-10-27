@@ -2435,12 +2435,15 @@ class GpuBenchmarkAdmission(support.GpuBenchmarkAdmissionSupport, unittest.TestC
         policy = manifest["package"]["metadata"]["gpu-bench-handoff"]
         self.assertEqual(sorted(policy["bins"]), sorted(admission.BINS))
         declared = {item["name"]: item for item in manifest.get("bin", [])}
+        # The admitted command grammar has no --no-default-features, so a default feature is always
+        # enabled and the table only has to name the required features a command can lack.
+        defaults = set(admission.feature_closure(manifest, ""))
         for name, features in admission.BINS.items():
             with self.subTest(binary=name):
                 source = REPO / "crates/inference/src/bin" / f"{name}.rs"
                 self.assertIn("gpu_test_lock()", source.read_text())
                 self.assertIn('feature = "metal-gpu"', source.read_text())
-                self.assertLessEqual(set(declared.get(name, {}).get("required-features", [])), features)
+                self.assertLessEqual(set(declared.get(name, {}).get("required-features", [])) - defaults, features)
                 self.assertIn("metal-gpu", features)
                 self.assertNotEqual(manifest["package"].get("autobins"), False)
 

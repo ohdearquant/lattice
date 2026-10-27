@@ -857,8 +857,9 @@ impl PagedKVCache {
     /// **Unstable**: restore a cached prefix into owned `PagePool` pages.
     ///
     /// Returns `Ok(Some(prefix_len))` on hit and `Ok(None)` when prefix sharing
-    /// is disabled or the key is absent. The cache must be pristine
-    /// (`seq_len == 0` and `num_pages == 0`) because restore fast-forwards the
+    /// is disabled, the key is absent, or a token-free insertion did not establish
+    /// the entry's identity. Verified entries must match every token ID. The cache
+    /// must be pristine (`seq_len == 0` and `num_pages == 0`) because restore fast-forwards the
     /// sequence before the first append.
     pub fn restore_prefix(
         &mut self,
@@ -877,7 +878,7 @@ impl PagedKVCache {
                 let mut guard = prefix_cache.lock().map_err(|_| {
                     InferenceError::PrefixCache("prefix cache lock poisoned".into())
                 })?;
-                guard.lookup(&key)
+                guard.lookup_for_tokens(&key, token_ids)?
             }
             None => None,
         };
@@ -885,14 +886,6 @@ impl PagedKVCache {
         let Some(entry) = entry else {
             return Ok(None);
         };
-
-        if entry.prefix_len != token_ids.len() {
-            return Err(InferenceError::PrefixCache(format!(
-                "prefix hash collision or invalid entry length: key length {}, entry length {}",
-                token_ids.len(),
-                entry.prefix_len
-            )));
-        }
 
         let restored = self.restore_prefix_entry(&entry)?;
         Ok(Some(restored))
@@ -934,12 +927,10 @@ impl PagedKVCache {
 
         let pages = self.copy_owned_pages_to_shared(prefix_page_size)?;
         let page_count = pages.len();
-        let key = PrefixKey::from_token_ids(adapter_id, token_ids);
-
         let mut guard = prefix_cache
             .lock()
             .map_err(|_| InferenceError::PrefixCache("prefix cache lock poisoned".into()))?;
-        guard.insert(key, prefix_len, pages);
+        guard.insert_for_tokens(adapter_id, token_ids, pages);
         Ok(Some(page_count))
     }
 

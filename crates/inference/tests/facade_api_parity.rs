@@ -1397,8 +1397,10 @@ mod model_config_parity {
         );
     }
 
+    #[cfg(feature = "qwen35")]
     fn same_fn<F>(_: F, _: F) {}
 
+    #[cfg(feature = "qwen35")]
     #[test]
     fn model_config_functions_are_the_same_function_at_both_paths() {
         same_fn(
@@ -1597,6 +1599,7 @@ mod compute_parity {
     }
 
     #[test]
+    #[allow(deprecated)] // `plan_prefix_reuse` is deprecated; its re-export must still name the same item
     fn prefix_cache_functions_are_the_same_items_at_both_paths() {
         same_function(
             lattice_inference::kv_cache::longest_common_token_prefix,
@@ -1698,6 +1701,10 @@ mod lora_hook_parity {
             PhantomData::<dyn facade::LoraHook>,
             PhantomData::<dyn extracted::LoraHook>,
         );
+        same_type(
+            PhantomData::<dyn facade::LoraTargetGeometry>,
+            PhantomData::<dyn extracted::LoraTargetGeometry>,
+        );
         let _: extracted::NoopLoraHook = facade::NoopLoraHook;
         send_sync::<dyn facade::LoraHook>();
         send_sync::<facade::NoopLoraHook>();
@@ -1709,10 +1716,12 @@ mod lora_hook_parity {
             facade::gdn_lora_module_is_servable,
             extracted::gdn_lora_module_is_servable,
         );
-        same_function(
-            facade::qwen35_projection_shape,
-            extracted::qwen35_projection_shape,
-        );
+        #[cfg(feature = "qwen35")]
+        let _: fn(
+            &lattice_inference::model::qwen35_config::Qwen35Config,
+            usize,
+            &str,
+        ) -> Result<facade::LoraProjectionShape, String> = facade::qwen35_projection_shape;
     }
 
     #[test]
@@ -2141,14 +2150,66 @@ mod gdn_parity {
             PhantomData::<facade::gdn_fused::GatedDeltaNetFusedScratch>,
             PhantomData::<extracted::gdn_fused::GatedDeltaNetFusedScratch>,
         );
+        same_type(
+            PhantomData::<facade::gdn::GdnDimensions>,
+            PhantomData::<extracted::gdn::GdnDimensions>,
+        );
+        same_type(
+            PhantomData::<facade::gdn::GdnGeometry>,
+            PhantomData::<extracted::gdn::GdnGeometry>,
+        );
+    }
+
+    /// The facade keeps the configuration-taking step signatures; `lattice-compute`'s steps take
+    /// a validated geometry instead.
+    #[test]
+    #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+    fn gdn_configuration_steps_keep_their_facade_signatures() {
+        #[cfg(feature = "qwen35")]
+        use lattice_inference::model::qwen35_config::Qwen35Config;
+
+        #[cfg(feature = "qwen35")]
+        let _: fn(
+            &[f32],
+            &mut facade::gdn::GatedDeltaNetState,
+            &facade::gdn::GatedDeltaNetWeights,
+            &Qwen35Config,
+            &mut facade::gdn::GatedDeltaNetScratch,
+            &mut [f32],
+        ) = facade::gdn::gated_delta_net_step;
+        #[cfg(feature = "qwen35")]
+        let _: fn(
+            &[f32],
+            &mut facade::gdn::GatedDeltaNetState,
+            &facade::gdn::GatedDeltaNetWeights,
+            &Qwen35Config,
+            &mut facade::gdn_fused::GatedDeltaNetFusedScratch,
+            &mut [f32],
+            &dyn lattice_inference::lora_hook::LoraHook,
+            usize,
+        ) = facade::gdn_fused::gated_delta_net_step_fused;
+        let _: fn(
+            &[f32],
+            &mut extracted::gdn::GatedDeltaNetState,
+            &extracted::gdn::GatedDeltaNetWeights,
+            &extracted::gdn::GdnGeometry,
+            &mut extracted::gdn::GatedDeltaNetScratch,
+            &mut [f32],
+        ) = extracted::gdn::gated_delta_net_step;
+        let _: fn(
+            &[f32],
+            &mut extracted::gdn::GatedDeltaNetState,
+            &extracted::gdn::GatedDeltaNetWeights,
+            &extracted::gdn::GdnGeometry,
+            &mut extracted::gdn_fused::GatedDeltaNetFusedScratch,
+            &mut [f32],
+            &dyn lattice_compute::lora_hook::LoraHook,
+            usize,
+        ) = extracted::gdn_fused::gated_delta_net_step_fused;
     }
 
     #[test]
     fn gdn_functions_are_the_same_items_at_both_paths() {
-        same_function(
-            facade::gdn::gated_delta_net_step,
-            extracted::gdn::gated_delta_net_step,
-        );
         same_function(facade::gdn::gated_rms_norm, extracted::gdn::gated_rms_norm);
         same_function(
             facade::gdn::l2_normalize_vec,
@@ -2156,10 +2217,6 @@ mod gdn_parity {
         );
         same_function(facade::gdn::sigmoid, extracted::gdn::sigmoid);
         same_function(facade::gdn::softplus, extracted::gdn::softplus);
-        same_function(
-            facade::gdn_fused::gated_delta_net_step_fused,
-            extracted::gdn_fused::gated_delta_net_step_fused,
-        );
         same_function(
             facade::gdn_fused::conv1d_silu_fused,
             extracted::gdn_fused::conv1d_silu_fused,
@@ -2349,4 +2406,394 @@ mod model_io_parity {
     fn ensure_model_files_is_the_same_function_at_both_paths() {
         same_function(facade::ensure_model_files, extracted::ensure_model_files);
     }
+}
+
+#[cfg(feature = "embeddinggemma2")]
+mod embeddinggemma2_parity {
+    use std::marker::PhantomData;
+
+    fn same_type<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+
+    #[test]
+    fn embeddinggemma2_items_keep_the_same_identity() {
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2Task>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2Task>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2Part>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2Part>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2PartCounts>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2PartCounts>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2PartsEncoding>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2PartsEncoding>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2ImageStages>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2ImageStages>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2::EmbeddingGemma2Model>,
+            PhantomData::<lattice_model_embeddinggemma2::model::EmbeddingGemma2Model>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::EmbeddingGemma2Model>,
+            PhantomData::<lattice_model_embeddinggemma2::EmbeddingGemma2Model>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::model::embeddinggemma2_image::EmbeddingGemma2Rgb8Image>,
+            PhantomData::<lattice_model_embeddinggemma2::image::EmbeddingGemma2Rgb8Image>,
+        );
+        same_type(
+            PhantomData::<
+                lattice_inference::forward::metal_embeddinggemma2::MetalEmbeddingGemma2State,
+            >,
+            PhantomData::<lattice_model_embeddinggemma2::metal::MetalEmbeddingGemma2State>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::forward::metal_embeddinggemma2::VisionTimings>,
+            PhantomData::<lattice_model_embeddinggemma2::metal::VisionTimings>,
+        );
+        same_type(
+            PhantomData::<lattice_inference::encoder::EmbeddingGemma2Encoder>,
+            PhantomData::<lattice_model_embeddinggemma2::encoder::EmbeddingGemma2Encoder>,
+        );
+        let _: fn(&str, &str) -> String =
+            lattice_inference::model::embeddinggemma2::format_titled_document;
+        let _: fn(&str, &str) -> String =
+            lattice_model_embeddinggemma2::model::format_titled_document;
+        assert_eq!(
+            lattice_inference::model::embeddinggemma2::EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS,
+            lattice_model_embeddinggemma2::model::EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS
+        );
+        assert!(std::ptr::eq(
+            &lattice_inference::family::EMBEDDING_GEMMA2,
+            &lattice_model_embeddinggemma2::family::EMBEDDING_GEMMA2
+        ));
+    }
+}
+
+#[test]
+fn vision_errors_keep_the_same_identity() {
+    let _: fn(
+        lattice_inference::vision::MultimodalInput,
+    ) -> lattice_model_io::multimodal::MultimodalInput = |input| input;
+    let _: fn(lattice_inference::vision::VisionError) -> lattice_model_io::image::VisionError =
+        |error| error;
+    let _: fn(lattice_model_io::image::VisionError) -> lattice_inference::vision::VisionError =
+        |error| error;
+}
+
+#[test]
+fn gemma_kernels_keep_both_named_paths() {
+    type ScaledEmbedding = fn(&[u32], &[f32], usize, &mut [f32]);
+    type LogitSoftcap = fn(&mut [f32], f32);
+    let _: (ScaledEmbedding, ScaledEmbedding) = (
+        lattice_inference::model::gemma4_ops::gemma4_scaled_embedding,
+        lattice_compute::gemma_ops::gemma4_scaled_embedding,
+    );
+    let _: (LogitSoftcap, LogitSoftcap) = (
+        lattice_inference::model::gemma4_ops::gemma4_logit_softcap,
+        lattice_compute::gemma_ops::gemma4_logit_softcap,
+    );
+    type RmsNorm = fn(&mut [f32], &[f32], usize, f32);
+    type Gelu = fn(&mut [f32]);
+    type Geglu =
+        fn(&[f32], &[f32], &[f32], &[f32], usize, usize, usize, &mut [f32], &mut [f32], &mut [f32]);
+    type QkNorm = fn(&mut [f32], &mut [f32], &mut [f32], &[f32], &[f32], usize, f32);
+    type Rope = fn(&mut [f32], &[f32], &[f32], usize, usize, usize);
+    type AxialRope = fn(&mut [f32], &[[usize; 2]], &[f32], usize, usize);
+    let _: (RmsNorm, RmsNorm) = (
+        lattice_inference::model::gemma4_ops::gemma4_rms_norm,
+        lattice_compute::gemma_ops::gemma4_rms_norm,
+    );
+    let _: (Gelu, Gelu) = (
+        lattice_inference::model::gemma4_ops::gemma4_gelu_tanh,
+        lattice_compute::gemma_ops::gemma4_gelu_tanh,
+    );
+    let _: (Geglu, Geglu) = (
+        lattice_inference::model::gemma4_ops::gemma4_geglu_mlp,
+        lattice_compute::gemma_ops::gemma4_geglu_mlp,
+    );
+    let _: (QkNorm, QkNorm) = (
+        lattice_inference::model::gemma4_ops::gemma4_qk_norm_v_unscaled,
+        lattice_compute::gemma_ops::gemma4_qk_norm_v_unscaled,
+    );
+    let _: (Rope, Rope) = (
+        lattice_inference::model::gemma4_ops::gemma4_apply_rope,
+        lattice_compute::gemma_ops::gemma4_apply_rope,
+    );
+    let _: (AxialRope, AxialRope) = (
+        lattice_inference::model::gemma4_ops::vision_axial_rope_apply,
+        lattice_compute::gemma_ops::vision_axial_rope_apply,
+    );
+}
+
+#[cfg(feature = "gemma4")]
+#[test]
+fn model_cache_and_preflight_paths_name_family_items() {
+    use lattice_inference::model as facade;
+    use lattice_model_gemma4 as family;
+    use std::marker::PhantomData;
+    let _: PhantomData<family::Gemma4Model> = PhantomData::<facade::Gemma4Model>;
+    let _: PhantomData<family::Gemma4Model> = PhantomData::<facade::gemma4_model::Gemma4Model>;
+    let _: PhantomData<family::gemma4_cache::Gemma4KvCache> =
+        PhantomData::<facade::gemma4_cache::Gemma4KvCache>;
+    let _: PhantomData<family::gemma4_preflight::TensorInfo> =
+        PhantomData::<facade::gemma4_preflight::TensorInfo>;
+    let _: PhantomData<family::gemma4_preflight::TensorInventory> =
+        PhantomData::<facade::gemma4_preflight::TensorInventory>;
+    let _: PhantomData<family::gemma4_preflight::PreflightReport> =
+        PhantomData::<facade::gemma4_preflight::PreflightReport>;
+    let _: fn(
+        &std::path::Path,
+    ) -> Result<family::Gemma4Model, lattice_inference_core::InferenceError> =
+        facade::Gemma4Model::from_safetensors;
+    type Check = fn(
+        &lattice_arch::gemma4_config::Gemma4Config,
+        &std::collections::HashMap<String, family::gemma4_preflight::TensorInfo>,
+    ) -> Result<
+        family::gemma4_preflight::PreflightReport,
+        lattice_inference_core::InferenceError,
+    >;
+    let old: Check = facade::gemma4_preflight::preflight_check;
+    let new: Check = family::gemma4_preflight::preflight_check;
+    assert!(std::ptr::fn_addr_eq(old, new));
+}
+
+#[cfg(feature = "ernie45")]
+fn same_ernie45_item<T>(_: T, _: T) {}
+
+#[cfg(feature = "ernie45")]
+#[test]
+fn ernie45_items_keep_family_identity() {
+    use lattice_inference::forward::metal_ernie45 as facade_metal;
+    use lattice_inference::model::ernie45 as facade;
+    use lattice_model_ernie45::forward::metal_ernie45 as family_metal;
+    use lattice_model_ernie45::model::ernie45 as family;
+    same_ernie45_item(
+        None::<facade_metal::MetalErnie45State>,
+        None::<family_metal::MetalErnie45State>,
+    );
+    same_ernie45_item(
+        None::<facade_metal::MetalErnie45KvCache>,
+        None::<family_metal::MetalErnie45KvCache>,
+    );
+
+    same_ernie45_item(None::<facade::Ernie45Config>, None::<family::Ernie45Config>);
+    same_ernie45_item(
+        None::<facade::Ernie45RopeScaling>,
+        None::<family::Ernie45RopeScaling>,
+    );
+    same_ernie45_item(
+        None::<facade::Ernie45LayerWeights>,
+        None::<family::Ernie45LayerWeights>,
+    );
+    same_ernie45_item(
+        None::<facade::Ernie45Weights>,
+        None::<family::Ernie45Weights>,
+    );
+    same_ernie45_item(None::<facade::Ernie45Trace>, None::<family::Ernie45Trace>);
+    same_ernie45_item(None::<facade::Ernie45Model>, None::<family::Ernie45Model>);
+    same_ernie45_item(
+        None::<facade::Ernie45KvCache>,
+        None::<family::Ernie45KvCache>,
+    );
+    assert_eq!(facade::MAX_LAYERS, family::MAX_LAYERS);
+    assert_eq!(facade::MAX_HIDDEN_SIZE, family::MAX_HIDDEN_SIZE);
+    assert_eq!(facade::MAX_INTERMEDIATE_SIZE, family::MAX_INTERMEDIATE_SIZE);
+    assert_eq!(facade::MAX_HEADS, family::MAX_HEADS);
+    assert_eq!(facade::MAX_KV_HEADS, family::MAX_KV_HEADS);
+    assert_eq!(facade::MAX_HEAD_DIM, family::MAX_HEAD_DIM);
+    assert_eq!(facade::MAX_VOCAB_SIZE, family::MAX_VOCAB_SIZE);
+    assert_eq!(facade::MAX_SEQ_LEN, family::MAX_SEQ_LEN);
+    same_ernie45_item(
+        facade::Ernie45Config::from_config_json_str,
+        family::Ernie45Config::from_config_json_str,
+    );
+    same_ernie45_item(
+        facade::Ernie45Weights::load::<lattice_weights::f32_weights::SafetensorsFile>,
+        family::Ernie45Weights::load::<lattice_weights::f32_weights::SafetensorsFile>,
+    );
+    same_ernie45_item(facade::Ernie45Model::new, family::Ernie45Model::new);
+    same_ernie45_item(
+        facade::Ernie45Model::forward_trace,
+        family::Ernie45Model::forward_trace,
+    );
+    same_ernie45_item(
+        facade::Ernie45Model::forward_embeds_trace,
+        family::Ernie45Model::forward_embeds_trace,
+    );
+    same_ernie45_item(
+        facade::Ernie45Model::forward_embeds_last_logits,
+        family::Ernie45Model::forward_embeds_last_logits,
+    );
+    same_ernie45_item(
+        facade::Ernie45Model::new_kv_cache,
+        family::Ernie45Model::new_kv_cache,
+    );
+    same_ernie45_item(
+        facade::Ernie45Model::kv_prefill,
+        family::Ernie45Model::kv_prefill,
+    );
+    same_ernie45_item(
+        facade::Ernie45Model::kv_decode_step,
+        family::Ernie45Model::kv_decode_step,
+    );
+    same_ernie45_item(facade::Ernie45KvCache::clear, family::Ernie45KvCache::clear);
+    same_ernie45_item(
+        facade::Ernie45KvCache::truncate,
+        family::Ernie45KvCache::truncate,
+    );
+    let cache: family::Ernie45KvCache = facade::Ernie45KvCache::new(2, 4, 5)
+        .expect("the old public path constructs the same cache type");
+    assert_eq!(cache.layers(), 2);
+    assert_eq!(cache.kv_dim(), 4);
+    assert_eq!(cache.capacity(), 5);
+    assert!(cache.is_empty());
+}
+
+fn same_qwen35_item<T>(_: T, _: T) {}
+
+#[test]
+fn qwen35_grid_keeps_neutral_identity() {
+    let neutral = lattice_arch::multimodal::GridThw { t: 2, h: 3, w: 4 };
+    let facade: lattice_inference::vision::qwen35_vit::GridThw = neutral;
+    same_qwen35_item(neutral, facade);
+    assert_eq!(facade.num_patches(), 24);
+}
+
+#[cfg(feature = "qwen35")]
+#[test]
+fn qwen35_cpu_items_keep_family_identity() {
+    use lattice_inference::vision::{
+        checkpoint as facade_weights, qwen35_merger as facade_merger, qwen35_vit as facade_vit,
+    };
+    use lattice_model_qwen35::vision::{
+        checkpoint as family_weights, qwen35_merger as family_merger, qwen35_vit as family_vit,
+    };
+    same_qwen35_item(
+        None::<facade_weights::Qwen35VisionWeights>,
+        None::<family_weights::Qwen35VisionWeights>,
+    );
+    same_qwen35_item(
+        None::<facade_weights::VisualBlockWeights>,
+        None::<family_weights::VisualBlockWeights>,
+    );
+    same_qwen35_item(
+        None::<facade_weights::VisualMergerWeights>,
+        None::<family_weights::VisualMergerWeights>,
+    );
+    same_qwen35_item(None::<facade_vit::GridThw>, None::<family_vit::GridThw>);
+    same_qwen35_item(
+        facade_weights::load_qwen35_vision_weights,
+        family_weights::load_qwen35_vision_weights,
+    );
+    same_qwen35_item(
+        facade_weights::load_qwen35_vision_weights_from_safetensors,
+        family_weights::load_qwen35_vision_weights_from_safetensors,
+    );
+    same_qwen35_item(
+        facade_weights::validate_qwen35_vision_weight_inventory,
+        family_weights::validate_qwen35_vision_weight_inventory,
+    );
+    same_qwen35_item(
+        facade_weights::resolve_qwen35_single_decoder_safetensors,
+        family_weights::resolve_qwen35_single_decoder_safetensors,
+    );
+    same_qwen35_item(
+        facade_weights::open_qwen35_single_decoder_safetensors,
+        family_weights::open_qwen35_single_decoder_safetensors,
+    );
+    same_qwen35_item(
+        facade_vit::preprocess_qwen35_image,
+        family_vit::preprocess_qwen35_image,
+    );
+    same_qwen35_item(
+        facade_vit::preprocess_qwen35_image_for_serve,
+        family_vit::preprocess_qwen35_image_for_serve,
+    );
+    same_qwen35_item(
+        facade_vit::preprocess_qwen35_image_for_embedding_serve,
+        family_vit::preprocess_qwen35_image_for_embedding_serve,
+    );
+    same_qwen35_item(
+        facade_vit::qwen35_vit_forward,
+        family_vit::qwen35_vit_forward,
+    );
+    same_qwen35_item(
+        facade_merger::qwen35_merger_forward,
+        family_merger::qwen35_merger_forward,
+    );
+}
+
+#[cfg(feature = "qwen35")]
+#[test]
+#[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+fn qwen35_supplied_rows_keep_the_family_contract() {
+    use lattice_inference::vision::multimodal::Qwen35VisionRequest;
+    use lattice_inference::vision::qwen35_vit::GridThw;
+    let request = Qwen35VisionRequest {
+        input_ids: vec![9],
+        image_grids: vec![GridThw { t: 1, h: 2, w: 2 }],
+        post_merger_rows: vec![0.25, -0.75],
+        image_token_id: 9,
+        spatial_merge_size: 2,
+        decoder_hidden_size: 2,
+    };
+    request
+        .validate()
+        .expect("external visual rows remain valid with the owning family");
+    let _: fn(
+        &lattice_inference::weights::f16_weights::F16ModelWeights,
+        &lattice_inference::model::qwen35_config::Qwen35Config,
+        &Qwen35VisionRequest,
+    ) -> Result<Vec<f32>, lattice_inference::error::InferenceError> =
+        lattice_inference::forward::cpu_f16::prefill_hidden_states_f16;
+    let _: fn(
+        &lattice_inference::weights::f16_weights::F16ModelWeights,
+        &lattice_inference::model::qwen35_config::Qwen35Config,
+        &lattice_inference::tokenizer::bpe::BpeTokenizer,
+        &str,
+        lattice_inference::forward::cpu_f16::PoolingStrategy,
+    ) -> Result<Vec<f32>, lattice_inference::error::InferenceError> =
+        lattice_inference::forward::cpu_f16::embed_text_vlm_f16;
+}
+
+#[cfg(feature = "qwen35")]
+#[test]
+#[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+fn qwen35_model_backend_and_cpu_paths_keep_family_identity() {
+    use lattice_inference::{forward, model};
+    use lattice_model_qwen35 as family;
+    use std::marker::PhantomData;
+    let _: PhantomData<family::model::qwen35::Qwen35Model> = PhantomData::<model::Qwen35Model>;
+    let _: PhantomData<family::model::qwen35::ModelWeights> =
+        PhantomData::<model::qwen35::ModelWeights>;
+    let _: PhantomData<family::family::Qwen35CpuDecoder> =
+        PhantomData::<lattice_inference::family::Qwen35CpuDecoder>;
+    let _: PhantomData<family::forward::metal_qwen35::MetalQwen35State> =
+        PhantomData::<forward::metal_qwen35::MetalQwen35State>;
+    let _: PhantomData<family::forward::metal_qwen35::ChatMessage> =
+        PhantomData::<forward::metal_qwen35::ChatMessage>;
+    let _: PhantomData<family::forward::metal_qwen35::ChatRole> =
+        PhantomData::<forward::metal_qwen35::ChatRole>;
+    let _: PhantomData<family::vision::multimodal::Qwen35VisionRequest> =
+        PhantomData::<lattice_inference::vision::multimodal::Qwen35VisionRequest>;
+    let _: PhantomData<family::forward::cpu_f16::PoolingStrategy> =
+        PhantomData::<forward::cpu_f16::PoolingStrategy>;
+    let old: fn(&[forward::metal_qwen35::ChatMessage]) -> String =
+        forward::metal_qwen35::format_chat_template;
+    let new: fn(&[family::forward::metal_qwen35::ChatMessage]) -> String =
+        family::forward::metal_qwen35::format_chat_template;
+    assert!(std::ptr::fn_addr_eq(old, new));
+    let old: fn(&[f32], &[f32], &mut [f32], usize, usize, usize) -> bool =
+        forward::metal_gemm::metal_matmul;
+    let new: fn(&[f32], &[f32], &mut [f32], usize, usize, usize) -> bool =
+        family::forward::metal_gemm::metal_matmul;
+    assert!(std::ptr::fn_addr_eq(old, new));
 }

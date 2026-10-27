@@ -144,7 +144,7 @@ impl EmbeddingModel {
         self.native_dimensions()
     }
 
-    /// **Stable**: check if this model can run locally (via lattice-inference).
+    /// **Stable**: check if this model can run locally (via the lattice model crates).
     #[inline]
     pub const fn is_local(&self) -> bool {
         matches!(

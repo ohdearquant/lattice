@@ -21,7 +21,12 @@ const PROVIDER_FILES: &[&str] = &[
 ];
 
 pub(super) const PRODUCTION_POPULATION: BoundaryPopulation<'_> = BoundaryPopulation {
-    origins: &[(".", "src/model"), (".", "src/forward/metal_*")],
+    origins: &[
+        (".", "src/model"),
+        (".", "src/forward/metal_*"),
+        ("../models/qwen35", "src/model"),
+        ("../models/qwen35", "src/forward/metal_*"),
+    ],
     frontends: &[
         ("../serve", "src/serve/mod.rs"),
         ("../serve", "src/serving_worker.rs"),

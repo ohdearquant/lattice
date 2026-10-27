@@ -1653,9 +1653,26 @@ impl CrossingScanner<'_> {
         // definition in some namespace, consult that namespace's
         // fn_returns table for the function's own key.
         let resolved_ns_and_key = self.resolve_callee_key(raw);
-        let Some((ns, key)) = resolved_ns_and_key else {
+        let Some((mut ns, mut key)) = resolved_ns_and_key else {
             return;
         };
+        // A callee named through a `pub use` re-export (a facade path to a
+        // function another package defines) has no fn_returns row under the
+        // re-exporting namespace, so follow the re-export to the definition.
+        if !self
+            .resolver
+            .indices
+            .get(&ns)
+            .is_some_and(|index| index.fn_returns.contains_key(&key))
+        {
+            let segments: Vec<String> = key.split("::").map(str::to_string).collect();
+            if let Resolved::Definition(_, defining_ns, defining_segments) =
+                self.resolver.lookup(&ns, &segments, 8)
+            {
+                ns = defining_ns;
+                key = defining_segments.join("::");
+            }
+        }
         let Some(namespace_index) = self.resolver.indices.get(&ns) else {
             return;
         };
@@ -2404,6 +2421,50 @@ fn inferred_constructor_is_rejected() {
             .any(|c| c.kind == "inferred-constructor"
                 && c.resolved_path.ends_with("model::ConcreteModel")),
         "the inferred-constructor rule must connect build() to its origin return type: {:?}",
+        report.crossings
+    );
+    assert!(
+        !resolved_paths(&report)
+            .iter()
+            .any(|p| p.contains("PlainOptions")),
+        "the neutral negative twin (build_neutral) must not be reported: {:?}",
+        report.crossings
+    );
+}
+
+/// MUST BE REJECTED: the same `factory::build()` as above, called through
+/// `facade`'s `pub use` re-export. The callee's key names the re-exporting
+/// module, which defines no function, so the rule has to follow the
+/// re-export to `factory` before it can read the declared return type.
+/// `facade::build_neutral()` is the negative twin.
+#[test]
+fn inferred_constructor_through_a_reexport_is_rejected() {
+    let dir = fixture_dir("inferred_constructor_reexport");
+    let report = analyze_boundary(
+        &dir,
+        &["model"],
+        &[dir.join("frontend.rs")],
+        &[
+            dir.join("model/mod.rs"),
+            dir.join("neutral/mod.rs"),
+            dir.join("factory/mod.rs"),
+            dir.join("facade/mod.rs"),
+        ],
+        false,
+    )
+    .unwrap_or_else(|reason| panic!("{reason}"));
+    assert!(
+        report.unresolved.is_empty(),
+        "unexpected unresolved: {:?}",
+        report.unresolved
+    );
+    assert!(
+        report
+            .crossings
+            .iter()
+            .any(|c| c.kind == "inferred-constructor"
+                && c.resolved_path.ends_with("model::ConcreteModel")),
+        "the inferred-constructor rule must follow facade::build to factory::build: {:?}",
         report.crossings
     );
     assert!(

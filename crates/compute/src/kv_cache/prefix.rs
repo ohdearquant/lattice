@@ -5,6 +5,7 @@
 //! before decode continues, so shared pages are never mutated.
 
 use indexmap::IndexMap;
+use lattice_inference_core::InferenceError;
 use rustc_hash::FxHasher;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::sync::Arc;
@@ -162,6 +163,17 @@ impl PrefixEntry {
     }
 }
 
+struct StoredPrefixEntry {
+    entry: PrefixEntry,
+    token_ids: Option<Box<[u32]>>,
+}
+
+impl std::fmt::Debug for StoredPrefixEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.entry, f)
+    }
+}
+
 /// A hash-keyed LRU cache of immutable prefix pages.
 ///
 /// LRU ordering is maintained via `IndexMap` insertion order: lookups
@@ -170,7 +182,7 @@ impl PrefixEntry {
 #[derive(Debug)]
 pub struct PrefixPageCache {
     config: PrefixPageCacheConfig,
-    entries: FxIndexMap<PrefixKey, PrefixEntry>,
+    entries: FxIndexMap<PrefixKey, StoredPrefixEntry>,
     clock: u64,
 }
 
@@ -221,18 +233,63 @@ impl PrefixPageCache {
     /// data into a live `PagePool`.
     pub fn lookup(&mut self, key: &PrefixKey) -> Option<PrefixEntry> {
         let last_used = self.next_clock();
-        let mut entry = self.entries.swap_remove(key)?;
-        entry.last_used = last_used;
-        let cloned = entry.clone();
+        let mut entry = self.entries.shift_remove(key)?;
+        entry.entry.last_used = last_used;
+        let cloned = entry.entry.clone();
         self.entries.insert(*key, entry);
         Some(cloned)
+    }
+
+    pub(super) fn lookup_for_tokens(
+        &mut self,
+        key: &PrefixKey,
+        token_ids: &[u32],
+    ) -> Result<Option<PrefixEntry>, InferenceError> {
+        let Some(stored) = self.entries.get(key) else {
+            return Ok(None);
+        };
+        if stored.entry.prefix_len != token_ids.len() {
+            return Err(InferenceError::PrefixCache(format!(
+                "prefix hash collision or invalid entry length: key length {}, entry length {}",
+                token_ids.len(),
+                stored.entry.prefix_len
+            )));
+        }
+        let Some(verified_tokens) = stored.token_ids.as_deref() else {
+            return Ok(None);
+        };
+        if verified_tokens != token_ids {
+            return Err(InferenceError::PrefixCache(
+                "prefix token identity mismatch".into(),
+            ));
+        }
+        Ok(self.lookup(key))
+    }
+
+    pub(super) fn insert_for_tokens(
+        &mut self,
+        adapter_id: AdapterId,
+        token_ids: &[u32],
+        pages: Vec<SharedPageRef>,
+    ) -> Option<PrefixEntry> {
+        let key = PrefixKey::from_token_ids(adapter_id, token_ids);
+        let entry = PrefixEntry::new(token_ids.len(), self.config.prefix_page_size, pages, 0);
+        self.insert_stored_entry(
+            key,
+            StoredPrefixEntry {
+                entry,
+                token_ids: Some(token_ids.into()),
+            },
+        )
     }
 
     /// Insert prefix pages for `key`.
     ///
     /// The page count must match `prefix_len` and `config.prefix_page_size`.
     /// Replaces and returns any existing entry for the same key. LRU eviction
-    /// runs after insertion until `len() <= capacity`.
+    /// runs after insertion until `len() <= capacity`. This token-free insertion
+    /// cannot establish identity for `PagedKVCache::restore_prefix`; a length-consistent
+    /// entry is a cache miss, including after replacing a verified entry.
     pub fn insert(
         &mut self,
         key: PrefixKey,
@@ -246,14 +303,30 @@ impl PrefixPageCache {
     /// Insert a fully constructed entry for tests or advanced callers.
     ///
     /// `entry.last_used` is overwritten by this cache's monotonic counter.
-    pub fn insert_entry(&mut self, key: PrefixKey, mut entry: PrefixEntry) -> Option<PrefixEntry> {
-        self.validate_entry(&entry);
+    /// As with [`Self::insert`], this token-free insertion does not establish
+    /// identity for `PagedKVCache::restore_prefix`.
+    pub fn insert_entry(&mut self, key: PrefixKey, entry: PrefixEntry) -> Option<PrefixEntry> {
+        self.insert_stored_entry(
+            key,
+            StoredPrefixEntry {
+                entry,
+                token_ids: None,
+            },
+        )
+    }
+
+    fn insert_stored_entry(
+        &mut self,
+        key: PrefixKey,
+        mut stored: StoredPrefixEntry,
+    ) -> Option<PrefixEntry> {
+        self.validate_entry(&stored.entry);
         let last_used = self.next_clock();
-        entry.last_used = last_used;
-        let replaced = self.entries.swap_remove(&key);
-        self.entries.insert(key, entry);
+        stored.entry.last_used = last_used;
+        let replaced = self.entries.shift_remove(&key);
+        self.entries.insert(key, stored);
         self.evict_until_within_capacity();
-        replaced
+        replaced.map(|stored| stored.entry)
     }
 
     /// Evict one least-recently-used entry.
@@ -272,6 +345,7 @@ impl PrefixPageCache {
         )]
         let (_key, entry) = self.entries.shift_remove_index(0).expect("non-empty");
         entry
+            .entry
             .pages
             .iter()
             .filter(|page| page.strong_count() == 1)

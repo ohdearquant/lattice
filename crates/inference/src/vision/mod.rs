@@ -1,8 +1,7 @@
 //! Vision encoder module. Three vision paths live here: the real Qwen3.5 path,
 //! the PaddleOCR-VL path, and the inert Qwen3-VL scaffold. PaddleOCR-VL has
-//! its own weights and config, but shares `apply_rope_inplace` and
-//! `multihead_attention_full` from `qwen35_vit`, plus `batch_matvec`, `gelu`,
-//! and `layer_norm` from `vit`, and `gelu_exact` from `qwen35_merger`.
+//! its own weights and config and uses the shared arithmetic helpers in
+//! `lattice_compute::vision`.
 //!
 //! ## The real path: Qwen3.5-0.8B (ADR-069, S1-S3b shipped)
 //!
@@ -76,92 +75,38 @@
 //! // state.generate_multimodal(mm_input, gen_cfg);
 //! ```
 
+#[cfg(feature = "qwen35")]
 pub mod checkpoint;
 pub mod config;
 pub mod merger;
 pub mod multimodal;
+#[cfg(feature = "paddleocr-vl")]
 pub mod paddleocr_preprocess;
+#[cfg(feature = "paddleocr-vl")]
 pub mod paddleocr_vit;
+#[cfg(feature = "qwen35")]
 pub mod pooled_embed;
 pub mod preprocess;
+#[cfg(feature = "qwen35")]
 pub mod qwen35_merger;
+#[cfg(feature = "qwen35")]
 pub mod qwen35_mrope;
 pub mod qwen35_vit;
+#[cfg(feature = "qwen35")]
 pub mod qwen35_vit_metal;
 pub mod vit;
 
 pub use config::VisionConfig;
 pub use multimodal::MultimodalInput;
+#[cfg(feature = "qwen35")]
 pub use pooled_embed::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 
 use merger::{MlpMerger, MlpMergerWeights};
 use preprocess::PreprocessConfig;
 use vit::{ViT, VisionWeights};
 
-/// Errors produced by the vision encoder pipeline.
-///
-/// Marked `#[non_exhaustive]` so that distinguishing a new failure mode is a
-/// minor change rather than a major one. Adding `DimensionsExceeded` was a
-/// breaking change only because this enum was exhaustive; that cost is paid
-/// once here.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum VisionError {
-    /// Raw image bytes could not be decoded (unsupported format, corrupt data).
-    ImageDecode(String),
-    /// A weight or activation tensor had unexpected dimensions.
-    ShapeMismatch {
-        expected: usize,
-        actual: usize,
-        context: String,
-    },
-    /// A configuration value is invalid (zero dimension, indivisible sizes, etc.).
-    InvalidConfig(String),
-    /// The decoded image's declared pixel dimensions, pre-merge patch grid,
-    /// or resulting preprocessed buffer exceed a serving-side budget --
-    /// distinct from [`Self::ImageDecode`] (the image itself is well-formed,
-    /// just larger than this server will process) and from
-    /// [`Self::InvalidConfig`] (a checkpoint/config problem, not a
-    /// per-request one). Callers map this to a client-safe, retriable
-    /// rejection rather than the generic image-decode error.
-    DimensionsExceeded(String),
-    /// I/O error during weight loading.
-    Io(std::io::Error),
-}
-
-impl std::fmt::Display for VisionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ImageDecode(msg) => write!(f, "Vision image decode error: {msg}"),
-            Self::ShapeMismatch {
-                expected,
-                actual,
-                context,
-            } => write!(
-                f,
-                "Vision shape mismatch ({context}): expected {expected}, got {actual}"
-            ),
-            Self::InvalidConfig(msg) => write!(f, "Vision invalid config: {msg}"),
-            Self::DimensionsExceeded(msg) => write!(f, "Vision dimensions exceeded: {msg}"),
-            Self::Io(e) => write!(f, "Vision I/O error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for VisionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for VisionError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
+#[doc(inline)]
+pub use lattice_model_io::image::VisionError;
 
 // ---------------------------------------------------------------------------
 // VisionOutput

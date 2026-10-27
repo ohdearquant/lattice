@@ -5,7 +5,7 @@
 //! state — it only decides, from token IDs and metadata, whether a cached
 //! prefix can be reused and where the new suffix begins. The Metal-specific
 //! runtime (live KV buffers, GDN snapshots) lives in
-//! `crate::forward::metal_qwen35`.
+//! `lattice_inference::forward::metal_qwen35`.
 //!
 //! See design.md step 4 (ADR: latest-boundary GDN snapshot + live KV logical
 //! reuse for v1). Three reuse modes exist: an exact token prefix that is
@@ -127,6 +127,14 @@ pub fn longest_common_token_prefix(a: &[u32], b: &[u32]) -> usize {
 /// internal invariant violation, not a valid no-op, so when no reuse mode
 /// leaves a non-empty suffix the plan falls back to `FullRefill` here rather
 /// than surfacing as an error.
+///
+/// This function does not compare `entry.slot_id` with any slot: it plans
+/// against whatever entry it is given. [`plan_prefix_reuse_for_slot`] applies
+/// the same rules and declines an entry retained for another slot.
+#[deprecated(
+    since = "0.15.0",
+    note = "use `plan_prefix_reuse_for_slot`, which applies the same rules and declines an entry retained for another slot"
+)]
 pub fn plan_prefix_reuse(
     entry: Option<&CrossTurnPrefixEntry>,
     metadata: &CrossTurnPrefixMetadata,
@@ -203,6 +211,8 @@ pub fn plan_prefix_reuse_for_slot(
     sparse_checkpoint_lens: &[usize],
 ) -> PrefixRestorePlan {
     let entry = entry.filter(|e| e.slot_id == slot_id);
+    // The slot is checked above; the deprecated planner is the body this function wraps.
+    #[allow(deprecated)]
     plan_prefix_reuse(entry, metadata, new_prompt_ids, sparse_checkpoint_lens)
 }
 

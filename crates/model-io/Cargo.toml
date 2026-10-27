@@ -18,10 +18,12 @@ default = ["download"]
 # Fetch missing model files over HTTPS. Without it, cached files are still verified and a cache
 # miss is an error.
 download = ["dep:ureq"]
+image = ["dep:image"]
 # Exposes the hidden `test_support` module to other crates' tests. Not part of the supported API.
 test-utils = []
 
 [dependencies]
+image = { workspace = true, optional = true }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 sha2.workspace = true
 tracing = { workspace = true, features = ["default"] }

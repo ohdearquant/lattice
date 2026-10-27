@@ -1,4 +1,4 @@
-//! Native, pure-Rust embedding service backed by `lattice-inference`.
+//! Native, pure-Rust embedding service backed by the lattice model-family crates.
 //!
 //! Model loading is lazy and cancellation-safe; BERT-family and Qwen models take different
 //! loading and batching paths. See `docs/service.md` for lifecycle and persistence details.
@@ -10,8 +10,9 @@ use super::{
 use crate::error::{EmbedError, Result};
 use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
-use lattice_inference::model::embeddinggemma2::EmbeddingGemma2Model;
-use lattice_inference::{BertModel, QwenModel};
+use lattice_model_bert::BertModel;
+use lattice_model_embeddinggemma2::model::EmbeddingGemma2Model;
+use lattice_model_qwen3::QwenModel;
 use lattice_tokenizer::EmbeddingTokenCounts;
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};

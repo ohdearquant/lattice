@@ -12,12 +12,10 @@ use std::path::Path;
 use crate::decoder::driver::DriverTrace;
 use crate::error::InferenceError;
 use crate::generation::{GenerateConfig, GenerateOutput};
+#[cfg(feature = "qwen35")]
 use crate::model::Qwen35Model;
+#[cfg(feature = "gemma4")]
 use crate::model::gemma4_model::Gemma4Model;
-use crate::model::qwen35_config::VisionModelConfig;
-use crate::vision::VisionError;
-use crate::vision::checkpoint::{Qwen35VisionWeights, VisualMergerWeights};
-use crate::vision::qwen35_vit::GridThw;
 
 /// The shared driver's counters for one request: sampling steps opened and
 /// consumed. All zero when the request never reached the driver.
@@ -42,13 +40,13 @@ impl From<DriverTrace> for TraceObservation {
 ///
 /// # Errors
 /// Propagates tokenizer and generation failures.
+#[cfg(feature = "qwen35")]
 pub fn qwen_generate_traced(
     model: &Qwen35Model,
     prompt: &str,
     gen_cfg: &GenerateConfig,
 ) -> Result<(GenerateOutput, TraceObservation), InferenceError> {
-    model
-        .generate_with_trace(prompt, gen_cfg)
+    lattice_model_qwen35::__internal::generate_traced(model, prompt, gen_cfg)
         .map(|(output, trace)| (output, trace.into()))
 }
 
@@ -57,6 +55,7 @@ pub fn qwen_generate_traced(
 ///
 /// # Errors
 /// Propagates tokenizer and generation failures.
+#[cfg(feature = "qwen35")]
 pub fn qwen_generate_streaming_traced<F, C>(
     model: &Qwen35Model,
     prompt: &str,
@@ -68,22 +67,27 @@ where
     F: FnMut(&str) -> bool,
     C: FnMut() -> bool,
 {
-    model
-        .generate_streaming_with_trace(prompt, gen_cfg, on_token, should_cancel, |_| {})
-        .map(|(output, trace)| (output, trace.into()))
+    lattice_model_qwen35::__internal::generate_streaming_traced(
+        model,
+        prompt,
+        gen_cfg,
+        on_token,
+        should_cancel,
+    )
+    .map(|(output, trace)| (output, trace.into()))
 }
 
 /// Gemma generation over prepared prompt ids with the driver's counters kept.
 ///
 /// # Errors
 /// Propagates generation failures.
+#[cfg(feature = "gemma4")]
 pub fn gemma_generate_traced(
     model: &Gemma4Model,
     prompt_ids: &[u32],
     gen_cfg: &GenerateConfig,
 ) -> Result<(GenerateOutput, TraceObservation), InferenceError> {
-    model
-        .generate_with_trace(prompt_ids, gen_cfg)
+    lattice_model_gemma4::__internal::generate_traced(model, prompt_ids, gen_cfg)
         .map(|(output, trace)| (output, trace.into()))
 }
 
@@ -92,6 +96,7 @@ pub fn gemma_generate_traced(
 ///
 /// # Errors
 /// Propagates generation failures.
+#[cfg(feature = "gemma4")]
 pub fn gemma_generate_streaming_traced<F, C>(
     model: &Gemma4Model,
     prompt_ids: &[u32],
@@ -103,16 +108,21 @@ where
     F: FnMut(&str) -> bool,
     C: FnMut() -> bool,
 {
-    model
-        .generate_streaming_via_driver(prompt_ids, gen_cfg, on_token, should_cancel)
-        .map(|(output, trace)| (output, trace.into()))
+    lattice_model_gemma4::__internal::generate_streaming_traced(
+        model,
+        prompt_ids,
+        gen_cfg,
+        on_token,
+        should_cancel,
+    )
+    .map(|(output, trace)| (output, trace.into()))
 }
 
 /// Metal prefix-cache streaming generation with the driver's counters kept.
 ///
 /// # Errors
 /// Propagates tokenizer, context and generation failures.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[cfg(all(feature = "qwen35", target_os = "macos", feature = "metal-gpu"))]
 pub fn metal_generate_streaming_with_prefix_cache_traced<F, C>(
     state: &mut crate::forward::metal_qwen35::MetalQwen35State,
     slot_id: crate::kv_cache::CrossTurnSlotId,
@@ -132,137 +142,22 @@ where
     F: FnMut(&str, u32) -> bool,
     C: FnMut() -> bool,
 {
-    state
-        .generate_streaming_with_prefix_cache_with_trace(
-            slot_id,
-            prompt,
-            tokenizer,
-            gen_cfg,
-            on_token,
-            should_cancel,
-        )
-        .map(|(output, trace)| (output, trace.into()))
-}
-
-/// The model configuration a Metal state's engine was built with, by value.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub fn metal_engine_config(
-    state: &crate::forward::metal_qwen35::MetalQwen35State,
-) -> crate::model::qwen35_config::Qwen35Config {
-    state.engine.config.clone()
-}
-
-/// ChatML rendering of `(role, content)` turns followed by the open
-/// generation turn, as the canonical text renderer emits it.
-pub fn format_chat_template_parts<'a>(
-    messages: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> String {
-    crate::forward::metal_qwen35::format_chat_template_parts(messages)
-}
-
-/// The role name a ChatML turn opener renders for `role`.
-pub fn chat_role_name(role: &crate::forward::metal_qwen35::ChatRole) -> &str {
-    role.as_str()
-}
-
-/// Append a ChatML turn opener for `role`.
-pub fn push_chat_turn_open(prompt: &mut String, role: &str) {
-    crate::forward::metal_qwen35::push_chat_turn_open(prompt, role);
-}
-
-/// Append a ChatML turn close.
-pub fn push_chat_turn_close(prompt: &mut String) {
-    crate::forward::metal_qwen35::push_chat_turn_close(prompt);
-}
-
-/// Append the open assistant turn left unclosed for generation.
-pub fn push_chat_generation_open(prompt: &mut String) {
-    crate::forward::metal_qwen35::push_chat_generation_open(prompt);
+    lattice_model_qwen35::__internal::generate_streaming_with_prefix_cache_traced(
+        state,
+        slot_id,
+        prompt,
+        tokenizer,
+        gen_cfg,
+        on_token,
+        should_cancel,
+    )
+    .map(|(output, trace)| (output, trace.into()))
 }
 
 /// Gemma stop-token ids: the text config's EOS plus any top-level EOS ids in
 /// the checkpoint's generation and model configs.
 pub fn resolve_stop_token_ids(model_dir: &Path, text_config_eos: u32) -> Vec<u32> {
     crate::model::gemma4_config::resolve_stop_token_ids(model_dir, text_config_eos)
-}
-
-/// Load Qwen3.5 vision weights, polling `should_cancel`. `Ok(None)` means
-/// cancelled.
-///
-/// # Errors
-/// Propagates checkpoint and validation failures.
-pub fn load_qwen35_vision_weights_with_cancel(
-    model_dir: &Path,
-    vision_cfg: &VisionModelConfig,
-    should_cancel: &mut dyn FnMut() -> bool,
-) -> Result<Option<Qwen35VisionWeights>, InferenceError> {
-    crate::vision::checkpoint::load_qwen35_vision_weights_with_cancel(
-        model_dir,
-        vision_cfg,
-        should_cancel,
-    )
-}
-
-/// Output of the Metal ViT forward.
-#[derive(Debug, Clone)]
-pub struct VitObservation {
-    /// Pre-merger hidden states.
-    pub hidden_states: Vec<f32>,
-    /// Metal GEMM dispatches the forward issued.
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    pub metal_dispatches: usize,
-    /// GEMM calls the forward made.
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    pub gemm_calls: usize,
-}
-
-/// Qwen3.5 ViT forward on Metal, polling `should_cancel`. `Ok(None)` means
-/// cancelled.
-///
-/// # Errors
-/// Propagates vision failures, including a build without Metal.
-pub fn qwen35_vit_forward_metal_with_cancel(
-    weights: &Qwen35VisionWeights,
-    cfg: &VisionModelConfig,
-    pixel_values: &[f32],
-    grid: GridThw,
-    should_cancel: &mut dyn FnMut() -> bool,
-) -> Result<Option<VitObservation>, VisionError> {
-    Ok(
-        crate::vision::qwen35_vit_metal::qwen35_vit_forward_metal_with_cancel(
-            weights,
-            cfg,
-            pixel_values,
-            grid,
-            should_cancel,
-        )?
-        .map(|output| VitObservation {
-            hidden_states: output.hidden_states,
-            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-            metal_dispatches: output.metal_dispatches,
-            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-            gemm_calls: output.gemm_calls,
-        }),
-    )
-}
-
-/// Qwen3.5 visual merger forward, polling `should_cancel`. `Ok(None)` means
-/// cancelled.
-///
-/// # Errors
-/// Propagates vision failures.
-pub fn qwen35_merger_forward_with_cancel(
-    weights: &VisualMergerWeights,
-    cfg: &VisionModelConfig,
-    pre_merger_hidden: &[f32],
-    should_cancel: &mut dyn FnMut() -> bool,
-) -> Result<Option<Vec<f32>>, VisionError> {
-    crate::vision::qwen35_merger::qwen35_merger_forward_with_cancel(
-        weights,
-        cfg,
-        pre_merger_hidden,
-        should_cancel,
-    )
 }
 
 /// The reasoning budget a configuration actually applies: none unless
@@ -296,3 +191,14 @@ pub fn refit_source_from_serving(
         exploration_scale,
     )
 }
+
+#[cfg(all(feature = "qwen35", target_os = "macos", feature = "metal-gpu"))]
+#[doc(inline)]
+pub use lattice_model_qwen35::serving_support::metal_engine_config;
+#[cfg(feature = "qwen35")]
+#[doc(inline)]
+pub use lattice_model_qwen35::serving_support::{
+    VitObservation, chat_role_name, format_chat_template_parts,
+    load_qwen35_vision_weights_with_cancel, push_chat_generation_open, push_chat_turn_close,
+    push_chat_turn_open, qwen35_merger_forward_with_cancel, qwen35_vit_forward_metal_with_cancel,
+};

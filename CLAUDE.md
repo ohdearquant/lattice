@@ -109,7 +109,7 @@ This split a two-test failure report cleanly: one test failed deterministically 
 
 ### Machine-Wide GPU Test Lock
 
-Metal lock coverage is enforced by `crates/inference/tests/metal_measurement_lock_contract.rs`: discovered `MetalQwen35State` construction sites must acquire the shared lock before construction or name an explicit exemption, while raw measurement markers use an exact inventory. This is not a claim that every Metal-touching target is locked; long-running processes and explicitly listed legacy targets are exempt. Locking callers serialize through the single `gpu_test_lock()` implementation in `crates/inference/src/measurement.rs`. The module is a `#[doc(hidden)]`, Metal-only export because Cargo builds integration tests, benches, examples, and binaries as crates separate from `lattice-inference`; it is not production API. The guard holds two locks: an in-process mutex (thread serialization within one test binary) and an exclusive advisory flock on `/tmp/lion-metal-gpu-test.lock` (cross-process serialization, machine-wide convention). Any harness on this machine that drives the GPU for measurements — other repos' test suites, bench runners, one-off scripts — should acquire the same flock before touching Metal. Concurrent GPU work corrupts both timing and numerics: contended confirmation batches inflated top-k logit margins enough to produce false failure reports (#628, #629).
+Metal lock coverage is enforced by `crates/inference/tests/metal_measurement_lock_contract.rs`: discovered `MetalQwen35State` construction sites must acquire the shared lock before construction or name an explicit exemption, while raw measurement markers use an exact inventory. This is not a claim that every Metal-touching target is locked; long-running processes and explicitly listed legacy targets are exempt. Locking callers serialize through the single `gpu_test_lock()` implementation in `crates/metal-runtime/src/measurement.rs`, which `lattice-inference` re-exports as `lattice_inference::measurement::gpu_test_lock`. The module is a `#[doc(hidden)]`, Metal-only export because Cargo builds integration tests, benches, examples, and binaries as crates separate from the library that defines it; it is not production API. The guard holds two locks: an in-process mutex (thread serialization within one test binary) and an exclusive advisory flock on `/tmp/lion-metal-gpu-test.lock` (cross-process serialization, machine-wide convention). Any harness on this machine that drives the GPU for measurements — other repos' test suites, bench runners, one-off scripts — should acquire the same flock before touching Metal. Concurrent GPU work corrupts both timing and numerics: contended confirmation batches inflated top-k logit margins enough to produce false failure reports (#628, #629).
 
 All reviewed Metal benchmarks additionally validate Criterion registration and explicit caller chains. One registered wrapper must hold the same guard across the entire ordered target list, including compared arms and CPU groups in mixed benchmarks. Helper-local and separate per-arm guards do not establish that span. Constructor coverage in those benchmarks depends on the same ownership check. This target-owned span applies to the active Metal configuration; it does not establish GPU exclusion for CPU-only builds.
 
@@ -169,8 +169,9 @@ executable from the invocation directory, as `cargo run` does, with the same
 descriptor, acknowledgement and quiet checks as a bench target. The binary
 arguments are frozen at admission. Each binary needs the features of its own
 `cfg` gate and `required-features` entry: `metal-gpu` for all four, plus `f16`
-for `bench_decode_ab` and `bench_logit_dump`. The comparison route admits bench
-targets only. For example:
+for `bench_decode_ab` and `bench_logit_dump`. All four also require `qwen35`,
+which is a default feature. The comparison route admits bench targets only. For
+example:
 
 ```bash
 BENCH_N=64 scripts/bench-command.sh --gpu-handoff --label decode-ab -- \

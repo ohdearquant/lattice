@@ -1,32 +1,34 @@
 //! Forward-kernel module index for batch prefill, BitNet, CPU, f16 CPU, q8 CPU, GPU, Metal, and NEON paths.
+#[cfg(feature = "qwen35")]
 pub mod batch_prefill;
 pub mod bitnet_kernel;
 pub mod cpu;
+#[cfg(feature = "qwen35")]
 pub mod cpu_f16;
+#[cfg(feature = "qwen35")]
 pub mod cpu_q8;
 // Host-side f32 chunkwise GDN parity oracle (issue #175). Test/bench-only —
 // adds zero production surface to the default build.
 #[cfg(any(test, feature = "bench-internals"))]
+#[cfg(feature = "qwen35")]
 pub mod gdn_chunk_ref;
 pub mod gpu;
 pub mod gpu_gemm;
 pub mod metal;
+#[cfg(feature = "embeddinggemma2")]
 pub mod metal_embeddinggemma2;
+#[cfg(feature = "ernie45")]
 pub mod metal_ernie45;
+#[cfg(feature = "qwen35")]
 pub mod metal_gemm;
+#[cfg(feature = "qwen35")]
 pub mod metal_qwen35;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-mod metal_runtime;
+#[cfg(feature = "qwen35")]
 pub mod moe_expert_cache;
+#[cfg(feature = "qwen35")]
 pub mod neon;
+#[cfg(feature = "qwen35")]
 pub mod neon_forward;
-// Every call site lives inside `metal_qwen35::inner`, gated the same way
-// (`target_os = "macos"` + `metal-gpu`) — mirror that gate here instead of
-// compiling the module everywhere and suppressing the resulting dead-code
-// lint. Smaller surface, nothing to keep in sync with `mod inner`'s own gate.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) mod signpost;
-
 // Re-export the supported CPU names for backward compatibility (was `layers`).
 #[cfg(target_arch = "aarch64")]
 #[doc(no_inline)]

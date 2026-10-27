@@ -64,6 +64,36 @@ Thumbs.db
 !crates/inference/tests/fixtures/gemma4/stage3/rms_norm_wide_weight.bin
 !crates/inference/tests/fixtures/gemma4/stage3/scaled_embedding_embed_weight.bin
 !crates/inference/tests/fixtures/gemma4/stage3/scaled_embedding_output.bin
+# Shared compute goldens retain exact binary tracking paths.
+!crates/compute/tests/fixtures/gemma4/stage3/dual_rope_global_input.bin
+!crates/compute/tests/fixtures/gemma4/stage3/dual_rope_global_inv_freq.bin
+!crates/compute/tests/fixtures/gemma4/stage3/dual_rope_global_output.bin
+!crates/compute/tests/fixtures/gemma4/stage3/dual_rope_local_input.bin
+!crates/compute/tests/fixtures/gemma4/stage3/dual_rope_local_inv_freq.bin
+!crates/compute/tests/fixtures/gemma4/stage3/dual_rope_local_output.bin
+!crates/compute/tests/fixtures/gemma4/stage3/geglu_mlp_down_proj_weight.bin
+!crates/compute/tests/fixtures/gemma4/stage3/geglu_mlp_gate_proj_weight.bin
+!crates/compute/tests/fixtures/gemma4/stage3/geglu_mlp_input.bin
+!crates/compute/tests/fixtures/gemma4/stage3/geglu_mlp_output.bin
+!crates/compute/tests/fixtures/gemma4/stage3/geglu_mlp_up_proj_weight.bin
+!crates/compute/tests/fixtures/gemma4/stage3/logit_softcap_input.bin
+!crates/compute/tests/fixtures/gemma4/stage3/logit_softcap_output.bin
+!crates/compute/tests/fixtures/gemma4/stage3/qk_norm_v_unscaled_k_input.bin
+!crates/compute/tests/fixtures/gemma4/stage3/qk_norm_v_unscaled_k_norm_weight.bin
+!crates/compute/tests/fixtures/gemma4/stage3/qk_norm_v_unscaled_k_output.bin
+!crates/compute/tests/fixtures/gemma4/stage3/qk_norm_v_unscaled_q_input.bin
+!crates/compute/tests/fixtures/gemma4/stage3/qk_norm_v_unscaled_q_norm_weight.bin
+!crates/compute/tests/fixtures/gemma4/stage3/qk_norm_v_unscaled_q_output.bin
+!crates/compute/tests/fixtures/gemma4/stage3/qk_norm_v_unscaled_v_input.bin
+!crates/compute/tests/fixtures/gemma4/stage3/qk_norm_v_unscaled_v_output.bin
+!crates/compute/tests/fixtures/gemma4/stage3/rms_norm_input.bin
+!crates/compute/tests/fixtures/gemma4/stage3/rms_norm_output.bin
+!crates/compute/tests/fixtures/gemma4/stage3/rms_norm_weight.bin
+!crates/compute/tests/fixtures/gemma4/stage3/rms_norm_wide_input.bin
+!crates/compute/tests/fixtures/gemma4/stage3/rms_norm_wide_output.bin
+!crates/compute/tests/fixtures/gemma4/stage3/rms_norm_wide_weight.bin
+!crates/compute/tests/fixtures/gemma4/stage3/scaled_embedding_embed_weight.bin
+!crates/compute/tests/fixtures/gemma4/stage3/scaled_embedding_output.bin
 
 # Review scratch artifacts (repo-root only)
 /review*.md

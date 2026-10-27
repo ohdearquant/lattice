@@ -756,6 +756,14 @@ the family crates names a model; items 2 and 6 say how and in which release that
    adds it. The new validation method defaults to accepting, as the two existing ones do, and through 0.15.0 the code
    that installs a hook calls the deprecated validator as well as the new one, so an implementor that overrides only
    the old method keeps its check; validation still rejects before any state changes.
+
+   For the four storage-owned weight loaders, the step 3 replacement is the composition of model-neutral tensor-reading
+   operations in `lattice-weights` and family assembly functions initially in the facade's existing BERT and Qwen3
+   modules. The neutral operations sit beside the deprecated inherent methods; the family assembly does not remain in
+   the lower crate. The old signatures and compatibility bodies remain through 0.15 and never delegate upward. The upper
+   functions and their owning result follow their families at steps 4 and 5; the existing lower bundle definitions
+   remain until step 7. This is the specific meaning of replacement beside these four storage methods; it does not
+   advance family-crate creation or the other family moves.
 5. **D5.** A consumer selects families by depending on their crates. The facade takes each family crate as an optional
    dependency behind a feature named for the family and forwards it, and its default set keeps every family path that
    is unconditional today, so the facade's default public surface stays; manifests and cfg change. Families form a
@@ -787,6 +795,75 @@ the family crates names a model; items 2 and 6 say how and in which release that
    move code that bench targets execute and each takes a measured A/B on the targets that reach it; step 6 takes a Metal
    decode and prefill A/B. This amendment records the target and its obligations; it does not assert a measurement
    result.
+
+## Amendment 22 (2026-10-26)
+
+Amendment 3 item 3 kept the GPU test lock in `lattice-inference`, because moving it inside an extraction would have
+been a harness change, which D6.5 keeps out of an extraction. Amendment 21 now requires the move: a family crate
+depends on lower crates and `lattice-arch` only (item 1), and the EmbeddingGemma2 (step 5) and Qwen3.5 (step 6) family
+crates carry Metal tests and measurement targets that must take the same machine-wide lock. The lock therefore moves
+in its own change, ahead of those steps, which is the separate change D6.5 asks for. Changed:
+
+1. The lock's implementation moves to `lattice-metal-runtime` as the hidden module `measurement`, under that crate's
+   existing `macos` and `metal-gpu` gate. `lattice-metal-runtime` is the lowest crate that every Metal-driving crate
+   depends on. The lock file path, the 30-minute wait, the supervisor handoff protocol and its environment variables
+   are unchanged; the code moves without edits apart from its module documentation.
+2. D1: `lattice_inference::measurement::gpu_test_lock` stays as a named re-export, so every existing caller and every
+   target the measurement harness admits are unchanged. A family crate calls
+   `lattice_metal_runtime::measurement::gpu_test_lock` directly; its targets join the harness admission list in the
+   step that moves them, not in this change.
+3. D6.1: the module's unit tests move with it, names unchanged, and run in a `lattice-metal-runtime` CI step on macOS,
+   because the workspace test run builds default features only and the crate's default build is empty. The
+   lock-coverage contract keeps its single-definition check and finds the one definition at
+   `crates/metal-runtime/src/measurement.rs`; it still lists the facade's guarded entry points.
+4. The environment-variable table in `crates/inference/CONFIG.md` keeps the four lock variables and names
+   `metal-runtime` as the crate that reads them.
+
+## Amendment 23 (2026-10-26)
+
+Amendment 21 item 1 lists `ernie45` and `paddleocr-vl` as two family crates, which never depend on each other, and
+item 5 makes `paddleocr-vl` imply `ernie45`. PaddleOCR-VL cannot be split that way without a new interface between the
+two crates. `PaddleOcrVlModel` owns an `Ernie45Model` and its `Ernie45Config`. It loads both from the checkpoint's one
+`config.json` and `model.safetensors`, reads the decoder's token-embedding table (`embed_tokens`) to splice the image
+rows into the prompt, and then drives the decoder through its embedding-input methods (`forward_embeds_last_logits`,
+`kv_prefill`, `kv_decode_step`) and an `Ernie45KvCache`. Its one public item that names an ERNIE type is `config()`,
+which returns `&Ernie45Config`. In the other direction, nothing in the workspace selects the ERNIE 4.5 decoder without
+PaddleOCR-VL: it has no registry entry and no generation entry point of its own, and no reader in `lattice-serve`,
+`lattice-embed` or `lattice-tune`; its other readers are its own Metal forward, its tests, the decoder goldens and a
+trace example. Changed:
+
+1. A family crate is the unit a consumer selects. ERNIE 4.5 and PaddleOCR-VL are one such unit today, so they share one
+   crate. `lattice-model-ernie45` (`crates/models/ernie45/`) holds the ERNIE 4.5 decoder (its configuration, weights
+   and CPU forward, and its Metal forward behind `metal-gpu`) and, behind the crate's own `paddleocr-vl` feature, the
+   PaddleOCR-VL image processor, vision encoder and projector and `PaddleOcrVlModel`. Item 1's crate list loses
+   `lattice-model-paddleocr-vl`; no crate of that name is created or published.
+2. The crate's default feature set does not include `paddleocr-vl`. Item 5's facade features keep their names and their
+   implication: `ernie45` enables the crate, and `paddleocr-vl` implies `ernie45` and forwards to
+   `lattice-model-ernie45?/paddleocr-vl`. Both stay in the facade's default set, so its default public surface does not
+   change, and these paths stay as named re-exports (D1): `lattice_inference::model::{ernie45, paddleocr_vl}`,
+   `lattice_inference::vision::{paddleocr_preprocess, paddleocr_vit}`, and, under `metal-gpu`,
+   `lattice_inference::forward::metal_ernie45`. A build with `ernie45` and without `paddleocr-vl` compiles no
+   PaddleOCR-VL code; that pair joins item 7's implication-pair coverage. Because the crate's default build leaves the
+   PaddleOCR-VL tests out, CI runs its tests with `--features paddleocr-vl`, and its macOS Metal step with
+   `--features metal-gpu,paddleocr-vl`.
+3. Item 1's rule that family crates never depend on each other, and item 7's mechanical check of it, are unchanged.
+   Item 6's step (6) moves ERNIE 4.5 and PaddleOCR-VL in one family step.
+4. Considered and not taken:
+   - Keeping `PaddleOcrVlModel` in the facade as glue over two family crates. Its prompt assembly, position rows and
+     decode loop exist only for PaddleOCR-VL, and item 1 puts code that exists for one family in a family crate.
+   - A `lattice-arch` interface for a decoder that takes injected embeddings (token-embedding table, three-row
+     positions, a cache type, prefill and decode step, and a loader), with `PaddleOcrVlModel` generic over it and the
+     facade naming the ERNIE instantiation by a type alias. This keeps item 1's rule and the facade paths. Its cost is a
+     public trait shaped by one implementor and one consumer, which item 3 requires to be closed (construction, errors,
+     lifecycle) in the same step. `config()` keeps returning `&Ernie45Config` only while that configuration sits in
+     `lattice-arch`; it lives in the facade today, so it would first move there, and item 6's step (7) moves
+     configurations out of `lattice-arch` again, after which `config()` returns an associated type.
+   - A named exception letting `lattice-model-paddleocr-vl` depend on `lattice-model-ernie45`. It is the smallest code
+     change, but it breaks the one invariant item 7 checks mechanically, and a first exception makes the next cheaper.
+
+   If ERNIE 4.5 gains a consumer that selects it without PaddleOCR-VL, the two can be split then. That split removes
+   the PaddleOCR-VL modules from `lattice-model-ernie45`, a breaking release of that crate (the facade paths stay), and
+   it needs the interface or the exception above at that point.
 
 ## Direction
 

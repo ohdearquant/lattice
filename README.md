@@ -23,9 +23,10 @@ handle the CPU path.
 
 Lattice is two things in one repo.
 
-**A Rust inference library.** Thirteen crates covering embeddings, generation,
-quantization, LoRA fine-tuning, and optimal transport. Use `lattice-embed` as a
-library dependency, or run the `lattice` binary for interactive chat and an
+**A Rust inference library.** A workspace of focused crates covering embeddings,
+generation, quantization, LoRA fine-tuning, and optimal transport. The canonical
+member list is in [`Cargo.toml`](Cargo.toml). Use `lattice-embed` as a library
+dependency, or run the `lattice` binary for interactive chat and an
 OpenAI-compatible HTTP server.
 
 **Lattice Studio: a native macOS app.** A SwiftUI instrument panel that drives
@@ -165,7 +166,9 @@ Three leaf crates (`fann`, `transport`, `inference-core`) have zero
 intra-workspace dependencies. `tokenizer`, `grammar` and `weights` each depend
 only on `inference-core` at runtime, as does `model-io`. `arch` depends on `inference-core`
 and `weights`; `quant` depends on those two and on `arch`, and `compute`
-on `inference-core` and `arch`. `inference` depends on all eight
+on `inference-core`, `arch`, `tokenizer` and `weights`. Those four `compute`
+dependencies are unconditional; its external `gemm` dependency is enabled only
+by the opt-in `x86-gemm` feature. `inference` depends on all eight
 unconditionally and pulls in `fann` through the optional `mixture` or
 `metal-gpu` features. Each can be used on its own.
 
@@ -715,11 +718,12 @@ dependents:
 2. `tokenizer`, `grammar`, `weights`, `metal-runtime`, and `model-io`.
 3. `arch`.
 4. `quant` and `compute`.
-5. `inference`.
-6. `embed`, `tune` and `serve`.
+5. The model-family crates under [`crates/models/`](crates/models).
+6. `inference`.
+7. `embed`, `tune` and `serve`.
 
 The script waits 30 seconds between tiers for registry indexing. Its dry-run
-mode checks package sizes for all fifteen crates, then runs
+mode checks package sizes for the workspace crates, then runs
 `cargo publish --dry-run` for the leaf tier only; later tiers require this
 release's dependencies on crates.io.
 

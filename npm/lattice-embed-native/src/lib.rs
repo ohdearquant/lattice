@@ -2,7 +2,7 @@
 // embedding path (MiniLM, BGE, E5). Unlike the `lattice-embed-wasm` package
 // (which is limited to in-memory byte buffers, see crates/embed/src/wasm.rs),
 // this binding loads models directly from a local directory on disk via
-// `lattice_inference::BertModel::from_directory`, the same real, production
+// `lattice_model_bert::BertModel::from_directory`, the same real, production
 // entry point `lattice_embed::service::native::NativeEmbeddingService` itself
 // calls for BERT-family models (see that module's `load_model_sync`).
 //
@@ -18,11 +18,11 @@
 //
 // Known v0 limitation (flagged loudly here):
 // `BertModel::encode`/`encode_batch` unconditionally L2-normalize their
-// output (see crates/inference/src/model/bert.rs; the `pool()` doc comment
+// output (see crates/models/bert/src/bert.rs; the `pool()` doc comment
 // confirms normalization always happens in the caller, i.e. `encode`/
 // `encode_batch`, and there is no public non-normalizing path). There is
 // therefore no way to honor `normalize: false` without adding a new public
-// method to `lattice-inference` (skipping this crate's own napi surface
+// method to `lattice-model-bert` (skipping this crate's own napi surface
 // entirely). Rather than silently ignoring an explicit `normalize: false`
 // and returning a normalized vector anyway (a silent-partial-success), this
 // binding rejects `normalize: false` with `FL_EMBED_BAD_OPTIONS` so the
@@ -35,7 +35,7 @@
 // unconditionally at the `lattice_embed` crate root (not gated behind the
 // `native` feature), so this crate can depend on them directly.
 use lattice_embed::{DEFAULT_MAX_BATCH_SIZE, EmbeddingModel as ModelFamily, MAX_TEXT_BYTES};
-use lattice_inference::BertModel;
+use lattice_model_bert::BertModel;
 use napi::bindgen_prelude::{AsyncTask, Float32Array, Task};
 use napi::{Env, Error, Result, Status};
 use napi_derive::napi;
@@ -56,8 +56,8 @@ use std::sync::Arc;
 /// inferred from `modelPath`'s final path component, which works
 /// automatically for any directory named after its canonical slug (e.g.
 /// `all-minilm-l6-v2`, `bge-small-en-v1.5` -- exactly the directory names
-/// `lattice-inference`'s own model cache convention uses, see
-/// `default_cache_dir` in crates/inference/src/lib.rs).
+/// `lattice-model-io`'s model cache convention uses, see
+/// `default_cache_dir` in crates/model-io/src/lib.rs).
 // A wrong JS type for `modelId`/`normalize` (e.g. a number or a stringified
 // boolean) never reaches `from_options` below: napi-rs converts the JS
 // object into this struct's typed fields as part of argument marshalling,
@@ -330,7 +330,7 @@ impl BatchOutput {
 
 /// Encodes a single text through the real engine. `BertModel::encode` is
 /// `&self` and allocates its own per-call scratch (`AttentionBuffers`, see
-/// crates/inference/src/model/bert.rs) rather than caching anything on
+/// crates/models/bert/src/bert.rs) rather than caching anything on
 /// `self`, so concurrent calls through the same `Arc<BertModel>` (e.g. many
 /// in-flight `embed()` AsyncTasks on napi's worker pool) never race.
 fn encode_one(model: &BertModel, text: &str) -> Result<Vec<f32>> {

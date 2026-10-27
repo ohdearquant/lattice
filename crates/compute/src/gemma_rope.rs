@@ -2,7 +2,7 @@
 //!
 //! The text-layer inverse-frequency table (default and proportional RoPE), its cos/sin
 //! expansion, and the vision tower's axial inverse-frequency table. Applying the rotation to a
-//! tensor stays in `lattice_inference::model::gemma4_ops`, which re-exports these functions at
+//! tensor is applied in [`crate::gemma_ops`]; `lattice_inference::model::gemma4_ops` re-exports these functions at
 //! their original paths.
 
 /// Build a per-layer-type RoPE inverse-frequency table of length
@@ -20,7 +20,7 @@
 /// `(partial_rotary_factor * head_dim / 2) as usize` slots are the computed
 /// frequency; the rest are **exactly zero**. A zero frequency makes
 /// `cos=1, sin=0` for that dimension pair in [`gemma4_rope_cos_sin`] /
-/// `lattice_inference::model::gemma4_ops::gemma4_apply_rope` -- i.e. those dimensions pass
+/// [`crate::gemma_ops::gemma4_apply_rope`] -- i.e. those dimensions pass
 /// through unrotated,
 /// rather than being truncated from the tensor. `cos`/`sin` stay
 /// `head_dim`-wide either way.
