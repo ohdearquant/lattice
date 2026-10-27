@@ -230,7 +230,7 @@ impl MetalQwen35State {
         }
     }
 
-    /// Pure planning step: delegates to [`lattice_compute::kv_cache::plan_prefix_reuse`]
+    /// Pure planning step: delegates to [`lattice_compute::kv_cache::plan_prefix_reuse_for_slot`]
     /// against whatever is currently cached for `slot_id`, supplying the
     /// entry's retained sparse GDN checkpoint boundaries (#590) so the
     /// planner can produce `PrefixReuseMode::ReplayFromCheckpoint` for
@@ -246,7 +246,8 @@ impl MetalQwen35State {
         let checkpoint_lens: Vec<usize> = entry
             .map(|e| e.checkpoints.iter().map(|c| c.len).collect())
             .unwrap_or_default();
-        lattice_compute::kv_cache::plan_prefix_reuse(
+        lattice_compute::kv_cache::plan_prefix_reuse_for_slot(
+            slot_id,
             entry.map(|e| &e.generic),
             metadata,
             prompt_ids,

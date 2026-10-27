@@ -39,9 +39,9 @@ pub struct VerifiedRound {
 /// The typed speculative extension of the execution boundary (ADR-090 D2, D6): a session
 /// that verifies draft tokens against the target and returns verified spans, with its own
 /// snapshot and rollback. It is a separate trait rather than optional methods on
-/// [`DecoderSession`](super::DecoderSession): only the Qwen Metal routes have it, and a session without it cannot
-/// be asked to speculate. The driver applies the shared decode policy to what it returns
-/// ([`run_speculative`]); the session never publishes a token.
+/// [`DecoderSession`](super::DecoderSession): only the Qwen Metal routes have it, and a
+/// session without it cannot be asked to speculate. The driver applies the shared decode
+/// policy to what it returns ([`run_speculative`]); the session never publishes a token.
 pub trait SpeculativeSession {
     /// The target's greedy prediction for the first output position, read from the prefill
     /// the caller already ran.
@@ -65,9 +65,9 @@ pub trait SpeculativeSession {
 }
 
 /// Ledger-transition counters for the speculative driver, the bypass detector the
-/// per-token [`DriverTrace`](super::driver::DriverTrace) is for the ordinary loop: `offered` counts the tokens
-/// the shared policy saw. A request whose output did not pass through the policy leaves
-/// `offered` below the number of tokens it published.
+/// per-token [`DriverTrace`](super::driver::DriverTrace) is for the ordinary loop: `offered`
+/// counts the tokens the shared policy saw. A request whose output did not pass through the
+/// policy leaves `offered` below the number of tokens it published.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SpeculativeTrace {
     /// Rounds the session ran.
@@ -126,8 +126,8 @@ fn check_greedy(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
 /// decode step; the prefill ran before this call, so there is no earlier point to poll.
 ///
 /// `decode_delta`, `text`, `token_logprob_end_offsets` and `emit_confirmed` are the raw
-/// I/O primitives [`run`](super::driver::run) takes, handed to the same policy call; a text sink that refuses a
-/// delta ends the request with [`StopReason::Interrupt`].
+/// I/O primitives [`run`](super::driver::run) takes, handed to the same policy call; a text
+/// sink that refuses a delta ends the request with [`StopReason::Interrupt`].
 #[allow(clippy::too_many_arguments)]
 pub fn run_speculative(
     session: &mut dyn SpeculativeSession,

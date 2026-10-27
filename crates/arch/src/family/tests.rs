@@ -36,7 +36,18 @@ fn registry() -> Registry {
 }
 
 fn loader_ran(result: Result<(), InferenceError>) -> bool {
-    matches!(result, Err(InferenceError::ModelNotFound(_)))
+    matches!(
+        result,
+        Err(InferenceError::ModelNotFound(message)) if message.contains(" loader ran for ")
+    )
+}
+
+#[test]
+fn loader_ran_ignores_a_model_not_found_no_stub_loader_wrote() {
+    assert!(!loader_ran(Err(InferenceError::ModelNotFound(
+        "model.safetensors not found".to_string()
+    ))));
+    assert!(!loader_ran(Ok(())));
 }
 
 #[test]

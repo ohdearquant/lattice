@@ -190,6 +190,22 @@ pub fn plan_prefix_reuse(
     full_refill(shared, entry.represented_len)
 }
 
+/// [`plan_prefix_reuse`] for the cache slot `slot_id`.
+///
+/// An `entry` retained for any other slot is never reused: the plan is a `FullRefill`, exactly as when no entry is
+/// cached. A caller that looks the entry up by slot already passes only that slot's entry; this keeps the isolation
+/// that [`CrossTurnSlotId`] documents true for whatever entry is passed.
+pub fn plan_prefix_reuse_for_slot(
+    slot_id: CrossTurnSlotId,
+    entry: Option<&CrossTurnPrefixEntry>,
+    metadata: &CrossTurnPrefixMetadata,
+    new_prompt_ids: &[u32],
+    sparse_checkpoint_lens: &[usize],
+) -> PrefixRestorePlan {
+    let entry = entry.filter(|e| e.slot_id == slot_id);
+    plan_prefix_reuse(entry, metadata, new_prompt_ids, sparse_checkpoint_lens)
+}
+
 /// Whether a retained sparse checkpoint at `len` remains valid when the
 /// slot's entry is replaced by a save at `new_represented_len` whose token
 /// history shares `common_prefix_len` tokens with the old entry's history

@@ -1,4 +1,5 @@
 use super::*;
+use crate::decoder::tests::fresh_ledger;
 use crate::decoder::{
     PredictionId, PredictionLedger, SelectionCandidate, StepStamp, TokenMetadata,
 };
@@ -23,7 +24,7 @@ impl RecordingSession {
                 stop_strings: true,
                 reasoning_budget: true,
             },
-            ledger: PredictionLedger::new().expect("a fresh ledger identity"),
+            ledger: fresh_ledger(),
             prediction: None,
             calls: Vec::new(),
             finishes: Vec::new(),
@@ -264,7 +265,10 @@ fn an_empty_prompt_is_refused_before_any_session_call() {
         .err()
         .expect("an empty prompt is refused");
     assert!(
-        matches!(&error, InferenceError::InvalidInput(message) if message.contains("non-empty prompt")),
+        matches!(
+            &error,
+            InferenceError::InvalidInput(message) if message.contains("non-empty prompt")
+        ),
         "{error:?}"
     );
     assert!(session.calls.is_empty(), "{:?}", session.calls);

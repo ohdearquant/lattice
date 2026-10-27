@@ -45,7 +45,7 @@ fn asymmetric_config() -> Qwen35Config {
     cfg
 }
 
-fn persistent_vectors(scratch: &PrefillScratch) -> [&Vec<f32>; 12] {
+fn persistent_vectors(scratch: &PrefillScratch) -> [&Vec<f32>; 17] {
     [
         &scratch.hidden,
         &scratch.residual,
@@ -57,8 +57,13 @@ fn persistent_vectors(scratch: &PrefillScratch) -> [&Vec<f32>; 12] {
         &scratch.gdn_k_tmp,
         &scratch.gdn_kv_mem,
         &scratch.gdn_delta,
-        &scratch.attn_acc,
-        &scratch.attn_tile_scores,
+        &scratch.tiled_buffers.q_tile,
+        &scratch.tiled_buffers.k_tile,
+        &scratch.tiled_buffers.v_tile,
+        &scratch.tiled_buffers.s_tile,
+        &scratch.tiled_buffers.output,
+        &scratch.tiled_buffers.row_max,
+        &scratch.tiled_buffers.row_sum,
     ]
 }
 
@@ -75,8 +80,13 @@ fn poison_scratch(scratch: &mut PrefillScratch) {
         &mut scratch.gdn_k_tmp,
         &mut scratch.gdn_kv_mem,
         &mut scratch.gdn_delta,
-        &mut scratch.attn_acc,
-        &mut scratch.attn_tile_scores,
+        &mut scratch.tiled_buffers.q_tile,
+        &mut scratch.tiled_buffers.k_tile,
+        &mut scratch.tiled_buffers.v_tile,
+        &mut scratch.tiled_buffers.s_tile,
+        &mut scratch.tiled_buffers.output,
+        &mut scratch.tiled_buffers.row_max,
+        &mut scratch.tiled_buffers.row_sum,
     ] {
         values.fill(f32::NAN);
     }
@@ -171,6 +181,9 @@ fn new_scratch_capacity_uses_largest_phase_not_the_sum() {
     let value_heads = cfg.linear_num_value_heads.unwrap();
     let output = value_heads * cfg.linear_value_head_dim;
     let qkv = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim + output;
+    let br = scratch.tiled_config.tile_size_q.max(1);
+    let bc = scratch.tiled_config.tile_size_kv.max(1);
+    let hd = scratch.tiled_config.head_dim;
     let expected_persistent = [
         seq_len * cfg.hidden_size,
         seq_len * cfg.hidden_size,
@@ -182,8 +195,13 @@ fn new_scratch_capacity_uses_largest_phase_not_the_sum() {
         cfg.linear_key_head_dim,
         cfg.linear_value_head_dim,
         cfg.linear_value_head_dim,
-        cfg.head_dim,
-        scratch.tiled_config.tile_size_kv.max(1),
+        br * hd,
+        bc * hd,
+        bc * hd,
+        br * bc,
+        br * hd,
+        br,
+        br,
     ];
     for (values, expected) in persistent_vectors(&scratch)
         .into_iter()
