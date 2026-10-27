@@ -16,9 +16,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::error::InferenceError;
-use crate::forward::cpu::{matmul_bt, rms_norm};
-use crate::weights::SafetensorsFile;
+use lattice_compute::forward::cpu::{matmul_bt, rms_norm};
+use lattice_inference_core::InferenceError;
+use lattice_weights::SafetensorsFile;
 
 const SCALE_FLOOR: f32 = 1e-5;
 const REG_TOKEN_ID: usize = 1;
