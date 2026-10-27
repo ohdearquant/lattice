@@ -129,6 +129,17 @@ native = [
     "dep:lattice-tokenizer",
     "dep:lattice-weights",
 ]
+# Feature forwards. This crate implements none of `image`, `download`, `metal-gpu`
+# or `x86-gemm` itself: each line forwards the capability to the crates that own
+# it, and a crate missing from a line does not declare that feature
+# (lattice-model-bert has no `metal-gpu`, lattice-model-qwen35 no `x86-gemm`).
+# Cargo rejects a forward to a feature the named crate does not declare, so a
+# rename or removal there fails this manifest's build instead of dropping silently.
+# The reverse is not checked: a feature a family crate adds later is not forwarded
+# until a line here names it.
+# `image` is image decoding. `lattice_embed::vision` compiles under `native`
+# without it, and `VisionEmbeddingModel::embed_image` then returns an error
+# instead of decoding the image.
 image = ["native", "lattice-model-qwen35/image", "lattice-model-embeddinggemma2/image"]
 # First-use model downloads for the native `embed` binary (its `--download-only`
 # flag and the implicit fetch inside `BertModel::from_pretrained`). Implies
