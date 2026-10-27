@@ -1,0 +1,21 @@
+[package]
+name = "lattice-forecast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native time-series forecasting models (Chronos-2, Reverso, Toto 2.0) and context preparation for Lattice"
+keywords = ["forecasting", "time-series", "inference", "lattice"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+lattice-compute.workspace = true
+lattice-inference-core.workspace = true
+lattice-weights.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

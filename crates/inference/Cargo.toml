@@ -125,6 +125,7 @@ tokenizers = { version = "0.22", optional = true, default-features = false, feat
 image = { workspace = true, optional = true }
 lattice-backward = { version = "0.15.0", path = "../backward", optional = true }
 lattice-compute = { version = "0.15.0", path = "../compute" }
+lattice-forecast = { version = "0.15.0", path = "../forecast" }
 lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
 lattice-grammar = { version = "0.15.0", path = "../grammar" }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }

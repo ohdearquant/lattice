@@ -17,6 +17,7 @@ members = [
     "crates/compute",
     "crates/backward",
     "crates/model-io",
+    "crates/forecast",
     "crates/models/embeddinggemma2",
     "crates/models/bert",
     "crates/models/qwen3",
@@ -126,6 +127,7 @@ approx = "0.5"
 lattice-arch = { version = "0.15.0", path = "crates/arch" }
 lattice-backward = { version = "0.15.0", path = "crates/backward" }
 lattice-compute = { version = "0.15.0", path = "crates/compute" }
+lattice-forecast = { version = "0.15.0", path = "crates/forecast" }
 lattice-grammar = { version = "0.15.0", path = "crates/grammar" }
 lattice-inference-core = { version = "0.15.0", path = "crates/inference-core" }
 lattice-metal-runtime = { version = "0.15.0", path = "crates/metal-runtime" }

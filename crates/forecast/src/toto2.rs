@@ -16,10 +16,10 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::error::InferenceError;
-use crate::forecast::QuantileForecast;
-use crate::forward::cpu::{matmul_bt, rms_norm};
-use crate::weights::SafetensorsFile;
+use crate::QuantileForecast;
+use lattice_compute::forward::cpu::{matmul_bt, rms_norm};
+use lattice_inference_core::InferenceError;
+use lattice_weights::SafetensorsFile;
 
 const QUANTILES: [f32; 9] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 const MIN_SCALE: f64 = 1e-6;
