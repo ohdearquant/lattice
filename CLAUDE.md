@@ -169,8 +169,9 @@ executable from the invocation directory, as `cargo run` does, with the same
 descriptor, acknowledgement and quiet checks as a bench target. The binary
 arguments are frozen at admission. Each binary needs the features of its own
 `cfg` gate and `required-features` entry: `metal-gpu` for all four, plus `f16`
-for `bench_decode_ab` and `bench_logit_dump`. The comparison route admits bench
-targets only. For example:
+for `bench_decode_ab` and `bench_logit_dump`. All four also require `qwen35`,
+which is a default feature. The comparison route admits bench targets only. For
+example:
 
 ```bash
 BENCH_N=64 scripts/bench-command.sh --gpu-handoff --label decode-ab -- \
