@@ -781,7 +781,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/inference-allocation-smoke.log"
-          if cargo bench --locked -p lattice-inference --no-default-features --features bench-internals \
+          if cargo bench --locked -p lattice-inference --no-default-features --features bench-internals,qwen35 \
             --bench inference_perf -- '^generate_forward_with_cache/(allocating_current|scratch_dispatch)$' --test >"$log" 2>&1; then
             cat "$log"
           else
