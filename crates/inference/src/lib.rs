@@ -45,7 +45,7 @@ pub mod model_format;
 /// Tokenizer implementations (`WordPiece`, `SentencePiece`, byte-level BPE) behind the
 /// [`Tokenizer`] trait, plus the [`load_tokenizer`] auto-detect helper. See [`model`].
 pub mod tokenizer;
-/// Qwen3-VL vision encoder path: patch preprocessing, ViT forward pass, and MLP merger.
+/// Vision encoder paths: the Qwen3.5 vision tower and the PaddleOCR-VL encoder.
 /// See [`model`] and [`weights`].
 pub mod vision;
 /// Safetensors-backed tensor storage and weight formats (f32, f16, Q8, Q4). See [`model`]
