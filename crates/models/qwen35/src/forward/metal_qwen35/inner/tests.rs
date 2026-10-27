@@ -1848,17 +1848,6 @@ fn make_valid_layer(hidden: usize, rank: usize) -> LoraLayerData {
     }
 }
 
-/// Minimal 4-layer hybrid fixture: [GDN, GDN, GDN, GQA] mirroring the
-/// Qwen3.5 pattern at small dimension. Sufficient to exercise the
-/// self-speculative draft path (GDN-only forward) and verify path (full).
-
-/// `tiny_hybrid_fixture` with token embeddings that spread the letter logits: every row
-/// has two non-zero entries, so the logit at a letter depends on the last prompt token and
-/// differs from letter to letter. The full-attention layer also carries one token-mixing
-/// path: q_proj and k_proj stay zero, so attention is uniform over the positions seen so
-/// far, value channel 0 reads hidden[0], and o_proj routes that channel into hidden[1].
-/// The last position's letter logits therefore depend on every earlier prompt token.
-
 fn f32_bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|v| v.to_bits()).collect()
 }
