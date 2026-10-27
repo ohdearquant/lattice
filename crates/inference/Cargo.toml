@@ -73,7 +73,7 @@ x86-gemm = ["lattice-compute/x86-gemm", "lattice-model-bert?/x86-gemm", "lattice
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
 backfill = ["dep:rusqlite", "f16"]
 download = ["lattice-model-io/download", "lattice-model-bert?/download", "lattice-model-qwen3?/download"]
-train-backward = ["lattice-model-qwen35?/train-backward"]
+train-backward = ["dep:lattice-backward", "lattice-model-qwen35?/train-backward"]
 # AdapterRouter gate: enables the lattice-fann backed routing module.
 # generate_with_lora_mixture does NOT require this feature — it is always
 # available under `metal-gpu`. blend_lora_layer_data now depends on
@@ -96,7 +96,7 @@ signpost = ["lattice-model-qwen35?/signpost"]
 # lattice_serve.rs) link against this crate as an ordinary dependency and
 # cannot see its `#[cfg(test)]`-only internals -- only a real Cargo feature
 # crosses that boundary.
-test-utils = ["lattice-model-bert?/test-utils", "lattice-model-gemma4?/test-utils", "lattice-model-qwen35?/test-utils"]
+test-utils = ["lattice-backward?/test-utils", "lattice-model-bert?/test-utils", "lattice-model-gemma4?/test-utils", "lattice-model-qwen35?/test-utils"]
 
 [dependencies]
 lattice-model-qwen35 = { workspace = true, optional = true }
@@ -123,6 +123,7 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { workspace = true, optional = true }
+lattice-backward = { version = "0.15.0", path = "../backward", optional = true }
 lattice-compute = { version = "0.15.0", path = "../compute" }
 lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
 lattice-grammar = { version = "0.15.0", path = "../grammar" }

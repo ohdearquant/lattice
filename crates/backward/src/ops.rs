@@ -65,7 +65,7 @@ pub fn linear_vjp(w: &[f32], g: &[f32], d_in: usize, d_out: usize) -> Vec<f32> {
     assert_eq!(g.len(), d_out);
 
     let mut dx = vec![0.0f32; d_in];
-    crate::forward::cpu::matmul_into(g, w, &mut dx, 1, d_out, d_in);
+    lattice_compute::forward::cpu::matmul_into(g, w, &mut dx, 1, d_out, d_in);
     dx
 }
 
@@ -107,7 +107,7 @@ pub fn lora_vjp(
     // shape as `linear_vjp`: B is [d_out, rank] row-major, g is [1, d_out] ⇒
     // bt_g = g @ B via the shared GEMM dispatch (m=1, k=d_out, n=rank).
     let mut bt_g = vec![0.0f32; rank];
-    crate::forward::cpu::matmul_into(g, b, &mut bt_g, 1, d_out, rank);
+    lattice_compute::forward::cpu::matmul_into(g, b, &mut bt_g, 1, d_out, rank);
 
     // grad_A[r, j] = scale * bt_g[r] * x[j]  (outer product; same shape as grad_B).
     let mut grad_a = vec![0.0f32; rank * d_in];
@@ -126,7 +126,7 @@ pub fn lora_vjp(
         *v *= scale;
     }
     let mut dx = vec![0.0f32; d_in];
-    crate::forward::cpu::matmul_into(&bt_g, a, &mut dx, 1, rank, d_in);
+    lattice_compute::forward::cpu::matmul_into(&bt_g, a, &mut dx, 1, rank, d_in);
 
     (grad_b, grad_a, dx)
 }
@@ -221,7 +221,7 @@ pub fn swiglu_backward(
     // [1, hidden] ⇒ dm = dy @ W_down via the shared GEMM dispatch (matches the
     // forward `swiglu_forward`'s own down-proj matmul shape).
     let mut dm = vec![0.0f32; inter];
-    crate::forward::cpu::matmul_into(dy, w_down, &mut dm, 1, hidden, inter);
+    lattice_compute::forward::cpu::matmul_into(dy, w_down, &mut dm, 1, hidden, inter);
 
     // Elementwise SwiGLU-gate backward: silu'(gate) and the up/gate splits.
     // O(inter), dominated by `exp()` (not a reduction) — left as a scan.
@@ -244,9 +244,9 @@ pub fn swiglu_backward(
     // row-major, so each term is a `[1, inter] @ [inter, hidden]` GEMM — same
     // matmul-transpose-accumulation shape as `dm` above.
     let mut dx = vec![0.0f32; hidden];
-    crate::forward::cpu::matmul_into(&d_up, w_up, &mut dx, 1, inter, hidden);
+    lattice_compute::forward::cpu::matmul_into(&d_up, w_up, &mut dx, 1, inter, hidden);
     let mut dx_gate = vec![0.0f32; hidden];
-    crate::forward::cpu::matmul_into(&d_gate_pre, w_gate, &mut dx_gate, 1, inter, hidden);
+    lattice_compute::forward::cpu::matmul_into(&d_gate_pre, w_gate, &mut dx_gate, 1, inter, hidden);
     for (dxi, dgi) in dx.iter_mut().zip(dx_gate.iter()) {
         *dxi += *dgi;
     }
@@ -779,7 +779,7 @@ mod tests {
         // Cross-check bt_g indirectly through the caller-visible dx, and
         // directly recompute it via matmul_into to pin down the isolated hop.
         let mut bt_g_vec = vec![0.0f32; rank];
-        crate::forward::cpu::matmul_into(&g, &b, &mut bt_g_vec, 1, d_out, rank);
+        lattice_compute::forward::cpu::matmul_into(&g, &b, &mut bt_g_vec, 1, d_out, rank);
 
         let err_btg = rel_err(&bt_g_vec, &bt_g_scalar);
         let err_dx = rel_err(&dx_vec, &dx_scalar);

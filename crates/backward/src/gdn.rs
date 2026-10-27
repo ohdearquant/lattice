@@ -68,9 +68,9 @@
 //! The gradcheck uses f64 accumulation in the finite-difference oracle to
 //! eliminate catastrophic cancellation at eps = 1e-3.
 
-use crate::attention::gdn::{sigmoid, softplus};
-use crate::backward::ops::lora_vjp;
-use crate::model::qwen35_config::Qwen35Config;
+use crate::ops::lora_vjp;
+use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_compute::attention::gdn::{sigmoid, softplus};
 
 /// Gradients of the GDN layer w.r.t. LoRA params for all 5 projections.
 ///
@@ -334,7 +334,7 @@ type LoraBound<'a> = (
 
 pub fn gdn_forward_save(
     inputs: &[f32],
-    weights: &crate::attention::gdn::GatedDeltaNetWeights,
+    weights: &lattice_compute::attention::gdn::GatedDeltaNetWeights,
     _cfg: &Qwen35Config,
     saved: &mut GdnSaved,
     outputs: &mut [f32],
@@ -356,7 +356,7 @@ pub fn gdn_forward_save(
     lora_rank: usize,
     lora_scale: f32,
 ) {
-    use crate::forward::cpu::matmul_bt;
+    use lattice_compute::forward::cpu::matmul_bt;
 
     let seq_len = saved.seq_len;
     let hidden = saved.hidden_size;
@@ -763,7 +763,7 @@ pub fn gdn_forward_save(
 pub fn gdn_backward(
     grad_outputs: &[f32],
     saved: &GdnSaved,
-    weights: &crate::attention::gdn::GatedDeltaNetWeights,
+    weights: &lattice_compute::attention::gdn::GatedDeltaNetWeights,
 ) -> GdnGrads {
     let seq_len = saved.seq_len;
     let hidden = saved.hidden_size;
@@ -1417,8 +1417,8 @@ fn conv1d_silu_fwd(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attention::gdn::GatedDeltaNetWeights;
-    use crate::model::qwen35_config::Qwen35Config;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_compute::attention::gdn::GatedDeltaNetWeights;
 
     /// Simple xorshift RNG (deterministic, no deps).
     struct Rng(u64);
@@ -2321,12 +2321,13 @@ mod tests {
     // production inference actually use. This test builds a fixture where
     // num_key_heads (2) != num_value_heads (4) and asserts the two forwards
     // agree, LoRA off.
-    #[cfg(feature = "qwen35")]
     #[test]
     fn source_parity_forward_save_vs_fused_asymmetric_heads() {
-        use crate::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry};
-        use crate::attention::gdn_fused::{GatedDeltaNetFusedScratch, gated_delta_net_step_fused};
-        use crate::lora_hook::NoopLoraHook;
+        use lattice_compute::attention::gdn::GatedDeltaNetState;
+        use lattice_compute::attention::gdn_fused::GatedDeltaNetFusedScratch;
+        use lattice_compute::lora_hook::NoopLoraHook;
+        use lattice_model_qwen35::attention::gdn::qwen35_gdn_geometry;
+        use lattice_model_qwen35::attention::gdn_fused::gated_delta_net_step_fused;
 
         let hidden = 32;
         let num_kh = 2;

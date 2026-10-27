@@ -94,7 +94,7 @@ pub fn swiglu_forward(
     // plays A, `w_gate`/`w_up` play B). Previously this silently truncated a too-short `x`
     // via `.zip(x.iter())` (no panic, just a wrong, under-summed dot product) instead of
     // rejecting the shape like `matmul_bt`/the materialized GQA training forward do.
-    crate::forward::cpu::validate_gemm_bt(
+    lattice_compute::forward::cpu::validate_gemm_bt(
         x.len(),
         w_gate.len(),
         inter,
@@ -103,7 +103,7 @@ pub fn swiglu_forward(
         inter,
         "swiglu_forward:gate",
     );
-    crate::forward::cpu::validate_gemm_bt(
+    lattice_compute::forward::cpu::validate_gemm_bt(
         x.len(),
         w_up.len(),
         inter,
@@ -140,7 +140,7 @@ pub fn swiglu_forward(
     // down_proj: `out = A(1,inter) @ B(hidden,inter)^T` (`mixed` plays A, `w_down` plays B).
     // `mixed` is freshly computed above at exactly `inter` elements, but `w_down` is
     // caller-supplied and gets the same release-active shape check as gate/up above.
-    crate::forward::cpu::validate_gemm_bt(
+    lattice_compute::forward::cpu::validate_gemm_bt(
         mixed.len(),
         w_down.len(),
         hidden,
@@ -189,8 +189,8 @@ pub fn swiglu_forward_seq(
     }
     let mut gate_pre = vec![0.0f32; rows * inter];
     let mut up_pre = vec![0.0f32; rows * inter];
-    crate::forward::cpu::matmul_bt(x, w_gate, &mut gate_pre, rows, hidden, inter);
-    crate::forward::cpu::matmul_bt(x, w_up, &mut up_pre, rows, hidden, inter);
+    lattice_compute::forward::cpu::matmul_bt(x, w_gate, &mut gate_pre, rows, hidden, inter);
+    lattice_compute::forward::cpu::matmul_bt(x, w_up, &mut up_pre, rows, hidden, inter);
 
     // silu(gate) * up, same expression as `swiglu_forward`.
     let mixed: Vec<f32> = gate_pre
@@ -203,7 +203,7 @@ pub fn swiglu_forward_seq(
         .collect();
 
     let mut out = vec![0.0f32; rows * hidden];
-    crate::forward::cpu::matmul_bt(&mixed, w_down, &mut out, rows, inter, hidden);
+    lattice_compute::forward::cpu::matmul_bt(&mixed, w_down, &mut out, rows, inter, hidden);
     (out, gate_pre, up_pre)
 }
 
