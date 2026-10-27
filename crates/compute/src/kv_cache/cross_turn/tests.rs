@@ -1,3 +1,7 @@
+// These tests exercise the planning rules through the deprecated `plan_prefix_reuse`, the body that
+// `plan_prefix_reuse_for_slot` wraps.
+#![allow(deprecated)]
+
 use super::*;
 
 fn metadata() -> CrossTurnPrefixMetadata {
