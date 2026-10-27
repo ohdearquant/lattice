@@ -626,10 +626,10 @@ jobs:
             echo "GUARD FAILED: expected one complete 95-test router-state result."
             exit 1
           fi
-      - name: inference — image decoding compiled out (CPU, no default features)
+      - name: inference — image decoding compiled out (CPU, no default features but qwen35)
         run: |
           log="${RUNNER_TEMP:-/tmp}/inference-image-off-tests.log"
-          if cargo test --locked -p lattice-inference --no-default-features --lib \
+          if cargo test --locked -p lattice-inference --no-default-features --features qwen35 --lib \
             image_decoders_require_image_feature -- --color never >"$log" 2>&1
           then
             cat "$log"
@@ -1308,19 +1308,6 @@ jobs:
           fi
           cat "$log"
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
-      - name: inference — metal-gpu Q4 tests (macOS only)
-        if: runner.os == 'macOS'
-        env:
-          LATTICE_METAL_TEST_ENFORCE: '1'
-        run: |
-          set -euo pipefail
-          log="${RUNNER_TEMP:-/tmp}/metal-q4-tests.log"
-          if ! cargo test -p lattice-inference --features f16,metal-gpu --lib q4 -- --nocapture >"$log" 2>&1; then
-            cat "$log"
-            exit 1
-          fi
-          cat "$log"
-          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: qwen35 — metal-gpu Q4 tests (macOS only)
         if: runner.os == 'macOS'
         env:
