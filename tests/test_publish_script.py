@@ -94,7 +94,7 @@ class PublishScriptArgs(_PublishScriptFixture):
                 "cargo publish -p lattice-forecast",
                 "cargo publish -p lattice-model-embeddinggemma2",
                 "cargo publish -p lattice-model-bert",
-                "cargo publish -p lattice-model-qwen3",
+                "cargo publish -p lattice-model-qwen3-embedding",
                 "cargo publish -p lattice-model-gemma4",
                 "cargo publish -p lattice-model-ernie45",
                 "cargo publish -p lattice-model-qwen35",

@@ -12,7 +12,7 @@ use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
 use lattice_model_bert::BertModel;
 use lattice_model_embeddinggemma2::model::EmbeddingGemma2Model;
-use lattice_model_qwen3::QwenModel;
+use lattice_model_qwen3_embedding::QwenModel;
 use lattice_tokenizer::EmbeddingTokenCounts;
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};

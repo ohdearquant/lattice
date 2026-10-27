@@ -18,7 +18,7 @@ const EXEMPT: &[(&str, &str)] = &[(
 /// scanned and enforced. Catches the walk itself breaking (an exclusion rule drawn
 /// too wide, a rename) before that reads as "nothing left to fix".
 const EXPECTED_FILES: &[&str] = &[
-    "models/qwen3/src/metal.rs",
+    "models/qwen3-embedding/src/metal.rs",
     "models/qwen35/src/forward/metal_gemm.rs",
     "models/qwen35/src/forward/metal_qwen35/inner/prefill_chunk.rs",
 ];
