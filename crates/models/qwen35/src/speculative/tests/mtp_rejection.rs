@@ -318,10 +318,10 @@ impl MtpTargetVerifier for HiddenTargetVerifier {
             self.rows.clone(),
         ))
     }
-    fn snapshot_gdn_states(&self) -> lattice_compute::attention::gdn::GdnSnapshot {
+    fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
         Vec::new()
     }
-    fn restore_gdn_states(&mut self, _snapshot: &lattice_compute::attention::gdn::GdnSnapshot) {}
+    fn restore_gdn_states(&mut self, _snapshot: &crate::attention::gdn::GdnSnapshot) {}
 }
 
 const HS_TOKEN: u32 = 1;
@@ -1057,10 +1057,10 @@ fn mtp_rejection_sampling_partial_acceptance_rolls_back_gdn_to_accepted_prefix()
                 self.cache_pos += tokens.len();
                 Ok(vec![])
             }
-            fn snapshot_gdn_states(&self) -> lattice_compute::attention::gdn::GdnSnapshot {
+            fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
                 Vec::new()
             }
-            fn restore_gdn_states(&mut self, _: &lattice_compute::attention::gdn::GdnSnapshot) {
+            fn restore_gdn_states(&mut self, _: &crate::attention::gdn::GdnSnapshot) {
                 // SAFETY: single-threaded test, pointer is to a local bool.
                 unsafe {
                     *self.restore_called = true;

@@ -1,6 +1,6 @@
 use super::*;
 use crate::attention::gdn_fused::{GatedDeltaNetFusedScratch, gated_delta_net_step_fused};
-use crate::lora_hook::NoopLoraHook;
+use lattice_compute::lora_hook::NoopLoraHook;
 
 fn presets() -> [(&'static str, Qwen35Config); 4] {
     [

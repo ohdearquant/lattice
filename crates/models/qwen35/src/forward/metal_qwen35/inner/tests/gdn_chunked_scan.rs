@@ -364,8 +364,8 @@ struct GdnSnapshotDiff {
 /// everywhere, because `f32::max` would otherwise drop a NaN and let it pass.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn gdn_snapshot_diff(
-    snap: &lattice_compute::attention::gdn::GdnSnapshot,
-    reference: &lattice_compute::attention::gdn::GdnSnapshot,
+    snap: &crate::attention::gdn::GdnSnapshot,
+    reference: &crate::attention::gdn::GdnSnapshot,
 ) -> GdnSnapshotDiff {
     assert_eq!(snap.len(), reference.len(), "snapshot layer count mismatch");
     assert!(!snap.is_empty(), "snapshot holds no GDN layers");
@@ -420,7 +420,7 @@ fn gdn_prefill_snapshot(
     state: &mut MetalQwen35State,
     tokens: &[u32],
     chunked: bool,
-) -> lattice_compute::attention::gdn::GdnSnapshot {
+) -> crate::attention::gdn::GdnSnapshot {
     use crate::speculative::MtpTargetVerifier as _;
     state.use_gdn_chunked = chunked;
     state.reset_state();

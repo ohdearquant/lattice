@@ -299,7 +299,7 @@ impl MetalQwen35State {
             )));
         }
 
-        let shape = lattice_compute::lora_hook::qwen35_projection_shape(cfg, layer_idx, module)
+        let shape = crate::lora_hook::qwen35_projection_shape(cfg, layer_idx, module)
             .map_err(InferenceError::Inference)?;
         Ok((shape.d_in, shape.d_out))
     }

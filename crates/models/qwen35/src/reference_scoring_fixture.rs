@@ -5,7 +5,7 @@ use crate::model::qwen35::{
 use lattice_arch::qwen35_config::{LayerType, Qwen35Config};
 
 pub(crate) fn tiny_hybrid_fixture() -> (Qwen35Config, ModelWeights) {
-    use lattice_compute::attention::gdn::GatedDeltaNetWeights;
+    use crate::attention::gdn::GatedDeltaNetWeights;
     // Metal FlashAttention decode requires head_dim=256 (see
     // `validate_flash_decode_shape`). Hidden size = num_attention_heads * head_dim
     // so the Q/K/V projections fit the per-head layout used by the decode kernel.

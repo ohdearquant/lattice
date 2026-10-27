@@ -5,4 +5,7 @@ pub(crate) use lattice_arch::__internal::{
 pub(crate) use lattice_arch::__internal::{compute_step_logprobs, sample_full_logits};
 #[cfg(test)]
 pub(crate) use lattice_arch::__internal::{penalized_logit, xorshift64_next};
-pub(crate) use lattice_arch::sampling::{Candidate, CandidateSet, Sampler};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use lattice_arch::sampling::{Candidate, CandidateSet};
+#[cfg(test)]
+pub(crate) use lattice_arch::sampling::{Sampler, SamplingConfig};

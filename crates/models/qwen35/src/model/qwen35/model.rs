@@ -105,10 +105,8 @@ impl Qwen35Model {
         #[allow(deprecated)]
         hook.validate_against(&self.config)
             .map_err(InferenceError::InvalidInput)?;
-        hook.validate_geometry(&lattice_compute::lora_hook::Qwen35LoraGeometry::new(
-            &self.config,
-        ))
-        .map_err(InferenceError::InvalidInput)?;
+        hook.validate_geometry(&crate::lora_hook::Qwen35LoraGeometry::new(&self.config))
+            .map_err(InferenceError::InvalidInput)?;
         self.lora = hook;
         Ok(())
     }
@@ -255,7 +253,7 @@ impl Qwen35Model {
         &self,
         layer: usize,
     ) -> Option<(
-        &lattice_compute::attention::gdn::GatedDeltaNetWeights,
+        &crate::attention::gdn::GatedDeltaNetWeights,
         &[f32], // input_layernorm
         &[f32], // post_attention_layernorm
         &[f32], // gate_proj

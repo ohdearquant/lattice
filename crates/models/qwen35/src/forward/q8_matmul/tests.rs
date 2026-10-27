@@ -1,6 +1,6 @@
 use super::*;
-use crate::forward::cpu::matmul_bt;
-use crate::weights::q8_weights::quantize_matrix;
+use lattice_compute::forward::cpu::matmul_bt;
+use lattice_weights::q8_weights::quantize_matrix;
 use lattice_weights::q8_weights::test_support::{approx_eq, uniform_signed};
 
 #[test]

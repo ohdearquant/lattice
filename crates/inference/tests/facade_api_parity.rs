@@ -1397,8 +1397,10 @@ mod model_config_parity {
         );
     }
 
+    #[cfg(feature = "qwen35")]
     fn same_fn<F>(_: F, _: F) {}
 
+    #[cfg(feature = "qwen35")]
     #[test]
     fn model_config_functions_are_the_same_function_at_both_paths() {
         same_fn(
@@ -1709,6 +1711,7 @@ mod lora_hook_parity {
             facade::gdn_lora_module_is_servable,
             extracted::gdn_lora_module_is_servable,
         );
+        #[cfg(feature = "qwen35")]
         let _: fn(
             &lattice_inference::model::qwen35_config::Qwen35Config,
             usize,
@@ -2157,8 +2160,10 @@ mod gdn_parity {
     #[test]
     #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
     fn gdn_configuration_steps_keep_their_facade_signatures() {
+        #[cfg(feature = "qwen35")]
         use lattice_inference::model::qwen35_config::Qwen35Config;
 
+        #[cfg(feature = "qwen35")]
         let _: fn(
             &[f32],
             &mut facade::gdn::GatedDeltaNetState,
@@ -2167,6 +2172,7 @@ mod gdn_parity {
             &mut facade::gdn::GatedDeltaNetScratch,
             &mut [f32],
         ) = facade::gdn::gated_delta_net_step;
+        #[cfg(feature = "qwen35")]
         let _: fn(
             &[f32],
             &mut facade::gdn::GatedDeltaNetState,
@@ -2722,6 +2728,7 @@ fn qwen35_cpu_items_keep_family_identity() {
 
 #[cfg(feature = "qwen35")]
 #[test]
+#[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
 fn qwen35_supplied_rows_keep_the_family_contract() {
     use lattice_inference::vision::multimodal::Qwen35VisionRequest;
     use lattice_inference::vision::qwen35_vit::GridThw;
@@ -2754,6 +2761,7 @@ fn qwen35_supplied_rows_keep_the_family_contract() {
 
 #[cfg(feature = "qwen35")]
 #[test]
+#[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
 fn qwen35_model_backend_and_cpu_paths_keep_family_identity() {
     use lattice_inference::{forward, model};
     use lattice_model_qwen35 as family;

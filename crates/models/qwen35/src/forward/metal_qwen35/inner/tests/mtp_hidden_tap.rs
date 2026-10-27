@@ -1541,8 +1541,8 @@ fn forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explic
 
 type CrossTurnCacheSnapshot = (
     lattice_compute::kv_cache::CrossTurnPrefixEntry,
-    lattice_compute::attention::gdn::GdnSnapshot,
-    Vec<(usize, lattice_compute::attention::gdn::GdnSnapshot)>,
+    crate::attention::gdn::GdnSnapshot,
+    Vec<(usize, crate::attention::gdn::GdnSnapshot)>,
 );
 
 fn snapshot_cross_turn_cache(state: &MetalQwen35State) -> Option<CrossTurnCacheSnapshot> {

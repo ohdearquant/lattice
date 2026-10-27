@@ -369,7 +369,7 @@ fn max_abs_diff(left: &[f32], right: &[f32]) -> f32 {
 }
 
 /// Every recurrent matrix and convolution buffer of a snapshot, in layer order.
-fn gdn_values(snapshot: &lattice_compute::attention::gdn::GdnSnapshot) -> Vec<f32> {
+fn gdn_values(snapshot: &crate::attention::gdn::GdnSnapshot) -> Vec<f32> {
     snapshot
         .iter()
         .flat_map(|(matrices, conv)| matrices.iter().chain(conv))

@@ -1,8 +1,8 @@
 use super::*;
+use crate::attention::gdn::GatedDeltaNetWeights;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::model::qwen35::ModelWeights;
 use lattice_arch::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
-use lattice_compute::attention::gdn::GatedDeltaNetWeights;
-use lattice_compute::attention::gdn::require_qwen35_gdn_geometry;
 use lattice_compute::lora_hook::NoopLoraHook;
 use lattice_compute::rope::RopeTable;
 use lattice_tokenizer::bpe::BpeTokenizer;

@@ -20,7 +20,7 @@
 
 use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
-use lattice_compute::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry};
+use crate::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry};
 use lattice_compute::forward::cpu::matmul_bt;
 use lattice_compute::option_scoring::{OptionScores, check_letter_ids, option_scores_from_logits};
 use lattice_inference_core::InferenceError;

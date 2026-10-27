@@ -1971,7 +1971,7 @@ fn tiny_moe_prefill_fixture() -> (Qwen35Config, ModelWeights) {
 
 #[cfg(feature = "bench-internals")]
 fn tiny_chunked_prefill_fixture() -> (Qwen35Config, ModelWeights) {
-    use lattice_compute::attention::gdn::GatedDeltaNetWeights;
+    use crate::attention::gdn::GatedDeltaNetWeights;
 
     let hidden = 1024usize;
     let intermediate = 32usize;
@@ -2083,7 +2083,7 @@ fn tiny_chunked_prefill_fixture() -> (Qwen35Config, ModelWeights) {
 struct PrefillSchedulerArtifacts {
     position: usize,
     kv_rows: Vec<(Vec<u8>, Vec<u8>)>,
-    gdn_snapshot: lattice_compute::attention::gdn::GdnSnapshot,
+    gdn_snapshot: crate::attention::gdn::GdnSnapshot,
     next_token: usize,
 }
 

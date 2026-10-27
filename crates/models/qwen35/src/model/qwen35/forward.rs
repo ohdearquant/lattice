@@ -7,9 +7,9 @@ use super::weights::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
     FullAttentionLayerWeights,
 };
+use crate::attention::gdn::GatedDeltaNetState;
+use crate::attention::gdn_fused::gated_delta_net_step_fused;
 use lattice_compute::attention::gated::apply_sigmoid_gate;
-use lattice_compute::attention::gdn::GatedDeltaNetState;
-use lattice_compute::attention::gdn_fused::gated_delta_net_step_fused;
 use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 
 impl Qwen35Model {

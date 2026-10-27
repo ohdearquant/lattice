@@ -14,24 +14,24 @@
 //! - GDN recurrence and GQA attention: f32 (operate on projected vectors)
 //! - Logits projection (lm_head): Q8_0 NEON (vocab x hidden is the largest single matmul)
 
+use crate::attention::gdn::{
+    GatedDeltaNetState, GatedDeltaNetWeights, gated_rms_norm, l2_normalize_vec, sigmoid, softplus,
+};
+use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
 use crate::decoder::standalone_cpu::{StandaloneWeights, generate_with_trace};
+use crate::forward::neon::{matmul_q8_neon_into, pack_weights_q8};
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, FeedForwardWeights, ForwardScratch,
     FullAttentionLayerWeights, KvCache, ModelWeights, qwen35_rms_norm, resize,
 };
+use crate::weights::q8_weights::{validate_cfg_len, validate_gdn_shapes};
 use lattice_arch::qwen35_config::Qwen35Config;
-use lattice_compute::attention::gdn::{
-    GatedDeltaNetState, GatedDeltaNetWeights, gated_rms_norm, l2_normalize_vec, sigmoid, softplus,
-};
-use lattice_compute::attention::gdn_fused::GatedDeltaNetFusedScratch;
 use lattice_compute::forward::cpu::{elementwise_mul, silu_inplace};
-use lattice_compute::forward::neon::{matmul_q8_neon_into, pack_weights_q8};
 use lattice_compute::rope::RopeTable;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::bpe::BpeTokenizer;
 use lattice_weights::ingress::{IngestedTensor, validate_ingested_tensor};
-use lattice_weights::q8_weights::{validate_cfg_len, validate_gdn_shapes};
 
 /// Source label for NEON full-attention ingress validation errors.
 const Q8_NEON_ATTENTION_SOURCE: &str = "full-attention Q8 NEON quantization";
@@ -974,8 +974,8 @@ pub fn generate_q8_neon(
 #[cfg(feature = "bench-internals")]
 pub mod bench_support {
     use super::*;
+    use crate::attention::gdn::require_qwen35_gdn_geometry;
     use lattice_arch::qwen35_config::LayerType;
-    use lattice_compute::attention::gdn::require_qwen35_gdn_geometry;
     use lattice_compute::rope::RopeTable;
 
     pub struct Q8ForwardBenchFixture {

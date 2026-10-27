@@ -180,15 +180,6 @@ fn qwen35_projection_shape_rejects_unknown_and_out_of_range_targets() {
 }
 
 #[test]
-fn row_helper_is_the_same_function_item() {
-    fn same_function<F>(_: F, _: F) {}
-    same_function(
-        super::apply_lora_rows,
-        lattice_compute::lora_hook::apply_lora_rows,
-    );
-}
-
-#[test]
 fn qwen_geometry_matches_projection_helper_for_both_layer_kinds_and_errors() {
     let modules = [
         "q_proj",

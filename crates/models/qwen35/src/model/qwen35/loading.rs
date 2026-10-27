@@ -4,9 +4,9 @@ use super::weights::{
     FullAttentionLayerWeights, ModelWeights, MoeLayerWeights, MoeRouter, RoutedExperts,
     SharedExpert,
 };
+use crate::attention::gdn::GatedDeltaNetWeights;
 use lattice_arch::qwen35_config::{Qwen35Config, ValidatedQwen35Config};
 use lattice_arch::qwen35_tensors::{qwen_layer_tensor_prefix, qwen_required_tensor_names};
-use lattice_compute::attention::gdn::GatedDeltaNetWeights;
 use lattice_inference_core::InferenceError;
 use lattice_weights::TensorSource;
 

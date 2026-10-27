@@ -1,7 +1,7 @@
 use super::*;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::forward::cpu_q8::forward_step_q8;
-use lattice_compute::attention::gdn::require_qwen35_gdn_geometry;
-use lattice_weights::q8_weights::Q8Matrix;
+use crate::weights::q8_weights::Q8Matrix;
 
 const PROMPT: [u32; 3] = [1, 3, 2];
 const DECODE_STEPS: usize = 2;

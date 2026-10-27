@@ -555,10 +555,10 @@ fn load_tensor<T: TensorSource + ?Sized>(
         });
     }
     let declared_bytes = checked_tensor_bytes(&declared_shape, name)?;
-    if declared_bytes > crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES {
+    if declared_bytes > lattice_arch::qwen35_config::MAX_VISION_TENSOR_BYTES {
         return Err(InferenceError::Inference(format!(
             "vision tensor {name}: declared size ({declared_bytes} bytes) exceeds MAX_VISION_TENSOR_BYTES ({}) -- rejected before decoding",
-            crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES
+            lattice_arch::qwen35_config::MAX_VISION_TENSOR_BYTES
         )));
     }
     let expected_elements = expected

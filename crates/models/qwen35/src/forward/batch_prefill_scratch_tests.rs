@@ -1,6 +1,6 @@
 use super::tests::{assert_allclose, build_random_model, run_sequential_prefill, tiny_test_config};
 use super::*;
-use lattice_compute::attention::gdn::require_qwen35_gdn_geometry;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 
 fn expected_lengths(cfg: &Qwen35Config, seq_len: usize) -> ([usize; 5], [usize; 5], [usize; 3]) {
     let q = cfg.num_attention_heads * cfg.head_dim;

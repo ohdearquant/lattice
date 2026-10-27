@@ -190,7 +190,7 @@ fn load_tensor_preflights_missing_tensor_without_materialization() {
 
 #[test]
 fn load_tensor_rejects_oversized_declared_tensor_before_materialization() {
-    let oversized = crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES as usize / 4 + 1;
+    let oversized = lattice_arch::qwen35_config::MAX_VISION_TENSOR_BYTES as usize / 4 + 1;
     let mut source = CountingTensorSource {
         declared_shape: Some(vec![oversized]),
         materializations: 0,

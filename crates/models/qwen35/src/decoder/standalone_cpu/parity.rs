@@ -1,6 +1,6 @@
 use super::*;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::stop_reason::StopReason;
-use lattice_compute::attention::gdn::require_qwen35_gdn_geometry;
 
 /// The wrapper's own single-token forward step, standing in for the session's dispatch.
 pub(crate) type ReferenceForward<'a> = dyn Fn(

@@ -37,6 +37,7 @@ use super::{
     MetadataRequest, PredictionId, PredictionLedger, SelectOutcome, SelectionCandidate,
     SelectionRequest, StepStamp, TokenMetadata,
 };
+use crate::attention::gdn::{GatedDeltaNetState, require_qwen35_gdn_geometry};
 use crate::forward::cpu_f16::forward_step_f16;
 use crate::forward::cpu_q8::forward_step_q8_with_scratch;
 use crate::forward::neon_forward::{Q8NeonModel, forward_step_q8_neon};
@@ -45,13 +46,12 @@ use crate::model::qwen35::{
     ForwardScratch, GenerationEntryContract, GenerationPlan, GenerationPreparation, KvCache,
     decode_tokens, prepare_generation, sample_token,
 };
+use crate::weights::f16_weights::F16ModelWeights;
+use crate::weights::q8_weights::{Q8AttentionWeights, Q8MatmulScratch, Q8ModelWeights};
 use lattice_arch::qwen35_config::Qwen35Config;
-use lattice_compute::attention::gdn::{GatedDeltaNetState, require_qwen35_gdn_geometry};
 use lattice_compute::rope::RopeTable;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::bpe::BpeTokenizer;
-use lattice_weights::f16_weights::F16ModelWeights;
-use lattice_weights::q8_weights::{Q8AttentionWeights, Q8MatmulScratch, Q8ModelWeights};
 
 /// Weights of one standalone wrapper, borrowed for the life of a session.
 #[derive(Clone, Copy)]

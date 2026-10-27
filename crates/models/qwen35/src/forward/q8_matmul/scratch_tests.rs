@@ -452,7 +452,7 @@ pub fn old_matmul_bt_q8(a: &[f32], b_q: &Q8Matrix, c: &mut [f32], m: usize, k: u
             }
 
             // Accelerate BLAS GEMM: C_tile[m, tile_n] = A[m, k] @ B_tile[tile_n, k]^T
-            crate::forward::cpu::matmul_bt(
+            lattice_compute::forward::cpu::matmul_bt(
                 a,
                 &b_f32[..tile_n * k],
                 &mut c_tile[..m * tile_n],

@@ -52,15 +52,6 @@ pub mod vision;
 /// and [`forward`].
 pub mod weights;
 
-/// Negative-scale Q4 fixture shared by every Q4 consumer's sign test.
-///
-/// Every block has a negative scale, so a consumer that drops the sign, clamps the
-/// scale at zero or otherwise reads the scale's sign computes different weights. Each
-/// consumer test runs the fixture, the same blocks with `|scale|`, and the same blocks
-/// with a zero scale: the first must match the f64 reference, and the other two, which
-/// are exactly what a sign-dropping or zero-clamping consumer would compute on the
-/// fixture, must miss it by more than ten times the tolerance.
-
 // Standalone modules
 /// Continuous batching and scheduler support for multi-sequence inference. See [`kv_cache`]
 /// and [`model`].
@@ -185,11 +176,6 @@ pub mod speculative;
 /// Generation stop reason taxonomy; see [`StopReason`] and [`model`].
 pub mod stop_reason;
 
-/// Cross-path sweep (#613): every CPU-family `generate*` entry point agrees on
-/// the stop-token contract (excluded from `token_ids`/`text`). The Metal-family
-/// entry points are covered in `forward::metal_qwen35`'s own test module; see
-/// this module's doc comment for the full manifest and rationale.
-
 /// Test-support helper for the thirteen checkpoint-gated unit tests in
 /// `model::bert`, [`model::qwen`], and `model::qwen35::generation` (a
 /// private submodule, so not linked) (issue #1664): resolves and panics
@@ -203,11 +189,6 @@ mod test_support;
 /// [`model`]. Requires the `train-backward` feature.
 #[cfg(feature = "train-backward")]
 pub mod backward;
-
-/// By-value environment switches, from `lattice-model-io` (ADR-103 Amendment 20); the
-/// crate-local path stays for this crate's Metal Qwen3.5 callers and their tests.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-pub(crate) use lattice_model_io::env_switch_enabled;
 
 // Re-exports for public API backward compatibility
 /// Root error type for inference, tokenizer, model loading, and runtime failures. See [`error`].

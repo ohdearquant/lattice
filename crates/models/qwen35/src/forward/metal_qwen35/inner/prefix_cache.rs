@@ -38,7 +38,7 @@ pub struct CachedChatCompletionOutput {
 #[derive(Debug, Clone)]
 pub(super) struct MetalGdnCheckpoint {
     pub(super) len: usize,
-    pub(super) snapshot: lattice_compute::attention::gdn::GdnSnapshot,
+    pub(super) snapshot: crate::attention::gdn::GdnSnapshot,
 }
 
 /// Maximum sparse checkpoints retained per entry (#590). Each GDN
@@ -60,7 +60,7 @@ const CROSS_TURN_GDN_CHECKPOINT_CAP: usize = 3;
 #[derive(Debug, Clone)]
 pub(super) struct MetalCrossTurnPrefixEntry {
     pub(super) generic: lattice_compute::kv_cache::CrossTurnPrefixEntry,
-    pub(super) gdn_snapshot: lattice_compute::attention::gdn::GdnSnapshot,
+    pub(super) gdn_snapshot: crate::attention::gdn::GdnSnapshot,
     /// Sparse GDN checkpoints at earlier turn boundaries, ascending by
     /// `len`, at most [`CROSS_TURN_GDN_CHECKPOINT_CAP`] (#590). These
     /// enable `PrefixReuseMode::ReplayFromCheckpoint` when a new prompt
@@ -593,8 +593,7 @@ impl MetalQwen35State {
     /// widen behind if that ever changes.
     fn snapshot_gdn_states_checked(
         &self,
-    ) -> Result<lattice_compute::attention::gdn::GdnSnapshot, lattice_inference_core::InferenceError>
-    {
+    ) -> Result<crate::attention::gdn::GdnSnapshot, lattice_inference_core::InferenceError> {
         use crate::speculative::MtpTargetVerifier;
         Ok(self.snapshot_gdn_states())
     }
@@ -604,7 +603,7 @@ impl MetalQwen35State {
     /// infallible trait entry point's logged, no-write rejection.
     fn restore_gdn_states_checked(
         &mut self,
-        snapshot: &lattice_compute::attention::gdn::GdnSnapshot,
+        snapshot: &crate::attention::gdn::GdnSnapshot,
     ) -> Result<(), lattice_inference_core::InferenceError> {
         self.validate_gdn_restore_snapshot(snapshot)?;
         self.restore_gdn_states_validated(snapshot);

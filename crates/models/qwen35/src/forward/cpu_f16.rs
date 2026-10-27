@@ -7,6 +7,11 @@
 //! The purpose is to halve memory bandwidth for weight-bound inference while preserving numerical
 //! accuracy in the accumulation path (all dot products widen f16 elements on the fly).
 
+use crate::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry, sigmoid, softplus};
+use crate::attention::gdn_fused::{
+    GatedDeltaNetFusedScratch, conv1d_silu_fused, simd_decay_and_rank1_update, simd_gated_rms_norm,
+    simd_l2_normalize, simd_matvec_transpose,
+};
 use crate::decoder::standalone_cpu::{StandaloneWeights, generate_with_trace};
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::{
@@ -14,20 +19,15 @@ use crate::model::qwen35::{
 };
 use crate::stop_reason::StopReason;
 use crate::vision::multimodal::Qwen35VisionRequest;
-use lattice_arch::qwen35_config::Qwen35Config;
-use lattice_compute::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry, sigmoid, softplus};
-use lattice_compute::attention::gdn_fused::{
-    GatedDeltaNetFusedScratch, conv1d_silu_fused, simd_decay_and_rank1_update, simd_gated_rms_norm,
-    simd_l2_normalize, simd_matvec_transpose,
+use crate::weights::f16_weights::{
+    F16AttentionWeights, F16FeedForwardWeights, F16FullAttentionLayerWeights,
+    F16GatedDeltaNetWeights, F16ModelWeights, F16MoeLayerWeights, f16_to_f32_slice, matmul_bt_f16,
 };
+use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_compute::forward::cpu::{elementwise_mul, silu_inplace};
 use lattice_compute::rope::RopeTable;
 use lattice_tokenizer::bpe::BpeTokenizer;
 use lattice_tokenizer::common::Tokenizer;
-use lattice_weights::f16_weights::{
-    F16AttentionWeights, F16FeedForwardWeights, F16FullAttentionLayerWeights,
-    F16GatedDeltaNetWeights, F16ModelWeights, F16MoeLayerWeights, f16_to_f32_slice, matmul_bt_f16,
-};
 
 // ---------------------------------------------------------------------------
 // GatedDeltaNet step (f16 weights)

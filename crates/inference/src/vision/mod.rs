@@ -76,12 +76,14 @@
 //! // state.generate_multimodal(mm_input, gen_cfg);
 //! ```
 
+#[cfg(feature = "qwen35")]
 pub mod checkpoint;
 pub mod config;
 pub mod merger;
 pub mod multimodal;
 pub mod paddleocr_preprocess;
 pub mod paddleocr_vit;
+#[cfg(feature = "qwen35")]
 pub mod pooled_embed;
 pub mod preprocess;
 #[cfg(feature = "qwen35")]
@@ -89,11 +91,13 @@ pub mod qwen35_merger;
 #[cfg(feature = "qwen35")]
 pub mod qwen35_mrope;
 pub mod qwen35_vit;
+#[cfg(feature = "qwen35")]
 pub mod qwen35_vit_metal;
 pub mod vit;
 
 pub use config::VisionConfig;
 pub use multimodal::MultimodalInput;
+#[cfg(feature = "qwen35")]
 pub use pooled_embed::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 
 use merger::{MlpMerger, MlpMergerWeights};

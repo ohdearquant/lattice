@@ -349,6 +349,8 @@ mod inner {
     use super::q4_embed_lookup::Q4Embedding;
     #[cfg(feature = "gdn-state-counters")]
     use super::{GdnStateCopyKind, GdnStateTrafficCounters, GdnStateTrafficShape};
+    use crate::attention::gdn::GatedDeltaNetState;
+    use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
     use crate::generation::{GenerateConfig, GenerateOutput};
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{
@@ -362,8 +364,6 @@ mod inner {
     pub use engine::{InferenceSession, MetalQwen35Engine};
     use engine::{build_rope_interleaved, derive_has_moe_layer};
     use lattice_arch::qwen35_config::Qwen35Config;
-    use lattice_compute::attention::gdn::GatedDeltaNetState;
-    use lattice_compute::attention::gdn_fused::GatedDeltaNetFusedScratch;
     use lattice_tokenizer::__internal::{self as tok, incremental_detokenizer_finish};
     use lattice_tokenizer::bpe::BpeTokenizer;
     use lattice_weights::q4_weights::quantize_row_q4_0;

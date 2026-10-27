@@ -8,23 +8,23 @@
 //! numerical accuracy. The i8->f32 dequantization + Accelerate BLAS path in `matmul_bt_q8`
 //! provides near-AMX throughput on Apple Silicon with 4x memory savings.
 
+use crate::attention::gdn::{GatedDeltaNetState, sigmoid, softplus};
+use crate::attention::gdn_fused::{
+    GatedDeltaNetFusedScratch, conv1d_silu_fused, simd_decay_and_rank1_update, simd_gated_rms_norm,
+    simd_l2_normalize, simd_matvec_transpose,
+};
 use crate::decoder::standalone_cpu::{StandaloneWeights, generate_with_trace};
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{ForwardScratch, KvCache, qwen35_rms_norm, resize};
-use lattice_arch::qwen35_config::Qwen35Config;
-use lattice_compute::attention::gdn::{GatedDeltaNetState, sigmoid, softplus};
-use lattice_compute::attention::gdn_fused::{
-    GatedDeltaNetFusedScratch, conv1d_silu_fused, simd_decay_and_rank1_update, simd_gated_rms_norm,
-    simd_l2_normalize, simd_matvec_transpose,
-};
-use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
-use lattice_compute::rope::RopeTable;
-use lattice_tokenizer::bpe::BpeTokenizer;
-use lattice_weights::q8_weights::{
+use crate::weights::q8_weights::{
     Q8AttentionWeights, Q8CommonLayerWeights, Q8FullAttentionLayerWeights, Q8GatedDeltaNetWeights,
     Q8MatmulScratch, Q8ModelWeights, matmul_bt_q8_with_scratch,
 };
+use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
+use lattice_compute::rope::RopeTable;
+use lattice_tokenizer::bpe::BpeTokenizer;
 
 // ---------------------------------------------------------------------------
 // Public conversion entry point
@@ -44,7 +44,7 @@ pub fn quantize_from_model(
     model: &Qwen35Model,
 ) -> Result<Q8ModelWeights, lattice_inference_core::InferenceError> {
     let cfg = model.config.clone();
-    lattice_weights::q8_weights::quantize_model_weights(&model.weights, &cfg)
+    crate::weights::q8_weights::quantize_model_weights(&model.weights, &cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -795,9 +795,9 @@ mod scratch_bench;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::gdn::require_qwen35_gdn_geometry;
     use crate::decoder::standalone_cpu::parity;
-    use lattice_compute::attention::gdn::require_qwen35_gdn_geometry;
-    use lattice_weights::q8_weights::matmul_bt_q8;
+    use crate::weights::q8_weights::matmul_bt_q8;
 
     #[test]
     fn q8_request_scratch_survives_poisoned_prefill_and_decode() {
@@ -826,8 +826,8 @@ mod tests {
     /// mutation verification).
     #[test]
     fn test_full_attn_step_q8_rope_stride_half_parity() {
+        use crate::weights::q8_weights::quantize_matrix;
         use lattice_arch::qwen35_config::LayerType;
-        use lattice_weights::q8_weights::quantize_matrix;
 
         let head_dim: usize = 32;
         let num_q_heads: usize = 1;
@@ -886,7 +886,7 @@ mod tests {
             k_proj_f32[j * hidden + j] = 1.0;
         }
 
-        let zero_q8 = |rows: usize, cols: usize| -> lattice_weights::q8_weights::Q8Matrix {
+        let zero_q8 = |rows: usize, cols: usize| -> crate::weights::q8_weights::Q8Matrix {
             quantize_matrix(&vec![0.0f32; rows * cols], rows, cols).unwrap()
         };
         // W_q = identity for first q_dim rows (Q part), zeros for next q_dim rows (gate part).
@@ -1054,8 +1054,8 @@ mod tests {
         let num_heads = cfg.linear_num_key_heads;
         let kernel_size = cfg.linear_conv_kernel_dim;
 
-        let make_zero_q8 = |rows: usize, cols: usize| -> lattice_weights::q8_weights::Q8Matrix {
-            lattice_weights::q8_weights::Q8Matrix {
+        let make_zero_q8 = |rows: usize, cols: usize| -> crate::weights::q8_weights::Q8Matrix {
+            crate::weights::q8_weights::Q8Matrix {
                 data: vec![0i8; rows * cols],
                 scales: vec![1.0f32; rows],
                 rows,
@@ -1103,8 +1103,8 @@ mod tests {
     /// Builds the tiny single-head full-attention Q8 fixture used by the
     /// fail-closed test (mirrors `test_full_attn_step_q8_rope_stride_half_parity`).
     fn tiny_full_attn_fixture() -> (Qwen35Config, RopeTable, Q8FullAttentionLayerWeights, usize) {
+        use crate::weights::q8_weights::quantize_matrix;
         use lattice_arch::qwen35_config::LayerType;
-        use lattice_weights::q8_weights::quantize_matrix;
 
         let head_dim: usize = 32;
         let num_q_heads: usize = 1;
@@ -1158,7 +1158,7 @@ mod tests {
         for j in 0..kv_dim {
             k_proj_f32[j * hidden + j] = 1.0;
         }
-        let zero_q8 = |rows: usize, cols: usize| -> lattice_weights::q8_weights::Q8Matrix {
+        let zero_q8 = |rows: usize, cols: usize| -> crate::weights::q8_weights::Q8Matrix {
             quantize_matrix(&vec![0.0f32; rows * cols], rows, cols).unwrap()
         };
         let mut q_proj_f32 = vec![0.0f32; 2 * q_dim * hidden];
@@ -1266,8 +1266,8 @@ mod tests {
         let num_heads = cfg.linear_num_key_heads;
         let kernel_size = cfg.linear_conv_kernel_dim;
 
-        let make_zero_q8 = |rows: usize, cols: usize| -> lattice_weights::q8_weights::Q8Matrix {
-            lattice_weights::q8_weights::Q8Matrix {
+        let make_zero_q8 = |rows: usize, cols: usize| -> crate::weights::q8_weights::Q8Matrix {
+            crate::weights::q8_weights::Q8Matrix {
                 data: vec![0i8; rows * cols],
                 scales: vec![1.0f32; rows],
                 rows,
@@ -1414,8 +1414,8 @@ mod tests {
     // and copy the printed `token_ids`/`stop_reason`/`stopped`/`text` lines into
     // the four `#[test]` functions below.
     pub(super) fn make_nonzero_q8_generate_fixture() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
+        use crate::weights::q8_weights::quantize_matrix;
         use lattice_arch::qwen35_config::LayerType;
-        use lattice_weights::q8_weights::quantize_matrix;
 
         let hidden: usize = 64;
         let vocab: usize = 128;
@@ -1535,7 +1535,7 @@ mod tests {
         let full_k_norm = next_small_vec(&mut seed, head_dim, 8.0);
 
         let mut next_weight =
-            |n: usize, k: usize, scale: f32| -> lattice_weights::q8_weights::Q8Matrix {
+            |n: usize, k: usize, scale: f32| -> crate::weights::q8_weights::Q8Matrix {
                 let floats: Vec<f32> = (0..n * k)
                     .map(|_| lcg_step(&mut seed) * scale - scale / 2.0)
                     .collect();
@@ -1578,7 +1578,7 @@ mod tests {
         let make_common = |seed: &mut u64| -> Q8CommonLayerWeights {
             let input_layernorm = next_small_vec(seed, hidden, 1.0);
             let post_attention_layernorm = next_small_vec(seed, hidden, 1.0);
-            let mut nw = |n: usize, k: usize| -> lattice_weights::q8_weights::Q8Matrix {
+            let mut nw = |n: usize, k: usize| -> crate::weights::q8_weights::Q8Matrix {
                 let floats: Vec<f32> = (0..n * k).map(|_| lcg_step(seed) * 0.04 - 0.02).collect();
                 quantize_matrix(&floats, n, k).unwrap()
             };
@@ -2408,8 +2408,8 @@ mod tests {
     /// copy into `input_tmp`, the `q_and_gate` projection write, `split_q_and_gate`'s
     /// deinterleave into `gate_z`, and the FFN input copy into `input_tmp`.
     fn make_nonzero_q8_cpu_test_model() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
+        use crate::weights::q8_weights::quantize_matrix;
         use lattice_arch::qwen35_config::LayerType;
-        use lattice_weights::q8_weights::quantize_matrix;
 
         let hidden: usize = 64;
         let vocab: usize = 128;
@@ -2471,7 +2471,7 @@ mod tests {
 
         // Deterministic weight generator: LCG producing small non-zero floats.
         let mut seed: u64 = 0xdead_beef_cafe_babe;
-        let mut next_weight = |n: usize, k: usize| -> lattice_weights::q8_weights::Q8Matrix {
+        let mut next_weight = |n: usize, k: usize| -> crate::weights::q8_weights::Q8Matrix {
             let floats: Vec<f32> = (0..n * k)
                 .map(|_| {
                     seed = seed
@@ -2508,7 +2508,7 @@ mod tests {
         };
 
         let make_common = |seed: &mut u64| -> Q8CommonLayerWeights {
-            let mut nw = |n: usize, k: usize| -> lattice_weights::q8_weights::Q8Matrix {
+            let mut nw = |n: usize, k: usize| -> crate::weights::q8_weights::Q8Matrix {
                 let floats: Vec<f32> = (0..n * k)
                     .map(|_| {
                         *seed = seed

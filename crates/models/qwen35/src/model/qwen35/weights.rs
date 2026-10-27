@@ -1,5 +1,5 @@
 //! Qwen3.5 full-attention, common, dense, attention, model, and MoE weight structs plus `ModelWeights::logits_weight`.
-use lattice_compute::attention::gdn::GatedDeltaNetWeights;
+use crate::attention::gdn::GatedDeltaNetWeights;
 use lattice_inference_core::InferenceError;
 
 /// Weights for a full-attention (GQA) layer.

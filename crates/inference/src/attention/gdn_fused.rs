@@ -1,15 +1,8 @@
 //! Fused GatedDeltaNet decode step, re-exported from `lattice-compute`.
 //!
-//! Named exports keep every existing path; the implementation lives in
-//! `lattice_compute::attention::gdn_fused`. The fused step there takes a validated
-//! [`GdnGeometry`](crate::attention::gdn::GdnGeometry); this module keeps the
-//! configuration-taking step under its existing name.
-
-use crate::attention::gdn::{
-    GatedDeltaNetState, GatedDeltaNetWeights, require_qwen35_gdn_geometry,
-};
-use crate::lora_hook::LoraHook;
-use crate::model::qwen35_config::Qwen35Config;
+//! Named exports keep every existing path. The fused kernel lives in
+//! `lattice_compute::attention::gdn_fused`; the step that builds its geometry from a Qwen3.5
+//! configuration lives in `lattice_model_qwen35::attention::gdn_fused`.
 
 #[doc(inline)]
 pub use lattice_compute::attention::gdn_fused::{
@@ -17,42 +10,6 @@ pub use lattice_compute::attention::gdn_fused::{
     simd_l2_normalize, simd_matvec_transpose,
 };
 
-/// **Unstable**: fused + SIMD GatedDeltaNet step for a Qwen3.5 layer; primary hot path.
-///
-/// Builds the layer geometry from `cfg` and runs
-/// `lattice_compute::attention::gdn_fused::gated_delta_net_step_fused` with it.
-///
-/// `input`: hidden state `[hidden_size]`
-/// `state`: mutable recurrent state for this layer
-/// `weights`: layer weights
-/// `cfg`: model config
-/// `scratch`: reusable fused scratch buffers
-/// `output`: output buffer `[hidden_size]`, written in-place
-///
-/// # Panics
-///
-/// Panics if `cfg` does not describe a valid GatedDeltaNet geometry;
-/// [`qwen35_gdn_geometry`](crate::attention::gdn::qwen35_gdn_geometry) reports the same
-/// condition as an error.
-#[inline]
-pub fn gated_delta_net_step_fused(
-    input: &[f32],
-    state: &mut GatedDeltaNetState,
-    weights: &GatedDeltaNetWeights,
-    cfg: &Qwen35Config,
-    scratch: &mut GatedDeltaNetFusedScratch,
-    output: &mut [f32],
-    lora: &dyn LoraHook,
-    layer_idx: usize,
-) {
-    lattice_compute::attention::gdn_fused::gated_delta_net_step_fused(
-        input,
-        state,
-        weights,
-        &require_qwen35_gdn_geometry(cfg),
-        scratch,
-        output,
-        lora,
-        layer_idx,
-    );
-}
+#[cfg(feature = "qwen35")]
+#[doc(inline)]
+pub use lattice_model_qwen35::attention::gdn_fused::gated_delta_net_step_fused;

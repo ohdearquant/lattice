@@ -788,8 +788,8 @@ fn lora_max_abs_diff(left: &[f32], right: &[f32]) -> f32 {
 }
 
 fn lora_gdn_state_diff(
-    left: &lattice_compute::attention::gdn::GdnSnapshot,
-    right: &lattice_compute::attention::gdn::GdnSnapshot,
+    left: &crate::attention::gdn::GdnSnapshot,
+    right: &crate::attention::gdn::GdnSnapshot,
 ) -> f32 {
     assert_eq!(left.len(), right.len(), "GDN layer counts must match");
     left.iter()
@@ -804,7 +804,7 @@ struct LoraArm {
     logits: Vec<f32>,
     hidden: Vec<f32>,
     followup: Vec<f32>,
-    gdn: lattice_compute::attention::gdn::GdnSnapshot,
+    gdn: crate::attention::gdn::GdnSnapshot,
     proof: PathProofSnapshot,
 }
 

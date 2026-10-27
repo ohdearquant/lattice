@@ -11,15 +11,15 @@
 //! `apply_lora_rows` so active adapter deltas reach every token's projection
 //! output before downstream processing, while inactive projections skip the row loop.
 
+use crate::attention::gdn::{
+    GatedDeltaNetState, GatedDeltaNetWeights, gated_rms_norm, l2_normalize_vec, sigmoid, softplus,
+};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
     FullAttentionLayerWeights, KvCache, Qwen35Model, qwen35_rms_norm, resize,
 };
 use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_compute::attention::flash::{TiledAttentionBuffers, TiledAttentionConfig};
-use lattice_compute::attention::gdn::{
-    GatedDeltaNetState, GatedDeltaNetWeights, gated_rms_norm, l2_normalize_vec, sigmoid, softplus,
-};
 use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use lattice_compute::lora_hook::apply_lora_rows;
 use lattice_inference_core::InferenceError;
@@ -1134,9 +1134,9 @@ mod scratch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::gdn::require_qwen35_gdn_geometry;
     use crate::model::qwen35::{ForwardScratch, ModelWeights};
     use lattice_arch::qwen35_config::LayerType;
-    use lattice_compute::attention::gdn::require_qwen35_gdn_geometry;
     use lattice_compute::lora_hook::LoraHook;
     use lattice_compute::rope::RopeTable;
     use lattice_tokenizer::bpe::BpeTokenizer;

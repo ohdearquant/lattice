@@ -1612,7 +1612,7 @@ fn generate_multimodal_vision_matches_cpu_oracle_on_real_fixture() {
     let safetensors_path = model_dir.join("model.safetensors");
     let sf = lattice_weights::f32_weights::SafetensorsFile::open(&safetensors_path)
         .expect("opening the checkpoint's safetensors file");
-    let f16_weights = lattice_weights::f16_weights::load_f16_weights(&sf, &cfg)
+    let f16_weights = crate::weights::f16_weights::load_f16_weights(&sf, &cfg)
         .expect("real f16 decoder weights must load");
 
     let cpu_out =

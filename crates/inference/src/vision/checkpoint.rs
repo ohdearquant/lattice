@@ -1,7 +1,5 @@
 //! Qwen3.5 vision checkpoint items, owned by the Qwen3.5 family.
 
-#[cfg(feature = "serving-support")]
-pub(crate) use lattice_model_qwen35::vision::checkpoint::load_qwen35_vision_weights_with_cancel;
 #[doc(inline)]
 pub use lattice_model_qwen35::vision::checkpoint::{
     Qwen35VisionWeights, VisualBlockWeights, VisualMergerWeights, load_qwen35_vision_weights,

@@ -2,12 +2,12 @@
 
 #![forbid(unsafe_code)]
 
+use crate::attention::gdn::GatedDeltaNetWeights;
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, FeedForwardWeights, FullAttentionLayerWeights,
     ModelWeights,
 };
 use lattice_arch::qwen35_config::{LayerType, Qwen35Config};
-use lattice_compute::attention::gdn::GatedDeltaNetWeights;
 use lattice_inference_core::InferenceError;
 use lattice_weights::ingress::{IngestedTensor, validate_ingested_tensor};
 use lattice_weights::q8_weights::Q8Matrix;

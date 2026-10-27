@@ -1,6 +1,6 @@
 use super::*;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::decoder::standalone_cpu::parity;
-use lattice_compute::attention::gdn::require_qwen35_gdn_geometry;
 
 #[test]
 #[allow(clippy::type_complexity)]
@@ -63,8 +63,8 @@ fn test_f16_forward_compiles() {
 /// max_diff ~0.9 (observed during mutation verification).
 #[test]
 fn test_full_attn_step_f16_rope_stride_half_parity() {
+    use crate::weights::f16_weights::f32_to_f16_slice;
     use lattice_arch::qwen35_config::LayerType;
-    use lattice_weights::f16_weights::f32_to_f16_slice;
 
     let head_dim: usize = 32;
     let num_q_heads: usize = 1;
@@ -244,8 +244,8 @@ fn test_full_attn_step_f16_rope_stride_half_parity() {
 /// before the fix: the poisoned row's NaN leaked into every context lane.
 #[test]
 fn test_full_attn_step_f16_nan_cached_score_fails_closed() {
+    use crate::weights::f16_weights::f32_to_f16_slice;
     use lattice_arch::qwen35_config::LayerType;
-    use lattice_weights::f16_weights::f32_to_f16_slice;
 
     let head_dim: usize = 32;
     let num_q_heads: usize = 1;
@@ -430,7 +430,7 @@ fn test_gdn_f16_step_with_zeros() {
 /// sentinel may reach accumulation.
 #[test]
 fn test_moe_ffn_step_f16_nan_router_fails_closed_no_panic() {
-    use lattice_weights::f16_weights::{
+    use crate::weights::f16_weights::{
         F16, F16MoeLayerWeights, F16MoeRouter, F16RoutedExperts, F16SharedExpert,
     };
     let num_experts = 4usize;
@@ -504,7 +504,7 @@ fn test_moe_ffn_step_f16_nan_router_fails_closed_no_panic() {
 /// `test_moe_router_finite_max_nan_tail_fails_closed`.
 #[test]
 fn test_moe_ffn_step_f16_finite_max_nan_tail_fails_closed() {
-    use lattice_weights::f16_weights::{
+    use crate::weights::f16_weights::{
         F16, F16MoeLayerWeights, F16MoeRouter, F16RoutedExperts, F16SharedExpert,
     };
     let num_experts = 4usize;
@@ -674,8 +674,8 @@ fn zero_layer_f16_fixture() -> (Qwen35Config, F16ModelWeights, RopeTable, BpeTok
 // the four `#[test]` functions below. Re-run whenever the fixture, the
 // shared sampler, or `forward_step_f16` changes on purpose.
 fn make_nonzero_f16_cpu_test_model() -> (Qwen35Config, F16ModelWeights, RopeTable) {
+    use crate::weights::f16_weights::f32_to_f16_slice;
     use lattice_arch::qwen35_config::LayerType;
-    use lattice_weights::f16_weights::f32_to_f16_slice;
 
     let hidden: usize = 64;
     let vocab: usize = 128;
@@ -1399,7 +1399,7 @@ fn test_generate_f16_honors_stop_token_ids() {
 /// becomes ≥ 2 — failing the assertion below.
 #[test]
 fn test_generate_f16_honors_stop_token_ids_decode_loop() {
-    use lattice_weights::f16_weights::f32_to_f16_slice;
+    use crate::weights::f16_weights::f32_to_f16_slice;
     use std::collections::HashMap;
 
     let hidden = 4usize;
@@ -1809,10 +1809,10 @@ fn generate_f16_max_new_tokens_zero_returns_empty() {
 // checkpoint required).
 // -----------------------------------------------------------------
 
-use lattice_arch::qwen35_config::{LayerType, RopeParams};
-use lattice_weights::f16_weights::{
+use crate::weights::f16_weights::{
     F16CommonLayerWeights, F16FullAttentionLayerWeights, f32_to_f16_slice,
 };
+use lattice_arch::qwen35_config::{LayerType, RopeParams};
 
 /// A minimal one-layer, full-attention-only (no GDN) config + f16 weight
 /// set: small enough to hand-construct, but with non-trivial (identity)

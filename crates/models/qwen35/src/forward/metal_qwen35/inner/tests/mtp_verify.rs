@@ -85,10 +85,7 @@ const POST_FINAL_TOKENS: [u32; 5] = [3, 8, 14, 5, 21];
 
 /// A GDN snapshot comparison is vacuous when every state is zero (#1838): require
 /// recurrent state in every GDN layer, in both the S matrix and the conv buffer.
-fn assert_gdn_state_is_nonzero(
-    snapshot: &lattice_compute::attention::gdn::GdnSnapshot,
-    what: &str,
-) {
+fn assert_gdn_state_is_nonzero(snapshot: &crate::attention::gdn::GdnSnapshot, what: &str) {
     assert!(!snapshot.is_empty(), "{what}: no GDN layers");
     for (layer, (s, conv)) in snapshot.iter().enumerate() {
         assert!(
@@ -586,10 +583,10 @@ impl crate::speculative::MtpTargetVerifier for MetalTargetRecordingRows<'_> {
         self.rows = out.1.clone();
         Ok(out)
     }
-    fn snapshot_gdn_states(&self) -> lattice_compute::attention::gdn::GdnSnapshot {
+    fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
         self.inner.snapshot_gdn_states()
     }
-    fn restore_gdn_states(&mut self, snapshot: &lattice_compute::attention::gdn::GdnSnapshot) {
+    fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
         self.inner.restore_gdn_states(snapshot)
     }
 }
@@ -1056,10 +1053,10 @@ impl crate::speculative::MtpTargetVerifier for NoRowsTarget<'_> {
     ) -> Result<Vec<Vec<f32>>, lattice_inference_core::InferenceError> {
         crate::speculative::MtpTargetVerifier::verify_tokens(&mut *self.0, tokens, start_pos)
     }
-    fn snapshot_gdn_states(&self) -> lattice_compute::attention::gdn::GdnSnapshot {
+    fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
         crate::speculative::MtpTargetVerifier::snapshot_gdn_states(&*self.0)
     }
-    fn restore_gdn_states(&mut self, snapshot: &lattice_compute::attention::gdn::GdnSnapshot) {
+    fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
         crate::speculative::MtpTargetVerifier::restore_gdn_states(&mut *self.0, snapshot)
     }
 }

@@ -20,8 +20,8 @@ use super::weights::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
     FullAttentionLayerWeights, ModelWeights,
 };
+use crate::attention::gdn::GatedDeltaNetWeights;
 use lattice_arch::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
-use lattice_compute::attention::gdn::GatedDeltaNetWeights;
 use lattice_compute::lora_hook::NoopLoraHook;
 use lattice_compute::rope::RopeTable;
 use lattice_tokenizer::bpe::BpeTokenizer;

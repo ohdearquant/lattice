@@ -1,9 +1,9 @@
 use super::*;
 use crate::vision::checkpoint::{VisualBlockWeights, VisualMergerWeights};
-use lattice_arch::qwen35_config::{LayerType, RopeParams, VisionModelConfig};
-use lattice_weights::f16_weights::{
+use crate::weights::f16_weights::{
     F16AttentionWeights, F16CommonLayerWeights, F16FeedForwardWeights, F16FullAttentionLayerWeights,
 };
+use lattice_arch::qwen35_config::{LayerType, RopeParams, VisionModelConfig};
 
 /// Deterministic pseudo-random f32 fill (xorshift LCG), mirroring the
 /// pattern already used by `qwen35_vit.rs`'s own unit tests, so weights
@@ -143,7 +143,7 @@ fn tiny_vlm_fixture() -> (Qwen35Config, F16ModelWeights, Qwen35VisionWeights) {
 
     let to_f16 = |src: &[f32]| -> Vec<u16> {
         let mut dst = vec![0u16; src.len()];
-        lattice_weights::f16_weights::f32_to_f16_slice(src, &mut dst);
+        crate::weights::f16_weights::f32_to_f16_slice(src, &mut dst);
         dst
     };
 

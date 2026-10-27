@@ -1631,13 +1631,13 @@ pub trait MtpTargetVerifier {
     ///
     /// Implementors that have no GDN layers (e.g. pure-attention test mocks) return an empty
     /// `Vec`. Callers must treat the returned snapshot as opaque.
-    fn snapshot_gdn_states(&self) -> lattice_compute::attention::gdn::GdnSnapshot;
+    fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot;
 
     /// Restore every GDN layer's recurrent state from a prior `snapshot_gdn_states` call.
     ///
     /// The snapshot must have been taken from the same model instance. Implementors that
     /// hold no GDN state accept an empty snapshot and do nothing.
-    fn restore_gdn_states(&mut self, snapshot: &lattice_compute::attention::gdn::GdnSnapshot);
+    fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot);
 }
 
 /// Fixed default seed used by [`mtp_verify_draft`] when no seed is supplied.

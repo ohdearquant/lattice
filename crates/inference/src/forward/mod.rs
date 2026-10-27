@@ -27,6 +27,7 @@ pub mod metal_qwen35;
 mod metal_runtime;
 #[cfg(feature = "qwen35")]
 pub mod moe_expert_cache;
+#[cfg(feature = "qwen35")]
 pub mod neon;
 #[cfg(feature = "qwen35")]
 pub mod neon_forward;

@@ -469,7 +469,7 @@ fn generate_streaming_with_prefix_cache_rejects_empty_prompt() {
         .expect("precondition: the warm-up call must retain a cache entry");
     let warm_generic = warm_entry.generic.clone();
     let warm_gdn_snapshot = warm_entry.gdn_snapshot.clone();
-    let warm_checkpoints: Vec<(usize, lattice_compute::attention::gdn::GdnSnapshot)> = warm_entry
+    let warm_checkpoints: Vec<(usize, crate::attention::gdn::GdnSnapshot)> = warm_entry
         .checkpoints
         .iter()
         .map(|c| (c.len, c.snapshot.clone()))
@@ -506,7 +506,7 @@ fn generate_streaming_with_prefix_cache_rejects_empty_prompt() {
         "the retained entry's GDN recurrent-state snapshot must be \
                  unchanged by a rejected empty-prompt request"
     );
-    let after_checkpoints: Vec<(usize, lattice_compute::attention::gdn::GdnSnapshot)> = entry_after
+    let after_checkpoints: Vec<(usize, crate::attention::gdn::GdnSnapshot)> = entry_after
         .checkpoints
         .iter()
         .map(|c| (c.len, c.snapshot.clone()))

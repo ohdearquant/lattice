@@ -2,8 +2,8 @@
 
 #![forbid(unsafe_code)]
 
-use crate::error::InferenceError;
-use crate::weights::q8_weights::Q8Matrix;
+use lattice_inference_core::InferenceError;
+use lattice_weights::q8_weights::Q8Matrix;
 #[cfg(target_os = "macos")]
 use std::mem::size_of;
 
@@ -181,7 +181,7 @@ pub(crate) fn matmul_bt_q8_with_scratch(
             }
 
             // Accelerate BLAS GEMM: C_tile[m, tile_n] = A[m, k] @ B_tile[tile_n, k]^T
-            crate::forward::cpu::matmul_bt(
+            lattice_compute::forward::cpu::matmul_bt(
                 a,
                 &b_f32[..tile_n * k],
                 &mut c_tile[..m * tile_n],

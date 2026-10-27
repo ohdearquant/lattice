@@ -10,16 +10,17 @@ use super::model::Qwen35Model;
 #[cfg(test)]
 use super::sampling::sample_token;
 use super::stop_strings::earliest_stop_match;
+use crate::attention::gdn::GatedDeltaNetState;
 use crate::decoder::Cancellation;
 use crate::decoder::driver;
 use crate::decoder::qwen_cpu::QwenCpuSession;
-#[cfg(test)]
-use crate::generation::{DecodePolicy, StepOutcome};
-use crate::generation::{GenerateConfig, GenerateOutput, truncate_token_logprobs_to_retained_text};
+use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::stop_reason::StopReason;
 use lattice_arch::__internal::decode_cap;
+use lattice_arch::__internal::truncate_token_logprobs_to_retained_text;
+#[cfg(test)]
+use lattice_arch::__internal::{DecodePolicy, StepOutcome};
 use lattice_arch::qwen35_config::Qwen35Config;
-use lattice_compute::attention::gdn::GatedDeltaNetState;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::__internal::{
     IncrementalDetokenizer, decode_tokens, incremental_detokenizer_finish,

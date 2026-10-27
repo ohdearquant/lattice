@@ -1217,7 +1217,7 @@ impl MetalQwen35State {
         let num_linear = active_gdn_layer_indices(cfg).len();
         let num_full = cfg.num_active_full_attention_layers();
         let gdn_geometry =
-            lattice_compute::attention::gdn::qwen35_gdn_geometry(cfg).map_err(|e| e.to_string())?;
+            crate::attention::gdn::qwen35_gdn_geometry(cfg).map_err(|e| e.to_string())?;
         let gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
             .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();

@@ -28,11 +28,11 @@ use super::qwen35_vit::{GridThw, preprocess_qwen35_image, qwen35_vit_forward};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use super::qwen35_vit_metal::qwen35_vit_forward_metal;
 use crate::forward::cpu_f16::{PoolingStrategy, embed_image_f16};
+use crate::weights::f16_weights::F16ModelWeights;
 use lattice_arch::qwen35_config::{Qwen35Config, VisionModelConfig};
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::bpe::BpeTokenizer;
 use lattice_tokenizer::common::Tokenizer;
-use lattice_weights::f16_weights::F16ModelWeights;
 
 /// **Unstable**: the pooled-embedding prompt scaffold and pooling contract
 /// may evolve before 1.0.

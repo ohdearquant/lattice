@@ -1,7 +1,7 @@
 //! Numerical and input-validation tests for requested prefill readouts.
 
 use super::*;
-use lattice_compute::attention::gdn::require_qwen35_gdn_geometry;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 
 fn readout_value_bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()

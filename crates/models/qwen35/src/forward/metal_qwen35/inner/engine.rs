@@ -795,7 +795,7 @@ impl MetalQwen35Engine {
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
         let gdn_geometry =
-            lattice_compute::attention::gdn::qwen35_gdn_geometry(cfg).map_err(|e| e.to_string())?;
+            crate::attention::gdn::qwen35_gdn_geometry(cfg).map_err(|e| e.to_string())?;
         let gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
             .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();
@@ -951,7 +951,7 @@ impl MetalQwen35State {
     /// Reset all recurrent state for a new generation.
     pub fn reset_state(&mut self) {
         let cfg = &self.engine.config;
-        let gdn_geometry = lattice_compute::attention::gdn::require_qwen35_gdn_geometry(cfg);
+        let gdn_geometry = crate::attention::gdn::require_qwen35_gdn_geometry(cfg);
         self.session.gdn_states = (0..cfg.num_active_linear_attention_layers())
             .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();

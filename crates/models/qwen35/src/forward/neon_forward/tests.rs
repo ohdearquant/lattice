@@ -1,8 +1,8 @@
 use super::*;
+use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::decoder::standalone_cpu::parity;
 use crate::stop_reason::StopReason;
 use lattice_arch::qwen35_config::LayerType;
-use lattice_compute::attention::gdn::require_qwen35_gdn_geometry;
 
 /// Helper: create a zero Q8_0 packed weight buffer for [n, k].
 fn zero_packed(n: usize, k: usize) -> Vec<u8> {
@@ -1361,7 +1361,7 @@ fn nonzero_fixture_tokenizer_q8_neon() -> BpeTokenizer {
 /// the whole point is that the two argument sets are normally identical.
 #[test]
 fn q8_neon_matmul_matches_scalar_kernel_directly() {
-    use lattice_compute::forward::neon::{matvec_q8_scalar, quantize_vec_q8_into};
+    use crate::forward::neon::{matvec_q8_scalar, quantize_vec_q8_into};
 
     let hidden = 64usize;
     let out_dim = 64usize; // matches lin_output_dim x hidden in this fixture

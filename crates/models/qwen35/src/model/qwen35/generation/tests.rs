@@ -412,12 +412,12 @@ fn grammar_masking_blocks_argmax_token() {
 /// without a cross-module test-support coupling.
 #[test]
 fn grammar_wiring_mask_logits_called_in_generate() {
+    use crate::attention::gdn::GatedDeltaNetWeights;
     use crate::model::qwen35::{
         AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
         FullAttentionLayerWeights, ModelWeights,
     };
     use lattice_arch::qwen35_config::{LayerType, compute_layer_types};
-    use lattice_compute::attention::gdn::GatedDeltaNetWeights;
     use lattice_compute::lora_hook::NoopLoraHook;
     use lattice_compute::rope::RopeTable;
     use lattice_grammar::{GrammarEngine, GrammarSpec};

@@ -1,16 +1,16 @@
 use crate::forward::cpu_f16::generate_f16;
 use crate::forward::cpu_q8::generate_q8;
+use crate::forward::neon::pack_weights_q8;
 use crate::forward::neon_forward::{Q8NeonModel, generate_q8_neon};
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::{ModelWeights, Qwen35Model};
 use crate::stop_reason::StopReason;
+use crate::weights::f16_weights::F16ModelWeights;
+use crate::weights::q8_weights::Q8ModelWeights;
 use lattice_arch::qwen35_config::Qwen35Config;
-use lattice_compute::forward::neon::pack_weights_q8;
 use lattice_compute::lora_hook::NoopLoraHook;
 use lattice_compute::rope::RopeTable;
 use lattice_tokenizer::bpe::BpeTokenizer;
-use lattice_weights::f16_weights::F16ModelWeights;
-use lattice_weights::q8_weights::Q8ModelWeights;
 use std::collections::HashMap;
 
 const HIDDEN: usize = 4;

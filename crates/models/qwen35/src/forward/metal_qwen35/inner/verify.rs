@@ -1105,7 +1105,7 @@ impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
         Ok((out.logits, Some(rows)))
     }
 
-    fn snapshot_gdn_states(&self) -> lattice_compute::attention::gdn::GdnSnapshot {
+    fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
         let num_layers = self.session.gdn_gpu_state.len();
         let mut snap = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
@@ -1134,7 +1134,7 @@ impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
         snap
     }
 
-    fn restore_gdn_states(&mut self, snapshot: &lattice_compute::attention::gdn::GdnSnapshot) {
+    fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
         if let Err(error) = self.validate_gdn_restore_snapshot(snapshot) {
             tracing::warn!(
                 error = %error,
@@ -1149,7 +1149,7 @@ impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
 impl MetalQwen35State {
     pub(super) fn validate_gdn_restore_snapshot(
         &self,
-        snapshot: &lattice_compute::attention::gdn::GdnSnapshot,
+        snapshot: &crate::attention::gdn::GdnSnapshot,
     ) -> Result<(), lattice_inference_core::InferenceError> {
         use lattice_inference_core::InferenceError;
 
@@ -1180,7 +1180,7 @@ impl MetalQwen35State {
 
     pub(super) fn restore_gdn_states_validated(
         &mut self,
-        snapshot: &lattice_compute::attention::gdn::GdnSnapshot,
+        snapshot: &crate::attention::gdn::GdnSnapshot,
     ) {
         for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
             let layer = self.session.gdn_gpu_state.layer(i);

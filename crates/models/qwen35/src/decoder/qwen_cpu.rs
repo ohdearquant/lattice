@@ -60,11 +60,11 @@ use super::{
     MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectOutcome,
     SelectionCandidate, SelectionRequest, StepStamp, TokenMetadata,
 };
+use crate::attention::gdn::{GatedDeltaNetState, require_qwen35_gdn_geometry};
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{ForwardScratch, KvCache, force_serial_prefill, initial_rng_state};
 use crate::model::qwen35::{prefill_tokens, sample_token};
 use crate::sampling::compute_step_logprobs;
-use lattice_compute::attention::gdn::{GatedDeltaNetState, require_qwen35_gdn_geometry};
 use lattice_inference_core::InferenceError;
 
 /// When a grammar engine blocks every token via `mask_logits`, every logit becomes

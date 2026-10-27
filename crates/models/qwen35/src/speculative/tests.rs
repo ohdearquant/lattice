@@ -487,10 +487,10 @@ impl MtpTargetVerifier for MockTargetVerifier {
         self.cache_pos += tokens.len();
         Ok(self.logits_by_step.clone())
     }
-    fn snapshot_gdn_states(&self) -> lattice_compute::attention::gdn::GdnSnapshot {
+    fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
         Vec::new()
     }
-    fn restore_gdn_states(&mut self, _snapshot: &lattice_compute::attention::gdn::GdnSnapshot) {}
+    fn restore_gdn_states(&mut self, _snapshot: &crate::attention::gdn::GdnSnapshot) {}
 }
 
 const EOS: u32 = 99;
@@ -717,10 +717,10 @@ impl MtpTargetVerifier for ErroringTargetVerifier {
             "simulated verify_tokens failure".into(),
         ))
     }
-    fn snapshot_gdn_states(&self) -> lattice_compute::attention::gdn::GdnSnapshot {
+    fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
         Vec::new()
     }
-    fn restore_gdn_states(&mut self, _snapshot: &lattice_compute::attention::gdn::GdnSnapshot) {}
+    fn restore_gdn_states(&mut self, _snapshot: &crate::attention::gdn::GdnSnapshot) {}
 }
 
 #[test]

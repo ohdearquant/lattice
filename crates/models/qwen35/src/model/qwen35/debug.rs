@@ -3,10 +3,8 @@ use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
 use super::norm::qwen35_rms_norm;
 use super::weights::{AttentionWeights, FeedForwardWeights};
-use lattice_compute::attention::gdn::{
-    GatedDeltaNetState, qwen35_gdn_geometry, require_qwen35_gdn_geometry,
-};
-use lattice_compute::attention::gdn_fused::gated_delta_net_step_fused;
+use crate::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry, require_qwen35_gdn_geometry};
+use crate::attention::gdn_fused::gated_delta_net_step_fused;
 use lattice_compute::forward::cpu::matmul_bt;
 use lattice_inference_core::InferenceError;
 

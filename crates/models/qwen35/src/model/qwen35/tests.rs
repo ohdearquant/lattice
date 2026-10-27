@@ -423,10 +423,10 @@ fn test_qwen36_greedy_one_token_smoke() {
 // ---------------------------------------------------------------------------
 mod lora_serving {
     use super::super::*;
-    use lattice_arch::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
-    use lattice_compute::attention::gdn::{
+    use crate::attention::gdn::{
         GatedDeltaNetState, GatedDeltaNetWeights, require_qwen35_gdn_geometry,
     };
+    use lattice_arch::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
     use lattice_compute::lora_hook::{LoraHook, NoopLoraHook};
     use lattice_compute::rope::RopeTable;
     use lattice_tokenizer::bpe::BpeTokenizer;

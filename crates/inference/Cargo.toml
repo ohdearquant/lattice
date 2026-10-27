@@ -245,7 +245,7 @@ required-features = ["train-backward", "f16", "qwen35"]
 
 [[example]]
 name = "diff_gdn_layer"
-required-features = ["train-backward", "f16"]
+required-features = ["train-backward", "f16", "qwen35"]
 
 [[example]]
 name = "bench_metal"
@@ -261,7 +261,7 @@ required-features = ["f16", "wgpu-gpu", "qwen3"]
 
 [[example]]
 name = "bench_suite"
-required-features = ["f16", "qwen3"]
+required-features = ["f16", "qwen3", "qwen35"]
 
 [[example]]
 name = "bench_embedding"
@@ -290,6 +290,10 @@ required-features = ["f16", "metal-gpu", "qwen35"]
 [[example]]
 name = "bench_q8_prefill"
 required-features = ["f16", "metal-gpu", "qwen35"]
+
+[[example]]
+name = "bench_gdn"
+required-features = ["qwen35"]
 
 [[example]]
 name = "bench_gdn_decode"

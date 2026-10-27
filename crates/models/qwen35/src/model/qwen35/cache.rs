@@ -1,6 +1,6 @@
 //! Qwen3.5 KV cache, forward scratch, and scratch resize helper.
+use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
 use lattice_arch::qwen35_config::Qwen35Config;
-use lattice_compute::attention::gdn_fused::GatedDeltaNetFusedScratch;
 
 /// Simple KV cache for autoregressive decoding (full-attention layers only).
 pub(crate) struct KvCache {
