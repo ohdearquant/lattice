@@ -29,7 +29,7 @@ def _write_exec(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-class PublishScriptArgs(unittest.TestCase):
+class _PublishScriptFixture(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
@@ -64,6 +64,8 @@ class PublishScriptArgs(unittest.TestCase):
     def _publishes(self, calls: list[str]) -> list[str]:
         return [c for c in calls if c.startswith("cargo publish ")]
 
+
+class PublishScriptArgs(_PublishScriptFixture):
     def test_no_argument_publishes_every_tier(self) -> None:
         proc, calls = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -135,6 +137,95 @@ class PublishScriptArgs(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stdout)
         self.assertIn("usage:", proc.stderr)
         self.assertEqual(calls, [])
+
+
+_FAILING_CARGO = """#!/bin/sh
+printf '%s\\n' "$(basename "$0") $*" >> "$CALL_LOG"
+[ "$*" = "publish -p $STUB_CRATE" ] || exit 0
+case "$STUB_MODE" in
+    429-once)
+        [ -e "$STUB_STATE" ] && exit 0
+        : > "$STUB_STATE"
+        echo "error: failed to publish to registry at https://crates.io"
+        echo "Caused by:"
+        echo "  the remote server responded with an error (status 429 Too Many Requests): You have published too many new crates in a short period of time."
+        exit 101
+        ;;
+    429-always)
+        echo "  the remote server responded with an error (status 429 Too Many Requests): You have published too many new crates in a short period of time."
+        exit 101
+        ;;
+    exists)
+        echo "error: crate $STUB_CRATE@0.15.0 already exists on crates.io index"
+        exit 101
+        ;;
+    exists-other)
+        echo "error: crate lattice-other@0.15.0 already exists on crates.io index"
+        exit 101
+        ;;
+    *)
+        echo "error: failed to verify package tarball"
+        exit 101
+        ;;
+esac
+"""
+
+
+class PublishScriptRetries(_PublishScriptFixture):
+    """A failing `cargo publish` for one crate: rate limits wait and retry, an
+    already-published version is skipped, anything else stops the script."""
+
+    def _fail(self, crate: str, mode: str, **extra: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        bin_dir = Path(self.env["PATH"].split(os.pathsep)[0])
+        _write_exec(bin_dir / "cargo", _FAILING_CARGO)
+        self.env.update(STUB_CRATE=crate, STUB_MODE=mode, STUB_STATE=str(self.call_log) + ".state", **extra)
+        return self._run()
+
+    def _sleeps(self, calls: list[str]) -> list[str]:
+        return [c for c in calls if c.startswith("sleep ") and c != "sleep 30"]
+
+    def test_rate_limited_crate_waits_and_retries(self) -> None:
+        proc, calls = self._fail("lattice-quant", "429-once")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        publishes = self._publishes(calls)
+        self.assertEqual(len(publishes), 22, calls)
+        self.assertEqual(publishes.count("cargo publish -p lattice-quant"), 2, publishes)
+        self.assertEqual(self._sleeps(calls), ["sleep 610"], calls)
+        i = calls.index("sleep 610")
+        self.assertEqual(calls[i - 1], "cargo publish -p lattice-quant")
+        self.assertEqual(calls[i + 1], "cargo publish -p lattice-quant")
+        self.assertEqual(publishes[-1], "cargo publish -p lattice-serve")
+        self.assertIn("rate limited by the registry (attempt 1 of 12)", proc.stdout)
+
+    def test_already_published_crate_is_skipped(self) -> None:
+        proc, calls = self._fail("lattice-fann", "exists")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        publishes = self._publishes(calls)
+        self.assertEqual(len(publishes), 21, calls)
+        self.assertEqual(self._sleeps(calls), [], calls)
+        self.assertIn("lattice-fann: this version is already on the registry; skipping", proc.stdout)
+
+    def test_other_failure_stops_the_script(self) -> None:
+        proc, calls = self._fail("lattice-arch", "other")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        publishes = self._publishes(calls)
+        self.assertEqual(publishes[-1], "cargo publish -p lattice-arch", publishes)
+        self.assertEqual(publishes.count("cargo publish -p lattice-arch"), 1)
+        self.assertEqual(self._sleeps(calls), [], calls)
+        self.assertIn("lattice-arch: cargo publish failed", proc.stderr)
+
+    def test_rate_limit_retries_are_bounded(self) -> None:
+        proc, calls = self._fail("lattice-quant", "429-always", PUBLISH_RETRY_MAX="3")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        publishes = self._publishes(calls)
+        self.assertEqual(publishes.count("cargo publish -p lattice-quant"), 3, publishes)
+        self.assertEqual(publishes[-1], "cargo publish -p lattice-quant", publishes)
+        self.assertEqual(self._sleeps(calls), ["sleep 610", "sleep 610"], calls)
+
+    def test_already_exists_for_another_crate_is_not_a_skip(self) -> None:
+        proc, calls = self._fail("lattice-fann", "exists-other")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual(self._publishes(calls), ["cargo publish -p lattice-fann"], calls)
 
 
 if __name__ == "__main__":
