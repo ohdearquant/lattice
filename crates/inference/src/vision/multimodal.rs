@@ -2,16 +2,22 @@
 
 /// A multimodal prompt: merged visual patch embeddings prepended to text tokens.
 ///
-/// Constructed by callers who have a `VisionOutput` and a tokenized text prompt:
+/// Constructed by callers who have merged visual patch embeddings and a tokenized text prompt:
 /// ```no_run
-/// use lattice_inference::vision::{VisionOutput, MultimodalInput};
+/// use lattice_inference::vision::MultimodalInput;
 ///
-/// fn build_multimodal(vision_out: VisionOutput, text_ids: Vec<u32>) -> MultimodalInput {
+/// fn build_multimodal(
+///     patch_embeddings: Vec<f32>,
+///     raw_patches: usize,
+///     visual_tokens: usize,
+///     d_model: usize,
+///     text_ids: Vec<u32>,
+/// ) -> MultimodalInput {
 ///     MultimodalInput {
-///         patch_embeddings: vision_out.patch_embeddings,
-///         raw_patches: vision_out.raw_patches,
-///         visual_tokens: vision_out.visual_tokens,
-///         d_model: vision_out.d_model,
+///         patch_embeddings,
+///         raw_patches,
+///         visual_tokens,
+///         d_model,
 ///         text_tokens: text_ids,
 ///     }
 /// }

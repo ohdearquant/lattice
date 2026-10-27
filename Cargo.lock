@@ -1689,7 +1689,6 @@ dependencies = [
  "bytemuck",
  "criterion",
  "half",
- "image",
  "indexmap",
  "lattice-arch",
  "lattice-compute",
