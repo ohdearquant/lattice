@@ -30,7 +30,7 @@ impl WordEncoder {
             identity: EncoderIdentity::new(Pooling::Mean, Normalization::None, dimension)
                 .with_checkpoint(Provenance::Pinned("weights-rev-1".into()))
                 .with_tokenizer(Provenance::Pinned("tokenizer-rev-1".into()))
-                .with_prompt_convention("raw")
+                .with_prompt_convention(EncoderIdentity::RAW_PROMPT_CONVENTION)
                 .with_variant("test words"),
         }
     }

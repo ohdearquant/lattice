@@ -345,6 +345,11 @@ role = "measurement"
 supervision = "gpu-handoff-child"
 
 [[entry]]
+path = "scripts/crate-readme.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
 path = "scripts/e2e-parity-local.sh"
 role = "measurement"
 supervision = "both-locks"
