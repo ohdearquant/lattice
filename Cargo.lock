@@ -1778,14 +1778,19 @@ name = "lattice-model-ernie45"
 version = "0.15.0"
 dependencies = [
  "bytemuck",
+ "image",
+ "lattice-arch",
  "lattice-compute",
  "lattice-inference-core",
  "lattice-metal-runtime",
+ "lattice-tokenizer",
  "lattice-weights",
  "metal 0.33.0",
  "objc",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

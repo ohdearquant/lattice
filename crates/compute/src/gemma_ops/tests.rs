@@ -418,6 +418,16 @@ fn scaled_embedding_matches_hf_golden() {
 }
 
 #[test]
+#[should_panic(expected = "embedding id 2 at row 1 must be less than 2 embedding rows")]
+fn scaled_embedding_rejects_id_equal_to_embedding_rows() {
+    let ids = [0, 2];
+    let embed_weight = [0.0f32; 4];
+    let mut out = [0.0f32; 4];
+
+    gemma4_scaled_embedding(&ids, &embed_weight, 2, &mut out);
+}
+
+#[test]
 fn logit_softcap_matches_hf_golden() {
     let fx = load_json("logit_softcap.json");
     let tol = tolerance("logit_softcap");
@@ -436,16 +446,26 @@ fn logit_softcap_matches_hf_golden() {
 
 #[test]
 fn mutation_disabled_softcap_fails_golden() {
-    // Fail-closed negative test: leaving logits uncapped (identity) must
-    // diverge from the capped golden beyond tolerance. The fixture's
-    // logits deliberately span well past +/-cap so saturation is
-    // material, not a rounding-noise-sized difference.
+    // An identity replacement must collapse the separation between both
+    // production calls; fixture-only divergence cannot detect that mutation.
     let fx = load_json("logit_softcap.json");
     let floor = mutation_separation_floor("logit_softcap");
-    let logits = load_bin(&fx, "input");
+    let cap = fx["cap"].as_f64().unwrap() as f32;
+    let mut capped_logits = load_bin(&fx, "input");
+    let mut uncapped_logits = capped_logits.clone();
     let expected = load_bin(&fx, "output");
 
-    let diff = max_abs_diff(&logits, &expected);
+    gemma4_logit_softcap(&mut capped_logits, cap);
+    gemma4_logit_softcap(&mut uncapped_logits, 1_000_000.0);
+
+    let separation = max_abs_diff(&capped_logits, &uncapped_logits);
+    assert!(
+        separation >= floor,
+        "enabled and effectively disabled softcaps must separate by at least \
+             the mutation floor (separation {separation}, floor {floor})"
+    );
+
+    let diff = max_abs_diff(&uncapped_logits, &expected);
     assert!(
         diff >= floor,
         "uncapped logits must diverge from the softcapped golden by at least the \

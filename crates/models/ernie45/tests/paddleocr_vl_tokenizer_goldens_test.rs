@@ -20,15 +20,16 @@
 //! (image/audio/LOC structure) are dropped, matching
 //! `skip_special_tokens=True`.
 
-use lattice_inference::error::InferenceError;
-use lattice_inference::tokenizer::common::Tokenizer;
-use lattice_inference::tokenizer::gemma_bpe::GemmaBpeTokenizer;
+use lattice_inference_core::InferenceError;
+use lattice_tokenizer::common::Tokenizer;
+use lattice_tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
 fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/paddleocr_vl/tokenizer")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../inference/tests/fixtures/paddleocr_vl/tokenizer")
 }
 
 fn read_fixture(name: &str) -> String {
@@ -295,7 +296,7 @@ fn gemma_constructor_rejects_ernie_tokenizer_json() {
 fn ernie_constructor_rejects_gemma_tokenizer_json() {
     let gemma_json = {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/gemma4/tokenizer/tokenizer.json");
+            .join("../../inference/tests/fixtures/gemma4/tokenizer/tokenizer.json");
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read gemma fixture {}: {e}", path.display()))
     };

@@ -19,7 +19,7 @@
 //!
 //! Run:
 //! ```bash
-//! cargo test --release -p lattice-inference --features f16 \
+//! cargo test --release -p lattice-model-ernie45 --features f16,image,paddleocr-vl \
 //!     --test paddleocr_vl_vision_goldens_test -- --nocapture
 //! ```
 
@@ -41,11 +41,11 @@ fn vision_forward_matches_hf_reference() {
 
 #[cfg(feature = "f16")]
 mod gate {
-    use lattice_inference::vision::paddleocr_vit::{
+    use lattice_model_ernie45::vision::paddleocr_vit::{
         PaddleOcrVisionConfig, PaddleOcrVisionWeights, paddleocr_vision_forward,
         paddleocr_vision_forward_trace,
     };
-    use lattice_inference::weights::SafetensorsFile;
+    use lattice_weights::SafetensorsFile;
     use serde::Deserialize;
     use std::path::PathBuf;
 
@@ -198,7 +198,7 @@ mod gate {
         };
 
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/paddleocr_vl/vision/vision_goldens.json");
+            .join("../../inference/tests/fixtures/paddleocr_vl/vision/vision_goldens.json");
         let golden: Golden =
             serde_json::from_str(&std::fs::read_to_string(&fixture).expect("read fixture"))
                 .expect("valid vision_goldens.json");

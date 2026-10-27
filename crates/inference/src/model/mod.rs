@@ -2,7 +2,6 @@
 #[cfg(feature = "bert")]
 pub mod bert;
 pub mod bitnet_config;
-pub(crate) use lattice_weights::bounded_config as config_file;
 #[cfg(feature = "bert")]
 pub mod cross_encoder;
 #[cfg(feature = "embeddinggemma2")]

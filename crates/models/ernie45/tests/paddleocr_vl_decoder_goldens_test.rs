@@ -5,7 +5,7 @@
 //! pinned checkpoint's own modeling source (revision noted in the fixture)
 //! running under HF transformers on CPU in f32 (eager attention, no cache).
 //! This test replays the same token sequences through
-//! `lattice_inference::model::ernie45` and holds every checkpoint against the
+//! `lattice_model_ernie45::model::ernie45` and holds every checkpoint against the
 //! goldens.
 //!
 //! **Fail-closed contract** (mirrors `vision_s3_vit_forward_test.rs`): the
@@ -16,11 +16,11 @@
 //!
 //! Run:
 //! ```bash
-//! cargo test --release -p lattice-inference --features f16 \
+//! cargo test --release -p lattice-model-ernie45 --features f16,image,paddleocr-vl \
 //!     --test paddleocr_vl_decoder_goldens_test -- --nocapture
 //! ```
 
-#![cfg(feature = "ernie45")]
+#![cfg(feature = "paddleocr-vl")]
 
 #[test]
 fn decoder_forward_matches_hf_reference() {
@@ -48,8 +48,8 @@ fn decoder_forward_matches_hf_reference() {
 /// `cargo clippy --all-targets -D warnings` without `f16` is a CI gate.
 #[cfg(feature = "f16")]
 mod gate {
-    use lattice_inference::model::ernie45::{Ernie45Config, Ernie45Model, Ernie45Weights};
-    use lattice_inference::weights::SafetensorsFile;
+    use lattice_model_ernie45::model::ernie45::{Ernie45Config, Ernie45Model, Ernie45Weights};
+    use lattice_weights::SafetensorsFile;
     use serde::Deserialize;
     use std::path::PathBuf;
 
@@ -149,7 +149,7 @@ mod gate {
         };
 
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/paddleocr_vl/decoder/decoder_goldens.json");
+            .join("../../inference/tests/fixtures/paddleocr_vl/decoder/decoder_goldens.json");
         let golden: Golden =
             serde_json::from_str(&std::fs::read_to_string(&fixture).expect("read fixture"))
                 .expect("valid decoder_goldens.json");
