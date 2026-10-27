@@ -17,9 +17,9 @@ use serde_json::Value;
 
 use super::fft::{Fft, FftScratch, KernelSpectrum};
 use super::prep;
-use crate::error::InferenceError;
-use crate::forward::cpu::{layer_norm, matmul_bt, matmul_into};
-use crate::weights::SafetensorsFile;
+use lattice_compute::forward::cpu::{layer_norm, matmul_bt, matmul_into};
+use lattice_inference_core::InferenceError;
+use lattice_weights::SafetensorsFile;
 
 const NUM_HEADS: usize = 4;
 const SHORT_CONV: usize = 4;

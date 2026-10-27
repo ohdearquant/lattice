@@ -6,7 +6,7 @@
 
 use std::f64::consts::PI;
 
-use crate::error::InferenceError;
+use lattice_inference_core::InferenceError;
 
 /// Tables for an in-place iterative radix-2 FFT of one power-of-two length.
 #[derive(Debug, Clone)]
