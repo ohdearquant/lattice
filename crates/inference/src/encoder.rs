@@ -7,10 +7,11 @@
 //! the tokenizer: these models record no revision or digest of their files.
 //!
 //! **Compatibility path.** The items here are re-exported from `lattice-arch`,
-//! `lattice-model-bert`, `lattice-model-embeddinggemma2` and `lattice-model-qwen3` so that code
-//! written against the pre-split `lattice-inference` keeps compiling. These low-level re-exports
-//! are not a stable API and will be removed at 1.0; import from `lattice-arch`,
-//! `lattice-model-bert`, `lattice-model-embeddinggemma2` and `lattice-model-qwen3` directly.
+//! `lattice-model-bert`, `lattice-model-embeddinggemma2` and
+//! `lattice-model-qwen3-embedding` so that code written against the pre-split
+//! `lattice-inference` keeps compiling. These low-level re-exports are not a stable API and
+//! will be removed at 1.0; import from `lattice-arch`, `lattice-model-bert`,
+//! `lattice-model-embeddinggemma2` and `lattice-model-qwen3-embedding` directly.
 
 pub use lattice_arch::encoder::{
     EncodedText, Encoder, EncoderCapabilities, EncoderIdentity, Normalization, Pooling, Provenance,
