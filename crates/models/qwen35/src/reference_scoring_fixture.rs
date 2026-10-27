@@ -4,6 +4,9 @@ use crate::model::qwen35::{
 };
 use lattice_arch::qwen35_config::{LayerType, Qwen35Config};
 
+/// Minimal 4-layer hybrid fixture: [GDN, GDN, GDN, GQA] mirroring the
+/// Qwen3.5 pattern at small dimension. Sufficient to exercise the
+/// self-speculative draft path (GDN-only forward) and verify path (full).
 pub(crate) fn tiny_hybrid_fixture() -> (Qwen35Config, ModelWeights) {
     use crate::attention::gdn::GatedDeltaNetWeights;
     // Metal FlashAttention decode requires head_dim=256 (see
@@ -132,6 +135,12 @@ pub(crate) fn tiny_hybrid_fixture() -> (Qwen35Config, ModelWeights) {
     (cfg, weights)
 }
 
+/// `tiny_hybrid_fixture` with token embeddings that spread the letter logits: every row
+/// has two non-zero entries, so the logit at a letter depends on the last prompt token and
+/// differs from letter to letter. The full-attention layer also carries one token-mixing
+/// path: q_proj and k_proj stay zero, so attention is uniform over the positions seen so
+/// far, value channel 0 reads hidden[0], and o_proj routes that channel into hidden[1].
+/// The last position's letter logits therefore depend on every earlier prompt token.
 pub(crate) fn option_scoring_fixture() -> (Qwen35Config, ModelWeights) {
     let (cfg, mut weights) = tiny_hybrid_fixture();
     let hidden = cfg.hidden_size;
