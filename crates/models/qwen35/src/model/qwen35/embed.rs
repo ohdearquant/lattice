@@ -52,7 +52,7 @@ impl Qwen35Model {
     /// # Example
     ///
     /// ```no_run
-    /// # use lattice_inference::model::qwen35::{HiddenPooling, Qwen35Model};
+    /// # use lattice_model_qwen35::model::qwen35::{HiddenPooling, Qwen35Model};
     /// # fn demo(model: &Qwen35Model, tokens: &[u32]) -> Result<(), Box<dyn std::error::Error>> {
     /// let v = model.embed_tokens(tokens, HiddenPooling::default())?;
     /// assert_eq!(v.len(), model.hidden_size());
