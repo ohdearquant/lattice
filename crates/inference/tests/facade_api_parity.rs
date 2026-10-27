@@ -1607,6 +1607,10 @@ mod compute_parity {
             extracted::kv_cache::cross_turn::plan_prefix_reuse,
         );
         same_function(
+            lattice_inference::kv_cache::plan_prefix_reuse_for_slot,
+            extracted::kv_cache::cross_turn::plan_prefix_reuse_for_slot,
+        );
+        same_function(
             lattice_inference::kv_cache::checkpoint_survives_save,
             extracted::kv_cache::cross_turn::checkpoint_survives_save,
         );
