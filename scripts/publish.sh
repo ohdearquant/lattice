@@ -132,7 +132,8 @@ if [ -z "$FLAG" ]; then
     sleep 30
 fi
 
-echo "--- Tier 5: model families (depend on arch, compute and lower crates) ---"
+echo "--- Tier 5: model families and forecasting (depend on arch, compute and lower crates) ---"
+publish_crate lattice-forecast
 publish_crate lattice-model-embeddinggemma2
 publish_crate lattice-model-bert
 publish_crate lattice-model-qwen3

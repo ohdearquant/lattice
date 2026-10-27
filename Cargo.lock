@@ -1659,6 +1659,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-forecast"
+version = "0.15.0"
+dependencies = [
+ "lattice-compute",
+ "lattice-inference-core",
+ "lattice-weights",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lattice-grammar"
 version = "0.15.0"
 dependencies = [
@@ -1683,6 +1694,7 @@ dependencies = [
  "lattice-arch",
  "lattice-compute",
  "lattice-fann",
+ "lattice-forecast",
  "lattice-grammar",
  "lattice-inference-core",
  "lattice-metal-runtime",
