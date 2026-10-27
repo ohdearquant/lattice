@@ -13,7 +13,8 @@
 //! are re-exports kept so that code written against the pre-split `lattice-inference` keeps
 //! compiling. They are not a stable API, and these low-level re-exports will be removed at 1.0.
 //! New code should import from the owning crate. Each compatibility module says so in its own
-//! documentation.
+//! documentation, and the removal list is tracked in
+//! <https://github.com/ohdearquant/lattice/issues/2333>.
 //!
 // ML inference kernels: many functions have >7 args by necessity (BLAS-style APIs
 // where grouping into structs would require heap allocation in hot paths), and many
