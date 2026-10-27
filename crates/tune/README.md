@@ -614,10 +614,10 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area        | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
-| `src/`      | 84    | 19367 | 3613    | 2718  | 465   | 544         | 0        |
+| `src/`      | 84    | 19686 | 3628    | 2731  | 472   | 545         | 0        |
 | `tests/`    | 8     | 1790  | 339     | 278   | 71    | 0           | 9        |
 | `examples/` | 1     | 244   | 4       | 10    | 0     | 0           | 0        |
-| total       | 93    | 21401 | 3956    | 3006  | 536   | 544         | 9        |
+| total       | 93    | 21720 | 3971    | 3019  | 543   | 545         | 9        |
 
 Other tracked files (the README excluded):
 
@@ -684,7 +684,7 @@ Default set: `sqlite`, `std`. Each description is the first sentence of the comm
 
 ### Workspace dependencies
 
-- Depends on: `lattice-fann`, `lattice-inference` (optional, enabled by `inference-hook`, `train-backward`; features `f16`)
+- Depends on: `lattice-fann`, `lattice-inference` (optional, enabled by `inference-hook`, `train-backward`; features `f16`, `qwen35`)
 - Used by: no other crate in this workspace
 
 <!-- generated:dependencies:end -->
