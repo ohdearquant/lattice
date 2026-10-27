@@ -36,7 +36,7 @@ esac
 #             -> inference            depends on every model family and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime
 #             -> embed                depends on bert, embeddinggemma2, qwen3, qwen35 and lower crates (inference only as a dev-dependency)
 #               -> serve              depends on inference (exact version), tokenizer, weights and fann (via `mixture` or `metal-gpu`)
-#               -> tune               depends on fann, inference
+#               -> tune               depends on fann, and on inference only through `inference-hook` or `train-backward`
 # Each tier waits for crates.io indexing before the next tier resolves it.
 # (--dry-run validates only the leaf tier: cargo cannot dry-run a crate whose
 #  internal deps are not yet live on the registry.)
