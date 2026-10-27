@@ -2155,7 +2155,7 @@ fn load_real_qwen35_0_8b_or_skip() -> Option<crate::model::qwen35::Qwen35Model> 
 /// device and a real checkpoint are both required to exercise the
 /// injection path. Fails closed (`LATTICE_METAL_TEST_ENFORCE=1`)
 /// instead of returning `None` when either is missing, matching the
-/// `lattice_model_qwen3::metal::metal_test_device` / `f16_kv_metal_path_executes_and_reports_capability`
+/// `lattice_model_qwen3_embedding::metal::metal_test_device` / `f16_kv_metal_path_executes_and_reports_capability`
 /// convention — otherwise a runner without a Metal device or
 /// checkpoint would report these tests as passing without ever
 /// exercising the injection path.

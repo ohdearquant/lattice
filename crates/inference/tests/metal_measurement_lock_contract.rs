@@ -578,7 +578,7 @@ const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
     CallSelector::Path(&["MetalQwen35State", "new"]),
     CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
     // QwenModel::from_directory attempts MetalForwardPass::new internally
-    // (crates/models/qwen3/src/lib.rs) whenever Metal is available, so
+    // (crates/models/qwen3-embedding/src/lib.rs) whenever Metal is available, so
     // every caller of it is a helper-mediated Metal construction site (#1274).
     CallSelector::Path(&["QwenModel", "from_directory"]),
 ];

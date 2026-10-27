@@ -93,7 +93,7 @@ class PublishScriptArgs(_PublishScriptFixture):
                 "sleep 30",
                 "cargo publish -p lattice-model-embeddinggemma2",
                 "cargo publish -p lattice-model-bert",
-                "cargo publish -p lattice-model-qwen3",
+                "cargo publish -p lattice-model-qwen3-embedding",
                 "cargo publish -p lattice-model-gemma4",
                 "cargo publish -p lattice-model-ernie45",
                 "cargo publish -p lattice-model-qwen35",

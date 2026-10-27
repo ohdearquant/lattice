@@ -171,7 +171,7 @@ pub(crate) fn validate_scanned_package_membership(
             return Err("inference package identity does not match the inference directory".into());
         }
         if name == "lattice-model-embeddinggemma2"
-            || name == "lattice-model-qwen3"
+            || name == "lattice-model-qwen3-embedding"
             || name == "lattice-model-gemma4"
             || name == "lattice-model-ernie45"
             || name == "lattice-model-qwen35"

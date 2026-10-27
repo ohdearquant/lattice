@@ -135,7 +135,7 @@ fi
 echo "--- Tier 5: model families (depend on arch, compute and lower crates) ---"
 publish_crate lattice-model-embeddinggemma2
 publish_crate lattice-model-bert
-publish_crate lattice-model-qwen3
+publish_crate lattice-model-qwen3-embedding
 publish_crate lattice-model-gemma4
 publish_crate lattice-model-ernie45
 publish_crate lattice-model-qwen35
