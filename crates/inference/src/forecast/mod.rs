@@ -4,6 +4,10 @@
 //! forecasts and can forecast related series jointly. Reverso's context preparation (missing values,
 //! padding, striding, resampling) lives in [`prep`](crate::forecast::prep) so it matches its reference evaluation;
 //! Chronos-2 and Toto 2.0 prepare their own input inside the model, as their references do.
+//!
+//! **Compatibility path.** This module keeps the pre-split `lattice-inference` paths compiling; the
+//! code it names lives in the crates that own it. These low-level paths are not a stable API and
+//! will be removed at 1.0.
 
 pub mod chronos2;
 mod fft;
