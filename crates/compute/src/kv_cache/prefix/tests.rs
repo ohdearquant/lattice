@@ -306,3 +306,67 @@ fn prefix_cache_debug_keeps_verified_token_ids_private() {
     assert!(rendered.contains("PrefixEntry"));
     assert!(rendered.contains("prefix_len: 4"));
 }
+
+#[test]
+fn lookup_refresh_preserves_other_entries_lru_order() {
+    let config = make_config(3);
+    let mut cache = PrefixPageCache::new(config);
+    let [a, b, c, d] = [1_u32, 5, 9, 13].map(|first| {
+        PrefixKey::from_token_ids(AdapterId::BASE, &[first, first + 1, first + 2, first + 3])
+    });
+    for (key, marker) in [(a, 1.0), (b, 2.0), (c, 3.0)] {
+        assert!(
+            cache
+                .insert(key, 4, make_pages(config, 4, marker))
+                .is_none()
+        );
+    }
+
+    assert!(cache.lookup(&a).is_some());
+    assert!(cache.insert(d, 4, make_pages(config, 4, 4.0)).is_none());
+
+    assert_eq!(cache.len(), 3);
+    assert!(cache.contains_key(&a));
+    assert!(!cache.contains_key(&b));
+    assert!(cache.contains_key(&c));
+    assert!(cache.contains_key(&d));
+    assert_eq!(cache.evict_lru(), 1);
+    assert!(!cache.contains_key(&c));
+    assert!(cache.contains_key(&a));
+    assert!(cache.contains_key(&d));
+}
+
+#[test]
+fn replacement_refresh_preserves_other_entries_lru_order() {
+    let config = make_config(3);
+    let mut cache = PrefixPageCache::new(config);
+    let [a, b, c, d] = [1_u32, 5, 9, 13].map(|first| {
+        PrefixKey::from_token_ids(AdapterId::BASE, &[first, first + 1, first + 2, first + 3])
+    });
+    for (key, marker) in [(a, 1.0), (b, 2.0), (c, 3.0)] {
+        assert!(
+            cache
+                .insert(key, 4, make_pages(config, 4, marker))
+                .is_none()
+        );
+    }
+
+    let replacement = PrefixEntry::new(4, config.prefix_page_size, make_pages(config, 4, 9.0), 0);
+    let replaced = cache
+        .insert_entry(a, replacement)
+        .expect("same key replaced");
+    assert_eq!(replaced.pages[0].as_slice()[0], 1.0);
+    assert!(cache.insert(d, 4, make_pages(config, 4, 4.0)).is_none());
+
+    assert_eq!(cache.len(), 3);
+    assert!(cache.contains_key(&a));
+    assert!(!cache.contains_key(&b));
+    assert!(cache.contains_key(&c));
+    assert!(cache.contains_key(&d));
+    assert_eq!(cache.evict_lru(), 1);
+    assert!(!cache.contains_key(&c));
+    assert!(cache.contains_key(&a));
+    assert!(cache.contains_key(&d));
+    let retained = cache.lookup(&a).expect("replacement remains cached");
+    assert_eq!(retained.pages[0].as_slice()[0], 9.0);
+}
