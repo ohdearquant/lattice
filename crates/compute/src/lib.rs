@@ -20,6 +20,7 @@
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 pub mod attention;
+pub mod batch;
 pub mod forward;
 pub mod gemma_ops;
 pub mod gemma_rope;
