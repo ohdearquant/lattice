@@ -50,7 +50,7 @@ default = ["std", "download", "image", "bert", "embeddinggemma2", "qwen3", "gemm
 bert = ["dep:lattice-model-bert"]
 gemma4 = ["dep:lattice-model-gemma4"]
 embeddinggemma2 = ["dep:lattice-model-embeddinggemma2"]
-qwen3 = ["dep:lattice-model-qwen3"]
+qwen3 = ["dep:lattice-model-qwen3-embedding"]
 ernie45 = ["dep:lattice-model-ernie45"]
 paddleocr-vl = ["ernie45", "lattice-model-ernie45?/paddleocr-vl"]
 # Unsupported, version-coupled interface for `lattice-serve` (ADR-103
@@ -65,14 +65,14 @@ f16 = ["lattice-weights/f16", "lattice-model-bert?/f16", "lattice-model-gemma4?/
 # lattice-fann supplies the shared LoRA descriptor/blend-validation module
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
 # be present whenever this feature is — not just under `mixture`.
-metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu", "lattice-model-embeddinggemma2?/metal-gpu", "lattice-model-qwen3?/metal-gpu", "lattice-model-ernie45?/metal-gpu", "lattice-model-qwen35?/metal-gpu"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu", "lattice-model-embeddinggemma2?/metal-gpu", "lattice-model-qwen3-embedding?/metal-gpu", "lattice-model-ernie45?/metal-gpu", "lattice-model-qwen35?/metal-gpu"]
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 bench-internals = ["lattice-compute/bench-internals", "lattice-grammar/bench-internals", "lattice-model-qwen35?/bench-internals"]
 # Stock `gemm` for multi-row `matmul_bt` on Linux x86_64 (ADR-099 F1, step 1). Off by default.
-x86-gemm = ["lattice-compute/x86-gemm", "lattice-model-bert?/x86-gemm", "lattice-model-qwen3?/x86-gemm", "lattice-model-gemma4?/x86-gemm", "lattice-model-ernie45?/x86-gemm"]
+x86-gemm = ["lattice-compute/x86-gemm", "lattice-model-bert?/x86-gemm", "lattice-model-qwen3-embedding?/x86-gemm", "lattice-model-gemma4?/x86-gemm", "lattice-model-ernie45?/x86-gemm"]
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
 backfill = ["dep:rusqlite", "f16"]
-download = ["lattice-model-io/download", "lattice-model-bert?/download", "lattice-model-qwen3?/download"]
+download = ["lattice-model-io/download", "lattice-model-bert?/download", "lattice-model-qwen3-embedding?/download"]
 train-backward = ["lattice-model-qwen35?/train-backward"]
 # AdapterRouter gate: enables the lattice-fann backed routing module.
 # generate_with_lora_mixture does NOT require this feature — it is always
@@ -101,7 +101,7 @@ test-utils = ["lattice-model-bert?/test-utils", "lattice-model-gemma4?/test-util
 [dependencies]
 lattice-model-qwen35 = { workspace = true, optional = true }
 lattice-model-bert = { workspace = true, optional = true }
-lattice-model-qwen3 = { workspace = true, optional = true }
+lattice-model-qwen3-embedding = { workspace = true, optional = true }
 lattice-model-gemma4 = { workspace = true, optional = true }
 half.workspace = true
 memmap2 = "0.9"
@@ -124,6 +124,7 @@ ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { workspace = true, optional = true }
 lattice-compute = { version = "0.15.0", path = "../compute" }
+lattice-forecast = { version = "0.15.0", path = "../forecast" }
 lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
 lattice-grammar = { version = "0.15.0", path = "../grammar" }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }

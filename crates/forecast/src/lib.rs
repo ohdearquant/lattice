@@ -2,7 +2,7 @@
 //!
 //! Reverso returns point forecasts of a univariate history; Chronos-2 and Toto 2.0 return quantile
 //! forecasts and can forecast related series jointly. Reverso's context preparation (missing values,
-//! padding, striding, resampling) lives in [`prep`](crate::forecast::prep) so it matches its reference evaluation;
+//! padding, striding, resampling) lives in [`prep`] so it matches its reference evaluation;
 //! Chronos-2 and Toto 2.0 prepare their own input inside the model, as their references do.
 
 pub mod chronos2;

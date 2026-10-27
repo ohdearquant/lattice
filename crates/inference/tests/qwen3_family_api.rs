@@ -1,7 +1,7 @@
 #![cfg(feature = "qwen3")]
 
 use lattice_inference::error::InferenceError;
-use lattice_model_qwen3 as family;
+use lattice_model_qwen3_embedding as family;
 use lattice_weights::{QwenWeights, SafetensorsFile, ShardedSafetensors};
 use std::marker::PhantomData;
 
@@ -32,7 +32,7 @@ fn model_and_profiling_paths_name_the_family_types() {
 #[test]
 fn loader_paths_keep_the_storage_and_owner_borrows() {
     use lattice_inference::model::qwen::weight_loading as facade;
-    use lattice_model_qwen3::weight_loading as family_loading;
+    use lattice_model_qwen3_embedding::weight_loading as family_loading;
     type Borrowed = for<'a> fn(
         &'a SafetensorsFile,
         usize,
