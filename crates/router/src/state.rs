@@ -306,7 +306,7 @@ pub enum RouterArtifactError {
 
     /// An operation needs the bootstrap authority rather than caller-supplied bytes.
     #[error(
-        "format-5 router {identity} cannot be published through this API; use router_init::init_directory for a bootstrap in a fresh directory; learned admission is not available"
+        "format-5 router {identity} cannot be published through this API; use lattice_router::init::init_directory for a bootstrap in a fresh directory; learned admission is not available"
     )]
     PublicationAuthorityRequired {
         /// The exact counter and content hash that were refused.
@@ -1126,7 +1126,7 @@ fn read_head_unlocked(dir: &Path) -> Result<Option<HeadRecord>, RouterArtifactEr
 /// Use `crate::init::init_directory` (with a gate backend enabled) to
 /// construct and durably commit a bootstrap into a fresh directory. Learned
 /// admission has no production entry point yet. Format 4 never has a head.
-#[deprecated(note = "use router_init::init_directory for fresh bootstrap publication")]
+#[deprecated(note = "use lattice_router::init::init_directory for fresh bootstrap publication")]
 pub fn commit_head(dir: &Path, artifact: &RouterArtifact) -> Result<PathBuf, RouterArtifactError> {
     HeadRecord {
         format: artifact.provenance.format(),
@@ -1226,9 +1226,9 @@ impl std::str::FromStr for RouterPin {
 /// Compatibility writer for format-4 artifacts only.
 ///
 /// Use [`write_legacy_artifact`] for legacy publication, or
-/// `router_init::init_directory` for a fresh format-5 bootstrap. Arbitrary
+/// `lattice_router::init::init_directory` for a fresh format-5 bootstrap. Arbitrary
 /// format-5 bytes cannot acquire publication authority through this API.
-#[deprecated(note = "use write_legacy_artifact or router_init::init_directory")]
+#[deprecated(note = "use write_legacy_artifact or lattice_router::init::init_directory")]
 pub fn write_artifact(
     dir: &Path,
     artifact: &RouterArtifact,
@@ -1240,7 +1240,7 @@ pub fn write_artifact(
 ///
 /// Gate and manifest destinations are create-only across both formats. The
 /// publisher serializes with bootstrap and readers, and never changes HEAD.
-/// Format-5 artifacts require the authority of `router_init::init_directory`.
+/// Format-5 artifacts require the authority of `lattice_router::init::init_directory`.
 pub fn write_legacy_artifact(
     dir: &Path,
     artifact: &RouterArtifact,

@@ -682,11 +682,11 @@ jobs:
         run: |
           cargo clippy --locked -p lattice-router --all-targets --no-default-features -- -D warnings
           cargo clippy --locked -p lattice-router --all-targets --features mixture -- -D warnings
-      - name: inference router-learning clippy
+      - name: inference and router — router-learning clippy
         run: |
           cargo clippy --locked -p lattice-inference --all-targets --features router-learning -- -D warnings
           cargo clippy --locked -p lattice-router --all-targets --features qwen35,serving-support,router-learning -- -D warnings
-      - name: inference router-learning without serving
+      - name: inference and router — router-learning without serving
         run: |
           cargo clippy --locked -p lattice-inference --lib --no-default-features --features router-learning -- -D warnings
           cargo clippy --locked -p lattice-router --lib --no-default-features --features router-learning -- -D warnings
