@@ -492,7 +492,7 @@ fn last_hidden_is_none_whenever_the_buffer_is_not_the_live_cursors_token() {
     };
     let slot = lattice_compute::kv_cache::CrossTurnSlotId(1);
     state
-        .save_cross_turn_prefix(slot, metadata.clone(), tokens.to_vec(), None)
+        .save_cross_turn_prefix(slot, metadata.clone(), tokens.to_vec(), None, None)
         .expect("save the turn's prefix");
     let mut next_prompt = tokens.to_vec();
     next_prompt.push(9);

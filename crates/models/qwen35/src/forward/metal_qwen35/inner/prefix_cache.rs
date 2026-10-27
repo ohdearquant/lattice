@@ -487,6 +487,7 @@ impl MetalQwen35State {
         metadata: lattice_compute::kv_cache::CrossTurnPrefixMetadata,
         represented_token_ids: Vec<u32>,
         consumed_entry: Option<MetalCrossTurnPrefixEntry>,
+        turn_checkpoint: Option<MetalGdnCheckpoint>,
     ) -> Result<(), lattice_inference_core::InferenceError> {
         use lattice_inference_core::InferenceError;
 
@@ -518,6 +519,17 @@ impl MetalQwen35State {
         // (chunk boundaries differ between the original and the
         // re-prefill), and the ring starts empty by design.
         let mut checkpoints: Vec<MetalGdnCheckpoint> = Vec::new();
+        // A fresh checkpoint was captured against this generation's own KV rows,
+        // so it remains eligible even when no previous entry survived a refill.
+        if let Some(cp) = turn_checkpoint
+            && lattice_compute::kv_cache::checkpoint_survives_save(
+                cp.len,
+                represented_len,
+                represented_len,
+            )
+        {
+            checkpoints.push(cp);
+        }
         if let Some(old) = consumed_entry {
             let common = lattice_compute::kv_cache::longest_common_token_prefix(
                 &old.generic.token_ids,
@@ -544,14 +556,14 @@ impl MetalQwen35State {
                     snapshot: old.gdn_snapshot,
                 });
             }
-            checkpoints.sort_by_key(|c| c.len);
-            checkpoints.dedup_by_key(|c| c.len);
-            // Evict the shallowest boundaries first — see
-            // CROSS_TURN_GDN_CHECKPOINT_CAP for the tradeoff.
-            if checkpoints.len() > CROSS_TURN_GDN_CHECKPOINT_CAP {
-                let excess = checkpoints.len() - CROSS_TURN_GDN_CHECKPOINT_CAP;
-                checkpoints.drain(..excess);
-            }
+        }
+        checkpoints.sort_by_key(|c| c.len);
+        checkpoints.dedup_by_key(|c| c.len);
+        // Evict the shallowest boundaries first — see
+        // CROSS_TURN_GDN_CHECKPOINT_CAP for the tradeoff.
+        if checkpoints.len() > CROSS_TURN_GDN_CHECKPOINT_CAP {
+            let excess = checkpoints.len() - CROSS_TURN_GDN_CHECKPOINT_CAP;
+            checkpoints.drain(..excess);
         }
 
         let generic = lattice_compute::kv_cache::CrossTurnPrefixEntry {
@@ -580,9 +592,16 @@ impl MetalQwen35State {
         metadata: lattice_compute::kv_cache::CrossTurnPrefixMetadata,
         represented_token_ids: Vec<u32>,
         consumed_entry: Option<MetalCrossTurnPrefixEntry>,
+        turn_checkpoint: Option<MetalGdnCheckpoint>,
     ) {
         if self
-            .save_cross_turn_prefix(slot_id, metadata, represented_token_ids, consumed_entry)
+            .save_cross_turn_prefix(
+                slot_id,
+                metadata,
+                represented_token_ids,
+                consumed_entry,
+                turn_checkpoint,
+            )
             .is_err()
         {
             self.cross_turn_prefix_cache.remove(slot_id);

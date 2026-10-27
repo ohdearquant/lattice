@@ -348,6 +348,23 @@ fn assert_appended(line: &CacheLine, context: &str) {
     );
 }
 
+fn assert_replayed(line: &CacheLine, context: &str) -> usize {
+    let checkpoint_len: usize = line
+        .mode
+        .strip_prefix("ReplayFromCheckpoint { checkpoint_len: ")
+        .and_then(|rest| rest.strip_suffix(" }"))
+        .and_then(|len| len.parse().ok())
+        .unwrap_or_else(|| panic!("{context}: {line:?}"));
+    assert!(checkpoint_len > 0, "{context}: {line:?}");
+    assert_eq!(line.reused, checkpoint_len, "{context}: {line:?}");
+    assert_eq!(
+        line.reused + line.prefetched,
+        line.prompt,
+        "{context}: {line:?}"
+    );
+    checkpoint_len
+}
+
 /// A raw streaming exchange that the test can abandon at any point.
 struct OpenStream {
     reader: std::io::BufReader<TcpStream>,
@@ -620,27 +637,45 @@ fn the_worker_route_reuses_an_appended_conversation_and_refills_a_diverged_one()
         // The next turn as a client sends it, with the answer it received as
         // history: the template renders that turn without the think block the
         // generation prompt ended with, so the tokens part right after the
-        // assistant header and nothing is reused.
+        // assistant header. The worker kept a checkpoint at that header, so the
+        // turn replays from it and prefills only the answer and the new message.
         let plain = [
             user("Name one primary color."),
             assistant(&answer),
             user("Name another one."),
         ];
-        let (_, line) = text_turn(
+        let plain_options = json!({"seed": 42});
+        let (plain_answer, line) = text_turn(
             &server,
             &plain,
-            json!({}),
+            plain_options.clone(),
             &format!("{format} plain append"),
         );
-        assert_refilled(
+        assert!(
+            !plain_answer.starts_with("<missing completion text:"),
+            "{format}: ordinary-history response has no completion text: {plain_answer}"
+        );
+        let plain_prompt_tokens = line.prompt;
+        let turn_start = assert_replayed(
             &line,
             &format!("{format}: the next turn with the answer as plain history"),
         );
+        assert_eq!(
+            cold_prompt - turn_start,
+            4,
+            "{format}: the checkpoint sits before the four think-block tokens: {line:?}"
+        );
 
+        // The first turn again parts from the held conversation at the same
+        // header, and replaying from there must give the cold answer.
         let (again, line) = text_turn(&server, &first, json!({}), &format!("{format} cold again"));
-        assert_refilled(
-            &line,
-            &format!("{format}: the first turn after the plain append"),
+        assert_eq!(
+            assert_replayed(
+                &line,
+                &format!("{format}: the first turn after the plain append"),
+            ),
+            turn_start,
+            "{format}: {line:?}"
         );
         assert_eq!(again, answer, "{format}: the first turn's answer changed");
 
@@ -688,6 +723,37 @@ fn the_worker_route_reuses_an_appended_conversation_and_refills_a_diverged_one()
         assert_eq!(
             repeated_answer, appended_answer,
             "{format}: a repeated request changed its answer"
+        );
+
+        // Displace the saved conversation only after the warm controls, so the
+        // identical ordinary request must rebuild without loading another model.
+        let (_, line) = text_turn(
+            &server,
+            &[user("Write one word about the sea.")],
+            json!({}),
+            &format!("{format} ordinary cold displacement"),
+        );
+        assert_refilled(
+            &line,
+            &format!("{format}: a different conversation before the ordinary cold control"),
+        );
+        let (cold_plain_answer, line) = text_turn(
+            &server,
+            &plain,
+            plain_options,
+            &format!("{format} ordinary cold control"),
+        );
+        assert_refilled(
+            &line,
+            &format!("{format}: the identical ordinary-history request is a full refill"),
+        );
+        assert_eq!(
+            line.prompt, plain_prompt_tokens,
+            "{format}: the ordinary warm and cold requests tokenized differently"
+        );
+        assert_eq!(
+            cold_plain_answer, plain_answer,
+            "{format}: replay changed the ordinary-history answer"
         );
     }
 }
