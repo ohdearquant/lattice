@@ -98,6 +98,7 @@ class PublishScriptArgs(_PublishScriptFixture):
                 "cargo publish -p lattice-model-gemma4",
                 "cargo publish -p lattice-model-ernie45",
                 "cargo publish -p lattice-model-qwen35",
+                "sleep 30",
                 "cargo publish -p lattice-router",
                 "sleep 30",
                 "cargo publish -p lattice-inference",

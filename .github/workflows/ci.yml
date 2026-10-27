@@ -461,7 +461,7 @@ jobs:
         run: cargo test -p lattice-fann --features online-router --lib
       # lattice-inference's OWN `mixture` feature is a different feature from the
       # lattice-tune one two steps above, and nothing here used to enable it, so
-      # crates/inference/src/mixture.rs (the AdapterRouter gate) was compiled by
+      # crates/router/src/mixture.rs (the AdapterRouter gate) was compiled by
       # no job in this file: its route_* tests never ran and clippy never saw it.
       # The reason that was easy to miss is worth stating, because the next
       # feature to go dark will hide the same way: the tune step's NAME contains
