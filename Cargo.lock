@@ -1725,10 +1725,8 @@ dependencies = [
  "libc",
  "memmap2",
  "metal 0.33.0",
- "naga 24.0.0",
  "objc",
  "ort",
- "pollster",
  "proc-macro2",
  "proptest",
  "rayon",
@@ -1742,7 +1740,6 @@ dependencies = [
  "thiserror 2.0.19",
  "tokenizers",
  "tracing",
- "wgpu 24.0.5",
 ]
 
 [[package]]
@@ -1855,6 +1852,7 @@ dependencies = [
 name = "lattice-model-qwen3-embedding"
 version = "0.15.0"
 dependencies = [
+ "bytemuck",
  "lattice-arch",
  "lattice-compute",
  "lattice-inference-core",
@@ -1863,12 +1861,15 @@ dependencies = [
  "lattice-tokenizer",
  "lattice-weights",
  "metal 0.33.0",
+ "naga 24.0.0",
  "objc",
+ "pollster",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tracing",
+ "wgpu 24.0.5",
 ]
 
 [[package]]

@@ -18,8 +18,12 @@ default = []
 download = ["lattice-model-io/download"]
 metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu"]
 x86-gemm = ["lattice-compute/x86-gemm"]
+wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 lattice-arch.workspace = true
 lattice-compute.workspace = true
 lattice-inference-core.workspace = true
@@ -39,6 +43,7 @@ objc = { workspace = true, optional = true }
 [dev-dependencies]
 lattice-model-io = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
+naga.workspace = true
 
 [lints]
 workspace = true
