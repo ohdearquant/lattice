@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-05-13
 **Crate**: lattice-embed
-**Proposed amendment**: [ADR-088](ADR-088-sealed-native-embedding-attestation.md) would resolve
+**Proposed amendment (withdrawn 2026-10-27)**: [ADR-088](ADR-088-sealed-native-embedding-attestation.md) would resolve
 prepared model source, backend, dimensions, and cache policy once and report the effective vector
 semantics instead of treating a model label as identity.
 
