@@ -1,4 +1,8 @@
 //! Qwen3.5 family compatibility exports.
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-model-qwen35` keep
+//! code written against the pre-split `lattice-inference` compiling. Those low-level re-exports are
+//! not a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 #[doc(inline)]
 pub use lattice_model_qwen35::forward::metal_qwen35::ChatRole;

@@ -3,6 +3,10 @@
 //! Every public item keeps the path it had before the tokenizer moved into its
 //! own crate. The re-exports are named rather than globbed so the facade never
 //! widens the supported API.
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-tokenizer` keep
+//! code written against the pre-split `lattice-inference` compiling. Those low-level re-exports are
+//! not a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 pub mod bpe {
     #[doc(inline)]
