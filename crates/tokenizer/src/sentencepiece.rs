@@ -215,7 +215,12 @@ impl SentencePieceTokenizer {
         let bytes = fs::read(path).map_err(|e| {
             InferenceError::Tokenizer(format!("failed to read {}: {e}", path.display()))
         })?;
-        let model = parse_sentencepiece_model(&bytes)?;
+        Self::from_model_bytes(&bytes)
+    }
+
+    /// Parse the exact native SentencePiece bytes supplied by a loader.
+    pub fn from_model_bytes(bytes: &[u8]) -> Result<Self, InferenceError> {
+        let model = parse_sentencepiece_model(bytes)?;
         Self::from_parsed_model(
             model,
             DEFAULT_SENTENCEPIECE_CACHE_CAPACITY,
@@ -778,6 +783,67 @@ impl SentencePieceTokenizer {
 }
 
 impl Tokenizer for SentencePieceTokenizer {
+    fn embedding_settings(&self) -> Option<Vec<(String, crate::common::TokenizerPolicyValue)>> {
+        use crate::common::{TokenizerPolicyValue as V, report_id, report_tokens};
+        let mut settings = vec![
+            (
+                "max_seq_len".into(),
+                V::Unsigned(self.inner.max_seq_len as u64),
+            ),
+            (
+                "vocab_size".into(),
+                V::Unsigned(self.inner.id_to_piece.len() as u64),
+            ),
+            (
+                "program".into(),
+                V::String("sentencepiece-single-v1".into()),
+            ),
+            ("min_score".into(), V::F32(self.inner.min_score)),
+        ];
+        for (key, value) in [
+            ("add_bos", self.inner.add_bos),
+            ("add_eos", self.inner.add_eos),
+            ("dummy_prefix", self.inner.dummy_prefix),
+            (
+                "remove_extra_whitespaces",
+                self.inner.remove_extra_whitespaces,
+            ),
+            ("escape_whitespaces", self.inner.escape_whitespaces),
+        ] {
+            settings.push((key.into(), V::Boolean(value)));
+        }
+        for (key, id) in [
+            ("pad", Some(self.inner.pad_id)),
+            ("unk", Some(self.inner.unk_id)),
+            ("bos", self.inner.bos_id),
+            ("eos", self.inner.eos_id),
+        ] {
+            report_id(&mut settings, key, id);
+        }
+        let fallback: Vec<_> = self
+            .inner
+            .byte_fallback_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(byte, id)| id.map(|id| (byte, id)))
+            .collect();
+        settings.push((
+            "byte_fallback.count".into(),
+            V::Unsigned(fallback.len() as u64),
+        ));
+        for (index, (byte, id)) in fallback.into_iter().enumerate() {
+            settings.push((
+                format!("byte_fallback.{index}.byte"),
+                V::Unsigned(byte as u64),
+            ));
+            settings.push((
+                format!("byte_fallback.{index}.id"),
+                V::Unsigned(u64::from(id)),
+            ));
+        }
+        report_tokens(&mut settings, "added", &self.inner.added_tokens);
+        Some(settings)
+    }
     fn tokenize(&self, text: &str) -> TokenizedInput {
         let (ids, pre_truncation_len) = self.tokenize_to_ids_with_pre_truncation_len(text);
         pad_ids(
