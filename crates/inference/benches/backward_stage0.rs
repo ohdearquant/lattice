@@ -531,7 +531,26 @@ fn bench_gdn_backward(c: &mut Criterion) {
     group.finish();
 }
 
+// Measurement control, not for merge: 752 bytes of padding at the front of the bench binary's
+// .text, so the library code linked after it moves by the same amount.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+std::arch::global_asm!(
+    ".pushsection .text.lattice_placement_pad,\"ax\",@progbits",
+    ".p2align 4",
+    ".globl lattice_placement_pad",
+    "lattice_placement_pad:",
+    ".skip 752, 0xcc",
+    ".popsection",
+);
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe extern "C" {
+    fn lattice_placement_pad();
+}
+
 fn criterion_config() -> Criterion {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    black_box(lattice_placement_pad as unsafe extern "C" fn() as usize);
     Criterion::default()
         .sample_size(20)
         .warm_up_time(Duration::from_secs(1))
