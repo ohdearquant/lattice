@@ -89,7 +89,7 @@ echo "--- Pre-publish: package size against the crates.io upload limit ---"
 "$(dirname "$0")/package-size-check.sh"
 
 echo "--- Tier 1: leaf crates (no internal deps) ---"
-publish_crate lattice-fann
+publish_crate lattice-lora
 publish_crate lattice-transport
 publish_crate lattice-simd
 publish_crate lattice-inference-core
@@ -100,6 +100,9 @@ if [ -n "$FLAG" ]; then
 fi
 echo "Waiting for crates.io indexing..."
 sleep 30
+
+echo "--- Tier 1b: lattice-fann (depends on lattice-lora) ---"
+publish_crate lattice-fann
 
 echo "--- Tier 2: tokenizer, grammar, weights, metal-runtime and model-io (depend on inference-core) ---"
 publish_crate lattice-tokenizer

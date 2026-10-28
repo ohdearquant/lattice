@@ -1,0 +1,15 @@
+[package]
+name = "lattice-lora"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LoRA adapter descriptor, target-module checks and blend budget validation for Lattice"
+keywords = ["lora", "adapter", "inference", "llm"]
+categories = ["science", "algorithms"]
+readme = "README.md"
+
+[lints]
+workspace = true
