@@ -222,6 +222,27 @@ impl SafetensorsFile {
         Self::from_open_file(file, path)
     }
 
+    /// Open and parse once, then capture evidence from that same validated backing.
+    ///
+    /// Header mode omits weight-data digests and cannot detect header-preserving
+    /// weight-value edits. The observer sees digest requests, not ordinary reads.
+    pub fn open_with_report(
+        path: &Path,
+        logical_identifier: &str,
+        mode: crate::consumed::WeightDigestMode,
+        observe: &mut dyn FnMut(crate::consumed::DigestRequest),
+    ) -> Result<(Self, crate::consumed::ConsumedSafetensors), InferenceError> {
+        let parsed = Self::open(path)?;
+        let report = crate::consumed::ConsumedSafetensors::capture(
+            parsed.data.as_slice(),
+            parsed.data_offset,
+            mode,
+            logical_identifier,
+            observe,
+        );
+        Ok((parsed, report))
+    }
+
     /// Parse a safetensors file from an already-open [`File`].
     ///
     /// Manifest-derived shards reach this through [`open_manifest_entry_once`], which
@@ -265,7 +286,10 @@ impl SafetensorsFile {
             bytes[0..8]
                 .try_into()
                 .map_err(|_| InferenceError::InvalidSafetensors("invalid header length".into()))?,
-        ) as usize;
+        );
+        let header_len = usize::try_from(header_len).map_err(|_| {
+            InferenceError::InvalidSafetensors("header length exceeds addressable size".into())
+        })?;
         if header_len > MAX_SAFETENSORS_HEADER_BYTES {
             return Err(InferenceError::InvalidSafetensors(format!(
                 "header length {header_len} exceeds limit of {MAX_SAFETENSORS_HEADER_BYTES} bytes"

@@ -1,7 +1,7 @@
 //! Regression tests for grammar JSON-schema compiler fixes (issue #310, findings #4 and #6).
 
-use lattice_inference::grammar::json_schema::compile_json_schema;
-use lattice_inference::grammar::pda::{CompiledGrammar, GrammarState, StepResult, advance_byte};
+use lattice_grammar::json_schema::compile_json_schema;
+use lattice_grammar::pda::{CompiledGrammar, GrammarState, StepResult, advance_byte};
 
 /// True iff `g` accepts every byte of `s` and ends in a complete (accepting) state.
 fn full_accept(g: &CompiledGrammar, s: &[u8]) -> bool {

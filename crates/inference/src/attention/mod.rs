@@ -1,4 +1,8 @@
 //! Attention module index for `decode`, `differential`, `flash`, `flash_causal`, `gated`, `gdn`, `gdn_backward`, `gdn_fused`, `gqa`, `native_sparse`, and `standard`; re-exports the standard attention helpers.
+//!
+//! **Compatibility path.** The items here are re-exported from `lattice-compute` so that code
+//! written against the pre-split `lattice-inference` keeps compiling. These low-level re-exports
+//! are not a stable API and will be removed at 1.0; import from `lattice-compute` directly.
 pub mod decode;
 pub mod differential;
 pub mod flash;
