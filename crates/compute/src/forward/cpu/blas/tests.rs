@@ -310,9 +310,33 @@ fn sgemm_strided_nonempty_controls_keep_ffi_layout() {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn sgemm_nn_ab_fallback_empty_product_retains_nan_with_zero_beta() {
-    let mut c = [f32::NAN, 91.0];
-    sgemm_nn_ab(&[], &[], &mut c, 1, 1, 0, 1.0, 0.0);
-    assert!(c[0].is_nan());
-    assert_eq!(c[1], 91.0);
+fn sgemm_nn_ab_fallback_empty_product_zero_beta_overwrites_nonfinite_c() {
+    for beta in [0.0, -0.0] {
+        let mut c = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 91.0];
+        sgemm_nn_ab(&[], &[], &mut c, 1, 3, 0, 1.0, beta);
+        assert_eq!(c, [0.0, 0.0, 0.0, 91.0]);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn sgemm_nn_ab_fallback_zero_beta_ignores_nonfinite_c() {
+    let a = [1.0, 2.0, 3.0, 4.0];
+    for beta in [0.0, -0.0] {
+        let mut c = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 91.0];
+        sgemm_nn_ab(&a, &a, &mut c, 2, 2, 2, 2.0, beta);
+        assert_eq!(c, [14.0, 20.0, 30.0, 44.0, 91.0]);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn sgemm_nn_ab_fallback_nonzero_beta_accumulates_c() {
+    let a = [1.0, 2.0, 3.0, 4.0];
+    let mut c = [2.0, 4.0, 6.0, 8.0, 91.0];
+    sgemm_nn_ab(&a, &a, &mut c, 2, 2, 2, 2.0, 0.5);
+    assert_eq!(c, [15.0, 22.0, 33.0, 48.0, 91.0]);
+    let mut empty = [2.0, -4.0, 91.0];
+    sgemm_nn_ab(&[], &[], &mut empty, 1, 2, 0, 1.0, 0.5);
+    assert_eq!(empty, [1.0, -2.0, 91.0]);
 }

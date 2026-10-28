@@ -446,13 +446,25 @@ pub fn sgemm_nn_ab(
     // release-active guarantee instead of only the FFI copy being upgraded.
     validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "sgemm_nn_ab");
 
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum = 0.0f32;
-            for p in 0..k {
-                sum += a[i * k + p] * b[p * n + j];
+    if beta == 0.0 {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a[i * k + p] * b[p * n + j];
+                }
+                c[i * n + j] = alpha * sum;
             }
-            c[i * n + j] = alpha * sum + beta * c[i * n + j];
+        }
+    } else {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a[i * k + p] * b[p * n + j];
+                }
+                c[i * n + j] = alpha * sum + beta * c[i * n + j];
+            }
         }
     }
 }
