@@ -4,6 +4,27 @@ use lattice_weights::consumed::{DigestKind, DigestRequest};
 use std::path::Path;
 
 #[test]
+fn every_embedding_model_has_the_expected_identity_family() {
+    use EmbeddingModel::*;
+    use IdentityFamily::*;
+    for (model, expected) in [
+        (BgeSmallEnV15, BertSmall),
+        (BgeBaseEnV15, BertFull),
+        (BgeLargeEnV15, BertFull),
+        (MultilingualE5Small, BertFull),
+        (MultilingualE5Base, BertFull),
+        (AllMiniLmL6V2, BertFull),
+        (ParaphraseMultilingualMiniLmL12V2, BertFull),
+        (Qwen3Embedding0_6B, Qwen),
+        (Qwen3Embedding4B, Qwen),
+        (EmbeddingGemma2, Gemma),
+        (TextEmbedding3Small, Unavailable),
+    ] {
+        assert_eq!(identity_family(model), expected, "{model:?}");
+    }
+}
+
+#[test]
 fn every_bert_pooling_variant_has_an_identity_name() {
     use lattice_compute::pool::BertPooling;
     for pooling in BertPooling::ALL {
