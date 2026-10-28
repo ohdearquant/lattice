@@ -489,7 +489,7 @@ Default set: `simd`, `std`. Each description is the first sentence of the commen
 ### Workspace dependencies
 
 - Depends on: no other crate in this workspace
-- Used by: `lattice-inference` (optional), `lattice-serve` (optional), `lattice-tune`
+- Used by: `lattice-inference` (optional), `lattice-router` (optional), `lattice-serve` (optional), `lattice-tune`
 
 <!-- generated:dependencies:end -->
 
