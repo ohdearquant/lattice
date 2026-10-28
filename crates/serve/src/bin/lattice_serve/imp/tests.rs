@@ -1055,7 +1055,7 @@ async fn chat_completions_unknown_role_400() {
     // A role string that is not an OpenAI chat role at all (as
     // opposed to "developer"/"tool", which ARE real OpenAI roles
     // this server just doesn't implement -- see
-    // `chat_completions_tool_and_developer_role_400_unsupported_feature`
+    // `chat_completions_tool_and_developer_role_400`
     // below for that split, ADR-080 C2).
     let body = Body::from(r#"{"messages":[{"role":"moderator","content":"hi"}]}"#.to_string());
     let response = chat_completions(State(test_app_state()), test_json_headers(), body).await;
@@ -1069,7 +1069,7 @@ async fn chat_completions_unknown_role_400() {
 
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 #[tokio::test]
-async fn chat_completions_tool_and_developer_role_400_unsupported_feature() {
+async fn chat_completions_tool_and_developer_role_400() {
     for role in ["tool", "developer"] {
         let body = Body::from(format!(
             r#"{{"messages":[{{"role":"{role}","content":"hi"}}]}}"#
@@ -1082,8 +1082,13 @@ async fn chat_completions_tool_and_developer_role_400_unsupported_feature() {
         let v: serde_json::Value =
             serde_json::from_slice(&bytes).expect("response body must be valid JSON");
         assert_eq!(
-            v["error"]["code"], "unsupported_feature",
-            "role '{role}' must be reported as unsupported_feature, not invalid_role"
+            v["error"]["code"],
+            if role == "tool" {
+                "invalid_request_body"
+            } else {
+                "unsupported_feature"
+            },
+            "unexpected error code for role {role}"
         );
     }
 }
@@ -2984,3 +2989,6 @@ mod parity_table;
 // -----------------------------------------------------------------------
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 mod production_adapter_observation;
+
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod tool_history;
