@@ -18,14 +18,15 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate as lattice_compute;
 use crate::batch::config::BatchConfig;
 use crate::batch::scheduler::{FifoScheduler, Scheduler};
 use crate::batch::sequence::{
     AdapterKey, FinishReason, SeqId, Sequence, SequenceManager, SequenceState,
 };
-use crate::error::InferenceError;
 use crate::kv_cache::{PagePool, PagedKVCacheConfig};
-use crate::sampling::{Sampler, SamplingConfig};
+use lattice_arch::sampling::{Sampler, SamplingConfig};
+use lattice_inference_core::InferenceError;
 
 // ---------------------------------------------------------------------------
 // GdnStatePool

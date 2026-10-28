@@ -1,4 +1,8 @@
 //! Forward-kernel module index for batch prefill, BitNet, CPU, f16 CPU, q8 CPU, GPU, Metal, and NEON paths.
+//!
+//! **Compatibility path.** This module keeps the pre-split `lattice-inference` paths compiling; the
+//! code it names lives in the crates that own it. These low-level paths are not a stable API and
+//! will be removed at 1.0.
 #[cfg(feature = "qwen35")]
 pub mod batch_prefill;
 pub mod bitnet_kernel;

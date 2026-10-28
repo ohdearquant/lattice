@@ -78,6 +78,9 @@ mod prepared_bpe_vocab_match;
 /// **Unstable**: BERT and classifier weight assembly from safetensors.
 pub mod weight_loading;
 
+/// Consumed inputs retained by additive reported-load constructors.
+pub mod load_report;
+
 /// Per-layer fused Q/K/V weight+bias, built once at model-load time from a
 /// `TransformerLayerWeights` layer's separate `query`/`key`/`value` tensors.
 ///
@@ -239,6 +242,7 @@ pub struct BertModel {
     /// `weights`/`_safetensors` pair above: this is owned, copied data, so it
     /// carries no lifetime/drop-order constraint.
     fused_qkv: Vec<LayerFusedQkv>,
+    load_report: Option<load_report::BertLoadReport>,
 }
 
 impl BertModel {
@@ -349,7 +353,7 @@ impl BertModel {
         let config = BertConfig::from_json_str(config_json)?;
         // The tokenizer's own sequence-length cap has no `tokenizer_config.json`
         // to read here (see `tokenizer_from_json_str`'s doc comment), so derive
-        // it from the config we already have, mirroring `infer_model_max_seq_len`'s
+        // it from the config we already have, mirroring the directory tokenizer loader's
         // 2048 embedding-workload cap.
         let config_cap = config.max_position_embeddings.min(2048);
         let max_seq_len = max_tokens.map_or(config_cap, |cap| cap.min(config_cap));
@@ -400,6 +404,7 @@ impl BertModel {
             _safetensors: safetensors,
             pooling: BertPooling::default(),
             fused_qkv,
+            load_report: None,
         })
     }
 

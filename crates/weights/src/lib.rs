@@ -11,6 +11,7 @@
 
 pub mod bounded_config;
 pub mod bounded_read;
+pub mod consumed;
 pub mod f16_encode;
 pub mod f16_weights;
 pub mod f32_weights;

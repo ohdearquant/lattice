@@ -7,6 +7,15 @@
 //! and the same pipeline over `allow(dead_code` rather than trusting these numbers verbatim. It is NOT intended for direct use by platform or feature crates.
 //! Consumers should go through `lattice-embed`.
 //!
+//! **Compatibility paths are removed at 1.0.** Since the split, the code lives in the crates
+//! that own it: `lattice-compute`, `lattice-arch`, `lattice-weights`, `lattice-metal-runtime`
+//! and the `lattice-model-*` crates, among others. Most module paths this crate still exposes
+//! are re-exports kept so that code written against the pre-split `lattice-inference` keeps
+//! compiling. They are not a stable API, and these low-level re-exports will be removed at 1.0.
+//! New code should import from the owning crate. Each compatibility module says so in its own
+//! documentation, and the removal list is tracked in
+//! <https://github.com/ohdearquant/lattice/issues/2333>.
+//!
 // ML inference kernels: many functions have >7 args by necessity (BLAS-style APIs
 // where grouping into structs would require heap allocation in hot paths), and many
 // loops use the index to access multiple arrays simultaneously so the

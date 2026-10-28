@@ -66,7 +66,7 @@ f16 = ["lattice-weights/f16", "lattice-router/f16", "lattice-model-bert?/f16", "
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
 # be present whenever this feature is — not just under `mixture`.
 metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu", "lattice-model-embeddinggemma2?/metal-gpu", "lattice-model-qwen3-embedding?/metal-gpu", "lattice-model-ernie45?/metal-gpu", "lattice-model-qwen35?/metal-gpu", "lattice-router/metal-gpu"]
-wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "lattice-compute/wgpu-gpu"]
 bench-internals = ["lattice-compute/bench-internals", "lattice-grammar/bench-internals", "lattice-model-qwen35?/bench-internals"]
 # Stock `gemm` for multi-row `matmul_bt` on Linux x86_64 (ADR-099 F1, step 1). Off by default.
 x86-gemm = ["lattice-compute/x86-gemm", "lattice-model-bert?/x86-gemm", "lattice-model-qwen3-embedding?/x86-gemm", "lattice-model-gemma4?/x86-gemm", "lattice-model-ernie45?/x86-gemm"]

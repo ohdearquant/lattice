@@ -60,11 +60,6 @@ const SHADERS: &[ShaderCase] = &[
         source: include_str!("../src/forward/wgsl/attention_context.wgsl"),
         entry_points: &["attention_context"],
     },
-    ShaderCase {
-        file: "gemm.wgsl",
-        source: include_str!("../src/forward/wgsl/gemm.wgsl"),
-        entry_points: &["gemm_bt", "gemm_nn"],
-    },
 ];
 
 #[test]
@@ -137,17 +132,5 @@ fn rust_sources_load_every_wgsl_artifact() {
     assert!(
         !shader_constants.contains("r#\""),
         "gpu/inner/shaders.rs must not retain inline WGSL"
-    );
-
-    let gemm_source = include_str!("../src/forward/gpu_gemm.rs");
-    let gemm_source_compact: String = gemm_source.split_whitespace().collect();
-    assert!(
-        gemm_source_compact
-            .contains(r#"constGEMM_SHADER:&str=concat!("\n",include_str!("wgsl/gemm.wgsl"));"#),
-        "gpu_gemm.rs must load gemm.wgsl"
-    );
-    assert!(
-        !gemm_source.contains("r#\""),
-        "gpu_gemm.rs must not retain inline WGSL"
     );
 }
