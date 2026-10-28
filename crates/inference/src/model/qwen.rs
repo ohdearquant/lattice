@@ -1,4 +1,9 @@
 //! Qwen3 embedding configuration and optional family implementation.
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-arch` and
+//! `lattice-model-qwen3-embedding` keep code written against the pre-split
+//! `lattice-inference` compiling. Those low-level re-exports are not a stable API and will be
+//! removed at 1.0; import them from the owning crate directly.
 
 #[doc(inline)]
 pub use lattice_arch::qwen_config::QwenConfig;
