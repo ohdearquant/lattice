@@ -736,3 +736,50 @@ fn test_save_skips_empty_buffer_layers() {
         );
     }
 }
+
+#[test]
+fn path_load_takes_alpha_from_adjacent_peft_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adapter_model.safetensors");
+    write_test_peft_safetensors(&path, 4, 8, 8);
+    let bytes = std::fs::read(&path).unwrap();
+
+    // No config beside the file: the rank default, as before.
+    assert_eq!(load_peft_safetensors(&path).unwrap().config().alpha, 4.0);
+
+    let config = dir.path().join("adapter_config.json");
+    std::fs::write(
+        &config,
+        r#"{"peft_type":"LORA","r":4,"lora_alpha":32,"target_modules":["q_proj","gate_proj"],"bias":"none"}"#,
+    )
+    .unwrap();
+    let adapter = load_peft_safetensors(&path).unwrap();
+    assert_eq!(adapter.config().alpha, 32.0);
+    assert_eq!(adapter.config().rank, 4);
+
+    // The bytes path reads no file beside anything: governed admission hashes
+    // only the adapter bytes.
+    assert_eq!(
+        load_peft_safetensors_bytes(&bytes).unwrap().config().alpha,
+        4.0
+    );
+
+    std::fs::write(
+        &config,
+        r#"{"r":4,"lora_alpha":32,"target_modules":["q_proj"]}"#,
+    )
+    .unwrap();
+    let err = load_peft_safetensors(&path).unwrap_err();
+    assert!(matches!(err, TuneError::Validation(_)), "{err:?}");
+    assert!(err.to_string().contains("gate_proj"), "{err}");
+
+    std::fs::write(
+        &config,
+        r#"{"r":4,"lora_alpha":32,"target_modules":["q_proj","gate_proj"],"use_dora":true}"#,
+    )
+    .unwrap();
+    assert!(load_peft_safetensors(&path).is_err());
+
+    std::fs::write(&config, "{").unwrap();
+    assert!(load_peft_safetensors(&path).is_err());
+}

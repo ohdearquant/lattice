@@ -28,6 +28,10 @@ fn from_codec(e: LoraError) -> TuneError {
 /// See [`docs/lora-io.md`](../../docs/lora-io.md#load_peft_safetensors_bytes) for parsing invariants.
 pub(crate) fn load_peft_safetensors_bytes(bytes: &[u8]) -> Result<LoraAdapter, TuneError> {
     let decoded = codec::decode_peft_safetensors(bytes).map_err(from_codec)?;
+    adapter_from_decoded(decoded)
+}
+
+fn adapter_from_decoded(decoded: codec::DecodedAdapter) -> Result<LoraAdapter, TuneError> {
     let config = LoraConfig {
         rank: decoded.rank,
         alpha: decoded.alpha,
@@ -112,10 +116,20 @@ pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<
 
 /// Load and validate a PEFT or MLX safetensors LoRA adapter from `path`.
 /// Rejects unreadable, malformed, incomplete, or shape-inconsistent files.
+/// For PEFT-form factors, an `adapter_config.json` beside the file supplies
+/// `lora_alpha` and is checked against the factors; a malformed or
+/// unsupported config is an error, and only a missing one falls back to the
+/// header alpha or the rank.
 /// See [`docs/lora-io.md`](../../docs/lora-io.md#load_peft_safetensors) for parser checks.
 pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
     let data = read_lora_file_bounded(path, MAX_LORA_SIZE)?;
-    load_peft_safetensors_bytes(&data)
+    let mut decoded = codec::decode_peft_safetensors(&data).map_err(from_codec)?;
+    if !decoded.has_mlx_factors
+        && let Some(sidecar) = codec::read_peft_sidecar(path).map_err(from_codec)?
+    {
+        codec::apply_peft_sidecar(&mut decoded, &sidecar).map_err(from_codec)?;
+    }
+    adapter_from_decoded(decoded)
 }
 
 /// Save an adapter as PEFT safetensors, optionally embedding provenance metadata.
