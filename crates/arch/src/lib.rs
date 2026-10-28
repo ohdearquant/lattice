@@ -26,6 +26,7 @@ mod error {
 pub mod bitnet_config;
 mod decode_budget;
 pub mod decoder;
+pub mod embedding_space;
 pub mod embeddinggemma2_config;
 pub mod encoder;
 mod encoder_support;

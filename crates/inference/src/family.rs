@@ -7,6 +7,11 @@
 //! [`crate::encoder`]. [`registry`](crate::family::registry) builds their available descriptors. The
 //! Qwen3 embedding model has no descriptor yet: its loader chooses the Metal backend itself, so a
 //! [`LoadRequest`](crate::family::LoadRequest) cannot fix its backend.
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-arch`,
+//! `lattice-model-bert`, `lattice-model-embeddinggemma2` and `lattice-model-qwen35` keep code
+//! written against the pre-split `lattice-inference` compiling. Those low-level re-exports are not
+//! a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 pub use lattice_arch::decoder::{DecoderModel, SessionRequest, TextDecoder, TextStream};
 pub use lattice_arch::family::{

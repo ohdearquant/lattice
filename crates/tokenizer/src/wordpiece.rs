@@ -630,6 +630,31 @@ impl WordPieceTokenizer {
 }
 
 impl Tokenizer for WordPieceTokenizer {
+    fn embedding_settings(&self) -> Option<Vec<(String, crate::common::TokenizerPolicyValue)>> {
+        use crate::common::{TokenizerPolicyValue as V, report_id, report_tokens};
+        let mut settings = vec![
+            (
+                "max_seq_len".into(),
+                V::Unsigned(self.inner.max_seq_len as u64),
+            ),
+            (
+                "vocab_size".into(),
+                V::Unsigned(self.inner.id_to_token.len() as u64),
+            ),
+            ("program".into(), V::String("wordpiece-single-v1".into())),
+        ];
+        for (key, id) in [
+            ("cls", self.inner.cls_id),
+            ("sep", self.inner.sep_id),
+            ("pad", self.inner.pad_id),
+            ("unk", self.inner.unk_id),
+            ("mask", self.inner.mask_id),
+        ] {
+            report_id(&mut settings, key, Some(id));
+        }
+        report_tokens(&mut settings, "added", &self.inner.added_tokens);
+        Some(settings)
+    }
     fn tokenize(&self, text: &str) -> TokenizedInput {
         let (ids, pre_truncation_len) = self.tokenize_to_ids(text);
         pad_ids(

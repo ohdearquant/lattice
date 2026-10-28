@@ -139,6 +139,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [101](ADR-101-time-series-forecasting.md)                     | Time-series forecasting models in lattice-inference                                                          | Proposed (2026-10-15) | ADR-003, ADR-096                                                               |
 | [102](ADR-102-metal-execution-reorganisation.md)              | Reorganising Metal execution around shared mechanisms and typed model sessions                               | Proposed (2026-10-16) | Extends ADR-090; ADR-074, ADR-087                                              |
 | [103](ADR-103-inference-crate-decomposition.md)               | Splitting lattice-inference into focused crates behind a facade                                              | Accepted (2026-10-19) | ADR-102                                                                        |
+| [104](ADR-104-embedding-vector-space-identity.md)             | Embedding Vector-Space Identity                                                                              | Proposed              | ADR-003, ADR-005, ADR-014–017, ADR-103                                         |
 
 ## informational
 
