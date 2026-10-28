@@ -9,8 +9,8 @@ The crate has no dependencies. `lattice-fann` re-exports it at its earlier paths
 (`lattice_fann::LoraDescriptor` and `lattice_fann::lora::*`), so code written against those paths
 keeps compiling and names the same types.
 
-Blend arithmetic, adapter file formats and the forward-pass hook still live in the crates that
-use them today, and move here in later releases.
+The shared host blend applies already-effective weights. Adapter file formats and the
+forward-pass hook remain in their current crates and move here in later releases.
 
 ## Crate reference
 
