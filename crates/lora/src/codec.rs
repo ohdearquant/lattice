@@ -510,12 +510,14 @@ pub fn read_adapter_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>,
         ))
     })?;
     let mut buf = Vec::new();
-    f.take(max_bytes + 1).read_to_end(&mut buf).map_err(|e| {
-        LoraError::Io(std::io::Error::new(
-            e.kind(),
-            format!("failed to read LoRA adapter from {}: {e}", path.display()),
-        ))
-    })?;
+    f.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| {
+            LoraError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to read LoRA adapter from {}: {e}", path.display()),
+            ))
+        })?;
     if buf.len() as u64 > max_bytes {
         return Err(LoraError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

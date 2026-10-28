@@ -484,3 +484,34 @@ fn unpaired_factors_and_rank_mismatch_preserve_error_precedence() {
         "LoRA rank mismatch for layer 0 module 'q_proj': A rank=1, B rank=2"
     );
 }
+
+#[test]
+fn bounded_read_u64_max_round_trips_and_honors_finite_cap() {
+    use std::io::Write;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "lattice-lora-bounded-read-{}-{unique}",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let bytes = b"small adapter fixture";
+    file.write_all(bytes).unwrap();
+    file.flush().unwrap();
+    assert_eq!(read_adapter_file_bounded(&path, u64::MAX).unwrap(), bytes);
+    assert_eq!(
+        read_adapter_file_bounded(&path, bytes.len() as u64).unwrap(),
+        bytes
+    );
+    let err = read_adapter_file_bounded(&path, bytes.len() as u64 - 1).unwrap_err();
+    assert!(matches!(err, LoraError::Io(_)));
+    assert!(err.message().contains("exceeds maximum"));
+    drop(file);
+    std::fs::remove_file(path).unwrap();
+}
