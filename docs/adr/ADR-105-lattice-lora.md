@@ -65,7 +65,7 @@ Every other LoRA concern stays with its current owner:
 
 `lattice-lora` depends on no model crate and on none of `lattice-compute`, `lattice-fann`, `lattice-tune`, `lattice-serve`, `lattice-router` or `lattice-arch`. With no features enabled it has no dependency at all: today's `LoraDescriptor` derives only `Debug`, `Clone` and `PartialEq` (`crates/fann/src/lora.rs:28`). Optional dependencies are feature-gated:
 
-- `safetensors`: format reading and writing. Reading a PEFT `adapter_config.json` sidecar also needs JSON, so this feature enables `serde` and `serde_json`.
+- `safetensors`: format reading and writing. Reading a PEFT `adapter_config.json` sidecar also needs JSON and PEFT's `target_modules` patterns, so this feature enables `serde_json` and `regex`.
 - `serde`: the manifest types, with `serde_json` for their JSON form.
 - Admission mechanics need both features, as tune's `loader` does today (`all(feature = "safetensors", feature = "serde")`).
 
@@ -122,8 +122,8 @@ One parser reads PEFT and MLX safetensors adapters. It:
 Alpha is resolved as follows:
 
 - For a path-based import, a bounded adjacent `adapter_config.json` is read when present. A missing file is different from an unreadable or malformed one, and only a missing file permits fallback.
-- PEFT `lora_alpha` from that file is authoritative. If the header also carries `alpha`, the two must be equal, or the load fails and names both sources. `r` must equal the tensor rank. `target_modules` must cover every target present.
-- `use_rslora=true`, a non-empty `rank_pattern` or `alpha_pattern`, and DoRA are refused as unsupported. They are never approximated.
+- PEFT `lora_alpha` from that file is authoritative. If the header also carries `alpha`, the two must be equal, or the load fails and names both sources. `r` must equal the tensor rank. `target_modules` must cover every target present, with PEFT's matching: a list entry matches a module path equal to it or ending in `.` plus it, and a string is a pattern that must match the whole path. `exclude_modules`, when present, must match no target present.
+- `use_rslora=true`, a non-empty `rank_pattern` or `alpha_pattern`, and DoRA are refused as unsupported, as are trained biases, `modules_to_save`, trainable tokens, `"all-linear"` and a pattern the reader cannot evaluate. They are never approximated.
 - MLX config semantics are not assumed. An MLX file uses header alpha, an explicitly supplied alpha, or the rank fallback.
 - When no source declares alpha, alpha = rank, and the load report records that the rank default was used.
 
