@@ -611,7 +611,7 @@ jobs:
             exit "$status"
           fi
           for name in \
-            chat::tests::oneshot_uses_checked_cpu_backend \
+            chat::io_tests::oneshot_uses_checked_cpu_backend \
             serve::tests::every_shared_lora_route_is_registered_in_this_binary
           do
             grep -Fxq "test ${name} ... ok" "$log" || {
