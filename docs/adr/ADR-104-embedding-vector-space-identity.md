@@ -292,10 +292,12 @@ pairs during rollback. Unsupported schemas and modes remain unsupported.
   when practical comparability is unchanged.
 - Header opt-in trades away detection of header-preserving weight-value edits.
 - Strict consumers refuse Unavailable results, including otherwise usable opaque producers.
-- Full content hashing has **UNMEASURED** load cost. Proposed measurements record bytes hashed
-  per load and per family plus wall time on an Apple silicon macOS host and an x86-64 Linux
-  host, for default Full and explicit Header. No measurement, negligible-overhead claim or
-  performance conclusion is established.
+- Full content hashing adds load cost. Measured for BGE-small-en-v1.5 on an x86-64 Linux host
+  (Intel i9-13900HX): one SHA-256 over the 133,466,304-byte `model.safetensors` per load adds
+  about 46 ms (median 126 ms to 172 ms for a load plus one short embed through the `embed` CLI,
+  10 processes per arm in ABBA order, quiet host). It is paid once per model load, not per
+  embedding, and grows with checkpoint size. Not yet measured: the Apple silicon macOS host,
+  explicit Header, and other model families. No negligible-overhead claim is made.
 
 ### Risks
 
