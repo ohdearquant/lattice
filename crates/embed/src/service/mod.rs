@@ -28,7 +28,9 @@ std::thread_local! {
 #[cfg(feature = "native")]
 pub use cached::CachedEmbeddingService;
 #[cfg(feature = "native")]
-pub use native::NativeEmbeddingService;
+pub use native::{
+    EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode, NativeEmbeddingService,
+};
 #[cfg(feature = "native")]
 pub use prepared::{
     AttestationAlgorithm, CheckpointAttestor, MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES,
