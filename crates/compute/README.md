@@ -10,6 +10,7 @@ attention kernels that build only on those primitives (standard multi-head, tile
 grouped-query, single-token decode, differential, causal flash, sigmoid output gating and
 native sparse attention), the GatedDeltaNet recurrent kernels, and the attention variant
 taxonomy (`AttentionKind`, `AttentionTag`).
+Continuous batching, including per-sequence state, scheduling, and the batch worker, lives in `batch`.
 Sampling moves here in a later release.
 `lattice-inference` re-exports the supported items at their original paths.
 
