@@ -20,6 +20,7 @@ lattice-arch.workspace = true
 lattice-compute.workspace = true
 
 [dev-dependencies]
+lattice-compute = { workspace = true, features = ["test-utils"] }
 lattice-model-qwen35.workspace = true
 
 [lints]
