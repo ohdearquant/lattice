@@ -24,15 +24,15 @@ LoRA code lives in six places today:
 
 The two safetensors readers disagree on the following:
 
-|                                   | `lattice-model-qwen35` reader                                                           | `lattice-tune` reader            |
-| --------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------- |
-| Key acceptance                    | `base_model.model.model.layers.` and `model.layers.`, blocks `self_attn` and `mlp` only | any key containing `.layers.`    |
-| Unknown module under `mlp`        | skipped                                                                                 | accepted                         |
-| Duplicate normalized keys         | last one wins                                                                           | last one wins                    |
-| Non-numeric `alpha`               | falls back to rank                                                                      | falls back to rank               |
-| Non-finite `alpha` (`NaN`, `inf`) | accepted                                                                                | refused                          |
-| Rank-0 factor pair                | loads                                                                                   | refused by descriptor validation |
-| Header read                       | unbounded                                                                               | bounded                          |
+|                                   | `lattice-model-qwen35` reader                                                           | `lattice-tune` reader         |
+| --------------------------------- | --------------------------------------------------------------------------------------- | ----------------------------- |
+| Key acceptance                    | `base_model.model.model.layers.` and `model.layers.`, blocks `self_attn` and `mlp` only | any key containing `.layers.` |
+| Unknown module under `mlp`        | skipped                                                                                 | accepted                      |
+| Duplicate normalized keys         | last one wins                                                                           | last one wins                 |
+| Non-numeric `alpha`               | falls back to rank                                                                      | refused                       |
+| Non-finite `alpha` (`NaN`, `inf`) | accepted                                                                                | refused                       |
+| Rank-0 factor pair                | loads                                                                                   | loads                         |
+| Header read                       | unbounded                                                                               | bounded                       |
 
 The Qwen reader matches only the `base_model.model.model.layers.` and `model.layers.` prefixes, so it misses a text decoder stored under `language_model` (Qwen3.5 checkpoints name their layers `model.language_model.layers.<i>`); the tune reader finds `.layers.` anywhere in the key and accepts that form. The Qwen reader also does not accept the `linear_attn` block where Qwen3.5 keeps its GatedDeltaNet projections.
 
@@ -65,7 +65,7 @@ Every other LoRA concern stays with its current owner:
 
 `lattice-lora` depends on no model crate and on none of `lattice-compute`, `lattice-fann`, `lattice-tune`, `lattice-serve`, `lattice-router` or `lattice-arch`. With no features enabled it has no dependency at all: today's `LoraDescriptor` derives only `Debug`, `Clone` and `PartialEq` (`crates/fann/src/lora.rs:28`). Optional dependencies are feature-gated:
 
-- `safetensors`: format reading and writing. Reading a PEFT `adapter_config.json` sidecar also needs JSON, so this feature enables `serde` and `serde_json`.
+- `safetensors`: format reading and writing. Reading a PEFT `adapter_config.json` sidecar also needs JSON and PEFT's `target_modules` patterns, so this feature enables `serde_json` and `regex`.
 - `serde`: the manifest types, with `serde_json` for their JSON form.
 - Admission mechanics need both features, as tune's `loader` does today (`all(feature = "safetensors", feature = "serde")`).
 
@@ -116,14 +116,14 @@ One parser reads PEFT and MLX safetensors adapters. It:
 - refuses tensors outside the selected text namespace, such as vision and audio towers;
 - refuses duplicate keys after normalization, including identical bytes;
 - refuses a pair with mixed dialects, and any unknown suffix;
-- checks pair completeness, shapes, rank agreement and finiteness before any factor is exposed. A rank-0 pair is not a parse error. Descriptor validation stays with the caller, so tune still refuses rank 0, and the Qwen load path keeps its current zero-rank behaviour until a separate decision;
+- checks pair completeness, shapes, rank agreement and finiteness before any factor is exposed. A rank-0 pair is not a parse error. Descriptor validation stays with the caller. Neither reader refuses rank 0 today (tune's descriptor check covers only alpha and scale finiteness), and both keep that behaviour until a separate decision;
 - reads the header under an explicit size cap and checks the decoded size before allocating.
 
 Alpha is resolved as follows:
 
 - For a path-based import, a bounded adjacent `adapter_config.json` is read when present. A missing file is different from an unreadable or malformed one, and only a missing file permits fallback.
-- PEFT `lora_alpha` from that file is authoritative. If the header also carries `alpha`, the two must be equal, or the load fails and names both sources. `r` must equal the tensor rank. `target_modules` must cover every target present.
-- `use_rslora=true`, a non-empty `rank_pattern` or `alpha_pattern`, and DoRA are refused as unsupported. They are never approximated.
+- PEFT `lora_alpha` from that file is authoritative. If the header also carries `alpha`, the two must be equal, or the load fails and names both sources. `r` must equal the tensor rank. `target_modules` must cover every target present, with PEFT's matching: a list entry matches a module path equal to it or ending in `.` plus it, and a string is a pattern that must match the whole path. `exclude_modules`, when present, must match no target present.
+- `use_rslora=true`, a non-empty `rank_pattern` or `alpha_pattern`, and DoRA are refused as unsupported, as are trained biases, `modules_to_save`, trainable tokens, `"all-linear"` and a pattern the reader cannot evaluate. They are never approximated.
 - MLX config semantics are not assumed. An MLX file uses header alpha, an explicitly supplied alpha, or the rank fallback.
 - When no source declares alpha, alpha = rank, and the load report records that the rank default was used.
 
@@ -158,7 +158,7 @@ The new API carries this in its types:
 - the kernel accepts only resolved contributions;
 - its result exposes no conversion back to a raw view.
 
-The existing wrappers keep their contracts. Tune's blend folds `config.scale()` exactly once, and keeps its pre-filter that drops empty placeholder layers (`a` and `b` both empty) before the shared kernel runs. The Qwen blend passes every layer to `plan_blend`, which refuses rank 0, so the two wrappers differ there on purpose. The Qwen Metal blend takes weights that are already effective, through a narrowly named legacy bridge. Routing keeps every choice about coefficient normalization and floors (ADR-091).
+The existing wrappers keep their contracts. Tune's blend folds `config.scale()` exactly once and has no placeholder pre-filter: a positive-rank layer with empty `a` and `b` is refused by the buffer-length check, and a rank-0 layer contributes nothing. The Qwen blend passes every layer to the shared planner, which does not refuse rank 0; Qwen refuses rank 0 later, when it loads the blended adapter. The Qwen Metal blend takes weights that are already effective, through a narrowly named legacy bridge. Routing keeps every choice about coefficient normalization and floors (ADR-091).
 
 ### D7: errors
 
