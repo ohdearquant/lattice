@@ -38,6 +38,9 @@ use lattice_compute::gemma_ops::{
     gemma4_apply_rope, gemma4_geglu_mlp, gemma4_gelu_tanh, gemma4_logit_softcap, gemma4_rms_norm,
     gemma4_rope_cos_sin, gemma4_rope_inv_freq, gemma4_scaled_embedding,
 };
+use lattice_compute::lora_hook::{
+    LoraHook, LoraProjectionShape, LoraTargetGeometry, NoopLoraHook, apply_lora_rows,
+};
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::common::Tokenizer;
 use lattice_tokenizer::gemma_bpe::GemmaBpeTokenizer;
@@ -157,6 +160,7 @@ pub struct Gemma4Model {
     pub(crate) weights: Gemma4Weights,
     per_layer_embeddings: PerLayerEmbeddings,
     pub(crate) tokenizer: GemmaBpeTokenizer,
+    lora: Box<dyn LoraHook>,
     /// Sliding-layer RoPE inverse-frequency table, length `head_dim / 2`.
     local_inv_freq: Vec<f32>,
     /// Global-layer RoPE inverse-frequency table (proportional, zero-padded
@@ -173,6 +177,87 @@ pub struct Gemma4Model {
     /// would be a semver-major break. `generate_greedy`/`generate_greedy_with_probe` do not read
     /// this at all -- they remain the fixed-count diagnostic entry points that never check EOS.
     stop_token_ids: Vec<u32>,
+}
+
+struct Gemma4LoraGeometry<'a>(&'a Gemma4Config);
+
+impl LoraTargetGeometry for Gemma4LoraGeometry<'_> {
+    fn num_layers(&self) -> usize {
+        self.0.num_hidden_layers
+    }
+
+    fn projection_shape(&self, layer: usize, module: &str) -> Result<LoraProjectionShape, String> {
+        let cfg = self.0;
+        if layer >= cfg.num_hidden_layers {
+            return Err(format!("Gemma 4 layer {layer} is out of range"));
+        }
+        let hidden = cfg.hidden_size;
+        let head = cfg.attn_head_dim(layer);
+        let q = cfg.num_attention_heads * head;
+        let kv = cfg.num_key_value_heads * head;
+        let mlp = cfg.mlp_intermediate_size(layer);
+        let (d_in, d_out) = match module {
+            "q_proj" => (hidden, q),
+            "k_proj" | "v_proj" if cfg.is_kv_shared_layer(layer) => {
+                return Err(format!(
+                    "Gemma 4 layer {layer} shares KV and has no {module}"
+                ));
+            }
+            "k_proj" | "v_proj" => (hidden, kv),
+            "o_proj" => (q, hidden),
+            "gate_proj" | "up_proj" => (hidden, mlp),
+            "down_proj" => (mlp, hidden),
+            _ => {
+                return Err(format!(
+                    "unknown Gemma 4 LoRA module {module} on layer {layer}"
+                ));
+            }
+        };
+        Ok(LoraProjectionShape { d_in, d_out })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemma4_lora_mlp(
+    hook: &dyn LoraHook,
+    layer: usize,
+    x: &[f32],
+    gate_w: &[f32],
+    up_w: &[f32],
+    down_w: &[f32],
+    rows: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate: &mut [f32],
+    up: &mut [f32],
+    out: &mut [f32],
+) {
+    if !["gate_proj", "up_proj", "down_proj"]
+        .iter()
+        .any(|module| hook.is_active(layer, module))
+    {
+        gemma4_geglu_mlp(
+            x,
+            gate_w,
+            up_w,
+            down_w,
+            rows,
+            hidden,
+            intermediate,
+            gate,
+            up,
+            out,
+        );
+        return;
+    }
+    matmul_bt(x, gate_w, gate, rows, hidden, intermediate);
+    apply_lora_rows(hook, layer, "gate_proj", x, gate, hidden, intermediate);
+    matmul_bt(x, up_w, up, rows, hidden, intermediate);
+    apply_lora_rows(hook, layer, "up_proj", x, up, hidden, intermediate);
+    gemma4_gelu_tanh(gate);
+    elementwise_mul(gate, up);
+    matmul_bt(gate, down_w, out, rows, intermediate, hidden);
+    apply_lora_rows(hook, layer, "down_proj", gate, out, intermediate, hidden);
 }
 
 /// UTF-8-boundary-safe streaming detokenizer for [`Gemma4Model::generate_streaming_via_driver`].
@@ -274,6 +359,7 @@ impl Gemma4Model {
             weights,
             per_layer_embeddings,
             tokenizer,
+            lora: Box::new(NoopLoraHook),
             local_inv_freq,
             global_inv_freq,
             stop_token_ids,
@@ -283,6 +369,33 @@ impl Gemma4Model {
     /// **Unstable**: access Gemma 4 configuration.
     pub fn config(&self) -> &Gemma4Config {
         &self.config
+    }
+
+    /// **Unstable**: install a LoRA hook after validating its declared targets.
+    ///
+    /// Hooks that use the default geometry validator are responsible for their
+    /// own shape checks. Hooks must accurately report their active targets via
+    /// `is_active`; its default of `true` refuses models with shared-KV layers.
+    /// Shared-KV layers never execute K/V projections.
+    ///
+    /// # Errors
+    /// Returns an error without replacing the current hook if validation fails.
+    pub fn set_lora(&mut self, hook: Box<dyn LoraHook>) -> Result<(), InferenceError> {
+        hook.validate_geometry(&Gemma4LoraGeometry(&self.config))
+            .map_err(InferenceError::InvalidInput)?;
+        for layer in 0..self.config.num_hidden_layers {
+            if self.config.is_kv_shared_layer(layer) {
+                for module in ["k_proj", "v_proj"] {
+                    if hook.is_active(layer, module) {
+                        return Err(InferenceError::InvalidInput(format!(
+                            "Gemma 4 layer {layer} shares KV and cannot target {module}"
+                        )));
+                    }
+                }
+            }
+        }
+        self.lora = hook;
+        Ok(())
     }
 
     /// **Unstable**: the full stop-token set [`Self::generate`]/`Self::generate_with_trace`/
@@ -423,6 +536,15 @@ impl Gemma4Model {
                 hidden_size,
                 q_dim,
             );
+            apply_lora_rows(
+                self.lora.as_ref(),
+                layer_idx,
+                "q_proj",
+                &scratch.normed[..hidden_size],
+                &mut scratch.q[..q_dim],
+                hidden_size,
+                q_dim,
+            );
             for h in 0..num_q_heads {
                 let start = h * head_w;
                 gemma4_rms_norm(
@@ -459,11 +581,29 @@ impl Gemma4Model {
                     hidden_size,
                     kv_dim,
                 );
+                apply_lora_rows(
+                    self.lora.as_ref(),
+                    layer_idx,
+                    "k_proj",
+                    &scratch.normed[..hidden_size],
+                    &mut scratch.k[..kv_dim],
+                    hidden_size,
+                    kv_dim,
+                );
                 matmul_bt(
                     &scratch.normed[..hidden_size],
                     v_proj,
                     &mut scratch.v[..kv_dim],
                     1,
+                    hidden_size,
+                    kv_dim,
+                );
+                apply_lora_rows(
+                    self.lora.as_ref(),
+                    layer_idx,
+                    "v_proj",
+                    &scratch.normed[..hidden_size],
+                    &mut scratch.v[..kv_dim],
                     hidden_size,
                     kv_dim,
                 );
@@ -532,6 +672,15 @@ impl Gemma4Model {
                 q_dim,
                 hidden_size,
             );
+            apply_lora_rows(
+                self.lora.as_ref(),
+                layer_idx,
+                "o_proj",
+                &scratch.context[..q_dim],
+                &mut scratch.attn_out[..hidden_size],
+                q_dim,
+                hidden_size,
+            );
             gemma4_rms_norm(
                 &mut scratch.attn_out[..hidden_size],
                 &lw.post_attention_layernorm,
@@ -552,7 +701,9 @@ impl Gemma4Model {
                 cfg.rms_norm_eps,
             );
             let mlp_dim = cfg.mlp_intermediate_size(layer_idx);
-            gemma4_geglu_mlp(
+            gemma4_lora_mlp(
+                self.lora.as_ref(),
+                layer_idx,
                 &scratch.normed2[..hidden_size],
                 &lw.gate_proj,
                 &lw.up_proj,
@@ -1410,6 +1561,7 @@ pub fn tiny_zero_model_with_vocab(vocab_size: usize) -> Gemma4Model {
         weights,
         per_layer_embeddings,
         tokenizer,
+        lora: Box::new(NoopLoraHook),
         local_inv_freq,
         global_inv_freq,
         stop_token_ids,

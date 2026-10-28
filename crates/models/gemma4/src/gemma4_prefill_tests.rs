@@ -1131,3 +1131,271 @@ fn gemma_batched_prefill_real_controller_matches_scalar_at_511_512_513() {
 fn gemma_batched_prefill_real_controller_matches_scalar_at_2512() {
     real_controller_parity(&[2512]);
 }
+
+type LoraCalls =
+    std::sync::Arc<std::sync::Mutex<Vec<(usize, String, Vec<f32>, Vec<f32>, Vec<f32>)>>>;
+
+#[derive(Clone)]
+struct TestAdapter {
+    targets: Vec<(usize, &'static str, usize, usize)>,
+    b: f32,
+    calls: LoraCalls,
+}
+
+impl LoraHook for TestAdapter {
+    fn validate_geometry(&self, geometry: &dyn LoraTargetGeometry) -> Result<(), String> {
+        for &(layer, module, input, output) in &self.targets {
+            let shape = geometry.projection_shape(layer, module)?;
+            if shape.d_in != input || shape.d_out != output {
+                return Err(format!("wrong shape for layer {layer} {module}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn is_active(&self, layer: usize, module: &str) -> bool {
+        self.targets
+            .iter()
+            .any(|target| target.0 == layer && target.1 == module)
+    }
+
+    fn apply(&self, layer: usize, module: &str, input: &[f32], output: &mut [f32]) {
+        let before = output.to_vec();
+        // Rank-one A and B have a single nonzero entry each, with scale 0.5.
+        output[0] += 0.5 * self.b * (2.0 * input[0]);
+        self.calls.lock().unwrap().push((
+            layer,
+            module.to_owned(),
+            input.to_vec(),
+            before,
+            output.to_vec(),
+        ));
+    }
+}
+
+fn adapter_for(model: &Gemma4Model, b: f32, all: bool) -> TestAdapter {
+    let geometry = Gemma4LoraGeometry(&model.config);
+    let mut targets = Vec::new();
+    for layer in 0..geometry.num_layers() {
+        for module in [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ] {
+            if !all && (layer != 0 || module != "q_proj") {
+                continue;
+            }
+            if let Ok(shape) = geometry.projection_shape(layer, module) {
+                targets.push((layer, module, shape.d_in, shape.d_out));
+            }
+        }
+    }
+    TestAdapter {
+        targets,
+        b,
+        calls: Default::default(),
+    }
+}
+
+fn lora_logits(model: &Gemma4Model, batch: bool) -> Vec<u32> {
+    let mut cache = model.new_cache(16).unwrap();
+    let mut output = Gemma4Scratch::new(&model.config);
+    if batch {
+        assert!(
+            forward_chunk(
+                model,
+                &[2, 3, 4],
+                0,
+                &mut cache,
+                &mut Gemma4PrefillScratch::default(),
+                &mut output,
+                true,
+                &|| false
+            )
+            .unwrap()
+        );
+    } else {
+        for (position, token) in [2, 3, 4].into_iter().enumerate() {
+            model
+                .forward_step(token, position, &mut cache, &mut output, &[])
+                .unwrap();
+        }
+    }
+    output.logits.iter().map(|value| value.to_bits()).collect()
+}
+
+#[test]
+fn lora_zero_b_preserves_logits_and_visits_every_available_projection() {
+    for batch in [false, true] {
+        let mut model = fixture();
+        let reference = lora_logits(&model, batch);
+        let adapter = adapter_for(&model, 0.0, true);
+        let calls = adapter.calls.clone();
+        model.set_lora(Box::new(adapter.clone())).unwrap();
+        assert_eq!(lora_logits(&model, batch), reference);
+        let recorded = calls.lock().unwrap();
+        for &(layer, module, _, _) in &adapter.targets {
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|entry| entry.0 == layer && entry.1 == module)
+                    .count(),
+                3,
+                "{layer} {module}"
+            );
+        }
+        assert!(
+            !recorded
+                .iter()
+                .any(|entry| entry.0 >= 4 && (entry.1 == "k_proj" || entry.1 == "v_proj"))
+        );
+    }
+}
+
+#[test]
+fn lora_query_rank_one_delta_is_applied_in_decode_and_prefill() {
+    for batch in [false, true] {
+        let mut model = fixture();
+        let reference = lora_logits(&model, batch);
+        let adapter = adapter_for(&model, 1.25, false);
+        let calls = adapter.calls.clone();
+        model.set_lora(Box::new(adapter)).unwrap();
+        let changed = lora_logits(&model, batch);
+        assert_ne!(changed, reference, "query adapter must change logits");
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        for (_, _, input, before, after) in recorded.iter() {
+            assert_eq!(
+                after[0].to_bits(),
+                (before[0] + 0.5 * 1.25 * (2.0 * input[0])).to_bits()
+            );
+            assert_eq!(&after[1..], &before[1..]);
+        }
+    }
+}
+
+#[test]
+fn lora_validation_refuses_bad_targets_without_replacing_hook() {
+    let mut model = fixture();
+    let good = adapter_for(&model, 1.25, false);
+    model.set_lora(Box::new(good)).unwrap();
+    let reference = lora_logits(&model, false);
+    for (layer, module, input, output, expected) in [
+        (0, "q_proj", 1, 16, "wrong shape"),
+        (8, "q_proj", 12, 16, "out of range"),
+        (0, "unknown", 12, 16, "unknown"),
+        (4, "k_proj", 12, 8, "shares KV"),
+        (5, "v_proj", 12, 16, "shares KV"),
+    ] {
+        let bad = TestAdapter {
+            targets: vec![(layer, module, input, output)],
+            b: 2.0,
+            calls: Default::default(),
+        };
+        let error = model.set_lora(Box::new(bad)).err().unwrap().to_string();
+        assert!(error.contains(expected), "{error}");
+        assert_eq!(
+            lora_logits(&model, false),
+            reference,
+            "failed installation replaced the hook"
+        );
+    }
+    let geometry = Gemma4LoraGeometry(&model.config);
+    for module in ["k_proj", "v_proj"] {
+        let error = geometry.projection_shape(4, module).unwrap_err();
+        assert!(
+            error.contains("layer 4") && error.contains(module),
+            "{error}"
+        );
+    }
+    for (layer, module, input, output) in [
+        (0, "q_proj", 12, 16),
+        (1, "q_proj", 12, 32),
+        (0, "k_proj", 12, 8),
+        (1, "v_proj", 12, 16),
+        (1, "o_proj", 32, 12),
+        (0, "gate_proj", 12, 11),
+        (4, "up_proj", 12, 22),
+        (4, "down_proj", 22, 12),
+    ] {
+        assert_eq!(
+            geometry.projection_shape(layer, module).unwrap(),
+            LoraProjectionShape {
+                d_in: input,
+                d_out: output
+            }
+        );
+    }
+}
+
+#[test]
+fn lora_attach_refuses_active_shared_kv_even_with_default_validator() {
+    struct SharedTarget(&'static str);
+    impl LoraHook for SharedTarget {
+        fn apply(&self, _: usize, _: &str, _: &[f32], _: &mut [f32]) {}
+        fn is_active(&self, layer: usize, module: &str) -> bool {
+            layer == 4 && module == self.0
+        }
+    }
+
+    let mut model = fixture();
+    model
+        .set_lora(Box::new(adapter_for(&model, 1.25, false)))
+        .unwrap();
+    let reference = lora_logits(&model, false);
+    for module in ["k_proj", "v_proj"] {
+        let error = model
+            .set_lora(Box::new(SharedTarget(module)))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("layer 4") && error.contains(module),
+            "{error}"
+        );
+        assert_eq!(lora_logits(&model, false), reference);
+    }
+}
+
+#[test]
+fn lora_adapter_geometry_refuses_shared_kv_before_installation() {
+    struct GeometryAdapter(TestAdapter);
+    impl LoraHook for GeometryAdapter {
+        fn apply(&self, layer: usize, module: &str, input: &[f32], output: &mut [f32]) {
+            self.0.apply(layer, module, input, output);
+        }
+        fn is_active(&self, _: usize, _: &str) -> bool {
+            false
+        }
+        fn validate_geometry(&self, geometry: &dyn LoraTargetGeometry) -> Result<(), String> {
+            self.0.validate_geometry(geometry)
+        }
+    }
+
+    let mut model = fixture();
+    model
+        .set_lora(Box::new(adapter_for(&model, 1.25, false)))
+        .unwrap();
+    let reference = lora_logits(&model, false);
+    for module in ["k_proj", "v_proj"] {
+        let adapter = TestAdapter {
+            targets: vec![(4, module, 12, 8)],
+            b: 1.0,
+            calls: Default::default(),
+        };
+        let error = model
+            .set_lora(Box::new(GeometryAdapter(adapter)))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("layer 4") && error.contains(module),
+            "{error}"
+        );
+        assert_eq!(lora_logits(&model, false), reference);
+    }
+}

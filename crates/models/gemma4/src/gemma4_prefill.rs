@@ -579,6 +579,15 @@ pub(super) fn forward_chunk_with_observer<O: WorkObserver>(
             Some(layer),
             observer,
         );
+        apply_lora_rows(
+            model.lora.as_ref(),
+            layer,
+            "q_proj",
+            &scratch.normed[..layout.hidden_len],
+            &mut scratch.q[..q_len],
+            hidden,
+            q_dim,
+        );
         for row in scratch.q[..q_len].chunks_exact_mut(head) {
             gemma4_rms_norm(row, &weights.q_norm, head, cfg.rms_norm_eps);
         }
@@ -618,6 +627,15 @@ pub(super) fn forward_chunk_with_observer<O: WorkObserver>(
                 Some(layer),
                 observer,
             );
+            apply_lora_rows(
+                model.lora.as_ref(),
+                layer,
+                "k_proj",
+                &scratch.normed[..layout.hidden_len],
+                &mut scratch.k[..kv_len],
+                hidden,
+                kv_dim,
+            );
             project(
                 &scratch.normed[..layout.hidden_len],
                 v_proj,
@@ -628,6 +646,15 @@ pub(super) fn forward_chunk_with_observer<O: WorkObserver>(
                 Projection::Value,
                 Some(layer),
                 observer,
+            );
+            apply_lora_rows(
+                model.lora.as_ref(),
+                layer,
+                "v_proj",
+                &scratch.normed[..layout.hidden_len],
+                &mut scratch.v[..kv_len],
+                hidden,
+                kv_dim,
             );
             for row in scratch.k[..kv_len].chunks_exact_mut(head) {
                 gemma4_rms_norm(row, k_norm, head, cfg.rms_norm_eps);
@@ -703,6 +730,15 @@ pub(super) fn forward_chunk_with_observer<O: WorkObserver>(
             Some(layer),
             observer,
         );
+        apply_lora_rows(
+            model.lora.as_ref(),
+            layer,
+            "o_proj",
+            &scratch.context[..q_len],
+            &mut scratch.branch_out[..layout.hidden_len],
+            q_dim,
+            hidden,
+        );
         for row in scratch.branch_out[..layout.hidden_len].chunks_exact_mut(hidden) {
             gemma4_rms_norm(
                 row,
@@ -726,7 +762,9 @@ pub(super) fn forward_chunk_with_observer<O: WorkObserver>(
             );
         }
         let intermediate = cfg.mlp_intermediate_size(layer);
-        gemma4_geglu_mlp(
+        gemma4_lora_mlp(
+            model.lora.as_ref(),
+            layer,
             &scratch.normed[..layout.hidden_len],
             &weights.gate_proj,
             &weights.up_proj,
