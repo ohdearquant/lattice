@@ -1988,3 +1988,18 @@ fn qwen_full_report_records_successful_sharded_load() {
             .any(|input| input.logical_identifier == "vocab.txt")
     );
 }
+
+#[test]
+fn identified_encode_bypasses_poisoned_cache_and_reports_cpu() {
+    let model = build_forward_test_model();
+    let (ids, _) = model.tokenize_for_embedding("two").unwrap();
+    let key = hash_token_ids(&ids);
+    let poison = vec![42.0; model.dimensions()];
+    model.cache.lock().unwrap().insert(key, poison.clone());
+    assert_eq!(model.encode("two").unwrap(), poison);
+    let (fresh, backend) = model.encode_identified_uncached("two").unwrap();
+    assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+    assert_ne!(fresh, poison);
+    assert_matches_reference(&fresh, FORWARD_REFERENCES[1].pooled);
+    assert_eq!(model.encode("two").unwrap(), poison);
+}

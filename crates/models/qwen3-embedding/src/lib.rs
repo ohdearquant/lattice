@@ -713,6 +713,16 @@ pub struct QwenFullLoadReport {
     pub sharded: Option<lattice_weights::f32_weights::ShardedFullReport>,
 }
 
+/// Backend that produced a particular uncached Qwen embedding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum QwenEmbeddingBackend {
+    /// CPU transformer forward.
+    Cpu,
+    /// Metal transformer forward.
+    Metal,
+}
+
 /// **Unstable**: Qwen3-Embedding model loaded for inference; internal architecture under active development.
 pub struct QwenModel {
     config: QwenConfig,
@@ -1199,6 +1209,28 @@ impl QwenModel {
         Ok(output)
     }
 
+    /// Encode freshly, bypassing both in-memory and persistent cache entries.
+    ///
+    /// Returns the backend that actually produced this vector, including CPU fallback.
+    #[doc(hidden)]
+    pub fn encode_identified_uncached(
+        &self,
+        text: &str,
+    ) -> Result<(Vec<f32>, QwenEmbeddingBackend), InferenceError> {
+        let (ids, seq_len) = self.tokenize_for_embedding(text)?;
+        let (hidden_states, backend) = self.forward_with_backend(&ids, seq_len);
+        let mask = vec![1u32; seq_len];
+        let pooled = last_token_pool(&hidden_states, &mask, seq_len, self.config.hidden_size);
+        let dim = self.dimensions();
+        let mut output = if dim < pooled.len() {
+            pooled[..dim].to_vec()
+        } else {
+            pooled
+        };
+        l2_normalize(&mut output);
+        Ok((output, backend))
+    }
+
     /// Encode text and return embeddings at EVERY layer exit point (0..num_layers).
     /// Used for early-exit analysis: find the shallowest layer that produces good embeddings.
     /// Returns Vec of (layer_index, embedding) — layer 0 is after the first transformer layer.
@@ -1341,6 +1373,14 @@ impl QwenModel {
     /// When a Metal GPU is available, runs the transformer layers on GPU (5x faster).
     /// Embedding lookup and final pooling always run on CPU.
     fn forward(&self, input_ids: &[u32], seq_len: usize) -> Vec<f32> {
+        self.forward_with_backend(input_ids, seq_len).0
+    }
+
+    fn forward_with_backend(
+        &self,
+        input_ids: &[u32],
+        seq_len: usize,
+    ) -> (Vec<f32>, QwenEmbeddingBackend) {
         // GPU path: embedding lookup on CPU, transformer layers on Metal GPU.
         // MetalForwardPass validates seq_len <= its max_seq_len internally.
         if let Some(ref metal_mutex) = self.metal {
@@ -1357,7 +1397,7 @@ impl QwenModel {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match metal.forward(&hidden_input, seq_len) {
-                    Ok(output) => return output,
+                    Ok(output) => return (output, QwenEmbeddingBackend::Metal),
                     Err(e) => {
                         tracing::warn!(
                             "Metal forward failed (seq_len={seq_len}), falling back to CPU: {e}"
@@ -1367,7 +1407,10 @@ impl QwenModel {
             }
         }
 
-        self.forward_cpu(input_ids, seq_len, NoopObserver)
+        (
+            self.forward_cpu(input_ids, seq_len, NoopObserver),
+            QwenEmbeddingBackend::Cpu,
+        )
     }
 
     fn forward_cpu<O: ForwardObserver>(
