@@ -16,6 +16,14 @@ use sha2::{Digest, Sha256};
 /// Revision of BERT native output semantics not already distinguished by inputs.
 const OUTPUT_REVISION: &str = "bert-native-output-v1";
 
+fn pooling_name(pooling: lattice_compute::pool::BertPooling) -> Option<&'static str> {
+    match pooling {
+        lattice_compute::pool::BertPooling::CLS => Some("cls"),
+        lattice_compute::pool::BertPooling::Mean => Some("mean"),
+        _ => None,
+    }
+}
+
 /// A newly computed batch and its identity from one model/policy snapshot.
 #[derive(Clone, Debug)]
 pub struct IdentifiedEmbeddings {
@@ -183,11 +191,7 @@ fn descriptor(model: &BertModel, mode: IdentityMode) -> Option<EmbeddingSpaceDes
         "config.layer_norm_eps",
         PolicyValue::F32(config.layer_norm_eps),
     );
-    let pooling = match model.pooling() {
-        lattice_compute::pool::BertPooling::CLS => "cls",
-        lattice_compute::pool::BertPooling::Mean => "mean",
-        _ => return None,
-    };
+    let pooling = pooling_name(model.pooling())?;
     for (key, value) in [
         ("pooling", pooling),
         ("normalization", "l2"),
