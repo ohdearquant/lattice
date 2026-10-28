@@ -708,3 +708,144 @@ fn device_route_buffer_refuses_unsupported_shapes() {
         "single expert with offsets inside u32"
     );
 }
+
+// Synthetic repeated-layer scheduling: this is not a claim that production
+// currently encodes multiple MoE tokens in a single command buffer (#2221).
+fn encode_route_witness_token<'a>(
+    state: &mut MetalQwen35State,
+    enc: &'a ComputeCommandEncoderRef,
+    input: &Buffer,
+    zeros: &Buffer,
+    position: usize,
+    cfg: &Qwen35Config,
+) -> &'a ComputeCommandEncoderRef {
+    // The copies run on the GPU in encoder order; changing shared memory from
+    // the CPU before submission would make both router calls see the last input.
+    state.dispatch_copy(
+        enc,
+        input,
+        &state.session.activations.residual,
+        HIDDEN as u32,
+    );
+    state.dispatch_copy(
+        enc,
+        zeros,
+        &state.session.activations.attn_out,
+        HIDDEN as u32,
+    );
+    let mut profile = StepProfile::default();
+    state.encode_mlp_block(enc, 0, 0, position, cfg, &mut profile, false, |_| {
+        panic!("route witness must not fall back to the host router")
+    })
+}
+
+fn run_route_publication_witness(two_tokens_in_one_command: bool) {
+    let scale = 1.0 / HIDDEN as f32;
+    let layers = [EagerLayer {
+        gamma: 0.0,
+        router_rows: [scale, 0.25 * scale, -0.5 * scale, -2.0 * scale],
+        shared: false,
+    }];
+    let (mut cfg, mut weights) = eager_moe_fixture(&[true], &layers);
+    cfg.num_experts_per_tok = Some(2);
+    let FeedForwardWeights::Moe(moe) = &mut weights.layers[0].1.ffn else {
+        panic!("route witness requires an MoE layer");
+    };
+    moe.router.num_experts_per_tok = 2;
+
+    let norm = 1.0 / (1.0 + cfg.rms_norm_eps).sqrt();
+    let expected_ids = [[0usize, 1], [3, 2]];
+    let expected_weights = [
+        softmax(&[norm, 0.25 * norm]),
+        softmax(&[2.0 * norm, 0.5 * norm]),
+    ];
+    assert_ne!(expected_ids[0], expected_ids[1]);
+    assert!((expected_weights[0][0] - expected_weights[1][0]).abs() > 0.1);
+
+    let _gpu = gpu_test_lock();
+    let _device = Device::system_default().expect("route witness requires a Metal device");
+    assert_default_route_conditions();
+    let _trace_guard = RoutingTraceGuard;
+    let _ = take_moe_routing_trace();
+    let _ = take_moe_router_runs_for_test();
+    let mut state = MetalQwen35State::new(&weights, &cfg, 16).expect("Eager MoE fixture");
+    assert_every_layer_has_a_device_route(&state);
+    let device = &state.engine.device;
+    let shared = MTLResourceOptions::StorageModeShared;
+    let positive = [1.0f32; HIDDEN];
+    let negative = [-1.0f32; HIDDEN];
+    let zero = [0.0f32; HIDDEN];
+    let input_buffers = [&positive, &negative].map(|input| {
+        device.new_buffer_with_data(
+            input.as_ptr() as *const _,
+            std::mem::size_of_val(input) as u64,
+            shared,
+        )
+    });
+    let zeros = device.new_buffer_with_data(
+        zero.as_ptr() as *const _,
+        std::mem::size_of_val(&zero) as u64,
+        shared,
+    );
+    let queue = state.engine.queue.clone();
+    arm_moe_routing_trace();
+
+    if two_tokens_in_one_command {
+        let cmd = queue.new_command_buffer();
+        let mut enc = cmd.new_compute_command_encoder();
+        for (position, input) in input_buffers.iter().enumerate() {
+            enc = encode_route_witness_token(&mut state, enc, input, &zeros, position, &cfg);
+        }
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        assert_eq!(cmd.status(), metal::MTLCommandBufferStatus::Completed);
+        // SAFETY: the command buffer containing both route writes completed.
+        unsafe { publish_moe_device_routes() };
+    } else {
+        for (position, input) in input_buffers.iter().enumerate() {
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            let enc = encode_route_witness_token(&mut state, enc, input, &zeros, position, &cfg);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            assert_eq!(cmd.status(), metal::MTLCommandBufferStatus::Completed);
+            // SAFETY: this token's route write completed before publication.
+            unsafe { publish_moe_device_routes() };
+        }
+    }
+    assert_eq!(
+        take_moe_router_runs_for_test(),
+        (0, 2),
+        "both routes must run on the device"
+    );
+    let trace = take_moe_routing_trace();
+    assert_eq!(trace.len(), 2);
+    eprintln!(
+        "route witness: actual={trace:?}; expected_ids={expected_ids:?}; expected_weights={expected_weights:?}"
+    );
+    for (position, record) in trace.iter().enumerate() {
+        assert_eq!((record.layer_idx, record.token_idx), (0, position));
+        assert_eq!(
+            record.selected_ids, expected_ids[position],
+            "wrong route for token {position}"
+        );
+        assert_weights(
+            &record.gate_weights,
+            &expected_weights[position],
+            "route publication",
+        );
+    }
+}
+
+#[test]
+fn device_route_publication_per_command_control() {
+    run_route_publication_witness(false);
+}
+
+#[test]
+#[ignore = "#2221: desired correctness for two device routes sharing one command buffer is not yet established"]
+fn device_route_publication_two_tokens_one_command_witness() {
+    run_route_publication_witness(true);
+}
