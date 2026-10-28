@@ -848,6 +848,12 @@ pub async fn chat_completions(
         })?;
 
     let req: ChatCompletionRequest = serde_json::from_slice(&bytes).map_err(|err| {
+        if let Some(field) = lattice_serve::serve::contract::tool_history_parse_error(&err) {
+            return ApiError::BadRequest {
+                message: format!("messages.{field} is not supported by this server"),
+                code: "invalid_request_body",
+            };
+        }
         if lattice_serve::serve::contract::is_message_flood_error(&err) {
             return ApiError::BadRequest {
                 message: lattice_serve::serve::contract::message_flood_text(),

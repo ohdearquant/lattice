@@ -920,6 +920,12 @@ mod imp {
         reject_duplicate_json_members(body)?;
         validate_content_part_limits(body)?;
         serde_json::from_slice::<ChatReq>(body).map_err(|err| {
+            if let Some(field) = lattice_serve::serve::contract::tool_history_parse_error(&err) {
+                return RequestError::bad_request(
+                    format!("messages.{field} is not supported by this server"),
+                    "invalid_request_body",
+                );
+            }
             if is_message_flood_error(&err) {
                 return RequestError::bad_request(message_flood_text(), "invalid_request_body");
             }

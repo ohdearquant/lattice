@@ -1004,7 +1004,7 @@ fn to_chat_messages_rejects_tool_role() {
     assert!(matches!(
         err,
         ApiError::BadRequest {
-            code: "unsupported_feature",
+            code: "invalid_request_body",
             ..
         }
     ));
@@ -2343,3 +2343,6 @@ mod min_p;
 mod completion_length_invariant_1334;
 
 mod lora_orchestration;
+
+#[cfg(feature = "test-utils")]
+mod tool_history;

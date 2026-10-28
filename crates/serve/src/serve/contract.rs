@@ -176,13 +176,94 @@ pub struct ChatStreamOptions {
 }
 
 /// One input chat message.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct Message {
     /// OpenAI message role.
     pub role: String,
     /// Plain text or typed content parts.
     pub content: MessageContent,
+    /// Raw tool-call history, retained for unsupported-feature admission.
+    pub tool_calls: Option<Box<RawValue>>,
+}
+
+fn tool_history_field(role: &str, calls: Option<&RawValue>) -> Option<&'static str> {
+    if role == "tool" {
+        return Some("role");
+    }
+    if let Some(raw) = calls {
+        let value = raw.get().trim();
+        if value != "null"
+            && !value
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .is_some_and(|s| s.trim().is_empty())
+        {
+            return Some("tool_calls");
+        }
+    }
+    None
+}
+
+const TOOL_HISTORY_ROLE_SENTINEL: &str = "lattice_tool_history_role";
+const TOOL_HISTORY_CALLS_SENTINEL: &str = "lattice_tool_history_calls";
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawMessage {
+            role: String,
+            #[serde(default)]
+            content: Option<Box<RawValue>>,
+            #[serde(default)]
+            tool_calls: Option<Box<RawValue>>,
+        }
+        let raw = RawMessage::deserialize(deserializer)?;
+        let content = raw
+            .content
+            .as_ref()
+            .and_then(|v| serde_json::from_str::<MessageContent>(v.get()).ok());
+        let Some(content) = content else {
+            if let Some(field) = tool_history_field(&raw.role, raw.tool_calls.as_deref()) {
+                let marker = if field == "role" {
+                    TOOL_HISTORY_ROLE_SENTINEL
+                } else {
+                    TOOL_HISTORY_CALLS_SENTINEL
+                };
+                return Err(serde::de::Error::custom(marker));
+            }
+            return Err(serde::de::Error::custom("invalid message content"));
+        };
+        Ok(Self {
+            role: raw.role,
+            content,
+            tool_calls: raw.tool_calls,
+        })
+    }
+}
+
+/// Identifies tool-history refusals encountered while decoding invalid content.
+pub fn tool_history_parse_error(err: &serde_json::Error) -> Option<&'static str> {
+    let text = err.to_string();
+    if text.contains(TOOL_HISTORY_ROLE_SENTINEL) {
+        Some("role")
+    } else if text.contains(TOOL_HISTORY_CALLS_SENTINEL) {
+        Some("tool_calls")
+    } else {
+        None
+    }
+}
+
+fn reject_tool_history(messages: &[Message]) -> Result<(), ApiError> {
+    for message in messages {
+        if let Some(field) = tool_history_field(&message.role, message.tool_calls.as_deref()) {
+            return Err(ApiError::BadRequest {
+                message: format!("messages.{field} is not supported by this server"),
+                code: "invalid_request_body",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Validated role carried by a normalized serving-contract message.
@@ -667,6 +748,7 @@ where
         });
     }
     check_message_bounds(&req.messages)?;
+    reject_tool_history(&req.messages)?;
     if profile.require_last_user
         && req.messages.last().map(|message| message.role.as_str()) != Some("user")
     {
@@ -1273,6 +1355,7 @@ fn normalize_logprobs(req: &ChatRequest) -> Result<Option<usize>, ApiError> {
 
 /// Validate and convert wire messages into backend-independent chat messages.
 pub fn normalize_messages(messages: &[Message]) -> Result<Vec<NormalizedChatMessage>, ApiError> {
+    reject_tool_history(messages)?;
     normalize_messages_with_vision(messages, false)
 }
 
