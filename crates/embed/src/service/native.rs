@@ -31,6 +31,7 @@ enum LoadedModel {
     EmbeddingGemma2 {
         model: Arc<EmbeddingGemma2Model>,
         output_dim: Option<usize>,
+        identity: std::result::Result<EmbeddingSpaceIdentity, String>,
     },
 }
 
@@ -48,7 +49,9 @@ impl LoadedModel {
                 }
                 Ok(results)
             }
-            LoadedModel::EmbeddingGemma2 { model, output_dim } => texts
+            LoadedModel::EmbeddingGemma2 {
+                model, output_dim, ..
+            } => texts
                 .iter()
                 .map(|text| model.encode(text, *output_dim).map_err(|e| e.to_string()))
                 .collect(),
@@ -92,7 +95,9 @@ impl LoadedModel {
                 let counts = self.count_batch(texts)?;
                 Ok((self.encode_batch(texts)?, counts))
             }
-            LoadedModel::EmbeddingGemma2 { model, output_dim } => {
+            LoadedModel::EmbeddingGemma2 {
+                model, output_dim, ..
+            } => {
                 let mut embeddings = Vec::with_capacity(texts.len());
                 let mut counts = Vec::with_capacity(texts.len());
                 for text in texts {
@@ -472,7 +477,9 @@ fn load_model_sync_with_bert_acquisition(
         EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => {
             load_qwen_model(model_config)
         }
-        EmbeddingModel::EmbeddingGemma2 => load_embeddinggemma2_model(model_config),
+        EmbeddingModel::EmbeddingGemma2 => {
+            load_embeddinggemma2_model(model_config, mode, directory)
+        }
         other => Err(format!("unsupported model: {other:?}")),
     }
 }
@@ -508,17 +515,29 @@ fn load_qwen_model(model_config: ModelConfig) -> std::result::Result<LoadedModel
 
 fn load_embeddinggemma2_model(
     model_config: ModelConfig,
+    mode: IdentityMode,
+    directory: Option<&std::path::Path>,
 ) -> std::result::Result<LoadedModel, String> {
     model_config.validate().map_err(|e| e.to_string())?;
     info!(
         output_dim = ?model_config.output_dim,
         "loading EmbeddingGemma 2 embedding model"
     );
-    let model_dir = embeddinggemma2_model_dir().map_err(|e| e.to_string())?;
-    let model = EmbeddingGemma2Model::from_model_dir(&model_dir).map_err(|e| e.to_string())?;
+    let model_dir = match directory {
+        Some(directory) => directory.to_path_buf(),
+        None => embeddinggemma2_model_dir().map_err(|e| e.to_string())?,
+    };
+    let model = if mode == IdentityMode::Full {
+        EmbeddingGemma2Model::from_model_dir_with_full_report(&model_dir, &mut |_| {})
+    } else {
+        EmbeddingGemma2Model::from_model_dir(&model_dir)
+    }
+    .map_err(|e| e.to_string())?;
+    let identity = identity::identify_gemma(&model, model_config.output_dim, mode);
     Ok(LoadedModel::EmbeddingGemma2 {
         model: Arc::new(model),
         output_dim: model_config.output_dim,
+        identity,
     })
 }
 

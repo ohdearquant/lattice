@@ -44,6 +44,15 @@ pub mod __internal {
     use crate::lora_hook::LoraHook;
     use lattice_inference_core::InferenceError;
 
+    /// Whether the x86 GEMM dispatch is compiled into this instance of the compute crate.
+    pub const fn x86_gemm_dispatch_enabled() -> bool {
+        cfg!(all(
+            not(target_os = "macos"),
+            target_arch = "x86_64",
+            feature = "x86-gemm"
+        ))
+    }
+
     /// Checked count of floats in a paged cache allocation.
     pub fn paged_cache_try_floats_per_page(
         config: &crate::kv_cache::PagedKVCacheConfig,

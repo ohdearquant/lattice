@@ -1,4 +1,8 @@
-//! Declared BGE-small native output identity bound to the successful load.
+//! Declared native output identities bound to the successful load.
+
+mod gemma;
+
+pub(super) use gemma::identify_gemma;
 
 use super::{LoadedModel, NativeEmbeddingService, prepared_views};
 use crate::error::{EmbedError, Result};
@@ -99,10 +103,11 @@ impl NativeEmbeddingService {
 
     /// Compute vectors and bind their declared identity to the same successful load.
     ///
-    /// Only the BGE-small producer currently declares a complete native recipe.
+    /// BGE-small and the native EmbeddingGemma 2 text producer declare recipes.
     /// Other producers, missing config origins and unreported preloaded models
-    /// return Unavailable. Generic has no prefix; Query/Passage share one paired
-    /// text policy. This family declares no image compatibility.
+    /// return Unavailable. EmbeddingGemma 2 is available only in Full mode.
+    /// Generic has no prefix; Query/Passage share one paired text policy. Neither
+    /// declared recipe covers image inputs.
     pub async fn embed_identified(
         &self,
         texts: &[String],
@@ -118,6 +123,11 @@ impl NativeEmbeddingService {
         let loaded = self.ensure_model().await?;
         let identity = match loaded {
             LoadedModel::Bert { identity, .. } if model == EmbeddingModel::BgeSmallEnV15 => {
+                identity.clone().map_err(EmbedError::InferenceFailed)?
+            }
+            LoadedModel::EmbeddingGemma2 { identity, .. }
+                if model == EmbeddingModel::EmbeddingGemma2 =>
+            {
                 identity.clone().map_err(EmbedError::InferenceFailed)?
             }
             _ => EmbeddingSpaceIdentity::Unavailable,
@@ -262,5 +272,7 @@ pub(super) fn identify(
     ))
 }
 
+#[cfg(test)]
+mod gemma_tests;
 #[cfg(test)]
 mod tests;
