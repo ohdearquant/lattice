@@ -44,7 +44,7 @@ struct PeftKey {
     transposed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LoraMatrix {
     A,
     B,
@@ -216,15 +216,41 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
     let tensors = SafeTensors::deserialize(bytes)
         .map_err(|e| LoraError::Format(format!("failed to parse safetensors: {e}")))?;
 
-    // Collect all parsed LoRA keys
-    let names: Vec<String> = tensors.names().into_iter().map(String::from).collect();
+    // Collect all parsed LoRA keys. Sorted so that error messages name the
+    // same keys on every run.
+    let mut names: Vec<String> = tensors.names().into_iter().map(String::from).collect();
+    names.sort_unstable();
     let mut a_tensors: HashMap<(usize, String), (Vec<f32>, Vec<usize>)> = HashMap::new();
     let mut b_tensors: HashMap<(usize, String), (Vec<f32>, Vec<usize>)> = HashMap::new();
     let mut target_modules = BTreeSet::new();
+    let mut sources: HashMap<(usize, String, LoraMatrix), &str> = HashMap::new();
+    let mut dialects: HashMap<(usize, String), (bool, &str)> = HashMap::new();
 
     for name in &names {
         if let Some(peft_key) = parse_peft_key(name) {
             let key = (peft_key.layer_idx, peft_key.module.clone());
+            let factor = match peft_key.matrix {
+                LoraMatrix::A => "lora_A",
+                LoraMatrix::B => "lora_B",
+            };
+            if let Some(first) = sources.insert((key.0, key.1.clone(), peft_key.matrix), name) {
+                return Err(LoraError::Format(format!(
+                    "LoRA adapter has two {factor} tensors for layer {} module '{}': '{first}' and '{name}'",
+                    key.0, key.1
+                )));
+            }
+            match dialects.get(&key) {
+                Some(&(mlx, first)) if mlx != peft_key.transposed => {
+                    return Err(LoraError::Format(format!(
+                        "LoRA adapter mixes PEFT and MLX key forms for layer {} module '{}': '{first}' and '{name}'",
+                        key.0, key.1
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    dialects.insert(key.clone(), (peft_key.transposed, name));
+                }
+            }
             let (data, shape) = read_tensor_f32(&tensors, name)?;
             target_modules.insert(peft_key.module.clone());
 

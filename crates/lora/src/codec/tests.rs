@@ -176,3 +176,87 @@ fn encode_then_decode_round_trips_factors_and_alpha() {
     );
     assert_eq!(read_header_metadata_value(&bytes, "absent"), None);
 }
+
+fn adapter_bytes(tensors: &[(&str, &[f32], &[usize])]) -> Vec<u8> {
+    let raw: Vec<(String, Vec<u8>, Vec<usize>)> = tensors
+        .iter()
+        .map(|(name, data, shape)| {
+            let bytes = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            (name.to_string(), bytes, shape.to_vec())
+        })
+        .collect();
+    let views: Vec<(String, TensorView<'_>)> = raw
+        .iter()
+        .map(|(name, bytes, shape)| {
+            (
+                name.clone(),
+                TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+            )
+        })
+        .collect();
+    serialize(views, &None).unwrap()
+}
+
+const Q_PREFIX: &str = "base_model.model.model.layers.0.self_attn.q_proj";
+
+#[test]
+fn duplicate_factor_keys_are_refused_even_with_identical_bytes() {
+    let a = [0.5f32, -1.0];
+    let b = [2.0f32, 3.0];
+    let with_suffix = format!("{Q_PREFIX}.lora_A.weight");
+    let without_suffix = format!("{Q_PREFIX}.lora_A");
+    let b_key = format!("{Q_PREFIX}.lora_B.weight");
+    let bytes = adapter_bytes(&[
+        (&with_suffix, &a, &[1, 2]),
+        (&without_suffix, &a, &[1, 2]),
+        (&b_key, &b, &[2, 1]),
+    ]);
+    let err = decode_peft_safetensors(&bytes).unwrap_err();
+    assert!(matches!(err, LoraError::Format(_)), "got {err:?}");
+    let msg = err.message();
+    assert!(
+        msg.contains("two lora_A tensors for layer 0 module 'q_proj'"),
+        "got {msg}"
+    );
+    assert!(
+        msg.contains(&with_suffix) && msg.contains(&without_suffix),
+        "got {msg}"
+    );
+}
+
+#[test]
+fn a_pair_mixing_peft_and_mlx_key_forms_is_refused() {
+    let a_key = format!("{Q_PREFIX}.lora_A.weight");
+    let b_key = format!("{Q_PREFIX}.lora_b");
+    let bytes = adapter_bytes(&[
+        (&a_key, &[0.5, -1.0], &[1, 2]),
+        (&b_key, &[2.0, 3.0], &[1, 2]),
+    ]);
+    let err = decode_peft_safetensors(&bytes).unwrap_err();
+    assert!(matches!(err, LoraError::Format(_)), "got {err:?}");
+    let msg = err.message();
+    assert!(
+        msg.contains("mixes PEFT and MLX key forms for layer 0 module 'q_proj'"),
+        "got {msg}"
+    );
+    assert!(msg.contains(&a_key) && msg.contains(&b_key), "got {msg}");
+}
+
+#[test]
+fn single_dialect_pairs_still_decode() {
+    let peft = adapter_bytes(&[
+        (&format!("{Q_PREFIX}.lora_A.weight"), &[0.5, -1.0], &[1, 2]),
+        (&format!("{Q_PREFIX}.lora_B.weight"), &[2.0, 3.0], &[2, 1]),
+    ]);
+    let mlx = adapter_bytes(&[
+        (&format!("{Q_PREFIX}.lora_a"), &[0.5, -1.0], &[2, 1]),
+        (&format!("{Q_PREFIX}.lora_b"), &[2.0, 3.0], &[1, 2]),
+    ]);
+    for bytes in [peft, mlx] {
+        let decoded = decode_peft_safetensors(&bytes).unwrap();
+        let layer = &decoded.layers[&(0, "q_proj".to_string())];
+        assert_eq!((layer.rank, layer.d_in, layer.d_out), (1, 2, 2));
+        assert_eq!(layer.a, vec![0.5, -1.0]);
+        assert_eq!(layer.b, vec![2.0, 3.0]);
+    }
+}
