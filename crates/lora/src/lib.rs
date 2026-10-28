@@ -28,7 +28,9 @@ mod error;
 mod factors;
 mod geometry;
 
-pub use blend::blend_effective_weights;
+pub use blend::{
+    blend_effective_weights, blend_layer_data_effective_weights, blend_layer_effective_weights,
+};
 pub use error::LoraError;
 pub use factors::{LoraLayer, LoraLayerData, apply_lora};
 
