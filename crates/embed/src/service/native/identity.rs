@@ -116,9 +116,9 @@ impl NativeEmbeddingService {
 
     /// Compute vectors and bind their declared identity to the same successful load.
     ///
-    /// BGE, multilingual E5, Qwen3 and the native EmbeddingGemma 2 text producer declare recipes.
+    /// BGE, multilingual E5, MiniLM, Qwen3 and the native EmbeddingGemma 2 text producer declare recipes.
     /// Other producers, missing config origins and unreported preloaded models
-    /// return Unavailable. BGE base/large, E5, Qwen3 and EmbeddingGemma 2 are available only in Full mode.
+    /// return Unavailable. BGE base/large, E5, MiniLM, Qwen3 and EmbeddingGemma 2 are available only in Full mode.
     /// Qwen3 identified requests bypass legacy caches and report the actual backend per vector.
     /// Execution backend is result metadata and is not part of these identity recipes.
     /// Generic has no prefix; Query/Passage share one paired text policy. Neither
@@ -145,6 +145,8 @@ impl NativeEmbeddingService {
                         | EmbeddingModel::BgeLargeEnV15
                         | EmbeddingModel::MultilingualE5Small
                         | EmbeddingModel::MultilingualE5Base
+                        | EmbeddingModel::AllMiniLmL6V2
+                        | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2
                 ) =>
             {
                 identity.clone().map_err(EmbedError::InferenceFailed)?
@@ -194,6 +196,8 @@ impl NativeEmbeddingService {
                         | EmbeddingModel::BgeLargeEnV15
                         | EmbeddingModel::MultilingualE5Small
                         | EmbeddingModel::MultilingualE5Base
+                        | EmbeddingModel::AllMiniLmL6V2
+                        | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2
                         | EmbeddingModel::EmbeddingGemma2
                 ) {
                 Some(EmbeddingBackend::Cpu)
@@ -396,6 +400,54 @@ fn e5_descriptor(
     let domain = match family {
         EmbeddingModel::MultilingualE5Small => "multilingual-e5-small-native-v1",
         EmbeddingModel::MultilingualE5Base => "multilingual-e5-base-native-v1",
+        _ => return None,
+    };
+    let mut descriptor = descriptor(model, mode)?;
+    descriptor.producer_family = domain.into();
+    for entry in &mut descriptor.policy {
+        match entry.key.as_str() {
+            "role.query" => {
+                entry.value = PolicyValue::String(family.query_instruction().unwrap_or("").into())
+            }
+            "role.passage" => {
+                entry.value =
+                    PolicyValue::String(family.document_instruction().unwrap_or("").into())
+            }
+            _ => {}
+        }
+    }
+    Some(descriptor)
+}
+
+pub(super) fn identify_minilm(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> std::result::Result<EmbeddingSpaceIdentity, String> {
+    if mode != IdentityMode::Full {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    }
+    let Some(descriptor) = minilm_descriptor(model, mode, family) else {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    };
+    let canonical = descriptor
+        .canonical_bytes()
+        .map_err(|error| error.to_string())?;
+    Ok(EmbeddingSpaceIdentity::Known(
+        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
+    ))
+}
+
+fn minilm_descriptor(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> Option<EmbeddingSpaceDescriptor> {
+    let domain = match family {
+        EmbeddingModel::AllMiniLmL6V2 => "all-minilm-l6-v2-native-v1",
+        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
+            "paraphrase-multilingual-minilm-l12-v2-native-v1"
+        }
         _ => return None,
     };
     let mut descriptor = descriptor(model, mode)?;

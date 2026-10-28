@@ -430,6 +430,8 @@ fn load_model_sync(
                     | EmbeddingModel::BgeLargeEnV15
                     | EmbeddingModel::MultilingualE5Small
                     | EmbeddingModel::MultilingualE5Base
+                    | EmbeddingModel::AllMiniLmL6V2
+                    | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2
             ) {
                 match (mode, directory) {
                     (IdentityMode::Full, Some(dir)) => BertModel::from_directory_with_digest_mode(
@@ -497,6 +499,10 @@ fn load_model_sync_with_bert_acquisition(
                 }
                 EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
                     identity::identify_e5(&bert, mode, model_config.model)
+                }
+                EmbeddingModel::AllMiniLmL6V2
+                | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
+                    identity::identify_minilm(&bert, mode, model_config.model)
                 }
                 _ => Ok(EmbeddingSpaceIdentity::Unavailable),
             };
