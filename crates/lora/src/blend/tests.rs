@@ -34,3 +34,116 @@ fn rank_zero_empty_factors_are_valid_but_positive_rank_placeholders_are_not() {
         "fixture: entry 0 A slice length 0 does not match rank*d_in=1*2=2"
     );
 }
+
+#[test]
+fn slice_bridges_match_iterator_and_preserve_validation_order() {
+    let first = LoraLayer {
+        a: vec![1.0, 2.0],
+        b: vec![1.3, -0.5],
+        rank: 1,
+        d_in: 2,
+        d_out: 2,
+    };
+    let second = LoraLayer {
+        a: vec![3.0, 4.0, 5.0, 6.0],
+        b: vec![0.25, 0.5, 1.5, 2.0],
+        rank: 2,
+        d_in: 2,
+        d_out: 2,
+    };
+    let make_data = |layer: &LoraLayer| LoraLayerData {
+        layer_idx: 0,
+        module: "q_proj".into(),
+        a: layer.a.clone(),
+        b: layer.b.clone(),
+        rank: layer.rank,
+        d_in: layer.d_in,
+        d_out: layer.d_out,
+    };
+    let data_first = make_data(&first);
+    let data_second = make_data(&second);
+    let layers = [(&first, 1.1_f32 * 1.2), (&second, -0.7)];
+    let data = [(&data_first, 1.1_f32 * 1.2), (&data_second, -0.7)];
+    let reference = blend_effective_weights(
+        "fixture",
+        layers
+            .iter()
+            .map(|(layer, weight)| (layer.a.as_slice(), layer.b.as_slice(), layer.rank, *weight)),
+        3,
+        2,
+        2,
+    )
+    .unwrap();
+    for actual in [
+        blend_layer_effective_weights("fixture", &layers, 3, 2, 2).unwrap(),
+        blend_layer_data_effective_weights("fixture", &data, 3, 2, 2).unwrap(),
+    ] {
+        assert_eq!(actual.a, reference.a);
+        assert_eq!(
+            actual.b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            reference.b.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    let invalid = LoraLayer {
+        a: vec![],
+        b: vec![],
+        rank: 1,
+        d_in: 2,
+        d_out: 2,
+    };
+    let invalid_data = make_data(&invalid);
+    for rank_total in [0, 1] {
+        let reference = blend_effective_weights(
+            "fixture",
+            [(&invalid.a[..], &invalid.b[..], invalid.rank, 1.0)].into_iter(),
+            rank_total,
+            2,
+            2,
+        )
+        .unwrap_err()
+        .message();
+        assert_eq!(
+            blend_layer_effective_weights("fixture", &[(&invalid, 1.0)], rank_total, 2, 2)
+                .unwrap_err()
+                .message(),
+            reference
+        );
+        assert_eq!(
+            blend_layer_data_effective_weights(
+                "fixture",
+                &[(&invalid_data, 1.0)],
+                rank_total,
+                2,
+                2,
+            )
+            .unwrap_err()
+            .message(),
+            reference
+        );
+    }
+}
+
+#[test]
+fn slice_bridges_accept_zero_rank() {
+    let layer = LoraLayer {
+        a: vec![],
+        b: vec![],
+        rank: 0,
+        d_in: 2,
+        d_out: 2,
+    };
+    let data = LoraLayerData {
+        layer_idx: 0,
+        module: "q_proj".into(),
+        a: vec![],
+        b: vec![],
+        rank: 0,
+        d_in: 2,
+        d_out: 2,
+    };
+    let host = blend_layer_effective_weights("fixture", &[(&layer, 0.5)], 0, 2, 2).unwrap();
+    let device = blend_layer_data_effective_weights("fixture", &[(&data, 0.5)], 0, 2, 2).unwrap();
+    assert!(host.a.is_empty() && host.b.is_empty());
+    assert!(device.a.is_empty() && device.b.is_empty());
+}

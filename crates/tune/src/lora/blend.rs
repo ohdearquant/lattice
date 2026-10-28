@@ -154,11 +154,14 @@ fn blend_layer_entries(
     shared::check_rank_total_cap(rank_total, "blend_layer_entries")
         .map_err(TuneError::Validation)?;
 
-    let factors = entries
-        .iter()
-        .map(|(layer, weight)| (layer.a.as_slice(), layer.b.as_slice(), layer.rank, *weight));
-    lattice_lora::blend_effective_weights("blend_layer_entries", factors, rank_total, d_in, d_out)
-        .map_err(|error| TuneError::Validation(error.message()))
+    lattice_lora::blend_layer_effective_weights(
+        "blend_layer_entries",
+        entries,
+        rank_total,
+        d_in,
+        d_out,
+    )
+    .map_err(|error| TuneError::Validation(error.message()))
 }
 
 #[cfg(test)]
