@@ -575,6 +575,36 @@ mod tests {
         assert!(c[..4].iter().all(|&v| v == 0.0));
     }
 
+    #[test]
+    fn matmul_into_zero_rows_returns() {
+        let (m, k, n) = (0usize, 3usize, 2usize);
+        let b = [1.0f32; 6];
+        let mut c = [SENTINEL; 4];
+        matmul_into(&[], &b, &mut c, m, k, n);
+        // m*n == 0: the result region is empty, so the property is that the call returns.
+    }
+
+    #[test]
+    fn matmul_into_zero_columns_returns() {
+        let (m, k, n) = (2usize, 3usize, 0usize);
+        let a = [1.0f32; 6];
+        let mut c = [SENTINEL; 4];
+        matmul_into(&a, &[], &mut c, m, k, n);
+        // m*n == 0: the result region is empty, so the property is that the call returns.
+    }
+
+    #[test]
+    fn matmul_into_zero_inner_dimension_zero_fills_output() {
+        let (m, k, n) = (3usize, 0usize, 2usize);
+        let mut c = [SENTINEL; 9];
+        matmul_into(&[], &[], &mut c, m, k, n);
+        assert!(
+            c[..m * n].iter().all(|&v| v == 0.0),
+            "k=0 must zero c[..m*n], got {:?}",
+            &c[..m * n]
+        );
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn lcg_vec(len: usize, seed: u32) -> Vec<f32> {
         let mut state = seed;
